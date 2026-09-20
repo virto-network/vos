@@ -1,9 +1,11 @@
 # Runtime-independent management recovery binding
 
-Status: source committed at `a1ebce16`, integrated after checkpoint `1b977731`.
+Evidence scope: r18, included in review checkpoint `c8028394`; not qualification
+of the implementation-only r19 cutover. Source committed at `a1ebce16`, integrated
+after checkpoint `1b977731`.
 The original physical reopen regression, broader guest/host coverage and repaired
 scripted fixtures pass with rebuilt r18 guests. Bundled bytes and pins are updated
-in the implementation worktree; independent reproduction and all 21 bundled Local
+at that checkpoint; independent reproduction and all 21 bundled Local
 tests pass. CLI bundle verification and the disposable debug-binary startup and
 lifecycle campaign pass, but the ten-second readiness gate fails. See [current status](agent-saga-status.md)
 for the authoritative plan and branch qualification.

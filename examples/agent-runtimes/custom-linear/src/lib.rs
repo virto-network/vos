@@ -689,7 +689,7 @@ fn apply_invoke(
 
 fn apply_acknowledge(
     state: RuntimeState,
-    work: InvocationWork,
+    work: vos_agent_sdk::InvocationRetirement,
     authorization: InvocationAuthorization,
 ) -> RuntimeTransition {
     let prior = state.clone();
@@ -699,8 +699,9 @@ fn apply_acknowledge(
     let Some(stored) = &model.linear.retained_work else {
         return acknowledged_error(prior, InvocationError::NotFound);
     };
-    if !authorization.matches_acknowledgement(&work)
-        || !stored_invoke_matches(stored, &work, &authorization)
+    if !work.validate()
+        || !authorization.matches_retirement(&work)
+        || !stored_retirement_matches(stored, &work, &authorization)
     {
         return acknowledged_error(prior, InvocationError::DivergentInvocation);
     }
@@ -1113,6 +1114,28 @@ fn stored_invoke_matches(
     )
 }
 
+// The custom layout retains the original canonical invocation. Decode and
+// validate those accepted bytes, then compare the complete metadata projection;
+// retirement transport need not duplicate its authenticated artifact preimages.
+fn stored_retirement_matches(
+    bytes: &[u8],
+    work: &vos_agent_sdk::InvocationRetirement,
+    authorization: &InvocationAuthorization,
+) -> bool {
+    matches!(
+        RuntimeWork::decode(bytes),
+        Ok(RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct,
+            state,
+            invocation,
+            authorization: stored_authorization,
+            ..
+        }) if state == RuntimeState::default()
+            && vos_agent_sdk::InvocationRetirement::from_work(&invocation) == *work
+            && stored_authorization.as_ref() == authorization
+    )
+}
+
 fn validate_stored_create(bytes: &[u8]) -> Result<(), DecodeError> {
     match RuntimeWork::decode(bytes).map_err(|_| DecodeError::NonCanonical)? {
         RuntimeWork::Manage {
@@ -1496,7 +1519,7 @@ mod tests {
         RuntimeWork::Acknowledge {
             context: RuntimeExecutionContext::Direct,
             state,
-            invocation: Box::new(invocation),
+            invocation: Box::new(vos_agent_sdk::InvocationRetirement::from_work(&invocation)),
             authorization: Box::new(authorization),
         }
     }
@@ -1762,10 +1785,35 @@ mod tests {
         );
         assert_eq!(blocked.state, applied.state);
 
+        let compact = vos_agent_sdk::InvocationRetirement::from_work(&work);
+        for mutation in 0..3 {
+            let mut changed = compact.clone();
+            match mutation {
+                0 => changed.message.push(0xa7),
+                1 => changed.gas += 1,
+                2 => changed.incarnation = Hash([0xa7; 32]),
+                _ => unreachable!(),
+            }
+            // Even a structurally valid binding for the substituted metadata
+            // cannot retire the invocation accepted in the custom state layout.
+            let changed_authorization = InvocationAuthorization::PublicPreflight(PublicPreflight {
+                work: changed.commitment(), origin: changed.origin, observed_slot: 7,
+            });
+            let rejected = dispatch(RuntimeWork::Acknowledge {
+                context: RuntimeExecutionContext::Direct,
+                state: applied.state.clone(),
+                invocation: Box::new(changed),
+                authorization: Box::new(changed_authorization),
+            });
+            assert_eq!(rejected.state, applied.state);
+            assert_eq!(rejected.outcome,
+                RuntimeOutcome::Acknowledged(Err(InvocationError::DivergentInvocation)));
+        }
+
         let acknowledged = dispatch(RuntimeWork::Acknowledge {
             context: RuntimeExecutionContext::Direct,
             state: applied.state,
-            invocation: Box::new(work),
+            invocation: Box::new(vos_agent_sdk::InvocationRetirement::from_work(&work)),
             authorization: Box::new(authorization),
         });
         assert!(matches!(
@@ -1895,7 +1943,7 @@ mod tests {
         let acknowledged = dispatch(RuntimeWork::Acknowledge {
             context: RuntimeExecutionContext::Direct,
             state: scheduled.state,
-            invocation: Box::new(schedule_work),
+            invocation: Box::new(vos_agent_sdk::InvocationRetirement::from_work(&schedule_work)),
             authorization: Box::new(schedule_authorization),
         });
         let tick = fixture.invocation_message(&install, 0x42, tick_message());
@@ -1927,7 +1975,7 @@ mod tests {
         let acknowledged = dispatch(RuntimeWork::Acknowledge {
             context: RuntimeExecutionContext::Direct,
             state: fired.state,
-            invocation: Box::new(tick),
+            invocation: Box::new(vos_agent_sdk::InvocationRetirement::from_work(&tick)),
             authorization: Box::new(tick_authorization),
         });
         let regressed = fixture.invocation_message(&install, 0x43, tick_message());

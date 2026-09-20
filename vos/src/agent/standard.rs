@@ -320,6 +320,8 @@ pub struct StandardInvocationResult {
     pub invocation: InvocationId,
     /// Install incarnation which owns this retained result.
     pub incarnation: Hash,
+    /// Clean results use the authenticated SDK work commitment. Legacy results
+    /// use ActorInvocation::commitment and are never interchangeable with them.
     pub request: Hash,
     pub reply: super::execution::ActorExecutionReply,
     /// Physical durable component retaining this exact result. Query replies
@@ -412,7 +414,15 @@ impl StandardCleanInvocationResult {
         work: &crate::agent_sdk::InvocationWork,
         authorization: &crate::agent_sdk::InvocationAuthorization,
     ) -> bool {
-        self.accepted == StandardAcceptedInvocation::from_work(work)
+        self.matches_retirement(&StandardAcceptedInvocation::from_work(work), authorization)
+    }
+
+    fn matches_retirement(
+        &self,
+        work: &crate::agent_sdk::InvocationRetirement,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+    ) -> bool {
+        self.accepted == *work
             && self.work == work.commitment()
             && self.authorization == *authorization
             && self.authorization.commitment() == authorization.commitment()
@@ -962,7 +972,7 @@ const fn clean_acknowledgement_storage_tag(mode: crate::agent_sdk::MethodMode) -
 /// is eligible for this compaction.
 fn is_system_authority_projection_query(
     descriptor: &crate::agent_sdk::AgentDescriptor,
-    work: &crate::agent_sdk::InvocationWork,
+    work: &crate::agent_sdk::InvocationRetirement,
     authorization: &crate::agent_sdk::InvocationAuthorization,
 ) -> bool {
     use crate::actors::codec::{Decode as _, Encode as _};
@@ -1795,6 +1805,7 @@ impl StandardAgentRuntime {
                 Some(binding) => {
                     binding.accepted.validate_accepted()
                         && binding.work != crate::agent_sdk::Hash::ZERO
+                        && result.request.0 == binding.work.0
                         && binding.authorization.commitment() != crate::agent_sdk::Hash::ZERO
                         && binding.accepted.invocation.0 == result.invocation.0
                         && binding.accepted.actor.0 == result.reply.actor.0
@@ -2453,7 +2464,7 @@ impl StandardAgentRuntime {
             return Err(ActorExecutionError::DivergentInvocation);
         }
         if let Some(result) = self.invocation_results.get(&key) {
-            if result.request != invocation.commitment() {
+            if result.clean.is_some() || result.request != invocation.commitment() {
                 return Err(ActorExecutionError::DivergentInvocation);
             }
             let reply = result.reply.clone();
@@ -2510,8 +2521,8 @@ impl StandardAgentRuntime {
         {
             return Err(InvocationError::DivergentInvocation);
         }
-        let (invocation, ..) = self.resolve_clean_invocation(work)?;
-        if result.request != invocation.commitment()
+        self.clean_invocation_target(work.actor, work.incarnation, work.deployment, work.program)?;
+        if result.request.0 != binding.work.0
             || result.scope != scope
             || result.invocation.0 != work.invocation.0
             || result.incarnation.0 != work.incarnation.0
@@ -2683,6 +2694,27 @@ impl StandardAgentRuntime {
         Ok(())
     }
 
+    fn clean_invocation_target(
+        &self,
+        actor: crate::agent_sdk::ActorId,
+        incarnation: crate::agent_sdk::Hash,
+        deployment: crate::agent_sdk::DeploymentId,
+        program: crate::agent_sdk::ProgramId,
+    ) -> Result<&ManagedActor, crate::agent_sdk::InvocationError> {
+        use crate::agent_sdk::InvocationError;
+        let actor = self.actors.get(&ActorId(actor.0)).ok_or(InvocationError::NotFound)?;
+        if actor.record.state_generation.0 != incarnation.0 {
+            return Err(InvocationError::StaleIncarnation);
+        }
+        if actor.record.entry.deployment.0 != deployment.0 {
+            return Err(InvocationError::StaleDeployment);
+        }
+        if actor.record.entry.program.0 != program.0 {
+            return Err(InvocationError::WrongProgram);
+        }
+        Ok(actor)
+    }
+
     pub(crate) fn resolve_clean_invocation(
         &self,
         work: &crate::agent_sdk::InvocationWork,
@@ -2699,19 +2731,7 @@ impl StandardAgentRuntime {
         use crate::agent_sdk::InvocationError;
 
         let actor_id = ActorId(work.actor.0);
-        let actor = self
-            .actors
-            .get(&actor_id)
-            .ok_or(InvocationError::NotFound)?;
-        if actor.record.state_generation.0 != work.incarnation.0 {
-            return Err(InvocationError::StaleIncarnation);
-        }
-        if actor.record.entry.deployment.0 != work.deployment.0 {
-            return Err(InvocationError::StaleDeployment);
-        }
-        if actor.record.entry.program.0 != work.program.0 {
-            return Err(InvocationError::WrongProgram);
-        }
+        let actor = self.clean_invocation_target(work.actor, work.incarnation, work.deployment, work.program)?;
         let mut program_index = None;
         let mut schema_index = None;
         let mut policy_index = None;
@@ -3922,6 +3942,7 @@ impl StandardAgentRuntime {
         if result.clean.is_some() {
             return Err(ActorExecutionError::InvalidActorOutput);
         }
+        result.request = Hash(work.commitment().0);
         result.clean = Some(StandardCleanInvocationResult::from_work(
             work,
             authorization.clone(),
@@ -4069,7 +4090,7 @@ impl StandardAgentRuntime {
                 scope: key.0,
                 invocation: invocation.invocation,
                 incarnation: invocation.incarnation,
-                request: invocation.commitment(),
+                request: Hash(work.commitment().0),
                 reply: reply.clone(),
                 storage,
                 clean: Some(StandardCleanInvocationResult::from_work(
@@ -4102,9 +4123,9 @@ impl StandardAgentRuntime {
         self.recover_clean_acknowledgement_after_work_validation(work, authorization)
     }
 
-    // Private continuation for the same immutable work. Invoke recovery has
-    // just performed full work and authorization validation; standalone ACK
-    // recovery above must still validate every availability preimage itself.
+    // Invoke recovery has already validated all availability preimages. The
+    // retained retirement fact binds their references, not another transport
+    // of their bytes.
     fn recover_clean_acknowledgement_after_work_validation(
         &self,
         work: &crate::agent_sdk::InvocationWork,
@@ -4113,9 +4134,26 @@ impl StandardAgentRuntime {
         Option<crate::agent_sdk::InvocationAcknowledgement>,
         crate::agent_sdk::InvocationError,
     > {
+        self.recover_clean_retirement(
+            &crate::agent_sdk::InvocationRetirement::from_work(work),
+            authorization,
+        )
+    }
+
+    /// Recover only an exact previously committed retirement fact. Structural
+    /// authorization matching is sufficient here because the full authorization
+    /// commitment must equal the retained fact; this cannot accept unseen work.
+    pub(crate) fn recover_clean_retirement(
+        &self,
+        work: &crate::agent_sdk::InvocationRetirement,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+    ) -> Result<
+        Option<crate::agent_sdk::InvocationAcknowledgement>,
+        crate::agent_sdk::InvocationError,
+    > {
         use crate::agent_sdk::InvocationError;
 
-        if !authorization.matches_acknowledgement(work) {
+        if !work.validate() || !authorization.matches_retirement(work) {
             return Err(InvocationError::InvalidAuthorization);
         }
         let scope = clean_method_mode(work.mode).invocation_scope();
@@ -4159,61 +4197,64 @@ impl StandardAgentRuntime {
         (crate::agent_sdk::InvocationAcknowledgement, bool),
         crate::agent_sdk::InvocationError,
     > {
-        if let Some(retained) = self.recover_clean_acknowledgement(work, authorization)? {
-            return Ok((retained, false));
+        if !work.validate() {
+            return Err(crate::agent_sdk::InvocationError::InvalidAuthorization);
         }
-        self.acknowledge_new_clean_invocation(work, authorization)
-            .map(|acknowledgement| (acknowledgement, true))
+        self.acknowledge_clean_retirement_with_status(
+            &crate::agent_sdk::InvocationRetirement::from_work(work), authorization,
+        )
     }
 
-    #[cfg(feature = "pvm")]
-    pub(super) fn acknowledge_validated_clean_invocation_with_status(
+    /// Retire an exact authenticated retained result using references only.
+    /// This never authorizes execution or supplies missing artifact preimages.
+    pub(crate) fn acknowledge_clean_retirement_with_status(
         &mut self,
-        validated: super::wire::ValidatedInvocationWork<'_>,
+        work: &crate::agent_sdk::InvocationRetirement,
         authorization: &crate::agent_sdk::InvocationAuthorization,
     ) -> Result<
         (crate::agent_sdk::InvocationAcknowledgement, bool),
         crate::agent_sdk::InvocationError,
     > {
-        let work = validated.work();
-        if let Some(retained) =
-            self.recover_clean_acknowledgement_after_work_validation(work, authorization)?
-        {
+        if let Some(retained) = self.recover_clean_retirement(work, authorization)? {
             return Ok((retained, false));
         }
-        self.acknowledge_new_clean_invocation(work, authorization)
+        self.acknowledge_new_clean_retirement(work, authorization)
             .map(|acknowledgement| (acknowledgement, true))
     }
 
     // Only called immediately after authenticated recovery found no retained
     // acknowledgement; never expose an entry point that skips that check.
-    fn acknowledge_new_clean_invocation(
+    fn acknowledge_new_clean_retirement(
         &mut self,
-        work: &crate::agent_sdk::InvocationWork,
+        work: &crate::agent_sdk::InvocationRetirement,
         authorization: &crate::agent_sdk::InvocationAuthorization,
     ) -> Result<crate::agent_sdk::InvocationAcknowledgement, crate::agent_sdk::InvocationError>
     {
         use crate::agent_sdk::{InvocationAcknowledgement, InvocationError};
 
-        let authorization_slot = match authorization {
-            crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(_) => 0,
-            crate::agent_sdk::InvocationAuthorization::PublicPreflight(preflight) => {
-                preflight.observed_slot
+        // Recovery validated the immutable metadata and authorization binding.
+        // Fresh retirement additionally authenticates scope and receipt signatures.
+        let descriptor = self.clean_descriptor.as_ref().ok_or(InvocationError::NotCreated)?;
+        if work.space != descriptor.identity.space
+            || work.agent != descriptor.identity.agent
+            || work.runtime_deployment != descriptor.identity.runtime_deployment
+        {
+            return Err(InvocationError::InvalidAuthorization);
+        }
+        if let crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(receipt) = authorization {
+            if !descriptor.authority.accepts(receipt)
+                || !super::authority::verify_raw_ed25519(
+                    &receipt.public_key, &receipt.signing_bytes(), &receipt.signature,
+                )
+            {
+                return Err(InvocationError::InvalidAuthorization);
             }
-        };
-        // recover_clean_acknowledgement just validated this same borrowed work.
-        // No mutation or external call occurs between that check and this
-        // private fresh-ack continuation. Repeat authorization, not blob hashes.
-        self.verify_clean_invocation_authorization_after_work_validation(
-            work,
-            authorization,
-            authorization_slot,
-        )?;
+        }
         let scope = clean_method_mode(work.mode).invocation_scope();
         let key = (scope, InvocationId(work.invocation.0));
         if let Some(record) = self.clean_invocation_errors.get(&key) {
             if !self.clean_invocation_error_is_valid(record)
-                || !record.binding.matches(work, authorization)
+                || !record.binding.matches_retirement(work, authorization)
             {
                 return Err(InvocationError::DivergentInvocation);
             }
@@ -4240,10 +4281,13 @@ impl StandardAgentRuntime {
         // authorization and runtime values. Only the observation slot differs
         // here: preserve that check (notably PublicPreflight's lower bound)
         // without hashing availability and verifying the signature again.
-        if !authorization.matches_invoke(work, binding.observed_slot) {
+        if matches!(authorization,
+            crate::agent_sdk::InvocationAuthorization::PublicPreflight(preflight)
+                if binding.observed_slot < preflight.observed_slot)
+        {
             return Err(InvocationError::InvalidAuthorization);
         }
-        if !binding.matches(work, authorization)
+        if !binding.matches_retirement(work, authorization)
             || !clean_authorization_is_live_at(&binding.authorization, binding.observed_slot)
             || self
                 .result_authority_slot(result.storage)
@@ -4251,8 +4295,8 @@ impl StandardAgentRuntime {
         {
             return Err(InvocationError::DivergentInvocation);
         }
-        let (invocation, ..) = self.resolve_clean_invocation(work)?;
-        if result.request != invocation.commitment()
+        self.clean_invocation_target(work.actor, work.incarnation, work.deployment, work.program)?;
+        if result.request.0 != binding.work.0
             || result.scope != scope
             || result.invocation.0 != work.invocation.0
             || result.incarnation.0 != work.incarnation.0
@@ -4276,7 +4320,7 @@ impl StandardAgentRuntime {
 
     fn commit_clean_acknowledgement(
         &mut self,
-        work: &crate::agent_sdk::InvocationWork,
+        work: &crate::agent_sdk::InvocationRetirement,
         authorization: &crate::agent_sdk::InvocationAuthorization,
         acknowledgement: crate::agent_sdk::InvocationAcknowledgement,
     ) -> Result<crate::agent_sdk::InvocationAcknowledgement, crate::agent_sdk::InvocationError>
@@ -4796,7 +4840,7 @@ impl StandardAgentRuntime {
             .invocation_results
             .get(&(scope, invocation))
             .ok_or(LifecycleError::NotFound)?;
-        if result.request != request || result.scope != scope {
+        if result.clean.is_some() || result.request != request || result.scope != scope {
             return Err(LifecycleError::InvalidRequest);
         }
         let config = self.created()?;

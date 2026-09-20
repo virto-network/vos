@@ -16354,7 +16354,7 @@ mod tests {
             operation: ReplayOperation::CleanAcknowledge {
                 context: *context,
                 expected_live: Some(expected_live),
-                work: work.clone(),
+                work: crate::agent_sdk::InvocationRetirement::from_work(&work),
                 authorization: authorization.clone(),
             },
         };

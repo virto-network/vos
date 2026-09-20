@@ -712,14 +712,11 @@ fn expected_standard_sdk_acknowledgement_transition(
     // acknowledgement. When a retained terminal result still exists, retire
     // it directly: re-running method admission here would incorrectly require
     // a Direct execution proof for work originally accepted through the
-    // attested path. `acknowledge_clean_invocation` still authenticates the
+    // attested path. `acknowledge_clean_retirement_with_status` authenticates the
     // retained exact work and authorization binding, matching the bundled
     // guest.
-    let result = match runtime.recover_clean_acknowledgement(invocation, authorization) {
-        Ok(Some(acknowledgement)) => Ok(acknowledgement),
-        Err(error) => Err(error),
-        Ok(None) => runtime.acknowledge_clean_invocation(invocation, authorization),
-    };
+    let result = runtime.acknowledge_clean_retirement_with_status(invocation, authorization)
+        .map(|(acknowledgement, _)| acknowledgement);
     Ok(crate::agent_sdk::RuntimeTransition {
         state: if result.is_ok() {
             legacy_state_as_sdk(&super::wire::encode_standard_runtime_state(
@@ -4161,7 +4158,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
         let work = crate::agent_sdk::RuntimeWork::Acknowledge {
             context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             state: legacy_state_as_sdk(&self.image.runtime_state),
-            invocation: Box::new(invocation),
+            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&invocation)),
             authorization: Box::new(authorization),
         };
         let encoded = work
@@ -6784,7 +6781,7 @@ mod tests {
         let ack = super::super::wire::apply_standard_runtime_work(RuntimeWork::Acknowledge {
             context: RuntimeExecutionContext::Direct,
             state: transition.state,
-            invocation: Box::new(accepted),
+            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&accepted)),
             authorization: Box::new(record.authorization.unwrap()),
         })
         .unwrap();
@@ -7310,7 +7307,7 @@ mod tests {
         let work = RuntimeWork::Acknowledge {
             context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             state: legacy_state_as_sdk(&prior),
-            invocation,
+            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&invocation)),
             authorization,
         };
         let expected = expected_standard_sdk_acknowledgement_transition(&work).unwrap();
@@ -7408,7 +7405,7 @@ mod tests {
         let work = RuntimeWork::Acknowledge {
             context: RuntimeExecutionContext::Direct,
             state: retained.clone(),
-            invocation: Box::new(invocation.clone()),
+            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&invocation)),
             authorization: Box::new(authorization.clone()),
         };
         let expected = super::super::wire::apply_standard_runtime_work(work.clone()).unwrap();

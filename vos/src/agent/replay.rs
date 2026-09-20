@@ -19370,7 +19370,7 @@ pub(crate) mod tests {
                             .ok_or(())
                     }
                     crate::agent_sdk::InvocationAuthorization::PublicPreflight(_) => {
-                        authorization.matches_work(work).then_some(()).ok_or(())
+                        authorization.matches_retirement(work).then_some(()).ok_or(())
                     }
                 },
                 ReplayOperation::CleanManage {
@@ -25124,7 +25124,7 @@ pub(crate) mod tests {
                     proof_system: crate::agent_sdk::Hash([0xf0; 32]),
                 },
                 expected_live: Some(key),
-                work: work.clone(),
+                work: crate::agent_sdk::InvocationRetirement::from_work(&work),
                 authorization: authorization.clone(),
             },
         };

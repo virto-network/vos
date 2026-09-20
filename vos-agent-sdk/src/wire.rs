@@ -4013,7 +4013,7 @@ fn runtime_work_valid_with_nested(value: &RuntimeWork, nested_already_validated:
             context.is_valid()
                 && state.validate()
                 && (nested_already_validated || invocation.validate())
-                && authorization.matches_acknowledgement(invocation)
+                && authorization.matches_retirement(invocation)
         }
     }
 }
@@ -4089,7 +4089,7 @@ impl CanonicalWire for RuntimeWork {
                 encoder.u8(3);
                 encode_runtime_execution_context(encoder, *context);
                 encode_runtime_state(encoder, state);
-                encode_invocation_work(encoder, invocation);
+                invocation.encode_body(encoder);
                 encode_invocation_authorization(encoder, authorization);
             }
         }
@@ -4124,7 +4124,7 @@ impl CanonicalWire for RuntimeWork {
             3 => RuntimeWork::Acknowledge {
                 context: decode_runtime_execution_context(decoder)?,
                 state: decode_runtime_state(decoder)?,
-                invocation: alloc::boxed::Box::new(decode_invocation_work(decoder)?),
+                invocation: alloc::boxed::Box::new(InvocationRetirement::decode_body(decoder)?),
                 authorization: alloc::boxed::Box::new(decode_invocation_authorization(decoder)?),
             },
             _ => return Err(DecodeError::InvalidTag),
@@ -5546,8 +5546,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/acc3-golden", &[&call_bytes]).0,
             [
-                0xfa, 0xbb, 0x6d, 0x94, 0x62, 0x68, 0x10, 0x9b, 0xc4, 0x9c, 0x9e, 0x4d, 0x21, 0x46, 0xca, 0xf6,
-                0x00, 0x40, 0x65, 0x44, 0xdb, 0x75, 0x7f, 0x82, 0x09, 0x5b, 0xf7, 0xbd, 0x34, 0x12, 0x33, 0xa3,
+                0x03, 0x25, 0xfc, 0x8b, 0xd6, 0x5b, 0xd3, 0xbb, 0x3a, 0x49, 0xc0, 0xa9, 0x0f, 0xc0, 0x3f, 0x28,
+                0xa0, 0xe6, 0x89, 0xb9, 0x84, 0x7e, 0x50, 0xc6, 0x16, 0x9d, 0x64, 0xb3, 0x3e, 0x19, 0xde, 0x03,
             ]
         );
 
@@ -5559,8 +5559,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/map2-golden", &[&approval_bytes]).0,
             [
-                0xef, 0xb4, 0x6d, 0x27, 0x63, 0xaf, 0x99, 0x5c, 0x3b, 0xff, 0xb4, 0xe7, 0xb2, 0x3d, 0x15, 0x18,
-                0x92, 0xce, 0x3d, 0x6b, 0x07, 0x13, 0x85, 0x05, 0x81, 0x15, 0xef, 0x23, 0x3e, 0x89, 0x26, 0xe3,
+                0xe3, 0xc2, 0xf7, 0x03, 0xc0, 0x59, 0x7c, 0x11, 0x9b, 0x67, 0x67, 0xa3, 0x71, 0x68, 0xe8, 0x02,
+                0xb2, 0xb9, 0x3c, 0xe8, 0x46, 0xce, 0xbb, 0xd8, 0x92, 0xb2, 0x7f, 0x79, 0x16, 0xfe, 0x97, 0x85,
             ]
         );
 
@@ -5575,8 +5575,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/maa2-golden", &[&acknowledgement_bytes]).0,
             [
-                0x98, 0x9c, 0x63, 0xa2, 0xea, 0x2b, 0x65, 0x2b, 0xc9, 0xa2, 0xc2, 0xd2, 0xa1, 0x0f, 0xc7, 0x5a,
-                0xcc, 0x6c, 0x3b, 0xff, 0x95, 0x9f, 0x19, 0xb1, 0x3d, 0x90, 0x8d, 0x08, 0x12, 0x10, 0xd0, 0x42,
+                0x26, 0xa6, 0xa0, 0x42, 0xae, 0xf0, 0x4b, 0x9e, 0xd3, 0x19, 0xbe, 0x64, 0x64, 0x8e, 0x61, 0xd7,
+                0x7a, 0x0e, 0xdf, 0x49, 0xf4, 0x66, 0xee, 0x4b, 0x2f, 0xc3, 0x16, 0xd5, 0x78, 0x99, 0xfb, 0xa6,
             ]
         );
     }
@@ -5591,8 +5591,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/aad4-golden", &[&bytes]).0,
             [
-                0x38, 0x96, 0x64, 0x52, 0xbf, 0x76, 0x0b, 0x9d, 0xe3, 0x62, 0x27, 0xab, 0x07, 0x74, 0xc3, 0x7e,
-                0x35, 0x63, 0x86, 0x2c, 0x33, 0xb2, 0x43, 0x01, 0x4f, 0x1d, 0xc3, 0xb9, 0x59, 0x50, 0xcd, 0xa5,
+                0xd6, 0x96, 0xea, 0x94, 0xb5, 0xb8, 0xb7, 0x4f, 0xe2, 0xfa, 0x76, 0x0e, 0x37, 0x77, 0xed, 0x03,
+                0xea, 0x17, 0x9e, 0x1c, 0x2d, 0x1b, 0x25, 0xbb, 0x95, 0x86, 0x38, 0xc1, 0xd1, 0x0a, 0x62, 0xb2,
             ]
         );
 
@@ -5607,8 +5607,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/aar4-golden", &[&result_bytes]).0,
             [
-                0x99, 0xdd, 0xe2, 0x1a, 0xe8, 0xc1, 0x06, 0x0e, 0xec, 0xb9, 0x27, 0x88, 0x9a, 0x31, 0xa0, 0x26,
-                0x3c, 0xb2, 0x44, 0xdf, 0xd5, 0xfb, 0x17, 0xb6, 0x86, 0xd1, 0x2e, 0x01, 0xe2, 0x13, 0x82, 0x24,
+                0x0e, 0x6d, 0x57, 0x28, 0x5d, 0x18, 0x0a, 0x96, 0x24, 0xf2, 0x86, 0x1f, 0x63, 0xc4, 0x3e, 0x54,
+                0x02, 0xa8, 0x45, 0xb9, 0x42, 0xc3, 0xa1, 0x86, 0xd9, 0x15, 0xf3, 0xc1, 0x3c, 0x69, 0x03, 0x8f,
             ]
         );
         assert_ne!(call.commitment(), result.commitment());
@@ -6457,6 +6457,14 @@ mod tests {
     }
 
     #[test]
+    fn r19_retirement_rejects_the_previous_abi_header() {
+        let retirement = InvocationRetirement::from_work(&invocation());
+        let mut bytes = retirement.encode().unwrap();
+        bytes[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-260920-r18");
+        assert!(InvocationRetirement::decode(&bytes).is_err());
+    }
+
+    #[test]
     fn retirement_wire_preserves_work_commitment_without_artifact_preimages() {
         let mut work = invocation();
         let bytes = alloc::vec![0x57; 1024 * 1024];
@@ -6627,8 +6635,8 @@ mod tests {
         assert_eq!(
             golden.0,
             [
-                0x4b, 0xbf, 0x03, 0x48, 0x7b, 0xf8, 0x77, 0xf9, 0x95, 0xee, 0x5d, 0x0d, 0xa5, 0xea, 0xe0, 0xd5,
-                0xae, 0x85, 0xbf, 0xbe, 0x0a, 0xf6, 0xd8, 0x1f, 0x57, 0x4b, 0xcc, 0x40, 0x68, 0x84, 0x05, 0x07,
+                0xa8, 0x76, 0xf3, 0x2a, 0x4c, 0xf5, 0x5a, 0x62, 0x52, 0x88, 0xec, 0x31, 0xd9, 0x1e, 0x41, 0x3f,
+                0x57, 0x5b, 0x0f, 0xe4, 0xb4, 0xc7, 0x09, 0x9c, 0x06, 0x79, 0x7b, 0xe1, 0x48, 0xd8, 0x40, 0x4a,
             ]
         );
 
@@ -6976,7 +6984,7 @@ mod tests {
         let acknowledgement = RuntimeWork::Acknowledge {
             context: RuntimeExecutionContext::Direct,
             state: RuntimeState::default(),
-            invocation: alloc::boxed::Box::new(invocation),
+            invocation: alloc::boxed::Box::new(InvocationRetirement::from_work(&invocation)),
             authorization: alloc::boxed::Box::new(authorization),
         };
         assert_eq!(
@@ -7015,12 +7023,6 @@ mod tests {
                 authorization: alloc::boxed::Box::new(authorization.clone()),
                 observed_slot: 45,
             },
-            RuntimeWork::Acknowledge {
-                context: RuntimeExecutionContext::Direct,
-                state: RuntimeState::default(),
-                invocation: alloc::boxed::Box::new(invocation),
-                authorization: alloc::boxed::Box::new(authorization),
-            },
             RuntimeWork::Resume {
                 context: RuntimeExecutionContext::Direct,
                 state: RuntimeState::default(),
@@ -7036,8 +7038,7 @@ mod tests {
             for mutation in 0..5 {
                 let mut invalid = work.clone();
                 let (availability, installation_data) = match &mut invalid {
-                    RuntimeWork::Invoke { invocation, .. }
-                    | RuntimeWork::Acknowledge { invocation, .. } => (
+                    RuntimeWork::Invoke { invocation, .. } => (
                         &mut invocation.availability,
                         &mut invocation.installation_data,
                     ),
@@ -7091,13 +7092,55 @@ mod tests {
     }
 
     #[test]
-    fn acknowledgement_work_and_outcome_have_one_r18_canonical_wire() {
+    fn acknowledgement_transport_is_reference_only_and_rejects_invalid_metadata() {
+        let mut invocation = invocation();
+        let bytes = alloc::vec![0xa7; 1024 * 1024];
+        invocation.availability = alloc::vec![RuntimeBlob {
+            reference: BlobRef::of_bytes(&bytes), bytes,
+        }];
+        invocation.installation_data = None;
+        let retirement = InvocationRetirement::from_work(&invocation);
+        let work = RuntimeWork::Acknowledge {
+            context: RuntimeExecutionContext::Direct,
+            state: RuntimeState::default(),
+            invocation: alloc::boxed::Box::new(retirement.clone()),
+            authorization: alloc::boxed::Box::new(InvocationAuthorization::AuthorityReceipt(
+                receipt_for(&invocation),
+            )),
+        };
+        let encoded = work.encode().unwrap();
+        assert!(encoded.len() < 2048, "ACK must not carry the 1 MiB preimage");
+        assert_eq!(RuntimeWork::decode(&encoded), Ok(work.clone()));
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(RuntimeWork::decode(&trailing).is_err());
+        assert!(RuntimeWork::decode(&encoded[..encoded.len() - 1]).is_err());
+        for mutation in 0..5 {
+            let mut invalid = work.clone();
+            let RuntimeWork::Acknowledge { invocation, .. } = &mut invalid else { unreachable!() };
+            match mutation {
+                0 => invocation.required[0].hash = Hash::ZERO,
+                1 => invocation.required.push(invocation.required[0].clone()),
+                2 => invocation.installation_data = Some(blob(62)),
+                3 => invocation.message.push(0x91),
+                4 => invocation.required[0].len += 1,
+                _ => unreachable!(),
+            }
+            assert_eq!(invalid.encode(), Err(WireError::InvalidValue));
+            let mut body = Vec::new();
+            invalid.encode_body(&mut Encoder(&mut body));
+            assert!(RuntimeWork::decode_body(&mut Decoder::new(&body)).is_err());
+        }
+    }
+
+    #[test]
+    fn acknowledgement_work_and_outcome_have_one_r19_canonical_wire() {
         let invocation = invocation();
         let authority = receipt_for(&invocation);
         let work = RuntimeWork::Acknowledge {
             context: RuntimeExecutionContext::Direct,
             state: RuntimeState::default(),
-            invocation: alloc::boxed::Box::new(invocation.clone()),
+            invocation: alloc::boxed::Box::new(InvocationRetirement::from_work(&invocation)),
             authorization: alloc::boxed::Box::new(InvocationAuthorization::AuthorityReceipt(
                 authority.clone(),
             )),
@@ -7108,7 +7151,7 @@ mod tests {
         assert_eq!(RuntimeWork::decode(&encoded), Ok(work.clone()));
 
         let mut previous_generation = encoded.clone();
-        previous_generation[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r9");
+        previous_generation[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-260902-r18");
         assert_eq!(
             RuntimeWork::decode(&previous_generation),
             Err(WireError::Decode(DecodeError::InvalidPlatform))

@@ -1548,7 +1548,7 @@ pub enum ReplayOperation {
     CleanAcknowledge {
         context: crate::agent_sdk::RuntimeExecutionContext,
         expected_live: Option<crate::agent_sdk::proof::TransitionProofKey>,
-        work: crate::agent_sdk::InvocationWork,
+        work: crate::agent_sdk::InvocationRetirement,
         authorization: crate::agent_sdk::InvocationAuthorization,
     },
     /// Retire the exact result produced by `invocation`. Keeping the complete
@@ -1575,9 +1575,9 @@ impl ReplayOperation {
             Self::Invoke { invocation, .. } | Self::Acknowledge { invocation, .. } => {
                 PersistedLane::from_result_storage(invocation.mode.result_storage())
             }
-            Self::CleanInvoke { work, .. }
-            | Self::CleanResume { work, .. }
-            | Self::CleanAcknowledge { work, .. } => match work.mode.result_storage() {
+            Self::CleanInvoke { work: crate::agent_sdk::InvocationWork { mode, .. }, .. }
+            | Self::CleanResume { work: crate::agent_sdk::InvocationWork { mode, .. }, .. }
+            | Self::CleanAcknowledge { work: crate::agent_sdk::InvocationRetirement { mode, .. }, .. } => match mode.result_storage() {
                 crate::agent_sdk::InvocationResultStorage::Control => PersistedLane::Control,
                 crate::agent_sdk::InvocationResultStorage::Lane(
                     crate::agent_sdk::StateLane::Linear,
@@ -1608,8 +1608,12 @@ impl ReplayInput {
     fn validate_inner(&self) -> Result<(), DecodeError> {
         match &self.operation {
             ReplayOperation::CleanInvoke { work, .. }
-            | ReplayOperation::CleanResume { work, .. }
-            | ReplayOperation::CleanAcknowledge { work, .. } => {
+            | ReplayOperation::CleanResume { work, .. } => {
+                if !work.validate() {
+                    return Err(DecodeError::NonCanonical);
+                }
+            }
+            ReplayOperation::CleanAcknowledge { work, .. } => {
                 if !work.validate() {
                     return Err(DecodeError::NonCanonical);
                 }
@@ -1679,7 +1683,7 @@ impl ReplayInput {
                 if !context.is_valid() {
                     return Err(DecodeError::NonCanonical);
                 }
-                validate_transition_proof_lifecycle_condition(*context, *expected_live, work)?;
+                validate_transition_proof_lifecycle_condition(*context, *expected_live, work.invocation)?;
                 validate_clean_invocation_authorization_binding(
                     &self.runtime,
                     work,
@@ -1710,7 +1714,7 @@ impl ReplayInput {
                 work,
                 authorization,
             } => {
-                validate_transition_proof_lifecycle_condition(*context, *expected_live, work)?;
+                validate_transition_proof_lifecycle_condition(*context, *expected_live, work.invocation)?;
                 validate_clean_exact_request_binding(&self.runtime, work, authorization)?;
             }
             ReplayOperation::Acknowledge {
@@ -3492,10 +3496,10 @@ fn decode_replay_operation(decoder: &mut Decoder<'_>) -> Result<ReplayOperation,
 
 fn validate_clean_exact_request_binding(
     runtime: &RuntimeBinding,
-    work: &crate::agent_sdk::InvocationWork,
+    work: &crate::agent_sdk::InvocationRetirement,
     authorization: &crate::agent_sdk::InvocationAuthorization,
 ) -> Result<(), DecodeError> {
-    if !authorization.matches_work(work)
+    if !authorization.matches_retirement(work)
         || work.space.0 != runtime.space.0
         || work.agent.0 != runtime.agent.0
         || work.runtime_deployment.0 != runtime.deployment.0
@@ -3508,12 +3512,12 @@ fn validate_clean_exact_request_binding(
 fn validate_transition_proof_lifecycle_condition(
     context: crate::agent_sdk::RuntimeExecutionContext,
     expected_live: Option<crate::agent_sdk::proof::TransitionProofKey>,
-    work: &crate::agent_sdk::InvocationWork,
+    invocation: crate::agent_sdk::InvocationId,
 ) -> Result<(), DecodeError> {
     match (context, expected_live) {
         (crate::agent_sdk::RuntimeExecutionContext::Direct, None) => Ok(()),
         (crate::agent_sdk::RuntimeExecutionContext::Attested { .. }, Some(expected))
-            if expected.validate() && expected.invocation == work.invocation =>
+            if expected.validate() && expected.invocation == invocation =>
         {
             Ok(())
         }
@@ -5577,6 +5581,7 @@ mod tests {
             unreachable!()
         };
         let payload = b"journal single-pass blob validation regression".to_vec();
+        let payload_reference = crate::agent_sdk::BlobRef::of_bytes(&payload);
         work.availability.push(crate::agent_sdk::RuntimeBlob {
             reference: crate::agent_sdk::BlobRef::of_bytes(&payload),
             bytes: payload.clone(),
@@ -5590,7 +5595,7 @@ mod tests {
                 RuntimeWork::Acknowledge {
                     context,
                     state: RuntimeState::default(),
-                    invocation: Box::new(work.clone()),
+                    invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&work)),
                     authorization: Box::new(authorization.clone()),
                 }
             } else {
@@ -5604,15 +5609,21 @@ mod tests {
             };
             let bytes = canonical.encode().unwrap();
             assert_eq!(decode_canonical_runtime_work(&bytes).unwrap(), canonical);
+            let transported = if acknowledgement {
+                assert!(!bytes.windows(payload.len()).any(|part| part == payload));
+                payload_reference.hash.as_bytes().as_slice()
+            } else {
+                payload.as_slice()
+            };
             let offset = bytes
-                .windows(payload.len())
-                .position(|part| part == payload)
+                .windows(transported.len())
+                .position(|part| part == transported)
                 .unwrap();
             let mut corrupted = bytes.clone();
             corrupted[offset] ^= 1;
             assert!(
                 decode_canonical_runtime_work(&corrupted).is_err(),
-                "the first validation must still authenticate every blob"
+                "validation must authenticate the transported preimage or reference"
             );
             let mut trailing = bytes.clone();
             trailing.push(0);
@@ -5625,7 +5636,7 @@ mod tests {
                     ReplayOperation::CleanAcknowledge {
                         context,
                         expected_live: None,
-                        work: work.clone(),
+                        work: crate::agent_sdk::InvocationRetirement::from_work(&work),
                         authorization: authorization.clone(),
                     }
                 } else {
@@ -5642,8 +5653,8 @@ mod tests {
             assert_eq!(decoded, replay);
             decoded.validate().unwrap();
             let offset = encoded
-                .windows(payload.len())
-                .position(|part| part == payload)
+                .windows(transported.len())
+                .position(|part| part == transported)
                 .unwrap();
             let mut corrupted = encoded;
             corrupted[offset] ^= 1;
@@ -5653,12 +5664,11 @@ mod tests {
             wrong_runtime.runtime.agent = AgentId([0x77; 32]);
             assert!(ReplayInput::decode(&wrong_runtime.encode()).is_err());
 
-            let (ReplayOperation::CleanInvoke { work, .. }
-            | ReplayOperation::CleanAcknowledge { work, .. }) = &mut decoded.operation
-            else {
-                unreachable!()
-            };
-            work.availability[0].bytes[0] ^= 1;
+            match &mut decoded.operation {
+                ReplayOperation::CleanInvoke { work, .. } => work.availability[0].bytes[0] ^= 1,
+                ReplayOperation::CleanAcknowledge { work, .. } => work.required[0].hash = crate::agent_sdk::Hash::ZERO,
+                _ => unreachable!(),
+            }
             assert_eq!(decoded.validate(), Err(DecodeError::NonCanonical));
         }
     }
@@ -5828,7 +5838,7 @@ mod tests {
             operation: ReplayOperation::CleanAcknowledge {
                 context: crate::agent_sdk::RuntimeExecutionContext::Direct,
                 expected_live: None,
-                work: work.clone(),
+                work: crate::agent_sdk::InvocationRetirement::from_work(&work),
                 authorization: authorization.clone(),
             },
         };
@@ -5939,7 +5949,7 @@ mod tests {
                 control: vec![1],
                 ..crate::agent_sdk::RuntimeState::default()
             },
-            invocation: Box::new(work.clone()),
+            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&work)),
             authorization: Box::new(authorization.clone()),
         }
         .encode()

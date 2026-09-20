@@ -5875,7 +5875,7 @@ mod tests {
                 } => ReplayOperation::CleanAcknowledge {
                     context: crate::agent_sdk::RuntimeExecutionContext::Direct,
                     expected_live: None,
-                    work,
+                    work: crate::agent_sdk::InvocationRetirement::from_work(&work),
                     authorization,
                 },
             };

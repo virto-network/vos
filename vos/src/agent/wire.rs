@@ -2260,7 +2260,7 @@ pub fn apply_standard_runtime_input(
             invocation,
             authorization,
             ..
-        } => apply_clean_acknowledge_inner(state, *invocation, *authorization, true),
+        } => apply_clean_acknowledge(state, *invocation, *authorization),
         other => apply_standard_runtime_work(other),
     }
 }
@@ -3012,18 +3012,8 @@ fn apply_clean_resume(
 #[cfg(feature = "pvm")]
 fn apply_clean_acknowledge(
     state: crate::agent_sdk::RuntimeState,
-    work: crate::agent_sdk::InvocationWork,
+    work: crate::agent_sdk::InvocationRetirement,
     authorization: crate::agent_sdk::InvocationAuthorization,
-) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
-    apply_clean_acknowledge_inner(state, work, authorization, false)
-}
-
-#[cfg(feature = "pvm")]
-fn apply_clean_acknowledge_inner(
-    state: crate::agent_sdk::RuntimeState,
-    work: crate::agent_sdk::InvocationWork,
-    authorization: crate::agent_sdk::InvocationAuthorization,
-    decoded_work: bool,
 ) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
     use crate::agent_sdk::{InvocationError, RuntimeOutcome, RuntimeTransition};
 
@@ -3040,14 +3030,7 @@ fn apply_clean_acknowledge_inner(
     // retire through the deliberately Direct housekeeping route. The runtime
     // below authenticates the original work, authorization, preflight, and
     // exact retained result before removing anything.
-    let acknowledged = if decoded_work {
-        runtime.acknowledge_validated_clean_invocation_with_status(
-            ValidatedInvocationWork(&work),
-            &authorization,
-        )
-    } else {
-        runtime.acknowledge_clean_invocation_with_status(&work, &authorization)
-    };
+    let acknowledged = runtime.acknowledge_clean_retirement_with_status(&work, &authorization);
     let acknowledgement = match acknowledged {
         Ok((acknowledgement, true)) => acknowledgement,
         Ok((acknowledgement, false)) => {
@@ -9401,7 +9384,52 @@ pub(crate) mod tests {
         runtime.commit_clean_execution(
             &work, &authorization, &invocation, &mut reply, &before, before.clone(), 1, None,
         ).unwrap();
-        assert_eq!(runtime.snapshot().invocation_results.len(), 1);
+        let committed = runtime.snapshot();
+        assert_eq!(committed.invocation_results.len(), 1);
+        assert_eq!(committed.invocation_results[0].request.0, work.commitment().0);
+        assert_eq!(runtime.recover_execution(&invocation, 1), Err(ActorExecutionError::DivergentInvocation));
+        assert_eq!(runtime.snapshot(), committed);
+        let mut substituted = committed.clone();
+        substituted.invocation_results[0].request = invocation.commitment();
+        assert_ne!(substituted.invocation_results[0].request, committed.invocation_results[0].request);
+        assert!(StandardAgentRuntime::restore(substituted).is_err(),
+            "r19 clean result identity must not accept the old execution commitment");
+        let mut reopened = StandardAgentRuntime::restore(committed).unwrap();
+        assert!(reopened.recover_clean_execution(&work, &authorization, 1).unwrap().is_some());
+        let compact = crate::agent_sdk::InvocationRetirement::from_work(&work);
+        assert_eq!(reopened.recover_clean_retirement(&compact, &authorization), Ok(None));
+        let mut full_work_path = StandardAgentRuntime::restore(reopened.snapshot()).unwrap();
+        let expected = full_work_path.acknowledge_clean_invocation(&work, &authorization).unwrap();
+        let before_retirement = reopened.snapshot();
+        let mut unseen = compact.clone();
+        unseen.invocation = crate::agent_sdk::InvocationId([0xa9; 32]);
+        let unseen_auth = InvocationAuthorization::PublicPreflight(PublicPreflight {
+            work: unseen.commitment(), origin: unseen.origin, observed_slot: 1,
+        });
+        assert_eq!(reopened.acknowledge_clean_retirement_with_status(&unseen, &unseen_auth),
+            Err(crate::agent_sdk::InvocationError::NotFound));
+        assert_eq!(reopened.snapshot(), before_retirement);
+        let (acknowledgement, applied) = reopened.acknowledge_clean_retirement_with_status(&compact, &authorization).unwrap();
+        assert!(applied);
+        assert_eq!(acknowledgement, expected);
+        assert_eq!(reopened.snapshot(), full_work_path.snapshot());
+        assert_eq!(reopened.acknowledge_clean_retirement_with_status(&compact, &authorization),
+            Ok((acknowledgement, false)));
+        assert!(reopened.snapshot().invocation_results.is_empty());
+        let retired = reopened.snapshot();
+        let reopened = StandardAgentRuntime::restore(retired.clone()).unwrap();
+        assert_eq!(reopened.recover_clean_retirement(&compact, &authorization), Ok(Some(acknowledgement)));
+        let mut changed = compact.clone();
+        changed.message.push(0x91);
+        assert_eq!(reopened.recover_clean_retirement(&changed, &authorization),
+            Err(crate::agent_sdk::InvocationError::InvalidAuthorization));
+        let mut changed_authorization = authorization.clone();
+        let InvocationAuthorization::PublicPreflight(preflight) = &mut changed_authorization else { unreachable!() };
+        preflight.observed_slot += 1;
+        assert!(changed_authorization.matches_retirement(&compact));
+        assert_eq!(reopened.recover_clean_retirement(&compact, &changed_authorization),
+            Err(crate::agent_sdk::InvocationError::DivergentInvocation));
+        assert_eq!(reopened.snapshot(), retired);
     }
 
     #[cfg(feature = "pvm")]
@@ -9495,7 +9523,7 @@ pub(crate) mod tests {
         let acknowledged = apply_standard_runtime_work(RuntimeWork::Acknowledge {
             context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             state: retried_later.state,
-            invocation: Box::new(work.clone()),
+            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&work)),
             authorization: Box::new(authorization.clone()),
         })
         .unwrap();
@@ -9886,7 +9914,7 @@ pub(crate) mod tests {
         let exact = apply_standard_runtime_work(RuntimeWork::Acknowledge {
             context: RuntimeExecutionContext::Direct,
             state: state.clone(),
-            invocation: Box::new(work.clone()),
+            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&work)),
             authorization: Box::new(authorization.clone()),
         })
         .unwrap();
@@ -9908,7 +9936,7 @@ pub(crate) mod tests {
             let rejected = apply_standard_runtime_work(RuntimeWork::Acknowledge {
                 context: RuntimeExecutionContext::Direct,
                 state: state.clone(),
-                invocation: Box::new(work),
+                invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&work)),
                 authorization: Box::new(authorization),
             })
             .unwrap();
@@ -9942,7 +9970,7 @@ pub(crate) mod tests {
             apply_standard_runtime_work(RuntimeWork::Acknowledge {
                 context: RuntimeExecutionContext::Attested { proof_system },
                 state,
-                invocation: Box::new(work),
+                invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&work)),
                 authorization: Box::new(authorization),
             }),
             Err(DecodeError::NonCanonical),
@@ -10173,7 +10201,7 @@ pub(crate) mod tests {
         let mut ack = RuntimeWork::Acknowledge {
             context,
             state: completed.state,
-            invocation,
+            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&invocation)),
             authorization,
         };
         let retired = compare(&ack);
@@ -10212,7 +10240,7 @@ pub(crate) mod tests {
                 RuntimeWork::Acknowledge {
                     context: RuntimeExecutionContext::Direct,
                     state: state.clone(),
-                    invocation: Box::new(invocation.clone()),
+                    invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&invocation)),
                     authorization,
                 }
             } else {
@@ -10230,9 +10258,15 @@ pub(crate) mod tests {
                 .iter()
                 .max_by_key(|blob| blob.bytes.len())
                 .unwrap();
+            let transported = if acknowledge {
+                assert!(!input.windows(largest.bytes.len()).any(|bytes| bytes == largest.bytes));
+                largest.reference.hash.as_bytes().as_slice()
+            } else {
+                largest.bytes.as_slice()
+            };
             let offset = input
-                .windows(largest.bytes.len())
-                .position(|bytes| bytes == largest.bytes)
+                .windows(transported.len())
+                .position(|bytes| bytes == transported)
                 .unwrap();
             let mut corrupt = input.clone();
             corrupt[offset] ^= 1;
@@ -10305,7 +10339,7 @@ pub(crate) mod tests {
         let ack = RuntimeWork::Acknowledge {
             context,
             state: completed.state,
-            invocation,
+            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&invocation)),
             authorization,
         };
         let mut programs = vec![(
@@ -10491,7 +10525,7 @@ pub(crate) mod tests {
         let input = RuntimeWork::Acknowledge {
             context: RuntimeExecutionContext::Direct,
             state,
-            invocation: Box::new(work),
+            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&work)),
             authorization: Box::new(InvocationAuthorization::AuthorityReceipt(receipt)),
         }
         .encode()
@@ -10578,7 +10612,7 @@ pub(crate) mod tests {
         let acknowledged = run(RuntimeWork::Acknowledge {
             context: RuntimeExecutionContext::Direct,
             state: retried.state,
-            invocation: Box::new(work.clone()),
+            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&work)),
             authorization: Box::new(authorization.clone()),
         });
         assert!(matches!(
@@ -10604,7 +10638,7 @@ pub(crate) mod tests {
         let repeated_ack = run(RuntimeWork::Acknowledge {
             context: RuntimeExecutionContext::Direct,
             state: acknowledged.state.clone(),
-            invocation: Box::new(work),
+            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&work)),
             authorization: Box::new(authorization),
         });
         assert_eq!(repeated_ack, acknowledged);
@@ -10625,7 +10659,7 @@ pub(crate) mod tests {
         let input = RuntimeWork::Acknowledge {
             context: RuntimeExecutionContext::Direct,
             state,
-            invocation: Box::new(work),
+            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&work)),
             authorization: Box::new(InvocationAuthorization::AuthorityReceipt(receipt)),
         }
         .encode()
@@ -10724,7 +10758,7 @@ pub(crate) mod tests {
             let ack_work = RuntimeWork::Acknowledge {
                 context: RuntimeExecutionContext::Direct,
                 state: retry.state,
-                invocation: Box::new(invocation),
+                invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&invocation)),
                 authorization: Box::new(authorization),
             };
             let ack = execute(ack_work.clone());
@@ -10834,7 +10868,7 @@ pub(crate) mod tests {
         };
         let acknowledged = execute(&RuntimeWork::Acknowledge {
             context,
-            invocation,
+            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&invocation)),
             authorization,
             state: legacy_state_to_clean(encode_standard_runtime_state(&restored.snapshot())),
         });
@@ -10971,7 +11005,7 @@ pub(crate) mod tests {
         let ack = execute(RuntimeWork::Acknowledge {
             context,
             state,
-            invocation,
+            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&invocation)),
             authorization,
         });
         assert!(matches!(ack.outcome, RuntimeOutcome::Acknowledged(Ok(_))));
@@ -11285,7 +11319,7 @@ pub(crate) mod tests {
         let ack = apply_standard_runtime_work(RuntimeWork::Acknowledge {
             context: RuntimeExecutionContext::Direct,
             state: legacy_state_to_clean(encode_standard_runtime_state(&reopened.snapshot())),
-            invocation: Box::new(invocation),
+            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&invocation)),
             authorization: Box::new(authorization),
         })
         .unwrap();
@@ -12148,7 +12182,7 @@ pub(crate) mod tests {
             "retry may advance only the result-lane authority clock");
         let acknowledged = execute(RuntimeWork::Acknowledge {
             context: RuntimeExecutionContext::Direct, state: retry.state,
-            invocation: Box::new(work.clone()), authorization: Box::new(authorization.clone()),
+            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&work)), authorization: Box::new(authorization.clone()),
         });
         assert!(matches!(acknowledged.outcome, RuntimeOutcome::Acknowledged(Ok(_))));
         let retired = decode_standard_runtime_state(&clean_state_to_legacy(&acknowledged.state)).unwrap();
@@ -12158,7 +12192,7 @@ pub(crate) mod tests {
         let repeated_ack = execute(RuntimeWork::Acknowledge {
             context: RuntimeExecutionContext::Direct,
             state: legacy_state_to_clean(encode_standard_runtime_state(&reopened.snapshot())),
-            invocation: Box::new(work.clone()), authorization: Box::new(authorization.clone()),
+            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&work)), authorization: Box::new(authorization.clone()),
         });
         assert!(repeated_ack == acknowledged, "exact acknowledgement retry changed transition");
         let replayed = execute(RuntimeWork::Invoke {
@@ -12283,7 +12317,7 @@ pub(crate) mod tests {
             let ack = apply_standard_runtime_work(RuntimeWork::Acknowledge {
                 context: crate::agent_sdk::RuntimeExecutionContext::Direct,
                 state: retry.state,
-                invocation,
+                invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&invocation)),
                 authorization,
             })
             .unwrap();
@@ -12381,7 +12415,7 @@ pub(crate) mod tests {
         let ack = apply_standard_runtime_work(RuntimeWork::Acknowledge {
             context: RuntimeExecutionContext::Direct,
             state: legacy_state_to_clean(encode_standard_runtime_state(&reopened.snapshot())),
-            invocation: Box::new(accepted),
+            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&accepted)),
             authorization: Box::new(record.authorization.unwrap()),
         })
         .unwrap();
@@ -12556,7 +12590,7 @@ pub(crate) mod tests {
         let acknowledged = apply_standard_runtime_work(RuntimeWork::Acknowledge {
             context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             state: retried.state.clone(),
-            invocation: Box::new(work.clone()),
+            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&work)),
             authorization: Box::new(crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
                 authority.clone(),
             )),
@@ -12617,7 +12651,7 @@ pub(crate) mod tests {
         let replayed = apply_standard_runtime_work(RuntimeWork::Acknowledge {
             context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             state: after_restart.clone(),
-            invocation: Box::new(work.clone()),
+            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&work)),
             authorization: Box::new(crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
                 authority.clone(),
             )),
@@ -12639,7 +12673,7 @@ pub(crate) mod tests {
         let rejected = apply_standard_runtime_work(RuntimeWork::Acknowledge {
             context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             state: after_restart.clone(),
-            invocation: Box::new(divergent),
+            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&divergent)),
             authorization: Box::new(crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
                 divergent_authority,
             )),
@@ -12667,7 +12701,7 @@ pub(crate) mod tests {
             let request = RuntimeWork::Acknowledge {
                 context: crate::agent_sdk::RuntimeExecutionContext::Direct,
                 state: state.clone(),
-                invocation: Box::new(work),
+                invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&work)),
                 authorization: Box::new(
                     crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(authority),
                 ),

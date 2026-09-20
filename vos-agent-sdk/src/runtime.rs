@@ -796,13 +796,13 @@ pub enum RuntimeWork {
         state: RuntimeState,
         resume: Box<ResumeWork>,
     },
-    /// Retire one delivered exact invocation result. The original work and
-    /// its exact authorization are resupplied so the guest can authenticate
-    /// the retained result without trusting a host-created shorthand.
+    /// Retire one delivered exact invocation result. Metadata and ordered
+    /// artifact references bind the original work without resending preimages.
+    /// The guest must authenticate the exact retained work and authorization.
     Acknowledge {
         context: RuntimeExecutionContext,
         state: RuntimeState,
-        invocation: Box<InvocationWork>,
+        invocation: Box<InvocationRetirement>,
         authorization: Box<InvocationAuthorization>,
     },
 }
@@ -1128,8 +1128,8 @@ mod tests {
         assert_eq!(
             commitment.0,
             [
-                0xb0, 0x2e, 0x30, 0x5b, 0xa4, 0xe0, 0x11, 0x85, 0xe1, 0x16, 0x0b, 0x76, 0xf7, 0x39, 0x39, 0xb9,
-                0xc9, 0xcf, 0x9a, 0x56, 0xef, 0x4c, 0x07, 0x21, 0xd2, 0x85, 0xc7, 0x75, 0xee, 0x33, 0x11, 0x8f,
+                0xfa, 0xf8, 0xe1, 0xc3, 0xdb, 0x75, 0x0a, 0xa7, 0x5d, 0x3b, 0x2c, 0xa0, 0x59, 0x2b, 0x32, 0x52,
+                0x9a, 0x83, 0xa1, 0x60, 0xd6, 0x34, 0xd3, 0xaf, 0xdf, 0xde, 0x80, 0x9c, 0x47, 0xc5, 0x84, 0x6e,
             ]
         );
         assert_ne!(

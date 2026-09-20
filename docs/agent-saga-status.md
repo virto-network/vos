@@ -5,7 +5,8 @@ navigation or checkpoint evidence, not competing plans. Updated 2026-09-20.
 
 ## Review checkpoint
 
-Review the current `saga/agents` tip, with new delta `16adf95e..saga/agents`.
+Review checkpoint `c8028394` on `saga/agents`, with delta
+`16adf95e..c8028394`.
 Implementation uses `wip/ch08-runtime-directory`; only qualified consolidated
 checkpoints are fast-forwarded into the root reviewer worktree. Master is
 unchanged; nothing has been pushed. This is **not production qualification**.
@@ -33,7 +34,7 @@ and bounded package envelopes remain included. See [review guide](agent-saga-rev
 [execution evidence](agent-execution-checkpoint-review.md), and
 [recovery contract](agent-recovery-contract.md).
 
-## Current evidence and limitations
+## Review-checkpoint evidence and limitations (r18, c8028394)
 
 Logs below are under
 `.worktrees/ch08-c2-native/target/task-tmp/` unless stated otherwise.
@@ -94,46 +95,98 @@ projection invocation/acknowledgement or whole-state costs.
 
 ## Next work
 
-Implementation-only foundation: `InvocationRetirement` now has a bounded AIRT
-codec carrying invocation metadata, message and ordered artifact references,
-never their preimages. Its commitment is identical to InvocationWork; structural
-receipt/PublicPreflight matching is available without claiming signature
-verification or prior acceptance. All 176 SDK tests pass
-(`compact-retirement-sdk-final.log`), covering field-by-field commitment parity,
-strict decoding, malformed references, empty installation data, authorization
-substitution and a 1 MiB artifact whose retirement frame is under 1 KiB.
-This type is not yet connected to RuntimeWork or production ACK execution.
-The runtime ABI and artifacts remain unchanged until the coordinated cutover;
-no current-binary latency improvement is claimed from this foundation.
+### Implementation-only cutover (r19, not a review/release checkpoint)
 
-Retained results and continuations now use that SDK metadata type directly
-instead of a duplicate StandardAcceptedInvocation struct. Commitment calculation
-no longer constructs empty-payload RuntimeBlobs. Persisted acceptance still
-rejects recovery-only work through explicit `validate_accepted` checks; state
-encoding is unchanged. Tests pass: 177 SDK (`shared-retirement-sdk-final.log`),
-108 wire (five ignored, `shared-retirement-wire.log`) and 52 Standard
-(`shared-retirement-standard.log`). RuntimeWork ACK remains full-work for now.
-The cutover must account for its additional legacy ActorInvocation request
-commitment check: today reconstructing that request identifies artifact roles
-from preimages before excluding them from application availability. A compact
-ACK must preserve that binding or cleanly eliminate the redundant legacy
-representation, not simply omit the comparison.
+Foundation commits `930a5450`, `76d37d4d` and `493a098c` introduce bounded
+reference-only `InvocationRetirement`, reuse it for retained acceptance metadata,
+and check complete SDK-to-execution correspondence before successful commit.
+The redundant Standard metadata implementation is removed. Retirement commitment
+matches InvocationWork without manufacturing empty artifact preimages; structural
+authorization matching does not substitute for signature or acceptance checks.
 
-The success commit now verifies the entire resolved ActorInvocation against
-the supplied execution request before publishing lanes/results, matching the
-existing terminal-failure path's correspondence requirement. The new regression
-rejects substituted message, gas, legacy auth and application availability
-without mutating runtime or reply. All 109 wire tests pass (five ignored,
-`clean-success-correspondence.log`). This is internal-boundary hardening, not
-evidence of an externally reachable exploit or a speedup: it adds resolution
-work pending the cutover. Importantly, the legacy commitment hashes application
-preimages themselves, so it cannot be reconstructed from references alone.
-The planned clean break must use the authenticated SDK work commitment as the
-clean result identity, require exact equality on restoration/retry/retirement,
-and refuse clean results through legacy recovery/ACK entry points. Establish
-full work/execution correspondence before commit, bump the runtime ABI for the
-changed retained-state semantics, and qualify standard/custom recovery and
-new artifacts together. No old-state compatibility shortcut is intended.
+The in-progress source now uses ABI r19 and its control-schema pin. Clean results
+use the authenticated SDK work commitment, with exact identity checked on
+restore/retry/retirement; legacy recovery and ACK entry points refuse clean
+results. The regression rejects a restored clean result carrying a legacy
+commitment and verifies valid restore, retry and retirement. This is a clean
+break, not old-state migration or a demonstrated latency improvement.
+
+**Do not deploy this implementation yet:** RuntimeWork ACK now carries compact
+InvocationRetirement. Host compilation and the source recovery suites below pass;
+compiled custom/Standard guest and release artifact qualification remain open.
+Bundled runtime/system templates and guest fixtures are
+still r18; rebuild, reproduce and repin the affected artifacts together before
+advancing `saga/agents`. The existing r18 checkpoint remains unchanged.
+
+Source evidence: 178 SDK tests (`r19-sdk-round4.log`), 41 clean-wire tests
+(`r19-clean-wire.log`) and 52 Standard tests (`r19-standard.log`) pass.
+The broader `r19-source-wire.log` run has 99 passes, four ignored and **three
+failures**: both `bundled_typed_error_*_requires_retirement` tests and
+`bundled_unseen_expired_invocation_preserves_state_after_restore` report guest
+Panic instead of Halt. Its `--skip bundled_runtime` filter did not exclude these
+bundled tests; r19-host/r18-guest mismatch remains unqualified until the coordinated
+rebuild and rerun. Do not count this as a passing full wire suite.
+The corrected source-only filter (`--skip bundled_`) passes 99 tests with four
+ignored (`r19-source-only-wire.log`); it does not qualify bundled execution.
+
+Retained-acknowledgement recovery now consumes reference-only metadata directly;
+full-work callers project to the same implementation after preimage validation.
+It returns only an exact already-retained fact, never accepts unseen work, and
+checks both work and authorization commitments. A restart regression rejects
+altered message and structurally matching but different authorization without
+mutation. Focused regression, 99 source-wire tests (four ignored), and 52 Standard
+tests pass (`r19-retirement-recovery.log`, `r19-retirement-recovery-wire.log`,
+`r19-retirement-recovery-standard.log`). Fresh retirement application now also
+uses reference-only metadata; the full-work entry points validate preimages and
+delegate to this one core. Receipt signatures, scope, exact retained binding,
+observation ordering, stale-target error retirement, projection compaction and
+capacity checks remain enforced. The direct compact regression checks unseen
+work refusal, exact retry, and state equality with the full-work wrapper.
+The 99 source-wire tests (four ignored) and 52 Standard tests pass
+(`r19-compact-application-wire.log`, `r19-compact-application-standard.log`).
+RuntimeWork ACK now encodes metadata/references, not artifact preimages. All 179
+SDK tests pass (`r19-compact-wire-sdk-final.log`), including a 1 MiB artifact whose
+empty-state ACK frame is under 2 KiB, malformed metadata and r18-header refusal.
+Standard dispatch uses the compact core; the obsolete decoded/full-work ACK
+dispatcher split is removed. Custom-linear compares the complete retirement
+projection against its own retained canonical invocation (not Standard state).
+Journal replay now persists compact retirement metadata and validates exact scope,
+authorization and transition-proof identity. Local execution compares outcomes
+against the same reference-only projection; Invoke/Resume still validate their
+preimages. Shared journal constructors project the original invocation explicitly.
+The host library check passes with `agent-runtime storage network http-ingress`
+(`r19-compact-host-check3.log`); this is compilation, not recovery qualification.
+Host test constructors are converted; test compilation passes
+(`r19-compact-test-build2.log`). The wire corruption test now checks transported
+references for ACK and preimages for Invoke. All 99 source-wire tests pass, with
+four ignored (`r19-compact-transport-wire.log`). All 41 journal tests pass
+(`r19-compact-journal-final.log`) after updating its corruption fixture to check
+authenticated references for ACK and preimages for Invoke. Neither source suite
+qualifies bundled guests.
+Broader source suites pass: 56 replay (`r19-compact-replay.log`), 33 Local journal
+(`r19-compact-local-journal.log`), 97 journal-store (`r19-compact-journal-store.log`),
+and 12 custom-linear tests (`r19-custom-source.log`, one compiled-guest test
+ignored). The custom test now rejects structurally rebound but substituted
+message, gas and incarnation without deleting its retained result. This runtime
+has a genuinely different state layout; these are source, not physical, tests.
+
+The r19 Standard guest candidate build passes in the separate disk-backed target
+`agent-r19-artifacts/runtime` under the shared build target
+(`r19-runtime-guest-build.log`). CLI compilation also passes (`r19-vosx-check.log`).
+The preserved r18 CLI rejects this ELF with `ABI probe did not halt: Panic`;
+do not use it to validate r19 or infer a same-generation execution defect.
+Direct r19-host/guest multi-megabyte yield-resume-retirement comparison passes
+(`r19-physical-yield-retire.log`, 13.82s debug host). This establishes output
+agreement for that fixture, not a latency benchmark. The custom guest build passes
+in `agent-r19-artifacts/custom` (`r19-custom-guest-build.log`); its physical
+scheduling/lifecycle and attested-context refusal test passes
+(`r19-custom-physical.log`, 9.48s debug host). These steps do not change the pinned r18 bundle
+or qualify mixed-generation startup; independent artifact reproduction remains.
+Do not hydrate missing bytes or restore the
+old full-work wire as a compatibility shortcut. Remove remaining transitional
+full-work ACK wrappers once their callers are cut over.
+
+### Remaining sequence
 
 1. Reviewer examines the scoped checkpoint read-only and returns findings.
    Implementation agent applies fixes on latest source.

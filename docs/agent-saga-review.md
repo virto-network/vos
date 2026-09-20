@@ -1,7 +1,9 @@
 # Agent saga: review guide
 
 [Current status](agent-saga-status.md) is authoritative for remaining work.
-Review the actual `saga/agents` tip, advanced from `16adf95e` for this handoff.
+Review checkpoint `c8028394` on `saga/agents`, advanced from `16adf95e`.
+The implementation worktree's unfinished r19 cutover is outside this r18
+checkpoint; its current blockers are tracked only in the status document.
 It includes control-worker isolation, indexed single restoration, reproducible
 optimized runtime artifacts, and physical Local lifecycle evidence. This is a scoped checkpoint,
 not a production-qualified release.
@@ -29,7 +31,7 @@ and [the recovery contract](agent-recovery-contract.md). Distinguish measured
 coordination from throughput, source tests from bundled-binary behavior, and
 historical release results from current qualification.
 
-The current debug binary passes fresh bootstrap, generated system packages and
+The checkpoint's recorded debug binary passes fresh bootstrap, generated system packages and
 ingress config, HTTP/SSH, Local Create, Counter Install, mutation, exact retry,
 positive retirement, read after restart and shutdown. Readiness remains 25–40s,
 Create 51s, Install 60s, and managed attempts approximately 32–34s: unacceptable

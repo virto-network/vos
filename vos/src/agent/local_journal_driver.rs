@@ -248,7 +248,7 @@ fn clean_ordered_operation_after_with_denial_ack<S: AgentJournalStore>(
             if allow_denial_ack
                 && matches!((&entry.input.operation, operation),
                 (ReplayOperation::CleanAcknowledge { context: a, expected_live: None, work: aw, authorization: aa },
-                 ReplayOperation::CleanInvoke { context: b, work: bw, authorization: ba, .. }) if a == b && aw == bw && aa == ba)
+                 ReplayOperation::CleanInvoke { context: b, work: bw, authorization: ba, .. }) if a == b && *aw == crate::agent_sdk::InvocationRetirement::from_work(bw) && aa == ba)
             {
                 if found.is_some() || acknowledgement {
                     return Err(JournalStoreError::Conflict);
@@ -465,8 +465,8 @@ fn clean_operation_invocation(
 ) -> Option<crate::agent_sdk::InvocationId> {
     match operation {
         ReplayOperation::CleanInvoke { work, .. }
-        | ReplayOperation::CleanResume { work, .. }
-        | ReplayOperation::CleanAcknowledge { work, .. } => Some(work.invocation),
+        | ReplayOperation::CleanResume { work, .. } => Some(work.invocation),
+        ReplayOperation::CleanAcknowledge { work, .. } => Some(work.invocation),
         _ => None,
     }
 }
@@ -1761,7 +1761,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
                 authorization,
                 observed_slot,
             } => (
-                work,
+                crate::agent_sdk::InvocationRetirement::from_work(work),
                 crate::agent_sdk::RuntimeWork::Invoke {
                     context: *context,
                     state: crate::agent_sdk::RuntimeState {
@@ -1782,7 +1782,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
                 yielded,
                 ..
             } => (
-                work,
+                crate::agent_sdk::InvocationRetirement::from_work(work),
                 crate::agent_sdk::RuntimeWork::Resume {
                     context: *context,
                     state: crate::agent_sdk::RuntimeState {
@@ -1813,7 +1813,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
                 authorization,
                 ..
             } => (
-                work,
+                work.clone(),
                 crate::agent_sdk::RuntimeWork::Acknowledge {
                     context: *context,
                     state: crate::agent_sdk::RuntimeState {
@@ -1965,12 +1965,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
                     && yielded.program == work.program
                     && yielded.mode == work.mode
                     && yielded.installation_data == work.installation_data
-                    && yielded.required
-                        == work
-                            .availability
-                            .iter()
-                            .map(|blob| blob.reference.clone())
-                            .collect::<Vec<_>>()
+                    && yielded.required == work.required
                     && match &input.operation {
                         ReplayOperation::CleanResume {
                             yielded: previous, ..
@@ -2391,18 +2386,21 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
                         preflight.observed_slot
                     }
                 };
-                self.verify_clean_invocation_input(work, authorization, slot, state, binding)?;
                 // As with Resume, only the admitted runtime may decide
                 // whether its opaque state currently retains this exact
                 // result (or acknowledgement fact).
                 if self.clean_genesis_descriptor.is_some() {
+                    let descriptor = self.trusted_current_clean_descriptor(binding)?;
+                    Self::validate_clean_retirement_envelope(&descriptor, work, authorization, slot)?;
                     return Ok(());
                 }
                 let decoded = decode_standard_runtime_state(state)
                     .map_err(|_| LocalReplayExecutorError::InvalidState)?;
+                let config = decoded.config.as_ref().ok_or(LocalReplayExecutorError::InvalidState)?;
+                let _ = self.validate_local_config(config, binding)?;
                 let mut runtime = StandardAgentRuntime::restore(decoded)
                     .map_err(|_| LocalReplayExecutorError::InvalidState)?;
-                match runtime.acknowledge_clean_invocation(work, authorization) {
+                match runtime.acknowledge_clean_retirement_with_status(work, authorization) {
                     Ok(_) | Err(crate::agent_sdk::InvocationError::NotFound) => Ok(()),
                     Err(_) => Err(LocalReplayExecutorError::InvalidRequest),
                 }
@@ -2521,8 +2519,23 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         authorization: &crate::agent_sdk::InvocationAuthorization,
         observed_slot: u64,
     ) -> Result<(), LocalReplayExecutorError> {
+        if !work.validate() {
+            return Err(LocalReplayExecutorError::InvalidAuthority);
+        }
+        Self::validate_clean_retirement_envelope(descriptor,
+            &crate::agent_sdk::InvocationRetirement::from_work(work), authorization, observed_slot)
+    }
+
+    fn validate_clean_retirement_envelope(
+        descriptor: &crate::agent_sdk::AgentDescriptor,
+        work: &crate::agent_sdk::InvocationRetirement,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        observed_slot: u64,
+    ) -> Result<(), LocalReplayExecutorError> {
         if !work.validate()
-            || !authorization.matches_invoke(work, observed_slot)
+            || !authorization.matches_retirement(work)
+            || matches!(authorization, crate::agent_sdk::InvocationAuthorization::PublicPreflight(preflight)
+                if observed_slot < preflight.observed_slot)
             || work.space != descriptor.identity.space
             || work.agent != descriptor.identity.agent
             || work.runtime_deployment != descriptor.identity.runtime_deployment
@@ -3641,13 +3654,18 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
                 authorization,
                 observed_slot,
                 ..
-            } => Some((work, authorization, *observed_slot)),
+            } => {
+                if !work.validate() {
+                    return Err(LocalReplayExecutorError::InvalidAuthority);
+                }
+                Some((crate::agent_sdk::InvocationRetirement::from_work(work), authorization, *observed_slot))
+            },
             ReplayOperation::CleanAcknowledge {
                 work,
                 authorization,
                 ..
             } => Some((
-                work,
+                work.clone(),
                 authorization,
                 match authorization {
                     crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(_) => 0,
@@ -3661,9 +3679,9 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
         {
             let runtime = self.clean_runtime_package(&input.runtime)?;
             let descriptor = self.trusted_current_clean_descriptor(&input.runtime)?;
-            Self::validate_clean_invocation_envelope(
+            Self::validate_clean_retirement_envelope(
                 &descriptor,
-                work,
+                &work,
                 authorization,
                 observed_slot,
             )?;
@@ -3764,7 +3782,7 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
             } => {
                 let mut runtime = StandardAgentRuntime::restore(decoded.clone())
                     .map_err(|_| LocalReplayExecutorError::InvalidState)?;
-                match runtime.acknowledge_clean_invocation(work, authorization) {
+                match runtime.acknowledge_clean_retirement_with_status(work, authorization) {
                     Ok(_) | Err(crate::agent_sdk::InvocationError::NotFound) => Ok(()),
                     Err(_) => Err(LocalReplayExecutorError::InvalidRequest),
                 }
@@ -9441,7 +9459,7 @@ mod tests {
             &ReplayOperation::CleanAcknowledge {
                 context: crate::agent_sdk::RuntimeExecutionContext::Direct,
                 expected_live: None,
-                work,
+                work: crate::agent_sdk::InvocationRetirement::from_work(&work),
                 authorization,
             }
         ));
@@ -9495,7 +9513,7 @@ mod tests {
             ReplayOperation::CleanAcknowledge {
                 context: crate::agent_sdk::RuntimeExecutionContext::Direct,
                 expected_live: None,
-                work: work.clone(),
+                work: crate::agent_sdk::InvocationRetirement::from_work(&work),
                 authorization: authorization.clone(),
             },
         ];
@@ -9790,9 +9808,9 @@ mod tests {
                 | ReplayOperation::Acknowledge { invocation, .. } => {
                     invocation.mode.invocation_scope()
                 }
-                ReplayOperation::CleanInvoke { work, .. }
-                | ReplayOperation::CleanResume { work, .. }
-                | ReplayOperation::CleanAcknowledge { work, .. } => match work.mode {
+                ReplayOperation::CleanInvoke { work: crate::agent_sdk::InvocationWork { mode, .. }, .. }
+                | ReplayOperation::CleanResume { work: crate::agent_sdk::InvocationWork { mode, .. }, .. }
+                | ReplayOperation::CleanAcknowledge { work: crate::agent_sdk::InvocationRetirement { mode, .. }, .. } => match mode {
                     crate::agent_sdk::MethodMode::Query
                     | crate::agent_sdk::MethodMode::LinearizableQuery
                     | crate::agent_sdk::MethodMode::Linear => InvocationScope::Ordered,

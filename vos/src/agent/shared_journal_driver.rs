@@ -828,7 +828,7 @@ impl CleanInvocationReplayRequest {
             } => ReplayOperation::CleanAcknowledge {
                 context: crate::agent_sdk::RuntimeExecutionContext::Direct,
                 expected_live: None,
-                work,
+                work: crate::agent_sdk::InvocationRetirement::from_work(&work),
                 authorization,
             },
         }
@@ -1599,7 +1599,7 @@ where
                     operation: ReplayOperation::CleanAcknowledge {
                         context: *context,
                         expected_live: None,
-                        work: (**work).clone(),
+                        work: crate::agent_sdk::InvocationRetirement::from_work(work),
                         authorization: (**authorization).clone(),
                     },
                 },
@@ -1676,7 +1676,7 @@ where
             ReplayOperation::CleanAcknowledge {
                 context: *context,
                 expected_live: None,
-                work: (**invocation).clone(),
+                work: crate::agent_sdk::InvocationRetirement::from_work(invocation),
                 authorization: (**authorization).clone(),
             },
         ] {
@@ -1830,7 +1830,7 @@ where
             let acknowledgement = ReplayOperation::CleanAcknowledge {
                 context: *context,
                 expected_live: None,
-                work: (**work).clone(),
+                work: crate::agent_sdk::InvocationRetirement::from_work(work),
                 authorization: (**authorization).clone(),
             };
             for operation in retained
@@ -1980,7 +1980,7 @@ where
                 operation: ReplayOperation::CleanAcknowledge {
                     context: crate::agent_sdk::RuntimeExecutionContext::Direct,
                     expected_live: None,
-                    work: work.clone(),
+                    work: crate::agent_sdk::InvocationRetirement::from_work(work),
                     authorization: authorization.clone(),
                 },
             },
@@ -2120,7 +2120,7 @@ where
         let operation = ReplayOperation::CleanAcknowledge {
             context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             expected_live: None,
-            work: work.clone(),
+            work: crate::agent_sdk::InvocationRetirement::from_work(work),
             authorization: authorization.clone(),
         };
         let Some(input) =
