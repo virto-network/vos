@@ -100,7 +100,7 @@ Logs/candidate are under the shared target's `task-tmp`; bundled artifacts and
 the reviewer branch remain unchanged. Remaining work is reduced full-state and
 projection execution cost, followed by artifact reproduction and qualification.
 
-The following implementation replaces three quadratic restoration operations:
+Source commit `1ef5f703` replaces three quadratic restoration operations:
 remaining-forest scans/vector removal, duplicate installation-ID scans, and
 rebuilding artifact usage for each actor. Indexed readiness preserves first-ready
 ordering; a set and incremental hash/length accounting retain the same checks.
@@ -112,9 +112,28 @@ rejections (`indexed-restore-standard-final.log`). All 108 wire tests pass
 `413558cfebdadca3a5aaa438a2daeef425aa33e67309909d72e9313dfb03a07b`.
 The small-directory physical fixtures retain exact outputs and lower gas than
 the bundled baseline, but use slightly more gas than `17fb38e9` due to indexing
-overhead. Large-directory physical scaling and memory budgets remain unqualified;
-this removes specific quadratic operations, not whole-state execution. Bundled
-artifacts and the reviewer branch are still unchanged.
+overhead. This removes specific quadratic operations, not whole-state execution.
+Bundled artifacts and the reviewer branch are still unchanged.
+
+An opt-in physical scaling regression now compares that candidate against the
+bundled guest for a one-entry directory inspection, requiring exact output and
+unchanged state. `directory-scaling-physical.log` records all cases passing:
+
+| Stored actors | Bundled gas | Candidate gas |
+| --- | ---: | ---: |
+| 1 | 18,319,802 | 16,515,538 |
+| 32 | 96,042,580 | 54,495,758 |
+| 128 | 571,502,921 | 184,413,547 |
+| 512 | 5,980,909,793 | 873,120,581 |
+
+At 512 actors, input is 638,478 bytes; this debug-host run took 3.852s versus
+0.887s. These measurements cover synthetic valid state and an optimized guest,
+not live creation, released node throughput or memory budgets. Gas remains
+strongly dependent on unrelated stored actors despite returning one entry.
+Run `agent::wire::tests::physical_directory_inspection_scaling` with
+`--ignored --exact --nocapture` and `VOS_AGENT_RUNTIME_COST_CANDIDATE` pointing to
+the rebuilt candidate PVM. The environment variable is required intentionally;
+the test must not silently substitute bundled bytes for the candidate.
 
 Review-checkpoint (`16adf95e`) debug diagnostic: readiness 27s, Create/resume 54s, Install 65s, restart
 37s, both shutdowns under one measured second. These are not production capacity

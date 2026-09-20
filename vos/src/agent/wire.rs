@@ -5177,6 +5177,80 @@ pub(crate) mod tests {
     }
 
     #[cfg(feature = "pvm")]
+    #[test]
+    #[ignore = "physical directory scaling; requires VOS_AGENT_RUNTIME_COST_CANDIDATE"]
+    fn physical_directory_inspection_scaling() {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        use crate::agent_sdk::{ManagementReply, ManagementRequest, RuntimeOutcome, RuntimeTransition, RuntimeWork};
+        let candidate = std::fs::read(std::env::var_os("VOS_AGENT_RUNTIME_COST_CANDIDATE")
+            .expect("set an explicitly rebuilt candidate PVM")).unwrap();
+        let template = clean_sparse_standard_state();
+        let descriptor = template.clean_descriptor.as_ref().unwrap();
+        for count in [1, 32, 128, 512] {
+            let mut state = template.clone();
+            state.actors.clear();
+            state.lane_state = StandardLaneState::default();
+            state.clean_actor_packages.as_mut().unwrap().clear();
+            state.clean_actor_installations.as_mut().unwrap().clear();
+            for index in 0..count {
+                let name = alloc::format!("scaling-{index:04}");
+                let actor = crate::agent_sdk::ActorId::top_level(descriptor.identity.agent, &name);
+                let mut entry = template.actors[0].clone();
+                entry.record.entry.actor = ActorId(actor.0);
+                entry.record.entry.name = name.clone();
+                entry.record.installation_id = crate::service::InstallationId(actor.0);
+                state.actors.push(entry);
+                let mut package = template.clean_actor_packages.as_ref().unwrap()[0];
+                package.actor = actor;
+                state.clean_actor_packages.as_mut().unwrap().push(package);
+                let mut installation = template.clean_actor_installations.as_ref().unwrap()[0].clone();
+                installation.actor = actor;
+                installation.original.entry.actor = actor;
+                installation.original.entry.name = name;
+                installation.original.installation_id = crate::agent_sdk::InstallationId(actor.0);
+                installation.commitment = installation.original.lineage_commitment();
+                state.clean_actor_installations.as_mut().unwrap().push(installation);
+            }
+            state.actors.sort_unstable_by_key(|actor| actor.record.entry.actor);
+            state.clean_actor_packages.as_mut().unwrap().sort_unstable_by_key(|item| item.actor);
+            state.clean_actor_installations.as_mut().unwrap().sort_unstable_by_key(|item| item.actor);
+            StandardAgentRuntime::restore(state.clone()).unwrap();
+            let state = legacy_state_to_clean(encode_standard_runtime_state(&state));
+            let work = RuntimeWork::Manage {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                space: descriptor.identity.space,
+                agent: descriptor.identity.agent,
+                runtime_deployment: descriptor.identity.runtime_deployment,
+                state: state.clone(),
+                request: Box::new(ManagementRequest::InspectActors { after: None, limit: 1 }),
+                authority: None,
+                observed_slot: 1,
+            };
+            let expected = apply_standard_runtime_work(work.clone()).unwrap();
+            assert_eq!(expected.state, state);
+            assert!(matches!(&expected.outcome, RuntimeOutcome::Management(Ok(ManagementReply::Actors(page))) if page.entries.len() == 1));
+            let input = work.encode().unwrap();
+            let expected = expected.encode().unwrap();
+            let mut baseline_gas = None;
+            for (label, program) in [
+                ("bundled", include_bytes!("../../../vosx/blobs/agent_runtime.pvm").as_slice()),
+                ("candidate", candidate.as_slice()),
+            ] {
+                let start = std::time::Instant::now();
+                let execution = vos_pvm::refine_host::RefineContext::load(program, &input, 20_000_000_000).unwrap().run();
+                eprintln!("directory-scaling actors={count} label={label} input_bytes={} gas_used={} elapsed_us={} exit={:?}", input.len(), execution.gas_used, start.elapsed().as_micros(), execution.exit);
+                assert_eq!(execution.exit, vos_pvm::ExitReason::Halt);
+                assert_eq!(execution.output_bounded(RuntimeTransition::MAX_ENCODED_BYTES).unwrap(), expected);
+                if let Some(gas) = baseline_gas {
+                    assert!(execution.gas_used < gas, "candidate should reduce directory inspection gas");
+                } else {
+                    baseline_gas = Some(execution.gas_used);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "pvm")]
     fn sparse_invocation(mode: MethodMode, id: u8) -> ActorInvocation {
         let state = sparse_standard_state();
         let actor = &state.actors[0].record;
