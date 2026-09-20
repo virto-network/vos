@@ -442,7 +442,6 @@ impl LocalAgentHost {
             .ok_or(LocalAgentHostError::NotFound)?;
         let slot = host.agent_path(agent);
         validate_same_directory(&hosted.directory, &slot)?;
-        validate_agent_slot(&slot, false)?;
         let hosted = host
             .agents
             .remove(&agent)
@@ -460,6 +459,14 @@ impl LocalAgentHost {
             failed: false,
         };
         drop(host);
+        // The lease excludes same-Agent work and retains the root lock while
+        // catalog traversal runs without blocking unrelated Agent checkout.
+        // A validation error drops the lease and restores the untouched driver.
+        validate_agent_slot(&execution.slot, false)?;
+        validate_same_directory(
+            &execution.hosted.as_ref().unwrap().directory,
+            &execution.slot,
+        )?;
         #[cfg(test)]
         if let Some(probe) = probe {
             probe(agent);
@@ -1308,6 +1315,8 @@ fn create_agent_slot(path: &Path) -> Result<(), LocalAgentHostError> {
 #[cfg(test)]
 std::thread_local! {
     static SLOT_VALIDATIONS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static CATALOG_VALIDATION_PROBE: core::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { core::cell::RefCell::new(None) };
 }
 
 fn validate_agent_slot(path: &Path, allow_image_stage: bool) -> Result<(), LocalAgentHostError> {
@@ -1348,6 +1357,12 @@ fn validate_agent_slot(path: &Path, allow_image_stage: bool) -> Result<(), Local
 }
 
 fn validate_catalog(path: &Path) -> Result<(), LocalAgentHostError> {
+    #[cfg(test)]
+    CATALOG_VALIDATION_PROBE.with(|probe| {
+        if let Some(probe) = probe.borrow().as_ref() {
+            probe();
+        }
+    });
     require_private_directory(path)?;
     let mut seen = BTreeMap::new();
     for entry in fs::read_dir(path).map_err(|_| LocalAgentHostError::Io)? {
@@ -2892,6 +2907,107 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn physical_catalog_validation_releases_registry_and_restores_failed_checkout() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let directory = TestDirectory::new("catalog-checkout-isolation");
+        let root = directory.child("agents");
+        let (_, trust) = clock_trust(1);
+        let mut host = LocalAgentHost::create(&root, space(), node(), trust).unwrap();
+        let runtime = admitted_runtime();
+        let first = descriptor(&runtime, 7, AgentProfile::Local, space(), node());
+        let second = descriptor(&runtime, 8, AgentProfile::Local, space(), node());
+        let a = host
+            .create_agent(runtime.clone(), first.clone(), create_receipt(&first, 10))
+            .unwrap();
+        let b = host
+            .create_agent(runtime, second.clone(), create_receipt(&second, 10))
+            .unwrap();
+        let shared = Arc::new(Mutex::new(host));
+        let (entered, observed) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let a_owner = shared.clone();
+        let a_thread = std::thread::spawn(move || {
+            CATALOG_VALIDATION_PROBE.with(|probe| {
+                *probe.borrow_mut() = Some(Box::new(move || {
+                    entered.send(()).unwrap();
+                    released.recv().unwrap();
+                }));
+            });
+            LocalAgentHost::checkout(&a_owner, a).map(drop)
+        });
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (finished, result) = mpsc::channel();
+        let b_owner = shared.clone();
+        let b_thread = std::thread::spawn(move || {
+            let same_agent_busy = matches!(
+                LocalAgentHost::checkout(&b_owner, a),
+                Err(LocalAgentHostError::Busy)
+            );
+            let independent = LocalAgentHost::checkout(&b_owner, b).map(drop);
+            finished.send((same_agent_busy, independent)).unwrap();
+        });
+        let independent = result.recv_timeout(Duration::from_secs(5));
+        // Corruption encountered after ownership transfer must still reject
+        // admission and return the untouched driver, without stranding a lane.
+        let invalid = root
+            .join(encode_agent_id(a))
+            .join(CATALOG_DIRECTORY)
+            .join("unexpected");
+        create_private_directory(&invalid).unwrap();
+        release.send(()).unwrap();
+        let rejected = a_thread.join().unwrap();
+        b_thread.join().unwrap();
+        let (same_agent_busy, independent) =
+            independent.expect("Agent B must complete while Agent A is inside catalog validation");
+        assert!(same_agent_busy);
+        independent.unwrap();
+        assert!(rejected.is_err());
+        assert!(shared.lock().unwrap().executing.is_empty());
+        assert!(LocalAgentHost::checkout(&shared, a).is_err());
+        fs::remove_dir(&invalid).unwrap();
+        drop(LocalAgentHost::checkout(&shared, a).unwrap());
+        assert_eq!(shared.lock().unwrap().list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn physical_checkout_rejects_slot_replacement_during_catalog_validation() {
+        let directory = TestDirectory::new("catalog-slot-replacement");
+        let root = directory.child("agents");
+        let (_, trust) = clock_trust(1);
+        let mut host = LocalAgentHost::create(&root, space(), node(), trust).unwrap();
+        let runtime = admitted_runtime();
+        let descriptor = descriptor(&runtime, 7, AgentProfile::Local, space(), node());
+        let agent = host
+            .create_agent(runtime, descriptor.clone(), create_receipt(&descriptor, 10))
+            .unwrap();
+        let shared = Arc::new(Mutex::new(host));
+        let slot = root.join(encode_agent_id(agent));
+        let original = directory.child("original-slot");
+        let replacement = directory.child("replacement-slot");
+        let probe_slot = slot.clone();
+        let probe_original = original.clone();
+        CATALOG_VALIDATION_PROBE.with(|probe| {
+            *probe.borrow_mut() = Some(Box::new(move || {
+                fs::rename(&probe_slot, &probe_original).unwrap();
+                create_agent_slot(&probe_slot).unwrap();
+                fs::copy(image_path(&probe_original), image_path(&probe_slot)).unwrap();
+            }));
+        });
+        let result = LocalAgentHost::checkout(&shared, agent);
+        CATALOG_VALIDATION_PROBE.with(|probe| *probe.borrow_mut() = None);
+        assert!(
+            result.is_err(),
+            "post-scan ownership must still match the pinned directory"
+        );
+        assert!(shared.lock().unwrap().executing.is_empty());
+        fs::rename(&slot, &replacement).unwrap();
+        fs::rename(&original, &slot).unwrap();
+        drop(LocalAgentHost::checkout(&shared, agent).unwrap());
     }
 
     #[test]

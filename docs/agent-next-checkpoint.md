@@ -1,5 +1,19 @@
 # Next review checkpoint: execution isolation and targeted access
 
+## Current follow-up: Local catalog validation isolation
+
+The catalog scan now runs after exclusive per-Agent checkout releases the
+registry mutex. Root ownership remains pinned, same-Agent access stays excluded,
+and validation failure restores the untouched driver. Physical regressions cover
+independent checkout during a held catalog scan, failed-validation cleanup, and
+slot replacement during scanning. See the current reviewer handoff for evidence
+and limitations. No artifacts are repinned and no recovery test is weakened.
+
+Next: address the known runtime-independent management-history recovery failure,
+then reconcile source/bundled runtime artifacts and run their release gates.
+Node maintenance scheduling, full-state scaling and Shared lifecycle acceptance
+remain part of the full saga; these checkpoints do not establish completion.
+
 ## Implemented checkpoint objective: supervisor refresh isolation
 
 Move refresh reconciliation to one bounded maintenance worker, leaving the

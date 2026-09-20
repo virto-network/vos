@@ -2,6 +2,38 @@
 
 This is a source-review checkpoint, not a deployment or architectural sign-off.
 
+## Follow-up checkpoint: Local catalog validation isolation
+
+Review the incremental change from `9acb7ef4` to the commit containing this
+section. Checkout transfers the target driver into its exclusive execution
+lease before scanning its catalog. The shared registry mutex now covers root
+identity validation and ownership transfer, not catalog traversal. Same-Agent
+work remains Busy; the lease retains the root lock. Failed validation returns
+the untouched driver through normal lease cleanup. Pinned directory identity
+is checked both before ownership transfer and after the scan.
+
+Two physical-host regressions cover the new boundary: a deliberately held
+catalog scan permits another Agent's checkout to finish, still excludes the
+same Agent, and rejects injected catalog corruption without stranding ownership;
+a directory replacement during scanning is rejected by the post-scan pin check.
+These are coordination/tamper tests, not production throughput measurements.
+
+Evidence logs are under the shared target's `task-tmp` directory:
+`catalog-isolation-test.log`, `catalog-isolation-replacement.log`,
+`catalog-isolation-local-final.log`, `catalog-isolation-supervisor.log`, and
+`catalog-isolation-vosx-check.log`. Final Local suite: 20 passed, one known
+recovery failure. Supervisor/adapter suite: 56 passed. `vosx` check passes.
+Physical tests explicitly select the existing candidate runtime ELF; no bundled
+artifact was replaced. The known substituted-management-history recovery failure
+remains an acceptance failure, not an ignored or weakened test.
+
+Limits: this removes cross-Agent lock contention caused by targeted checkout
+catalog scans; it does not remove the scans themselves. Explicit lifecycle and
+namespace audits still use the registry lock. Root identity filesystem checks,
+node inventory scheduling, whole-state VM/publication costs and the remaining
+release gates are unchanged. Prioritize runtime-independent recovery-history
+binding next, before declaring the candidate safe for deployment.
+
 ## Follow-up checkpoint: supervisor refresh isolation
 
 Review this incremental change from `817e528c` to the commit containing this
@@ -37,8 +69,8 @@ Evidence (host `nightly-2025-05-09`, offline/locked):
 All logs remain in the shared target's `task-tmp` directory. Refresh tracing
 records worker-queue wait and callback service time (not total deferred wait).
 
-Limits: Attach reconciliation and retirement callbacks can still occupy the
-coordinator. Node inventory/reconciliation remains synchronous, and target
+Limits at this checkpoint: Attach reconciliation and retirement callbacks can
+still occupy the coordinator. Node inventory/reconciliation remains synchronous, and target
 catalog traversal still holds the registry mutex. VM memory budgeting,
 whole-state costs, generic-runtime recovery, bundle compatibility and release
 qualification are unchanged. This does not claim complete maintenance isolation.
