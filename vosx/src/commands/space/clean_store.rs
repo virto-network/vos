@@ -567,6 +567,14 @@ impl CleanAgentGenesisArchiveFile {
         parent: &Path,
         locator: vos::agent::genesis::AgentGenesisLocator,
     ) -> Result<Self, CleanFileStoreError> {
+        Self::open(parent, locator, true)
+    }
+
+    fn open(
+        parent: &Path,
+        locator: vos::agent::genesis::AgentGenesisLocator,
+        create: bool,
+    ) -> Result<Self, CleanFileStoreError> {
         locator
             .validate()
             .map_err(|_| CleanFileStoreError::Corrupt)?;
@@ -575,19 +583,127 @@ impl CleanAgentGenesisArchiveFile {
             hex::encode(locator.space.0),
             hex::encode(locator.agent.0)
         ));
-        let root = Arc::new(StoreRoot::open_with_entries(
+        let root = Arc::new(StoreRoot::open_with_entries_mode(
             &path,
             &[
                 LOCK_FILE,
                 "ordinary-agent.genesis-archive",
                 "ordinary-agent.genesis-archive.next",
             ],
+            create,
         )?);
         Ok(Self {
             locator,
             store: Mutex::new(ExactFileStore::new(root, StoreRole::OrdinaryGenesisArchive)),
         })
     }
+}
+
+/// Non-creating archive discovery for ordinary Shared startup. The caller must
+/// compare the complete discovered set with lifecycle reservations and retain
+/// all opened leases. Directory membership and image integrity are not finality.
+pub(crate) struct CleanAgentGenesisArchiveStoreFactory {
+    parent: PathBuf,
+    directory: File,
+    space: vos::service::SpaceId,
+}
+
+impl CleanAgentGenesisArchiveStoreFactory {
+    pub(crate) fn open_existing(
+        parent: &Path,
+        space: vos::service::SpaceId,
+    ) -> Result<Self, CleanFileStoreError> {
+        if space == vos::service::SpaceId::ZERO {
+            return Err(CleanFileStoreError::InvalidPath);
+        }
+        Ok(Self {
+            parent: parent.to_path_buf(),
+            directory: open_private_directory(parent, true)?,
+            space,
+        })
+    }
+
+    pub(crate) fn discover(
+        &self,
+        maximum: usize,
+    ) -> Result<Vec<vos::agent::genesis::AgentGenesisLocator>, CleanFileStoreError> {
+        discover_genesis_directories(
+            &self.directory,
+            &self.parent,
+            self.space,
+            "genesis",
+            maximum,
+        )
+    }
+
+    pub(crate) fn open_archive(
+        &self,
+        locator: vos::agent::genesis::AgentGenesisLocator,
+    ) -> Result<CleanAgentGenesisArchiveFile, CleanFileStoreError> {
+        if locator.space != self.space {
+            return Err(CleanFileStoreError::InvalidPath);
+        }
+        validate_opened_directory(&self.directory, &self.parent, true)?;
+        let archive = CleanAgentGenesisArchiveFile::open(&self.parent, locator, false)?;
+        validate_opened_directory(&self.directory, &self.parent, true)?;
+        Ok(archive)
+    }
+}
+
+fn discover_genesis_directories(
+    directory: &File,
+    parent: &Path,
+    space: vos::service::SpaceId,
+    kind: &str,
+    maximum: usize,
+) -> Result<Vec<vos::agent::genesis::AgentGenesisLocator>, CleanFileStoreError> {
+    validate_opened_directory(directory, parent, true)?;
+    #[cfg(target_os = "linux")]
+    let scan = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+    #[cfg(not(target_os = "linux"))]
+    let scan: PathBuf = return Err(CleanFileStoreError::InvalidPath);
+    let prefix = format!("{kind}-{}-", hex::encode(space.0));
+    let mut found = Vec::new();
+    for entry in fs::read_dir(scan)? {
+        let entry = entry?;
+        if found.len() == maximum {
+            return Err(CleanFileStoreError::Oversized);
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| CleanFileStoreError::UnexpectedResidue)?;
+        let suffix = name
+            .strip_prefix(&prefix)
+            .ok_or(CleanFileStoreError::UnexpectedResidue)?;
+        if suffix.len() != 64
+            || !suffix
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        {
+            return Err(CleanFileStoreError::UnexpectedResidue);
+        }
+        let mut bytes = [0; 32];
+        hex::decode_to_slice(suffix, &mut bytes)
+            .map_err(|_| CleanFileStoreError::UnexpectedResidue)?;
+        let locator = vos::agent::genesis::AgentGenesisLocator {
+            space,
+            agent: vos::service::AgentId(bytes),
+        };
+        locator
+            .validate()
+            .map_err(|_| CleanFileStoreError::UnexpectedResidue)?;
+        let path = parent.join(&name);
+        let child = open_child_directory(directory, &path)?;
+        validate_opened_directory(&child, &path, false)?;
+        found.push(locator);
+    }
+    validate_opened_directory(directory, parent, true)?;
+    found.sort_unstable_by_key(|locator| locator.agent);
+    if found.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(CleanFileStoreError::Alias);
+    }
+    Ok(found)
 }
 
 impl vos::agent::genesis_archive::AgentGenesisArchiveStore for CleanAgentGenesisArchiveFile {
@@ -755,53 +871,13 @@ impl CleanAgentGenesisCommitteeStoreFactory {
         &self,
         maximum: usize,
     ) -> Result<Vec<vos::agent::genesis::AgentGenesisLocator>, CleanFileStoreError> {
-        validate_opened_directory(&self.directory, &self.parent, true)?;
-        #[cfg(target_os = "linux")]
-        let scan = PathBuf::from(format!("/proc/self/fd/{}", self.directory.as_raw_fd()));
-        #[cfg(not(target_os = "linux"))]
-        let scan: PathBuf = return Err(CleanFileStoreError::InvalidPath);
-        let prefix = format!("genesis-committee-{}-", hex::encode(self.space.0));
-        let mut found = Vec::new();
-        for entry in fs::read_dir(scan)? {
-            let entry = entry?;
-            if found.len() == maximum {
-                return Err(CleanFileStoreError::Oversized);
-            }
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| CleanFileStoreError::UnexpectedResidue)?;
-            let suffix = name
-                .strip_prefix(&prefix)
-                .ok_or(CleanFileStoreError::UnexpectedResidue)?;
-            if suffix.len() != 64
-                || !suffix
-                    .bytes()
-                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-            {
-                return Err(CleanFileStoreError::UnexpectedResidue);
-            }
-            let mut bytes = [0; 32];
-            hex::decode_to_slice(suffix, &mut bytes)
-                .map_err(|_| CleanFileStoreError::UnexpectedResidue)?;
-            let locator = vos::agent::genesis::AgentGenesisLocator {
-                space: self.space,
-                agent: vos::service::AgentId(bytes),
-            };
-            locator
-                .validate()
-                .map_err(|_| CleanFileStoreError::UnexpectedResidue)?;
-            let path = self.parent.join(&name);
-            let directory = open_child_directory(&self.directory, &path)?;
-            validate_opened_directory(&directory, &path, false)?;
-            found.push(locator);
-        }
-        validate_opened_directory(&self.directory, &self.parent, true)?;
-        found.sort_unstable_by_key(|locator| locator.agent);
-        if found.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err(CleanFileStoreError::Alias);
-        }
-        Ok(found)
+        discover_genesis_directories(
+            &self.directory,
+            &self.parent,
+            self.space,
+            "genesis-committee",
+            maximum,
+        )
     }
 
     pub(crate) fn open_existing(
@@ -4733,6 +4809,93 @@ pub(crate) mod tests {
             };
             assert!(publication.load().is_err());
         }
+    }
+
+    #[test]
+    fn ordinary_genesis_archive_discovery_is_noncreating_bounded_and_leased() {
+        use vos::agent::genesis::AgentGenesisLocator;
+        use vos::agent::genesis_archive::AgentGenesisArchiveStore;
+        let fixture = Fixture::new("ordinary-genesis-archive-discovery");
+        let parent = fixture.parent.join("archives");
+        let space = vos::service::SpaceId([1; 32]);
+        assert!(CleanAgentGenesisArchiveStoreFactory::open_existing(&parent, space).is_err());
+        assert!(!parent.exists());
+        ensure_private_directory(&parent).unwrap();
+        let factory = CleanAgentGenesisArchiveStoreFactory::open_existing(&parent, space).unwrap();
+        assert!(factory.discover(0).unwrap().is_empty());
+        let low = AgentGenesisLocator {
+            space,
+            agent: vos::service::AgentId([2; 32]),
+        };
+        let high = AgentGenesisLocator {
+            space,
+            agent: vos::service::AgentId([3; 32]),
+        };
+        assert!(factory.open_archive(low).is_err());
+        assert!(factory.discover(0).unwrap().is_empty());
+        let high_file = CleanAgentGenesisArchiveFile::open_or_create(&parent, high).unwrap();
+        let low_file = CleanAgentGenesisArchiveFile::open_or_create(&parent, low).unwrap();
+        low_file.insert_if_absent(low, b"opaque archive").unwrap();
+        assert_eq!(factory.discover(2).unwrap(), vec![low, high]);
+        assert!(matches!(
+            factory.discover(1),
+            Err(CleanFileStoreError::Oversized)
+        ));
+        assert!(matches!(
+            factory.open_archive(low),
+            Err(CleanFileStoreError::Busy)
+        ));
+        drop(low_file);
+        let reopened = factory.open_archive(low).unwrap();
+        assert_eq!(
+            reopened.load(low).unwrap(),
+            Some(b"opaque archive".to_vec())
+        );
+        assert!(
+            factory
+                .open_archive(AgentGenesisLocator {
+                    space: vos::service::SpaceId([9; 32]),
+                    ..low
+                })
+                .is_err()
+        );
+        drop(high_file);
+        drop(reopened);
+        let moved = fixture.parent.join("moved-archives");
+        fs::rename(&parent, &moved).unwrap();
+        ensure_private_directory(&parent).unwrap();
+        assert!(factory.discover(2).is_err());
+        assert!(factory.open_archive(low).is_err());
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn ordinary_genesis_archive_discovery_refuses_foreign_and_symlink_entries() {
+        let fixture = Fixture::new("ordinary-genesis-archive-hostile");
+        let parent = fixture.parent.join("archives");
+        ensure_private_directory(&parent).unwrap();
+        let space = vos::service::SpaceId([1; 32]);
+        let factory = CleanAgentGenesisArchiveStoreFactory::open_existing(&parent, space).unwrap();
+        let foreign = vos::agent::genesis::AgentGenesisLocator {
+            space: vos::service::SpaceId([9; 32]),
+            agent: vos::service::AgentId([2; 32]),
+        };
+        let foreign_file = CleanAgentGenesisArchiveFile::open_or_create(&parent, foreign).unwrap();
+        assert!(matches!(
+            factory.discover(2),
+            Err(CleanFileStoreError::UnexpectedResidue)
+        ));
+        drop(foreign_file);
+        let other = fixture.parent.join("symlinks");
+        ensure_private_directory(&other).unwrap();
+        let factory = CleanAgentGenesisArchiveStoreFactory::open_existing(&other, space).unwrap();
+        let link = other.join(format!(
+            "genesis-{}-{}",
+            hex::encode(space.0),
+            hex::encode([2; 32])
+        ));
+        std::os::unix::fs::symlink(&parent, &link).unwrap();
+        assert!(factory.discover(1).is_err());
     }
 
     #[test]

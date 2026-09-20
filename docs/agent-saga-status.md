@@ -405,6 +405,20 @@ Additional gates at `d17794c5`:
   This is a failed release gate, not evidence that every unused API is obsolete:
   several belong to the incomplete Shared/Private integration below.
 
+Shared production integration has begun with non-creating archive discovery in
+`vosx`'s clean file layer. `CleanAgentGenesisArchiveStoreFactory` pins the private
+parent descriptor, discovers bounded canonical space-scoped locators, and opens
+existing archives under exclusive leases without creating missing directories.
+Archive and committee discovery now share the same hardened directory walker.
+The ordinary-genesis store suite passes: 13 tests, one existing opt-in ignored
+(`shared-archive-discovery-tests.log`), including new missing-path, sorted/bounded
+set, conflicting lease, foreign-space, symlink and replaced-parent regressions.
+This is a prerequisite, not production activation: it is not yet called by startup.
+The next integration step must retain archive leases together with the existing
+`CleanSharedGenesisRecovery` entries, check the complete archive/lifecycle sets,
+then drive owner-authenticated recovery before publishing routes. File integrity
+or successful discovery must never be treated as finality.
+
 1. Reviewer examines `7bd66a7d..saga/agents` read-only and returns findings.
    Apply fixes on latest implementation source; advance the reviewer branch only
    at qualified checkpoints. Do not mix reviewer edits with implementation work.
