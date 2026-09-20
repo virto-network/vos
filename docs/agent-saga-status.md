@@ -371,6 +371,23 @@ profile qualification and explicitly warn that post-bootstrap native backup is
 unavailable. The production inventory owner's test-only descriptor import is
 scoped to tests; no runtime or artifact behavior changes.
 
+Additional gates at `d17794c5`:
+
+- CLI binary suite (`cargo test -p vosx --bin vosx`, serial, offline/locked):
+  271 passed, zero failures, 20 opt-in ignored, 85.15s;
+  `saga-cli-bin-tests.log`. No live deployment test is implicitly enabled.
+- `scripts/check-agent-clean-break.sh` passes against the current debug binary
+  and operator docs (`saga-clean-break-final.log`), with offline Cargo and the
+  pinned host toolchain. Retired commands, flags and paths remain absent.
+- Explicit `private-agent-crypto` feature, `agent::private_crypto::tests`:
+  16 passed, zero ignored, 2.29s (`saga-private-crypto-tests.log`). Includes
+  hostile key/envelope substitutions, revocation/rotation, offline recovery,
+  stable imports and the 4,096-entry invitation-history boundary. This does not
+  qualify Private storage/network lifecycle or released recovery.
+- Workspace `cargo fmt --all -- --check` fails with differences in 44 files
+  (`saga-workspace-format-check.log`). It is read-only; no broad formatting was
+  applied. Keep the eventual mechanical cleanup separate from semantic changes.
+
 1. Reviewer examines `7bd66a7d..saga/agents` read-only and returns findings.
    Apply fixes on latest implementation source; advance the reviewer branch only
    at qualified checkpoints. Do not mix reviewer edits with implementation work.
