@@ -53,7 +53,9 @@ The stream reduces invocation count, not whole-state transport/restoration,
 publication or signature cost. Unchanged-head authentication still costs one
 query. Growing compiled directories, idle-Agent scaling, released-node tail
 latency and thousands-active-user throughput remain unqualified.
-The ten-second readiness target still fails.
+The ten-second readiness target fails for this fixed checkpoint's campaign.
+Later implementation-only qualification is recorded separately in current status;
+do not apply its results retroactively to this review boundary.
 
 Earlier r19 retirement evidence and review instructions remain at
 `7bd66a7d:docs/agent-saga-review.md`; the prior implementation qualification

@@ -10664,6 +10664,35 @@ mod tests {
             member, visible,
             "hidden Agents must also hide their replica/actor rows"
         );
+        // CLI targeted discovery starts after the greatest possible row of
+        // the preceding Agent ID, which need not exist in this directory.
+        // Seeking must agree with the complete authenticated view, including
+        // when the requested Private Agent is invisible to the caller.
+        for descriptor in &descriptors {
+            let target = descriptor.identity.agent;
+            let mut predecessor = target.0;
+            for byte in predecessor.iter_mut().rev() {
+                let (value, borrow) = byte.overflowing_sub(1);
+                *byte = value;
+                if !borrow {
+                    break;
+                }
+            }
+            let after = (predecessor != [0; 32]).then_some(AuthorityInventoryCursor {
+                agent: AgentId(predecessor),
+                position: AuthorityInventoryPosition::Actor(ActorId([0xff; 32])),
+            });
+            for (key, complete) in [(&signing(0x21), &rows), (&owner_key, &member)] {
+                let page = inventory_page(&actor, &inventory_query(&actor, key, after, 2, None));
+                let expected = complete
+                    .iter()
+                    .filter(|entry| entry.cursor().agent >= target)
+                    .take(2)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                assert_eq!(page.entries, expected);
+            }
+        }
         for descriptor in &descriptors {
             let projected = rows
                 .iter()

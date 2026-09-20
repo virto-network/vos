@@ -760,7 +760,7 @@ fn bundled_runtime_identity_and_vos3_package_are_exactly_pinned() {
     );
     assert_eq!(
         sdk::RUNTIME_ABI_ID,
-        Hash(*b"vos-agent-runtime-abi-260920-r18")
+        Hash(*b"vos-agent-runtime-abi-260920-r19")
     );
 
     let mut previous_generation = bytes;
@@ -970,7 +970,7 @@ fn bundled_runtime_installs_exact_catalog_executes_retries_and_acknowledges() {
     let rejected = apply_runtime(RuntimeWork::Acknowledge {
         context: RuntimeExecutionContext::Direct,
         state: retried.state.clone(),
-        invocation: Box::new(work.clone()),
+        invocation: Box::new(sdk::InvocationRetirement::from_work(&work)),
         authorization: Box::new(InvocationAuthorization::AuthorityReceipt(forged_ack)),
     });
     assert_eq!(
@@ -985,7 +985,7 @@ fn bundled_runtime_installs_exact_catalog_executes_retries_and_acknowledges() {
     let rejected = apply_runtime(RuntimeWork::Acknowledge {
         context: RuntimeExecutionContext::Direct,
         state: retried.state.clone(),
-        invocation: Box::new(wrong_actor),
+        invocation: Box::new(sdk::InvocationRetirement::from_work(&wrong_actor)),
         authorization: Box::new(InvocationAuthorization::AuthorityReceipt(
             wrong_actor_authority,
         )),
@@ -999,7 +999,7 @@ fn bundled_runtime_installs_exact_catalog_executes_retries_and_acknowledges() {
     let acknowledged = apply_runtime(RuntimeWork::Acknowledge {
         context: RuntimeExecutionContext::Direct,
         state: retried.state,
-        invocation: Box::new(work.clone()),
+        invocation: Box::new(sdk::InvocationRetirement::from_work(&work)),
         authorization: Box::new(InvocationAuthorization::AuthorityReceipt(authority.clone())),
     });
     let expected_acknowledgement = InvocationAcknowledgement {
@@ -1020,7 +1020,7 @@ fn bundled_runtime_installs_exact_catalog_executes_retries_and_acknowledges() {
     let replayed = apply_runtime(RuntimeWork::Acknowledge {
         context: RuntimeExecutionContext::Direct,
         state: restarted.state.clone(),
-        invocation: Box::new(work.clone()),
+        invocation: Box::new(sdk::InvocationRetirement::from_work(&work)),
         authorization: Box::new(InvocationAuthorization::AuthorityReceipt(authority.clone())),
     });
     assert_eq!(

@@ -94,7 +94,7 @@ Immutable-resolution source/physical tests and earlier gas profiles remain
 indexed at `9fe6762e:docs/agent-saga-status.md`. No broad release suite or
 all-profile claim is inferred from these scoped passes.
 
-## Frozen-binary disposable CLI campaign
+## Historical reviewer checkpoint: debug-host CLI campaign
 
 Evidence: `indexed-lifecycle.inventory-final.JsB1oS/`. Scripts use frozen binary
 copies and fixed-path isolated XDG/space directories. Generated HTTP/SSH defaults
@@ -232,7 +232,7 @@ share of managed-invocation time is not isolated by these logs. Do not replace i
 with an unchecked cached result. Existing projection checkpoint cadence bounds
 the suffix but does not bound its replay cost in time or gas.
 
-## Next sequence
+## Implementation follow-up: targeted CLI discovery
 
 Implementation-only targeted CLI discovery now replaces the old Agent-directory
 walk plus separate replica fetch. Install and managed invocation seek immediately
@@ -263,7 +263,54 @@ client SHA-256 is
 The initial campaign `indexed-lifecycle.r6zMSu/` exposed the HTTP selector gap
 (403 before descriptor dispatch); its evidence is retained. No artifacts or ABI
 changed. Both node and CLI source changes must ship together; the fixed reviewer
-node does not yet expose this selector over HTTP. Optimized timing is pending.
+node does not yet expose this selector over HTTP. Optimized results follow.
+
+### Current optimized-host qualification
+
+Production source `f98a7afc`, unchanged r19 artifacts; normal release build passes
+(`targeted-release-cli-build.log`, 7m23s). Frozen evidence:
+`target/agent-lifecycle-qualification/indexed-lifecycle.5HJ5w4/`;
+console `targeted-release-lifecycle.log`. Release CLI SHA-256:
+`5a3a5ca73272d97d4a763609069eb6fb999ba7b6c6bd83cdc803f0e0bfce244a`.
+Client hash matches the targeted-discovery debug client above. No builds/tests
+ran alongside this campaign. Functional lifecycle and all four scoped ten-second
+readiness checks pass; all four shutdowns complete in 305–915ms. This supersedes
+the implementation baseline's readiness outcome, not the fixed review checkpoint
+or the still-open production latency/throughput gates.
+
+| Phase | Milliseconds |
+| --- | ---: |
+| Fresh readiness | 8,190 |
+| Create / Install | 15,639 / 19,702 |
+| First restart readiness | 5,824 |
+| Mutation readiness / test | 8,876 / 18,599 |
+| Read readiness / test | 6,333 / 18,539 |
+
+Managed mutation/read attempts take 16.88s/16.80s. Maximum sampled RSS is
+271,544 KiB, reported high-water RSS 292,616 KiB, threads 42, FDs 264.
+Whole-phase traced calls are 114/23/85/83 (initial/restart/mutation/read),
+with summed physical time 28.046/3.053/15.365/13.063s. These are not per-request
+counts. Compared with the preceding traced baseline, operations remain slow;
+different retained journal suffixes also affect restart, so do not attribute the
+entire restart improvement to targeted lookup or infer load capacity from one run.
+
+Additional boundary/clean-break checks:
+
+- Numeric cursor borrow across all 31 nonfinal bytes passes
+  (`targeted-cursor-boundaries.log`). Authority targeted seeks match the complete
+  visible directory for admin/owner, including filtered Private rows and absent
+  predecessor IDs (`targeted-authority-seek.log`).
+- Default-feature `cargo check --workspace --all-targets --offline --locked`
+  passes (`targeted-workspace-check-final.log`). This exposed four stale physical
+  test ACK payloads; they now use r19 `InvocationRetirement`, retaining forged
+  authorization, divergent actor and exact-retry assertions.
+- All five default-feature physical integration tests pass with the reproduced
+  runtime explicitly supplied and ignored tests included
+  (`r19-integration-cutover-final.log`, 3.55s). The stale exact ABI assertion is
+  updated from r18 to r19. This is not the feature-gated attested-proof suite or
+  full workspace test qualification. Initial failures remain in the log root.
+
+## Next sequence
 
 1. Reviewer examines `7bd66a7d..saga/agents` read-only and returns findings.
    Apply fixes on latest implementation source; advance the reviewer branch only
@@ -272,8 +319,8 @@ node does not yet expose this selector over HTTP. Optimized timing is pending.
    versus same-Agent workloads. Shared reopen is now attributed to materialization;
    distinguish physical work kinds and fresh versus replayed lifecycle verification
    on the managed invocation/ACK path before changing its boundaries. Keep exact
-   identities, CPU/RAM/FD and queue/tail measurements; neither current campaign
-   passes the production latency/capacity gates.
+   identities, CPU/RAM/FD and queue/tail measurements. The latest scoped readiness
+   pass does not establish production latency/capacity gates.
 3. Address whole-state/touched-state and incremental-publication costs with an
    explicit common runtime contract, recovery invariants and growth acceptance;
    preserve fresh revision-consistent projections and scheduling isolation.

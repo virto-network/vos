@@ -1065,6 +1065,20 @@ mod tests {
         );
         let maximum = AgentId([0xff; 32]);
         assert!(descriptor_lookup_cursor(maximum).unwrap().agent < maximum);
+        for carry_at in 0..31 {
+            let mut target = [0; 32];
+            target[carry_at] = 1;
+            let mut previous = [0; 32];
+            previous[carry_at + 1..].fill(0xff);
+            let cursor = descriptor_lookup_cursor(AgentId(target)).unwrap();
+            assert_eq!(cursor.agent, AgentId(previous));
+            assert_eq!(
+                cursor.position,
+                vos::agent::sdk::authority::AuthorityInventoryPosition::Actor(
+                    vos::agent::sdk::ActorId([0xff; 32])
+                )
+            );
+        }
     }
 
     #[test]
