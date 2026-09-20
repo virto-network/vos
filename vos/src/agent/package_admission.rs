@@ -618,9 +618,18 @@ fn admitted_scripted_runtime_impl(
         use crate::agent_sdk::protocol::wire::Encoder;
         const MARKER: &[u8; 16] = b"VOS-SCRIPT-R18V1";
         const CAPACITY: usize = 64 * 1024;
-        let path = std::env::var("AGENT_SCRIPTED_RUNTIME_ELF")
-            .expect("build custom-linear with --features scripted-fixture and set AGENT_SCRIPTED_RUNTIME_ELF");
-        let elf = std::fs::read(path).expect("read scripted recovery guest ELF");
+        let path = std::env::var_os("AGENT_SCRIPTED_RUNTIME_ELF")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent().unwrap()
+                    .join(std::env::var_os("CARGO_TARGET_DIR").unwrap_or_else(|| "target".into()))
+                    .join("agent-recovery-artifacts/scripted/riscv64em-vos/release/custom_linear_agent_runtime.elf")
+            });
+        let elf = std::fs::read(&path).unwrap_or_else(|error| panic!(
+            "read scripted recovery guest {}: {error}; run `just build-agent-recovery-fixture` or set AGENT_SCRIPTED_RUNTIME_ELF",
+            path.display(),
+        ));
         let mut program = vos_pvm_compiler::link_elf_spi(&elf).expect("link scripted recovery guest");
         let positions: Vec<_> = program.windows(MARKER.len()).enumerate()
             .filter_map(|(offset, bytes)| (bytes == MARKER).then_some(offset)).collect();

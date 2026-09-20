@@ -50,7 +50,7 @@ build-actor name:
     cd actors/{{name}}; cargo actor --locked
 
 # Build all generated artifacts consumed by the test suite.
-build-test-artifacts: build-extensions build-pvm build-probe-fixture build-actors build-voucher-check
+build-test-artifacts: build-extensions build-pvm build-probe-fixture build-actors build-voucher-check build-agent-recovery-fixture
     cargo build
 
 # Build all built-in actors used by host tests.
@@ -159,8 +159,21 @@ test-custom-agent-runtime:
     cd examples/agent-runtimes/custom-linear; cargo test
     cd examples/agent-runtimes/custom-linear; cargo test --lib tests::compiled_runtime_executes_scheduling_and_rejects_attested_context -- --ignored --exact --test-threads=1
 
+# Build the opaque history-aware guest required by host recovery tests.
+build-agent-recovery-fixture:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    repository_root="{{justfile_directory()}}"
+    test_target="${CARGO_TARGET_DIR:-$repository_root/target}"
+    mkdir -p "$test_target"
+    test_target=$(cd "$test_target" && pwd)
+    export TMPDIR="$test_target/task-tmp"
+    mkdir -p "$TMPDIR"
+    cd "$repository_root/examples/agent-runtimes/custom-linear"
+    CARGO_TARGET_DIR="$test_target/agent-recovery-artifacts/scripted" cargo +nightly-2026-03-20 actor --offline --locked --features scripted-fixture
+
 # Build both explicit guest fixtures and run physical Local recovery gates.
-test-local-agent-recovery:
+test-local-agent-recovery: build-agent-recovery-fixture
     #!/usr/bin/env bash
     set -euo pipefail
     repository_root="{{justfile_directory()}}"
@@ -172,7 +185,6 @@ test-local-agent-recovery:
     runtime_target="$test_target/agent-recovery-artifacts/runtime"
     scripted_target="$test_target/agent-recovery-artifacts/scripted"
     (cd "$repository_root/services/agent-runtime"; CARGO_TARGET_DIR="$runtime_target" cargo +nightly-2026-03-20 actor --offline --locked)
-    (cd "$repository_root/examples/agent-runtimes/custom-linear"; CARGO_TARGET_DIR="$scripted_target" cargo +nightly-2026-03-20 actor --offline --locked --features scripted-fixture)
     export AGENT_RUNTIME_CANDIDATE_ELF="$runtime_target/riscv64em-vos/release/agent_runtime.elf"
     export AGENT_SCRIPTED_RUNTIME_ELF="$scripted_target/riscv64em-vos/release/custom_linear_agent_runtime.elf"
     CARGO_TARGET_DIR="$test_target" cargo +nightly-2025-05-09 test --offline --locked -p vos --features 'agent-runtime storage network' --lib agent::local_sdk_host::tests -- --test-threads=1

@@ -1,9 +1,12 @@
 # Runtime-independent management recovery binding
 
-Status: implementation in progress after checkpoint `1b977731`. The original
-physical reopen regression now passes with an explicitly rebuilt r18 candidate.
-Do not publish this as a qualified checkpoint until the broader guest/host
-coverage, scripted fixtures and bundled artifact reproduction pass together.
+Status: source committed at `a1ebce16`, after review checkpoint `1b977731`.
+The original physical reopen regression, broader guest/host coverage and repaired
+scripted fixtures pass with rebuilt r18 guests. Bundled bytes and pins are updated
+in the implementation worktree; independent reproduction and all 21 bundled Local
+tests pass. CLI bundle verification also passes; disposable current-binary startup
+and lifecycle qualification remain pending. See [current status](agent-saga-status.md)
+for the authoritative plan and branch qualification.
 
 ## Cause and boundary
 
@@ -83,11 +86,13 @@ exception or host-native oracle is introduced. This fixture is deliberately
 not an authenticating or deployable runtime; the normal custom runtime remains
 the independent production-contract example.
 
-The fixture uses a separate ELF selected by `AGENT_SCRIPTED_RUNTIME_ELF`, built
+The fixture uses a separate ELF optionally selected by `AGENT_SCRIPTED_RUNTIME_ELF`, built
 with `cargo +nightly-2026-03-20 actor --offline --locked --features scripted-fixture`
 inside `examples/agent-runtimes/custom-linear`. Its linker now computes the
 read-write base from the page-rounded read-only extent, preserving the required
-GP guard zone even with the larger fixture table. `just test-local-agent-recovery`
+GP guard zone even with the larger fixture table. `just build-agent-recovery-fixture`
+builds it at the default test lookup path under the selected Cargo target directory;
+`build-test-artifacts` includes this prerequisite. `just test-local-agent-recovery`
 builds both the standard candidate and scripted guest in separate disk-backed
 directories before selecting the complete Local suite. For sandboxed execution,
 set `JUST_TEMPDIR` to an existing writable disk-backed directory as well.
@@ -95,13 +100,30 @@ The complete fresh-build recipe passes (`recovery-recipe.log`: 21 Local tests).
 Rebuilding the ordinary custom runtime with the adjusted linker layout also
 passes all 13 tests, including compiled execution (`recovery-custom-normal-final.log`).
 All 56 supervisor/adapter tests pass (`recovery-supervisor-final.log`).
-No bundled PVM or provenance pin is replaced yet.
+Candidate bundled PVM/package bytes and provenance pins now come from the immutable
+`a1ebce168605747c876955a299152dd60d18d59a` source export, using an isolated builder
+cache. Their presence alone does not establish release qualification.
+
+`recovery-release-reproduction.log` records independent immutable-source rebuilding
+of all three artifacts, with exact digest, runtime identity and bundled-byte
+comparisons passing. Evidence is also retained under the implementation target's
+`agent-release-reproduction/run.VrpljE`. `recovery-bundled-local-suite.log` records
+21 passing Local tests with `AGENT_RUNTIME_CANDIDATE_ELF` unset (78.74 seconds),
+including substituted-history rejection and physical lifecycle/reopen. These
+scoped checks do not establish released end-to-end or performance qualification.
+CLI source checks also pass: four bundled-package admission tests
+(`recovery-bundled-vosx.log`), 18 release-package tests (`recovery-release-tests.log`)
+and three local configuration tests (`recovery-config-tests.log`).
+The current debug CLI builds (`recovery-bundled-cli-build.log`) and its `release
+bundle` followed by `release verify` passes. The verified output is retained at
+`task-tmp/recovery-release.O1sinY/current-bundle` under the shared target. This is
+not an optimized released-binary startup or throughput result.
 
 The following earlier SDK/helper tests are preparation, not evidence for items 1–5.
 Preparation evidence (offline/locked, host `nightly-2025-05-09`): all 170 SDK
 tests and all three Local management-history tests pass. Logs are
 `recovery-commitment-sdk-full.log` and `recovery-commitment-host.log` under the
-shared target's `task-tmp`. These changes remain in the implementation worktree;
+shared target's `task-tmp`. Recovery source is committed on the implementation branch;
 the reviewer branch stays at `1b977731` until the integrated batch is ready.
 Shared replay, Private control recovery and broader release acceptance retain
 their own existing gates; this Local recovery fix cannot qualify them by proxy.
