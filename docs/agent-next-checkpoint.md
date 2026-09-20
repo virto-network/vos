@@ -7,7 +7,8 @@ leases; targeted lookup and pinned-slot checkout are implemented. Full node
 maintenance isolation, runtime/bundle compatibility and generic-runtime history
 validation remain open. This is not release qualification.
 
-Review branch remains frozen at e20cbb76. Implementation base29a745c2 preserves
+The review branch `saga/agents` now carries implementation checkpoint `92ce97f4`.
+The previous review baseline is `e20cbb76`. Implementation base29a745c2 preserves
 all previous Shared/row-state follow-up; it is explicitly unqualified, not a
 release. Implement here, then provide two consolidated review groups.
 

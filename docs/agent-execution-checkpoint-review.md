@@ -1,11 +1,11 @@
 # Execution isolation / targeted access review checkpoint
 
 This is a source-review checkpoint, not a deployment or architectural sign-off.
-`saga/agents` stays frozen at `e20cbb76`; implementation is on
+The implementation checkpoint is `92ce97f4`, now carried on `saga/agents` for
+review. The previous review baseline is `e20cbb76`. Ongoing implementation uses
 `wip/ch08-runtime-directory`. Please report findings without applying fixes.
 
-For this follow-up, review the delta from `29a745c2` to the checkpoint commit
-containing this document. That base preserves earlier unqualified Shared and
+For this follow-up, review the delta `29a745c2..92ce97f4`. That base preserves earlier unqualified Shared and
 row-state work; this checkpoint does not retroactively qualify it. The full
 delta from `e20cbb76` remains much larger than these review changes.
 
