@@ -15,12 +15,13 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use super::sdk::authority::MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES;
 use super::sdk::authority::{
-    AuthorityActorProjection, AuthorityActorProjectionPage, AuthorityActorTarget,
-    AuthorityAgentProjection, AuthorityAgentProjectionPage, AuthorityAgentReplicaProjectionPage,
+    AuthorityActorProjection, AuthorityActorTarget, AuthorityAgentProjection,
     AuthorityCredentialKind, AuthorityCredentialProjection, AuthorityCredentialStatus,
-    AuthorityProjectionHead, AuthorityProjectionQuery, AuthorityProjectionSelector,
-    MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES, MAX_AUTHORITY_REPLICA_PAGE_ENTRIES,
+    AuthorityInventoryEntry, AuthorityInventoryProjectionPage, AuthorityProjectionHead,
+    AuthorityProjectionQuery, AuthorityProjectionSelector, MAX_AUTHORITY_INVENTORY_PAGE_ENTRIES,
 };
 use super::sdk::wire::CanonicalWire;
 use super::sdk::{AgentDescriptor, AgentId, AgentProfile, NodeId, PrincipalId};
@@ -266,82 +267,132 @@ impl CleanAuthorityProjectionClient {
         Ok((query, response))
     }
 
-    fn load_replicas(
+    fn inventory_page(
         &mut self,
-        agent: &AuthorityAgentProjection,
-        head: AuthorityProjectionHead,
-    ) -> Result<Vec<super::sdk::AgentReplica>, AgentProductionOwnerError> {
-        let limit = u16::try_from(MAX_AUTHORITY_REPLICA_PAGE_ENTRIES)
-            .map_err(|_| AgentProductionOwnerError::InventoryLimit)?;
-        // Reply-size bounds may shorten any non-final page. Shape validation
-        // requires every continuation to advance past at least one entry.
-        let maximum_pages = usize::from(agent.replica_count).saturating_add(1);
-        let mut entries = Vec::new();
-        let mut after = None;
-        for _ in 0..maximum_pages {
-            let selector = AuthorityProjectionSelector::AgentReplicas {
-                agent: agent.identity.agent,
+        after: Option<super::sdk::authority::AuthorityInventoryCursor>,
+        known_head: Option<AuthorityProjectionHead>,
+    ) -> Result<AuthorityInventoryProjectionPage, AgentProductionOwnerError> {
+        let (query, page): (_, AuthorityInventoryProjectionPage) =
+            self.query(AuthorityProjectionSelector::Inventory {
                 after,
-                limit,
-            };
-            let (query, page): (_, AuthorityAgentReplicaProjectionPage) = self.query(selector)?;
-            if page.query != query
-                || page.validate_shape().is_err()
-                || !page.matches_agent_at_head(agent, head)
-                || entries
-                    .len()
-                    .checked_add(page.entries.len())
-                    .is_none_or(|count| count > usize::from(agent.replica_count))
-            {
-                return Err(AgentProductionOwnerError::InconsistentHead);
+                limit: MAX_AUTHORITY_INVENTORY_PAGE_ENTRIES as u16,
+                known_head,
+            })?;
+        if page.credential.query != query || page.validate_shape().is_err() {
+            return Err(AgentProductionOwnerError::InvalidProjection);
+        }
+        if page.credential.status != AuthorityCredentialStatus::Active {
+            return Err(AgentProductionOwnerError::RevokedCredential);
+        }
+        if page.credential.kind != self.authenticator.expected_kind() {
+            return Err(AgentProductionOwnerError::WrongCredentialKind);
+        }
+        Ok(page)
+    }
+}
+
+/// Compare complete freshly authenticated claims, not a head or Principal alone.
+/// Nonces, page cursors and signatures vary across calls; their exact query
+/// binding is checked separately before this comparison.
+fn same_inventory_claims(
+    left: &AuthorityCredentialProjection,
+    right: &AuthorityCredentialProjection,
+) -> bool {
+    if left.query.authority != right.query.authority
+        || left.query.credential != right.query.credential
+    {
+        return false;
+    }
+    let mut normalized = left.clone();
+    normalized.query = right.query.clone();
+    normalized == *right
+}
+
+struct PendingInventoryAgent {
+    row: AuthorityAgentProjection,
+    replicas: Vec<super::sdk::AgentReplica>,
+    actors: Vec<AuthorityActorProjection>,
+}
+
+impl PendingInventoryAgent {
+    fn finish(self) -> Result<AgentAuthorityRouteProjection, AgentProductionOwnerError> {
+        let descriptor = self
+            .row
+            .reconstruct_descriptor(self.replicas)
+            .map_err(|_| AgentProductionOwnerError::InvalidProjection)?;
+        AgentAuthorityRouteProjection::new(self.row.replica_generation, descriptor, self.actors)
+            .map_err(|_| AgentProductionOwnerError::InvalidProjection)
+    }
+}
+
+#[derive(Default)]
+struct InventoryAssembly {
+    agents: Vec<AgentAuthorityRouteProjection>,
+    pending: Option<PendingInventoryAgent>,
+}
+
+impl InventoryAssembly {
+    fn push(&mut self, entry: AuthorityInventoryEntry) -> Result<(), AgentProductionOwnerError> {
+        match entry {
+            AuthorityInventoryEntry::Agent(row) => {
+                if self.agents.len() + usize::from(self.pending.is_some()) >= MAX_INVENTORY_AGENTS {
+                    return Err(AgentProductionOwnerError::InventoryLimit);
+                }
+                if let Some(prior) = self.pending.take() {
+                    if prior.row.identity.agent >= row.identity.agent {
+                        return Err(AgentProductionOwnerError::InvalidProjection);
+                    }
+                    self.agents.push(prior.finish()?);
+                }
+                self.pending = Some(PendingInventoryAgent {
+                    row,
+                    replicas: Vec::new(),
+                    actors: Vec::new(),
+                });
             }
-            entries.extend(page.entries);
-            match page.next {
-                None if entries.len() == usize::from(agent.replica_count) => return Ok(entries),
-                None => return Err(AgentProductionOwnerError::InvalidProjection),
-                Some(next) if after != Some(next) => after = Some(next),
-                Some(_) => return Err(AgentProductionOwnerError::InvalidProjection),
+            AuthorityInventoryEntry::Replica { agent, replica } => {
+                let pending = self
+                    .pending
+                    .as_mut()
+                    .ok_or(AgentProductionOwnerError::InvalidProjection)?;
+                if agent != pending.row.identity.agent
+                    || !pending.actors.is_empty()
+                    || pending.replicas.len() >= usize::from(pending.row.replica_count)
+                    || pending
+                        .replicas
+                        .last()
+                        .is_some_and(|last| last.node >= replica.node)
+                {
+                    return Err(AgentProductionOwnerError::InvalidProjection);
+                }
+                pending.replicas.push(replica);
+            }
+            AuthorityInventoryEntry::Actor(actor) => {
+                let pending = self
+                    .pending
+                    .as_mut()
+                    .ok_or(AgentProductionOwnerError::InvalidProjection)?;
+                if actor.agent != pending.row.identity.agent
+                    || pending.replicas.len() != usize::from(pending.row.replica_count)
+                    || pending.actors.len() >= pending.row.capabilities.max_actors as usize
+                    || pending
+                        .actors
+                        .last()
+                        .is_some_and(|last| last.entry.actor >= actor.entry.actor)
+                {
+                    return Err(AgentProductionOwnerError::InvalidProjection);
+                }
+                pending.actors.push(actor);
             }
         }
-        Err(AgentProductionOwnerError::InventoryLimit)
+        Ok(())
     }
 
-    fn load_actors(
-        &mut self,
-        descriptor: &AgentDescriptor,
-        head: AuthorityProjectionHead,
-    ) -> Result<Vec<AuthorityActorProjection>, AgentProductionOwnerError> {
-        let limit = u16::try_from(MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES)
-            .map_err(|_| AgentProductionOwnerError::InventoryLimit)?;
-        let maximum = descriptor.capabilities.max_actors as usize;
-        let maximum_pages = maximum.saturating_add(1);
-        let mut entries = Vec::new();
-        let mut after = None;
-        for _ in 0..maximum_pages {
-            let selector = AuthorityProjectionSelector::Actors {
-                agent: descriptor.identity.agent,
-                after,
-                limit,
-            };
-            let (query, page): (_, AuthorityActorProjectionPage) = self.query(selector)?;
-            if page.query != query
-                || page.validate_shape().is_err()
-                || page.head != head
-                || entries
-                    .len()
-                    .checked_add(page.entries.len())
-                    .is_none_or(|count| count > maximum)
-            {
-                return Err(AgentProductionOwnerError::InconsistentHead);
-            }
-            entries.extend(page.entries);
-            match page.next {
-                None => return Ok(entries),
-                Some(next) if after != Some(next) => after = Some(next),
-                Some(_) => return Err(AgentProductionOwnerError::InvalidProjection),
-            }
+    fn finish(mut self) -> Result<Vec<AgentAuthorityRouteProjection>, AgentProductionOwnerError> {
+        if let Some(pending) = self.pending.take() {
+            self.agents.push(pending.finish()?);
         }
-        Err(AgentProductionOwnerError::InventoryLimit)
+        Ok(self.agents)
     }
 }
 
@@ -351,93 +402,187 @@ impl AuthorityInventorySource for CleanAuthorityProjectionClient {
     }
 
     fn load_inventory(&mut self) -> Result<AgentAuthorityInventory, AgentProductionOwnerError> {
-        // Any failed refresh invalidates reuse, including authentication and
-        // partial pagination errors. No cached value is a fallback on failure.
+        // No failure may leave a usable cache or publish a partially assembled
+        // revision. Durable query recovery/retirement stays in query().
         let previous = self.inventory.take();
-        let (credential_query, credential): (_, AuthorityCredentialProjection) =
-            self.query(AuthorityProjectionSelector::Credential)?;
-        if credential.query != credential_query || credential.validate_shape().is_err() {
-            return Err(AgentProductionOwnerError::InvalidProjection);
-        }
-        if credential.status != AuthorityCredentialStatus::Active {
-            return Err(AgentProductionOwnerError::RevokedCredential);
-        }
-        if credential.kind != self.authenticator.expected_kind() {
-            return Err(AgentProductionOwnerError::WrongCredentialKind);
-        }
-        let head = credential.head;
-        if let Some((mut prior_credential, inventory)) = previous {
-            if prior_credential.query.authority == credential_query.authority
-                && prior_credential.query.credential == credential_query.credential
-                && inventory.head == head
+        let known_head = previous
+            .as_ref()
+            .filter(|(credential, inventory)| {
+                credential.query.authority == self.transport.target()
+                    && credential.head == inventory.head
+            })
+            .map(|(_, inventory)| inventory.head);
+        let mut page = self.inventory_page(None, known_head)?;
+        if let Some((credential, inventory)) = &previous {
+            let same_binding = credential.query.authority == page.credential.query.authority
+                && credential.query.credential == page.credential.query.credential;
+            if same_binding
+                && credential.head == page.credential.head
+                && !same_inventory_claims(credential, &page.credential)
             {
-                // The head commits to the COMPLETE Authority state, advancing
-                // on every mutation. Visibility is a function of that state
-                // and these claims, not the query nonce. Require fresh active
-                // credential authentication above and exact claims below.
-                prior_credential.query = credential_query.clone();
-                if prior_credential != credential {
-                    return Err(AgentProductionOwnerError::InconsistentHead);
-                }
-                self.inventory = Some((credential, inventory.clone()));
+                return Err(AgentProductionOwnerError::InconsistentHead);
+            }
+            if page.unchanged && same_binding && inventory.head == page.credential.head {
+                let inventory = inventory.clone();
+                self.inventory = Some((page.credential, inventory.clone()));
                 tracing::debug!(
-                    "Authority inventory pages reused at freshly authenticated unchanged head"
+                    "Authority inventory reused at freshly authenticated unchanged head"
                 );
                 return Ok(inventory);
             }
         }
-        let limit = u16::try_from(MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES)
-            .map_err(|_| AgentProductionOwnerError::InventoryLimit)?;
-        let maximum_pages = MAX_INVENTORY_AGENTS.saturating_add(1);
-        let mut rows = Vec::new();
-        let mut after = None;
-        let mut complete = false;
-        for _ in 0..maximum_pages {
-            let selector = AuthorityProjectionSelector::Agents { after, limit };
-            let (query, page): (_, AuthorityAgentProjectionPage) = self.query(selector)?;
-            if page.query != query
-                || page.validate_shape().is_err()
-                || page.head != head
-                || rows
-                    .len()
-                    .checked_add(page.entries.len())
-                    .is_none_or(|count| count > MAX_INVENTORY_AGENTS)
-            {
+        if page.unchanged {
+            // An authenticator may rotate credentials between refreshes. The
+            // hint described the old cache, not this credential's visibility.
+            // Fetch a full fresh view; never reuse another credential's rows.
+            page = self.inventory_page(None, None)?;
+        }
+        let credential = page.credential.clone();
+        let mut assembly = InventoryAssembly::default();
+        // Same declared aggregate capacity as the former per-Agent loaders.
+        // Every nonterminal canonical page advances at least one row.
+        let maximum_rows = MAX_INVENTORY_AGENTS.saturating_mul(
+            1 + super::sdk::MAX_AGENT_REPLICAS
+                + super::sdk::RuntimeCapabilities::STANDARD_MAX_ACTORS as usize,
+        );
+        let mut rows = 0usize;
+        loop {
+            if !same_inventory_claims(&credential, &page.credential) || page.unchanged {
                 return Err(AgentProductionOwnerError::InconsistentHead);
             }
-            rows.extend(page.entries);
+            rows = rows
+                .checked_add(page.entries.len())
+                .filter(|rows| *rows <= maximum_rows)
+                .ok_or(AgentProductionOwnerError::InventoryLimit)?;
+            for entry in page.entries {
+                assembly.push(entry)?;
+            }
             match page.next {
-                None => {
-                    complete = true;
-                    break;
-                }
-                Some(next) if after != Some(next) => after = Some(next),
-                Some(_) => return Err(AgentProductionOwnerError::InvalidProjection),
+                Some(next) => page = self.inventory_page(Some(next), None)?,
+                None => break,
             }
         }
-        if !complete {
-            return Err(AgentProductionOwnerError::InventoryLimit);
-        }
-
-        let mut agents = Vec::with_capacity(rows.len());
-        for row in rows {
-            let replicas = self.load_replicas(&row, head)?;
-            let descriptor = row
-                .reconstruct_descriptor(replicas)
-                .map_err(|_| AgentProductionOwnerError::InvalidProjection)?;
-            let actors = self.load_actors(&descriptor, head)?;
-            agents.push(
-                AgentAuthorityRouteProjection::new(row.replica_generation, descriptor, actors)
-                    .map_err(|_| AgentProductionOwnerError::InvalidProjection)?,
-            );
-        }
         let inventory = AgentAuthorityInventory {
-            head,
+            head: credential.head,
             principal: credential.principal,
-            agents,
+            agents: assembly.finish()?,
         };
         self.inventory = Some((credential, inventory.clone()));
         Ok(inventory)
+    }
+}
+
+/// Shared source-test transport fixture; never used to authenticate production
+/// data. Mirrors the public stream shape without decoding runtime-private state.
+#[cfg(test)]
+pub(crate) fn inventory_page_fixture(
+    query: AuthorityProjectionQuery,
+    head: AuthorityProjectionHead,
+    principal: PrincipalId,
+    descriptors: &[AgentDescriptor],
+    actors: &[AuthorityActorProjection],
+    page_cap: usize,
+) -> Result<Vec<u8>, AgentProductionOwnerError> {
+    use super::sdk::authority::{AuthorityBuiltinRole, AuthorityIngressAuthentication};
+    let AuthorityProjectionSelector::Inventory {
+        after,
+        limit,
+        known_head,
+    } = query.selector
+    else {
+        return Err(AgentProductionOwnerError::InvalidProjection);
+    };
+    let unchanged = after.is_none() && known_head == Some(head);
+    let kind = match query.authentication {
+        AuthorityIngressAuthentication::ApiCredentialSignature { .. } => {
+            AuthorityCredentialKind::Api
+        }
+        AuthorityIngressAuthentication::SshNodeAttestation { .. } => AuthorityCredentialKind::Ssh,
+    };
+    let mut page = AuthorityInventoryProjectionPage {
+        credential: AuthorityCredentialProjection {
+            query,
+            head,
+            principal,
+            status: AuthorityCredentialStatus::Active,
+            kind,
+            builtin_role: AuthorityBuiltinRole::Admin,
+            management_request_high_water: 0,
+            operation_request_high_water: 0,
+            admin_request_high_water: 0,
+            space_roles: Vec::new(),
+            actor_roles: Vec::new(),
+            capabilities: Vec::new(),
+        },
+        unchanged,
+        entries: Vec::new(),
+        next: None,
+    };
+    let mut more = false;
+    if !unchanged {
+        let mut ordered: Vec<_> = descriptors.iter().collect();
+        ordered.sort_by_key(|descriptor| descriptor.identity.agent);
+        let mut complex = 0;
+        'agents: for descriptor in ordered
+            .into_iter()
+            .filter(|descriptor| after.is_none_or(|after| descriptor.identity.agent >= after.agent))
+        {
+            let row = AuthorityInventoryEntry::Agent(AuthorityAgentProjection {
+                identity: descriptor.identity.clone(),
+                creation_nonce: descriptor.creation_nonce,
+                authority: descriptor.authority,
+                private_recovery: descriptor.private_recovery,
+                runtime_package: descriptor.runtime_package.clone(),
+                runtime_contract: descriptor.runtime_contract,
+                capabilities: descriptor.capabilities,
+                replica_count: descriptor.replicas.len() as u16,
+                replica_generation: descriptor.replica_generation(),
+            });
+            let mut actor_rows: Vec<_> = actors
+                .iter()
+                .filter(|actor| actor.agent == descriptor.identity.agent)
+                .collect();
+            actor_rows.sort_by_key(|actor| actor.entry.actor);
+            let rows = std::iter::once(row)
+                .chain(descriptor.replicas.iter().cloned().map(|replica| {
+                    AuthorityInventoryEntry::Replica {
+                        agent: descriptor.identity.agent,
+                        replica,
+                    }
+                }))
+                .chain(
+                    actor_rows
+                        .into_iter()
+                        .cloned()
+                        .map(AuthorityInventoryEntry::Actor),
+                );
+            for entry in rows.filter(|entry| after.is_none_or(|after| entry.cursor() > after)) {
+                let is_complex = !matches!(entry, AuthorityInventoryEntry::Replica { .. });
+                if page.entries.len() == usize::from(limit).min(page_cap)
+                    || is_complex && complex == MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES
+                {
+                    more = true;
+                    break 'agents;
+                }
+                complex += usize::from(is_complex);
+                page.entries.push(entry);
+            }
+        }
+    }
+    loop {
+        if more && page.entries.is_empty() {
+            return Err(AgentProductionOwnerError::InvalidProjection);
+        }
+        page.next = more
+            .then(|| page.entries.last().map(AuthorityInventoryEntry::cursor))
+            .flatten();
+        if let Ok(bytes) = page.encode() {
+            return Ok(bytes);
+        }
+        if page.entries.pop().is_none() {
+            return Err(AgentProductionOwnerError::InvalidProjection);
+        }
+        more = true;
     }
 }
 
@@ -445,6 +590,7 @@ impl AuthorityInventorySource for CleanAuthorityProjectionClient {
 pub(crate) fn load_system_inventory_for_test(
     attachment: &AgentRouteHostAttachment,
     authenticator: Box<dyn AuthorityProjectionQueryAuthenticator>,
+    full_refreshes: usize,
 ) -> Result<
     (
         AuthorityProjectionHead,
@@ -457,11 +603,22 @@ pub(crate) fn load_system_inventory_for_test(
     let target = handle
         .authority_target()
         .map_err(|_| AgentProductionOwnerError::ProjectionTransport)?;
-    let inventory = CleanAuthorityProjectionClient::new(
+    let mut client = CleanAuthorityProjectionClient::new(
         Box::new(SystemAgentProjectionTransport { target, handle }),
         authenticator,
-    )
-    .load_inventory()?;
+    );
+    let mut inventory = None;
+    for _ in 0..full_refreshes {
+        // Stress the public paging/retirement path beyond the journal suffix
+        // capacity, independently of the unchanged-head cache optimization.
+        client.inventory = None;
+        let current = client.load_inventory()?;
+        if inventory.as_ref().is_some_and(|prior| prior != &current) {
+            return Err(AgentProductionOwnerError::InconsistentHead);
+        }
+        inventory = Some(current);
+    }
+    let inventory = inventory.ok_or(AgentProductionOwnerError::InvalidProjection)?;
     Ok((inventory.head, inventory.principal, inventory.agents))
 }
 
@@ -1760,134 +1917,33 @@ mod tests {
             query: AuthorityProjectionQuery,
         ) -> Result<Vec<u8>, AgentProductionOwnerError> {
             self.calls.lock().unwrap().push(query.selector);
-            let bytes = match query.selector {
-                AuthorityProjectionSelector::Inventory { .. } => {
-                    return Err(AgentProductionOwnerError::InvalidProjection);
-                }
-                AuthorityProjectionSelector::Credential => AuthorityCredentialProjection {
-                    query,
-                    head: self.head,
-                    principal: PrincipalId([0xb1; 32]),
-                    status: AuthorityCredentialStatus::Active,
-                    kind: AuthorityCredentialKind::Api,
-                    builtin_role: AuthorityBuiltinRole::Admin,
-                    management_request_high_water: 0,
-                    operation_request_high_water: 0,
-                    admin_request_high_water: 0,
-                    space_roles: Vec::new(),
-                    actor_roles: Vec::new(),
-                    capabilities: Vec::new(),
-                }
-                .encode(),
-                AuthorityProjectionSelector::Agents { after, limit } => {
-                    let entries = self
-                        .descriptors
-                        .iter()
-                        .filter(|descriptor| {
-                            after.is_none_or(|after| descriptor.identity.agent > after)
-                        })
-                        .take(usize::from(limit).min(self.page_cap))
-                        .map(|descriptor| AuthorityAgentProjection {
-                            identity: descriptor.identity.clone(),
-                            creation_nonce: descriptor.creation_nonce,
-                            authority: descriptor.authority,
-                            private_recovery: descriptor.private_recovery,
-                            runtime_package: descriptor.runtime_package.clone(),
-                            runtime_contract: descriptor.runtime_contract,
-                            capabilities: descriptor.capabilities,
-                            replica_count: descriptor.replicas.len() as u16,
-                            replica_generation: descriptor.replica_generation(),
-                        })
-                        .collect::<Vec<_>>();
-                    let more = entries.last().is_some_and(|last| {
-                        self.descriptors
-                            .iter()
-                            .any(|descriptor| descriptor.identity.agent > last.identity.agent)
-                    });
-                    let next = more.then(|| {
-                        entries
-                            .last()
-                            .expect("continued page is nonempty")
-                            .identity
-                            .agent
-                    });
-                    AuthorityAgentProjectionPage {
-                        query,
-                        head: self.head,
-                        entries,
-                        next,
-                    }
-                    .encode()
-                }
-                AuthorityProjectionSelector::AgentReplicas {
-                    agent,
-                    after,
-                    limit,
-                } => {
-                    let descriptor = self
-                        .descriptors
-                        .iter()
-                        .find(|descriptor| descriptor.identity.agent == agent)
-                        .unwrap();
-                    let entries: Vec<_> = descriptor
-                        .replicas
-                        .iter()
-                        .filter(|replica| after.is_none_or(|after| replica.node > after))
-                        .take(usize::from(limit).min(self.page_cap))
-                        .cloned()
-                        .collect();
-                    let next = entries
-                        .last()
-                        .filter(|last| {
-                            descriptor
-                                .replicas
-                                .iter()
-                                .any(|replica| replica.node > last.node)
-                        })
-                        .map(|last| last.node);
-                    AuthorityAgentReplicaProjectionPage {
-                        query,
-                        head: self.head,
-                        replica_count: descriptor.replicas.len() as u16,
-                        replica_generation: descriptor.replica_generation(),
-                        entries,
-                        next,
-                    }
-                    .encode()
-                }
-                AuthorityProjectionSelector::Actors {
-                    agent,
-                    after,
-                    limit,
-                } => {
-                    let entries: Vec<_> = self
-                        .actors
-                        .iter()
-                        .filter(|actor| {
-                            actor.agent == agent
-                                && after.is_none_or(|after| actor.entry.actor > after)
-                        })
-                        .take(usize::from(limit).min(self.page_cap))
-                        .cloned()
-                        .collect();
-                    let next = entries
-                        .last()
-                        .filter(|last| {
-                            self.actors.iter().any(|actor| {
-                                actor.agent == agent && actor.entry.actor > last.entry.actor
-                            })
-                        })
-                        .map(|last| last.entry.actor);
-                    AuthorityActorProjectionPage {
-                        query,
-                        head: self.actor_head,
-                        entries,
-                        next,
-                    }
-                    .encode()
-                }
-            };
-            bytes.map_err(|_| AgentProductionOwnerError::InvalidProjection)
+            let changing = self.head != self.actor_head;
+            let continuation = matches!(
+                query.selector,
+                AuthorityProjectionSelector::Inventory { after: Some(_), .. }
+            );
+            inventory_page_fixture(
+                query,
+                if changing && continuation {
+                    self.actor_head
+                } else {
+                    self.head
+                },
+                PrincipalId([0xb1; 32]),
+                &self.descriptors,
+                &self.actors,
+                if changing { 1 } else { self.page_cap },
+            )
+        }
+    }
+
+    fn inventory_selector(
+        known_head: Option<AuthorityProjectionHead>,
+    ) -> AuthorityProjectionSelector {
+        AuthorityProjectionSelector::Inventory {
+            after: None,
+            limit: MAX_AUTHORITY_INVENTORY_PAGE_ENTRIES as u16,
+            known_head,
         }
     }
 
@@ -1917,6 +1973,130 @@ mod tests {
     }
 
     #[test]
+    fn inventory_stream_rejects_incomplete_or_substituted_rows_without_reusing_cache() {
+        struct HostileTransport {
+            inner: ProjectionTransport,
+            mode: Arc<std::sync::atomic::AtomicU8>,
+        }
+        impl AuthorityProjectionTransport for HostileTransport {
+            fn target(&self) -> AuthorityActorTarget {
+                self.inner.target()
+            }
+            fn dispatch(
+                &mut self,
+                query: AuthorityProjectionQuery,
+            ) -> Result<Vec<u8>, AgentProductionOwnerError> {
+                let mode = self.mode.load(Ordering::Acquire);
+                if mode != 0 {
+                    self.inner.head = head(2);
+                    self.inner.actor_head = head(2);
+                }
+                self.inner.page_cap = if mode >= 8 { 1 } else { usize::MAX };
+                let continuation = matches!(
+                    query.selector,
+                    AuthorityProjectionSelector::Inventory { after: Some(_), .. }
+                );
+                if mode == 9 && continuation {
+                    return Err(AgentProductionOwnerError::ProjectionTransport);
+                }
+                let bytes = self.inner.dispatch(query)?;
+                let mut page = AuthorityInventoryProjectionPage::decode(&bytes).unwrap();
+                match mode {
+                    1 => {
+                        page.entries.remove(0);
+                    }
+                    2 => page
+                        .entries
+                        .retain(|entry| !matches!(entry, AuthorityInventoryEntry::Replica { .. })),
+                    3 => {
+                        let AuthorityInventoryEntry::Replica { replica, .. } = &mut page.entries[1]
+                        else {
+                            unreachable!()
+                        };
+                        replica.node = NodeId([0xfe; 32]); // wrong committed roster
+                    }
+                    4 => {
+                        let mut extra = page.entries[1].clone();
+                        let AuthorityInventoryEntry::Replica { replica, .. } = &mut extra else {
+                            unreachable!()
+                        };
+                        replica.node = NodeId([0xfe; 32]);
+                        page.entries.insert(2, extra); // exceeds replica_count
+                    }
+                    5 => {
+                        let AuthorityInventoryEntry::Actor(actor) = &mut page.entries[2] else {
+                            unreachable!()
+                        };
+                        actor.agent = AgentId([0xff; 32]);
+                    }
+                    6 => {
+                        let AuthorityInventoryEntry::Agent(row) = &mut page.entries[0] else {
+                            unreachable!()
+                        };
+                        row.capabilities.max_actors = 1;
+                        let mut extra = page.entries[2].clone();
+                        let AuthorityInventoryEntry::Actor(actor) = &mut extra else {
+                            unreachable!()
+                        };
+                        actor.entry.actor = super::super::sdk::ActorId([0xfe; 32]);
+                        actor.entry.name = "extra".into();
+                        page.entries.push(extra);
+                        page.entries.sort_by_key(AuthorityInventoryEntry::cursor);
+                    }
+                    7 => page.credential.query.nonce = super::super::sdk::Hash([0xee; 32]),
+                    8 if continuation => page.credential.operation_request_high_water += 1,
+                    10 => {
+                        if let Some(AuthorityInventoryEntry::Agent(row)) = page.entries.first() {
+                            // Canonical, terminal descriptor-only page: a
+                            // producer cannot make a missing roster look done.
+                            page.entries = vec![AuthorityInventoryEntry::Agent(row.clone())];
+                            page.next = None;
+                        }
+                    }
+                    _ => {}
+                }
+                page.encode()
+                    .map_err(|_| AgentProductionOwnerError::InvalidProjection)
+            }
+        }
+        for fault in 1..=10 {
+            let descriptor = descriptor(1, AgentProfile::Shared, NodeId([0x31; 32]));
+            let actors = vec![actor(&descriptor, true)];
+            let mode = Arc::new(std::sync::atomic::AtomicU8::new(0));
+            let mut source = CleanAuthorityProjectionClient::new(
+                Box::new(HostileTransport {
+                    inner: ProjectionTransport {
+                        target: target(),
+                        head: head(1),
+                        actor_head: head(1),
+                        descriptors: vec![descriptor],
+                        actors,
+                        calls: Arc::new(Mutex::new(Vec::new())),
+                        page_cap: usize::MAX,
+                    },
+                    mode: mode.clone(),
+                }),
+                Box::new(TestAuthenticator { ordinal: 0 }),
+            );
+            source.load_inventory().unwrap();
+            assert!(source.inventory.is_some());
+            mode.store(fault, Ordering::Release);
+            let expected = match fault {
+                8 => AgentProductionOwnerError::InconsistentHead,
+                9 => AgentProductionOwnerError::ProjectionTransport,
+                _ => AgentProductionOwnerError::InvalidProjection,
+            };
+            assert_eq!(source.load_inventory(), Err(expected), "fault {fault}");
+            assert!(
+                source.inventory.is_none(),
+                "fault {fault} retained stale inventory"
+            );
+            mode.store(0, Ordering::Release);
+            assert_eq!(source.load_inventory().unwrap().head, head(2));
+        }
+    }
+
+    #[test]
     fn inventory_reuse_requires_fresh_credential_and_exact_complete_head() {
         let node = NodeId([0x31; 32]);
         let descriptor = descriptor(1, AgentProfile::Shared, node);
@@ -1924,12 +2104,12 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mut source = client(vec![descriptor], vec![actor], head(1), calls.clone());
         let original = source.load_inventory().unwrap();
-        assert_eq!(calls.lock().unwrap().len(), 4);
+        assert_eq!(calls.lock().unwrap().len(), 1);
         assert_eq!(source.load_inventory().unwrap(), original);
-        assert_eq!(calls.lock().unwrap().len(), 5);
+        assert_eq!(calls.lock().unwrap().len(), 2);
         assert_eq!(
             calls.lock().unwrap().last(),
-            Some(&AuthorityProjectionSelector::Credential)
+            Some(&inventory_selector(Some(head(1))))
         );
 
         // Neither another Authority target nor another credential may reuse
@@ -1943,14 +2123,14 @@ mod tests {
             .authority
             .system_agent = AgentId([0x91; 32]);
         assert_eq!(source.load_inventory().unwrap(), original);
-        assert_eq!(calls.lock().unwrap().len(), 9);
+        assert_eq!(calls.lock().unwrap().len(), 3);
         source.inventory.as_mut().unwrap().0.query.credential =
             super::super::sdk::CredentialId([0x92; 32]);
         assert_eq!(source.load_inventory().unwrap(), original);
-        assert_eq!(calls.lock().unwrap().len(), 13);
+        assert_eq!(calls.lock().unwrap().len(), 5);
         source.inventory.as_mut().unwrap().1.head = head(2);
         assert_eq!(source.load_inventory().unwrap(), original);
-        assert_eq!(calls.lock().unwrap().len(), 17);
+        assert_eq!(calls.lock().unwrap().len(), 6);
 
         // Equal head with contradictory claims is invalid, not a cache hit
         // and not an excuse to return previously authorized pages.
@@ -1961,7 +2141,7 @@ mod tests {
         );
         assert!(source.inventory.is_none());
         assert_eq!(source.load_inventory().unwrap(), original);
-        assert_eq!(calls.lock().unwrap().len(), 22);
+        assert_eq!(calls.lock().unwrap().len(), 8);
     }
 
     #[test]
@@ -2003,13 +2183,14 @@ mod tests {
         let original = source.load_inventory().unwrap();
         assert_eq!(original.agents.len(), 2);
         let initial_queries = calls.lock().unwrap().clone();
-        // Credential + Agents + (Replicas + Actors) for each Agent.
-        assert_eq!(initial_queries.len(), 6);
+        // Credential + both descriptors, replica sets and actor sets in one
+        // bounded execution, versus six independent calls before the cutover.
+        assert_eq!(initial_queries, vec![inventory_selector(None)]);
         calls.lock().unwrap().clear();
         assert_eq!(source.load_inventory().unwrap(), original);
         assert_eq!(
             *calls.lock().unwrap(),
-            vec![AuthorityProjectionSelector::Credential]
+            vec![inventory_selector(Some(head(1)))]
         );
 
         // Change the transport's real state, not the client's cached head.
@@ -2022,7 +2203,10 @@ mod tests {
         }
         calls.lock().unwrap().clear();
         let refreshed = source.load_inventory().unwrap();
-        assert_eq!(*calls.lock().unwrap(), initial_queries);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![inventory_selector(Some(head(1)))]
+        );
         assert_eq!(refreshed.head, head(2));
         let mut expected = original;
         expected.head = head(2);
@@ -2038,7 +2222,7 @@ mod tests {
         assert_eq!(source.load_inventory().unwrap(), refreshed);
         assert_eq!(
             *calls.lock().unwrap(),
-            vec![AuthorityProjectionSelector::Credential]
+            vec![inventory_selector(Some(head(2)))]
         );
     }
 
@@ -2057,7 +2241,7 @@ mod tests {
                 &mut self,
                 query: AuthorityProjectionQuery,
             ) -> Result<Vec<u8>, AgentProductionOwnerError> {
-                let stop = matches!(query.selector, AuthorityProjectionSelector::Agents { .. })
+                let stop = matches!(query.selector, AuthorityProjectionSelector::Inventory { after: Some(_), .. })
                     && self.armed.load(Ordering::Acquire);
                 let result = self.inner.dispatch(query);
                 if stop {
@@ -2075,7 +2259,7 @@ mod tests {
         let mut source = CleanAuthorityProjectionClient::new(
             Box::new(StoppingTransport {
                 inner: ProjectionTransport {
-                    page_cap: usize::MAX,
+                    page_cap: 1,
                     target: target(),
                     head: head(1),
                     actor_head: head(1),
@@ -2138,15 +2322,16 @@ mod tests {
                     self.inner.head = head(2);
                     self.inner.actor_head = head(2);
                 }
-                let is_credential = query.selector == AuthorityProjectionSelector::Credential;
                 let bytes = self.inner.dispatch(query)?;
-                if !is_credential {
-                    return Ok(bytes);
-                }
-                let mut projection = AuthorityCredentialProjection::decode(&bytes).unwrap();
+                let mut projection = AuthorityInventoryProjectionPage::decode(&bytes).unwrap();
                 match mode {
-                    1 => projection.status = AuthorityCredentialStatus::Revoked,
-                    2 => projection.kind = AuthorityCredentialKind::Ssh,
+                    1 => {
+                        projection.credential.status = AuthorityCredentialStatus::Revoked;
+                        projection.unchanged = false;
+                        projection.entries.clear();
+                        projection.next = None;
+                    }
+                    2 => projection.credential.kind = AuthorityCredentialKind::Ssh,
                     _ => {}
                 }
                 projection
@@ -2186,14 +2371,14 @@ mod tests {
             mode.store(0, Ordering::Relaxed);
             let before = calls.lock().unwrap().len();
             source.load_inventory().unwrap();
-            assert_eq!(calls.lock().unwrap().len(), before + 4);
+            assert_eq!(calls.lock().unwrap().len(), before + 1);
         }
         mode.store(4, Ordering::Relaxed);
         let before = calls.lock().unwrap().len();
         assert_eq!(source.load_inventory().unwrap().head, head(2));
-        assert_eq!(calls.lock().unwrap().len(), before + 4);
+        assert_eq!(calls.lock().unwrap().len(), before + 1);
         source.load_inventory().unwrap();
-        assert_eq!(calls.lock().unwrap().len(), before + 5);
+        assert_eq!(calls.lock().unwrap().len(), before + 2);
     }
 
     #[test]
@@ -2483,10 +2668,10 @@ mod tests {
             assert_eq!(owner.drive_if_due(admitted), Ok(true));
         }
         assert!(owner.reconcile_after >= before + interval);
-        assert_eq!(calls.lock().unwrap().len(), 4);
+        assert_eq!(calls.lock().unwrap().len(), 1);
         assert!(owner.is_ready());
         assert_eq!(owner.drive_if_due(before), Ok(false));
-        assert_eq!(calls.lock().unwrap().len(), 4);
+        assert_eq!(calls.lock().unwrap().len(), 1);
         assert!(owner.completed_local_publication.is_none());
         assert!(owner.completed_local_install.is_none());
         owner.completed_local_install = completed_install;
@@ -2593,11 +2778,11 @@ mod tests {
                 .collect();
             assert_eq!(row.actors(), expected_actors);
         }
-        assert_eq!(calls.lock().unwrap().len(), 1 + 3 + 3 * (3 + 3));
+        assert_eq!(calls.lock().unwrap().len(), 3 * (1 + 3 + 3));
         // An authenticated unchanged-head refresh still reuses the complete
         // inventory only after a new credential query succeeds.
         assert_eq!(source.load_inventory().unwrap(), inventory);
-        assert_eq!(calls.lock().unwrap().len(), 23);
+        assert_eq!(calls.lock().unwrap().len(), 22);
     }
 
     #[test]
@@ -2617,7 +2802,7 @@ mod tests {
         assert_eq!(inventory.agents.len(), 1);
         assert_eq!(inventory.agents[0].descriptor(), &system_descriptor);
         assert_eq!(inventory.agents[0].actors(), &[actor]);
-        assert_eq!(calls.lock().unwrap().len(), 4);
+        assert_eq!(calls.lock().unwrap().len(), 1);
 
         let changed_head_calls = Arc::new(Mutex::new(Vec::new()));
         assert_eq!(
@@ -2630,7 +2815,7 @@ mod tests {
             .load_inventory(),
             Err(AgentProductionOwnerError::InconsistentHead)
         );
-        assert_eq!(changed_head_calls.lock().unwrap().len(), 4);
+        assert_eq!(changed_head_calls.lock().unwrap().len(), 2);
 
         let mut descriptors = (0..=MAX_INVENTORY_AGENTS as u64)
             .map(|index| descriptor(index + 10, AgentProfile::Shared, node))
@@ -2639,11 +2824,11 @@ mod tests {
         let bounded_calls = Arc::new(Mutex::new(Vec::new()));
         assert_eq!(
             client(descriptors, Vec::new(), head(1), bounded_calls.clone()).load_inventory(),
-            Err(AgentProductionOwnerError::InconsistentHead)
+            Err(AgentProductionOwnerError::InventoryLimit)
         );
         assert_eq!(
             bounded_calls.lock().unwrap().len(),
-            1 + MAX_INVENTORY_AGENTS.div_ceil(MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES) + 1
+            MAX_INVENTORY_AGENTS.div_ceil(MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES) + 1
         );
     }
 }

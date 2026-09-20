@@ -178,7 +178,7 @@ Journal store identity binds canonical path and lock nonce; both focused tests
 pass in `resolved-store-identity.log`. Directory relocation is not a qualified
 backup/restore workflow.
 
-### Combined inventory projection: staged source, not enabled
+### Combined inventory projection: host source cutover, bundle integration pending
 
 The SDK and system-authority actor now define a signed `Inventory` selector and
 `AIP1` page: fresh credential claims, one complete Authority head, and a cursor
@@ -190,33 +190,50 @@ the existing 16 KiB reply ceiling including its five-byte actor wrapper.
 This preserves dense-roster paging while combining small inventories. The actor
 still validates/reconstructs whole state; this is not touched-state execution.
 
-The production client has **not switched** from its existing separate queries.
-Old-query test transports explicitly refuse the new selector until their
-cutover tests are added. Runtime projection-retirement recognition and method
-dispatch know the new selector; bundled artifacts remain unchanged. Host
-reconstruction, cache/failure behavior, physical query/retirement/recovery,
-reproduced runtime/templates and integrated performance are required before
-enabling this batch or advancing it to the reviewer branch.
+The production client now reconstructs this stream; its old per-Agent replica
+and actor fetch loops are removed. Complete descriptors, roster counts and
+generations, actor ownership/capacity, exact query binding and unchanged claims
+at one head are checked before publishing an inventory. Every failed refresh
+clears reuse. Credential rotation during an unchanged-head request fetches a
+full new view rather than reusing another credential's rows.
+
+**The implementation source now requires the new endpoint, but its bundled
+Authority template is still the previous version. Do not deploy this source
+checkpoint yet.** Reproduce and integrate matched runtime/templates, qualify
+physical query/retirement/recovery and rerun the CLI campaign before advancing
+the reviewer branch. Existing `saga/agents` remains the fixed usable Local test
+checkpoint; the previous implementation CLI evidence does not qualify this cutover.
 
 Source evidence: 182 SDK tests (`inventory-stream-sdk-final.log`), 75 Authority
 tests with two opt-in tests ignored (`inventory-stream-authority-final.log`),
-17 existing inventory-owner regressions (`inventory-stream-owner-final.log`)
-and 52 Standard tests (`inventory-stream-standard-final.log`) pass. Coverage
+18 inventory-owner tests (`inventory-host-owner.log`), 31 adapter tests
+(`inventory-host-adapters.log`) and 52 Standard foundation tests
+(`inventory-stream-standard-final.log`) pass. Coverage
 includes canonical/truncated/oversized wire refusal, separate row/byte budgets,
 dense rosters, complete paged reconstruction, Private filtering, signature
 substitution, fresh cache hits, changed-head continuation, revocation and actor
 restart. The no-std Authority guest builds (`inventory-stream-authority-guest-final.log`);
 it is not yet a reproduced/pinned bundled artifact or a physical performance result.
+The two-Agent host fixture requires one dispatch instead of six. Host failures
+cover missing descriptors/replicas, altered or excess replicas, foreign/extra
+actors, query substitution, mid-page claim changes, transport errors and a
+premature terminal page. These source tests do not measure released latency.
+The updated long journal regression passes in 212.73s
+(`inventory-host-suffix-rotation.log`): 17 full 241-Agent refreshes, 31 pages each,
+527 distinct signed queries and 1,054 ordered entries. It checks complete
+inventory equality, exact retirement, bounded retained suffix and repeated
+checkpoint rotation, with no pending projection left. This uses native Standard
+execution and a purpose-built projection actor PVM, not the compiled production
+Authority artifact. CLI source checking passes (`inventory-host-cli-check.log`).
 
 ## Next sequence
 
 1. Reviewer examines `c8028394..saga/agents` read-only and returns findings;
    implementation applies fixes on latest source.
-2. The immutable-resolution source, reproduced runtime and integrated Local
-   lifecycle evidence above are ready for the next scoped review handoff.
-   Keep the current reviewer branch fixed until that handoff; apply returned
-   findings on latest implementation. Remaining repeated validation and total
-   request cost still need measurement.
+2. Keep the current reviewer branch fixed while completing the combined
+   inventory batch. The next scoped handoff should include immutable-resolution
+   reuse plus the inventory cutover and matched reproduced artifacts, with a
+   fresh lifecycle/performance campaign. Apply returned findings on latest source.
 3. Reduce authenticated inventory projection work with explicit revision,
    freshness, availability and ordering. Preserve same-head pagination, cache
    invalidation on refresh failure and durable retirement; no custom-state decoding

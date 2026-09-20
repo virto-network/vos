@@ -5678,12 +5678,10 @@ mod tests {
             admitted_standard_actor_for_test,
         };
         use crate::agent::sdk::authority::{
-            AuthorityActorProjectionPage, AuthorityAgentProjection, AuthorityAgentProjectionPage,
-            AuthorityAgentReplicaProjectionPage, AuthorityBuiltinRole, AuthorityCredentialKind,
-            AuthorityCredentialProjection, AuthorityCredentialStatus, AuthorityEvidence,
-            AuthorityIngressAuthentication, AuthorityLaneRoots, AuthorityProjectionHead,
-            AuthorityReceiptSelector, MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES,
-            MAX_AUTHORITY_REPLICA_PAGE_ENTRIES,
+            AuthorityBuiltinRole, AuthorityCredentialKind, AuthorityCredentialProjection,
+            AuthorityCredentialStatus, AuthorityEvidence, AuthorityIngressAuthentication,
+            AuthorityLaneRoots, AuthorityProjectionHead, AuthorityReceiptSelector,
+            MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES,
         };
         use crate::agent::sdk::contract::{ActorPackageContract, RuntimePackageContract};
         use crate::agent::sdk::introspection::{
@@ -6652,20 +6650,6 @@ mod tests {
             descriptor
         }
 
-        fn inventory_agent_row(descriptor: &AgentDescriptor) -> AuthorityAgentProjection {
-            AuthorityAgentProjection {
-                identity: descriptor.identity.clone(),
-                creation_nonce: descriptor.creation_nonce,
-                authority: descriptor.authority,
-                private_recovery: descriptor.private_recovery,
-                runtime_package: descriptor.runtime_package.clone(),
-                runtime_contract: descriptor.runtime_contract,
-                capabilities: descriptor.capabilities,
-                replica_count: descriptor.replicas.len() as u16,
-                replica_generation: descriptor.replica_generation(),
-            }
-        }
-
         fn projection_actor_case<T: CanonicalWire>(
             query: AuthorityProjectionQuery,
             response: &T,
@@ -6759,7 +6743,7 @@ mod tests {
             }
         }
 
-        /// Compact purpose PVM for the real 514-query inventory regression.
+        /// Compact purpose PVM for the real multi-refresh inventory regression.
         /// It retains one response template per wire shape and one 96-byte row
         /// (Agent ID, creation nonce, replica generation) per advertised Agent.
         /// Query authentication and response validation still traverse the real
@@ -6901,18 +6885,26 @@ mod tests {
             }
         }
 
-        fn agent_page_table_copies(
+        fn inventory_page_table_copies(
             case: &ProjectionActorCase,
-            page: &AuthorityAgentProjectionPage,
+            page: &crate::agent_sdk::authority::AuthorityInventoryProjectionPage,
         ) -> Vec<ProjectionTableCopy> {
             let mut copies = Vec::with_capacity(page.entries.len() * 3);
-            for (index, entry) in page.entries.iter().enumerate() {
+            for (index, entry) in page
+                .entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    crate::agent_sdk::authority::AuthorityInventoryEntry::Agent(row) => Some(row),
+                    _ => None,
+                })
+                .enumerate()
+            {
                 let source = index * INVENTORY_DESCRIPTOR_ROW_BYTES;
                 copies.push(projection_table_copy(
                     &case.output,
                     &entry.identity.agent.0,
                     source,
-                    1 + usize::from(page.next == Some(entry.identity.agent)),
+                    2 + usize::from(page.next.is_some_and(|cursor| cursor.agent == entry.identity.agent)),
                 ));
                 copies.push(projection_table_copy(
                     &case.output,
@@ -6973,10 +6965,6 @@ mod tests {
                 table_copies: Vec::new(),
             };
 
-            let rows = descriptors
-                .iter()
-                .map(inventory_agent_row)
-                .collect::<Vec<_>>();
             let mut descriptor_table =
                 Vec::with_capacity(descriptors.len() * INVENTORY_DESCRIPTOR_ROW_BYTES);
             for descriptor in descriptors {
@@ -6984,33 +6972,32 @@ mod tests {
                 descriptor_table.extend_from_slice(&descriptor.creation_nonce.0);
                 descriptor_table.extend_from_slice(&descriptor.replica_generation().0);
             }
-            let mut agent_page_routines = Vec::new();
+            let mut routines = Vec::new();
             let mut after = None;
-            for (page_index, chunk) in rows
-                .chunks(MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES)
-                .enumerate()
-            {
-                let more = (page_index + 1) * MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES < rows.len();
-                let next = more.then(|| chunk.last().unwrap().identity.agent);
+            loop {
+                let page_index = routines.len();
                 let query = inventory_template_query(
                     target,
-                    AuthorityProjectionSelector::Agents {
-                        after,
-                        limit: MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES as u16,
+                    AuthorityProjectionSelector::Inventory {
+                        after, limit: 64, known_head: None,
                     },
-                    2,
-                    u8::try_from(page_index + 1).unwrap(),
+                    5, u8::try_from(page_index + 1).unwrap(),
                 );
-                let page = AuthorityAgentProjectionPage {
-                    query: query.clone(),
+                let bytes = crate::agent::production_owner::inventory_page_fixture(
+                    query.clone(),
                     head,
-                    entries: chunk.to_vec(),
-                    next,
-                };
-                page.validate_shape().unwrap();
+                    PrincipalId([0xb1; 32]),
+                    descriptors,
+                    &[],
+                    usize::MAX,
+                )
+                .unwrap();
+                let page =
+                    crate::agent_sdk::authority::AuthorityInventoryProjectionPage::decode(&bytes)
+                        .unwrap();
                 let case = projection_actor_case(query, &page, target.binding);
-                let table_copies = agent_page_table_copies(&case, &page);
-                agent_page_routines.push(ProjectionActorRoutine {
+                let table_copies = inventory_page_table_copies(&case, &page);
+                routines.push(ProjectionActorRoutine {
                     case,
                     table_sources: vec![(
                         u8::try_from(page_index + 1).unwrap(),
@@ -7020,109 +7007,24 @@ mod tests {
                     )],
                     table_copies,
                 });
-                after = next;
+                after = page.next;
+                if after.is_none() {
+                    break;
+                }
             }
-
-            assert_eq!(agent_page_routines.len(), 31);
-            let first_agent_page = agent_page_routines.remove(0);
-            let last_agent_page = agent_page_routines.pop().unwrap();
-            let mut middle_agent_pages = agent_page_routines.remove(0);
-            let middle_shape = normalized_projection_routine(&middle_agent_pages);
-            for routine in agent_page_routines {
-                assert_eq!(normalized_projection_routine(&routine), middle_shape);
-                middle_agent_pages
-                    .table_sources
-                    .extend(routine.table_sources);
+            assert_eq!(routines.len(), 31);
+            let first = routines.remove(0);
+            let last = routines.pop().unwrap();
+            let mut middle = routines.remove(0);
+            let shape = normalized_projection_routine(&middle);
+            for routine in routines {
+                assert_eq!(normalized_projection_routine(&routine), shape);
+                middle.table_sources.extend(routine.table_sources);
             }
-
-            let first_descriptor = descriptors.first().unwrap();
-            let replica_query = inventory_template_query(
-                target,
-                AuthorityProjectionSelector::AgentReplicas {
-                    agent: first_descriptor.identity.agent,
-                    after: None,
-                    limit: MAX_AUTHORITY_REPLICA_PAGE_ENTRIES as u16,
-                },
-                3,
-                1,
-            );
-            let replica_page = AuthorityAgentReplicaProjectionPage {
-                query: replica_query.clone(),
-                head,
-                replica_count: 1,
-                replica_generation: first_descriptor.replica_generation(),
-                entries: first_descriptor.replicas.clone(),
-                next: None,
-            };
-            replica_page.validate_shape().unwrap();
-            let replica_case = projection_actor_case(replica_query, &replica_page, target.binding);
-            let replica_generation_offsets =
-                offsets(&replica_case.output, &replica_page.replica_generation.0);
-            assert_eq!(replica_generation_offsets.len(), 1);
-            let replica_routine = ProjectionActorRoutine {
-                case: replica_case,
-                table_sources: descriptors
-                    .iter()
-                    .enumerate()
-                    .map(|(index, _)| {
-                        (
-                            u8::try_from(index + 1).unwrap(),
-                            index * INVENTORY_DESCRIPTOR_ROW_BYTES,
-                        )
-                    })
-                    .collect(),
-                table_copies: vec![ProjectionTableCopy {
-                    source_offset: 64,
-                    output_offsets: replica_generation_offsets,
-                    len: 32,
-                }],
-            };
-
-            let actor_query = inventory_template_query(
-                target,
-                AuthorityProjectionSelector::Actors {
-                    agent: first_descriptor.identity.agent,
-                    after: None,
-                    limit: MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES as u16,
-                },
-                4,
-                1,
-            );
-            let actor_page = AuthorityActorProjectionPage {
-                query: actor_query.clone(),
-                head,
-                entries: Vec::new(),
-                next: None,
-            };
-            actor_page.validate_shape().unwrap();
-            let actor_routine = ProjectionActorRoutine {
-                case: projection_actor_case(actor_query, &actor_page, target.binding),
-                table_sources: Vec::new(),
-                table_copies: Vec::new(),
-            };
-
-            // The one-row terminal page shares the same query length/group as
-            // the full middle pages, so test it first and fall through on every
-            // other ordinal. All other selector shapes are disjoint by length
-            // and the authenticated nonce group byte.
             let program = scripted_projection_actor_program(
-                vec![
-                    credential_routine,
-                    first_agent_page,
-                    last_agent_page,
-                    middle_agent_pages,
-                    replica_routine,
-                    actor_routine,
-                ],
-                descriptor_table,
+                vec![credential_routine, first, last, middle], descriptor_table,
             );
-
-            let method_names = [
-                "actor_projection_page",
-                "agent_projection_page",
-                "agent_replica_projection_page",
-                "credential_projection",
-            ];
+            let method_names = ["credential_projection", "inventory_projection_page"];
             let schema = ParsedSchema {
                 constructor: ConstructorContract::Forbidden,
                 fields: vec![ParsedField::Inline(ParsedInlineField {
@@ -8925,7 +8827,7 @@ mod tests {
         }
 
         struct InventoryProjectionAuthenticator {
-            counters: [u8; 4],
+            ordinal: u16,
             host: Arc<Mutex<SharedAgentHost>>,
             agent: HostAgentId,
             observations: Arc<Mutex<Vec<InventoryProjectionObservation>>>,
@@ -8946,20 +8848,30 @@ mod tests {
                 AuthorityProjectionQuery,
                 crate::agent::production_owner::AgentProductionOwnerError,
             > {
-                let group = match selector {
-                    AuthorityProjectionSelector::Inventory { .. } => {
-                        return Err(crate::agent::production_owner::AgentProductionOwnerError::InvalidProjection);
-                    }
-                    AuthorityProjectionSelector::Credential => 1,
-                    AuthorityProjectionSelector::Agents { .. } => 2,
-                    AuthorityProjectionSelector::AgentReplicas { .. } => 3,
-                    AuthorityProjectionSelector::Actors { .. } => 4,
-                };
-                let counter = &mut self.counters[usize::from(group - 1)];
-                *counter = counter.checked_add(1).ok_or(
+                self.ordinal = self.ordinal.checked_add(1).ok_or(
                     crate::agent::production_owner::AgentProductionOwnerError::InventoryLimit,
                 )?;
-                let query = inventory_template_query(authority, selector, group, *counter);
+                // The fixture has 31 pages per complete refresh. The last
+                // nonce byte selects its response table; the middle bytes
+                // distinguish every signed query across repeated refreshes.
+                let mut query = inventory_template_query(
+                    authority,
+                    selector,
+                    5,
+                    ((self.ordinal - 1) % 31 + 1) as u8,
+                );
+                query.nonce.0[1..3].copy_from_slice(&self.ordinal.to_be_bytes());
+                let signature = SigningKey::from_bytes(&[0xa4; 32])
+                    .sign(&query.signing_bytes())
+                    .to_bytes();
+                let AuthorityIngressAuthentication::ApiCredentialSignature {
+                    signature: actual,
+                    ..
+                } = &mut query.authentication
+                else {
+                    unreachable!()
+                };
+                *actual = signature;
                 let (ordered_index, snapshot, retained_entries) = {
                     let host = self.host.lock().unwrap();
                     let (_, remaining, _) = host.capacity(self.agent).unwrap();
@@ -20018,11 +19930,12 @@ mod tests {
             let inventory = crate::agent::production_owner::load_system_inventory_for_test(
                 &attachment,
                 Box::new(InventoryProjectionAuthenticator {
-                    counters: [0; 4],
+                    ordinal: 0,
                     host: Arc::clone(&host),
                     agent,
                     observations: Arc::clone(&observations),
                 }),
+                17,
             );
             let (head, principal, projections) = inventory.unwrap_or_else(|error| {
                 let observed = observations.lock().unwrap();
@@ -20053,30 +19966,28 @@ mod tests {
             }
 
             let observations = observations.lock().unwrap();
-            assert_eq!(observations.len(), 514);
-            let mut expected_selectors = vec![AuthorityProjectionSelector::Credential];
-            for page in 0..31 {
-                let after = (page != 0).then(|| {
-                    expected_descriptors[page * MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES - 1]
-                        .identity
-                        .agent
-                });
-                expected_selectors.push(AuthorityProjectionSelector::Agents {
-                    after,
-                    limit: MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES as u16,
-                });
-            }
-            for descriptor in &expected_descriptors {
-                expected_selectors.push(AuthorityProjectionSelector::AgentReplicas {
-                    agent: descriptor.identity.agent,
-                    after: None,
-                    limit: MAX_AUTHORITY_REPLICA_PAGE_ENTRIES as u16,
-                });
-                expected_selectors.push(AuthorityProjectionSelector::Actors {
-                    agent: descriptor.identity.agent,
-                    after: None,
-                    limit: MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES as u16,
-                });
+            let expected_query_count = 17 * 31;
+            assert_eq!(observations.len(), expected_query_count);
+            let mut expected_selectors = Vec::new();
+            for _ in 0..17 {
+                for page in 0..31 {
+                    let after = (page != 0).then(|| {
+                        let descriptor =
+                            &expected_descriptors[page * MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES - 1];
+                        crate::agent_sdk::authority::AuthorityInventoryCursor {
+                            agent: descriptor.identity.agent,
+                            position:
+                                crate::agent_sdk::authority::AuthorityInventoryPosition::Replica(
+                                    descriptor.replicas.last().unwrap().node,
+                                ),
+                        }
+                    });
+                    expected_selectors.push(AuthorityProjectionSelector::Inventory {
+                        after,
+                        limit: 64,
+                        known_head: None,
+                    });
+                }
             }
             assert_eq!(
                 observations
@@ -20093,8 +20004,8 @@ mod tests {
                 .iter()
                 .map(|observation| observation.query.commitment().0)
                 .collect::<std::collections::BTreeSet<_>>();
-            assert_eq!(unique_nonces.len(), 514);
-            assert_eq!(unique_queries.len(), 514);
+            assert_eq!(unique_nonces.len(), expected_query_count);
+            assert_eq!(unique_queries.len(), expected_query_count);
             let snapshot_index = |snapshot| match snapshot {
                 crate::agent::shared_host::SharedAgentSnapshotState::Installed {
                     raft_index,
@@ -20135,7 +20046,7 @@ mod tests {
                 rotations > 1,
                 "long inventory must rotate its bounded history repeatedly"
             );
-            let rotated_snapshot = observations[513].snapshot;
+            let rotated_snapshot = observations[expected_query_count - 1].snapshot;
             assert_ne!(rotated_snapshot, initial.2.snapshots);
             drop(observations);
 
@@ -20146,7 +20057,10 @@ mod tests {
                     host.show(agent).unwrap().unwrap(),
                 )
             };
-            assert_eq!(final_state.0.ordered_index, initial.0.ordered_index + 1_028);
+            assert_eq!(
+                final_state.0.ordered_index,
+                initial.0.ordered_index + 2 * expected_query_count as u64
+            );
             assert_eq!(final_state.1.snapshots, rotated_snapshot);
             assert!(!final_state.1.reservation_pending);
             assert!(
