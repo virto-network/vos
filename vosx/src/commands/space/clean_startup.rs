@@ -1,4 +1,4 @@
-//! Native construction of the one root-authorized Shared system Agent.
+//! Native root-authorized system startup and leased ordinary Shared recovery.
 
 use std::num::NonZeroU64;
 use std::path::Path;
@@ -55,7 +55,7 @@ use super::clean_store::{
     CleanAuthorityOperationFiles, CleanManagementLifecycleStoreFactory,
     CleanNativeAuthorityOperationCompletions, CleanNativeAuthorityOperationDenials,
     CleanNativeAuthorityOperationJournal, CleanNativeAuthorityOperationRetirements,
-    CleanSystemAgentFileStores,
+    CleanSystemAgentFileStores, discover_shared_genesis_startup,
 };
 
 const SYSTEM_AUTHORITY_NAME: &str = "system-authority";
@@ -417,6 +417,21 @@ pub(crate) fn start_clean_system_agent(
     let lifecycle_admission = lifecycle_recovery.startup_admission()
         .map_err(|error| anyhow::anyhow!("Local lifecycle requires incomplete-phase recovery before startup; preserved all stores: {error:?}"))?;
     report_phase("lifecycle_discovery");
+    let mut shared_genesis = discover_shared_genesis_startup(
+        data_dir,
+        authority_target,
+        vos::agent::shared_host::MAX_SHARED_HOST_AGENTS,
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "verify Shared lifecycle stores before startup; preserved stores: {error:?}"
+        )
+    })?;
+    report_phase("shared_lifecycle_discovery");
+    tracing::debug!(
+        configured = shared_genesis.is_some(),
+        "Shared lifecycle recovery discovered"
+    );
     let operation_journal = CleanNativeAuthorityOperationJournal::open_or_create(
         data_dir.join(OPERATION_JOURNAL_DIRECTORY),
         authority_target,
@@ -470,6 +485,14 @@ pub(crate) fn start_clean_system_agent(
             anyhow::anyhow!("verify admin recovery before startup; preserved stores: {error:?}")
         })?;
     report_phase("operation_admission");
+    let operation_admission = match shared_genesis.as_mut() {
+        Some(shared) => shared
+            .startup_admission(operation_admission)
+            .map_err(|error| {
+                anyhow::anyhow!("admit Shared recovery before startup; preserved stores: {error:?}")
+            })?,
+        None => operation_admission,
+    };
     let mut owner = CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
         pins_store,
         record_store,
@@ -524,12 +547,20 @@ pub(crate) fn start_clean_system_agent(
         lifecycle_stores,
         OwnedCleanOperatorIdentitySigner::new(operator.clone())?,
         lifecycle_recovery,
-    )?
-    .with_operations(
-        operations,
-        OwnedCleanOperatorIdentitySigner::new(operator.clone())?,
-    )?
-    .with_admins(admins, admin_signer)?;
+    )?;
+    let lifecycle = match shared_genesis {
+        Some(shared) => lifecycle.with_shared_genesis(shared).map_err(|error| {
+            anyhow::anyhow!("complete Shared recovery before routes; preserved stores: {error:?}")
+        })?,
+        None => lifecycle,
+    };
+    report_phase("shared_lifecycle_recovery");
+    let lifecycle = lifecycle
+        .with_operations(
+            operations,
+            OwnedCleanOperatorIdentitySigner::new(operator.clone())?,
+        )?
+        .with_admins(admins, admin_signer)?;
     report_phase("lifecycle_controller");
     node.start_clean_local_agent_production(
         clean_node,
@@ -719,8 +750,9 @@ impl AgentTrustProvider for SystemAgentTrust {
     }
 }
 
-/// Root system genesis has its own pinned QC path. Ordinary Agent genesis is
-/// refused until an authenticated live-system finality adapter is supplied.
+/// Root system genesis has its own pinned QC path. This fallback refuses all
+/// ordinary provisions; deferred recovery replaces it only with exact proofs
+/// independently replayed by the root-pinned owner, never archive-only trust.
 struct UnavailableAgentFinality;
 
 impl AgentGenesisFinalityVerifier for UnavailableAgentFinality {

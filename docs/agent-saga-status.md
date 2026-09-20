@@ -8,13 +8,13 @@ The complete Agent Architecture Saga remains the objective.
 
 - Reviewer checkpoint: `saga/agents` at `9cd2fa6a`. The review guide applies
   only to that checkpoint, not the later implementation evidence below.
-- Implementation branch: `wip/ch08-runtime-directory`. Shared reservation,
-  discovery, admission and lifecycle ownership exist, but production startup
-  does not yet call them. Ordinary Shared is
-  still unavailable; helper tests are not deployment qualification.
-- Next functional batch: connect the owned Shared recovery controller to startup
-  before route publication and qualify nonempty published-state recovery and
-  store ownership through worker retirement. Do not bypass
+- Implementation branch: `wip/ch08-runtime-directory`. Production startup now
+  discovers and owns Shared recovery before route publication. Ordinary Shared
+  creation/serving is still incomplete; recovery wiring is not deployment
+  qualification.
+- Next functional batch: qualify nonempty published-state recovery, complete
+  ordinary Shared provisioning/network/route ownership, and verify store
+  ownership through worker retirement. Do not bypass
   finality or broaden this batch into unrelated performance redesign.
 - Release remains open: Local disposable testing has scoped evidence; Shared,
   backup, other profile gates, production performance and workspace lint remain
@@ -471,9 +471,9 @@ been removed; `into_controller` transfers their ownership to this common path.
 Earlier borrowed-handoff and admission evidence remains in
 `shared-borrowed-recovery-cli-tests.log`, `shared-borrowed-recovery-owner-test.log`
 and `shared-startup-admission-tests.log`. Those owner results use an empty ordinary
-set. The production startup call site, nonempty authenticated published recovery,
-and store lifetime through actual worker retirement remain unqualified. No
-production Shared activation, wire/artifact change or permissive finality was added.
+set. Nonempty authenticated published recovery and store lifetime through actual
+worker retirement remain unqualified. No ordinary Shared serving, wire/artifact
+change or permissive finality was added.
 
 Controller evidence: all 17 ordinary-genesis CLI tests pass with the explicit
 signed fixture (`shared-controller-cli-final.log`, zero ignored, 0.96s), including
@@ -485,6 +485,37 @@ until drop. The positive owner tests still have no ordinary Shared generation;
 these are ownership/recovery-boundary tests, not nonempty Shared startup evidence.
 Workspace formatting passes (`shared-controller-format.log`). Full release and
 lint gates are not rerun or claimed by this focused batch.
+
+Production startup now uses non-creating discovery of `shared-agent-lifecycle`,
+`shared-agent-committee` and `shared-agent-genesis` under the space data directory.
+All absent preserves fresh/Local startup; a partial, invalid or symlinked set
+fails closed without manufacturing the missing directories. A discovered set
+extends startup admission, requests system-first opening, and transfers into
+`with_shared_genesis` before the node production owner or ingress is exposed.
+The unavailable fallback verifier remains: only exact owner replay can complete
+deferred opening. These paths do not implement new Shared creation or publication.
+All 19 ordinary-genesis store tests pass with the explicit fixture
+(`shared-production-startup-store-tests.log`, zero ignored, 0.96s), including
+missing/partial/symlink namespace cases and live file-lease ownership through
+the actual discovery entrypoint. The debug CLI build and workspace formatting
+also pass (`shared-production-startup-build.log`,
+`shared-production-startup-format.log`).
+
+Real debug-daemon integration: `indexed-lifecycle.H0rOHh/` under implementation
+`target/agent-lifecycle-qualification`, using
+`VOSX_QUALIFY_EMPTY_SHARED_RECOVERY=1`. Frozen CLI SHA-256
+`1a84603266a46c31d03e25fde27ef86d477fd687beb594291ba613a6e60fe765`, client
+`830dbf1869172815aa1905d2cef6f5aed84817f506d473baacdcf29634377d25`.
+The first startup observes no Shared controls; the following three recover an
+explicitly empty Shared set. Local Create (20.737s), Install (30.345s), mutation
+and exact retry (24.632s test), and read-after-restart (25.432s test) all pass.
+HTTP/SSH ingress checks and frozen-input hashes pass; all four daemons stop in
+0.306–1.529s. Readiness is 12.742/8.919/10.575/10.285s: the unchanged 10s gate
+**fails**, so the harness exits 1 despite functional success. This is a debug
+integration run, not a released performance comparison or nonempty Shared test.
+The optional harness mode is recorded in `recovery-mode.txt`; default campaigns
+remain unchanged. Source was the tracked implementation delta atop `9c2f19bf`;
+the frozen binaries and script, rather than that base hash alone, identify the run.
 
 ## Continuation plan
 
@@ -507,13 +538,14 @@ not prerequisites to silently add to that batch.
    preserve fresh revision-consistent projections and scheduling isolation.
 4. Complete ordinary Shared production integration as a cohesive functional
    batch, rather than deleting its currently unused components to satisfy lint.
-   Startup still installs `UnavailableAgentFinality`. The root-pinned owner
-   already has exact replay attestations and `recover_deferred_shared_generations`,
-   but its ordinary genesis preparation/publication/recovery flow has no CLI/node
-   caller. Wire durable, exclusively leased intent/issuer/query/reply/publication
-   stores and the genesis archive into the lifecycle owner; recover the complete
-   deferred set before exposing routes. Creation must go through signed issuance,
-   publication and positive retirement. Never replace the unavailable verifier
+   Startup keeps `UnavailableAgentFinality` as the default and now invokes exact
+   deferred recovery from leased stores through the lifecycle owner. Next prove
+   nonempty published recovery with a real runtime and complete ordinary Shared
+   provisioning, network attachment and supervisor route ownership. Production
+   `start_local` still initializes its ordinary Shared route slot empty; opening
+   a recovered physical generation alone does not make it callable. Creation
+   must go through signed issuance, publication and positive retirement.
+   Never replace the unavailable verifier
    with archive-only acceptance or a permissive verifier. Acceptance requires a
    released create/replicate/restart/recovery campaign plus missing/substituted
    publication and interrupted-write refusal, not just the existing source tests.

@@ -3,6 +3,14 @@
 # Build the CLI and its test client first. This script freezes both inputs.
 set -euo pipefail
 
+# Opt-in startup integration check: initial Local startup has no Shared stores;
+# later restarts recover an explicitly empty Shared set. This is not a positive
+# ordinary Shared lifecycle or replication qualification.
+empty_shared_recovery=${VOSX_QUALIFY_EMPTY_SHARED_RECOVERY:-0}
+[[ $empty_shared_recovery == 0 || $empty_shared_recovery == 1 ]] || {
+    echo 'VOSX_QUALIFY_EMPTY_SHARED_RECOVERY must be 0 or 1' >&2; exit 2;
+}
+
 if (( $# < 3 || $# > 4 )); then
     echo "usage: $0 VOSX TEST_CLIENT COUNTER_PACKAGE [DISK_EVIDENCE_ROOT]" >&2
     exit 2
@@ -35,6 +43,7 @@ test_binary="$evidence/qualified-test-client"
 sha256sum "$binary" "$test_binary" "$evidence/counter.vos" "$evidence/qualification.sh" > "$evidence/identities.sha256"
 git rev-parse HEAD > "$evidence/source-revision.txt"
 git status --short > "$evidence/source-status.txt"
+printf 'empty_shared_recovery=%s\n' "$empty_shared_recovery" > "$evidence/recovery-mode.txt"
 uname -srmo > "$evidence/platform.txt"
 getconf CLK_TCK > "$evidence/cpu-clock-ticks-per-second.txt"
 mkdir "$evidence/tmp"
@@ -154,7 +163,18 @@ started=$(date +%s%3N)
 timeout --signal=TERM --kill-after=5s 180s "$binary" space install-local-actor indexed-lifecycle "$agent_id" "$evidence/counter.vos" --name counter > "$evidence/install.txt" 2> "$evidence/install.stderr"
 record_duration install "$started"
 stop_daemon initial
+if [[ $empty_shared_recovery == 1 ]]; then
+    rg -q 'Shared lifecycle recovery discovered.*configured=false' "$evidence/initial.log"
+    # Exact private control namespaces from clean_store.rs; mkdir deliberately
+    # refuses preexisting directories, so stale fixtures cannot satisfy this run.
+    mkdir -m 700 "$evidence/space/shared-agent-lifecycle" \
+        "$evidence/space/shared-agent-committee" "$evidence/space/shared-agent-genesis"
+fi
 start_daemon restart
+if [[ $empty_shared_recovery == 1 ]]; then
+    rg -q 'Shared lifecycle recovery discovered.*configured=true' "$evidence/restart.log"
+    rg -q 'shared_lifecycle_recovery' "$evidence/restart.log"
+fi
 stop_daemon restart
 start_daemon mutation
 run_test real_daemon_counter_mutation_and_exact_retry mutation

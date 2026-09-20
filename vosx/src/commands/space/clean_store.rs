@@ -62,6 +62,9 @@ const LIFECYCLE_RUNTIME_FILE: &str = "management.runtime";
 const LIFECYCLE_RUNTIME_STAGE_FILE: &str = "management.runtime.next";
 const LIFECYCLE_ACTOR_FILE: &str = "management.actor";
 const LIFECYCLE_ACTOR_STAGE_FILE: &str = "management.actor.next";
+pub(crate) const SHARED_LIFECYCLE_DIRECTORY: &str = "shared-agent-lifecycle";
+pub(crate) const SHARED_COMMITTEE_DIRECTORY: &str = "shared-agent-committee";
+pub(crate) const SHARED_ARCHIVE_DIRECTORY: &str = "shared-agent-genesis";
 const LOCAL_REQUEST_FILE: &str = "local-create.request";
 const LOCAL_REQUEST_STAGE_FILE: &str = "local-create.request.next";
 const LOCAL_REQUEST_ENTRIES: [&str; 3] = [LOCK_FILE, LOCAL_REQUEST_FILE, LOCAL_REQUEST_STAGE_FILE];
@@ -790,6 +793,61 @@ pub(crate) type CleanSharedGenesisRecovery =
         CleanAgentGenesisCommitteeFile,
     >;
 
+pub(crate) type CleanSharedGenesisController =
+    vos::agent::clean_bootstrap::NativeSharedGenesisController<
+        CleanManagementIntentFile,
+        CleanManagementIssuerFile,
+        CleanAgentGenesisCommitteeFile,
+        CleanAgentGenesisCommitteeFile,
+        CleanAgentGenesisCommitteeFile,
+        CleanAgentGenesisCommitteeFile,
+        CleanAgentGenesisArchiveFile,
+    >;
+
+/// Discover ordinary Shared recovery before opening the physical host. Fresh
+/// spaces have no Shared control directories; do not create them during reads.
+/// A partial set is an interrupted/invalid setup, never an empty recovery set.
+pub(crate) fn discover_shared_genesis_startup(
+    data_dir: &Path,
+    authority: vos::agent::sdk::authority::AuthorityActorTarget,
+    maximum: usize,
+) -> Result<Option<CleanSharedGenesisController>, CleanFileStoreError> {
+    if !authority.is_valid() {
+        return Err(CleanFileStoreError::InvalidPath);
+    }
+    let directory = open_private_directory(data_dir, true)?;
+    let paths = [
+        data_dir.join(SHARED_LIFECYCLE_DIRECTORY),
+        data_dir.join(SHARED_COMMITTEE_DIRECTORY),
+        data_dir.join(SHARED_ARCHIVE_DIRECTORY),
+    ];
+    let mut present = 0;
+    for path in &paths {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_dir() => present += 1,
+            Ok(_) => return Err(CleanFileStoreError::InvalidPath),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if present == 0 {
+        validate_opened_directory(&directory, data_dir, true)?;
+        return Ok(None);
+    }
+    if present != paths.len() {
+        return Err(CleanFileStoreError::Corrupt);
+    }
+    let space = vos::service::SpaceId(authority.space.0);
+    let mut lifecycle = CleanManagementLifecycleStoreFactory::new(&paths[0], authority.space)?;
+    let committee = CleanAgentGenesisCommitteeStoreFactory::open_existing_parent(&paths[1], space)?;
+    let archives = CleanAgentGenesisArchiveStoreFactory::open_existing(&paths[2], space)?;
+    let entries = archives.discover_recovery(&mut lifecycle, &committee, authority, maximum)?;
+    validate_opened_directory(&directory, data_dir, true)?;
+    CleanSharedGenesisStartupEntry::into_controller(authority, entries)
+        .map(Some)
+        .map_err(|_| CleanFileStoreError::Corrupt)
+}
+
 /// One startup reservation with every acquired lease still owned. An absent
 /// archive or absent record represents incomplete publication, never a route
 /// eligible for admission. Even a present record requires independent replay.
@@ -807,18 +865,7 @@ impl CleanSharedGenesisStartupEntry {
     pub(crate) fn into_controller(
         authority: vos::agent::sdk::authority::AuthorityActorTarget,
         entries: Vec<Self>,
-    ) -> Result<
-        vos::agent::clean_bootstrap::NativeSharedGenesisController<
-            CleanManagementIntentFile,
-            CleanManagementIssuerFile,
-            CleanAgentGenesisCommitteeFile,
-            CleanAgentGenesisCommitteeFile,
-            CleanAgentGenesisCommitteeFile,
-            CleanAgentGenesisCommitteeFile,
-            CleanAgentGenesisArchiveFile,
-        >,
-        vos::agent::shared_host::SharedAgentHostError,
-    > {
+    ) -> Result<CleanSharedGenesisController, vos::agent::shared_host::SharedAgentHostError> {
         vos::agent::clean_bootstrap::NativeSharedGenesisController::new(
             authority,
             entries
@@ -905,6 +952,20 @@ impl CleanAgentGenesisArchiveStoreFactory {
 }
 
 impl CleanAgentGenesisCommitteeStoreFactory {
+    pub(crate) fn open_existing_parent(
+        parent: &Path,
+        space: vos::service::SpaceId,
+    ) -> Result<Self, CleanFileStoreError> {
+        if space == vos::service::SpaceId::ZERO {
+            return Err(CleanFileStoreError::InvalidPath);
+        }
+        Ok(Self {
+            parent: parent.to_path_buf(),
+            directory: open_private_directory(parent, true)?,
+            space,
+        })
+    }
+
     /// Discover the complete two-directory set before opening records. Returned
     /// recovery entries own both lifecycle and committee leases. The caller
     /// must retain them through admission and transfer them to its controller.
@@ -5039,6 +5100,63 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn ordinary_genesis_startup_discovery_is_noncreating_and_refuses_partial_namespaces() {
+        let fixture = Fixture::new("shared-startup-discovery");
+        let (_, authority, _, _) = super::super::local_create::tests::fixture();
+        let paths = [
+            SHARED_LIFECYCLE_DIRECTORY,
+            SHARED_COMMITTEE_DIRECTORY,
+            SHARED_ARCHIVE_DIRECTORY,
+        ];
+        assert!(
+            discover_shared_genesis_startup(&fixture.parent, authority, 1)
+                .unwrap()
+                .is_none()
+        );
+        for name in paths {
+            assert!(!fixture.parent.join(name).exists());
+        }
+        for (index, name) in paths.iter().enumerate() {
+            ensure_private_directory(&fixture.parent.join(name)).unwrap();
+            if index < 2 {
+                assert!(matches!(
+                    discover_shared_genesis_startup(&fixture.parent, authority, 1),
+                    Err(CleanFileStoreError::Corrupt)
+                ));
+                for missing in &paths[index + 1..] {
+                    assert!(!fixture.parent.join(missing).exists());
+                }
+            }
+        }
+        let controller = discover_shared_genesis_startup(&fixture.parent, authority, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(controller.authority(), authority);
+        assert!(!controller.is_recovered());
+        for name in paths {
+            assert_eq!(fs::read_dir(fixture.parent.join(name)).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_genesis_startup_discovery_refuses_symlink_namespace() {
+        let fixture = Fixture::new("shared-startup-symlink");
+        let (_, authority, _, _) = super::super::local_create::tests::fixture();
+        let target = fixture.parent.join("actual");
+        ensure_private_directory(&target).unwrap();
+        std::os::unix::fs::symlink(&target, fixture.parent.join(SHARED_LIFECYCLE_DIRECTORY))
+            .unwrap();
+        assert!(matches!(
+            discover_shared_genesis_startup(&fixture.parent, authority, 1),
+            Err(CleanFileStoreError::InvalidPath)
+        ));
+        assert_eq!(fs::read_dir(target).unwrap().count(), 0);
+        assert!(!fixture.parent.join(SHARED_COMMITTEE_DIRECTORY).exists());
+        assert!(!fixture.parent.join(SHARED_ARCHIVE_DIRECTORY).exists());
+    }
+
+    #[test]
     fn ordinary_genesis_signed_reservation_retries_and_joint_discovery_holds_leases() {
         use vos::agent::local_lifecycle::LocalLifecycleStoreFactory as _;
         use vos::agent::sdk::{AgentProfile, ManagementRequest};
@@ -5092,18 +5210,18 @@ pub(crate) mod tests {
             space: vos::service::SpaceId(authority.space.0),
             agent: vos::service::AgentId(descriptor.identity.agent.0),
         };
-        let archives_path = fixture.parent.join("archives");
+        let archives_path = fixture.parent.join(SHARED_ARCHIVE_DIRECTORY);
         ensure_private_directory(&archives_path).unwrap();
         let archives =
             CleanAgentGenesisArchiveStoreFactory::open_existing(&archives_path, locator.space)
                 .unwrap();
         let committee = CleanAgentGenesisCommitteeStoreFactory::open_or_create(
-            &fixture.parent.join("committee"),
+            &fixture.parent.join(SHARED_COMMITTEE_DIRECTORY),
             locator.space,
         )
         .unwrap();
         let mut lifecycle = CleanManagementLifecycleStoreFactory::open_or_create(
-            fixture.parent.join("lifecycle"),
+            fixture.parent.join(SHARED_LIFECYCLE_DIRECTORY),
             authority.space,
         )
         .unwrap();
@@ -5333,6 +5451,24 @@ pub(crate) mod tests {
                 .len(),
             1
         );
+        let controller = discover_shared_genesis_startup(&fixture.parent, authority, 1)
+            .unwrap()
+            .unwrap();
+        assert!(!controller.is_recovered());
+        assert!(matches!(
+            archives.open_archive(locator),
+            Err(CleanFileStoreError::Busy)
+        ));
+        assert!(matches!(
+            committee.open_existing(locator),
+            Err(CleanFileStoreError::Busy)
+        ));
+        assert!(matches!(
+            lifecycle.open_existing(authority.space, vos::agent::sdk::AgentId(locator.agent.0)),
+            Err(CleanFileStoreError::Busy)
+        ));
+        drop(controller);
+        assert!(archives.open_archive(locator).is_ok());
     }
 
     #[test]
