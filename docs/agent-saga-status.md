@@ -1,274 +1,158 @@
 # Agent saga: current status
 
 This is the authoritative status and remaining-work index. Other handoffs are
-navigation or checkpoint evidence, not competing plans. Updated 2026-09-20.
+navigation or checkpoint-specific evidence, not competing plans. Updated 2026-09-20.
 The complete Agent Architecture Saga remains the objective.
 
 ## Review boundary
 
-Review the r19 retirement checkpoint on root `saga/agents`, with new delta
-`c8028394..saga/agents`. Implementation continues on `wip/ch08-runtime-directory`
-in `.worktrees/ch08-runtime-directory`. Master is unchanged;
-nothing has been pushed. This is **not production qualification**.
-See [review guide](agent-saga-review.md) for the two scoped review groups.
+Review the inventory checkpoint on `saga/agents`, new delta
+`7bd66a7d..saga/agents`. Implementation continues on `wip/ch08-runtime-directory`
+in `.worktrees/ch08-runtime-directory`. Master is unchanged; nothing is pushed.
+See [review guide](agent-saga-review.md) for two consolidated groups.
+This qualifies a disposable Local/Public-policy test workflow, not production,
+old-store migration, all-profile architecture or thousands-user capacity.
 
-Foundation commits `930a5450`, `76d37d4d`, `493a098c` and source cutover
-`3c5e44c7` introduce reference-only retirement, reuse retained SDK metadata,
-and establish full SDK-to-execution correspondence before successful commit.
-ABI r19 uses SDK work commitment as clean result identity; restore/retry/retirement
-check exact equality and legacy APIs refuse clean results.
-RuntimeWork and journal ACKs carry metadata and ordered references, not preimages.
-Signature, scope, exact accepted binding, expiry/error retirement, capacity and
-projection compaction checks remain. Custom-linear validates its own distinct
-retained layout. No missing-byte hydration or old-state migration is provided.
+Source `eef8890a` reuses immutable invocation resolution while preserving
+authentication and complete actor-record correspondence. Sources `525319d5`
+and `2ccfacb8` add the signed bounded Inventory stream and host reconstruction.
+Integration `9fe6762e` pins matched artifacts and tests physical fresh/cached
+queries. The checkpoint adds interrupted compiled-Inventory recovery evidence.
 
-The prior concurrency, Local lease/retirement, control-worker isolation, targeted
-lookup, catalog isolation, public management recovery and indexed single-restore
-work remains included. See [execution evidence](agent-execution-checkpoint-review.md)
-and [recovery contract](agent-recovery-contract.md), whose earlier results are
-explicitly checkpoint-specific.
+Prior concurrency, Local lease/retirement, control-worker isolation, targeted
+lookup, catalog isolation, public management recovery, indexed restoration and
+r19 reference-only retirement remain included. Their checkpoint evidence is
+linked from [execution evidence](agent-execution-checkpoint-review.md) and
+[recovery contract](agent-recovery-contract.md), not retroactively extended to
+unqualified profiles.
 
-## r19 evidence
+## What changed and what did not
+
+- Invoke/Resume resolution is bound to the original SDK work and full actor
+  record. Commit still authenticates work/authorization and rejects changed
+  records. Unbound callers still perform full correspondence validation.
+- Signed Inventory pages combine fresh credential claims and Agent/replica/actor
+  rows at one head. Bounds are 64 total rows, eight complex rows, and the existing
+  16 KiB wrapped reply ceiling. Strict cursors and visibility filtering remain.
+- The host reconstructs complete descriptors and actor sets before publishing.
+  Wrong bindings, inconsistent claims/head, incomplete/excess rosters, foreign
+  actors, capacity overflow and transport failures invalidate reuse.
+- An unchanged-head hint suppresses rows only after fresh authentication and
+  exact Authority/credential/claims checks. Credential rotation fetches a new view.
+- The old production per-Agent replica/actor fetch loops are removed.
+  Standalone projection APIs still used by ingress/CLI remain intentionally.
+- This reduces runtime execution count, not whole-state transport/restoration,
+  publication, signature cost or durable ordering. No native fallback or
+  custom-runtime private-state decoding was introduced.
+
+ABI remains r19. Runtime and both system templates pin immutable source
+`2ccfacb82089f804dbdbfea7ebfcabf377e7dde3`; template builder remains `3c5e44c7`.
+Exact ProgramIds/digests are in `support/production-artifacts.toml`.
+Use fresh disposable spaces; older stores and directory relocation are not
+qualified migration or backup/restore workflows.
+
+## Evidence
 
 Logs below are under `.worktrees/ch08-c2-native/target/task-tmp/`.
-These scoped passes do not establish every full-saga acceptance gate.
 
-- 179 SDK tests: `r19-compact-wire-sdk-final.log`. Includes commitment parity,
-  hostile references, authorization substitution, r18-header refusal and a
-  1 MiB artifact whose empty-state ACK frame is below 2 KiB.
-- 52 Standard tests: `r19-compact-application-standard.log`.
-- 99 source-wire tests: `r19-compact-transport-wire.log`; four ignored.
-- 109 bundled wire tests: `r19-bundled-wire.log`; five opt-in tests ignored.
-- 41 journal, 56 replay, 33 Local journal and 97 journal-store tests:
-  `r19-compact-journal-final.log`, `r19-compact-replay.log`,
-  `r19-compact-local-journal.log`, `r19-compact-journal-store.log`.
-- 21 bundled Local recovery tests, without runtime candidate override:
-  `r19-bundled-local.log`. Scripted guest rebuilt with r19.
-- Four CLI bundled-admission tests: `r19-bundled-admission.log`.
-- 12 custom-linear source tests: `r19-custom-source.log`; one physical test
-  ignored there. Substituted message, gas and incarnation cannot retire accepted
-  work, even with a newly matching unsigned preflight.
-- Explicit physical Standard multi-megabyte yield/resume/retirement comparison:
-  `r19-physical-yield-retire.log`. Custom physical scheduling/lifecycle and
-  attested-context refusal: `r19-custom-physical.log`. Both pass.
+- 182 SDK tests: `inventory-stream-sdk-final.log`; 75 Authority tests, two opt-in
+  ignored: `inventory-stream-authority-final.log`; 52 Standard tests:
+  `inventory-stream-standard-final.log`.
+- 18 owner tests and 31 adapter tests: `inventory-host-owner.log`,
+  `inventory-host-adapters.log`. Includes hostile cross-page data, revocation,
+  Private filtering, credential rotation, cancellation and no partial publication.
+- Scripted journal campaign: `inventory-host-suffix-rotation.log`, 212.73s.
+  Seventeen complete 241-Agent refreshes produce 527 distinct signed queries and
+  1,054 ordered entries. Exact inventory, bounded retained suffix, repeated
+  checkpoints and no pending projection are checked. Uses native Standard and a
+  purpose-built actor PVM, not the compiled production Authority.
+- Independent byte-identical runtime ELF/PVM and both signed templates:
+  `inventory-pinned-reproduction.log`, implementation
+  `target/agent-release-reproduction/run.VMA5jz`.
+- 110 bundled wire tests, five opt-in ignored: `inventory-bundled-wire.log`.
+  All 21 Local tests: `inventory-bundled-local-configured.log`. The first run
+  passed 19 but lacked the scripted guest path for two fixtures; its failed log
+  remains at `inventory-bundled-local.log`. Corrected run explicitly uses the
+  existing r19 `AGENT_SCRIPTED_RUNTIME_ELF`; no assertion was disabled.
+- Four CLI bundled-admission tests: `inventory-bundled-admission.log`.
+  CLI/test-client builds: `inventory-cli-build.log`, `inventory-cli-test-build.log`.
+  Release bundle generation/verification passes in implementation
+  `target/agent-release-reproduction/inventory-2ccfacb8/integrated-bundle`.
+- Compiled Authority plus real outer PVM fresh Inventory and authenticated
+  unchanged-head retirement: `inventory-bundled-physical-query.log`, 24.97s.
+- Compiled Inventory interrupted recovery:
+  `inventory-bundled-physical-recovery-final.log`, 53.41s. Reopens after Invoke,
+  retires the exact pair, simulates failure clearing a durable ACK, reopens again
+  without duplicate ordered entries, rejects competitors without state changes
+  and accepts a fresh successor. Original scripted regression still passes:
+  `inventory-original-recovery.log`. Initial new-test failure is retained in
+  `inventory-bundled-physical-recovery.log`: synthetic Merge/Local methods absent
+  from the real Authority correctly fail schema validation before admission;
+  the test now asserts that exact rejection and unchanged state.
 
-At review checkpoint `7bd66a7d`, runtime, system templates and builder pin source
-`3c5e44c769d4cc16c1c13a9949c60a154f378a57`; exact identities and hashes are
-in `support/production-artifacts.toml`. The clean export
-`r19-reproduction.VgKyCd/` produces byte-identical runtime ELF/PVM.
-The prescribed independent all-artifact reproduction passes:
-`r19-pinned-reproduction.log`, implementation
-`target/agent-release-reproduction/run.catJ18`. Runtime and system templates
-are integrated together. Release bundle generation/verification passes into
-`r19-reproduction.VgKyCd/integrated-bundle`. These are optimized guests with
-a debug CLI/host, not an optimized released-node throughput qualification.
+Immutable-resolution source/physical tests and earlier gas profiles remain
+indexed at `9fe6762e:docs/agent-saga-status.md`. No broad release suite or
+all-profile claim is inferred from these scoped passes.
 
-## Integrated disposable lifecycle
+## Frozen-binary disposable CLI campaign
 
-Evidence: `indexed-lifecycle.r19.SWGRhK/`. Isolated XDG directories and explicit
-space directory; no live user stores. Generated HTTP/SSH config is preserved in
-`generated-local.toml`; only disposable ports changed to 18109/2253.
-Counter rebuilt for r19. CLI SHA-256:
-`9219bfa1731d6bd4dc1725f615d4b85c6524262a720b59b1a61b8d16af26f09f`.
-Test client SHA-256:
-`600fa6b2634e4da5013645c7cf7d4e4e34f826e02e2a0f2a8ffe0750f115c6b8`.
+Evidence: `indexed-lifecycle.inventory-final.JsB1oS/`. Scripts use frozen binary
+copies and fixed-path isolated XDG/space directories. Generated HTTP/SSH defaults
+are preserved; only test ports change to 18109/2253. No builds ran alongside
+this final campaign. Guest artifacts are optimized; CLI/host are debug builds.
 
-`probe.log` passes bootstrap, HTTP/SSH, Agent Create, Counter Install, restart
-and shutdown: readiness 23s, Create 38s, Install 47s, restart 26s, shutdowns
-0s/1s. Both probe daemons stopped.
-Mutation/positive retirement/exact retry passes (`mutation-test.log`): managed
-attempt 27.91s, test 29.86s. Read-after-restart passes (`read-test.log`): managed
-attempt 29.56s, test 31.54s. Invocation-campaign readiness was 33s/28s and shutdown
-2s/1s (`invocation-probe.log`). Both daemons stopped and the probe exited zero.
-This is not non-Public policy or multi-profile proof qualification.
-**The unchanged ten-second readiness target fails.**
+CLI SHA-256:
+`8736f68f18fec28bfcbbd0311e84f2f4336a9b30a5c1c86adb7430e071aed315`.
+Test-client SHA-256:
+`337767089f28ca1c9623dd9f35b1b6488927ad944083943ec8edd6a532427a26`.
 
-## Performance: measured improvement and remaining cost
+`probe.log` passes bootstrap, HTTP/SSH, Create, Install and restart:
+13s readiness, 22s Create, 31s Install, 17s restart; both shutdowns below 1s.
+`invocation-probe.log` passes mutation/positive retirement/exact retry in 28.79s
+(managed attempt 26.76s) and read-after-restart in 30.80s (managed 28.65s).
+Invocation readiness is 10s/11s, shutdown 2s/1s. Both scripts exited zero and
+all four probe daemons stopped. This is Local/Public-policy acceptance only.
+**The ten-second readiness gate still fails.**
 
-The fresh signed Credential query/retirement fixture passes. Compare
-`indexed-authority-query-profile.log` (r18 baseline) with
-`r19-authority-query-tagged-profile.log` (r19). The test-only all-input override
-avoids the former 700 KB profiling threshold hiding compact ACKs; work tags
-distinguish small management calls from retirement.
+Earlier diagnostic `indexed-lifecycle.inventory.kCJ8Bt/` also passed, but a
+test-client build replaced its CLI during the campaign. Keep it as diagnostic
+evidence, not a fixed-binary comparison; the frozen campaign supersedes it.
 
-| Metric | r18 | r19 |
+## Performance interpretation
+
+The final run's first inventory is one query in 3.563s. After Create, a complete
+two-Agent refresh is one query in 3.962s; the preceding lifecycle phase takes
+13.820s. The prior resolved-runtime campaign required six queries and 19.793s
+for the corresponding two-Agent inventory. This confirms reduced invocation
+count and debug-host refresh work, not controlled released throughput.
+An authenticated unchanged-head refresh still takes one query.
+
+| Disposable debug-host operation | Prior resolved runtime | Inventory checkpoint |
 | --- | ---: | ---: |
-| Invoke input bytes | 1,090,241 | 1,094,783 |
-| Invoke gas | 763,079,916 | 853,869,674 |
-| ACK input bytes | 1,092,566 | 9,220 |
-| ACK gas | 276,552,182 | 20,952,819 |
-| Invoke + ACK gas | 1,039,632,098 | 874,822,493 |
+| Create | 37s | 22s |
+| Install | 46s | 31s |
+| Restart readiness | 26s | 17s |
 
-ACK input falls 99.2% and gas 92.4%, but Invoke gas rises 11.9%; the pair improves
-only 15.9%. Additional management calls are not included in that pair.
-Instrumented wall times are not release latency, and this does not establish
-thousands-active-users capacity.
-
-Source-based likely contributor to the Invoke regression: successful commit
-repeats `resolve_clean_invocation` for full SDK-to-execution correspondence;
-resolution recomputes ProgramId from actor bytes. This is not isolated causal
-measurement. Preserve the check; reusing prior validation needs an explicit
-immutable binding, not omission of authorization or correspondence validation.
-Whole-state transport/publication and sequential directory projections remain.
-
-## Implementation follow-up (not yet on reviewer branch)
-
-Source `eef8890a`, integrated artifacts `07c7d1b8`, after review checkpoint
-`7bd66a7d`: Invoke and
-Resume now retain an immutable resolved-invocation object through execution.
-It borrows the original SDK work and privately owns the resolved inputs plus
-the complete actor record. Commit still authenticates work/authorization and
-requires the current actor record to match, while avoiding a second program
-resolution. Unbound internal callers retain full correspondence validation.
-All 100 source-wire tests pass, including stale-provenance, authorization and
-state/reply equivalence (`resolved-invocation-wire-final.log`); all 52 Standard
-tests pass (`resolved-standard.log`). Candidate guest
-build passes (`resolved-runtime-guest-build.log`). Physical fresh invocation
-preserves exact output and lowers gas from 465,388,608 to 402,186,858 on the
-792,537-byte padded fixture (`resolved-physical-fresh-cost.log`, about 13.6%).
-The multi-megabyte yield/resume/retirement comparison also passes
-(`resolved-physical-resume.log`). This is not whole-query latency evidence or
-released qualification; `saga/agents` and its bundles stay fixed for review.
-Implementation runtime artifact is integrated, pinned to
-`eef8890a`: isolated clean-source ELF matches the tested candidate byte-for-byte
-(`resolved-reproduction.umoyY0/`). Only the runtime blob and its source/identity
-pins change; ABI r19 and system templates stay unchanged. Bundled suite and
-prescribed reproduction are tracked in `resolved-bundled-wire.log` and
-`resolved-pinned-reproduction.log` (implementation verifier evidence
-`target/agent-release-reproduction/run.MKZjct`). All 110 bundled wire tests pass,
-five ignored, and prescribed runtime reproduction passes. All 21 bundled Local
-recovery tests pass (`resolved-bundled-local.log`). The real Authority query
-profile also passes (`resolved-authority-query-profile.log`): Invoke gas falls
-from checkpoint 853,869,674 to 766,337,681 (10.3%), ACK uses 20,954,277, and the
-pair totals 787,291,958 (24.3% below r18). Invoke alone remains about 0.4% above
-r18. This supports the repeated-resolution attribution but does not establish
-whole-query or released-node latency. Four CLI bundled-admission tests pass
-(`resolved-bundled-admission.log`). The review checkpoint's recorded CLI timings
-above remain specific to that older runtime.
-
-### Latest integrated lifecycle evidence
-
-Rebuilt debug CLI: `resolved-lifecycle-cli-build.log`, SHA-256
-`c45f3415464e8d8d628975074e8e85673208b27109281f93d46270c1ea461d23`.
-Test client SHA-256:
-`615cb3f7bf28a10256ca45497d2cadff54756f319f2f326ee20f0f47130dbc44`.
-Fresh fixed-path campaign: `indexed-lifecycle.resolved.QtFlV7/`.
-`probe.log` passes bundled bootstrap, HTTP/SSH, Create, Install and restart:
-21s readiness, 37s Create, 46s Install, 26s restart, both shutdowns below 1s.
-Generated ingress defaults are preserved in `generated-local.toml`; only test
-ports change. Mutation/positive retirement/exact retry passes in 28.36s
-(`mutation-test.log`, managed attempt 26.40s). Read-after-restart passes in
-30.34s (`read-test.log`, managed attempt 28.28s). The invocation campaign's
-readiness is 31s/27s and shutdowns 2s/1s (`invocation-probe.log`); the complete
-script exits zero and all four probe daemons have stopped. This qualifies only
-the disposable Local/Public-policy workflow, not the remaining profile gates.
-
-The same run's `up.log` attributes 11.549s to the Create lifecycle phase and
-19.793s to the following two-Agent inventory refresh. Its six query dispatches
-consume 19.790s in total. This is end-to-end debug-host diagnostic evidence,
-not released capacity qualification. It supports the combined-projection work
-below rather than treating the Invoke gas optimization as sufficient.
-
-Earlier setup evidence is retained in `resolved-lifecycle.ekSIW8/`: initial
-bootstrap/Create/Install/restart passed, but the mutation fixture rejected the
-directory prefix before dispatch. Renaming that store then failed reopening
-with `Host(CorruptResidue)`; its original path was restored, and qualification
-restarted in the fresh fixed-path campaign above. No safety guard was weakened.
-Journal store identity binds canonical path and lock nonce; both focused tests
-pass in `resolved-store-identity.log`. Directory relocation is not a qualified
-backup/restore workflow.
-
-### Combined inventory projection: matched bundles, qualification in progress
-
-The SDK and system-authority actor now define a signed `Inventory` selector and
-`AIP1` page: fresh credential claims, one complete Authority head, and a cursor
-ordered by Agent then descriptor/replica/actor. An unchanged-head hint suppresses
-rows only after fresh authentication; consumers must still compare the exact
-Authority, credential and complete claims. Revoked credentials receive no rows.
-Pages cap total rows at 64, complex Agent/actor rows at eight, and bytes below
-the existing 16 KiB reply ceiling including its five-byte actor wrapper.
-This preserves dense-roster paging while combining small inventories. The actor
-still validates/reconstructs whole state; this is not touched-state execution.
-
-The production client now reconstructs this stream; its old per-Agent replica
-and actor fetch loops are removed. Complete descriptors, roster counts and
-generations, actor ownership/capacity, exact query binding and unchanged claims
-at one head are checked before publishing an inventory. Every failed refresh
-clears reuse. Credential rotation during an unchanged-head request fetches a
-full new view rather than reusing another credential's rows.
-
-Matched runtime and system templates are now integrated from immutable source
-`2ccfacb82089f804dbdbfea7ebfcabf377e7dde3`, using the existing pinned builder.
-The prescribed independent all-artifact reproduction passes:
-`inventory-pinned-reproduction.log`, implementation evidence
-`target/agent-release-reproduction/run.VMA5jz`. Runtime ELF/PVM and both signed
-templates match byte-for-byte; exact hashes are in `support/production-artifacts.toml`.
-**Do not deploy this implementation checkpoint yet:** qualify
-physical query/retirement/recovery and rerun the CLI campaign before advancing
-the reviewer branch. Existing `saga/agents` remains the fixed usable Local test
-checkpoint; the previous implementation CLI evidence does not qualify this cutover.
-
-Source evidence: 182 SDK tests (`inventory-stream-sdk-final.log`), 75 Authority
-tests with two opt-in tests ignored (`inventory-stream-authority-final.log`),
-18 inventory-owner tests (`inventory-host-owner.log`), 31 adapter tests
-(`inventory-host-adapters.log`) and 52 Standard foundation tests
-(`inventory-stream-standard-final.log`) pass. Coverage
-includes canonical/truncated/oversized wire refusal, separate row/byte budgets,
-dense rosters, complete paged reconstruction, Private filtering, signature
-substitution, fresh cache hits, changed-head continuation, revocation and actor
-restart. The no-std Authority guest builds (`inventory-stream-authority-guest-final.log`);
-the separate reproduction above now establishes bundled artifact provenance,
-not physical performance or end-to-end lifecycle qualification.
-The two-Agent host fixture requires one dispatch instead of six. Host failures
-cover missing descriptors/replicas, altered or excess replicas, foreign/extra
-actors, query substitution, mid-page claim changes, transport errors and a
-premature terminal page. These source tests do not measure released latency.
-The updated long journal regression passes in 212.73s
-(`inventory-host-suffix-rotation.log`): 17 full 241-Agent refreshes, 31 pages each,
-527 distinct signed queries and 1,054 ordered entries. It checks complete
-inventory equality, exact retirement, bounded retained suffix and repeated
-checkpoint rotation, with no pending projection left. This uses native Standard
-execution and a purpose-built projection actor PVM, not the compiled production
-Authority artifact. CLI source checking passes (`inventory-host-cli-check.log`).
-
-The new bundled physical inventory test passes in 24.97s
-(`inventory-bundled-physical-query.log`), explicitly enabling the real outer PVM.
-It executes the compiled Authority's fresh Inventory endpoint and an authenticated
-unchanged-head query, verifies exact query/head binding and positive retirement
-for both, and leaves no pending projection. This small bootstrap inventory is not
-growing-directory, crash-recovery or released-latency qualification.
-All 110 bundled wire tests pass, with five opt-in tests ignored
-(`inventory-bundled-wire.log`). The updated debug CLI builds
-(`inventory-cli-build.log`), and its release bundle generation/verification passes
-at `target/agent-release-reproduction/inventory-2ccfacb8/integrated-bundle`.
-These checks do not replace the fresh CLI lifecycle campaign.
-All 21 bundled Local tests pass (`inventory-bundled-local-configured.log`),
-including opaque runtime recovery and hostile upgrade directories. The first
-run (`inventory-bundled-local.log`) passed 19 tests but lacked the explicit
-`AGENT_SCRIPTED_RUNTIME_ELF` path for two fixtures; the corrected full run uses
-the existing r19 scripted guest. No assertion or guest validation was bypassed.
+The operations remain seconds-long. Mutation/read latency remains roughly
+27–29s for the managed attempt: inventory batching does not solve that path.
+Earlier immutable resolution reduced the measured Credential Invoke+ACK gas
+24.3% versus r18; that profile does not establish the new Inventory query's
+released cost. Large compiled directories, idle-Agent scaling, mixed load,
+resource budgets and tail latency remain unqualified.
 
 ## Next sequence
 
-1. Reviewer examines `c8028394..saga/agents` read-only and returns findings;
-   implementation applies fixes on latest source.
-2. Keep the current reviewer branch fixed while completing the combined
-   inventory batch. The next scoped handoff should include immutable-resolution
-   reuse plus the inventory cutover and matched reproduced artifacts, with a
-   fresh lifecycle/performance campaign. Apply returned findings on latest source.
-3. Qualify the implemented combined projection (`525319d5`, `2ccfacb8`) with
-   matched compiled artifacts. Source acceptance already covers exact bindings,
-   one revision, revocation/visibility, interrupted pagination and cache invalidation;
-   the scripted journal campaign covers repeated retirement/checkpoint rotation.
-   The compiled endpoint/runtime pair now passes fresh-query and unchanged-head
-   retirement. Remaining evidence includes interrupted physical recovery and the
-   end-to-end CLI campaign. Compare complete
-   refresh cost and runtime execution counts at fixed one-, two- and growing-Agent
-   inventories. Preserve total response bounds, freshness and durable retirement;
-   no custom-state decoding shortcuts or discarded guest state.
-4. Develop bounded touched-state access/incremental publication and qualify costs
-   against directory growth, idle Agents and independent workloads.
-5. Continue every full-saga gate below; the checkpoint does not narrow the goal.
+1. Reviewer examines `7bd66a7d..saga/agents` read-only and returns findings.
+   Apply fixes on latest implementation source; advance the reviewer branch only
+   at qualified checkpoints. Do not mix reviewer edits with implementation work.
+2. Establish released-binary phase/cost baselines for startup, managed
+   invocation/ACK and inventory at fixed one-, two- and growing-Agent sizes.
+   Keep exact binary/artifact identities, CPU/RAM/FD and queue/tail measurements.
+   Do not treat the debug campaign as a passed production latency gate.
+3. Address whole-state/touched-state and incremental-publication costs with an
+   explicit common runtime contract, recovery invariants and growth acceptance;
+   preserve fresh revision-consistent projections and scheduling isolation.
+4. Continue every full-saga gate below. This checkpoint does not narrow the goal.
 
 ## Remaining full-saga acceptance gates
 
@@ -295,10 +179,9 @@ the existing r19 scripted guest. No assertion or guest validation was bypassed.
 
 ## Historical evidence
 
-Previous r18 checkpoint status/review is at `c8028394:docs/agent-saga-status.md`
-and `c8028394:docs/agent-saga-review.md`. Intermediate r19 foundation evidence is
-preserved at `3c5e44c7:docs/agent-saga-status.md`. Original long journals remain
-at `a1ebce16:docs/agent-saga-handoff.md` and `a1ebce16:docs/agent-saga-review.md`.
-Historical pending-work statements apply only to their checkpoints. Frozen
-clients, failed-operation bytes, release-specific stores and evidence were not
-deleted by this compaction. Keep scratch disk-backed, not RAM-backed /tmp.
+Full pre-inventory status is at `9fe6762e:docs/agent-saga-status.md`; r19 reviewer
+status is at `7bd66a7d:docs/agent-saga-status.md`; r18 status is at
+`c8028394:docs/agent-saga-status.md`. Original long handoff/review journals remain
+at `a1ebce16`. Historical pending-work statements apply only to those checkpoints.
+This compaction deletes no frozen clients, failure bytes, stores or logs.
+Keep scratch disk-backed, not RAM-backed /tmp.

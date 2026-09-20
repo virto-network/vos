@@ -19372,10 +19372,23 @@ mod tests {
 
         #[test]
         fn pending_projection_recovers_exact_invoke_and_ack_before_record_clear() {
+            check_pending_projection_exact_recovery(false);
+        }
+
+        #[test]
+        fn bundled_inventory_recovers_exact_invoke_and_ack_before_record_clear() {
+            check_pending_projection_exact_recovery(true);
+        }
+
+        fn check_pending_projection_exact_recovery(inventory: bool) {
             use crate::agent::sdk::authority::AuthorityCredentialProjection;
             use crate::agent::shared_journal_driver::CleanInvocationReplayRequest;
 
-            let fixture = native_projection_physical_fixture();
+            let fixture = if inventory {
+                native_bundled_authority_fixture()
+            } else {
+                native_projection_physical_fixture()
+            };
             let directory = TestDirectory::new("pending-projection-exact-recovery");
             let pins = BootstrapMemoryStore::default();
             let record = BootstrapMemoryStore::default();
@@ -19393,15 +19406,50 @@ mod tests {
                 Arc::clone(&provider),
                 Arc::clone(&network),
             );
-            let query = signed_credential_projection_query(&owner, 0xc1);
-            assert_eq!(
-                query.encode().unwrap().len(),
-                placeholder_credential_projection()
-                    .query
-                    .encode()
-                    .unwrap()
-                    .len()
-            );
+            let signed_query = |owner: &MemoryBootstrapOwner, nonce: u8| {
+                if !inventory {
+                    return signed_credential_projection_query(owner, nonce);
+                }
+                let public = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32])
+                    .verifying_key()
+                    .to_bytes();
+                let (node_key, _, _, node) = node_material();
+                let mut query = AuthorityProjectionQuery {
+                    authority: owner.authority_target(),
+                    credential: CredentialId::of_public_key(&public),
+                    nonce: Hash([nonce; 32]),
+                    selector: AuthorityProjectionSelector::Inventory {
+                        after: None,
+                        limit: 64,
+                        known_head: None,
+                    },
+                    authentication: AuthorityIngressAuthentication::SshNodeAttestation {
+                        credential_public_key: public,
+                        node: NodeId(node.0),
+                        request_binding: Hash([0xd6; 32]),
+                        signature: [1; 64],
+                    },
+                };
+                let signature = node_key.sign(&query.signing_bytes()).to_bytes();
+                if let AuthorityIngressAuthentication::SshNodeAttestation {
+                    signature: value, ..
+                } = &mut query.authentication
+                {
+                    *value = signature;
+                }
+                query
+            };
+            let query = signed_query(&owner, 0xc1);
+            if !inventory {
+                assert_eq!(
+                    query.encode().unwrap().len(),
+                    placeholder_credential_projection()
+                        .query
+                        .encode()
+                        .unwrap()
+                        .len()
+                );
+            }
             let pending = owner.prepare_authority_projection(query.clone()).unwrap();
             let (work, authorization) = pending.invocation().unwrap();
             let work = work.clone();
@@ -19456,7 +19504,16 @@ mod tests {
             else {
                 panic!("projection reply was not bytes");
             };
-            let projection = AuthorityCredentialProjection::decode(&response).unwrap();
+            let projection = if inventory {
+                let page = crate::agent_sdk::authority::AuthorityInventoryProjectionPage::decode(
+                    &response,
+                )
+                .unwrap();
+                page.validate_shape().unwrap();
+                page.credential
+            } else {
+                AuthorityCredentialProjection::decode(&response).unwrap()
+            };
             assert_eq!(projection.query, query);
             assert_eq!(owner.ordered_index_for_test().unwrap(), before_invoke + 1);
             {
@@ -19477,7 +19534,7 @@ mod tests {
                 );
             }
             let rival = owner
-                .prepare_authority_projection(signed_credential_projection_query(&owner, 0xc2))
+                .prepare_authority_projection(signed_query(&owner, 0xc2))
                 .unwrap();
             let (rival_work, rival_authorization) = rival.invocation().unwrap();
             let earlier_authorization = InvocationAuthorization::PublicPreflight(
@@ -19621,7 +19678,14 @@ mod tests {
                 );
                 assert_eq!(
                     owner.supervisor_invoke(identity, probe, probe_authorization),
-                    Err(SharedAgentHostError::CapacityExhausted)
+                    // The scripted actor declares these synthetic probe methods;
+                    // the compiled Authority does not. Both must leave the exact
+                    // retained pair and all host/runtime state untouched below.
+                    Err(if inventory {
+                        SharedAgentHostError::InvalidProvision
+                    } else {
+                        SharedAgentHostError::CapacityExhausted
+                    })
                 );
             }
             let after_blocked_competitors = {
@@ -19688,7 +19752,7 @@ mod tests {
                     .retained_positive_clean_acknowledgement(agent, &work, &authorization)
                     .unwrap()
             );
-            let fresh = signed_credential_projection_query(&owner, 0xc3);
+            let fresh = signed_query(&owner, 0xc3);
             assert!(owner.invoke_authority_projection(fresh).is_ok());
             assert_eq!(owner.ordered_index_for_test().unwrap(), after_ack + 2);
             assert_eq!(owner.record.pending_projection, None);
