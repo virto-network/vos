@@ -496,6 +496,7 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
         "issuer-reuse-smoke" => "issuer-reuse-release.",
         "fresh-ack-smoke" => "fresh-ack-release.",
         "current-latency-smoke" => "current-latency.",
+        "indexed-lifecycle" => "indexed-lifecycle.",
         _ => panic!("only the explicitly named disposable campaigns are supported"),
     };
     let (data, space, node_public, address) =
@@ -503,11 +504,15 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
     assert!(data.to_string_lossy().contains(fixture_prefix));
     let recovery_campaign = matches!(
         selected_space.as_str(),
-        "issuer-reuse-smoke" | "fresh-ack-smoke" | "current-latency-smoke"
+        "issuer-reuse-smoke" | "fresh-ack-smoke" | "current-latency-smoke" | "indexed-lifecycle"
     );
     let campaign_root = if recovery_campaign {
         assert!(counter, "recovery fixture only supports Counter checks");
-        data.ancestors().nth(3).expect("isolated XDG fixture root")
+        if selected_space == "indexed-lifecycle" {
+            data.parent().expect("isolated explicit data directory")
+        } else {
+            data.ancestors().nth(3).expect("isolated XDG fixture root")
+        }
     } else {
         data.parent().unwrap()
     };
@@ -519,7 +524,7 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
     };
     let retained_create_campaign = matches!(
         selected_space.as_str(),
-        "fresh-ack-smoke" | "current-latency-smoke"
+        "fresh-ack-smoke" | "current-latency-smoke" | "indexed-lifecycle"
     );
     let counter_path = campaign_root.join(if retained_create_campaign {
         "counter.vos"

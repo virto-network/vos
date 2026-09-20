@@ -46,7 +46,8 @@ touched-state execution cost.
 
 Do not use that historical list as the current backlog. Implementation commit
 `caeeac18` moves node inventory/lifecycle work to a bounded control worker;
-it is not yet in review checkpoint `16adf95e`. This isolates scheduling but
+it was not in review checkpoint `16adf95e`, but is included in the subsequent
+control-worker/restoration checkpoint. This isolates scheduling but
 does not reduce physical inventory execution costs. See
 [current status](agent-saga-status.md) for current evidence and remaining gates.
 

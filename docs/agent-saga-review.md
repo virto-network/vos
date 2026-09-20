@@ -1,25 +1,26 @@
 # Agent saga: review guide
 
 [Current status](agent-saga-status.md) is authoritative for remaining work.
-Review the actual `saga/agents` tip, advanced from `1b977731` for this handoff.
-It includes recovery source `a1ebce16`, reproducible r18 artifacts `f9c362cb`,
-and the lifecycle-envelope fix. This is a qualified scoped review checkpoint,
+Review the actual `saga/agents` tip, advanced from `16adf95e` for this handoff.
+It includes control-worker isolation, indexed single restoration, reproducible
+optimized runtime artifacts, and physical Local lifecycle evidence. This is a scoped checkpoint,
 not a production-qualified release.
 
 Keep two consolidated review groups:
 
-1. Execution ownership and isolation: bounded admission, independent-Agent
-   dispatch, same-Agent ordering, Local leases, lifecycle generations,
-   retirement, refresh, shutdown and error recovery.
-2. Runtime-independent state access and recovery: targeted lookup, directory
-   snapshot reuse, pinned ownership, catalog scan boundaries, public history
-   projection, exact guest/host recovery agreement, reproducible bundled bytes,
-   durable package-bearing requests and bounded HTTP upload admission.
+1. Control-worker ownership and isolation: bounded admission, serial control
+   ordering, route exposure, cancellation during blocked inventory, rejected
+   queued closures and transferred attachments, panic/error propagation,
+   draining and idle-exit accounting. Examine `production_worker.rs`,
+   `production_owner.rs`, `node.rs` and supervisor shutdown delegation.
+2. Restoration and artifact integration: restore once without exposing unchecked
+   state; preserve first-ready forest order, missing-parent/cycle/duplicate-ID
+   refusal, artifact length consistency, capacity and suspension invariants.
+   Examine `wire.rs`, `standard.rs`, pins and independent reproduction. Check
+   physical output equivalence, not just native tests.
 
-Useful fixed deltas: `29a745c2..1b977731` covers the reviewed execution work;
-`1b977731..saga/agents` is the new integrated review delta. In particular, review
-the two-per-process upload admission lifetime across HTTP cancellation, exact
-endpoint body ceilings, and unchanged ordinary-body limits. Earlier Shared and
+New delta: `16adf95e..saga/agents`, with implementation through `63d52425` and
+bundled runtime update `066e6d3c`. Earlier Shared and
 row-state work inherited through `29a745c2` remains subject to the full-saga
 acceptance gates; these review groups do not retroactively qualify it.
 
@@ -28,12 +29,13 @@ and [the recovery contract](agent-recovery-contract.md). Distinguish measured
 coordination from throughput, source tests from bundled-binary behavior, and
 historical release results from current qualification.
 
-The `16adf95e` debug campaign passes bootstrap, HTTP/SSH, retained Create/resume,
-Counter Install and restart/shutdown. It does not rerun application invocation.
-Readiness remains 27–37s and lifecycle operations 54–65s: unacceptable latency,
-not a throughput benchmark. The ten-second test has not been relaxed or ignored.
-Later implementation-only evidence belongs in the current status, not in this
-checkpoint's qualification claims.
+The current debug binary passes fresh bootstrap, generated system packages and
+ingress config, HTTP/SSH, Local Create, Counter Install, mutation, exact retry,
+positive retirement, read after restart and shutdown. Readiness remains 25–40s,
+Create 51s, Install 60s, and managed attempts approximately 32–34s: unacceptable
+latency. The ten-second target is unchanged. The 512-actor one-entry inspection
+uses approximately 85% less gas, but unrelated actors still increase its cost.
+This is not touched-state, optimized-release or thousands-concurrent qualification.
 
 Review read-only: no fixes, formatting, branch movement, commits or pushes.
 Return severity, exact commit/file/line, violated invariant, concrete scenario,
