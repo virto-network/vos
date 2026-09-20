@@ -10494,6 +10494,15 @@ mod tests {
 
         #[test]
         fn native_bundled_authority_fresh_credential_query_retires_exact_pair() {
+            check_bundled_authority_fresh_query(false);
+        }
+
+        #[test]
+        fn native_bundled_authority_inventory_query_and_cache_hit_retire_exact_pairs() {
+            check_bundled_authority_fresh_query(true);
+        }
+
+        fn check_bundled_authority_fresh_query(inventory: bool) {
             let mut harness = NativeProjectionOwnerHarness::with_fixture(
                 "bundled-authority-fresh-query",
                 native_bundled_authority_fixture(),
@@ -10506,7 +10515,15 @@ mod tests {
                 authority: owner.authority_target(),
                 credential: CredentialId::of_public_key(&public),
                 nonce: Hash([0xd5; 32]),
-                selector: AuthorityProjectionSelector::Credential,
+                selector: if inventory {
+                    AuthorityProjectionSelector::Inventory {
+                        after: None,
+                        limit: 64,
+                        known_head: None,
+                    }
+                } else {
+                    AuthorityProjectionSelector::Credential
+                },
                 authentication: AuthorityIngressAuthentication::SshNodeAttestation {
                     credential_public_key: public,
                     node: NodeId(node.0),
@@ -10539,7 +10556,18 @@ mod tests {
             eprintln!("bundled_authority_fresh_query begin");
             let response = owner.invoke_authority_projection(query.clone()).unwrap();
             eprintln!("bundled_authority_fresh_query end");
-            let projection = AuthorityCredentialProjection::decode(&response).unwrap();
+            let projection = if inventory {
+                let page = crate::agent_sdk::authority::AuthorityInventoryProjectionPage::decode(
+                    &response,
+                )
+                .unwrap();
+                page.validate_shape().unwrap();
+                assert!(!page.unchanged);
+                assert!(page.next.is_none());
+                page.credential
+            } else {
+                AuthorityCredentialProjection::decode(&response).unwrap()
+            };
             projection.validate_shape().unwrap();
             assert_eq!(projection.query, query);
             assert_eq!(projection.status, AuthorityCredentialStatus::Active);
@@ -10553,6 +10581,43 @@ mod tests {
                     .retained_positive_clean_acknowledgement(agent, work, authorization)
                     .unwrap()
             );
+            if inventory {
+                query.nonce = Hash([0xd7; 32]);
+                query.selector = AuthorityProjectionSelector::Inventory {
+                    after: None,
+                    limit: 64,
+                    known_head: Some(projection.head),
+                };
+                let signature = node_key.sign(&query.signing_bytes()).to_bytes();
+                if let AuthorityIngressAuthentication::SshNodeAttestation {
+                    signature: value, ..
+                } = &mut query.authentication
+                {
+                    *value = signature;
+                }
+                let before = owner.ordered_index_for_test().unwrap();
+                let pending = owner.prepare_authority_projection(query.clone()).unwrap();
+                let (work, authorization) = pending.invocation().unwrap();
+                let response = owner.invoke_authority_projection(query.clone()).unwrap();
+                let page = crate::agent_sdk::authority::AuthorityInventoryProjectionPage::decode(
+                    &response,
+                )
+                .unwrap();
+                page.validate_shape().unwrap();
+                assert_eq!(page.credential.query, query);
+                assert_eq!(page.credential.head, projection.head);
+                assert!(page.unchanged && page.entries.is_empty() && page.next.is_none());
+                assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
+                assert!(owner.record.pending_projection.is_none());
+                assert!(
+                    owner
+                        .host
+                        .lock()
+                        .unwrap()
+                        .retained_positive_clean_acknowledgement(agent, work, authorization)
+                        .unwrap()
+                );
+            }
             harness.stop();
         }
 

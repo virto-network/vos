@@ -178,7 +178,7 @@ Journal store identity binds canonical path and lock nonce; both focused tests
 pass in `resolved-store-identity.log`. Directory relocation is not a qualified
 backup/restore workflow.
 
-### Combined inventory projection: host source cutover, bundle integration pending
+### Combined inventory projection: matched bundles, qualification in progress
 
 The SDK and system-authority actor now define a signed `Inventory` selector and
 `AIP1` page: fresh credential claims, one complete Authority head, and a cursor
@@ -197,9 +197,13 @@ at one head are checked before publishing an inventory. Every failed refresh
 clears reuse. Credential rotation during an unchanged-head request fetches a
 full new view rather than reusing another credential's rows.
 
-**The implementation source now requires the new endpoint, but its bundled
-Authority template is still the previous version. Do not deploy this source
-checkpoint yet.** Reproduce and integrate matched runtime/templates, qualify
+Matched runtime and system templates are now integrated from immutable source
+`2ccfacb82089f804dbdbfea7ebfcabf377e7dde3`, using the existing pinned builder.
+The prescribed independent all-artifact reproduction passes:
+`inventory-pinned-reproduction.log`, implementation evidence
+`target/agent-release-reproduction/run.VMA5jz`. Runtime ELF/PVM and both signed
+templates match byte-for-byte; exact hashes are in `support/production-artifacts.toml`.
+**Do not deploy this implementation checkpoint yet:** qualify
 physical query/retirement/recovery and rerun the CLI campaign before advancing
 the reviewer branch. Existing `saga/agents` remains the fixed usable Local test
 checkpoint; the previous implementation CLI evidence does not qualify this cutover.
@@ -213,7 +217,8 @@ includes canonical/truncated/oversized wire refusal, separate row/byte budgets,
 dense rosters, complete paged reconstruction, Private filtering, signature
 substitution, fresh cache hits, changed-head continuation, revocation and actor
 restart. The no-std Authority guest builds (`inventory-stream-authority-guest-final.log`);
-it is not yet a reproduced/pinned bundled artifact or a physical performance result.
+the separate reproduction above now establishes bundled artifact provenance,
+not physical performance or end-to-end lifecycle qualification.
 The two-Agent host fixture requires one dispatch instead of six. Host failures
 cover missing descriptors/replicas, altered or excess replicas, foreign/extra
 actors, query substitution, mid-page claim changes, transport errors and a
@@ -226,6 +231,23 @@ checkpoint rotation, with no pending projection left. This uses native Standard
 execution and a purpose-built projection actor PVM, not the compiled production
 Authority artifact. CLI source checking passes (`inventory-host-cli-check.log`).
 
+The new bundled physical inventory test passes in 24.97s
+(`inventory-bundled-physical-query.log`), explicitly enabling the real outer PVM.
+It executes the compiled Authority's fresh Inventory endpoint and an authenticated
+unchanged-head query, verifies exact query/head binding and positive retirement
+for both, and leaves no pending projection. This small bootstrap inventory is not
+growing-directory, crash-recovery or released-latency qualification.
+All 110 bundled wire tests pass, with five opt-in tests ignored
+(`inventory-bundled-wire.log`). The updated debug CLI builds
+(`inventory-cli-build.log`), and its release bundle generation/verification passes
+at `target/agent-release-reproduction/inventory-2ccfacb8/integrated-bundle`.
+These checks do not replace the fresh CLI lifecycle campaign.
+All 21 bundled Local tests pass (`inventory-bundled-local-configured.log`),
+including opaque runtime recovery and hostile upgrade directories. The first
+run (`inventory-bundled-local.log`) passed 19 tests but lacked the explicit
+`AGENT_SCRIPTED_RUNTIME_ELF` path for two fixtures; the corrected full run uses
+the existing r19 scripted guest. No assertion or guest validation was bypassed.
+
 ## Next sequence
 
 1. Reviewer examines `c8028394..saga/agents` read-only and returns findings;
@@ -234,16 +256,16 @@ Authority artifact. CLI source checking passes (`inventory-host-cli-check.log`).
    inventory batch. The next scoped handoff should include immutable-resolution
    reuse plus the inventory cutover and matched reproduced artifacts, with a
    fresh lifecycle/performance campaign. Apply returned findings on latest source.
-3. Reduce authenticated inventory projection work with explicit revision,
-   freshness, availability and ordering. Preserve same-head pagination, cache
-   invalidation on refresh failure and durable retirement; no custom-state decoding
-   shortcuts or discarded guest state. Complete the staged combined projection
-   implementation to amortize the repeated authenticated invocation/retirement pairs;
-   enforce total response bounds rather than merely increasing page sizes.
-   Acceptance must cover exact credential/nonce/Authority binding, one revision,
-   revocation and visibility filtering, interrupted pagination, pending-query
-   recovery, and unchanged-head reuse. Compare complete refresh cost and runtime
-   execution counts at fixed one-, two- and growing-Agent inventories.
+3. Qualify the implemented combined projection (`525319d5`, `2ccfacb8`) with
+   matched compiled artifacts. Source acceptance already covers exact bindings,
+   one revision, revocation/visibility, interrupted pagination and cache invalidation;
+   the scripted journal campaign covers repeated retirement/checkpoint rotation.
+   The compiled endpoint/runtime pair now passes fresh-query and unchanged-head
+   retirement. Remaining evidence includes interrupted physical recovery and the
+   end-to-end CLI campaign. Compare complete
+   refresh cost and runtime execution counts at fixed one-, two- and growing-Agent
+   inventories. Preserve total response bounds, freshness and durable retirement;
+   no custom-state decoding shortcuts or discarded guest state.
 4. Develop bounded touched-state access/incremental publication and qualify costs
    against directory growth, idle Agents and independent workloads.
 5. Continue every full-saga gate below; the checkpoint does not narrow the goal.

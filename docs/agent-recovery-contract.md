@@ -1,7 +1,7 @@
 # Runtime-independent management recovery binding
 
 Evidence scope: r18, included in review checkpoint `c8028394`; not qualification
-of the implementation-only r19 cutover. Source committed at `a1ebce16`, integrated
+of later r19 or inventory-stream artifacts. Source committed at `a1ebce16`, integrated
 after checkpoint `1b977731`.
 The original physical reopen regression, broader guest/host coverage and repaired
 scripted fixtures pass with rebuilt r18 guests. Bundled bytes and pins are updated
@@ -42,7 +42,10 @@ can map their own storage into borrowed entries without cloning their state or
 adopting the host's `LMH1` representation. This helper validates projection shape,
 not signatures. Local host history now has the corresponding projection method.
 
-## Integration checklist for this work batch
+## Historical integration checklist (r18, completed)
+
+This records the original integration sequence, not pending work. Follow
+[current status](agent-saga-status.md) for remaining acceptance gates.
 
 1. Add a canonical read-only `InspectManagementHistory` request and a fixed-size
    commitment reply. Include it in authority-free/read-only classification,
