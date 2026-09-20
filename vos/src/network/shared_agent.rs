@@ -4106,8 +4106,25 @@ impl SharedAgentNetworkHost {
     pub(crate) fn supervisor_projections(
         &mut self,
     ) -> Result<Vec<SharedAgentRuntimeProjection>, SharedAgentHostError> {
+        self.supervisor_projections_scoped(None)
+    }
+
+    pub(crate) fn supervisor_projection_for(
+        &mut self,
+        agent: crate::service::AgentId,
+    ) -> Result<Vec<SharedAgentRuntimeProjection>, SharedAgentHostError> {
+        self.supervisor_projections_scoped(Some(agent))
+    }
+
+    fn supervisor_projections_scoped(
+        &mut self,
+        only: Option<crate::service::AgentId>,
+    ) -> Result<Vec<SharedAgentRuntimeProjection>, SharedAgentHostError> {
         self.refresh()?;
-        let agents = self.generations.keys().copied().collect::<Vec<_>>();
+        let agents = match only {
+            Some(agent) => vec![agent],
+            None => self.generations.keys().copied().collect(),
+        };
         let mut projections = Vec::with_capacity(agents.len());
         for agent in agents {
             let attached = self
@@ -4160,8 +4177,35 @@ impl SharedAgentNetworkHost {
         root: Option<&crate::agent::invocation_preparation::PhysicalRootLineage>,
     ) -> Result<crate::agent::shared_host::SharedAuthorityProjectionAudit, SharedAgentHostError>
     {
+        self.audit_authority_projection_scoped(head, projected, root, false)
+    }
+
+    pub(crate) fn audit_system_authority_projection(
+        &mut self,
+        head: crate::agent_sdk::authority::AuthorityProjectionHead,
+        projected: &[crate::agent::supervisor_adapters::AgentAuthorityRouteProjection],
+        root: &crate::agent::invocation_preparation::PhysicalRootLineage,
+    ) -> Result<crate::agent::shared_host::SharedAuthorityProjectionAudit, SharedAgentHostError>
+    {
+        self.audit_authority_projection_scoped(head, projected, Some(root), true)
+    }
+
+    fn audit_authority_projection_scoped(
+        &mut self,
+        head: crate::agent_sdk::authority::AuthorityProjectionHead,
+        projected: &[crate::agent::supervisor_adapters::AgentAuthorityRouteProjection],
+        root: Option<&crate::agent::invocation_preparation::PhysicalRootLineage>,
+        system_only: bool,
+    ) -> Result<crate::agent::shared_host::SharedAuthorityProjectionAudit, SharedAgentHostError>
+    {
         self.refresh()?;
-        let leased_agents = self.generations.keys().copied().collect::<Vec<_>>();
+        let leased_agents = if system_only {
+            vec![crate::service::AgentId(
+                root.ok_or(SharedAgentHostError::ScopeMismatch)?.agent.0,
+            )]
+        } else {
+            self.generations.keys().copied().collect::<Vec<_>>()
+        };
         let mut leases = Vec::with_capacity(leased_agents.len());
         for agent in &leased_agents {
             let attached = self
@@ -4196,7 +4240,15 @@ impl SharedAgentNetworkHost {
                 return Err(SharedAgentHostError::TransportNotAttached);
             }
         }
-        let audit = host.audit_authority_projection(head, projected, root)?;
+        let audit = if system_only {
+            host.audit_system_authority_projection(
+                head,
+                projected,
+                root.ok_or(SharedAgentHostError::ScopeMismatch)?,
+            )?
+        } else {
+            host.audit_authority_projection(head, projected, root)?
+        };
         if leased_agents.iter().any(|agent| {
             self.generations
                 .get(agent)

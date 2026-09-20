@@ -585,6 +585,64 @@ PVM in 23.06s (`shared-stack-physical-inventory-test.log`). That test qualifies
 artifact integration on the Inventory path, not full physical Shared publication.
 Workspace formatting and diff checks pass (`shared-stack-artifact-format.log`).
 
+The subsequent physical-publication gate now selects an executable bundled
+runtime for the proposed ordinary Agent as well as the system Agent when
+`VOS_AGENT_PROFILE_REFINE_MACHINES=1`. Previously the proposal still used the
+native-only trap fixture. `just test-shared-agent-publication` makes this gate
+repeatable, clears the candidate-runtime override and keeps Cargo scratch on
+disk; set `JUST_TEMPDIR` to an existing disk-backed directory before invoking it.
+Recipe parsing/shell syntax and workspace formatting pass. The ordinary native
+preparation regression still passes (4.06s,
+`shared-proposal-runtime-selection-regression.log`). The full physical run passes
+in 510.61s (`shared-bundled-full-physical-publication.log`). This was before the
+subsequent provisioning/reopen extension below and does not establish nonempty
+provisioned-generation recovery. Its many fault/retry cases are not a
+single-operation latency measurement.
+
+### Owner-authenticated provisioning and nonempty recovery
+
+`provision_published_shared_genesis` obtains an exact live-publication replay
+proof with a positive ACK before provisioning the ordinary generation. The host
+uses that proof only for this provision; its configured verifier is not replaced.
+The committee authority comes from the authenticated Create descriptor. The
+caller must retain lifecycle/archive leases; supervisor serving remains separate.
+
+The bundled regression now rejects substituted finality, provisions and retries
+the exact generation, and attempts a nonempty deferred reopen through the leased
+controller. Its fixture rejects archive-only finality. The native-outer test
+passes in 53.91s (`shared-owner-nonempty-recovery-strict.log`), including refusal
+to open the nonempty deferred set with no proofs. This is not yet a real-PVM
+or released serving qualification. Initial failures are preserved:
+`shared-owner-provision-regression.log` (test ID type mismatch),
+`shared-owner-provision-regression-fixed.log` and
+`shared-owner-nonempty-recovery.log` (retry comparisons incorrectly included
+attachment status and Raft initialization), and
+`shared-owner-nonempty-recovery-state.log` (large fixture host-stack overflow).
+Restart bootstrap now uses a normal separate thread like initial fixture
+bootstrap; no stack limit is raised. Exact retry checks generation/route and
+runtime state instead of forbidding the transport's leader initialization entry.
+The broader host suite passes: 23 tests, one opt-in ignored, 248.67s
+(`shared-owner-provision-host-suite.log`). The actual
+`just test-shared-agent-publication` execution
+(`shared-owner-nonempty-physical-recipe.log`) is still running; collect its terminal
+result before claiming a pass. Formatting/diff checks pass. The earlier
+510.61s physical pass does not cover these later changes. The new method is not
+yet wired into ordinary CLI creation or supervisor route ownership.
+
+The serving-path follow-up found two system-only assumptions invalidated by
+nonempty recovery: system route discovery expected the complete physical host
+to contain exactly one generation, and system inventory was audited against
+all physical generations. Explicit pinned-system selection now keeps those
+checks scoped to the root generation while retaining completeness within that
+scope; generic Shared audits still require the whole set. The expanded native
+regression passes in 63.59s (`shared-owner-scoped-system-recovery-fixed.log`),
+and the retained root-forgery regression passes in 2.48s
+(`shared-owner-scoped-system-root-refusals.log`). The initial test type-qualification
+build failure remains at `shared-owner-scoped-system-recovery.log`. The broader
+host suite and physical recipe above preceded this scoped-system follow-up.
+The host-suite rerun on the scoped implementation is ongoing in
+`shared-owner-scoped-host-suite.log`.
+
 ## Continuation plan
 
 The immediate functional batch is item 4; items 2–3 remain performance work,

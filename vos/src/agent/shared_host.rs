@@ -1287,6 +1287,30 @@ impl SharedAgentHost {
         &mut self,
         intent: SharedGenesisIntent,
     ) -> Result<SharedAgentStatus, SharedAgentHostError> {
+        let finality = Arc::clone(&self.finality);
+        self.provision_intent_with_finality(intent, finality.as_ref())
+    }
+
+    /// The owning system coordinator supplies an exact live-replay proof.
+    /// This does not replace the verifier used for other generations or reopen.
+    #[cfg(all(feature = "network", target_os = "linux"))]
+    pub(crate) fn provision_replay_verified(
+        &mut self,
+        provision: AgentGenesisProvision,
+        catalog: Vec<RuntimeBlob>,
+        committee_authority: CommitteeChangeAuthorityBinding,
+        finality: &super::clean_bootstrap::ReplayVerifiedAgentGenesisFinality,
+    ) -> Result<SharedAgentStatus, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        let intent = SharedGenesisIntent::new(provision, catalog, committee_authority)?;
+        self.provision_intent_with_finality(intent, finality)
+    }
+
+    fn provision_intent_with_finality(
+        &mut self,
+        intent: SharedGenesisIntent,
+        finality: &dyn AgentGenesisFinalityVerifier,
+    ) -> Result<SharedAgentStatus, SharedAgentHostError> {
         let agent = intent.agent()?;
         if self.deferred_generations.contains_key(&agent) {
             return Err(SharedAgentHostError::Conflict);
@@ -1299,7 +1323,7 @@ impl SharedAgentHost {
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        let sealed = self.verify_and_prepare(&intent)?;
+        let sealed = self.verify_and_prepare_with_finality(&intent, finality)?;
         if let Some(existing) = self.agents.get(&agent) {
             if existing.intent != intent {
                 return Err(SharedAgentHostError::Conflict);
@@ -1487,10 +1511,36 @@ impl SharedAgentHost {
         projected: &[super::supervisor_adapters::AgentAuthorityRouteProjection],
         root: Option<&super::invocation_preparation::PhysicalRootLineage>,
     ) -> Result<SharedAuthorityProjectionAudit, SharedAgentHostError> {
-        match self.audit_authority_projection_exact(projected, root) {
+        self.audit_authority_projection_scoped(head, projected, root, None)
+    }
+
+    /// Audit only the independently pinned system generation. Ordinary
+    /// generations remain subject to their own complete authority audit.
+    pub(crate) fn audit_system_authority_projection(
+        &self,
+        head: crate::agent_sdk::authority::AuthorityProjectionHead,
+        projected: &[super::supervisor_adapters::AgentAuthorityRouteProjection],
+        root: &super::invocation_preparation::PhysicalRootLineage,
+    ) -> Result<SharedAuthorityProjectionAudit, SharedAgentHostError> {
+        self.audit_authority_projection_scoped(
+            head,
+            projected,
+            Some(root),
+            Some(AgentId(root.agent.0)),
+        )
+    }
+
+    fn audit_authority_projection_scoped(
+        &self,
+        head: crate::agent_sdk::authority::AuthorityProjectionHead,
+        projected: &[super::supervisor_adapters::AgentAuthorityRouteProjection],
+        root: Option<&super::invocation_preparation::PhysicalRootLineage>,
+        only: Option<AgentId>,
+    ) -> Result<SharedAuthorityProjectionAudit, SharedAgentHostError> {
+        match self.audit_authority_projection_exact(projected, root, only) {
             Ok(identities) => return Ok(SharedAuthorityProjectionAudit::Ready(identities)),
             Err(error) => {
-                if self.physical_projection_is_one_ack_ahead(head, projected, root)? {
+                if self.physical_projection_is_one_ack_ahead(head, projected, root, only)? {
                     return Ok(SharedAuthorityProjectionAudit::Lag);
                 }
                 return Err(error);
@@ -1502,9 +1552,13 @@ impl SharedAgentHost {
         &self,
         projected: &[super::supervisor_adapters::AgentAuthorityRouteProjection],
         root: Option<&super::invocation_preparation::PhysicalRootLineage>,
+        only: Option<AgentId>,
     ) -> Result<Vec<super::supervisor::AgentRouteIdentity>, SharedAgentHostError> {
         let mut local = Vec::new();
         for (agent, hosted) in &self.agents {
+            if only.is_some_and(|selected| selected != *agent) {
+                continue;
+            }
             if hosted
                 .driver
                 .local_role()
@@ -1589,9 +1643,13 @@ impl SharedAgentHost {
         head: crate::agent_sdk::authority::AuthorityProjectionHead,
         projected: &[super::supervisor_adapters::AgentAuthorityRouteProjection],
         root: Option<&super::invocation_preparation::PhysicalRootLineage>,
+        only: Option<AgentId>,
     ) -> Result<bool, SharedAgentHostError> {
         let mut physical = Vec::new();
         for (agent, hosted) in &self.agents {
+            if only.is_some_and(|selected| selected != *agent) {
+                continue;
+            }
             if hosted
                 .driver
                 .local_role()
@@ -5835,6 +5893,7 @@ mod tests {
                 head,
                 core::slice::from_ref(&before_install_projection),
                 None,
+                None,
             )
             .unwrap()
         );
@@ -5847,6 +5906,7 @@ mod tests {
                 .physical_projection_is_one_ack_ahead(
                     stale_head,
                     core::slice::from_ref(&before_install_projection),
+                    None,
                     None,
                 )
                 .unwrap()

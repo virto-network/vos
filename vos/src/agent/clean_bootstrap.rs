@@ -2357,7 +2357,9 @@ where
     pub(crate) fn supervisor_projections(
         &mut self,
     ) -> Result<Vec<super::shared_host::SharedAgentRuntimeProjection>, SharedAgentHostError> {
-        let projections = self._network_host.supervisor_projections()?;
+        let projections = self
+            ._network_host
+            .supervisor_projection_for(crate::service::AgentId(self.pins.agent.0))?;
         if projections.len() != 1 {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
@@ -3609,6 +3611,57 @@ where
         Ok(ReplayVerifiedAgentGenesisFinality(
             record.provision().clone(),
         ))
+    }
+
+    /// Provision only an exactly published and positively retired Shared Create.
+    /// Reauthenticate through this root-pinned owner before touching generation
+    /// files. The caller retains the lifecycle/archive leases; routing is a
+    /// separate lifecycle step and is not published by this method.
+    pub fn provision_published_shared_genesis<B, J, Q, ReplyStore, W, PubReply, S>(
+        &mut self,
+        recovery: &mut NativeSharedGenesisRecovery<B, J, Q, ReplyStore, W, PubReply>,
+        receipt_signer: &mut S,
+        record: &super::genesis::AgentGenesisArchiveRecord,
+    ) -> Result<super::shared_host::SharedAgentStatus, SharedAgentHostError>
+    where
+        B: super::clean_authority_issuer::CleanManagementRuntimeStore,
+        J: CleanManagementIssuerStore,
+        Q: CleanManagementIssuerStore,
+        ReplyStore: CleanManagementIssuerStore,
+        W: CleanManagementIssuerStore,
+        PubReply: CleanManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+    {
+        let proof = self.verify_published_shared_genesis(
+            recovery,
+            record.provision().replicas(),
+            receipt_signer,
+            record,
+        )?;
+        let intent = recovery
+            .intent
+            .intent()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let ManagementRequest::Create(descriptor) = intent.request() else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        let authority = CommitteeChangeAuthorityBinding::new(
+            descriptor.authority.policy,
+            descriptor.authority.issuer,
+            descriptor.identity.runtime_deployment,
+            descriptor.authority.public_key,
+            descriptor.authority.initial_epoch,
+        )
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        self.host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .provision_replay_verified(
+                record.provision().clone(),
+                record.catalog().to_vec(),
+                authority,
+                &proof,
+            )
     }
 
     /// Reopen the complete deferred ordinary set from leased recovery records.
@@ -4995,7 +5048,7 @@ where
         // The normal physical audit still checks the complete directory and
         // exact package/install material, including the pinned Authority row.
         self._network_host
-            .audit_authority_projection(head, &[complete], Some(&self.root_lineage))
+            .audit_system_authority_projection(head, &[complete], &self.root_lineage)
     }
 
     /// Periodic scheduling only; actual projection admission stays authoritative.
@@ -19369,17 +19422,33 @@ mod tests {
         }
 
         fn check_shared_proposal_and_committee_preparation(
-            fixture: PhysicalFixture,
+            mut fixture: PhysicalFixture,
             complete_publication: bool,
         ) {
             use crate::agent::clean_management_intent::{
                 CleanManagementIntent, CleanManagementIntentSlot,
             };
             use crate::agent::genesis::AgentReplicaMember;
+            struct NoArchiveFinality;
+            impl AgentGenesisFinalityVerifier for NoArchiveFinality {
+                fn verify_finalized(
+                    &self,
+                    _: &crate::agent::genesis::AgentGenesisProvision,
+                ) -> Result<(), crate::agent::genesis::AgentGenesisFinalityError> {
+                    Err(crate::agent::genesis::AgentGenesisFinalityError::NotFinalized)
+                }
+            }
+            // Only live publication replay may admit an ordinary generation.
+            // Do not inherit the generic fixture's permissive finality adapter.
+            fixture.finality = Arc::new(NoArchiveFinality);
             let mut harness =
                 NativeProjectionOwnerHarness::with_fixture("shared-proposal-retry", fixture);
             let owner = harness.owner.as_mut().unwrap();
-            let runtime = shape_only_runtime();
+            // The proposed generation must use executable runtime bytes too
+            // when qualifying the full physical path, not just its system Agent.
+            let runtime = test_runtime_package(
+                std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some(),
+            );
             let mut descriptor = owner.pins.descriptor.clone();
             descriptor.creation_nonce = Hash([0xdd; 32]);
             descriptor.identity.agent = AgentId::derive(
@@ -20599,7 +20668,26 @@ mod tests {
                     .verify_finalized(record.provision()),
                 Err(crate::agent::genesis::AgentGenesisFinalityError::NotFinalized)
             );
-            // No ordinary generation has been provisioned in this fixture.
+            assert_eq!(
+                owner.host.lock().unwrap().provision_replay_verified(
+                    alternate_record.provision().clone(),
+                    alternate_record.catalog().to_vec(),
+                    CommitteeChangeAuthorityBinding::new(
+                        descriptor.authority.policy,
+                        descriptor.authority.issuer,
+                        descriptor.identity.runtime_deployment,
+                        descriptor.authority.public_key,
+                        descriptor.authority.initial_epoch,
+                    )
+                    .unwrap(),
+                    &finality,
+                ),
+                Err(SharedAgentHostError::Finality(
+                    crate::agent::genesis::AgentGenesisFinalityError::Conflict
+                ))
+            );
+            assert_eq!(owner.host.lock().unwrap().len(), 1);
+            // No ordinary generation has been provisioned yet in this fixture.
             // Extra or duplicate attestations must not silently alter recovery.
             assert_eq!(
                 owner.complete_deferred_shared_genesis(vec![finality.clone(), finality.clone()]),
@@ -20729,6 +20817,37 @@ mod tests {
                     Err(GenesisIssuanceError::Unavailable)
                 );
             }
+            // Provision through the same live owner that authenticated the
+            // publication. Archive decoding alone cannot reach this path.
+            let provisioned = owner
+                .provision_published_shared_genesis(&mut recovered, &mut signer, &record)
+                .unwrap();
+            assert_eq!(provisioned.identity.agent.0, descriptor.identity.agent.0);
+            assert_eq!(owner.host.lock().unwrap().len(), 2);
+            let provisioned_state = owner
+                .host
+                .lock()
+                .unwrap()
+                .clean_state_commitment(locator.agent)
+                .unwrap();
+            let repeated = owner
+                .provision_published_shared_genesis(&mut recovered, &mut signer, &record)
+                .unwrap();
+            // Network refresh during authenticated replay may attach the
+            // generation and commit its Raft initialization entry. Its durable
+            // identity and runtime state must not change.
+            assert_eq!(repeated.generation, provisioned.generation);
+            assert_eq!(repeated.route, provisioned.route);
+            assert_eq!(
+                owner
+                    .host
+                    .lock()
+                    .unwrap()
+                    .clean_state_commitment(locator.agent)
+                    .unwrap(),
+                provisioned_state
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), after_ack);
             publication_reply
                 .image
                 .lock()
@@ -20780,6 +20899,119 @@ mod tests {
                 Err(SharedAgentHostError::Unavailable)
             );
             assert_eq!(owner.ordered_index_for_test().unwrap(), after_ack);
+            // Reopen the physical host with only the system generation visible,
+            // then recover the nonempty ordinary set from leased publication
+            // stores. The valid reply copy is separate from the corruption
+            // fixture above.
+            let target = owner.authority_target();
+            let recovery = super::super::NativeSharedGenesisRecovery::open(
+                target,
+                locator,
+                intent_store,
+                issuer_store,
+                reopened_query,
+                missing_reply,
+                publication_store,
+                missing,
+            )
+            .unwrap();
+            let mut controller = super::super::NativeSharedGenesisController::new(
+                target,
+                vec![(recovery, Some(archive_store))],
+            )
+            .unwrap();
+            let owner = harness.owner.take().unwrap();
+            let pins = owner._pins_store.clone();
+            let bootstrap_record = owner.record_store.clone();
+            let issuer = owner.issuer.into_store();
+            drop(owner._network_host);
+            drop(owner.host);
+            let mut operations = OperationTestJournal(harness._directory.0.clone());
+            let admission =
+                NativeAuthorityOperationStartupAdmission::load(&mut operations, target, &[])
+                    .unwrap();
+            let admission = controller.startup_admission(admission).unwrap();
+            // Match initial bootstrap's normal-stack isolation from this
+            // intentionally large, multiphase fault-injection fixture.
+            let mut owner =
+                std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
+                    pins,
+                    bootstrap_record,
+                    issuer,
+                    &mut signer,
+                    || panic!("nonempty recovery must not recreate bootstrap"),
+                    harness._directory.host(),
+                    harness._directory.lock(),
+                    harness.fixture.plan.pins.space,
+                    harness.fixture.plan.pins.node,
+                    harness.fixture.trust.clone(),
+                    harness.fixture.merge.clone(),
+                    harness.fixture.finality.clone(),
+                    harness.provider.clone(),
+                    harness.network.clone(),
+                    None,
+                    Some(&admission),
+                )
+                .unwrap()
+            }).join().unwrap()
+                });
+            drop(admission);
+            assert_eq!(owner.host.lock().unwrap().len(), 1);
+            assert_eq!(
+                owner.host.lock().unwrap().deferred_agent_ids(),
+                vec![locator.agent]
+            );
+            assert_eq!(
+                owner.complete_deferred_shared_genesis(Vec::new()),
+                Err(SharedAgentHostError::ScopeMismatch)
+            );
+            assert_eq!(owner.host.lock().unwrap().len(), 1);
+            controller.recover(&mut owner, &mut signer).unwrap();
+            assert!(controller.is_recovered());
+            assert_eq!(owner.host.lock().unwrap().len(), 2);
+            assert!(!owner.host.lock().unwrap().has_deferred_open());
+            assert_eq!(owner.ordered_index_for_test().unwrap(), after_ack);
+            let reopened = owner
+                .host
+                .lock()
+                .unwrap()
+                .show(locator.agent)
+                .unwrap()
+                .unwrap();
+            assert_eq!(reopened.generation, provisioned.generation);
+            // Ordinary generations sharing the physical host must not make
+            // the independently pinned system route disappear.
+            let system = owner.supervisor_projections().unwrap();
+            assert_eq!(system.len(), 1);
+            assert_eq!(system[0].descriptor.identity.agent, owner.pins.agent);
+            let catalog =
+                super::super::install_request(harness.fixture.plan.catalog_request()).unwrap();
+            let projected = crate::agent::supervisor_adapters::AgentAuthorityRouteProjection::new(
+                owner.pins.descriptor.replica_generation(),
+                owner.pins.descriptor.clone(),
+                vec![crate::agent_sdk::authority::AuthorityActorProjection {
+                    agent: owner.pins.agent,
+                    entry: catalog.entry.clone(),
+                    producer: catalog.producer,
+                    contract: catalog.contract,
+                    requirements: catalog.requirements,
+                    root_provenance: true,
+                    installation_id: catalog.installation_id,
+                    registry_reservation: catalog.registry_reservation,
+                    install_request: catalog.lineage_commitment(),
+                }],
+            )
+            .unwrap();
+            assert!(matches!(
+                owner.audit_authority_projection(
+                    placeholder_credential_projection().head, &[projected],
+                ),
+                Ok(crate::agent::shared_host::SharedAuthorityProjectionAudit::Ready(identities))
+                    if identities.len() == 2
+            ));
+            harness.owner = Some(owner);
             harness.stop();
         }
 

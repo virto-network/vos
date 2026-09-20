@@ -189,6 +189,23 @@ test-local-agent-recovery: build-agent-recovery-fixture
     export AGENT_SCRIPTED_RUNTIME_ELF="$scripted_target/riscv64em-vos/release/custom_linear_agent_runtime.elf"
     CARGO_TARGET_DIR="$test_target" cargo +nightly-2025-05-09 test --offline --locked -p vos --features 'agent-runtime storage network' --lib agent::local_sdk_host::tests -- --test-threads=1
 
+# Exercise bundled Shared publication/retry/recovery through the real outer PVM.
+# This is not a released serving or multi-replica lifecycle gate.
+# Set JUST_TEMPDIR to a disk-backed directory before invoking this recipe.
+test-shared-agent-publication:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    repository_root="{{justfile_directory()}}"
+    test_target="${CARGO_TARGET_DIR:-$repository_root/target}"
+    mkdir -p "$test_target"
+    test_target=$(cd "$test_target" && pwd)
+    export TMPDIR="$test_target/task-tmp"
+    mkdir -p "$TMPDIR"
+    unset VOS_AGENT_RUNTIME_COST_CANDIDATE
+    export VOS_AGENT_PROFILE_REFINE_MACHINES=1
+    export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+    CARGO_TARGET_DIR="$test_target" cargo +nightly-2025-05-09 test --offline --locked -p vos --features 'agent-runtime storage network http-ingress' --lib agent::clean_bootstrap::tests::physical::native_shared_bundled_publication_and_recovery -- --exact --test-threads=1
+
 # Run extension tests.
 test-extensions: build-extensions
     cargo test -p vos extension -- --nocapture
