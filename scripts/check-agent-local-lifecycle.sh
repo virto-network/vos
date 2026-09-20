@@ -42,7 +42,8 @@ export TMPDIR="$evidence/tmp" XDG_DATA_HOME="$evidence/data"
 export XDG_CONFIG_HOME="$evidence/config" XDG_CACHE_HOME="$evidence/cache"
 export VOSX_DISABLE_MDNS=1 VOSX_INVOKE_SMOKE_SPACE=indexed-lifecycle
 export VOSX_INVOKE_SMOKE_CONFIG="$evidence/create.txt"
-export RUST_LOG=info,vosx::commands::space::clean_startup=debug,vos::agent::production_owner=debug,vos::agent::clean_bootstrap=debug
+export RUST_LOG=${RUST_LOG:-info,vosx::commands::space::clean_startup=debug,vos::agent::production_owner=debug,vos::agent::clean_bootstrap=debug}
+printf '%s\n' "$RUST_LOG" > "$evidence/trace-filter.txt"
 probe_pid=''
 sampler_pid=''
 cleanup() {
@@ -175,6 +176,25 @@ sha256sum --check "$evidence/identities.sha256"
         ' "$evidence/$phase.resources"
     done
 } > "$evidence/resources-summary.tsv"
+{
+    # Whole daemon phases: startup, maintenance and retry are included. These
+    # are not per-user-request counts. Zero means tracing may be disabled.
+    printf 'phase\ttraced_calls\tsummed_physical_us\tsummed_input_bytes\tsummed_gas\n'
+    for phase in initial restart mutation read; do
+        awk -v phase="$phase" '
+            /physical Agent runtime execution/ {
+                count++
+                for(i=1;i<=NF;i++) {
+                    split($i,a,"=")
+                    if(a[1]=="elapsed_us") us+=a[2]
+                    if(a[1]=="input_bytes") bytes+=a[2]
+                    if(a[1]=="gas_used") gas+=a[2]
+                }
+            }
+            END {printf "%s\t%d\t%.0f\t%.0f\t%.0f\n",phase,count,us,bytes,gas}
+        ' "$evidence/$phase.log"
+    done
+} > "$evidence/runtime-execution-summary.tsv"
 echo 'PASS Local/Public functional lifecycle; not full release or load qualification'
 if awk '$1 ~ /-readiness$/ && $2 > 10000 {failed=1} END {exit !failed}' "$evidence/timings-ms.tsv"; then
     echo 'FAIL production readiness gate: at least one startup exceeded 10000 ms'

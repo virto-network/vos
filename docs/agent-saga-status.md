@@ -193,14 +193,54 @@ remain seconds-long. Do not attribute all remaining delay to debug compilation.
 The retained CLI/documentation clean-break check also passes
 (`inventory-clean-break.log`).
 
+### Replay/execution attribution (same frozen release binary)
+
+Repeat evidence: implementation
+`target/agent-lifecycle-qualification/indexed-lifecycle.Jtce5F/`, console log
+`inventory-release-phase-profile.log`. The harness now accepts and records an
+explicit `RUST_LOG`; this run adds `shared_host`, `shared_journal_driver` and
+`local_journal_driver` debug categories to the normal filter. Binary/package
+hashes match the baseline, and the script copy is frozen and hashed too.
+Functional checks pass again; exit 1 is the expected readiness-gate failure
+(restart 11,006ms). Create/Install take 15,638/20,974ms; managed mutation/read
+attempts take 18.82/19.27s. This is a traced diagnostic repeat, not a load test.
+
+Restart's journal materialization takes 5.490s between executor-setup and
+materialize-current markers. Eight physical runtime calls inside that interval
+total 5.198360s and 3,401,221,540 gas. Journal-store opening takes 38ms and the
+next Raft-ledger stage 25ms; this restart is dominated by replayed computation,
+not those store-opening stages. The physical timing includes program preparation
+and `RefineContext::run`, not a separate ZK proving operation.
+
+The harness also summarizes traced executions by **complete daemon phase**, not
+by user request. Startup, maintenance, authentication and exact retries are included:
+
+| Daemon phase | Traced runtime calls | Summed physical seconds |
+| --- | ---: | ---: |
+| Initial bootstrap + Create + Install | 127 | 27.953 |
+| First restart | 30 | 6.978 |
+| Mutation campaign | 90 | 14.148 |
+| Read campaign | 90 | 14.452 |
+
+`runtime-execution-summary.tsv` also records summed input bytes and gas; its
+summary block was checked against the completed trace. Zero traced calls with
+the default log filter means absent instrumentation, not zero execution.
+Source inspection finds a fresh `materialize_current` in
+`SharedJournalAgentDriver::replay_durable_clean_terminal_with_input` for durable
+lifecycle evidence. That is an intentional verification boundary; its specific
+share of managed-invocation time is not isolated by these logs. Do not replace it
+with an unchecked cached result. Existing projection checkpoint cadence bounds
+the suffix but does not bound its replay cost in time or gas.
+
 ## Next sequence
 
 1. Reviewer examines `7bd66a7d..saga/agents` read-only and returns findings.
    Apply fixes on latest implementation source; advance the reviewer branch only
    at qualified checkpoints. Do not mix reviewer edits with implementation work.
 2. Extend the optimized-host baseline to growing-Agent directories and independent
-   versus same-Agent workloads. Attribute the measured Shared reopen and managed
-   invocation/ACK cost before changing recovery or runtime boundaries. Keep exact
+   versus same-Agent workloads. Shared reopen is now attributed to materialization;
+   distinguish physical work kinds and fresh versus replayed lifecycle verification
+   on the managed invocation/ACK path before changing its boundaries. Keep exact
    identities, CPU/RAM/FD and queue/tail measurements; neither current campaign
    passes the production latency/capacity gates.
 3. Address whole-state/touched-state and incremental-publication costs with an
