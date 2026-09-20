@@ -236,7 +236,7 @@ impl ManagementAuthorizationPlan {
                     .collect(),
                 descriptor_commitment: descriptor.commitment(),
             },
-            ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources => {
+            ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources | ManagementRequest::InspectManagementHistory => {
                 return None;
             }
             ManagementRequest::Install(value) => {
@@ -1934,7 +1934,8 @@ fn management_application_reply_shape_matches(
         | (_, ManagementReply::Removed(_))
         | (_, ManagementReply::RuntimeUpgraded(_))
         | (_, ManagementReply::ReplicasChanged { .. })
-        | (_, ManagementReply::ResourcePolicySet(_)) => false,
+        | (_, ManagementReply::ResourcePolicySet(_))
+        | (_, ManagementReply::ManagementHistory(_)) => false,
     }
 }
 

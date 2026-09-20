@@ -2208,7 +2208,7 @@ mod tests {
             ManagementRequest::ChangeReplicas { .. } => {
                 (AuthorityOperationKind::ChangeReplicaSet, None, None)
             }
-            ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources => {
+            ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources | ManagementRequest::InspectManagementHistory => {
                 panic!("read-only management has no receipt")
             }
             ManagementRequest::PrivateControl { .. } => {
@@ -3382,7 +3382,7 @@ mod tests {
     fn opaque_runtime_lifecycle_with_upgrade(upgrade_mutation: u8) {
         use super::super::driver::AgentImageStore as _;
         use super::super::package_admission::{
-            ScriptedRuntimeCase, ScriptedRuntimeCopy, admitted_scripted_runtime_for_test,
+            ScriptedRuntimeCase, ScriptedRuntimeCopy, admitted_recovery_scripted_runtime_for_test,
         };
         use crate::agent_sdk::wire::CanonicalWire as _;
         use crate::agent_sdk::{
@@ -3838,8 +3838,11 @@ mod tests {
             }
         }
         target_cases.extend(lookup_cases);
-        let target =
-            admitted_scripted_runtime_for_test("local-opaque-migration-target", 0xd1, target_cases);
+        let target = admitted_recovery_scripted_runtime_for_test(
+            "local-opaque-migration-target",
+            0xd1,
+            target_cases,
+        );
         let target_descriptor = descriptor(&target, 9, AgentProfile::Local, space(), node());
         let mut upgrade_request =
             ManagementRequest::UpgradeRuntime(Box::new(sdk::RuntimeUpgrade {
@@ -3880,8 +3883,11 @@ mod tests {
             .unwrap(),
             copies: Vec::new(),
         });
-        let runtime =
-            admitted_scripted_runtime_for_test("local-opaque-image-lifecycle", 0xc2, cases);
+        let runtime = admitted_recovery_scripted_runtime_for_test(
+            "local-opaque-image-lifecycle",
+            0xc2,
+            cases,
+        );
         let descriptor = descriptor(&runtime, 9, AgentProfile::Local, space(), node());
         let directory = TestDirectory::new("opaque-image-lifecycle");
         let root = directory.child("agents");

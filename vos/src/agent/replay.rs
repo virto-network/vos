@@ -10296,6 +10296,7 @@ fn clean_management_artifact_references(
         }
         crate::agent_sdk::ManagementRequest::InspectActors { .. }
         | crate::agent_sdk::ManagementRequest::InspectResources
+        | crate::agent_sdk::ManagementRequest::InspectManagementHistory
         | crate::agent_sdk::ManagementRequest::Suspend { .. }
         | crate::agent_sdk::ManagementRequest::Resume { .. }
         | crate::agent_sdk::ManagementRequest::RemoveLeaf { .. }
@@ -11539,6 +11540,7 @@ fn validate_clean_management_lanes<SourceError, ExecutorError>(
         request,
         crate::agent_sdk::ManagementRequest::InspectActors { .. }
             | crate::agent_sdk::ManagementRequest::InspectResources
+            | crate::agent_sdk::ManagementRequest::InspectManagementHistory
             | crate::agent_sdk::ManagementRequest::PrivateControl { .. }
     ) {
         return Err(ReplayError::InvalidManagementTransition);

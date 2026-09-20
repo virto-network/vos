@@ -2363,6 +2363,7 @@ where
             crate::agent_sdk::ManagementRequest::Create(_)
                 | crate::agent_sdk::ManagementRequest::InspectActors { .. }
                 | crate::agent_sdk::ManagementRequest::InspectResources
+                | crate::agent_sdk::ManagementRequest::InspectManagementHistory
                 | crate::agent_sdk::ManagementRequest::ChangeReplicas { .. }
                 | crate::agent_sdk::ManagementRequest::PrivateControl { .. }
         ) {
@@ -3819,6 +3820,7 @@ fn clean_management_artifact_references(operation: &ReplayOperation) -> Option<V
         crate::agent_sdk::ManagementRequest::Create(_)
         | crate::agent_sdk::ManagementRequest::InspectActors { .. }
         | crate::agent_sdk::ManagementRequest::InspectResources
+        | crate::agent_sdk::ManagementRequest::InspectManagementHistory
         | crate::agent_sdk::ManagementRequest::Suspend { .. }
         | crate::agent_sdk::ManagementRequest::Resume { .. }
         | crate::agent_sdk::ManagementRequest::RemoveLeaf { .. }

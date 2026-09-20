@@ -1572,6 +1572,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             request,
             crate::agent_sdk::ManagementRequest::InspectActors { .. }
                 | crate::agent_sdk::ManagementRequest::InspectResources
+                | crate::agent_sdk::ManagementRequest::InspectManagementHistory
         ) {
             return Err(LocalReplayExecutorError::InvalidRequest);
         }
@@ -2140,7 +2141,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
                 )
                 .map_err(|_| LocalReplayExecutorError::InvalidRequest)?;
             }
-            ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources => {
+            ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources | ManagementRequest::InspectManagementHistory => {
                 return Err(LocalReplayExecutorError::InvalidRequest);
             }
             ManagementRequest::PrivateControl { .. } => {
@@ -5706,6 +5707,7 @@ where
             crate::agent_sdk::ManagementRequest::Create(_)
                 | crate::agent_sdk::ManagementRequest::InspectActors { .. }
                 | crate::agent_sdk::ManagementRequest::InspectResources
+                | crate::agent_sdk::ManagementRequest::InspectManagementHistory
                 | crate::agent_sdk::ManagementRequest::ChangeReplicas { .. }
                 | crate::agent_sdk::ManagementRequest::PrivateControl { .. }
         ) {

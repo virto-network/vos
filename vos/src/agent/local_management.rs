@@ -12,7 +12,8 @@ use crate::agent_sdk::{
 };
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 
-pub const MAX_LOCAL_MANAGEMENT_RECORDS: usize = 256;
+pub const MAX_LOCAL_MANAGEMENT_RECORDS: usize =
+    crate::agent_sdk::recovery::MAX_MANAGEMENT_HISTORY_ENTRIES;
 pub const MAX_LOCAL_MANAGEMENT_HISTORY_BYTES: usize =
     64 + MAX_LOCAL_MANAGEMENT_RECORDS * (92 + super::wire::MAX_CLEAN_MANAGEMENT_RESULT_BYTES);
 
@@ -41,6 +42,26 @@ pub struct LocalManagementHistory {
 }
 
 impl LocalManagementHistory {
+    /// Public semantic projection, independent of the runtime's private layout.
+    /// This is only the host side of recovery verification; callers must compare
+    /// it with a value physically produced by the admitted guest.
+    pub(crate) fn recovery_commitment(&self) -> Result<Hash, DecodeError> {
+        use crate::agent_sdk::recovery::{ManagementHistoryEntry, management_history_commitment};
+        self.validate()?;
+        management_history_commitment(
+            self.acknowledged_through,
+            self.records.iter().map(|record| ManagementHistoryEntry {
+                authority: record.authority,
+                request: record.request,
+                epoch: record.epoch,
+                sequence: record.sequence,
+                observed_slot: record.observed_slot,
+                result: &record.result,
+            }),
+        )
+        .map_err(|_| DecodeError::NonCanonical)
+    }
+
     pub(crate) fn retained(
         &self,
         request: &ManagementRequest,
@@ -175,7 +196,7 @@ impl LocalManagementHistory {
             return if !changed
                 && matches!(
                     request.as_ref(),
-                    ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources
+                    ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources | ManagementRequest::InspectManagementHistory
                 ) {
                 Ok(self.clone())
             } else {
@@ -414,6 +435,33 @@ mod tests {
             unreachable!()
         };
         history.classify(request, receipt)
+    }
+
+    #[test]
+    fn recovery_projection_binds_persisted_history_without_runtime_decoding() {
+        let history = LocalManagementHistory::default()
+            .after_validated_transition(&work(1, 0), &output(true))
+            .unwrap()
+            .after_validated_transition(&work(3, 0), &output(true))
+            .unwrap();
+        let expected = history.recovery_commitment().unwrap();
+        let reopened = LocalManagementHistory::decode(&history.encode()).unwrap();
+        assert_eq!(reopened.recovery_commitment().unwrap(), expected);
+        let mut substituted = reopened.clone();
+        substituted.records[0].request.0[0] ^= 1;
+        let substituted = LocalManagementHistory::decode(&substituted.encode()).unwrap();
+        assert_ne!(substituted.recovery_commitment().unwrap(), expected);
+        let compacted = reopened
+            .after_validated_transition(&work(4, 3), &output(true))
+            .unwrap();
+        assert_ne!(compacted.recovery_commitment().unwrap(), expected);
+        assert_eq!(
+            compacted.recovery_commitment().unwrap(),
+            LocalManagementHistory::decode(&compacted.encode())
+                .unwrap()
+                .recovery_commitment()
+                .unwrap()
+        );
     }
 
     #[test]

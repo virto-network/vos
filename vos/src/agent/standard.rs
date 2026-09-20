@@ -5129,6 +5129,7 @@ impl StandardAgentRuntime {
             }
             crate::agent_sdk::ManagementRequest::InspectActors { .. }
             | crate::agent_sdk::ManagementRequest::InspectResources
+            | crate::agent_sdk::ManagementRequest::InspectManagementHistory
             | crate::agent_sdk::ManagementRequest::PrivateControl { .. } => {
                 return Err(ManagementError::InvalidRequest);
             }
@@ -5232,7 +5233,7 @@ impl StandardAgentRuntime {
                 self.active_resource_policy = Some(descriptor.initial_resource_policy());
                 Ok(ManagementReply::Created(descriptor.identity.clone()))
             }
-            ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources => {
+            ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources | ManagementRequest::InspectManagementHistory => {
                 Err(ManagementError::InvalidRequest)
             }
             ManagementRequest::Install(install) => {
@@ -5809,7 +5810,7 @@ impl StandardAgentRuntime {
 
         if matches!(
             request,
-            ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources
+            ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources | ManagementRequest::InspectManagementHistory
         ) {
             if authority.is_some() {
                 return Err(ManagementError::InvalidRequest);
@@ -5851,6 +5852,20 @@ impl StandardAgentRuntime {
                 }
                 ManagementRequest::InspectResources => {
                     self.clean_resource_usage().map(ManagementReply::Resources)
+                }
+                ManagementRequest::InspectManagementHistory => {
+                    use crate::agent_sdk::recovery::{ManagementHistoryEntry, management_history_commitment};
+                    management_history_commitment(
+                        self.clean_acknowledged_through,
+                        self.clean_management_dispositions.iter().map(|record| ManagementHistoryEntry {
+                            authority: record.authority,
+                            request: record.request,
+                            epoch: record.epoch,
+                            sequence: record.sequence,
+                            observed_slot: record.observed_slot,
+                            result: &record.result,
+                        }),
+                    ).map(ManagementReply::ManagementHistory).map_err(|_| ManagementError::InvalidRequest)
                 }
                 _ => unreachable!("read-only branch selected above"),
             };

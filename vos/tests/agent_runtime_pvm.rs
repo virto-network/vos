@@ -205,7 +205,7 @@ fn operation_for(
         ManagementRequest::PrivateControl { .. } => {
             panic!("private control is not a generic Local/Shared management request")
         }
-        ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources => {
+        ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources | ManagementRequest::InspectManagementHistory => {
             panic!("read-only management does not carry authority")
         }
     }
@@ -760,7 +760,7 @@ fn bundled_runtime_identity_and_vos3_package_are_exactly_pinned() {
     );
     assert_eq!(
         sdk::RUNTIME_ABI_ID,
-        Hash(*b"vos-agent-runtime-abi-260915-r17")
+        Hash(*b"vos-agent-runtime-abi-260920-r18")
     );
 
     let mut previous_generation = bytes;

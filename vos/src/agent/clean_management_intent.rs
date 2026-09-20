@@ -175,6 +175,7 @@ impl CleanManagementIntent {
                 self.request,
                 ManagementRequest::InspectActors { .. }
                     | ManagementRequest::InspectResources
+                    | ManagementRequest::InspectManagementHistory
                     | ManagementRequest::PrivateControl { .. }
             )
         {

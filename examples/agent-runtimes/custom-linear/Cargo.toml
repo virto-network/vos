@@ -11,6 +11,10 @@ repository = "https://github.com/virto-network/vos"
 [lib]
 crate-type = ["rlib"]
 
+[features]
+# Test-only guest for host lifecycle fixtures; never a released runtime.
+scripted-fixture = []
+
 [dependencies]
 ed25519-dalek = { version = "2", default-features = false }
 vos-agent-runtime-guest = { path = "../../../services/agent-runtime-guest" }

@@ -19,6 +19,7 @@ pub mod package;
 pub mod private;
 pub mod proof;
 pub mod proof_system;
+pub mod recovery;
 mod runtime;
 pub mod scheduling;
 pub mod schema;
@@ -37,7 +38,7 @@ pub use vos_protocol::{
 };
 
 /// Stable clean-generation management/runtime ABI identity.
-pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-260915-r17");
+pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-260920-r18");
 
 /// Maximum bytes named by one content-addressed artifact reference.
 pub const MAX_CATALOG_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;

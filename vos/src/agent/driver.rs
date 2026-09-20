@@ -177,7 +177,7 @@ fn clean_management_operation(
     use crate::agent_sdk::authority::AuthorityOperationKind;
     match request {
         ManagementRequest::Create(_) => Some(AuthorityOperationKind::CreateAgent),
-        ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources => None,
+        ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources | ManagementRequest::InspectManagementHistory => None,
         ManagementRequest::Install(_) => Some(AuthorityOperationKind::InstallActor),
         ManagementRequest::UpgradeActor(_) => Some(AuthorityOperationKind::UpgradeActor),
         ManagementRequest::Suspend { .. } => Some(AuthorityOperationKind::SuspendActor),
@@ -293,6 +293,7 @@ pub(crate) fn validate_sdk_management_artifacts(
             ManagementRequest::Create(_)
             | ManagementRequest::InspectActors { .. }
             | ManagementRequest::InspectResources
+            | ManagementRequest::InspectManagementHistory
             | ManagementRequest::Suspend { .. }
             | ManagementRequest::Resume { .. }
             | ManagementRequest::RemoveLeaf { .. }
@@ -326,6 +327,7 @@ fn validate_sdk_retry_artifact_shape(
             ManagementRequest::Create(_)
             | ManagementRequest::InspectActors { .. }
             | ManagementRequest::InspectResources
+            | ManagementRequest::InspectManagementHistory
             | ManagementRequest::Suspend { .. }
             | ManagementRequest::Resume { .. }
             | ManagementRequest::RemoveLeaf { .. }
@@ -513,6 +515,7 @@ pub(crate) fn sdk_management_reply_matches(
             page.validate().is_ok()
         }
         (ManagementRequest::InspectResources, ManagementReply::Resources(_)) => true,
+        (ManagementRequest::InspectManagementHistory, ManagementReply::ManagementHistory(commitment)) => *commitment != crate::agent_sdk::Hash::ZERO,
         (ManagementRequest::Install(install), ManagementReply::Installed(entry)) => {
             *entry == install.entry
         }
@@ -627,6 +630,7 @@ fn sdk_descriptor_after_management(
         ManagementRequest::Create(_)
         | ManagementRequest::InspectActors { .. }
         | ManagementRequest::InspectResources
+        | ManagementRequest::InspectManagementHistory
         | ManagementRequest::Install(_)
         | ManagementRequest::UpgradeActor(_)
         | ManagementRequest::Suspend { .. }
@@ -660,6 +664,7 @@ fn expected_standard_sdk_management_transition(
         request.as_ref(),
         crate::agent_sdk::ManagementRequest::InspectActors { .. }
             | crate::agent_sdk::ManagementRequest::InspectResources
+            | crate::agent_sdk::ManagementRequest::InspectManagementHistory
     );
     let decoded = super::wire::decode_standard_runtime_state(&sdk_state_as_legacy(state))
         .map_err(|_| AgentDriverError::InvalidRuntime)?;
@@ -2473,6 +2478,37 @@ impl<S: AgentImageStore> AgentDriver<S> {
         if runtime_pvm != runtime_package.program_bytes() {
             return Err(AgentDriverError::RuntimeProgramMismatch);
         }
+        // Recovered host history is a semantic projection, not an authority on
+        // the guest's private state. Require agreement from the admitted PVM
+        // for every runtime, with no program-ID exception or native fallback.
+        let recovery_work = crate::agent_sdk::RuntimeWork::Manage {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+            space: descriptor.identity.space,
+            agent: descriptor.identity.agent,
+            runtime_deployment: descriptor.identity.runtime_deployment,
+            state: legacy_state_as_sdk(&image.runtime_state),
+            request: Box::new(crate::agent_sdk::ManagementRequest::InspectManagementHistory),
+            authority: None,
+            observed_slot: 0,
+        };
+        let recovery_input = recovery_work
+            .encode()
+            .map_err(|_| AgentDriverError::InvalidRuntime)?;
+        let recovery: crate::agent_sdk::RuntimeTransition =
+            execute_runtime_canonical(&runtime_pvm, DEFAULT_MANAGEMENT_GAS, &recovery_input)?;
+        let expected_history = image
+            .clean_management
+            .as_ref()
+            .ok_or(AgentDriverError::InvalidRuntime)?
+            .recovery_commitment()
+            .map_err(|_| AgentDriverError::InvalidRuntime)?;
+        if !crate::agent_sdk::recovery::management_history_reply_matches(
+            &legacy_state_as_sdk(&image.runtime_state),
+            expected_history,
+            &recovery,
+        ) {
+            return Err(AgentDriverError::InvalidRuntime);
+        }
         let mut driver = Self {
             runtime_pvm,
             image,
@@ -3666,6 +3702,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
             &request,
             crate::agent_sdk::ManagementRequest::InspectActors { .. }
                 | crate::agent_sdk::ManagementRequest::InspectResources
+                | crate::agent_sdk::ManagementRequest::InspectManagementHistory
         );
         let receipt_history = match authority.as_ref() {
             Some(receipt) => self
@@ -3694,7 +3731,8 @@ impl<S: AgentImageStore> AgentDriver<S> {
         match (&request, authority.as_ref()) {
             (
                 crate::agent_sdk::ManagementRequest::InspectActors { .. }
-                | crate::agent_sdk::ManagementRequest::InspectResources,
+                | crate::agent_sdk::ManagementRequest::InspectResources
+                | crate::agent_sdk::ManagementRequest::InspectManagementHistory,
                 None,
             ) => {}
             (_, Some(receipt)) => {

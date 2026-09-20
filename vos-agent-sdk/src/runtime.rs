@@ -413,6 +413,10 @@ pub enum ManagementRequest {
         limit: u16,
     },
     InspectResources,
+    /// Read-only recovery projection of all retained consumed management
+    /// decisions. The reply must be derived from the supplied runtime state;
+    /// no authority receipt is accepted and the state must remain unchanged.
+    InspectManagementHistory,
     Install(Box<InstallActor>),
     UpgradeActor(Box<UpgradeActor>),
     Suspend {
@@ -603,6 +607,7 @@ pub enum ManagementReply {
     Created(AgentIdentity),
     Actors(ActorDirectoryPage),
     Resources(RuntimeResourceUsage),
+    ManagementHistory(Hash),
     Installed(ActorEntry),
     Upgraded(ActorEntry),
     Suspended(ActorEntry),
@@ -996,9 +1001,8 @@ mod tests {
         assert_eq!(
             commitment.0,
             [
-                0xb5, 0xd6, 0x4d, 0xa0, 0x1a, 0x33, 0xa4, 0x27, 0xfb, 0x86, 0xcc, 0xb1, 0x7c, 0x63,
-                0x07, 0x0e, 0x77, 0xa6, 0xc8, 0x70, 0xe3, 0xd6, 0x80, 0xed, 0x7b, 0x05, 0x14, 0x9e,
-                0x40, 0x20, 0x69, 0xc0,
+                0xb0, 0x2e, 0x30, 0x5b, 0xa4, 0xe0, 0x11, 0x85, 0xe1, 0x16, 0x0b, 0x76, 0xf7, 0x39, 0x39, 0xb9,
+                0xc9, 0xcf, 0x9a, 0x56, 0xef, 0x4c, 0x07, 0x21, 0xd2, 0x85, 0xc7, 0x75, 0xee, 0x33, 0x11, 0x8f,
             ]
         );
         assert_ne!(

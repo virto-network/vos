@@ -3189,6 +3189,7 @@ pub(crate) fn management_request_valid(value: &ManagementRequest) -> bool {
                 && *after != Some(ActorId::ZERO)
         }
         ManagementRequest::InspectResources => true,
+        ManagementRequest::InspectManagementHistory => true,
         ManagementRequest::Install(value) => install_valid(value),
         ManagementRequest::UpgradeActor(value) => upgrade_actor_valid(value),
         ManagementRequest::Suspend {
@@ -3226,6 +3227,7 @@ fn encode_management_request(encoder: &mut Encoder<'_>, value: &ManagementReques
             encoder.u16(*limit);
         }
         ManagementRequest::InspectResources => encoder.u8(2),
+        ManagementRequest::InspectManagementHistory => encoder.u8(11),
         ManagementRequest::Install(value) => {
             encoder.u8(3);
             encode_install(encoder, value);
@@ -3292,6 +3294,7 @@ fn decode_management_request(decoder: &mut Decoder<'_>) -> Result<ManagementRequ
             limit: decoder.u16()?,
         },
         2 => ManagementRequest::InspectResources,
+        11 => ManagementRequest::InspectManagementHistory,
         3 => ManagementRequest::Install(alloc::boxed::Box::new(decode_install(decoder)?)),
         4 => {
             ManagementRequest::UpgradeActor(alloc::boxed::Box::new(decode_upgrade_actor(decoder)?))
@@ -3361,7 +3364,7 @@ pub(crate) fn management_request_commitment(value: &ManagementRequest) -> Hash {
         return plan.commitment();
     }
     match value {
-        ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources
+        ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources | ManagementRequest::InspectManagementHistory
             if value.is_valid() =>
         {
             Hash::digest(
@@ -3391,7 +3394,7 @@ pub(crate) fn required_management_operation(
 ) -> Option<AuthorityOperationKind> {
     match value {
         ManagementRequest::Create(_) => Some(AuthorityOperationKind::CreateAgent),
-        ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources => None,
+        ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources | ManagementRequest::InspectManagementHistory => None,
         ManagementRequest::Install(_) => Some(AuthorityOperationKind::InstallActor),
         ManagementRequest::UpgradeActor(_) => Some(AuthorityOperationKind::UpgradeActor),
         ManagementRequest::Suspend { .. } => Some(AuthorityOperationKind::SuspendActor),
@@ -4153,6 +4156,7 @@ pub(crate) fn management_reply_valid(value: &ManagementReply) -> bool {
             identity_valid(identity)
         }
         ManagementReply::Actors(page) => page.validate().is_ok(),
+        ManagementReply::ManagementHistory(commitment) => *commitment != Hash::ZERO,
         ManagementReply::Resources(usage) => {
             usage.actors <= STANDARD_MAX_ACTORS
                 && usage.active_machines <= 63
@@ -4195,6 +4199,10 @@ fn encode_management_reply(encoder: &mut Encoder<'_>, value: &ManagementReply) {
             encoder.u8(2);
             encode_resource_usage(encoder, *value);
         }
+        ManagementReply::ManagementHistory(value) => {
+            encoder.u8(11);
+            encoder.fixed(value.as_bytes());
+        }
         ManagementReply::Installed(value) => {
             encoder.u8(3);
             encode_actor_entry(encoder, value);
@@ -4235,6 +4243,7 @@ fn decode_management_reply(decoder: &mut Decoder<'_>) -> Result<ManagementReply,
         0 => ManagementReply::Created(decode_agent_identity(decoder)?),
         1 => ManagementReply::Actors(decode_directory_page(decoder)?),
         2 => ManagementReply::Resources(decode_resource_usage(decoder)?),
+        11 => ManagementReply::ManagementHistory(Hash(decoder.fixed()?)),
         3 => ManagementReply::Installed(decode_actor_entry(decoder)?),
         4 => ManagementReply::Upgraded(decode_actor_entry(decoder)?),
         5 => ManagementReply::Suspended(decode_actor_entry(decoder)?),
@@ -5479,9 +5488,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/acc3-golden", &[&call_bytes]).0,
             [
-                0xe4, 0x14, 0xc4, 0x61, 0x2a, 0x0c, 0xd8, 0xd8, 0x14, 0x0b, 0x4e, 0x92, 0xc5, 0xcf,
-                0x05, 0x96, 0x26, 0x73, 0x80, 0xb0, 0xff, 0xae, 0x2b, 0xfb, 0x64, 0xe7, 0x3a, 0x24,
-                0xb9, 0xcb, 0x31, 0x04,
+                0xfa, 0xbb, 0x6d, 0x94, 0x62, 0x68, 0x10, 0x9b, 0xc4, 0x9c, 0x9e, 0x4d, 0x21, 0x46, 0xca, 0xf6,
+                0x00, 0x40, 0x65, 0x44, 0xdb, 0x75, 0x7f, 0x82, 0x09, 0x5b, 0xf7, 0xbd, 0x34, 0x12, 0x33, 0xa3,
             ]
         );
 
@@ -5493,9 +5501,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/map2-golden", &[&approval_bytes]).0,
             [
-                0x5e, 0xdf, 0xa8, 0x1f, 0x85, 0x32, 0x6d, 0x64, 0x82, 0xc4, 0x4e, 0xac, 0x28, 0x2b,
-                0xf1, 0x61, 0xed, 0x3e, 0x38, 0x7f, 0xd7, 0x7b, 0xec, 0x62, 0x5a, 0x76, 0x2c, 0xf2,
-                0x53, 0x6f, 0x9b, 0x3c,
+                0xef, 0xb4, 0x6d, 0x27, 0x63, 0xaf, 0x99, 0x5c, 0x3b, 0xff, 0xb4, 0xe7, 0xb2, 0x3d, 0x15, 0x18,
+                0x92, 0xce, 0x3d, 0x6b, 0x07, 0x13, 0x85, 0x05, 0x81, 0x15, 0xef, 0x23, 0x3e, 0x89, 0x26, 0xe3,
             ]
         );
 
@@ -5510,9 +5517,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/maa2-golden", &[&acknowledgement_bytes]).0,
             [
-                0x36, 0x81, 0x10, 0x43, 0x5f, 0x19, 0x9f, 0x3f, 0xb0, 0x22, 0xf9, 0x1c, 0x2d, 0x20,
-                0x8a, 0x6d, 0x88, 0x26, 0x52, 0x6f, 0xe6, 0x72, 0xd4, 0x1f, 0x29, 0x71, 0x1d, 0x3c,
-                0xa1, 0xa8, 0x33, 0xea,
+                0x98, 0x9c, 0x63, 0xa2, 0xea, 0x2b, 0x65, 0x2b, 0xc9, 0xa2, 0xc2, 0xd2, 0xa1, 0x0f, 0xc7, 0x5a,
+                0xcc, 0x6c, 0x3b, 0xff, 0x95, 0x9f, 0x19, 0xb1, 0x3d, 0x90, 0x8d, 0x08, 0x12, 0x10, 0xd0, 0x42,
             ]
         );
     }
@@ -5527,9 +5533,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/aad4-golden", &[&bytes]).0,
             [
-                0xc3, 0x9c, 0xe3, 0xfa, 0xa6, 0x66, 0xba, 0xd0, 0x19, 0xa7, 0x00, 0x04, 0x8c, 0x75,
-                0x73, 0xb8, 0x89, 0x67, 0x95, 0xe0, 0x06, 0xc0, 0xeb, 0x32, 0xf7, 0x0e, 0x45, 0x74,
-                0xdf, 0x9e, 0xa2, 0xe7,
+                0x38, 0x96, 0x64, 0x52, 0xbf, 0x76, 0x0b, 0x9d, 0xe3, 0x62, 0x27, 0xab, 0x07, 0x74, 0xc3, 0x7e,
+                0x35, 0x63, 0x86, 0x2c, 0x33, 0xb2, 0x43, 0x01, 0x4f, 0x1d, 0xc3, 0xb9, 0x59, 0x50, 0xcd, 0xa5,
             ]
         );
 
@@ -5544,9 +5549,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/aar4-golden", &[&result_bytes]).0,
             [
-                0xe9, 0x26, 0xe1, 0x56, 0x6a, 0x68, 0xef, 0x52, 0xd5, 0xb6, 0x54, 0xc4, 0x3c, 0xa6,
-                0x45, 0xc5, 0xef, 0x5b, 0x6c, 0x0f, 0x2e, 0x8d, 0xf7, 0x6d, 0x41, 0xf5, 0x55, 0xbb,
-                0xd8, 0x71, 0x00, 0x99,
+                0x99, 0xdd, 0xe2, 0x1a, 0xe8, 0xc1, 0x06, 0x0e, 0xec, 0xb9, 0x27, 0x88, 0x9a, 0x31, 0xa0, 0x26,
+                0x3c, 0xb2, 0x44, 0xdf, 0xd5, 0xfb, 0x17, 0xb6, 0x86, 0xd1, 0x2e, 0x01, 0xe2, 0x13, 0x82, 0x24,
             ]
         );
         assert_ne!(call.commitment(), result.commitment());
@@ -6429,9 +6433,8 @@ mod tests {
         assert_eq!(
             golden.0,
             [
-                0x87, 0x3c, 0x95, 0xe8, 0xf6, 0xf7, 0x62, 0x7a, 0xc1, 0x37, 0x11, 0x71, 0x75, 0xdb,
-                0xc7, 0xe7, 0x23, 0x6c, 0x12, 0x91, 0x97, 0xa9, 0x45, 0x74, 0x10, 0x5c, 0x1c, 0x08,
-                0x61, 0x51, 0xb3, 0x94,
+                0x4b, 0xbf, 0x03, 0x48, 0x7b, 0xf8, 0x77, 0xf9, 0x95, 0xee, 0x5d, 0x0d, 0xa5, 0xea, 0xe0, 0xd5,
+                0xae, 0x85, 0xbf, 0xbe, 0x0a, 0xf6, 0xd8, 0x1f, 0x57, 0x4b, 0xcc, 0x40, 0x68, 0x84, 0x05, 0x07,
             ]
         );
 
@@ -6894,7 +6897,7 @@ mod tests {
     }
 
     #[test]
-    fn acknowledgement_work_and_outcome_have_one_r17_canonical_wire() {
+    fn acknowledgement_work_and_outcome_have_one_r18_canonical_wire() {
         let invocation = invocation();
         let authority = receipt_for(&invocation);
         let work = RuntimeWork::Acknowledge {

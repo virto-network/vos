@@ -116,7 +116,13 @@ impl AgentRuntime for CustomLinearRuntime {
     }
 }
 
+#[cfg(not(feature = "scripted-fixture"))]
 vos_agent_runtime_guest::export_agent_runtime!(crate::CustomLinearRuntime);
+
+#[cfg(feature = "scripted-fixture")]
+pub mod scripted_fixture;
+#[cfg(feature = "scripted-fixture")]
+vos_agent_runtime_guest::export_agent_runtime!(crate::scripted_fixture::ScriptedRuntime);
 
 /// Incarnation selected by this runtime for its one installed actor.
 pub fn actor_incarnation(install: &InstallActor) -> Hash {
@@ -250,6 +256,57 @@ struct CustomState {
 }
 
 impl CustomState {
+    // Derive the public recovery projection from this runtime's own retained
+    // signed work, not the standard runtime layout or a host-owned history.
+    fn management_history_commitment(&self) -> Option<Hash> {
+        use vos_agent_sdk::recovery::{ManagementHistoryEntry, management_history_commitment};
+        let mut records = Vec::new();
+        let mut acknowledged_through = 0;
+        for bytes in
+            core::iter::once(&self.control.create_work).chain(self.control.install_work.iter())
+        {
+            let RuntimeWork::Manage {
+                request,
+                authority: Some(receipt),
+                observed_slot,
+                ..
+            } = RuntimeWork::decode(bytes).ok()?
+            else {
+                return None;
+            };
+            let reply = match request.as_ref() {
+                ManagementRequest::Create(descriptor) => {
+                    ManagementReply::Created(descriptor.identity.clone())
+                }
+                ManagementRequest::Install(install) => {
+                    ManagementReply::Installed(install.entry.clone())
+                }
+                _ => return None,
+            };
+            acknowledged_through = receipt.selector.acknowledged_through;
+            records.push((receipt, request, observed_slot, Ok(reply)));
+        }
+        management_history_commitment(
+            acknowledged_through,
+            records
+                .iter()
+                .filter(|(receipt, _, _, _)| {
+                    receipt.selector.decision_sequence > acknowledged_through
+                })
+                .map(
+                    |(receipt, request, observed_slot, result)| ManagementHistoryEntry {
+                        authority: receipt.commitment(),
+                        request: request.replay_commitment(),
+                        epoch: receipt.selector.epoch,
+                        sequence: receipt.selector.decision_sequence,
+                        observed_slot: *observed_slot,
+                        result,
+                    },
+                ),
+        )
+        .ok()
+    }
+
     fn decode(state: &RuntimeState) -> Result<Self, DecodeError> {
         if !state.merge.is_empty() || !state.local.is_empty() {
             return Err(DecodeError::NonCanonical);
@@ -465,6 +522,15 @@ fn apply_management(
     }
 
     match request {
+        ManagementRequest::InspectManagementHistory => {
+            if authority.is_some() {
+                return management_error(prior, ManagementError::InvalidRequest);
+            }
+            match model.management_history_commitment() {
+                Some(commitment) => transition(state, RuntimeOutcome::Management(Ok(ManagementReply::ManagementHistory(commitment)))),
+                None => management_error(prior, ManagementError::InvalidRequest),
+            }
+        }
         ManagementRequest::InspectActors { after, limit } => {
             let mut entries = Vec::new();
             if let Some(install) = model.install()
@@ -1475,6 +1541,80 @@ mod tests {
     }
 
     #[test]
+    fn recovery_query_uses_custom_layout_and_rejects_foreign_scope_or_authority() {
+        use vos_agent_sdk::recovery::{ManagementHistoryEntry, management_history_commitment};
+        let fixture = Fixture::new();
+        let create = fixture.create(RuntimeState::default(), 1);
+        let created = dispatch(create.clone());
+        let RuntimeWork::Manage {
+            request,
+            authority: Some(receipt),
+            observed_slot,
+            ..
+        } = &create
+        else {
+            unreachable!()
+        };
+        let result = Ok(ManagementReply::Created(
+            fixture.descriptor.identity.clone(),
+        ));
+        let expected = management_history_commitment(
+            0,
+            [ManagementHistoryEntry {
+                authority: receipt.commitment(),
+                request: request.replay_commitment(),
+                epoch: receipt.selector.epoch,
+                sequence: receipt.selector.decision_sequence,
+                observed_slot: *observed_slot,
+                result: &result,
+            }],
+        )
+        .unwrap();
+        let query = RuntimeWork::Manage {
+            context: RuntimeExecutionContext::Direct,
+            space: fixture.descriptor.identity.space,
+            agent: fixture.descriptor.identity.agent,
+            runtime_deployment: fixture.descriptor.identity.runtime_deployment,
+            state: created.state.clone(),
+            request: Box::new(ManagementRequest::InspectManagementHistory),
+            authority: None,
+            observed_slot: 0,
+        };
+        let inspected = dispatch(query.clone());
+        assert_eq!(inspected.state, created.state);
+        assert_eq!(
+            inspected.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::ManagementHistory(expected)))
+        );
+        for mutation in 0..4 {
+            let mut invalid = query.clone();
+            if let RuntimeWork::Manage {
+                space,
+                agent,
+                runtime_deployment,
+                authority,
+                ..
+            } = &mut invalid
+            {
+                match mutation {
+                    0 => space.0[0] ^= 1,
+                    1 => agent.0[0] ^= 1,
+                    2 => runtime_deployment.0[0] ^= 1,
+                    _ => *authority = Some(receipt.clone()),
+                }
+            }
+            // Exercise the runtime directly as well as the canonical codec's
+            // admission rules: a caller cannot authorize this read-only query.
+            let rejected = CustomLinearRuntime.apply(invalid);
+            assert_eq!(rejected.state, created.state);
+            assert!(matches!(
+                rejected.outcome,
+                RuntimeOutcome::Management(Err(_))
+            ));
+        }
+    }
+
+    #[test]
     fn create_install_inspect_and_expired_exact_create_retry_are_deterministic() {
         let fixture = Fixture::new();
         let created = dispatch(fixture.create(RuntimeState::default(), 5));
@@ -1857,6 +1997,22 @@ mod tests {
                 install.lineage_commitment()
             );
             assert_eq!(inspected.state, installed.state);
+
+            let recovery = physical(RuntimeWork::Manage {
+                context: RuntimeExecutionContext::Direct,
+                space: fixture.descriptor.identity.space,
+                agent: fixture.descriptor.identity.agent,
+                runtime_deployment: fixture.descriptor.identity.runtime_deployment,
+                state: installed.state.clone(),
+                request: Box::new(ManagementRequest::InspectManagementHistory),
+                authority: None,
+                observed_slot: 0,
+            });
+            assert!(vos_agent_sdk::recovery::management_history_reply_matches(
+                &installed.state,
+                CustomState::decode(&installed.state).unwrap().management_history_commitment().unwrap(),
+                &recovery,
+            ));
 
             let interval = ScheduleId([0x71; 32]);
             let schedule = fixture.invocation_message(

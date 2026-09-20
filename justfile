@@ -159,6 +159,24 @@ test-custom-agent-runtime:
     cd examples/agent-runtimes/custom-linear; cargo test
     cd examples/agent-runtimes/custom-linear; cargo test --lib tests::compiled_runtime_executes_scheduling_and_rejects_attested_context -- --ignored --exact --test-threads=1
 
+# Build both explicit guest fixtures and run physical Local recovery gates.
+test-local-agent-recovery:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    repository_root="{{justfile_directory()}}"
+    test_target="${CARGO_TARGET_DIR:-$repository_root/target}"
+    mkdir -p "$test_target"
+    test_target=$(cd "$test_target" && pwd)
+    export TMPDIR="$test_target/task-tmp"
+    mkdir -p "$TMPDIR"
+    runtime_target="$test_target/agent-recovery-artifacts/runtime"
+    scripted_target="$test_target/agent-recovery-artifacts/scripted"
+    (cd "$repository_root/services/agent-runtime"; CARGO_TARGET_DIR="$runtime_target" cargo +nightly-2026-03-20 actor --offline --locked)
+    (cd "$repository_root/examples/agent-runtimes/custom-linear"; CARGO_TARGET_DIR="$scripted_target" cargo +nightly-2026-03-20 actor --offline --locked --features scripted-fixture)
+    export AGENT_RUNTIME_CANDIDATE_ELF="$runtime_target/riscv64em-vos/release/agent_runtime.elf"
+    export AGENT_SCRIPTED_RUNTIME_ELF="$scripted_target/riscv64em-vos/release/custom_linear_agent_runtime.elf"
+    CARGO_TARGET_DIR="$test_target" cargo +nightly-2025-05-09 test --offline --locked -p vos --features 'agent-runtime storage network' --lib agent::local_sdk_host::tests -- --test-threads=1
+
 # Run extension tests.
 test-extensions: build-extensions
     cargo test -p vos extension -- --nocapture

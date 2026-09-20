@@ -810,7 +810,7 @@ pub(crate) fn clean_management_lane_changes_allowed(
     use crate::agent_sdk::{LaneSet, ManagementRequest, StateLane};
     if matches!(
         request,
-        ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources
+        ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources | ManagementRequest::InspectManagementHistory
     ) {
         return before == after;
     }
@@ -2433,6 +2433,7 @@ fn apply_clean_manage(
         &request,
         crate::agent_sdk::ManagementRequest::InspectActors { .. }
             | crate::agent_sdk::ManagementRequest::InspectResources
+            | crate::agent_sdk::ManagementRequest::InspectManagementHistory
     );
     let decoded = decode_standard_runtime_state(&clean_state_to_legacy(&state))?;
     let mut runtime =
@@ -5505,7 +5506,7 @@ pub(crate) mod tests {
                 ),
                 _ => panic!("non-runtime Private control has no runtime receipt"),
             },
-            ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources => {
+            ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources | ManagementRequest::InspectManagementHistory => {
                 panic!("read-only management has no authority receipt")
             }
         };

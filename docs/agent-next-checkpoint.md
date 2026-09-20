@@ -11,6 +11,13 @@ and limitations. No artifacts are repinned and no recovery test is weakened.
 
 Next: address the known runtime-independent management-history recovery failure,
 then reconcile source/bundled runtime artifacts and run their release gates.
+The [recovery contract work plan](agent-recovery-contract.md) records the cause,
+portable commitment and guest/host/artifact integration. The r18 source now
+passes the original physical recovery regression and all 21 Local host tests,
+including repaired opaque-runtime lifecycle fixtures. The real custom runtime's
+13 tests (including compiled execution) and 56 supervisor tests pass. Bundled
+artifacts and immutable-source reproduction remain pending; keep `saga/agents`
+at the prior checkpoint until that integrated gate is qualified.
 Node maintenance scheduling, full-state scaling and Shared lifecycle acceptance
 remain part of the full saga; these checkpoints do not establish completion.
 

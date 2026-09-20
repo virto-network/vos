@@ -545,6 +545,26 @@ pub(crate) fn admitted_scripted_runtime_for_test(
     signing_seed: u8,
     cases: Vec<ScriptedRuntimeCase>,
 ) -> AdmittedRuntimePackage {
+    admitted_scripted_runtime_impl(name, signing_seed, cases, false)
+}
+
+/// Response-table fixture with physically maintained opaque recovery history.
+#[cfg(test)]
+pub(crate) fn admitted_recovery_scripted_runtime_for_test(
+    name: &str,
+    signing_seed: u8,
+    cases: Vec<ScriptedRuntimeCase>,
+) -> AdmittedRuntimePackage {
+    admitted_scripted_runtime_impl(name, signing_seed, cases, true)
+}
+
+#[cfg(test)]
+fn admitted_scripted_runtime_impl(
+    name: &str,
+    signing_seed: u8,
+    cases: Vec<ScriptedRuntimeCase>,
+    recovery: bool,
+) -> AdmittedRuntimePackage {
     use ed25519_dalek::{Signer as _, SigningKey};
     use vos_agent_sdk::contract::RuntimePackageContract;
     use vos_agent_sdk::package::{PackageArtifact, PackageSigning};
@@ -594,6 +614,42 @@ pub(crate) fn admitted_scripted_runtime_for_test(
         }
     }
 
+    let recovery_program = recovery.then(|| {
+        use crate::agent_sdk::protocol::wire::Encoder;
+        const MARKER: &[u8; 16] = b"VOS-SCRIPT-R18V1";
+        const CAPACITY: usize = 64 * 1024;
+        let path = std::env::var("AGENT_SCRIPTED_RUNTIME_ELF")
+            .expect("build custom-linear with --features scripted-fixture and set AGENT_SCRIPTED_RUNTIME_ELF");
+        let elf = std::fs::read(path).expect("read scripted recovery guest ELF");
+        let mut program = vos_pvm_compiler::link_elf_spi(&elf).expect("link scripted recovery guest");
+        let positions: Vec<_> = program.windows(MARKER.len()).enumerate()
+            .filter_map(|(offset, bytes)| (bytes == MARKER).then_some(offset)).collect();
+        assert_eq!(positions.len(), 1, "one fixed guest configuration region");
+        let start = positions[0];
+        assert!(program.get(start..start + CAPACITY).is_some());
+        assert!(program[start + MARKER.len()..start + CAPACITY].iter().all(|byte| *byte == 0xd5));
+        let mut config = MARKER.to_vec();
+        let mut encoder = Encoder(&mut config);
+        encoder.u32(cases.len().try_into().unwrap());
+        for (case, discriminator) in cases.iter().zip(&discriminators) {
+            encoder.u32(case.input.len().try_into().unwrap());
+            encoder.option(discriminator, |encoder, (offset, value)| {
+                encoder.u32((*offset).try_into().unwrap());
+                encoder.u8(*value);
+            });
+            encoder.bytes(&case.output);
+            encoder.u32(case.copies.len().try_into().unwrap());
+            for copy in &case.copies {
+                encoder.u32(copy.input_offset.try_into().unwrap());
+                encoder.u32(copy.output_offset.try_into().unwrap());
+                encoder.u32(copy.len.try_into().unwrap());
+            }
+        }
+        assert!(config.len() <= CAPACITY, "bounded recovery fixture table");
+        program[start..start + config.len()].copy_from_slice(&config);
+        vos_pvm::spi::validate_refine_host_calls(&program).expect("clean fixture host calls");
+        program
+    });
     let mut data = Vec::new();
     let mut output_offsets = Vec::with_capacity(cases.len());
     for case in &cases {
@@ -666,7 +722,7 @@ pub(crate) fn admitted_scripted_runtime_for_test(
             .jump_ind(Reg::RA, 0);
     }
     assembler.trap();
-    let program = assembler.build_standard();
+    let program = recovery_program.unwrap_or_else(|| assembler.build_standard());
 
     let signing = SigningKey::from_bytes(&[signing_seed; 32]);
     let public_key = signing.verifying_key().to_bytes();
