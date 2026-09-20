@@ -89,6 +89,37 @@ The12 supervisor baseline tests also pass after adding queue/service tracing
 
 ## Execution ownership decisions to implement next
 
+### In-progress supervisor implementation
+
+The supervisor now owns a bounded per-Agent lane scheduler and a fixed worker
+pool. Dispatch no longer waits on the coordinator thread. A route adapter is
+moved exclusively to a worker and returned on completion; each attachment is
+still exclusive, while separate attachments for independent Agents overlap.
+Lane ordering spans actors and attachments sharing `(SpaceId, AgentId)`.
+Unique completion tickets prevent stale completions from releasing newer jobs.
+Queue capacity counts both the command queue and waiting lane jobs. Worker
+completion wakes the coordinator without a polling interval. Pending detach/
+refresh barriers wait for their Agent lanes and stop new admission for those
+lanes; unrelated dispatches remain runnable. Shutdown rejects queued work,
+joins the execution pool and then retires adapters. No thread-per-request model.
+
+The first async regression stalled in the queue-capacity test because draining
+the command channel hid queued lane jobs. The exact live test session was
+interrupted after diagnosis; global queued admission was restored. All47
+selected supervisor/adapter tests then passed (0.05s with event-driven wake),
+including independent-route overlap before either release, same-Agent ordering
+across attachments, waiting-detach isolation, bounds, stale generations, panic,
+unpublication and worker join. Log: supervisor-async-wake.log under shared
+target/task-tmp. This is not a physical Local concurrency qualification.
+
+A further FIFO guard prevents a blocked attachment's first job from being
+overtaken by another attachment's job in the same Agent lane. Its final rerun
+passes48 tests,0 failures/ignored,in0.06s (supervisor-async-fifo.log).
+The Local backend still holds its host-wide
+mutex and one adapter covers multiple Agents; that ownership split remains
+required. Reconciliation/retirement work itself can still block the coordinator;
+full maintenance isolation and fairness/retirement stress coverage remain open.
+
 - Ordering key is `(SpaceId, AgentId)`, not actor route or attachment ID.
   Multiple actors/attachments for one Agent cannot evade its execution order.
 - Global admission remains bounded by request count and owned payload bytes;

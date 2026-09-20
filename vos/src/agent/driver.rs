@@ -2216,7 +2216,6 @@ fn verify_authority_admission(
     })
 }
 
-/// Physically verified records borrowed from one immutable driver generation.
 #[cfg(test)]
 std::thread_local! {
     static DIRECTORY_EXECUTIONS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
@@ -2227,6 +2226,7 @@ pub(crate) fn directory_execution_count() -> usize {
     DIRECTORY_EXECUTIONS.with(core::cell::Cell::get)
 }
 
+/// Physically verified records borrowed from one immutable driver generation.
 pub(crate) struct PhysicalAuthorityDirectory<'a, S> {
     driver: &'a AgentDriver<S>,
     records: Vec<crate::agent_sdk::ActorDirectoryRecord>,
