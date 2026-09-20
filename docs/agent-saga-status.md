@@ -384,9 +384,19 @@ Additional gates at `d17794c5`:
   hostile key/envelope substitutions, revocation/rotation, offline recovery,
   stable imports and the 4,096-entry invitation-history boundary. This does not
   qualify Private storage/network lifecycle or released recovery.
-- Workspace `cargo fmt --all -- --check` fails with differences in 44 files
-  (`saga-workspace-format-check.log`). It is read-only; no broad formatting was
-  applied. Keep the eventual mechanical cleanup separate from semantic changes.
+- The initial workspace `cargo fmt --all -- --check` failed with differences in
+  44 files (`saga-workspace-format-check.log`). A dedicated mechanical follow-up
+  applies the pinned formatter to those files; the check now passes
+  (`saga-workspace-format-final.log`). Every changed Rust file was compared
+  byte-for-byte against `rustfmt +nightly-2025-05-09 --edition 2024 --config
+  skip_children=true --emit stdout` applied to its `e194c28e` predecessor; all
+  match. There are no hand-written Rust changes in this batch. Review functional
+  work before this formatting boundary, or inspect this batch independently.
+  Post-format `check --workspace --all-targets --offline --locked` passes in
+  37.44s (`saga-formatted-workspace-check.log`). Earlier executed test results
+  remain attributed to their pre-format sources; tests were not rerun here.
+  Bundled artifacts and their immutable source pins are unchanged. Lint warnings
+  and the other release gates remain open.
 
 1. Reviewer examines `7bd66a7d..saga/agents` read-only and returns findings.
    Apply fixes on latest implementation source; advance the reviewer branch only

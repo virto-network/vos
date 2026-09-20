@@ -116,7 +116,10 @@ pub fn with_transaction<T, E>(operation: impl FnOnce() -> Result<T, E>) -> Resul
     impl Drop for Savepoint {
         fn drop(&mut self) {
             with_state(|state| {
-                assert_eq!(state.transaction_depth, self.depth, "storage transaction order changed");
+                assert_eq!(
+                    state.transaction_depth, self.depth,
+                    "storage transaction order changed"
+                );
                 state.transaction_depth -= 1;
                 if let Some(pending) = self.pending.take() {
                     state.pending = pending;
@@ -126,15 +129,23 @@ pub fn with_transaction<T, E>(operation: impl FnOnce() -> Result<T, E>) -> Resul
         }
     }
     let mut savepoint = with_state(|state| {
-        let depth = state.transaction_depth.checked_add(1).expect("storage transaction depth overflow");
+        let depth = state
+            .transaction_depth
+            .checked_add(1)
+            .expect("storage transaction depth overflow");
         // Copy only this dispatch's pending delta, never the persistent map or
         // read cache. Existing pending writes remain visible within the scope.
         let pending = state.pending.clone();
         state.transaction_depth = depth;
-        Savepoint { pending: Some(pending), depth }
+        Savepoint {
+            pending: Some(pending),
+            depth,
+        }
     });
     let result = operation();
-    if result.is_ok() { savepoint.pending = None; }
+    if result.is_ok() {
+        savepoint.pending = None;
+    }
     result
 }
 
@@ -188,7 +199,10 @@ pub(crate) fn seed_witness_rows(rows: BTreeMap<Vec<u8>, Option<Vec<u8>>>) {
 #[cfg_attr(not(feature = "service"), allow(dead_code))]
 pub(crate) fn end_dispatch() -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
     with_state(|s| {
-        assert_eq!(s.transaction_depth, 0, "storage transaction crosses dispatch boundary");
+        assert_eq!(
+            s.transaction_depth, 0,
+            "storage transaction crosses dispatch boundary"
+        );
         s.cache.clear();
         s.witness = None;
         core::mem::take(&mut s.pending).into_iter().collect()
@@ -197,7 +211,9 @@ pub(crate) fn end_dispatch() -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
 
 /// Finish a clean slice. Failed slices discard their overlay; successful and
 /// yielded slices export one canonical delta, never legacy service effects.
-pub(crate) fn finish_clean_dispatch(status: u8) -> Result<Option<Vec<u8>>, crate::service::wire::DecodeError> {
+pub(crate) fn finish_clean_dispatch(
+    status: u8,
+) -> Result<Option<Vec<u8>>, crate::service::wire::DecodeError> {
     let changes = end_dispatch();
     if changes.is_empty() || !matches!(status, super::STATUS_DONE | super::STATUS_YIELDED) {
         return Ok(None);
@@ -1185,20 +1201,33 @@ mod tests {
     fn nested_storage_transactions_keep_only_successful_scopes() {
         fresh();
         let mut map = map();
-        assert_eq!(with_transaction(|| {
-            map.insert(&key(1), &10);
-            with_transaction(|| { map.insert(&key(2), &20); Ok::<(), ()>(()) })?;
-            Err::<(), ()>(())
-        }), Err(()));
+        assert_eq!(
+            with_transaction(|| {
+                map.insert(&key(1), &10);
+                with_transaction(|| {
+                    map.insert(&key(2), &20);
+                    Ok::<(), ()>(())
+                })?;
+                Err::<(), ()>(())
+            }),
+            Err(())
+        );
         assert!(end_dispatch().is_empty());
         assert_eq!(map.len(), 0);
         with_transaction(|| {
             map.insert(&key(1), &10);
-            assert_eq!(with_transaction(|| { map.insert(&key(2), &20); Err::<(), ()>(()) }), Err(()));
+            assert_eq!(
+                with_transaction(|| {
+                    map.insert(&key(2), &20);
+                    Err::<(), ()>(())
+                }),
+                Err(())
+            );
             assert_eq!(map.get(&key(1)), Some(10));
             assert_eq!(map.get(&key(2)), None);
             Ok::<(), ()>(())
-        }).unwrap();
+        })
+        .unwrap();
         mock::commit(end_dispatch());
         assert_eq!(map.len(), 1);
         assert_eq!(map.get(&key(1)), Some(10));
@@ -1216,7 +1245,9 @@ mod tests {
                 with_transaction(|| -> Result<(), ()> {
                     map.insert(&key(2), &20);
                     assert!(transaction_is_open());
-                    if cross_boundary { let _ = end_dispatch(); }
+                    if cross_boundary {
+                        let _ = end_dispatch();
+                    }
                     panic!("abort transaction");
                 })
             }));
@@ -1228,39 +1259,67 @@ mod tests {
 
     #[test]
     fn clean_slice_drain_exports_success_and_discards_failure() {
-        for status in [super::super::STATUS_DONE, super::super::STATUS_YIELDED,
-            super::super::STATUS_FORBIDDEN, super::super::STATUS_PANICKED, super::super::STATUS_OOG] {
+        for status in [
+            super::super::STATUS_DONE,
+            super::super::STATUS_YIELDED,
+            super::super::STATUS_FORBIDDEN,
+            super::super::STATUS_PANICKED,
+            super::super::STATUS_OOG,
+        ] {
             fresh();
             overlay_store(b"rows/a".to_vec(), Some(vec![7]));
             overlay_store(b"rows/b".to_vec(), None);
             overlay_store(b"rows/c".to_vec(), Some(Vec::new()));
             let delta = finish_clean_dispatch(status).unwrap();
-            if matches!(status, super::super::STATUS_DONE | super::super::STATUS_YIELDED) {
-                assert_eq!(crate::agent::actor_storage::decode_row_delta(&delta.unwrap()).unwrap(), vec![
-                    (b"rows/a".to_vec(), Some(vec![7])), (b"rows/b".to_vec(), None),
-                    (b"rows/c".to_vec(), Some(Vec::new())),
-                ]);
-            } else { assert!(delta.is_none()); }
+            if matches!(
+                status,
+                super::super::STATUS_DONE | super::super::STATUS_YIELDED
+            ) {
+                assert_eq!(
+                    crate::agent::actor_storage::decode_row_delta(&delta.unwrap()).unwrap(),
+                    vec![
+                        (b"rows/a".to_vec(), Some(vec![7])),
+                        (b"rows/b".to_vec(), None),
+                        (b"rows/c".to_vec(), Some(Vec::new())),
+                    ]
+                );
+            } else {
+                assert!(delta.is_none());
+            }
             assert!(end_dispatch().is_empty());
-            assert_eq!(overlay_load(b"rows/a"), None, "drain must clear the cached overlay too");
+            assert_eq!(
+                overlay_load(b"rows/a"),
+                None,
+                "drain must clear the cached overlay too"
+            );
         }
     }
 
     #[test]
     fn clean_resume_discards_prior_slice_writes_tombstones_and_cached_reads() {
         fresh();
-        mock::commit(vec![(b"rows/a".to_vec(), Some(vec![1])), (b"rows/b".to_vec(), Some(vec![2]))]);
+        mock::commit(vec![
+            (b"rows/a".to_vec(), Some(vec![1])),
+            (b"rows/b".to_vec(), Some(vec![2])),
+        ]);
         assert_eq!(overlay_load(b"rows/a"), Some(vec![1]));
         overlay_store(b"rows/a".to_vec(), Some(vec![3]));
         overlay_store(b"rows/b".to_vec(), None);
         assert_eq!(overlay_load(b"rows/c"), None);
-        mock::commit(vec![(b"rows/a".to_vec(), Some(vec![4])), (b"rows/b".to_vec(), Some(vec![5])),
-            (b"rows/c".to_vec(), Some(vec![6]))]);
+        mock::commit(vec![
+            (b"rows/a".to_vec(), Some(vec![4])),
+            (b"rows/b".to_vec(), Some(vec![5])),
+            (b"rows/c".to_vec(), Some(vec![6])),
+        ]);
         resume_clean_dispatch();
         assert_eq!(overlay_load(b"rows/a"), Some(vec![4]));
         assert_eq!(overlay_load(b"rows/b"), Some(vec![5]));
         assert_eq!(overlay_load(b"rows/c"), Some(vec![6]));
-        assert!(finish_clean_dispatch(super::super::STATUS_DONE).unwrap().is_none());
+        assert!(
+            finish_clean_dispatch(super::super::STATUS_DONE)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

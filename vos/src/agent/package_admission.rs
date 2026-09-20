@@ -481,7 +481,11 @@ pub(crate) fn admitted_standard_runtime_for_test(
     name: &str,
     signing_seed: u8,
 ) -> AdmittedRuntimePackage {
-    admitted_runtime_program_for_test(name, signing_seed, include_bytes!("../../../vosx/blobs/agent_runtime.pvm"))
+    admitted_runtime_program_for_test(
+        name,
+        signing_seed,
+        include_bytes!("../../../vosx/blobs/agent_runtime.pvm"),
+    )
 }
 
 #[cfg(test)]

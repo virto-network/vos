@@ -671,7 +671,9 @@ fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError> {
                 RelocType::Abs32 | RelocType::Add32 | RelocType::Sub32 => {
                     data_relocation_ranges.push((r_offset, r_offset.saturating_add(4)));
                 }
-                RelocType::Abs64 => data_relocation_ranges.push((r_offset, r_offset.saturating_add(8))),
+                RelocType::Abs64 => {
+                    data_relocation_ranges.push((r_offset, r_offset.saturating_add(8)))
+                }
                 _ => {}
             }
 
@@ -1107,9 +1109,10 @@ fn translate_section_linked(
                 // Peek at JALR to get link register
                 if offset + 8 <= data.len() {
                     if elf.control_flow_targets.contains(&(rv_addr + 4)) {
-                        return Err(TranspileError::InvalidSection(
-                            format!("control-flow target {:#x} splits a relocated AUIPC+JALR call pair at {rv_addr:#x}", rv_addr + 4),
-                        ));
+                        return Err(TranspileError::InvalidSection(format!(
+                            "control-flow target {:#x} splits a relocated AUIPC+JALR call pair at {rv_addr:#x}",
+                            rv_addr + 4
+                        )));
                     }
                     let jalr = u32::from_le_bytes([
                         data[offset + 4],
@@ -1268,9 +1271,9 @@ mod tests {
         assert_eq!(merged, vec![(4, 14), (20, 28), (40, 48)]);
         for address in 0..56 {
             for size in 1..=8u8 {
-                let expected = original.iter().any(|&(start, end)| {
-                    address < end && start < address + u64::from(size)
-                });
+                let expected = original
+                    .iter()
+                    .any(|&(start, end)| address < end && start < address + u64::from(size));
                 assert_eq!(overlaps_data_relocation(&merged, address, size), expected);
             }
         }

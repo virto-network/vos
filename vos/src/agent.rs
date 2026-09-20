@@ -17,6 +17,7 @@ pub use crate::actors::tasks::{Child, TaskId, TaskRecord, TaskStatus, Tasks};
 pub mod sdk {
     pub use vos_agent_sdk::*;
 }
+pub(crate) mod actor_storage;
 pub mod authority;
 #[cfg(feature = "std")]
 pub mod authority_operation_coordinator;
@@ -42,7 +43,6 @@ pub mod contract;
 #[cfg(feature = "std")]
 pub mod driver;
 pub mod execution;
-pub(crate) mod actor_storage;
 pub mod genesis;
 pub mod genesis_archive;
 #[cfg(feature = "std")]
@@ -93,7 +93,12 @@ pub mod private_sync;
     target_os = "linux"
 ))]
 pub mod production_owner;
-#[cfg(all(feature = "std", feature = "storage", feature = "network", target_os = "linux"))]
+#[cfg(all(
+    feature = "std",
+    feature = "storage",
+    feature = "network",
+    target_os = "linux"
+))]
 pub(crate) mod production_worker;
 pub(crate) mod replay;
 #[cfg(feature = "std")]

@@ -2208,7 +2208,9 @@ mod tests {
             ManagementRequest::ChangeReplicas { .. } => {
                 (AuthorityOperationKind::ChangeReplicaSet, None, None)
             }
-            ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources | ManagementRequest::InspectManagementHistory => {
+            ManagementRequest::InspectActors { .. }
+            | ManagementRequest::InspectResources
+            | ManagementRequest::InspectManagementHistory => {
                 panic!("read-only management has no receipt")
             }
             ManagementRequest::PrivateControl { .. } => {

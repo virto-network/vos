@@ -4,9 +4,9 @@
 //! availability. The runtime owns actor lookup, lane selection, inner-machine
 //! host calls, and the next opaque runtime state.
 
-use alloc::vec::Vec;
 #[cfg(feature = "pvm")]
 use alloc::vec;
+use alloc::vec::Vec;
 
 use super::{MethodMode, StateLane};
 use crate::service::wire::Encoder;
@@ -30,7 +30,8 @@ pub const MAX_EXECUTION_STATE_BYTES: usize = 48 * 1024;
 /// invocation.
 pub const MAX_EXECUTION_STATE_TOTAL_BYTES: usize = 48 * 1024;
 /// Maximum aggregate content-addressed availability supplied to one call.
-pub const MAX_EXECUTION_AVAILABILITY_BYTES: usize = crate::agent_sdk::MAX_RUNTIME_CALLER_AVAILABILITY_BYTES;
+pub const MAX_EXECUTION_AVAILABILITY_BYTES: usize =
+    crate::agent_sdk::MAX_RUNTIME_CALLER_AVAILABILITY_BYTES;
 /// Maximum application PVM accepted by the bundled runtime. Parsing a PVM
 /// materializes its data, code, bitmask, and compact-code form concurrently,
 /// so this is intentionally much smaller than a generic service wire.
@@ -66,8 +67,8 @@ const MAX_EXECUTION_FETCH_BYTES: usize = MAX_EXECUTION_STATE_TOTAL_BYTES
 // Preserve the actor's baseline crypto allowance and budget one SDK content
 // verification per admitted blob (128-byte BLAKE2b blocks plus framing). These
 // counters, like fetch work, are retained across yields and are not per slice.
-const MAX_EXECUTION_BLAKE2B_COMPRESS_CALLS: usize = 1024
-    + MAX_EXECUTION_AVAILABILITY_BYTES.div_ceil(128) + 2 * MAX_EXECUTION_BLOBS;
+const MAX_EXECUTION_BLAKE2B_COMPRESS_CALLS: usize =
+    1024 + MAX_EXECUTION_AVAILABILITY_BYTES.div_ceil(128) + 2 * MAX_EXECUTION_BLOBS;
 const MAX_EXECUTION_DEBUG_BYTES: usize = 16 * 1024;
 
 #[cfg(feature = "pvm")]
@@ -491,16 +492,26 @@ impl ActorInvocation {
         reference: &BlobRef,
     ) -> Result<Option<&[u8]>, ActorExecutionError> {
         if self.availability.len() > MAX_EXECUTION_BLOBS
-            || self.availability.windows(2)
+            || self
+                .availability
+                .windows(2)
                 .any(|pair| pair[0].reference.hash >= pair[1].reference.hash)
-            || self.availability.iter().try_fold(0usize, |total, blob| {
-                (blob.bytes.len() <= MAX_EXECUTION_AVAILABILITY_BYTES)
-                    .then(|| total.checked_add(blob.bytes.len())).flatten()
-            }).is_none_or(|total| total > MAX_EXECUTION_AVAILABILITY_BYTES)
+            || self
+                .availability
+                .iter()
+                .try_fold(0usize, |total, blob| {
+                    (blob.bytes.len() <= MAX_EXECUTION_AVAILABILITY_BYTES)
+                        .then(|| total.checked_add(blob.bytes.len()))
+                        .flatten()
+                })
+                .is_none_or(|total| total > MAX_EXECUTION_AVAILABILITY_BYTES)
         {
             return Err(ActorExecutionError::InvalidInput);
         }
-        let Ok(index) = self.availability.binary_search_by_key(&reference.hash, |blob| blob.reference.hash) else {
+        let Ok(index) = self
+            .availability
+            .binary_search_by_key(&reference.hash, |blob| blob.reference.hash)
+        else {
             return Ok(None);
         };
         let blob = &self.availability[index];
@@ -531,7 +542,8 @@ impl ActorInvocation {
                 .windows(2)
                 .any(|pair| pair[0].reference.hash >= pair[1].reference.hash)
             || self.availability.iter().any(|blob| {
-                blob.bytes.len() > MAX_EXECUTION_AVAILABILITY_BYTES || !blob.reference.matches(&blob.bytes)
+                blob.bytes.len() > MAX_EXECUTION_AVAILABILITY_BYTES
+                    || !blob.reference.matches(&blob.bytes)
             })
             || availability_bytes.is_none_or(|bytes| bytes > MAX_EXECUTION_AVAILABILITY_BYTES)
         {
@@ -562,7 +574,9 @@ impl ActorHostBudget {
         else {
             #[cfg(test)]
             if std::env::var_os("VOS_TEST_INNER_DIAGNOSTICS").is_some() {
-                std::eprintln!("native quota exhausted: total={total} amount={amount} maximum={maximum}");
+                std::eprintln!(
+                    "native quota exhausted: total={total} amount={amount} maximum={maximum}"
+                );
             }
             return false;
         };
@@ -711,7 +725,13 @@ pub(crate) fn run_inner_actor(
     continuation: Option<ActorMachineContinuation>,
 ) -> Result<ActorRunOutcome, ActorExecutionError> {
     run_inner_actor_with_storage(
-        invocation, clean_context, actor_pvm, installation_data, actor_state, continuation, None,
+        invocation,
+        clean_context,
+        actor_pvm,
+        installation_data,
+        actor_state,
+        continuation,
+        None,
     )
 }
 
@@ -732,7 +752,11 @@ pub(crate) fn run_inner_actor_with_storage(
     use super::machine::{ActorMachine, InnerExit};
     use crate::abi::{error, hostcall};
 
-    if storage.is_some_and(|storage| clean_context.as_ref().is_none_or(|ctx| ctx.mode != storage.mode())) {
+    if storage.is_some_and(|storage| {
+        clean_context
+            .as_ref()
+            .is_none_or(|ctx| ctx.mode != storage.mode())
+    }) {
         return Err(ActorExecutionError::InvalidInput);
     }
     if actor_state
@@ -854,7 +878,9 @@ pub(crate) fn run_inner_actor_with_storage(
                     (_, None) => {
                         let rows = if reply.status == ActorExecutionStatus::Done {
                             exported_rows.take().unwrap_or_default()
-                        } else { Vec::new() };
+                        } else {
+                            Vec::new()
+                        };
                         Ok(ActorRunOutcome::Completed { reply, state, rows })
                     }
                 };
@@ -862,7 +888,10 @@ pub(crate) fn run_inner_actor_with_storage(
             _failure @ (InnerExit::Panic | InnerExit::Fault(_)) => {
                 #[cfg(test)]
                 if std::env::var_os("VOS_TEST_INNER_DIAGNOSTICS").is_some() {
-                    std::eprintln!("inner failure: {_failure:?}, registers={:?}", machine.registers());
+                    std::eprintln!(
+                        "inner failure: {_failure:?}, registers={:?}",
+                        machine.registers()
+                    );
                 }
                 return Ok(ActorRunOutcome::Completed {
                     reply: terminal_reply(
@@ -871,14 +900,14 @@ pub(crate) fn run_inner_actor_with_storage(
                         machine.gas_remaining(),
                     ),
                     state: actor_state.clone(),
-                        rows: Vec::new(),
+                    rows: Vec::new(),
                 });
             }
             InnerExit::OutOfGas => {
                 return Ok(ActorRunOutcome::Completed {
                     reply: terminal_reply(invocation, ActorExecutionStatus::OutOfGas, 0),
                     state: actor_state.clone(),
-                        rows: Vec::new(),
+                    rows: Vec::new(),
                 });
             }
             InnerExit::InvalidResult(_) => return Err(ActorExecutionError::InvalidActorOutput),
@@ -922,54 +951,79 @@ pub(crate) fn run_inner_actor_with_storage(
                 let (result0, result1) = match id {
                     value if value == u64::from(hostcall::GAS) => (gas, 0),
                     value if value == u64::from(hostcall::ACTOR_EFFECT_EXPORT) => {
-                        let storage = storage.ok_or(ActorExecutionError::UnsupportedHostCall(id))?;
-                        if exported_rows.is_some() { return Err(ActorExecutionError::InvalidActorOutput); }
-                        let address = u32::try_from(registers[7]).map_err(|_| ActorExecutionError::InvalidInput)?;
-                        let len = usize::try_from(registers[8]).ok()
+                        let storage =
+                            storage.ok_or(ActorExecutionError::UnsupportedHostCall(id))?;
+                        if exported_rows.is_some() {
+                            return Err(ActorExecutionError::InvalidActorOutput);
+                        }
+                        let address = u32::try_from(registers[7])
+                            .map_err(|_| ActorExecutionError::InvalidInput)?;
+                        let len = usize::try_from(registers[8])
+                            .ok()
                             .filter(|len| *len <= super::actor_storage::MAX_ROW_DELTA_BYTES)
                             .ok_or(ActorExecutionError::InvalidInput)?;
                         // Account for guest-memory copy and owned decoded rows
                         // before allocating either representation.
-                        if !host_budget.fetch(len.checked_mul(2).ok_or(ActorExecutionError::InvalidInput)?) {
+                        if !host_budget.fetch(
+                            len.checked_mul(2)
+                                .ok_or(ActorExecutionError::InvalidInput)?,
+                        ) {
                             return Ok(ActorRunOutcome::Completed {
-                                reply: terminal_reply(invocation, ActorExecutionStatus::OutOfGas, 0),
+                                reply: terminal_reply(
+                                    invocation,
+                                    ActorExecutionStatus::OutOfGas,
+                                    0,
+                                ),
                                 state: actor_state.clone(),
-                        rows: Vec::new(),
+                                rows: Vec::new(),
                             });
                         }
                         let mut bytes = vec![0; len];
-                        machine.read(address, &mut bytes).map_err(|_| ActorExecutionError::InvalidInput)?;
+                        machine
+                            .read(address, &mut bytes)
+                            .map_err(|_| ActorExecutionError::InvalidInput)?;
                         let changes = super::actor_storage::decode_row_delta(&bytes)
                             .map_err(|_| ActorExecutionError::InvalidActorOutput)?;
-                        storage.validate_delta(&changes).map_err(|_| ActorExecutionError::InvalidActorOutput)?;
+                        storage
+                            .validate_delta(&changes)
+                            .map_err(|_| ActorExecutionError::InvalidActorOutput)?;
                         exported_rows = Some(changes);
                         (0, 0)
                     }
                     value if value == u64::from(hostcall::STORAGE_R) => {
-                        let storage = storage.ok_or(ActorExecutionError::UnsupportedHostCall(id))?;
+                        let storage =
+                            storage.ok_or(ActorExecutionError::UnsupportedHostCall(id))?;
                         let key_address = u32::try_from(registers[7])
                             .map_err(|_| ActorExecutionError::InvalidInput)?;
-                        let key_len = usize::try_from(registers[8]).ok()
+                        let key_len = usize::try_from(registers[8])
+                            .ok()
                             .filter(|len| *len > 0 && *len <= super::actor_storage::MAX_KEY_BYTES)
                             .ok_or(ActorExecutionError::InvalidInput)?;
                         let address = u32::try_from(registers[9])
                             .map_err(|_| ActorExecutionError::InvalidInput)?;
-                        let capacity = usize::try_from(registers[10]).ok()
+                        let capacity = usize::try_from(registers[10])
+                            .ok()
                             .filter(|len| *len <= crate::actors::storage::MAX_VALUE_BYTES)
                             .ok_or(ActorExecutionError::InvalidInput)?;
                         // Charge before allocating or touching guest memory, including
                         // absent-key probes. The full key participates in ownership.
                         if !host_budget.fetch(key_len) {
                             return Ok(ActorRunOutcome::Completed {
-                                reply: terminal_reply(invocation, ActorExecutionStatus::OutOfGas, 0),
+                                reply: terminal_reply(
+                                    invocation,
+                                    ActorExecutionStatus::OutOfGas,
+                                    0,
+                                ),
                                 state: actor_state.clone(),
-                        rows: Vec::new(),
+                                rows: Vec::new(),
                             });
                         }
                         let mut key = vec![0; key_len];
-                        machine.read(key_address, &mut key)
+                        machine
+                            .read(key_address, &mut key)
                             .map_err(|_| ActorExecutionError::InvalidInput)?;
-                        let row = storage.read(&key)
+                        let row = storage
+                            .read(&key)
                             .map_err(|_| ActorExecutionError::InvalidInput)?;
                         match row {
                             None => (error::HOST_NONE, 0),
@@ -977,15 +1031,24 @@ pub(crate) fn run_inner_actor_with_storage(
                                 // STORAGE_R returns full length and copies a prefix;
                                 // a size probe does not copy or charge unseen bytes.
                                 let copied = row.len().min(capacity);
-                                if !ActorHostBudget::charge(&mut host_budget.fetch_bytes, copied, MAX_EXECUTION_FETCH_BYTES) {
+                                if !ActorHostBudget::charge(
+                                    &mut host_budget.fetch_bytes,
+                                    copied,
+                                    MAX_EXECUTION_FETCH_BYTES,
+                                ) {
                                     return Ok(ActorRunOutcome::Completed {
-                                        reply: terminal_reply(invocation, ActorExecutionStatus::OutOfGas, 0),
+                                        reply: terminal_reply(
+                                            invocation,
+                                            ActorExecutionStatus::OutOfGas,
+                                            0,
+                                        ),
                                         state: actor_state.clone(),
-                        rows: Vec::new(),
+                                        rows: Vec::new(),
                                     });
                                 }
                                 if copied != 0 {
-                                    machine.write(address, &row[..copied])
+                                    machine
+                                        .write(address, &row[..copied])
                                         .map_err(|_| ActorExecutionError::InvalidInput)?;
                                 }
                                 (row.len() as u64, 0)
@@ -997,42 +1060,64 @@ pub(crate) fn run_inner_actor_with_storage(
                             .map_err(|_| ActorExecutionError::InvalidInput)?;
                         let address = u32::try_from(registers[8])
                             .map_err(|_| ActorExecutionError::InvalidInput)?;
-                        let capacity = usize::try_from(registers[9]).ok()
+                        let capacity = usize::try_from(registers[9])
+                            .ok()
                             .filter(|len| *len <= MAX_EXECUTION_AVAILABILITY_BYTES)
                             .ok_or(ActorExecutionError::InvalidInput)?;
                         // Charge the key read even for an absent blob. The collection
                         // is validated on admission; lookup never consults ambient IO.
                         if !host_budget.fetch(32) {
                             return Ok(ActorRunOutcome::Completed {
-                                reply: terminal_reply(invocation, ActorExecutionStatus::OutOfGas, 0),
+                                reply: terminal_reply(
+                                    invocation,
+                                    ActorExecutionStatus::OutOfGas,
+                                    0,
+                                ),
                                 state: actor_state.clone(),
-                        rows: Vec::new(),
+                                rows: Vec::new(),
                             });
                         }
                         let mut hash = [0; 32];
-                        machine.read(hash_address, &mut hash)
+                        machine
+                            .read(hash_address, &mut hash)
                             .map_err(|_| ActorExecutionError::InvalidInput)?;
-                        match invocation.availability.binary_search_by_key(&Hash(hash), |blob| blob.reference.hash) {
+                        match invocation
+                            .availability
+                            .binary_search_by_key(&Hash(hash), |blob| blob.reference.hash)
+                        {
                             Err(_) => (error::HOST_NONE, 0),
                             Ok(index) => {
                                 let blob = &invocation.availability[index];
-                                let work = blob.bytes.len().checked_mul(2)
+                                let work = blob
+                                    .bytes
+                                    .len()
+                                    .checked_mul(2)
                                     .ok_or(ActorExecutionError::InvalidInput)?;
                                 // Use the persisted FETCH byte counter, without
                                 // consuming a second call, before hashing/copying.
-                                if !ActorHostBudget::charge(&mut host_budget.fetch_bytes, work, MAX_EXECUTION_FETCH_BYTES) {
+                                if !ActorHostBudget::charge(
+                                    &mut host_budget.fetch_bytes,
+                                    work,
+                                    MAX_EXECUTION_FETCH_BYTES,
+                                ) {
                                     return Ok(ActorRunOutcome::Completed {
-                                        reply: terminal_reply(invocation, ActorExecutionStatus::OutOfGas, 0),
+                                        reply: terminal_reply(
+                                            invocation,
+                                            ActorExecutionStatus::OutOfGas,
+                                            0,
+                                        ),
                                         state: actor_state.clone(),
-                        rows: Vec::new(),
+                                        rows: Vec::new(),
                                     });
                                 }
-                                let bytes = invocation.available_preimage(&blob.reference)?
+                                let bytes = invocation
+                                    .available_preimage(&blob.reference)?
                                     .ok_or(ActorExecutionError::InvalidAvailability)?;
                                 if capacity < bytes.len() {
                                     (error::HOST_FULL, 0)
                                 } else {
-                                    machine.write(address, bytes)
+                                    machine
+                                        .write(address, bytes)
                                         .map_err(|_| ActorExecutionError::InvalidInput)?;
                                     (bytes.len() as u64, 0)
                                 }
@@ -1056,7 +1141,7 @@ pub(crate) fn run_inner_actor_with_storage(
                                         0,
                                     ),
                                     state: actor_state.clone(),
-                        rows: Vec::new(),
+                                    rows: Vec::new(),
                                 });
                             }
                             machine
@@ -1084,7 +1169,7 @@ pub(crate) fn run_inner_actor_with_storage(
                                     0,
                                 ),
                                 state: actor_state.clone(),
-                        rows: Vec::new(),
+                                rows: Vec::new(),
                             });
                         }
                         let h_address = u32::try_from(registers[7])
@@ -1128,7 +1213,7 @@ pub(crate) fn run_inner_actor_with_storage(
                                     0,
                                 ),
                                 state: actor_state.clone(),
-                        rows: Vec::new(),
+                                rows: Vec::new(),
                             });
                         }
                         let mut discarded = alloc::vec![0u8; len];
@@ -1293,7 +1378,13 @@ mod tests {
     fn maximum_clean_input_fetches_include_guest_probe_cost() {
         let mut budget = ActorHostBudget::default();
         let lane = MAX_EXECUTION_STATE_TOTAL_BYTES / 3;
-        for bytes in [lane + 1, lane + 1, lane + 1, ACTOR_DISPATCH_CONTROL_CAPACITY, MAX_EXECUTION_MESSAGE_BYTES] {
+        for bytes in [
+            lane + 1,
+            lane + 1,
+            lane + 1,
+            ACTOR_DISPATCH_CONTROL_CAPACITY,
+            MAX_EXECUTION_MESSAGE_BYTES,
+        ] {
             assert!(budget.fetch(ACTOR_FETCH_PROBE_BYTES));
             assert!(budget.fetch(bytes));
         }
@@ -1309,24 +1400,45 @@ mod tests {
         let mut call = invocation();
         let oversized = vec![0x41; MAX_EXECUTION_AVAILABILITY_BYTES + 1];
         let reference = BlobRef::of_bytes(&oversized);
-        call.availability.push(RuntimeBlob { reference: reference.clone(), bytes: oversized });
-        assert_eq!(call.available_preimage(&reference), Err(ActorExecutionError::InvalidInput));
+        call.availability.push(RuntimeBlob {
+            reference: reference.clone(),
+            bytes: oversized,
+        });
+        assert_eq!(
+            call.available_preimage(&reference),
+            Err(ActorExecutionError::InvalidInput)
+        );
 
         let size = MAX_EXECUTION_AVAILABILITY_BYTES / 2 + 1;
         assert!(size <= MAX_EXECUTION_AVAILABILITY_BYTES);
-        call.availability = [0x41, 0x42].into_iter().map(|marker| {
-            let bytes = vec![marker; size];
-            RuntimeBlob { reference: BlobRef::of_bytes(&bytes), bytes }
-        }).collect();
+        call.availability = [0x41, 0x42]
+            .into_iter()
+            .map(|marker| {
+                let bytes = vec![marker; size];
+                RuntimeBlob {
+                    reference: BlobRef::of_bytes(&bytes),
+                    bytes,
+                }
+            })
+            .collect();
         call.availability.sort_by_key(|blob| blob.reference.hash);
         let selected = call.availability[0].reference.clone();
-        assert_eq!(call.available_preimage(&selected), Err(ActorExecutionError::InvalidInput));
+        assert_eq!(
+            call.available_preimage(&selected),
+            Err(ActorExecutionError::InvalidInput)
+        );
 
         call.availability.truncate(1);
         let bytes = vec![0x41; MAX_EXECUTION_AVAILABILITY_BYTES];
         let reference = BlobRef::of_bytes(&bytes);
-        call.availability[0] = RuntimeBlob { reference: reference.clone(), bytes };
-        assert_eq!(call.available_preimage(&reference).unwrap().unwrap().len(), MAX_EXECUTION_AVAILABILITY_BYTES);
+        call.availability[0] = RuntimeBlob {
+            reference: reference.clone(),
+            bytes,
+        };
+        assert_eq!(
+            call.available_preimage(&reference).unwrap().unwrap().len(),
+            MAX_EXECUTION_AVAILABILITY_BYTES
+        );
     }
 
     #[test]
@@ -1335,20 +1447,38 @@ mod tests {
         let reference = BlobRef::of_bytes(&bytes);
         let mut call = invocation();
         assert_eq!(call.available_preimage(&reference), Ok(None));
-        call.availability.push(RuntimeBlob { reference: reference.clone(), bytes: bytes.clone() });
+        call.availability.push(RuntimeBlob {
+            reference: reference.clone(),
+            bytes: bytes.clone(),
+        });
         assert_eq!(call.validate(), Ok(()));
-        assert_eq!(call.available_preimage(&reference), Ok(Some(bytes.as_slice())));
+        assert_eq!(
+            call.available_preimage(&reference),
+            Ok(Some(bytes.as_slice()))
+        );
         assert_eq!(invocation().available_preimage(&reference), Ok(None));
         let mut wrong_length = reference.clone();
         wrong_length.len += 1;
-        assert_eq!(call.available_preimage(&wrong_length), Err(ActorExecutionError::InvalidInput));
+        assert_eq!(
+            call.available_preimage(&wrong_length),
+            Err(ActorExecutionError::InvalidInput)
+        );
         call.availability[0].bytes[0] ^= 1;
-        assert_eq!(call.available_preimage(&reference), Err(ActorExecutionError::InvalidInput));
+        assert_eq!(
+            call.available_preimage(&reference),
+            Err(ActorExecutionError::InvalidInput)
+        );
         call.availability[0].bytes[0] ^= 1;
         call.availability.push(call.availability[0].clone());
-        assert_eq!(call.available_preimage(&reference), Err(ActorExecutionError::InvalidInput));
+        assert_eq!(
+            call.available_preimage(&reference),
+            Err(ActorExecutionError::InvalidInput)
+        );
         call.availability = vec![call.availability[0].clone(); MAX_EXECUTION_BLOBS + 1];
-        assert_eq!(call.available_preimage(&reference), Err(ActorExecutionError::InvalidInput));
+        assert_eq!(
+            call.available_preimage(&reference),
+            Err(ActorExecutionError::InvalidInput)
+        );
     }
 
     #[test]
@@ -1750,73 +1880,136 @@ mod tests {
     #[ignore = "requires Authority candidate ELF and exported signed publication fixture"]
     fn compiled_authority_publication_matches_native_state_and_retry() {
         use crate::actors::codec::{Decode, Encode};
-        use crate::actors::value::{Msg, Value, TAG_DYNAMIC};
+        use crate::actors::value::{Msg, TAG_DYNAMIC, Value};
         use crate::agent_sdk::wire::CanonicalWire as _;
-        let root = std::path::PathBuf::from(std::env::var("AUTHORITY_PUBLICATION_FIXTURE")
-            .expect("set AUTHORITY_PUBLICATION_FIXTURE to the explicit exported fixture"));
+        let root = std::path::PathBuf::from(
+            std::env::var("AUTHORITY_PUBLICATION_FIXTURE")
+                .expect("set AUTHORITY_PUBLICATION_FIXTURE to the explicit exported fixture"),
+        );
         let read = |name| std::fs::read(root.join(name)).expect("read publication fixture");
-        let elf = std::fs::read(std::env::var("AUTHORITY_CANDIDATE_ELF")
-            .expect("set AUTHORITY_CANDIDATE_ELF")).expect("read Authority ELF");
+        let elf = std::fs::read(
+            std::env::var("AUTHORITY_CANDIDATE_ELF").expect("set AUTHORITY_CANDIDATE_ELF"),
+        )
+        .expect("read Authority ELF");
         let program = vos_pvm_compiler::link_elf_spi(&elf).expect("link Authority ELF");
         assert!(program.len() <= MAX_EXECUTION_PROGRAM_BYTES);
         if let Some(path) = std::env::var_os("VOS_TEST_INNER_PROGRAM_EXPORT") {
             use std::io::Write as _;
-            std::fs::OpenOptions::new().write(true).create_new(true).open(path)
-                .unwrap().write_all(&program).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .unwrap()
+                .write_all(&program)
+                .unwrap();
         }
         let schema = crate::agent_sdk::schema::decode(
             &super::super::schema::raw_section_from_elf(&elf).expect("Authority schema"),
-        ).unwrap();
+        )
+        .unwrap();
         let access = super::super::actor_storage::ActorStorageAccess::new(
-            &schema, "publish_genesis", crate::agent_sdk::MethodMode::Linear,
-        ).unwrap();
+            &schema,
+            "publish_genesis",
+            crate::agent_sdk::MethodMode::Linear,
+        )
+        .unwrap();
         let image = super::super::actor_storage::ActorLaneImage::from_parts(
-            Vec::new(), Decode::decode(&read("node-rows")),
+            Vec::new(),
+            Decode::decode(&read("node-rows")),
         );
-        let reader = super::super::actor_storage::ActorStorageReader::new(
-            &access, Some(&image), None, None,
-        ).unwrap();
+        let reader =
+            super::super::actor_storage::ActorStorageReader::new(&access, Some(&image), None, None)
+                .unwrap();
         let mut context = crate::agent_sdk::InvocationContext::decode(&read("context")).unwrap();
         let config = read("configuration");
         let provision = read("provision");
-        let decoded = <super::super::genesis::AgentGenesisProvision as crate::service::ServiceWire>::decode(&provision).unwrap();
+        let decoded =
+            <super::super::genesis::AgentGenesisProvision as crate::service::ServiceWire>::decode(
+                &provision,
+            )
+            .unwrap();
         for member in decoded.replicas().members() {
-            assert_ne!(member.replica().principal,
+            assert_ne!(
+                member.replica().principal,
                 crate::service::PrincipalId::of_public_key(member.ed25519_public_key()),
-                "publication fixture must exercise distinct logical owner and transport identity");
+                "publication fixture must exercise distinct logical owner and transport identity"
+            );
         }
         let reference = BlobRef::of_bytes(&provision);
         let expected_state = read("published-linear");
         let expected_reply = read("decision");
-        let mut state = ActorStateLanes { linear: Some(read("pending-linear")), ..Default::default() };
+        let mut state = ActorStateLanes {
+            linear: Some(read("pending-linear")),
+            ..Default::default()
+        };
         let mut call = invocation();
         call.invocation = InvocationId(context.invocation.0);
         call.actor = ActorId(context.actor.0);
         call.mode = MethodMode::Linear;
         call.gas = MAX_EXECUTION_GAS;
         call.message = vec![TAG_DYNAMIC];
-        call.message.extend(Msg::new("publish_genesis")
-            .with("authorization", Value::Bytes(read("authorization")))
-            .with("provision_hash", Value::Bytes(reference.hash.0.to_vec()))
-            .with("provision_len", Value::U64(reference.len)).encode());
+        call.message.extend(
+            Msg::new("publish_genesis")
+                .with("authorization", Value::Bytes(read("authorization")))
+                .with("provision_hash", Value::Bytes(reference.hash.0.to_vec()))
+                .with("provision_len", Value::U64(reference.len))
+                .encode(),
+        );
         for phase in 0..3 {
             if phase == 1 {
-                call.availability.push(RuntimeBlob { reference: reference.clone(), bytes: provision.clone() });
+                call.availability.push(RuntimeBlob {
+                    reference: reference.clone(),
+                    bytes: provision.clone(),
+                });
             }
-            if phase == 2 { context.observed_slot = u64::MAX; }
+            if phase == 2 {
+                context.observed_slot = u64::MAX;
+            }
             call.validate().unwrap();
-            let ActorRunOutcome::Completed { reply, state: next, rows } =
-                run_inner_actor_with_storage(&call, Some(context), &program, Some(&config), &state, None, Some(&reader))
-                    .expect("execute Authority publication") else { panic!("publication yielded") };
-            assert!(rows.is_empty(), "publication must not rewrite enrollment certificates");
-            std::eprintln!("Authority publication phase={phase} status={:?} gas_remaining={}", reply.status, reply.gas_remaining);
+            let ActorRunOutcome::Completed {
+                reply,
+                state: next,
+                rows,
+            } = run_inner_actor_with_storage(
+                &call,
+                Some(context),
+                &program,
+                Some(&config),
+                &state,
+                None,
+                Some(&reader),
+            )
+            .expect("execute Authority publication")
+            else {
+                panic!("publication yielded")
+            };
+            assert!(
+                rows.is_empty(),
+                "publication must not rewrite enrollment certificates"
+            );
+            std::eprintln!(
+                "Authority publication phase={phase} status={:?} gas_remaining={}",
+                reply.status,
+                reply.gas_remaining
+            );
             assert_eq!(reply.status, ActorExecutionStatus::Done);
-            let expected = if phase == 0 { Vec::new() } else { expected_reply.clone() };
+            let expected = if phase == 0 {
+                Vec::new()
+            } else {
+                expected_reply.clone()
+            };
             assert_eq!(Value::decode(&reply.reply), Value::Bytes(expected));
             if phase == 0 {
-                assert_eq!(next.linear, state.linear, "missing blob changed pending state");
+                assert_eq!(
+                    next.linear, state.linear,
+                    "missing blob changed pending state"
+                );
             } else {
-                assert_eq!(next.linear.as_deref(), Some(expected_state.as_slice()), "guest/native publication state differs");
+                assert_eq!(
+                    next.linear.as_deref(),
+                    Some(expected_state.as_slice()),
+                    "guest/native publication state differs"
+                );
             }
             state = next;
         }
@@ -1826,19 +2019,22 @@ mod tests {
     #[test]
     #[ignore = "requires Authority candidate ELF and exported AUTHORITY_NODE_FIXTURE"]
     fn compiled_authority_genesis_committee_query_preserves_state() {
+        use super::super::actor_storage::{ActorLaneImage, ActorStorageAccess, ActorStorageReader};
+        use super::super::committee::{
+            AuthorityCommittee, AuthorityCommitteeMember, AuthorityMemberRole,
+        };
         use crate::actors::codec::{Decode, Encode};
-        use crate::actors::value::{Msg, Value, TAG_DYNAMIC};
+        use crate::actors::value::{Msg, TAG_DYNAMIC, Value};
         use crate::agent_sdk::wire::CanonicalWire as _;
         use crate::service::ServiceWire as _;
-        use super::super::actor_storage::{ActorLaneImage, ActorStorageAccess, ActorStorageReader};
-        use super::super::committee::{AuthorityCommittee, AuthorityCommitteeMember, AuthorityMemberRole};
         let root = std::path::PathBuf::from(std::env::var("AUTHORITY_NODE_FIXTURE").unwrap());
         let read = |name: &str| std::fs::read(root.join(name)).unwrap();
         let elf = std::fs::read(std::env::var("AUTHORITY_CANDIDATE_ELF").unwrap()).unwrap();
         let program = vos_pvm_compiler::link_elf_spi(&elf).unwrap();
         let schema = crate::agent_sdk::schema::decode(
             &super::super::schema::raw_section_from_elf(&elf).unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         let config_bytes = read("configuration");
         let config = system_authority::SystemAuthorityConfiguration::decode(&config_bytes).unwrap();
         let binding = crate::agent_sdk::authority::AgentAuthorityBinding {
@@ -1854,16 +2050,33 @@ mod tests {
             initial_epoch: config.binding.initial_epoch,
         };
         let expected = AuthorityCommittee::new(
-            crate::service::SpaceId(config.space), crate::service::Hash(binding.commitment().0),
-            1, None, vec![AuthorityCommitteeMember::new(
-                crate::service::NodeId(config.bootstrap_node), config.bootstrap_credential_public_key,
-                AuthorityMemberRole::Voter,
-            ).unwrap()],
-        ).unwrap();
-        let image = ActorLaneImage::from_parts(read("initial-linear"), Decode::decode(&read("initial-rows")));
-        let access = ActorStorageAccess::new(&schema, "genesis_signing_committee", crate::agent_sdk::MethodMode::Query).unwrap();
+            crate::service::SpaceId(config.space),
+            crate::service::Hash(binding.commitment().0),
+            1,
+            None,
+            vec![
+                AuthorityCommitteeMember::new(
+                    crate::service::NodeId(config.bootstrap_node),
+                    config.bootstrap_credential_public_key,
+                    AuthorityMemberRole::Voter,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let image = ActorLaneImage::from_parts(
+            read("initial-linear"),
+            Decode::decode(&read("initial-rows")),
+        );
+        let access = ActorStorageAccess::new(
+            &schema,
+            "genesis_signing_committee",
+            crate::agent_sdk::MethodMode::Query,
+        )
+        .unwrap();
         let reader = ActorStorageReader::new(&access, Some(&image), None, None).unwrap();
-        let mut context = crate::agent_sdk::InvocationContext::decode(&read("enroll-context")).unwrap();
+        let mut context =
+            crate::agent_sdk::InvocationContext::decode(&read("enroll-context")).unwrap();
         context.mode = crate::agent_sdk::MethodMode::Query;
         let mut call = invocation();
         call.invocation = InvocationId(context.invocation.0);
@@ -1871,15 +2084,27 @@ mod tests {
         call.mode = MethodMode::Query;
         call.gas = MAX_EXECUTION_GAS;
         call.message = vec![TAG_DYNAMIC];
-        call.message.extend(Msg::new("genesis_signing_committee").encode());
+        call.message
+            .extend(Msg::new("genesis_signing_committee").encode());
         call.validate().unwrap();
         let before = ActorStateLanes {
-            linear: Some(image.inline().to_vec()), merge: Some(Vec::new()), local: Some(Vec::new()),
+            linear: Some(image.inline().to_vec()),
+            merge: Some(Vec::new()),
+            local: Some(Vec::new()),
         };
         for _ in 0..2 {
             let ActorRunOutcome::Completed { reply, state, rows } = run_inner_actor_with_storage(
-                &call, Some(context), &program, Some(&config_bytes), &before, None, Some(&reader),
-            ).unwrap() else { panic!("committee query yielded"); };
+                &call,
+                Some(context),
+                &program,
+                Some(&config_bytes),
+                &before,
+                None,
+                Some(&reader),
+            )
+            .unwrap() else {
+                panic!("committee query yielded");
+            };
             assert_eq!(reply.status, ActorExecutionStatus::Done);
             assert_eq!(Value::decode(&reply.reply), Value::Bytes(expected.encode()));
             assert!(state == before, "committee query changed inline state");
@@ -1891,19 +2116,23 @@ mod tests {
     #[test]
     #[ignore = "requires Authority candidate ELF and exported AUTHORITY_NODE_FIXTURE"]
     fn compiled_authority_malformed_entrypoints_preserve_rows() {
-        use crate::actors::codec::{Decode, Encode};
-        use crate::actors::value::{Msg, Value, TAG_DYNAMIC};
-        use crate::agent_sdk::wire::CanonicalWire as _;
         use super::super::actor_storage::{ActorLaneImage, ActorStorageAccess, ActorStorageReader};
+        use crate::actors::codec::{Decode, Encode};
+        use crate::actors::value::{Msg, TAG_DYNAMIC, Value};
+        use crate::agent_sdk::wire::CanonicalWire as _;
         let root = std::path::PathBuf::from(std::env::var("AUTHORITY_NODE_FIXTURE").unwrap());
         let read = |name: &str| std::fs::read(root.join(name)).unwrap();
         let elf = std::fs::read(std::env::var("AUTHORITY_CANDIDATE_ELF").unwrap()).unwrap();
         let program = vos_pvm_compiler::link_elf_spi(&elf).unwrap();
         let schema = crate::agent_sdk::schema::decode(
             &super::super::schema::raw_section_from_elf(&elf).unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         let config = read("configuration");
-        let image = ActorLaneImage::from_parts(read("initial-linear"), Decode::decode(&read("initial-rows")));
+        let image = ActorLaneImage::from_parts(
+            read("initial-linear"),
+            Decode::decode(&read("initial-rows")),
+        );
         let context = crate::agent_sdk::InvocationContext::decode(&read("enroll-context")).unwrap();
         for (method, argument, expected) in [
             ("authorize", "call", Value::Bytes(Vec::new())),
@@ -1913,7 +2142,9 @@ mod tests {
             ("acknowledge_issuance", "ack", Value::Bool(false)),
             ("resolve_private_application", "ack", Value::Bool(false)),
         ] {
-            let access = ActorStorageAccess::new(&schema, method, crate::agent_sdk::MethodMode::Linear).unwrap();
+            let access =
+                ActorStorageAccess::new(&schema, method, crate::agent_sdk::MethodMode::Linear)
+                    .unwrap();
             let reader = ActorStorageReader::new(&access, Some(&image), None, None).unwrap();
             let mut call = invocation();
             call.invocation = InvocationId(context.invocation.0);
@@ -1921,7 +2152,11 @@ mod tests {
             call.mode = MethodMode::Linear;
             call.gas = MAX_EXECUTION_GAS;
             call.message = vec![TAG_DYNAMIC];
-            call.message.extend(Msg::new(method).with(argument, Value::Bytes(Vec::new())).encode());
+            call.message.extend(
+                Msg::new(method)
+                    .with(argument, Value::Bytes(Vec::new()))
+                    .encode(),
+            );
             call.validate().unwrap();
             let before = ActorStateLanes {
                 linear: Some(image.inline().to_vec()),
@@ -1929,11 +2164,23 @@ mod tests {
                 local: Some(Vec::new()),
             };
             let ActorRunOutcome::Completed { reply, state, rows } = run_inner_actor_with_storage(
-                &call, Some(context), &program, Some(&config), &before, None, Some(&reader),
-            ).unwrap() else { panic!("malformed request yielded"); };
+                &call,
+                Some(context),
+                &program,
+                Some(&config),
+                &before,
+                None,
+                Some(&reader),
+            )
+            .unwrap() else {
+                panic!("malformed request yielded");
+            };
             assert_eq!(reply.status, ActorExecutionStatus::Done, "{method}");
             assert_eq!(Value::decode(&reply.reply), expected, "{method}");
-            assert!(state == before, "{method}: refused request changed inline state");
+            assert!(
+                state == before,
+                "{method}: refused request changed inline state"
+            );
             assert!(rows.is_empty(), "{method}: refused request exported rows");
         }
     }
@@ -1942,28 +2189,61 @@ mod tests {
     #[test]
     #[ignore = "requires Authority candidate ELF and exported AUTHORITY_NODE_FIXTURE"]
     fn compiled_authority_node_mutations_match_native_rows_and_retry() {
-        use crate::actors::codec::{Decode, Encode};
-        use crate::actors::value::{Msg, Value, TAG_DYNAMIC};
-        use crate::agent_sdk::wire::CanonicalWire as _;
         use super::super::actor_storage::{ActorLaneImage, ActorStorageAccess, ActorStorageReader};
+        use crate::actors::codec::{Decode, Encode};
+        use crate::actors::value::{Msg, TAG_DYNAMIC, Value};
+        use crate::agent_sdk::wire::CanonicalWire as _;
         let root = std::path::PathBuf::from(std::env::var("AUTHORITY_NODE_FIXTURE").unwrap());
         let read = |name: &str| std::fs::read(root.join(name)).expect("read node mutation fixture");
         let elf = std::fs::read(std::env::var("AUTHORITY_CANDIDATE_ELF").unwrap()).unwrap();
         let program = vos_pvm_compiler::link_elf_spi(&elf).unwrap();
         let schema = crate::agent_sdk::schema::decode(
             &super::super::schema::raw_section_from_elf(&elf).unwrap(),
-        ).unwrap();
-        let access = ActorStorageAccess::new(&schema, "administer", crate::agent_sdk::MethodMode::Linear).unwrap();
+        )
+        .unwrap();
+        let access =
+            ActorStorageAccess::new(&schema, "administer", crate::agent_sdk::MethodMode::Linear)
+                .unwrap();
         let config = read("configuration");
-        let mut image = ActorLaneImage::from_parts(read("initial-linear"), Decode::decode(&read("initial-rows")));
+        let mut image = ActorLaneImage::from_parts(
+            read("initial-linear"),
+            Decode::decode(&read("initial-rows")),
+        );
         for (phase, (message, context, expected_reply, expected_state, mutation)) in [
             ("bad-call", "enroll-context", None, "initial", false),
-            ("enroll-call", "enroll-context", Some("enroll-reply"), "enrolled", true),
-            ("enroll-call", "enroll-context", Some("enroll-reply"), "enrolled", false),
+            (
+                "enroll-call",
+                "enroll-context",
+                Some("enroll-reply"),
+                "enrolled",
+                true,
+            ),
+            (
+                "enroll-call",
+                "enroll-context",
+                Some("enroll-reply"),
+                "enrolled",
+                false,
+            ),
             ("bad-call", "enroll-context", None, "enrolled", false),
-            ("remove-call", "remove-context", Some("remove-reply"), "removed", true),
-            ("remove-call", "remove-context", Some("remove-reply"), "removed", false),
-        ].into_iter().enumerate() {
+            (
+                "remove-call",
+                "remove-context",
+                Some("remove-reply"),
+                "removed",
+                true,
+            ),
+            (
+                "remove-call",
+                "remove-context",
+                Some("remove-reply"),
+                "removed",
+                false,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let context = crate::agent_sdk::InvocationContext::decode(&read(context)).unwrap();
             let mut call = invocation();
             call.invocation = InvocationId(context.invocation.0);
@@ -1971,19 +2251,64 @@ mod tests {
             call.mode = MethodMode::Linear;
             call.gas = MAX_EXECUTION_GAS;
             call.message = vec![TAG_DYNAMIC];
-            call.message.extend(Msg::new("administer").with("call", Value::Bytes(read(message))).encode());
+            call.message.extend(
+                Msg::new("administer")
+                    .with("call", Value::Bytes(read(message)))
+                    .encode(),
+            );
             call.validate().unwrap();
             let reader = ActorStorageReader::new(&access, Some(&image), None, None).unwrap();
-            let state = ActorStateLanes { linear: Some(image.inline().to_vec()), ..Default::default() };
-            let ActorRunOutcome::Completed { reply, state: next, rows } = run_inner_actor_with_storage(
-                &call, Some(context), &program, Some(&config), &state, None, Some(&reader),
-            ).unwrap() else { panic!("node mutation yielded"); };
-            std::eprintln!("Authority node phase={phase} status={:?} gas_remaining={} rows={}", reply.status, reply.gas_remaining, rows.len());
+            let state = ActorStateLanes {
+                linear: Some(image.inline().to_vec()),
+                ..Default::default()
+            };
+            let ActorRunOutcome::Completed {
+                reply,
+                state: next,
+                rows,
+            } = run_inner_actor_with_storage(
+                &call,
+                Some(context),
+                &program,
+                Some(&config),
+                &state,
+                None,
+                Some(&reader),
+            )
+            .unwrap()
+            else {
+                panic!("node mutation yielded");
+            };
+            std::eprintln!(
+                "Authority node phase={phase} status={:?} gas_remaining={} rows={}",
+                reply.status,
+                reply.gas_remaining,
+                rows.len()
+            );
             assert_eq!(reply.status, ActorExecutionStatus::Done);
-            assert_eq!(Value::decode(&reply.reply), Value::Bytes(expected_reply.map(&read).unwrap_or_default()));
-            assert_eq!(!rows.is_empty(), mutation, "retry/refusal must not export rows");
-            if phase == 4 { assert!(rows.iter().any(|(_, value)| value.is_none()), "removal must export a tombstone"); }
-            access.apply_batch(crate::agent_sdk::StateLane::Linear, &mut image, next.linear.unwrap(), rows).unwrap();
+            assert_eq!(
+                Value::decode(&reply.reply),
+                Value::Bytes(expected_reply.map(&read).unwrap_or_default())
+            );
+            assert_eq!(
+                !rows.is_empty(),
+                mutation,
+                "retry/refusal must not export rows"
+            );
+            if phase == 4 {
+                assert!(
+                    rows.iter().any(|(_, value)| value.is_none()),
+                    "removal must export a tombstone"
+                );
+            }
+            access
+                .apply_batch(
+                    crate::agent_sdk::StateLane::Linear,
+                    &mut image,
+                    next.linear.unwrap(),
+                    rows,
+                )
+                .unwrap();
             // Reconstruct both inline state and rows before each subsequent
             // slice; compare the full image, including untouched bootstrap data.
             image = ActorLaneImage::decode(&image.encode().unwrap()).unwrap();
@@ -1991,7 +2316,10 @@ mod tests {
                 read(&format!("{expected_state}-linear")),
                 Decode::decode(&read(&format!("{expected_state}-rows"))),
             );
-            assert!(image.encode().unwrap() == expected.encode().unwrap(), "phase {phase}: native/guest row image differs");
+            assert!(
+                image.encode().unwrap() == expected.encode().unwrap(),
+                "phase {phase}: native/guest row image differs"
+            );
         }
     }
 
@@ -2004,12 +2332,16 @@ mod tests {
         let elf = std::fs::read(path).expect("read Authority ELF");
         let schema_bytes = super::super::schema::raw_section_from_elf(&elf)
             .expect("Authority must publish its signed clean schema");
-        let schema = crate::agent_sdk::schema::decode(&schema_bytes)
-            .expect("decode Authority clean schema");
-        let storage = schema.fields.iter().filter_map(|field| match field {
-            crate::agent_sdk::schema::ParsedField::Storage(field) => Some(field),
-            _ => None,
-        }).collect::<Vec<_>>();
+        let schema =
+            crate::agent_sdk::schema::decode(&schema_bytes).expect("decode Authority clean schema");
+        let storage = schema
+            .fields
+            .iter()
+            .filter_map(|field| match field {
+                crate::agent_sdk::schema::ParsedField::Storage(field) => Some(field),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         assert_eq!(storage.len(), 1);
         assert_eq!(storage[0].name, "node_certificates");
         assert_eq!(storage[0].prefix, b"s/authority-nodes/");
@@ -2017,8 +2349,10 @@ mod tests {
         assert!(!storage[0].committed);
         let program = vos_pvm_compiler::link_elf_spi(&elf).expect("link Authority ELF");
         std::eprintln!("Authority candidate PVM bytes={}", program.len());
-        assert!(program.len() <= MAX_EXECUTION_PROGRAM_BYTES,
-            "Authority program exceeds the inner actor admission bound");
+        assert!(
+            program.len() <= MAX_EXECUTION_PROGRAM_BYTES,
+            "Authority program exceeds the inner actor admission bound"
+        );
         super::super::machine::ActorMachine::load(&program, &[])
             .expect("Authority candidate must load in the real inner machine");
         // Loading is not execution or package/release qualification. The full
@@ -2030,42 +2364,73 @@ mod tests {
     #[test]
     fn inner_storage_reads_are_scoped_bounded_and_preserve_state() {
         use super::super::actor_storage::{ActorLaneImage, ActorStorageAccess, ActorStorageReader};
-        use crate::agent_sdk::schema::{ConstructorContract, ParsedField, ParsedMethod, ParsedSchema, ParsedStorageField};
+        use crate::agent_sdk::schema::{
+            ConstructorContract, ParsedField, ParsedMethod, ParsedSchema, ParsedStorageField,
+        };
         use crate::agent_sdk::{MethodMode as CleanMode, StateLane as CleanLane};
         use vos_pvm_compiler::assembler::{Assembler, Reg};
 
         let schema = ParsedSchema {
             constructor: ConstructorContract::Forbidden,
-            fields: [CleanLane::Linear, CleanLane::Local].into_iter().enumerate().map(|(index, lane)| {
-                ParsedField::Storage(ParsedStorageField {
-                    source_index: index as u16, name: alloc::format!("rows_{index}"),
-                    type_identity: "test::StorageMap<u32,u64>".into(),
-                    prefix: alloc::format!("s/{index}/").into_bytes(), lane,
-                    committed: false, leaf_domain: None, node_domain: None,
+            fields: [CleanLane::Linear, CleanLane::Local]
+                .into_iter()
+                .enumerate()
+                .map(|(index, lane)| {
+                    ParsedField::Storage(ParsedStorageField {
+                        source_index: index as u16,
+                        name: alloc::format!("rows_{index}"),
+                        type_identity: "test::StorageMap<u32,u64>".into(),
+                        prefix: alloc::format!("s/{index}/").into_bytes(),
+                        lane,
+                        committed: false,
+                        leaf_domain: None,
+                        node_domain: None,
+                    })
                 })
-            }).collect(),
+                .collect(),
             methods: vec![ParsedMethod {
-                source_index: 0, name: "read".into(), mode: CleanMode::Linear, explicit: true,
+                source_index: 0,
+                name: "read".into(),
+                mode: CleanMode::Linear,
+                explicit: true,
             }],
         };
         let access = ActorStorageAccess::new(&schema, "read", CleanMode::Linear).unwrap();
         let mut image = ActorLaneImage::default();
         let max_row = crate::actors::storage::MAX_VALUE_BYTES;
-        access.write(CleanLane::Linear, &mut image, b"s/0/value".to_vec(), Some(vec![0x71; max_row])).unwrap();
-        access.write(CleanLane::Linear, &mut image, b"s/0/empty".to_vec(), Some(Vec::new())).unwrap();
+        access
+            .write(
+                CleanLane::Linear,
+                &mut image,
+                b"s/0/value".to_vec(),
+                Some(vec![0x71; max_row]),
+            )
+            .unwrap();
+        access
+            .write(
+                CleanLane::Linear,
+                &mut image,
+                b"s/0/empty".to_vec(),
+                Some(Vec::new()),
+            )
+            .unwrap();
         let reader = ActorStorageReader::new(&access, Some(&image), None, None).unwrap();
         let before_image = image.encode().unwrap();
         let mut call = invocation();
         call.gas = 100_000;
         let context = crate::agent_sdk::InvocationContext {
             invocation: crate::agent_sdk::InvocationId(call.invocation.0),
-            actor: crate::agent_sdk::ActorId(call.actor.0), mode: CleanMode::Linear,
+            actor: crate::agent_sdk::ActorId(call.actor.0),
+            mode: CleanMode::Linear,
             origin: crate::agent_sdk::InvocationOrigin::anonymous(),
-            roles: crate::agent_sdk::InvocationRoleClaims::none(), observed_slot: 1,
+            roles: crate::agent_sdk::InvocationRoleClaims::none(),
+            observed_slot: 1,
         };
         // The raw return frame represents empty lanes as present-empty.
         let state = ActorStateLanes {
-            linear: Some(Vec::new()), merge: Some(Vec::new()), local: Some(Vec::new()),
+            linear: Some(Vec::new()),
+            merge: Some(Vec::new()),
+            local: Some(Vec::new()),
         };
         let base = 2 * vos_pvm::PVM_ZONE_SIZE;
         for (key, capacity, repeats, expected) in [
@@ -2073,13 +2438,28 @@ mod tests {
             (b"s/0/value".as_slice(), 8, 1, Some(max_row as u64)),
             (b"s/0/value".as_slice(), 0, 1, Some(max_row as u64)),
             (b"s/0/empty".as_slice(), 8, 1, Some(0)),
-            (b"s/0/missing".as_slice(), 8, 1, Some(crate::abi::error::HOST_NONE)),
+            (
+                b"s/0/missing".as_slice(),
+                8,
+                1,
+                Some(crate::abi::error::HOST_NONE),
+            ),
             (b"s/1/missing".as_slice(), 8, 1, None),
             (b"other/value".as_slice(), 8, 1, None),
             (b"".as_slice(), 8, 1, None),
             (b"s/0/value".as_slice(), max_row + 1, 1, None),
-            (b"s/0/value".as_slice(), max_row, MAX_EXECUTION_FETCH_BYTES / max_row + 1, Some(0)),
-            (b"s/0/missing".as_slice(), 0, MAX_EXECUTION_FETCH_CALLS + 1, Some(0)),
+            (
+                b"s/0/value".as_slice(),
+                max_row,
+                MAX_EXECUTION_FETCH_BYTES / max_row + 1,
+                Some(0),
+            ),
+            (
+                b"s/0/missing".as_slice(),
+                0,
+                MAX_EXECUTION_FETCH_CALLS + 1,
+                Some(0),
+            ),
         ] {
             let mut data = actor_output([0, 0, 0], 16);
             data.extend_from_slice(key);
@@ -2088,28 +2468,55 @@ mod tests {
             let mut program = Assembler::new();
             program.set_rw_data(data);
             for _ in 0..repeats {
-                program.load_imm_64(Reg::A0, u64::from(base + 29))
+                program
+                    .load_imm_64(Reg::A0, u64::from(base + 29))
                     .load_imm_64(Reg::A1, key.len() as u64)
                     .load_imm_64(Reg::A2, u64::from(buffer))
                     .load_imm_64(Reg::A3, capacity as u64)
                     .ecalli(crate::abi::hostcall::STORAGE_R)
                     .store_u64(Reg::A0, base + 13);
             }
-            program.load_imm_64(Reg::A0, u64::from(buffer))
-                .load_ind_u64(Reg::A1, Reg::A0, 0).store_u64(Reg::A1, base + 21)
-                .load_imm_64(Reg::A0, u64::from(base)).load_imm_64(Reg::A1, 29)
+            program
+                .load_imm_64(Reg::A0, u64::from(buffer))
+                .load_ind_u64(Reg::A1, Reg::A0, 0)
+                .store_u64(Reg::A1, base + 21)
+                .load_imm_64(Reg::A0, u64::from(base))
+                .load_imm_64(Reg::A1, 29)
                 .jump_ind(Reg::RA, 0);
             let program = program.build_standard();
-            let outcome = run_inner_actor_with_storage(&call, Some(context), &program, None, &state, None, Some(&reader));
+            let outcome = run_inner_actor_with_storage(
+                &call,
+                Some(context),
+                &program,
+                None,
+                &state,
+                None,
+                Some(&reader),
+            );
             if let Some(expected) = expected {
-                let ActorRunOutcome::Completed { reply, state: next, .. } = outcome.unwrap() else { panic!("read yielded") };
+                let ActorRunOutcome::Completed {
+                    reply, state: next, ..
+                } = outcome.unwrap()
+                else {
+                    panic!("read yielded")
+                };
                 assert_eq!(next, state);
                 if repeats > 1 {
                     assert_eq!(reply.status, ActorExecutionStatus::OutOfGas);
                 } else {
                     assert_eq!(reply.status, ActorExecutionStatus::Done);
-                    assert_eq!(u64::from_le_bytes(reply.reply[..8].try_into().unwrap()), expected);
-                    assert_eq!(&reply.reply[8..], &[if key == b"s/0/value" && capacity >= 8 { 0x71 } else { 0 }; 8]);
+                    assert_eq!(
+                        u64::from_le_bytes(reply.reply[..8].try_into().unwrap()),
+                        expected
+                    );
+                    assert_eq!(
+                        &reply.reply[8..],
+                        &[if key == b"s/0/value" && capacity >= 8 {
+                            0x71
+                        } else {
+                            0
+                        }; 8]
+                    );
                 }
             } else {
                 assert_eq!(outcome, Err(ActorExecutionError::InvalidInput));
@@ -2117,10 +2524,20 @@ mod tests {
             assert_eq!(image.encode().unwrap(), before_image);
             assert_eq!(
                 run_inner_actor(&call, Some(context), &program, None, &state, None),
-                Err(ActorExecutionError::UnsupportedHostCall(u64::from(crate::abi::hostcall::STORAGE_R)))
+                Err(ActorExecutionError::UnsupportedHostCall(u64::from(
+                    crate::abi::hostcall::STORAGE_R
+                )))
             );
             assert_eq!(
-                run_inner_actor_with_storage(&call, None, &program, None, &state, None, Some(&reader)),
+                run_inner_actor_with_storage(
+                    &call,
+                    None,
+                    &program,
+                    None,
+                    &state,
+                    None,
+                    Some(&reader)
+                ),
                 Err(ActorExecutionError::InvalidInput)
             );
         }
@@ -2129,8 +2546,10 @@ mod tests {
         // Exhaust the configured byte budget across real slice boundaries.
         let successful_reads = (MAX_EXECUTION_FETCH_BYTES / (b"s/0/value".len() + max_row)) as u32;
         let finish = |program: &mut Assembler| {
-            program.load_imm_64(Reg::A0, u64::from(base))
-                .load_imm_64(Reg::A1, 13).jump_ind(Reg::RA, 0);
+            program
+                .load_imm_64(Reg::A0, u64::from(base))
+                .load_imm_64(Reg::A1, 13)
+                .jump_ind(Reg::RA, 0);
         };
         let mut prefix = Assembler::new();
         prefix.jump(0);
@@ -2148,7 +2567,8 @@ mod tests {
         finish(&mut program);
         assert_eq!(program.current_offset(), entry_pc);
         for phase in 0..=successful_reads {
-            program.load_imm_64(Reg::A0, u64::from(base + 13))
+            program
+                .load_imm_64(Reg::A0, u64::from(base + 13))
                 .load_imm_64(Reg::A1, key.len() as u64)
                 .load_imm_64(Reg::A2, u64::from(buffer))
                 .load_imm_64(Reg::A3, max_row as u64)
@@ -2164,17 +2584,37 @@ mod tests {
         let mut state = state;
         let mut saved = None;
         for phase in 0..=successful_reads {
-            match run_inner_actor_with_storage(&call, Some(context), &program, None, &state, saved.take(), Some(&reader)).unwrap() {
-                ActorRunOutcome::Yielded { reply, state: next, continuation, .. } => {
+            match run_inner_actor_with_storage(
+                &call,
+                Some(context),
+                &program,
+                None,
+                &state,
+                saved.take(),
+                Some(&reader),
+            )
+            .unwrap()
+            {
+                ActorRunOutcome::Yielded {
+                    reply,
+                    state: next,
+                    continuation,
+                    ..
+                } => {
                     assert!(phase < successful_reads);
                     assert_eq!(reply.status, ActorExecutionStatus::Yielded);
                     assert_eq!(continuation.host_budget.fetch_calls, phase + 1);
-                    assert_eq!(continuation.host_budget.fetch_bytes as usize, (phase as usize + 1) * (key.len() + max_row));
+                    assert_eq!(
+                        continuation.host_budget.fetch_bytes as usize,
+                        (phase as usize + 1) * (key.len() + max_row)
+                    );
                     assert!(continuation.validate());
                     state = next;
                     saved = Some(continuation);
                 }
-                ActorRunOutcome::Completed { reply, state: next, .. } => {
+                ActorRunOutcome::Completed {
+                    reply, state: next, ..
+                } => {
                     assert_eq!(phase, successful_reads);
                     assert_eq!(reply.status, ActorExecutionStatus::OutOfGas);
                     assert_eq!(next, state);
@@ -2188,66 +2628,138 @@ mod tests {
     #[test]
     #[ignore = "requires AGENT_STORAGE_PROBE_ELF built from current agent-yield fixture"]
     fn compiled_storage_map_reads_writes_and_resumes_clean_slices() {
-        use crate::actors::codec::{Decode, Encode};
-        use crate::actors::value::{Msg, Value, TAG_DYNAMIC};
         use super::super::actor_storage::{ActorLaneImage, ActorStorageAccess, ActorStorageReader};
-        use crate::agent_sdk::schema::{ConstructorContract, ParsedField, ParsedMethod, ParsedSchema, ParsedStorageField};
+        use crate::actors::codec::{Decode, Encode};
+        use crate::actors::value::{Msg, TAG_DYNAMIC, Value};
+        use crate::agent_sdk::schema::{
+            ConstructorContract, ParsedField, ParsedMethod, ParsedSchema, ParsedStorageField,
+        };
         use crate::agent_sdk::{MethodMode as Mode, StateLane as Lane};
-        let elf = std::fs::read(std::env::var("AGENT_STORAGE_PROBE_ELF").expect("set fixture ELF")).unwrap();
+        let elf = std::fs::read(std::env::var("AGENT_STORAGE_PROBE_ELF").expect("set fixture ELF"))
+            .unwrap();
         let program = vos_pvm_compiler::link_elf_spi(&elf).unwrap();
         // Explicit fixture scope for this inner-machine behavior test; package
         // signature/schema admission is covered separately at runtime dispatch.
         let schema = ParsedSchema {
             constructor: ConstructorContract::Forbidden,
             fields: vec![ParsedField::Storage(ParsedStorageField {
-                source_index: 0, name: "rows".into(), type_identity: "test::StorageMap<u64,u64>".into(),
-                prefix: b"s/rows/".to_vec(), lane: Lane::Local, committed: false, leaf_domain: None, node_domain: None,
+                source_index: 0,
+                name: "rows".into(),
+                type_identity: "test::StorageMap<u64,u64>".into(),
+                prefix: b"s/rows/".to_vec(),
+                lane: Lane::Local,
+                committed: false,
+                leaf_domain: None,
+                node_domain: None,
             })],
-            methods: [("row_set", Mode::Local), ("row_get", Mode::LocalQuery), ("row_yield", Mode::Local), ("row_rejected", Mode::Local)]
-                .into_iter().enumerate().map(|(index, (name, mode))| ParsedMethod {
-                    source_index: index as u16, name: name.into(), mode, explicit: true,
-                }).collect(),
+            methods: [
+                ("row_set", Mode::Local),
+                ("row_get", Mode::LocalQuery),
+                ("row_yield", Mode::Local),
+                ("row_rejected", Mode::Local),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, mode))| ParsedMethod {
+                source_index: index as u16,
+                name: name.into(),
+                mode,
+                explicit: true,
+            })
+            .collect(),
         };
         let mut image = ActorLaneImage::default();
         for (step, (method, key, value, expected)) in [
-            ("row_set", 7, Some(41), 41), ("row_rejected", 7, None, 41),
-            ("row_get", 7, None, 41), ("row_rejected", 9, None, u64::MAX),
+            ("row_set", 7, Some(41), 41),
+            ("row_rejected", 7, None, 41),
+            ("row_get", 7, None, 41),
+            ("row_rejected", 9, None, u64::MAX),
             ("row_get", 9, None, u64::MAX),
-            ("row_yield", 8, None, 2), ("row_get", 8, None, 2),
-        ].into_iter().enumerate() {
+            ("row_yield", 8, None, 2),
+            ("row_get", 8, None, 2),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             image = ActorLaneImage::decode(&image.encode().unwrap()).unwrap();
-            let mode = if method == "row_get" { Mode::LocalQuery } else { Mode::Local };
+            let mode = if method == "row_get" {
+                Mode::LocalQuery
+            } else {
+                Mode::Local
+            };
             let access = ActorStorageAccess::new(&schema, method, mode).unwrap();
-            let mut call = invocation(); call.invocation.0[0] = step as u8 + 1;
-            call.mode = if method == "row_get" { MethodMode::LocalQuery } else { MethodMode::Local };
+            let mut call = invocation();
+            call.invocation.0[0] = step as u8 + 1;
+            call.mode = if method == "row_get" {
+                MethodMode::LocalQuery
+            } else {
+                MethodMode::Local
+            };
             call.gas = 100_000_000;
             let mut message = Msg::new(method).with("key", Value::U64(key));
-            if let Some(value) = value { message = message.with("value", Value::U64(value)); }
-            call.message = vec![TAG_DYNAMIC]; call.message.extend(message.encode());
+            if let Some(value) = value {
+                message = message.with("value", Value::U64(value));
+            }
+            call.message = vec![TAG_DYNAMIC];
+            call.message.extend(message.encode());
             let context = crate::agent_sdk::InvocationContext {
-                invocation: crate::agent_sdk::InvocationId(call.invocation.0), actor: crate::agent_sdk::ActorId(call.actor.0),
-                mode, origin: crate::agent_sdk::InvocationOrigin::anonymous(), roles: crate::agent_sdk::InvocationRoleClaims::none(), observed_slot: 1,
+                invocation: crate::agent_sdk::InvocationId(call.invocation.0),
+                actor: crate::agent_sdk::ActorId(call.actor.0),
+                mode,
+                origin: crate::agent_sdk::InvocationOrigin::anonymous(),
+                roles: crate::agent_sdk::InvocationRoleClaims::none(),
+                observed_slot: 1,
             };
             let mut saved = None;
             let mut yields = 0;
             loop {
-                let state = ActorStateLanes { local: Some(image.inline().to_vec()), ..Default::default() };
+                let state = ActorStateLanes {
+                    local: Some(image.inline().to_vec()),
+                    ..Default::default()
+                };
                 let reader = ActorStorageReader::new(&access, None, None, Some(&image)).unwrap();
-                let outcome = run_inner_actor_with_storage(&call, Some(context), &program, None, &state, saved.take(), Some(&reader)).unwrap();
+                let outcome = run_inner_actor_with_storage(
+                    &call,
+                    Some(context),
+                    &program,
+                    None,
+                    &state,
+                    saved.take(),
+                    Some(&reader),
+                )
+                .unwrap();
                 match outcome {
-                    ActorRunOutcome::Yielded { state: next, rows, continuation, .. } => {
-                        yields += 1; assert_eq!(yields, 1); assert_eq!(method, "row_yield");
+                    ActorRunOutcome::Yielded {
+                        state: next,
+                        rows,
+                        continuation,
+                        ..
+                    } => {
+                        yields += 1;
+                        assert_eq!(yields, 1);
+                        assert_eq!(method, "row_yield");
                         assert!(!rows.is_empty());
-                        access.apply_batch(Lane::Local, &mut image, next.local.unwrap(), rows).unwrap();
+                        access
+                            .apply_batch(Lane::Local, &mut image, next.local.unwrap(), rows)
+                            .unwrap();
                         image = ActorLaneImage::decode(&image.encode().unwrap()).unwrap();
                         saved = Some(continuation);
                     }
-                    ActorRunOutcome::Completed { reply, state: next, rows } => {
+                    ActorRunOutcome::Completed {
+                        reply,
+                        state: next,
+                        rows,
+                    } => {
                         assert_eq!(reply.status, ActorExecutionStatus::Done, "{method}");
                         assert_eq!(Value::decode(&reply.reply), Value::U64(expected));
                         if method == "row_get" || method == "row_rejected" {
-                            assert!(rows.is_empty()); assert_eq!(next.local.as_deref(), Some(image.inline()));
-                        } else { access.apply_batch(Lane::Local, &mut image, next.local.unwrap(), rows).unwrap(); }
+                            assert!(rows.is_empty());
+                            assert_eq!(next.local.as_deref(), Some(image.inline()));
+                        } else {
+                            access
+                                .apply_batch(Lane::Local, &mut image, next.local.unwrap(), rows)
+                                .unwrap();
+                        }
                         assert_eq!(yields, usize::from(method == "row_yield"));
                         break;
                     }
@@ -2259,51 +2771,112 @@ mod tests {
     #[cfg(feature = "pvm")]
     #[test]
     fn row_export_rejects_duplicate_exports_and_suspend_after_export() {
-        use super::super::actor_storage::{ActorStorageAccess, ActorStorageReader, encode_row_delta};
-        use crate::agent_sdk::schema::{ConstructorContract, ParsedField, ParsedMethod, ParsedSchema, ParsedStorageField};
+        use super::super::actor_storage::{
+            ActorStorageAccess, ActorStorageReader, encode_row_delta,
+        };
+        use crate::agent_sdk::schema::{
+            ConstructorContract, ParsedField, ParsedMethod, ParsedSchema, ParsedStorageField,
+        };
         use crate::agent_sdk::{MethodMode as Mode, StateLane as Lane};
         use vos_pvm_compiler::assembler::{Assembler, Reg};
         let schema = ParsedSchema {
             constructor: ConstructorContract::Forbidden,
             fields: vec![ParsedField::Storage(ParsedStorageField {
-                source_index: 0, name: "rows".into(), type_identity: "test::StorageMap<u32,u64>".into(),
-                prefix: b"rows/".to_vec(), lane: Lane::Linear, committed: false, leaf_domain: None, node_domain: None,
+                source_index: 0,
+                name: "rows".into(),
+                type_identity: "test::StorageMap<u32,u64>".into(),
+                prefix: b"rows/".to_vec(),
+                lane: Lane::Linear,
+                committed: false,
+                leaf_domain: None,
+                node_domain: None,
             })],
-            methods: vec![ParsedMethod { source_index: 0, name: "write".into(), mode: Mode::Linear, explicit: true }],
+            methods: vec![ParsedMethod {
+                source_index: 0,
+                name: "write".into(),
+                mode: Mode::Linear,
+                explicit: true,
+            }],
         };
         let access = ActorStorageAccess::new(&schema, "write", Mode::Linear).unwrap();
         let reader = ActorStorageReader::new(&access, None, None, None).unwrap();
-        let mut call = invocation(); call.gas = 100_000;
+        let mut call = invocation();
+        call.gas = 100_000;
         let context = crate::agent_sdk::InvocationContext {
-            invocation: crate::agent_sdk::InvocationId(call.invocation.0), actor: crate::agent_sdk::ActorId(call.actor.0),
-            mode: Mode::Linear, origin: crate::agent_sdk::InvocationOrigin::anonymous(),
-            roles: crate::agent_sdk::InvocationRoleClaims::none(), observed_slot: 1,
+            invocation: crate::agent_sdk::InvocationId(call.invocation.0),
+            actor: crate::agent_sdk::ActorId(call.actor.0),
+            mode: Mode::Linear,
+            origin: crate::agent_sdk::InvocationOrigin::anonymous(),
+            roles: crate::agent_sdk::InvocationRoleClaims::none(),
+            observed_slot: 1,
         };
         let state = ActorStateLanes::default();
         let base = 2 * vos_pvm::PVM_ZONE_SIZE;
         for case in 0..5 {
             let changes = if case == 4 {
-                (0..=MAX_EXECUTION_FETCH_BYTES / (2 * 64 * 1024)).map(|index| {
-                    (alloc::format!("rows/{index:04}").into_bytes(), Some(vec![1; 64 * 1024]))
-                }).collect()
-            } else { vec![(if case == 2 { b"other/a".to_vec() } else { b"rows/a".to_vec() }, Some(vec![1]))] };
+                (0..=MAX_EXECUTION_FETCH_BYTES / (2 * 64 * 1024))
+                    .map(|index| {
+                        (
+                            alloc::format!("rows/{index:04}").into_bytes(),
+                            Some(vec![1; 64 * 1024]),
+                        )
+                    })
+                    .collect()
+            } else {
+                vec![(
+                    if case == 2 {
+                        b"other/a".to_vec()
+                    } else {
+                        b"rows/a".to_vec()
+                    },
+                    Some(vec![1]),
+                )]
+            };
             let mut delta = encode_row_delta(&changes).unwrap();
-            if case == 3 { delta[0] ^= 1; }
+            if case == 3 {
+                delta[0] ^= 1;
+            }
             let mut data = actor_output([0, 0, 0], 0);
             data.extend_from_slice(&delta);
-            let mut program = Assembler::new(); program.set_rw_data(data);
+            let mut program = Assembler::new();
+            program.set_rw_data(data);
             for _ in 0..if case == 0 { 2 } else { 1 } {
-                program.load_imm_64(Reg::A0, u64::from(base + 13)).load_imm_64(Reg::A1, delta.len() as u64)
+                program
+                    .load_imm_64(Reg::A0, u64::from(base + 13))
+                    .load_imm_64(Reg::A1, delta.len() as u64)
                     .ecalli(crate::abi::hostcall::ACTOR_EFFECT_EXPORT);
             }
-            if case == 1 { program.ecalli(crate::abi::hostcall::SUSPEND); }
-            program.load_imm_64(Reg::A0, u64::from(base)).load_imm_64(Reg::A1, 13).jump_ind(Reg::RA, 0);
-            let outcome = run_inner_actor_with_storage(&call, Some(context), &program.build_standard(), None, &state, None, Some(&reader));
+            if case == 1 {
+                program.ecalli(crate::abi::hostcall::SUSPEND);
+            }
+            program
+                .load_imm_64(Reg::A0, u64::from(base))
+                .load_imm_64(Reg::A1, 13)
+                .jump_ind(Reg::RA, 0);
+            let outcome = run_inner_actor_with_storage(
+                &call,
+                Some(context),
+                &program.build_standard(),
+                None,
+                &state,
+                None,
+                Some(&reader),
+            );
             if case == 4 {
-                let ActorRunOutcome::Completed { reply, state: next, rows } = outcome.unwrap() else { panic!("oversized export yielded") };
+                let ActorRunOutcome::Completed {
+                    reply,
+                    state: next,
+                    rows,
+                } = outcome.unwrap()
+                else {
+                    panic!("oversized export yielded")
+                };
                 assert_eq!(reply.status, ActorExecutionStatus::OutOfGas);
-                assert_eq!(next, state); assert!(rows.is_empty());
-            } else { assert_eq!(outcome, Err(ActorExecutionError::InvalidActorOutput)); }
+                assert_eq!(next, state);
+                assert!(rows.is_empty());
+            } else {
+                assert_eq!(outcome, Err(ActorExecutionError::InvalidActorOutput));
+            }
         }
     }
 
@@ -2315,8 +2888,10 @@ mod tests {
         let reference = BlobRef::of_bytes(&bytes);
         let base = 2 * u64::from(vos_pvm::PVM_ZONE_SIZE);
         let finish = |program: &mut Assembler| {
-            program.load_imm_64(Reg::A0, base)
-                .load_imm_64(Reg::A1, 13).jump_ind(Reg::RA, 0);
+            program
+                .load_imm_64(Reg::A0, base)
+                .load_imm_64(Reg::A1, 13)
+                .jump_ind(Reg::RA, 0);
         };
         let mut prefix = Assembler::new();
         prefix.jump(0);
@@ -2332,7 +2907,8 @@ mod tests {
         finish(&mut program);
         assert_eq!(program.current_offset(), entry_pc);
         for phase in 0..3 {
-            program.load_imm_64(Reg::A0, base + 13)
+            program
+                .load_imm_64(Reg::A0, base + 13)
                 .load_imm_64(Reg::A1, base + 45)
                 .load_imm_64(Reg::A2, bytes.len() as u64)
                 .ecalli(crate::abi::hostcall::PREIMAGE_LOOKUP);
@@ -2354,23 +2930,35 @@ mod tests {
             actor: crate::agent_sdk::ActorId(call.actor.0),
             mode: crate::agent_sdk::MethodMode::Linear,
             origin: crate::agent_sdk::InvocationOrigin::anonymous(),
-            roles: crate::agent_sdk::InvocationRoleClaims::none(), observed_slot: 1,
+            roles: crate::agent_sdk::InvocationRoleClaims::none(),
+            observed_slot: 1,
         };
         let mut state = ActorStateLanes::default();
         let mut saved = None;
         for phase in 0..3 {
-            match run_inner_actor(&call, Some(context), &program, None, &state, saved.take()).unwrap() {
-                ActorRunOutcome::Yielded { reply, state: next, continuation, .. } => {
+            match run_inner_actor(&call, Some(context), &program, None, &state, saved.take())
+                .unwrap()
+            {
+                ActorRunOutcome::Yielded {
+                    reply,
+                    state: next,
+                    continuation,
+                    ..
+                } => {
                     assert!(phase < 2);
                     assert_eq!(reply.status, ActorExecutionStatus::Yielded);
                     assert_eq!(continuation.host_budget.fetch_calls, phase + 1);
-                    assert_eq!(continuation.host_budget.fetch_bytes as usize,
-                        (phase as usize + 1) * (32 + 2 * call.availability[0].bytes.len()));
+                    assert_eq!(
+                        continuation.host_budget.fetch_bytes as usize,
+                        (phase as usize + 1) * (32 + 2 * call.availability[0].bytes.len())
+                    );
                     assert!(continuation.validate());
                     state = next;
                     saved = Some(continuation);
                 }
-                ActorRunOutcome::Completed { reply, state: next, .. } => {
+                ActorRunOutcome::Completed {
+                    reply, state: next, ..
+                } => {
                     assert_eq!(phase, 2);
                     assert_eq!(reply.status, ActorExecutionStatus::OutOfGas);
                     assert_eq!(next, state);
@@ -2387,7 +2975,10 @@ mod tests {
         let reference = BlobRef::of_bytes(&bytes);
         let mut call = invocation();
         call.gas = 100_000;
-        call.availability.push(RuntimeBlob { reference: reference.clone(), bytes: bytes.clone() });
+        call.availability.push(RuntimeBlob {
+            reference: reference.clone(),
+            bytes: bytes.clone(),
+        });
         call.validate().unwrap();
         let state = ActorStateLanes::default();
         let base = 2 * vos_pvm::PVM_ZONE_SIZE;
@@ -2398,14 +2989,17 @@ mod tests {
             (true, bytes.len(), 3, 0),
         ] {
             let mut input = call.clone();
-            if !available { input.availability.clear(); }
+            if !available {
+                input.availability.clear();
+            }
             let mut output = actor_output([0, 0, 0], 16);
             output.extend_from_slice(&reference.hash.0);
             output.resize(61 + bytes.len(), 0);
             let mut program = Assembler::new();
             program.set_rw_data(output);
             for _ in 0..repeats {
-                program.load_imm_64(Reg::A0, u64::from(base + 29))
+                program
+                    .load_imm_64(Reg::A0, u64::from(base + 29))
                     .load_imm_64(Reg::A1, u64::from(base + 61))
                     .load_imm_64(Reg::A2, capacity as u64)
                     .ecalli(crate::abi::hostcall::PREIMAGE_LOOKUP)
@@ -2413,21 +3007,36 @@ mod tests {
             }
             // Return the lookup result and first copied payload word.
             program.load_imm_64(Reg::A0, u64::from(base + 61));
-            program.load_ind_u64(Reg::A1, Reg::A0, 0)
+            program
+                .load_ind_u64(Reg::A1, Reg::A0, 0)
                 .store_u64(Reg::A1, base + 21)
                 .load_imm_64(Reg::A0, u64::from(base))
                 .load_imm_64(Reg::A1, 29)
                 .jump_ind(Reg::RA, 0);
-            let ActorRunOutcome::Completed { reply, state: next, .. } =
-                run_inner_actor(&input, None, &program.build_standard(), None, &state, None).unwrap()
-                else { panic!("lookup yielded") };
+            let ActorRunOutcome::Completed {
+                reply, state: next, ..
+            } = run_inner_actor(&input, None, &program.build_standard(), None, &state, None)
+                .unwrap()
+            else {
+                panic!("lookup yielded")
+            };
             if repeats == 3 {
                 assert_eq!(reply.status, ActorExecutionStatus::OutOfGas);
                 assert_eq!(next, state);
             } else {
                 assert_eq!(reply.status, ActorExecutionStatus::Done);
-                assert_eq!(u64::from_le_bytes(reply.reply[..8].try_into().unwrap()), expected);
-                assert_eq!(&reply.reply[8..], &[if available && capacity == bytes.len() { 0x61 } else { 0 }; 8]);
+                assert_eq!(
+                    u64::from_le_bytes(reply.reply[..8].try_into().unwrap()),
+                    expected
+                );
+                assert_eq!(
+                    &reply.reply[8..],
+                    &[if available && capacity == bytes.len() {
+                        0x61
+                    } else {
+                        0
+                    }; 8]
+                );
             }
         }
     }
@@ -2437,7 +3046,7 @@ mod tests {
     #[ignore = "requires AGENT_INPUT_PROBE_ELF built from the agent-yield fixture"]
     fn compiled_clean_guest_accepts_maximum_encoded_input() {
         use crate::actors::codec::{Decode, Encode};
-        use crate::actors::value::{Msg, Value, TAG_DYNAMIC};
+        use crate::actors::value::{Msg, TAG_DYNAMIC, Value};
 
         let path = std::env::var("AGENT_INPUT_PROBE_ELF")
             .expect("set AGENT_INPUT_PROBE_ELF to the freshly built agent-yield ELF");
@@ -2445,13 +3054,19 @@ mod tests {
         let program = vos_pvm_compiler::link_elf_spi(&elf).expect("link fixture ELF");
         let message = |len| {
             let mut bytes = vec![TAG_DYNAMIC];
-            bytes.extend(Msg::new("input_len").with("bytes", Value::Bytes(vec![0x5a; len])).encode());
+            bytes.extend(
+                Msg::new("input_len")
+                    .with("bytes", Value::Bytes(vec![0x5a; len]))
+                    .encode(),
+            );
             bytes
         };
         // Archive alignment means not every total byte length is expressible.
         // Use the largest real message below the limit, without synthetic padding.
-        let payload_len = (0..=MAX_EXECUTION_MESSAGE_BYTES).rev()
-            .find(|len| message(*len).len() <= MAX_EXECUTION_MESSAGE_BYTES).unwrap();
+        let payload_len = (0..=MAX_EXECUTION_MESSAGE_BYTES)
+            .rev()
+            .find(|len| message(*len).len() <= MAX_EXECUTION_MESSAGE_BYTES)
+            .unwrap();
         let mut call = invocation();
         call.mode = MethodMode::LocalQuery;
         call.gas = 100_000_000;
@@ -2464,24 +3079,37 @@ mod tests {
                 ..crate::agent_sdk::InvocationOrigin::anonymous()
             },
             roles: crate::agent_sdk::InvocationRoleClaims {
-                space: None, actor: Some(crate::agent_sdk::RoleId([0x51; 32])),
+                space: None,
+                actor: Some(crate::agent_sdk::RoleId([0x51; 32])),
             },
             observed_slot: 1,
         };
         assert!(context.validate());
-        let mut state = ActorStateLanes { local: Some(Vec::new()), ..Default::default() };
+        let mut state = ActorStateLanes {
+            local: Some(Vec::new()),
+            ..Default::default()
+        };
         for len in [0, payload_len] {
             call.message = message(len);
             call.validate().unwrap();
-            let ActorRunOutcome::Completed { reply, state: next, .. } =
-                run_inner_actor(&call, Some(context), &program, None, &state, None)
-                    .expect("execute compiled input probe") else { panic!("query yielded") };
+            let ActorRunOutcome::Completed {
+                reply, state: next, ..
+            } = run_inner_actor(&call, Some(context), &program, None, &state, None)
+                .expect("execute compiled input probe")
+            else {
+                panic!("query yielded")
+            };
             assert_eq!(reply.status, ActorExecutionStatus::Done);
             assert_eq!(Value::decode(&reply.reply), Value::U64(len as u64));
-            if len != 0 { assert_eq!(next, state, "query changed canonical state"); }
+            if len != 0 {
+                assert_eq!(next, state, "query changed canonical state");
+            }
             state = next;
         }
-        std::eprintln!("compiled guest: message={} payload={payload_len}", call.message.len());
+        std::eprintln!(
+            "compiled guest: message={} payload={payload_len}",
+            call.message.len()
+        );
         // Exercise the Rust context API with a caller blob larger than the
         // message ceiling, then repeat without availability and with bad length.
         let blob_bytes = vec![0x62; MAX_EXECUTION_AVAILABILITY_BYTES];
@@ -2490,22 +3118,33 @@ mod tests {
             (true, reference.len, reference.len),
             (false, reference.len, u64::MAX),
             (true, reference.len - 1, u64::MAX - 1),
-            (true, MAX_EXECUTION_AVAILABILITY_BYTES as u64 + 1, u64::MAX - 1),
+            (
+                true,
+                MAX_EXECUTION_AVAILABILITY_BYTES as u64 + 1,
+                u64::MAX - 1,
+            ),
         ] {
             call.availability.clear();
             if present {
                 call.availability.push(RuntimeBlob {
-                    reference: BlobRef::of_bytes(&blob_bytes), bytes: blob_bytes.clone(),
+                    reference: BlobRef::of_bytes(&blob_bytes),
+                    bytes: blob_bytes.clone(),
                 });
             }
             call.message = vec![TAG_DYNAMIC];
-            call.message.extend(Msg::new("blob_len")
-                .with("hash", Value::Bytes(reference.hash.0.to_vec()))
-                .with("len", Value::U64(len)).encode());
+            call.message.extend(
+                Msg::new("blob_len")
+                    .with("hash", Value::Bytes(reference.hash.0.to_vec()))
+                    .with("len", Value::U64(len))
+                    .encode(),
+            );
             call.validate().unwrap();
-            let ActorRunOutcome::Completed { reply, state: next, .. } =
-                run_inner_actor(&call, Some(context), &program, None, &state, None).unwrap()
-                else { panic!("blob query yielded") };
+            let ActorRunOutcome::Completed {
+                reply, state: next, ..
+            } = run_inner_actor(&call, Some(context), &program, None, &state, None).unwrap()
+            else {
+                panic!("blob query yielded")
+            };
             assert_eq!(reply.status, ActorExecutionStatus::Done);
             assert_eq!(Value::decode(&reply.reply), Value::U64(expected));
             assert_eq!(next, state, "blob query changed Local state");
@@ -2535,8 +3174,11 @@ mod tests {
             actor: crate::agent_sdk::ActorId(call.actor.0),
             mode: crate::agent_sdk::MethodMode::Linear,
             origin: crate::agent_sdk::InvocationOrigin {
-                principal: None, transport_node: None, credential: None,
-                actor: None, capability: None,
+                principal: None,
+                transport_node: None,
+                credential: None,
+                actor: None,
+                capability: None,
             },
             roles: crate::agent_sdk::InvocationRoleClaims::none(),
             observed_slot: 1,
@@ -2544,7 +3186,8 @@ mod tests {
         assert!(context.validate());
         let mut state = ActorStateLanes {
             linear: Some(vec![0; MAX_EXECUTION_STATE_TOTAL_BYTES]),
-            merge: None, local: None,
+            merge: None,
+            local: None,
         };
         assert!(run_inner_actor(&call, Some(context), &program, None, &state, None).is_ok());
         // Exercise the actual ECALL dispatcher with the same probe/retry
@@ -2556,14 +3199,22 @@ mod tests {
             merge: Some(vec![0; lane]),
             local: Some(vec![0; lane]),
         };
-        let control_len = encode_inner_actor_control(&call, Some(context)).unwrap().len();
+        let control_len = encode_inner_actor_control(&call, Some(context))
+            .unwrap()
+            .len();
         let mut output = actor_output([0, 0, 0], 0);
         let output_len = output.len();
         output.resize(output_len + lane + 1, 0);
         let base = 2 * u64::from(vos_pvm::PVM_ZONE_SIZE);
         let mut fetching = Assembler::new();
         fetching.set_rw_data(output);
-        for bytes in [lane + 1, lane + 1, lane + 1, control_len, call.message.len()] {
+        for bytes in [
+            lane + 1,
+            lane + 1,
+            lane + 1,
+            control_len,
+            call.message.len(),
+        ] {
             fetching
                 .load_imm_64(Reg::A0, base + output_len as u64)
                 .load_imm_64(Reg::A1, ACTOR_FETCH_PROBE_BYTES as u64)

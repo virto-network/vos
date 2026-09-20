@@ -5945,7 +5945,8 @@ impl VosNode {
             .as_ref()
             .ok_or(crate::agent::shared_host::SharedAgentHostError::Unavailable)?
             .call(move |owner| {
-                owner.ok_or(crate::agent::shared_host::SharedAgentHostError::Unavailable)?
+                owner
+                    .ok_or(crate::agent::shared_host::SharedAgentHostError::Unavailable)?
                     .authorize_operation(&call, context, issued_at)
             })
             .map_err(|_| crate::agent::shared_host::SharedAgentHostError::Unavailable)?
@@ -5980,13 +5981,15 @@ impl VosNode {
             .store(handle.is_none(), Ordering::Release);
         *exposed = handle;
         drop(exposed);
-        self.clean_agent_owner = Some(crate::agent::production_worker::AgentProductionWorker::start(
-            owner,
-            self.shutdown.clone(),
-            self.clean_agent_ingress_supervisor.clone(),
-            self.clean_agent_recovering.clone(),
-            self.clean_local_lifecycle_queue.clone(),
-        )?);
+        self.clean_agent_owner = Some(
+            crate::agent::production_worker::AgentProductionWorker::start(
+                owner,
+                self.shutdown.clone(),
+                self.clean_agent_ingress_supervisor.clone(),
+                self.clean_agent_recovering.clone(),
+                self.clean_local_lifecycle_queue.clone(),
+            )?,
+        );
         Ok(())
     }
 
@@ -8270,7 +8273,9 @@ impl VosNode {
                         .as_ref()
                         .map_or(idle, |host| idle.min(host.idle_for()));
                     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
-                    let idle = self.clean_agent_owner.as_ref()
+                    let idle = self
+                        .clean_agent_owner
+                        .as_ref()
                         .map_or(idle, |worker| idle.min(worker.idle_for()));
                     if idle >= threshold {
                         self.signal_node_shutdown();
@@ -8402,7 +8407,11 @@ impl VosNode {
             self.signal_node_shutdown();
             return false;
         }
-        if self.clean_agent_owner.as_ref().is_some_and(|worker| !worker.is_running()) {
+        if self
+            .clean_agent_owner
+            .as_ref()
+            .is_some_and(|worker| !worker.is_running())
+        {
             self.signal_node_shutdown();
             return false;
         }
@@ -13874,7 +13883,7 @@ fn is_private_read_method(method: &str) -> bool {
 /// (status + zero-length state). Both the length and the leading
 /// status byte are load-bearing for the client-side detection.
 #[cfg(feature = "network")]
-#[allow(dead_code)]// Retained as host-side fallback; see doc comment above.
+#[allow(dead_code)] // Retained as host-side fallback; see doc comment above.
 fn forbidden_envelope() -> Vec<u8> {
     use crate::actors::run::STATUS_FORBIDDEN;
     encode_invoke_envelope(STATUS_FORBIDDEN, &[], &[])

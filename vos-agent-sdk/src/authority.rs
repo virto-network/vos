@@ -241,7 +241,9 @@ impl ManagementAuthorizationPlan {
                     .collect(),
                 descriptor_commitment: descriptor.commitment(),
             },
-            ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources | ManagementRequest::InspectManagementHistory => {
+            ManagementRequest::InspectActors { .. }
+            | ManagementRequest::InspectResources
+            | ManagementRequest::InspectManagementHistory => {
                 return None;
             }
             ManagementRequest::Install(value) => {
@@ -1084,7 +1086,11 @@ pub enum AuthorityProjectionSelector {
 impl AuthorityProjectionSelector {
     pub fn validate_shape(self) -> bool {
         match self {
-            Self::Inventory { after, limit, known_head } => {
+            Self::Inventory {
+                after,
+                limit,
+                known_head,
+            } => {
                 after.is_none_or(|cursor| cursor.is_valid())
                     && limit != 0
                     && usize::from(limit) <= MAX_AUTHORITY_INVENTORY_PAGE_ENTRIES
@@ -1281,9 +1287,10 @@ pub struct AuthorityCredentialProjection {
 impl AuthorityCredentialProjection {
     pub fn validate_shape(&self) -> Result<(), AuthorityActorProtocolError> {
         self.query.validate_shape()?;
-        if !matches!(self.query.selector,
-            AuthorityProjectionSelector::Credential | AuthorityProjectionSelector::Inventory { .. })
-            || !self.head.is_valid()
+        if !matches!(
+            self.query.selector,
+            AuthorityProjectionSelector::Credential | AuthorityProjectionSelector::Inventory { .. }
+        ) || !self.head.is_valid()
             || self.principal == PrincipalId::ZERO
             || self.space_roles.len() + self.actor_roles.len() + self.capabilities.len()
                 > MAX_AUTHORITY_PRINCIPAL_GRANTS

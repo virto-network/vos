@@ -1263,12 +1263,18 @@ pub fn run_refine<A: super::Actor>(args_address: u64, args_len: u64) {
         local.clear();
     }
 
-    if let Some(delta) = super::storage::finish_clean_dispatch(status[0])
-        .expect("invalid clean actor storage delta")
+    if let Some(delta) =
+        super::storage::finish_clean_dispatch(status[0]).expect("invalid clean actor storage delta")
     {
-        assert!(ctx.agent_invocation_context().is_some(), "row export requires clean invocation context");
-        assert_eq!(crate::abi::pvm::hostcalls::actor_effect_export(&delta), 0,
-            "clean actor row export was rejected");
+        assert!(
+            ctx.agent_invocation_context().is_some(),
+            "row export requires clean invocation context"
+        );
+        assert_eq!(
+            crate::abi::pvm::hostcalls::actor_effect_export(&delta),
+            0,
+            "clean actor row export was rejected"
+        );
     }
 
     // Pack output: status, three lane lengths/bytes, then reply.

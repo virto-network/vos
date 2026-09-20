@@ -103,23 +103,49 @@ impl<'a> NativeAuthorityOperationStartupAdmission<'a> {
         self
     }
 
-    pub fn from_shared_genesis<I, J, Q, R, W, P>(recovery: &'a mut super::NativeSharedGenesisRecovery<I, J, Q, R, W, P>)
-        -> Result<Self, SharedAgentHostError>
-    where I: CleanManagementIssuerStore, J: CleanManagementIssuerStore, Q: CleanManagementIssuerStore, R: CleanManagementIssuerStore {
-        Self { authority: recovery.authority, pending: Vec::new(), retirements: Vec::new(),
-            has_history: false, defer_shared_genesis: false, _lease: core::marker::PhantomData }.include_shared_genesis(recovery)
+    pub fn from_shared_genesis<I, J, Q, R, W, P>(
+        recovery: &'a mut super::NativeSharedGenesisRecovery<I, J, Q, R, W, P>,
+    ) -> Result<Self, SharedAgentHostError>
+    where
+        I: CleanManagementIssuerStore,
+        J: CleanManagementIssuerStore,
+        Q: CleanManagementIssuerStore,
+        R: CleanManagementIssuerStore,
+    {
+        Self {
+            authority: recovery.authority,
+            pending: Vec::new(),
+            retirements: Vec::new(),
+            has_history: false,
+            defer_shared_genesis: false,
+            _lease: core::marker::PhantomData,
+        }
+        .include_shared_genesis(recovery)
     }
 
     /// Include one verified Shared Create/query reservation while borrowing
     /// its stores. Call for every discovered entry before opening bootstrap.
-    pub fn include_shared_genesis<I, J, Q, R, W, P>(mut self, recovery: &'a mut super::NativeSharedGenesisRecovery<I, J, Q, R, W, P>)
-        -> Result<Self, SharedAgentHostError>
-    where I: CleanManagementIssuerStore, J: CleanManagementIssuerStore, Q: CleanManagementIssuerStore, R: CleanManagementIssuerStore {
-        if !recovery.admission_valid || recovery.authority != self.authority
-            || self.pending.len().saturating_add(recovery.pending.len()) > super::super::replay::MAX_REPLAY_SUFFIX_ENTRIES
-        { return Err(SharedAgentHostError::ScopeMismatch); }
+    pub fn include_shared_genesis<I, J, Q, R, W, P>(
+        mut self,
+        recovery: &'a mut super::NativeSharedGenesisRecovery<I, J, Q, R, W, P>,
+    ) -> Result<Self, SharedAgentHostError>
+    where
+        I: CleanManagementIssuerStore,
+        J: CleanManagementIssuerStore,
+        Q: CleanManagementIssuerStore,
+        R: CleanManagementIssuerStore,
+    {
+        if !recovery.admission_valid
+            || recovery.authority != self.authority
+            || self.pending.len().saturating_add(recovery.pending.len())
+                > super::super::replay::MAX_REPLAY_SUFFIX_ENTRIES
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
         for (_, work) in &recovery.pending {
-            let RuntimeWork::Invoke { invocation, .. } = work else { return Err(SharedAgentHostError::ScopeMismatch); };
+            let RuntimeWork::Invoke { invocation, .. } = work else {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            };
             if self.pending.iter().any(|(_, old)| matches!(old, RuntimeWork::Invoke { invocation: existing, .. } if existing.invocation == invocation.invocation))
                 || self.retirements.iter().flatten().any(|old| matches!(old, RuntimeWork::Invoke { invocation: existing, .. } if existing.invocation == invocation.invocation))
             { return Err(SharedAgentHostError::Conflict); }

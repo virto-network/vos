@@ -16,6 +16,8 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
+use super::sdk::AgentDescriptor;
+#[cfg(test)]
 use super::sdk::authority::MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES;
 use super::sdk::authority::{
     AuthorityActorProjection, AuthorityActorTarget, AuthorityAgentProjection,
@@ -24,8 +26,6 @@ use super::sdk::authority::{
     AuthorityProjectionQuery, AuthorityProjectionSelector, MAX_AUTHORITY_INVENTORY_PAGE_ENTRIES,
 };
 use super::sdk::wire::CanonicalWire;
-#[cfg(test)]
-use super::sdk::AgentDescriptor;
 use super::sdk::{AgentId, AgentProfile, NodeId, PrincipalId};
 use super::supervisor::{
     AgentRouteIdentity, AgentRouteKey, AgentRoutePublication, AgentSupervisorError,
@@ -1606,7 +1606,11 @@ mod tests {
         fn load_inventory(&mut self) -> Result<AgentAuthorityInventory, AgentProductionOwnerError> {
             self.entered.send(()).unwrap();
             let _ = self.release.recv_timeout(Duration::from_secs(5));
-            if self.shutdown.as_ref().is_some_and(|signal| signal.load(Ordering::Acquire)) {
+            if self
+                .shutdown
+                .as_ref()
+                .is_some_and(|signal| signal.load(Ordering::Acquire))
+            {
                 Err(AgentProductionOwnerError::ShutdownRequested)
             } else {
                 Err(AgentProductionOwnerError::InvalidProjection)
@@ -1624,12 +1628,18 @@ mod tests {
         let owner = AgentProductionOwner {
             node: NodeId([1; 32]),
             system_agent: AgentId([2; 32]),
-            supervisor: Some(AgentSupervisorOwner::start(AgentSupervisorLimits::default()).unwrap()),
+            supervisor: Some(
+                AgentSupervisorOwner::start(AgentSupervisorLimits::default()).unwrap(),
+            ),
             system: OwnedRouteSlot::Empty,
             local: OwnedRouteSlot::Empty,
             local_by_agent: None,
             shared: OwnedRouteSlot::Empty,
-            source: Box::new(HeldInventory { entered, release: wait, shutdown: None }),
+            source: Box::new(HeldInventory {
+                entered,
+                release: wait,
+                shutdown: None,
+            }),
             accepted_head: None,
             completed_local_publication: None,
             completed_local_install: None,
@@ -1660,8 +1670,14 @@ mod tests {
         // Release even after a failed observation so the test never leaks workers.
         let _ = release.send(());
         let result = routing.join().unwrap();
-        assert!(progressed.is_ok(), "node routing waited for inventory execution");
-        assert!(admission_closed, "shutdown must hide admission before inventory returns");
+        assert!(
+            progressed.is_ok(),
+            "node routing waited for inventory execution"
+        );
+        assert!(
+            admission_closed,
+            "shutdown must hide admission before inventory returns"
+        );
         assert!(result.is_ok());
     }
 
@@ -1670,11 +1686,16 @@ mod tests {
         use super::super::production_worker::AgentProductionWorker;
         let (owner, entered, release) = held_inventory_owner();
         let shutdown = Arc::new(AtomicBool::new(false));
-        let worker = Arc::new(AgentProductionWorker::start(
-            owner, shutdown.clone(), Arc::new(std::sync::RwLock::new(None)),
-            Arc::new(AtomicBool::new(true)),
-            Arc::new(super::super::local_lifecycle::LocalLifecycleQueue::default()),
-        ).unwrap());
+        let worker = Arc::new(
+            AgentProductionWorker::start(
+                owner,
+                shutdown.clone(),
+                Arc::new(std::sync::RwLock::new(None)),
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(super::super::local_lifecycle::LocalLifecycleQueue::default()),
+            )
+            .unwrap(),
+        );
         entered.recv_timeout(Duration::from_secs(1)).unwrap();
         let (completed, results) = std::sync::mpsc::channel();
         let mut callers = Vec::new();
@@ -1682,16 +1703,25 @@ mod tests {
             let worker = worker.clone();
             let completed = completed.clone();
             callers.push(std::thread::spawn(move || {
-                completed.send(worker.call(|owner| owner.is_some())).unwrap();
+                completed
+                    .send(worker.call(|owner| owner.is_some()))
+                    .unwrap();
             }));
         }
         let overflow = results.recv_timeout(Duration::from_secs(1));
         worker.request_shutdown();
         assert!(shutdown.load(Ordering::Acquire));
         let _ = release.send(());
-        for caller in callers { caller.join().unwrap(); }
-        assert!(matches!(overflow, Ok(Err(_))), "fifth queued control must be refused");
-        for _ in 0..4 { assert_eq!(results.recv().unwrap(), Ok(false)); }
+        for caller in callers {
+            caller.join().unwrap();
+        }
+        assert!(
+            matches!(overflow, Ok(Err(_))),
+            "fifth queued control must be refused"
+        );
+        for _ in 0..4 {
+            assert_eq!(results.recv().unwrap(), Ok(false));
+        }
         let worker = Arc::try_unwrap(worker).ok().unwrap();
         worker.shutdown_and_join().unwrap();
     }
@@ -1724,8 +1754,14 @@ mod tests {
         let early = observed.recv_timeout(Duration::from_millis(150));
         let _ = release.send(());
         let result = routing.join().unwrap();
-        assert!(matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
-        assert!(result.is_err(), "released invalid inventory still fails closed");
+        assert!(matches!(
+            early,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(
+            result.is_err(),
+            "released invalid inventory still fails closed"
+        );
     }
 
     #[test]
@@ -1736,14 +1772,21 @@ mod tests {
         let handle = owner.handle();
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker = AgentProductionWorker::start(
-            owner, shutdown.clone(), Arc::new(std::sync::RwLock::new(None)),
+            owner,
+            shutdown.clone(),
+            Arc::new(std::sync::RwLock::new(None)),
             Arc::new(AtomicBool::new(true)),
             Arc::new(super::super::local_lifecycle::LocalLifecycleQueue::default()),
-        ).unwrap();
-        assert!(worker.call::<()>(|owner| {
-            assert!(owner.is_some());
-            panic!("injected control failure");
-        }).is_err());
+        )
+        .unwrap();
+        assert!(
+            worker
+                .call::<()>(|owner| {
+                    assert!(owner.is_some());
+                    panic!("injected control failure");
+                })
+                .is_err()
+        );
         assert!(worker.shutdown_and_join().is_err());
         assert!(shutdown.load(Ordering::Acquire));
         assert!(!handle.is_running());
@@ -2243,8 +2286,10 @@ mod tests {
                 &mut self,
                 query: AuthorityProjectionQuery,
             ) -> Result<Vec<u8>, AgentProductionOwnerError> {
-                let stop = matches!(query.selector, AuthorityProjectionSelector::Inventory { after: Some(_), .. })
-                    && self.armed.load(Ordering::Acquire);
+                let stop = matches!(
+                    query.selector,
+                    AuthorityProjectionSelector::Inventory { after: Some(_), .. }
+                ) && self.armed.load(Ordering::Acquire);
                 let result = self.inner.dispatch(query);
                 if stop {
                     self.shutdown.store(true, Ordering::Release);

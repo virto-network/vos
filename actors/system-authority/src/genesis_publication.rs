@@ -113,8 +113,12 @@ fn initial_committee(config: &SystemAuthorityConfiguration) -> Option<AuthorityC
 /// installed configuration and system journal before trusting them. A future
 /// rotation implementation must update this query and publication together.
 pub(super) fn signing_committee(config: &SystemAuthorityConfiguration) -> Vec<u8> {
-    if !config.is_valid() { return Vec::new(); }
-    initial_committee(config).map(|committee| committee.encode()).unwrap_or_default()
+    if !config.is_valid() {
+        return Vec::new();
+    }
+    initial_committee(config)
+        .map(|committee| committee.encode())
+        .unwrap_or_default()
 }
 
 fn decoded(
@@ -177,16 +181,26 @@ pub(super) fn publish_from_blob(
     context: &InvocationContext,
     lookup: impl FnOnce(&vos::agent_sdk::BlobRef) -> Option<Vec<u8>>,
 ) -> Vec<u8> {
-    if authorization.len() != 32 || !context_matches(config, context)
+    if authorization.len() != 32
+        || !context_matches(config, context)
         || len > vos::agent::execution::MAX_EXECUTION_AVAILABILITY_BYTES as u64
         || len > MAX_CLEAN_CREATE_GENESIS_PROVISION_BYTES as u64
     {
         return Vec::new();
     }
-    let Ok(hash) = <[u8; 32]>::try_from(hash) else { return Vec::new() };
-    let reference = vos::agent_sdk::BlobRef { hash: vos::agent_sdk::Hash(hash), len };
-    let Some(bytes) = lookup(&reference) else { return Vec::new() };
-    if !reference.matches(&bytes) { return Vec::new(); }
+    let Ok(hash) = <[u8; 32]>::try_from(hash) else {
+        return Vec::new();
+    };
+    let reference = vos::agent_sdk::BlobRef {
+        hash: vos::agent_sdk::Hash(hash),
+        len,
+    };
+    let Some(bytes) = lookup(&reference) else {
+        return Vec::new();
+    };
+    if !reference.matches(&bytes) {
+        return Vec::new();
+    }
     publish(config, state, authorization, &bytes, context)
 }
 

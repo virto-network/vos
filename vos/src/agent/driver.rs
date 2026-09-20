@@ -177,7 +177,9 @@ fn clean_management_operation(
     use crate::agent_sdk::authority::AuthorityOperationKind;
     match request {
         ManagementRequest::Create(_) => Some(AuthorityOperationKind::CreateAgent),
-        ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources | ManagementRequest::InspectManagementHistory => None,
+        ManagementRequest::InspectActors { .. }
+        | ManagementRequest::InspectResources
+        | ManagementRequest::InspectManagementHistory => None,
         ManagementRequest::Install(_) => Some(AuthorityOperationKind::InstallActor),
         ManagementRequest::UpgradeActor(_) => Some(AuthorityOperationKind::UpgradeActor),
         ManagementRequest::Suspend { .. } => Some(AuthorityOperationKind::SuspendActor),
@@ -515,7 +517,10 @@ pub(crate) fn sdk_management_reply_matches(
             page.validate().is_ok()
         }
         (ManagementRequest::InspectResources, ManagementReply::Resources(_)) => true,
-        (ManagementRequest::InspectManagementHistory, ManagementReply::ManagementHistory(commitment)) => *commitment != crate::agent_sdk::Hash::ZERO,
+        (
+            ManagementRequest::InspectManagementHistory,
+            ManagementReply::ManagementHistory(commitment),
+        ) => *commitment != crate::agent_sdk::Hash::ZERO,
         (ManagementRequest::Install(install), ManagementReply::Installed(entry)) => {
             *entry == install.entry
         }
@@ -715,7 +720,8 @@ fn expected_standard_sdk_acknowledgement_transition(
     // attested path. `acknowledge_clean_retirement_with_status` authenticates the
     // retained exact work and authorization binding, matching the bundled
     // guest.
-    let result = runtime.acknowledge_clean_retirement_with_status(invocation, authorization)
+    let result = runtime
+        .acknowledge_clean_retirement_with_status(invocation, authorization)
         .map(|(acknowledgement, _)| acknowledgement);
     Ok(crate::agent_sdk::RuntimeTransition {
         state: if result.is_ok() {
@@ -4158,7 +4164,9 @@ impl<S: AgentImageStore> AgentDriver<S> {
         let work = crate::agent_sdk::RuntimeWork::Acknowledge {
             context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             state: legacy_state_as_sdk(&self.image.runtime_state),
-            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&invocation)),
+            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(
+                &invocation,
+            )),
             authorization: Box::new(authorization),
         };
         let encoded = work
@@ -7307,7 +7315,9 @@ mod tests {
         let work = RuntimeWork::Acknowledge {
             context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             state: legacy_state_as_sdk(&prior),
-            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&invocation)),
+            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(
+                &invocation,
+            )),
             authorization,
         };
         let expected = expected_standard_sdk_acknowledgement_transition(&work).unwrap();
@@ -7405,7 +7415,9 @@ mod tests {
         let work = RuntimeWork::Acknowledge {
             context: RuntimeExecutionContext::Direct,
             state: retained.clone(),
-            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&invocation)),
+            invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(
+                &invocation,
+            )),
             authorization: Box::new(authorization.clone()),
         };
         let expected = super::super::wire::apply_standard_runtime_work(work.clone()).unwrap();

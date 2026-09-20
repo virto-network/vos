@@ -1795,11 +1795,18 @@ where
                 #[cfg(not(all(feature = "network", target_os = "linux")))]
                 let admin_success = false;
                 #[cfg(all(feature = "network", target_os = "linux"))]
-                let committee_query = super::clean_bootstrap::genesis_issuance::is_committee_query_reply(work, &reply.reply);
+                let committee_query =
+                    super::clean_bootstrap::genesis_issuance::is_committee_query_reply(
+                        work,
+                        &reply.reply,
+                    );
                 #[cfg(not(all(feature = "network", target_os = "linux")))]
                 let committee_query = false;
                 #[cfg(all(feature = "network", target_os = "linux"))]
-                let publication = super::clean_bootstrap::genesis_issuance::is_publication_reply(work, &reply.reply);
+                let publication = super::clean_bootstrap::genesis_issuance::is_publication_reply(
+                    work,
+                    &reply.reply,
+                );
                 #[cfg(not(all(feature = "network", target_os = "linux")))]
                 let publication = false;
                 if reply.invocation != work.invocation
@@ -1808,7 +1815,9 @@ where
                     || reply.deployment != work.deployment
                     || reply.mode != work.mode
                     || reply.status != crate::agent_sdk::InvocationStatus::Done
-                    || (!admin_success && !committee_query && !publication
+                    || (!admin_success
+                        && !committee_query
+                        && !publication
                         && reply.reply
                             != crate::actors::codec::Encode::encode(
                                 &crate::actors::value::Value::Bytes(Vec::new()),
@@ -2685,8 +2694,10 @@ where
         else {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         };
-        if !matches!(work.mode, crate::agent_sdk::MethodMode::Linear | crate::agent_sdk::MethodMode::Query)
-            || !preflight.matches_work(work)
+        if !matches!(
+            work.mode,
+            crate::agent_sdk::MethodMode::Linear | crate::agent_sdk::MethodMode::Query
+        ) || !preflight.matches_work(work)
             || preflight.observed_slot > self.executor.current_logical_slot()?
         {
             return Err(SharedJournalDriverError::CrossStoreMismatch);

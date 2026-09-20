@@ -1700,11 +1700,19 @@ fn encode_authority_projection_selector(
     value: AuthorityProjectionSelector,
 ) {
     match value {
-        AuthorityProjectionSelector::Inventory { after, limit, known_head } => {
+        AuthorityProjectionSelector::Inventory {
+            after,
+            limit,
+            known_head,
+        } => {
             encoder.u8(4);
-            encoder.option(&after, |encoder, cursor| encode_inventory_cursor(encoder, *cursor));
+            encoder.option(&after, |encoder, cursor| {
+                encode_inventory_cursor(encoder, *cursor)
+            });
             encoder.u16(limit);
-            encoder.option(&known_head, |encoder, head| encode_authority_projection_head(encoder, *head));
+            encoder.option(&known_head, |encoder, head| {
+                encode_authority_projection_head(encoder, *head)
+            });
         }
         AuthorityProjectionSelector::Credential => encoder.u8(0),
         AuthorityProjectionSelector::Agents { after, limit } => {
@@ -3490,7 +3498,9 @@ pub(crate) fn management_request_commitment(value: &ManagementRequest) -> Hash {
         return plan.commitment();
     }
     match value {
-        ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources | ManagementRequest::InspectManagementHistory
+        ManagementRequest::InspectActors { .. }
+        | ManagementRequest::InspectResources
+        | ManagementRequest::InspectManagementHistory
             if value.is_valid() =>
         {
             Hash::digest(
@@ -3520,7 +3530,9 @@ pub(crate) fn required_management_operation(
 ) -> Option<AuthorityOperationKind> {
     match value {
         ManagementRequest::Create(_) => Some(AuthorityOperationKind::CreateAgent),
-        ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources | ManagementRequest::InspectManagementHistory => None,
+        ManagementRequest::InspectActors { .. }
+        | ManagementRequest::InspectResources
+        | ManagementRequest::InspectManagementHistory => None,
         ManagementRequest::Install(_) => Some(AuthorityOperationKind::InstallActor),
         ManagementRequest::UpgradeActor(_) => Some(AuthorityOperationKind::UpgradeActor),
         ManagementRequest::Suspend { .. } => Some(AuthorityOperationKind::SuspendActor),
@@ -3850,10 +3862,12 @@ pub(crate) fn invocation_work_commitment(value: &InvocationWork) -> Hash {
 
 impl CanonicalWire for InvocationRetirement {
     const MAGIC: [u8; 4] = *b"AIRT";
-    const MAX_ENCODED_BYTES: usize = HEADER_BYTES + MAX_INVOCATION_MESSAGE_BYTES
-        + MAX_RUNTIME_AVAILABILITY_ITEMS * 40 + 1024;
+    const MAX_ENCODED_BYTES: usize =
+        HEADER_BYTES + MAX_INVOCATION_MESSAGE_BYTES + MAX_RUNTIME_AVAILABILITY_ITEMS * 40 + 1024;
 
-    fn validate_wire(&self) -> bool { self.validate() }
+    fn validate_wire(&self) -> bool {
+        self.validate()
+    }
 
     fn encode_body(&self, encoder: &mut Encoder<'_>) {
         encoder.fixed(self.space.as_bytes());
@@ -3890,11 +3904,27 @@ impl CanonicalWire for InvocationRetirement {
         let installation_data = decode_optional_blob(decoder)?;
         let availability = decode_required_refs(decoder, installation_data.as_ref())?;
         let value = Self {
-            space, agent, runtime_deployment, invocation, actor, incarnation,
-            deployment, program, mode, origin, roles, message, installation_data,
-            required: availability, gas: decoder.u64()?, recovery_only: decoder.bool()?,
+            space,
+            agent,
+            runtime_deployment,
+            invocation,
+            actor,
+            incarnation,
+            deployment,
+            program,
+            mode,
+            origin,
+            roles,
+            message,
+            installation_data,
+            required: availability,
+            gas: decoder.u64()?,
+            recovery_only: decoder.bool()?,
         };
-        value.validate().then_some(value).ok_or(DecodeError::NonCanonical)
+        value
+            .validate()
+            .then_some(value)
+            .ok_or(DecodeError::NonCanonical)
     }
 }
 
@@ -5672,8 +5702,9 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/acc3-golden", &[&call_bytes]).0,
             [
-                0x03, 0x25, 0xfc, 0x8b, 0xd6, 0x5b, 0xd3, 0xbb, 0x3a, 0x49, 0xc0, 0xa9, 0x0f, 0xc0, 0x3f, 0x28,
-                0xa0, 0xe6, 0x89, 0xb9, 0x84, 0x7e, 0x50, 0xc6, 0x16, 0x9d, 0x64, 0xb3, 0x3e, 0x19, 0xde, 0x03,
+                0x03, 0x25, 0xfc, 0x8b, 0xd6, 0x5b, 0xd3, 0xbb, 0x3a, 0x49, 0xc0, 0xa9, 0x0f, 0xc0,
+                0x3f, 0x28, 0xa0, 0xe6, 0x89, 0xb9, 0x84, 0x7e, 0x50, 0xc6, 0x16, 0x9d, 0x64, 0xb3,
+                0x3e, 0x19, 0xde, 0x03,
             ]
         );
 
@@ -5685,8 +5716,9 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/map2-golden", &[&approval_bytes]).0,
             [
-                0xe3, 0xc2, 0xf7, 0x03, 0xc0, 0x59, 0x7c, 0x11, 0x9b, 0x67, 0x67, 0xa3, 0x71, 0x68, 0xe8, 0x02,
-                0xb2, 0xb9, 0x3c, 0xe8, 0x46, 0xce, 0xbb, 0xd8, 0x92, 0xb2, 0x7f, 0x79, 0x16, 0xfe, 0x97, 0x85,
+                0xe3, 0xc2, 0xf7, 0x03, 0xc0, 0x59, 0x7c, 0x11, 0x9b, 0x67, 0x67, 0xa3, 0x71, 0x68,
+                0xe8, 0x02, 0xb2, 0xb9, 0x3c, 0xe8, 0x46, 0xce, 0xbb, 0xd8, 0x92, 0xb2, 0x7f, 0x79,
+                0x16, 0xfe, 0x97, 0x85,
             ]
         );
 
@@ -5701,8 +5733,9 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/maa2-golden", &[&acknowledgement_bytes]).0,
             [
-                0x26, 0xa6, 0xa0, 0x42, 0xae, 0xf0, 0x4b, 0x9e, 0xd3, 0x19, 0xbe, 0x64, 0x64, 0x8e, 0x61, 0xd7,
-                0x7a, 0x0e, 0xdf, 0x49, 0xf4, 0x66, 0xee, 0x4b, 0x2f, 0xc3, 0x16, 0xd5, 0x78, 0x99, 0xfb, 0xa6,
+                0x26, 0xa6, 0xa0, 0x42, 0xae, 0xf0, 0x4b, 0x9e, 0xd3, 0x19, 0xbe, 0x64, 0x64, 0x8e,
+                0x61, 0xd7, 0x7a, 0x0e, 0xdf, 0x49, 0xf4, 0x66, 0xee, 0x4b, 0x2f, 0xc3, 0x16, 0xd5,
+                0x78, 0x99, 0xfb, 0xa6,
             ]
         );
     }
@@ -5717,8 +5750,9 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/aad4-golden", &[&bytes]).0,
             [
-                0xd6, 0x96, 0xea, 0x94, 0xb5, 0xb8, 0xb7, 0x4f, 0xe2, 0xfa, 0x76, 0x0e, 0x37, 0x77, 0xed, 0x03,
-                0xea, 0x17, 0x9e, 0x1c, 0x2d, 0x1b, 0x25, 0xbb, 0x95, 0x86, 0x38, 0xc1, 0xd1, 0x0a, 0x62, 0xb2,
+                0xd6, 0x96, 0xea, 0x94, 0xb5, 0xb8, 0xb7, 0x4f, 0xe2, 0xfa, 0x76, 0x0e, 0x37, 0x77,
+                0xed, 0x03, 0xea, 0x17, 0x9e, 0x1c, 0x2d, 0x1b, 0x25, 0xbb, 0x95, 0x86, 0x38, 0xc1,
+                0xd1, 0x0a, 0x62, 0xb2,
             ]
         );
 
@@ -5733,8 +5767,9 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/aar4-golden", &[&result_bytes]).0,
             [
-                0x0e, 0x6d, 0x57, 0x28, 0x5d, 0x18, 0x0a, 0x96, 0x24, 0xf2, 0x86, 0x1f, 0x63, 0xc4, 0x3e, 0x54,
-                0x02, 0xa8, 0x45, 0xb9, 0x42, 0xc3, 0xa1, 0x86, 0xd9, 0x15, 0xf3, 0xc1, 0x3c, 0x69, 0x03, 0x8f,
+                0x0e, 0x6d, 0x57, 0x28, 0x5d, 0x18, 0x0a, 0x96, 0x24, 0xf2, 0x86, 0x1f, 0x63, 0xc4,
+                0x3e, 0x54, 0x02, 0xa8, 0x45, 0xb9, 0x42, 0xc3, 0xa1, 0x86, 0xd9, 0x15, 0xf3, 0xc1,
+                0x3c, 0x69, 0x03, 0x8f,
             ]
         );
         assert_ne!(call.commitment(), result.commitment());
@@ -6882,13 +6917,19 @@ mod tests {
     fn retirement_wire_preserves_work_commitment_without_artifact_preimages() {
         let mut work = invocation();
         let bytes = alloc::vec![0x57; 1024 * 1024];
-        work.availability.push(RuntimeBlob { reference: BlobRef::of_bytes(&bytes), bytes });
+        work.availability.push(RuntimeBlob {
+            reference: BlobRef::of_bytes(&bytes),
+            bytes,
+        });
         assert!(work.validate());
         let retirement = InvocationRetirement::from_work(&work);
         assert!(retirement.validate());
         assert_eq!(retirement.commitment(), work.commitment());
         let encoded = retirement.encode().unwrap();
-        assert!(encoded.len() < 1024, "artifact size must not determine retirement size");
+        assert!(
+            encoded.len() < 1024,
+            "artifact size must not determine retirement size"
+        );
         assert_eq!(InvocationRetirement::decode(&encoded).unwrap(), retirement);
         let mut trailing = encoded.clone();
         trailing.push(0);
@@ -6924,10 +6965,22 @@ mod tests {
         changed!(program, ProgramId([0x99; 32]));
         changed!(mode, MethodMode::Query);
         changed!(origin, InvocationOrigin::anonymous());
-        changed!(roles, InvocationRoleClaims { space: Some(RoleId([0x99; 32])), actor: None });
+        changed!(
+            roles,
+            InvocationRoleClaims {
+                space: Some(RoleId([0x99; 32])),
+                actor: None
+            }
+        );
         changed!(message, alloc::vec![0x99]);
         changed!(installation_data, Some(BlobRef::of_bytes(&[])));
-        changed!(availability, alloc::vec![RuntimeBlob { reference: BlobRef::of_bytes(b"a"), bytes: b"a".to_vec() }]);
+        changed!(
+            availability,
+            alloc::vec![RuntimeBlob {
+                reference: BlobRef::of_bytes(b"a"),
+                bytes: b"a".to_vec()
+            }]
+        );
         changed!(gas, 1001);
         changed!(recovery_only, true);
     }
@@ -6937,11 +6990,17 @@ mod tests {
         let mut work = invocation();
         let empty = BlobRef::of_bytes(&[]);
         work.installation_data = Some(empty.clone());
-        work.availability.push(RuntimeBlob { reference: empty, bytes: Vec::new() });
+        work.availability.push(RuntimeBlob {
+            reference: empty,
+            bytes: Vec::new(),
+        });
         let valid = InvocationRetirement::from_work(&work);
         assert!(valid.validate());
         assert_eq!(valid.commitment(), work.commitment());
-        assert_eq!(InvocationRetirement::decode(&valid.encode().unwrap()).unwrap(), valid);
+        assert_eq!(
+            InvocationRetirement::decode(&valid.encode().unwrap()).unwrap(),
+            valid
+        );
         let mut cases = Vec::new();
         let mut invalid = valid.clone();
         invalid.installation_data = None;
@@ -6992,7 +7051,8 @@ mod tests {
             }
         }
         work.origin.capability = Some(CapabilityId([0x91; 32]));
-        let authorization = InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&work, 45));
+        let authorization =
+            InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&work, 45));
         assert!(!authorization.matches_retirement(&InvocationRetirement::from_work(&work)));
     }
 
@@ -7000,14 +7060,21 @@ mod tests {
     fn retained_acceptance_shares_metadata_but_refuses_recovery_only_creation() {
         let mut work = invocation();
         let bytes = b"accepted artifact".to_vec();
-        work.availability.push(RuntimeBlob { reference: BlobRef::of_bytes(&bytes), bytes });
+        work.availability.push(RuntimeBlob {
+            reference: BlobRef::of_bytes(&bytes),
+            bytes,
+        });
         let accepted = InvocationRetirement::from_work(&work);
         assert!(accepted.validate_accepted());
         assert_eq!(accepted.with_availability(work.availability.clone()), work);
-        assert!(!accepted.with_availability(alloc::vec![RuntimeBlob {
-            reference: work.availability[0].reference.clone(),
-            bytes: b"wrong preimage".to_vec(),
-        }]).validate());
+        assert!(
+            !accepted
+                .with_availability(alloc::vec![RuntimeBlob {
+                    reference: work.availability[0].reference.clone(),
+                    bytes: b"wrong preimage".to_vec(),
+                }])
+                .validate()
+        );
         work.recovery_only = true;
         let recovery = InvocationRetirement::from_work(&work);
         assert!(recovery.validate());
@@ -7049,8 +7116,9 @@ mod tests {
         assert_eq!(
             golden.0,
             [
-                0xa8, 0x76, 0xf3, 0x2a, 0x4c, 0xf5, 0x5a, 0x62, 0x52, 0x88, 0xec, 0x31, 0xd9, 0x1e, 0x41, 0x3f,
-                0x57, 0x5b, 0x0f, 0xe4, 0xb4, 0xc7, 0x09, 0x9c, 0x06, 0x79, 0x7b, 0xe1, 0x48, 0xd8, 0x40, 0x4a,
+                0xa8, 0x76, 0xf3, 0x2a, 0x4c, 0xf5, 0x5a, 0x62, 0x52, 0x88, 0xec, 0x31, 0xd9, 0x1e,
+                0x41, 0x3f, 0x57, 0x5b, 0x0f, 0xe4, 0xb4, 0xc7, 0x09, 0x9c, 0x06, 0x79, 0x7b, 0xe1,
+                0x48, 0xd8, 0x40, 0x4a,
             ]
         );
 
@@ -7510,7 +7578,8 @@ mod tests {
         let mut invocation = invocation();
         let bytes = alloc::vec![0xa7; 1024 * 1024];
         invocation.availability = alloc::vec![RuntimeBlob {
-            reference: BlobRef::of_bytes(&bytes), bytes,
+            reference: BlobRef::of_bytes(&bytes),
+            bytes,
         }];
         invocation.installation_data = None;
         let retirement = InvocationRetirement::from_work(&invocation);
@@ -7523,7 +7592,10 @@ mod tests {
             )),
         };
         let encoded = work.encode().unwrap();
-        assert!(encoded.len() < 2048, "ACK must not carry the 1 MiB preimage");
+        assert!(
+            encoded.len() < 2048,
+            "ACK must not carry the 1 MiB preimage"
+        );
         assert_eq!(RuntimeWork::decode(&encoded), Ok(work.clone()));
         let mut trailing = encoded.clone();
         trailing.push(0);
@@ -7531,7 +7603,9 @@ mod tests {
         assert!(RuntimeWork::decode(&encoded[..encoded.len() - 1]).is_err());
         for mutation in 0..5 {
             let mut invalid = work.clone();
-            let RuntimeWork::Acknowledge { invocation, .. } = &mut invalid else { unreachable!() };
+            let RuntimeWork::Acknowledge { invocation, .. } = &mut invalid else {
+                unreachable!()
+            };
             match mutation {
                 0 => invocation.required[0].hash = Hash::ZERO,
                 1 => invocation.required.push(invocation.required[0].clone()),

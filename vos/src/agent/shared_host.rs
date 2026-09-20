@@ -1004,10 +1004,22 @@ impl SharedAgentHost {
         root_pins: RootAnchorPins,
         system_agent: AgentId,
     ) -> Result<Self, SharedAgentHostError> {
-        root_pins.validate().map_err(|_| SharedAgentHostError::InvalidProvision)?;
-        if system_agent == AgentId::ZERO { return Err(SharedAgentHostError::InvalidScope); }
-        let lease = AgentHostRootLease::acquire(root, stable_lock_path, scope).map_err(map_outer_lease_error)?;
-        Self::open_with_lease_and_root_mode(lease, trust, merge, finality, Some(root_pins), Some(system_agent))
+        root_pins
+            .validate()
+            .map_err(|_| SharedAgentHostError::InvalidProvision)?;
+        if system_agent == AgentId::ZERO {
+            return Err(SharedAgentHostError::InvalidScope);
+        }
+        let lease = AgentHostRootLease::acquire(root, stable_lock_path, scope)
+            .map_err(map_outer_lease_error)?;
+        Self::open_with_lease_and_root_mode(
+            lease,
+            trust,
+            merge,
+            finality,
+            Some(root_pins),
+            Some(system_agent),
+        )
     }
 
     fn open_with_lease_and_root_mode(
@@ -1056,7 +1068,12 @@ impl SharedAgentHost {
             } else {
                 host.read_intent(agent, files)?
             };
-            if only_system.is_some() && !matches!(intent.authority, SharedGenesisAuthority::SystemBootstrap { .. }) {
+            if only_system.is_some()
+                && !matches!(
+                    intent.authority,
+                    SharedGenesisAuthority::SystemBootstrap { .. }
+                )
+            {
                 return Err(SharedAgentHostError::InvalidProvision);
             }
             let sealed = host.verify_and_prepare(&intent)?;
@@ -1082,40 +1099,66 @@ impl SharedAgentHost {
         self.deferred_generations.keys().copied().collect()
     }
 
-    pub(crate) fn has_deferred_open(&self) -> bool { self.deferred_open }
+    pub(crate) fn has_deferred_open(&self) -> bool {
+        self.deferred_open
+    }
 
     /// Complete startup under the original outer lease after obtaining finality.
     pub(crate) fn reopen_deferred_generations(
-        &mut self, finality: Arc<dyn AgentGenesisFinalityVerifier>,
+        &mut self,
+        finality: Arc<dyn AgentGenesisFinalityVerifier>,
     ) -> Result<(), SharedAgentHostError> {
-        if !self.deferred_open { return Err(SharedAgentHostError::Conflict); }
+        if !self.deferred_open {
+            return Err(SharedAgentHostError::Conflict);
+        }
         self.lease.validate_live().map_err(map_outer_lease_error)?;
         let mut reopened = BTreeMap::new();
         let current_files = scan_generation_namespaces(&self.lease)?;
-        if current_files.keys().any(|agent| !self.agents.contains_key(agent) && !self.deferred_generations.contains_key(agent)) {
+        if current_files.keys().any(|agent| {
+            !self.agents.contains_key(agent) && !self.deferred_generations.contains_key(agent)
+        }) {
             return Err(SharedAgentHostError::CorruptResidue);
         }
         let deferred: Vec<_> = self.deferred_generations.keys().copied().collect();
         for agent in deferred {
-            if self.agents.contains_key(&agent) { return Err(SharedAgentHostError::Conflict); }
-            let mut files = *current_files.get(&agent).ok_or(SharedAgentHostError::CorruptResidue)?;
+            if self.agents.contains_key(&agent) {
+                return Err(SharedAgentHostError::Conflict);
+            }
+            let mut files = *current_files
+                .get(&agent)
+                .ok_or(SharedAgentHostError::CorruptResidue)?;
             let recovery = self.read_portable_restore(agent, files)?;
             let (intent, encoded) = if let Some(recovery) = &recovery {
                 if files.intent || files.intent_stage {
                     let pair = self.read_intent(agent, files)?;
-                    if pair.0 != recovery.bundle.intent { return Err(SharedAgentHostError::CorruptResidue); }
+                    if pair.0 != recovery.bundle.intent {
+                        return Err(SharedAgentHostError::CorruptResidue);
+                    }
                     pair
-                } else { (recovery.bundle.intent.clone(), recovery.bundle.intent.encode()) }
-            } else { self.read_intent(agent, files)? };
-            if !matches!(intent.authority, SharedGenesisAuthority::AuthorityFinalized(_)) {
+                } else {
+                    (
+                        recovery.bundle.intent.clone(),
+                        recovery.bundle.intent.encode(),
+                    )
+                }
+            } else {
+                self.read_intent(agent, files)?
+            };
+            if !matches!(
+                intent.authority,
+                SharedGenesisAuthority::AuthorityFinalized(_)
+            ) {
                 return Err(SharedAgentHostError::InvalidProvision);
             }
             let sealed = self.verify_and_prepare_with_finality(&intent, finality.as_ref())?;
             install_host_record(&self.intent_path(agent), &encoded)?;
             files.intent = true;
             let exposed = self.read_exposure(agent, intent.id(), files)?;
-            let hosted = self.open_generation(intent, &sealed, exposed, files, recovery.as_ref())?;
-            if recovery.is_some() { retire_host_record(&self.portable_restore_path(agent))?; }
+            let hosted =
+                self.open_generation(intent, &sealed, exposed, files, recovery.as_ref())?;
+            if recovery.is_some() {
+                retire_host_record(&self.portable_restore_path(agent))?;
+            }
             reopened.insert(agent, hosted);
         }
         self.lease.validate_live().map_err(map_outer_lease_error)?;
@@ -1185,14 +1228,20 @@ impl SharedAgentHost {
         authority: crate::agent_sdk::authority::AuthorityReceipt,
         observed_slot: u64,
         committee: &AgentReplicaCommittee,
-    ) -> Result<(super::genesis::AgentGenesisProposal, Vec<RuntimeBlob>), SharedAgentHostError> {
+    ) -> Result<(super::genesis::AgentGenesisProposal, Vec<RuntimeBlob>), SharedAgentHostError>
+    {
         self.lease.validate_live().map_err(map_outer_lease_error)?;
         if descriptor.identity.space.0 != self.scope().space.0 {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         let (create, catalog) =
             LocalJournalAgentDriver::<FileAgentJournalStore>::clean_shared_genesis_input(
-                descriptor, runtime, authority, observed_slot, &self.trust, &self.merge,
+                descriptor,
+                runtime,
+                authority,
+                observed_slot,
+                &self.trust,
+                &self.merge,
             )
             .map_err(|_| SharedAgentHostError::InvalidProvision)?;
         let proposal = self.prepare_genesis_proposal(create, committee, &catalog)?;
@@ -1239,7 +1288,9 @@ impl SharedAgentHost {
         intent: SharedGenesisIntent,
     ) -> Result<SharedAgentStatus, SharedAgentHostError> {
         let agent = intent.agent()?;
-        if self.deferred_generations.contains_key(&agent) { return Err(SharedAgentHostError::Conflict); }
+        if self.deferred_generations.contains_key(&agent) {
+            return Err(SharedAgentHostError::Conflict);
+        }
         if intent.space() != self.scope().space
             || intent
                 .committee()
@@ -1255,7 +1306,12 @@ impl SharedAgentHost {
             }
             return status_for(existing, self.transport_is_attached(agent));
         }
-        if self.agents.len().saturating_add(self.deferred_generations.len()) >= MAX_SHARED_HOST_AGENTS {
+        if self
+            .agents
+            .len()
+            .saturating_add(self.deferred_generations.len())
+            >= MAX_SHARED_HOST_AGENTS
+        {
             return Err(SharedAgentHostError::CapacityExhausted);
         }
         let current = scan_generation_namespaces(&self.lease)?;
@@ -2431,7 +2487,11 @@ impl SharedAgentHost {
             return Err(SharedAgentHostError::Conflict);
         }
         let current = scan_generation_namespaces(&self.lease)?;
-        if self.agents.len().saturating_add(self.deferred_generations.len()) >= MAX_SHARED_HOST_AGENTS
+        if self
+            .agents
+            .len()
+            .saturating_add(self.deferred_generations.len())
+            >= MAX_SHARED_HOST_AGENTS
             || !current.contains_key(&agent) && current.len() == MAX_SHARED_HOST_AGENTS
         {
             return Err(SharedAgentHostError::CapacityExhausted);
@@ -2772,16 +2832,15 @@ impl SharedAgentHost {
     }
 
     fn verify_and_prepare_with_finality(
-        &self, intent: &SharedGenesisIntent, finality: &dyn AgentGenesisFinalityVerifier,
+        &self,
+        intent: &SharedGenesisIntent,
+        finality: &dyn AgentGenesisFinalityVerifier,
     ) -> Result<PreparedSharedGenesis, SharedAgentHostError> {
         intent.validate()?;
         match &intent.authority {
             SharedGenesisAuthority::AuthorityFinalized(provision) => {
-                let verified = VerifiedAgentGenesisProvision::verify(
-                    provision.clone(),
-                    finality,
-                )
-                .map_err(map_provision_verification_error)?;
+                let verified = VerifiedAgentGenesisProvision::verify(provision.clone(), finality)
+                    .map_err(map_provision_verification_error)?;
                 let member = verified
                     .provision()
                     .replicas()
@@ -4749,9 +4808,12 @@ mod tests {
     #[cfg(feature = "pvm")]
     fn standard_projection_fixture(nonce_byte: u8) -> Fixture {
         let runtime = super::super::package_admission::admitted_scripted_runtime_for_test(
-            "shared-projection-standard-shape", 0x74,
+            "shared-projection-standard-shape",
+            0x74,
             vec![super::super::package_admission::ScriptedRuntimeCase {
-                input: vec![0], output: vec![0], copies: Vec::new(),
+                input: vec![0],
+                output: vec![0],
+                copies: Vec::new(),
             }],
         );
         standard_projection_fixture_with_runtime(nonce_byte, runtime)
@@ -4762,7 +4824,12 @@ mod tests {
         nonce_byte: u8,
         admitted_runtime: super::super::package_admission::AdmittedRuntimePackage,
     ) -> Fixture {
-        standard_projection_fixture_with_replicas(nonce_byte, admitted_runtime, &[(0x31, ReplicaRole::Voter)], false)
+        standard_projection_fixture_with_replicas(
+            nonce_byte,
+            admitted_runtime,
+            &[(0x31, ReplicaRole::Voter)],
+            false,
+        )
     }
 
     #[cfg(feature = "pvm")]
@@ -4782,18 +4849,25 @@ mod tests {
         let agent = AgentId(clean_agent.0);
         let authority_key = key(0x41);
         let authority = authority_binding(&authority_key);
-        let mut keyed_members: Vec<_> = replica_seeds.iter().map(|(seed, role)| {
-            let signing_key = key(*seed);
-            let mut member = replica_member(&signing_key, *role);
-            if distinct_owner {
-                let mut replica = member.replica();
-                replica.principal = PrincipalId(owner.0);
-                member = AgentReplicaMember::new(
-                    replica, member.peer_id().to_vec(), *member.ed25519_public_key(), member.raft_slot(),
-                ).unwrap();
-            }
-            (member, signing_key)
-        }).collect();
+        let mut keyed_members: Vec<_> = replica_seeds
+            .iter()
+            .map(|(seed, role)| {
+                let signing_key = key(*seed);
+                let mut member = replica_member(&signing_key, *role);
+                if distinct_owner {
+                    let mut replica = member.replica();
+                    replica.principal = PrincipalId(owner.0);
+                    member = AgentReplicaMember::new(
+                        replica,
+                        member.peer_id().to_vec(),
+                        *member.ed25519_public_key(),
+                        member.raft_slot(),
+                    )
+                    .unwrap();
+                }
+                (member, signing_key)
+            })
+            .collect();
         keyed_members.sort_by_key(|(member, _)| member.replica().node);
         let (members, replica_keys): (Vec<_>, Vec<_>) = keyed_members.into_iter().unzip();
         let descriptor = clean_descriptor_for_runtime(
@@ -6476,32 +6550,61 @@ mod tests {
         let elf = fs::read(std::env::var("AGENT_RUNTIME_CANDIDATE_ELF").unwrap()).unwrap();
         let program = vos_pvm_compiler::link_elf_spi(&elf).unwrap();
         let runtime = super::super::package_admission::admitted_runtime_program_for_test(
-            "shared-genesis-candidate", 0x74, &program,
+            "shared-genesis-candidate",
+            0x74,
+            &program,
         );
         let fixture = standard_projection_fixture_with_runtime(0x24, runtime.clone());
         let committee = fixture.provision.replicas();
         let replica = committee.members()[0].replica();
         // CleanTrust does not enable either native-runtime test oracle.
         let trust: Arc<dyn AgentTrustProvider> = Arc::new(CleanTrust {
-            authority: fixture.authority.clone(), slot: Arc::new(AtomicU64::new(20)),
+            authority: fixture.authority.clone(),
+            slot: Arc::new(AtomicU64::new(20)),
         });
-        let merge: Arc<dyn LocalMergeAuthenticator> = Arc::new(SigningMerge(fixture.replica_keys[0].clone()));
+        let merge: Arc<dyn LocalMergeAuthenticator> =
+            Arc::new(SigningMerge(fixture.replica_keys[0].clone()));
         let directory = TempDirectory::new("compiled_shared_proposal");
         let mut host = SharedAgentHost::open(
-            directory.root(), directory.lock(),
-            AgentHostScope { space: fixture.space, node: replica.node },
-            trust, merge, Arc::new(AcceptFinality),
-        ).unwrap();
-        let proposal = host.prepare_genesis_proposal(
-            fixture.provision.proposal().create().clone(), committee, &fixture.catalog,
-        ).unwrap();
+            directory.root(),
+            directory.lock(),
+            AgentHostScope {
+                space: fixture.space,
+                node: replica.node,
+            },
+            trust,
+            merge,
+            Arc::new(AcceptFinality),
+        )
+        .unwrap();
+        let proposal = host
+            .prepare_genesis_proposal(
+                fixture.provision.proposal().create().clone(),
+                committee,
+                &fixture.catalog,
+            )
+            .unwrap();
         assert_eq!(&proposal, fixture.provision.proposal());
-        let ReplayOperation::CleanManage { request, authority, observed_slot } =
-            &fixture.provision.proposal().create().operation else { panic!("clean Create") };
-        let crate::agent_sdk::ManagementRequest::Create(descriptor) = request else { panic!("Create") };
-        let (clean_proposal, catalog) = host.prepare_clean_genesis_proposal(
-            (**descriptor).clone(), &runtime, authority.clone(), *observed_slot, committee,
-        ).unwrap();
+        let ReplayOperation::CleanManage {
+            request,
+            authority,
+            observed_slot,
+        } = &fixture.provision.proposal().create().operation
+        else {
+            panic!("clean Create")
+        };
+        let crate::agent_sdk::ManagementRequest::Create(descriptor) = request else {
+            panic!("Create")
+        };
+        let (clean_proposal, catalog) = host
+            .prepare_clean_genesis_proposal(
+                (**descriptor).clone(),
+                &runtime,
+                authority.clone(),
+                *observed_slot,
+                committee,
+            )
+            .unwrap();
         assert_eq!(clean_proposal, proposal);
         assert_eq!(catalog, fixture.catalog);
         assert!(scan_generation_namespaces(&host.lease).unwrap().is_empty());
@@ -6513,41 +6616,97 @@ mod tests {
         runtime: super::super::package_admission::AdmittedRuntimePackage,
         native: bool,
     ) {
-        let fixture = standard_projection_fixture_with_replicas(0x25, runtime.clone(), &[
-            (0x31, ReplicaRole::Voter), (0x32, ReplicaRole::Voter),
-            (0x33, ReplicaRole::Voter), (0x34, ReplicaRole::Observer),
-        ], true);
+        let fixture = standard_projection_fixture_with_replicas(
+            0x25,
+            runtime.clone(),
+            &[
+                (0x31, ReplicaRole::Voter),
+                (0x32, ReplicaRole::Voter),
+                (0x33, ReplicaRole::Voter),
+                (0x34, ReplicaRole::Observer),
+            ],
+            true,
+        );
         let committee = fixture.provision.replicas();
-        let ReplayOperation::CleanManage { request, authority, observed_slot } =
-            &fixture.provision.proposal().create().operation else { panic!("clean Create") };
-        let crate::agent_sdk::ManagementRequest::Create(descriptor) = request else { panic!("Create") };
+        let ReplayOperation::CleanManage {
+            request,
+            authority,
+            observed_slot,
+        } = &fixture.provision.proposal().create().operation
+        else {
+            panic!("clean Create")
+        };
+        let crate::agent_sdk::ManagementRequest::Create(descriptor) = request else {
+            panic!("Create")
+        };
         for (member, signing_key) in committee.members().iter().zip(&fixture.replica_keys) {
-            assert_ne!(member.replica().principal, PrincipalId::of_public_key(member.ed25519_public_key()));
+            assert_ne!(
+                member.replica().principal,
+                PrincipalId::of_public_key(member.ed25519_public_key())
+            );
             let directory = TempDirectory::new("multi_replica_proposal");
             let slot = Arc::new(AtomicU64::new(20));
             let trust: Arc<dyn AgentTrustProvider> = if native {
-                Arc::new(NativeCleanTrust { authority: fixture.authority.clone(), slot })
+                Arc::new(NativeCleanTrust {
+                    authority: fixture.authority.clone(),
+                    slot,
+                })
             } else {
-                Arc::new(CleanTrust { authority: fixture.authority.clone(), slot })
+                Arc::new(CleanTrust {
+                    authority: fixture.authority.clone(),
+                    slot,
+                })
             };
             let mut host = SharedAgentHost::open(
-                directory.root(), directory.lock(),
-                AgentHostScope { space: fixture.space, node: member.replica().node },
-                trust, Arc::new(SigningMerge(signing_key.clone())), Arc::new(AcceptFinality),
-            ).unwrap();
-            let (proposal, catalog) = host.prepare_clean_genesis_proposal(
-                (**descriptor).clone(), &runtime, authority.clone(), *observed_slot, committee,
-            ).unwrap();
-            assert_eq!(&proposal, fixture.provision.proposal(), "all voters and observers derive the same proposal");
+                directory.root(),
+                directory.lock(),
+                AgentHostScope {
+                    space: fixture.space,
+                    node: member.replica().node,
+                },
+                trust,
+                Arc::new(SigningMerge(signing_key.clone())),
+                Arc::new(AcceptFinality),
+            )
+            .unwrap();
+            let (proposal, catalog) = host
+                .prepare_clean_genesis_proposal(
+                    (**descriptor).clone(),
+                    &runtime,
+                    authority.clone(),
+                    *observed_slot,
+                    committee,
+                )
+                .unwrap();
+            assert_eq!(
+                &proposal,
+                fixture.provision.proposal(),
+                "all voters and observers derive the same proposal"
+            );
             assert_eq!(catalog, fixture.catalog);
-            let other_members = committee.members().iter()
-                .filter(|other| other.replica().node != member.replica().node).cloned().collect();
+            let other_members = committee
+                .members()
+                .iter()
+                .filter(|other| other.replica().node != member.replica().node)
+                .cloned()
+                .collect();
             let absent = AgentReplicaCommittee::new(
-                committee.space(), committee.agent(), committee.profile(), other_members,
-            ).unwrap();
-            assert_eq!(host.prepare_clean_genesis_proposal(
-                (**descriptor).clone(), &runtime, authority.clone(), *observed_slot, &absent,
-            ), Err(SharedAgentHostError::ScopeMismatch));
+                committee.space(),
+                committee.agent(),
+                committee.profile(),
+                other_members,
+            )
+            .unwrap();
+            assert_eq!(
+                host.prepare_clean_genesis_proposal(
+                    (**descriptor).clone(),
+                    &runtime,
+                    authority.clone(),
+                    *observed_slot,
+                    &absent,
+                ),
+                Err(SharedAgentHostError::ScopeMismatch)
+            );
             assert!(host.is_empty());
             assert!(scan_generation_namespaces(&host.lease).unwrap().is_empty());
         }
@@ -6557,9 +6716,12 @@ mod tests {
     #[cfg(feature = "pvm")]
     fn clean_shared_genesis_proposals_agree_across_voters_and_observer() {
         let runtime = super::super::package_admission::admitted_scripted_runtime_for_test(
-            "multi-replica-proposal", 0x74,
+            "multi-replica-proposal",
+            0x74,
             vec![super::super::package_admission::ScriptedRuntimeCase {
-                input: vec![0], output: vec![0], copies: Vec::new(),
+                input: vec![0],
+                output: vec![0],
+                copies: Vec::new(),
             }],
         );
         assert_multi_replica_genesis_proposals(runtime, true);
@@ -6569,53 +6731,105 @@ mod tests {
     #[cfg(feature = "pvm")]
     fn clean_shared_proposal_binds_package_receipt_and_retained_slot() {
         let runtime = super::super::package_admission::admitted_scripted_runtime_for_test(
-            "clean-proposal-boundary", 0x74,
+            "clean-proposal-boundary",
+            0x74,
             vec![super::super::package_admission::ScriptedRuntimeCase {
-                input: vec![0], output: vec![0], copies: Vec::new(),
+                input: vec![0],
+                output: vec![0],
+                copies: Vec::new(),
             }],
         );
         let fixture = standard_projection_fixture_with_runtime(0x24, runtime.clone());
         let directory = TempDirectory::new("clean_proposal_boundary");
         let clock = Arc::new(AtomicU64::new(20));
         let mut host = open_native_clean_host_at_slot(&directory, &fixture, Arc::clone(&clock));
-        let ReplayOperation::CleanManage { request, authority, observed_slot } =
-            &fixture.provision.proposal().create().operation else { panic!("clean Create") };
-        let crate::agent_sdk::ManagementRequest::Create(descriptor) = request else { panic!("Create") };
-        let prepare = |host: &mut SharedAgentHost, descriptor, runtime: &super::super::package_admission::AdmittedRuntimePackage, slot| {
-            host.prepare_clean_genesis_proposal(descriptor, runtime, authority.clone(), slot, fixture.provision.replicas())
+        let ReplayOperation::CleanManage {
+            request,
+            authority,
+            observed_slot,
+        } = &fixture.provision.proposal().create().operation
+        else {
+            panic!("clean Create")
         };
-        let (proposal, catalog) = prepare(&mut host, (**descriptor).clone(), &runtime, *observed_slot).unwrap();
+        let crate::agent_sdk::ManagementRequest::Create(descriptor) = request else {
+            panic!("Create")
+        };
+        let prepare = |host: &mut SharedAgentHost,
+                       descriptor,
+                       runtime: &super::super::package_admission::AdmittedRuntimePackage,
+                       slot| {
+            host.prepare_clean_genesis_proposal(
+                descriptor,
+                runtime,
+                authority.clone(),
+                slot,
+                fixture.provision.replicas(),
+            )
+        };
+        let (proposal, catalog) =
+            prepare(&mut host, (**descriptor).clone(), &runtime, *observed_slot).unwrap();
         assert_eq!(&proposal, fixture.provision.proposal());
         assert_eq!(catalog, fixture.catalog);
         clock.store(21, Ordering::SeqCst);
-        assert_eq!(prepare(&mut host, (**descriptor).clone(), &runtime, *observed_slot).unwrap().0, proposal);
+        assert_eq!(
+            prepare(&mut host, (**descriptor).clone(), &runtime, *observed_slot)
+                .unwrap()
+                .0,
+            proposal
+        );
         assert!(prepare(&mut host, (**descriptor).clone(), &runtime, 22).is_err());
         let other = super::super::package_admission::admitted_scripted_runtime_for_test(
-            "wrong-proposal-package", 0x75,
+            "wrong-proposal-package",
+            0x75,
             vec![super::super::package_admission::ScriptedRuntimeCase {
-                input: vec![0], output: vec![0], copies: Vec::new(),
+                input: vec![0],
+                output: vec![0],
+                copies: Vec::new(),
             }],
         );
         assert!(prepare(&mut host, (**descriptor).clone(), &other, *observed_slot).is_err());
         let mut forged = authority.clone();
         forged.signature[0] ^= 1;
-        assert!(host.prepare_clean_genesis_proposal(
-            (**descriptor).clone(), &runtime, forged, *observed_slot, fixture.provision.replicas(),
-        ).is_err());
+        assert!(
+            host.prepare_clean_genesis_proposal(
+                (**descriptor).clone(),
+                &runtime,
+                forged,
+                *observed_slot,
+                fixture.provision.replicas(),
+            )
+            .is_err()
+        );
         // Ordinary multi-replica preparation must not relax root bootstrap's
         // independent one-voter restriction.
-        assert!(LocalJournalAgentDriver::<FileAgentJournalStore>::clean_shared_system_genesis_input(
-            (**descriptor).clone(), &runtime, authority.clone(), *observed_slot, &host.trust, &host.merge,
-        ).is_ok());
+        assert!(
+            LocalJournalAgentDriver::<FileAgentJournalStore>::clean_shared_system_genesis_input(
+                (**descriptor).clone(),
+                &runtime,
+                authority.clone(),
+                *observed_slot,
+                &host.trust,
+                &host.merge,
+            )
+            .is_ok()
+        );
         let mut expanded = (**descriptor).clone();
         let mut extra = expanded.replicas[0].clone();
         extra.node = crate::agent_sdk::NodeId([0xf1; 32]);
         extra.principal = crate::agent_sdk::PrincipalId([0xf2; 32]);
         expanded.replicas.push(extra);
         expanded.replicas.sort_by_key(|replica| replica.node);
-        assert!(LocalJournalAgentDriver::<FileAgentJournalStore>::clean_shared_system_genesis_input(
-            expanded, &runtime, authority.clone(), *observed_slot, &host.trust, &host.merge,
-        ).is_err());
+        assert!(
+            LocalJournalAgentDriver::<FileAgentJournalStore>::clean_shared_system_genesis_input(
+                expanded,
+                &runtime,
+                authority.clone(),
+                *observed_slot,
+                &host.trust,
+                &host.merge,
+            )
+            .is_err()
+        );
         let mut changed = (**descriptor).clone();
         changed.identity.owner = crate::agent_sdk::PrincipalId([0xf1; 32]);
         assert!(prepare(&mut host, changed, &runtime, *observed_slot).is_err());
@@ -6627,7 +6841,10 @@ mod tests {
     fn host_genesis_preparation_checks_scope_without_granting_finality() {
         struct RejectFinality;
         impl AgentGenesisFinalityVerifier for RejectFinality {
-            fn verify_finalized(&self, _: &AgentGenesisProvision) -> Result<(), AgentGenesisFinalityError> {
+            fn verify_finalized(
+                &self,
+                _: &AgentGenesisProvision,
+            ) -> Result<(), AgentGenesisFinalityError> {
                 Err(AgentGenesisFinalityError::NotFinalized)
             }
         }
@@ -6639,18 +6856,37 @@ mod tests {
         let create = fixture.provision.proposal().create();
         assert!(scan_generation_namespaces(&host.lease).unwrap().is_empty());
         for _ in 0..2 {
-            assert_eq!(host.prepare_genesis_proposal(create.clone(), committee, &fixture.catalog).unwrap(),
-                *fixture.provision.proposal());
+            assert_eq!(
+                host.prepare_genesis_proposal(create.clone(), committee, &fixture.catalog)
+                    .unwrap(),
+                *fixture.provision.proposal()
+            );
         }
         let foreign = AgentReplicaCommittee::new(
-            SpaceId([0xf1; 32]), committee.agent(), committee.profile(), committee.members().to_vec(),
-        ).unwrap();
-        assert_eq!(host.prepare_genesis_proposal(create.clone(), &foreign, &fixture.catalog),
-            Err(SharedAgentHostError::ScopeMismatch));
-        assert_eq!(host.prepare_genesis_proposal(create.clone(), committee, &[]),
-            Err(SharedAgentHostError::InvalidProvision));
-        assert_eq!(host.provision(fixture.provision.clone(), fixture.catalog.clone(), fixture.committee_authority),
-            Err(SharedAgentHostError::Finality(AgentGenesisFinalityError::NotFinalized)));
+            SpaceId([0xf1; 32]),
+            committee.agent(),
+            committee.profile(),
+            committee.members().to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            host.prepare_genesis_proposal(create.clone(), &foreign, &fixture.catalog),
+            Err(SharedAgentHostError::ScopeMismatch)
+        );
+        assert_eq!(
+            host.prepare_genesis_proposal(create.clone(), committee, &[]),
+            Err(SharedAgentHostError::InvalidProvision)
+        );
+        assert_eq!(
+            host.provision(
+                fixture.provision.clone(),
+                fixture.catalog.clone(),
+                fixture.committee_authority
+            ),
+            Err(SharedAgentHostError::Finality(
+                AgentGenesisFinalityError::NotFinalized
+            ))
+        );
         assert!(host.is_empty());
         assert!(scan_generation_namespaces(&host.lease).unwrap().is_empty());
     }
@@ -6659,14 +6895,22 @@ mod tests {
     fn deferred_generations_keep_lease_and_require_finality_before_exposure() {
         struct RejectFinality;
         impl AgentGenesisFinalityVerifier for RejectFinality {
-            fn verify_finalized(&self, _: &AgentGenesisProvision) -> Result<(), AgentGenesisFinalityError> {
+            fn verify_finalized(
+                &self,
+                _: &AgentGenesisProvision,
+            ) -> Result<(), AgentGenesisFinalityError> {
                 Err(AgentGenesisFinalityError::NotFinalized)
             }
         }
         let directory = TempDirectory::new("deferred_generation_finality");
         let fixture = fixture(0x24);
         let mut host = open_host(&directory, &fixture);
-        host.provision(fixture.provision.clone(), fixture.catalog.clone(), fixture.committee_authority).unwrap();
+        host.provision(
+            fixture.provision.clone(),
+            fixture.catalog.clone(),
+            fixture.committee_authority,
+        )
+        .unwrap();
         let scope = host.scope();
         let trust = host.trust.clone();
         let merge = host.merge.clone();
@@ -6674,19 +6918,40 @@ mod tests {
         let lease = AgentHostRootLease::acquire(directory.root(), directory.lock(), scope).unwrap();
         // Exercise the staging mechanism without inventing a root fixture.
         // The production entrypoint separately requires validated root pins.
-        let mut host = SharedAgentHost::open_with_lease_and_root_mode(lease, trust, merge,
-            Arc::new(RejectFinality), None, Some(AgentId([0xf1; 32]))).unwrap();
+        let mut host = SharedAgentHost::open_with_lease_and_root_mode(
+            lease,
+            trust,
+            merge,
+            Arc::new(RejectFinality),
+            None,
+            Some(AgentId([0xf1; 32])),
+        )
+        .unwrap();
         assert!(host.list().unwrap().is_empty());
         assert!(host.show(fixture.agent).unwrap().is_none());
         assert!(host.route(fixture.agent).is_err());
         assert!(AgentHostRootLease::acquire(directory.root(), directory.lock(), scope).is_err());
-        assert!(host.provision(fixture.provision.clone(), fixture.catalog.clone(), fixture.committee_authority).is_err());
-        assert!(host.reopen_deferred_generations(Arc::new(RejectFinality)).is_err());
+        assert!(
+            host.provision(
+                fixture.provision.clone(),
+                fixture.catalog.clone(),
+                fixture.committee_authority
+            )
+            .is_err()
+        );
+        assert!(
+            host.reopen_deferred_generations(Arc::new(RejectFinality))
+                .is_err()
+        );
         assert!(host.agents.is_empty());
         assert_eq!(host.deferred_generations.len(), 1);
-        host.reopen_deferred_generations(Arc::new(AcceptFinality)).unwrap();
+        host.reopen_deferred_generations(Arc::new(AcceptFinality))
+            .unwrap();
         assert!(host.deferred_generations.is_empty());
-        assert!(host.reopen_deferred_generations(Arc::new(RejectFinality)).is_err());
+        assert!(
+            host.reopen_deferred_generations(Arc::new(RejectFinality))
+                .is_err()
+        );
         assert!(host.show(fixture.agent).unwrap().is_some());
         drop(host);
         assert_eq!(open_host(&directory, &fixture).len(), 1);
@@ -6698,16 +6963,29 @@ mod tests {
         let fixture = fixture(0x24);
         let host = open_host(&directory, &fixture);
         let committee = fixture.provision.replicas();
-        let replica = committee.member_by_node(host.scope().node).unwrap().replica();
+        let replica = committee
+            .member_by_node(host.scope().node)
+            .unwrap()
+            .replica();
         let prepare = |replica, catalog: &[RuntimeBlob]| {
             LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_shared_genesis_candidate(
-                fixture.provision.proposal().create().clone(), replica, committee, catalog,
-                Arc::clone(&host.trust), Arc::clone(&host.merge),
+                fixture.provision.proposal().create().clone(),
+                replica,
+                committee,
+                catalog,
+                Arc::clone(&host.trust),
+                Arc::clone(&host.merge),
             )
         };
         let candidate = prepare(replica, &fixture.catalog).unwrap();
-        assert_eq!(&candidate.ordinary_proposal().unwrap(), fixture.provision.proposal());
-        assert!(host.agents.is_empty(), "proposal preparation must not provision a generation");
+        assert_eq!(
+            &candidate.ordinary_proposal().unwrap(),
+            fixture.provision.proposal()
+        );
+        assert!(
+            host.agents.is_empty(),
+            "proposal preparation must not provision a generation"
+        );
         let mut wrong_replica = replica;
         wrong_replica.principal = PrincipalId([0xf1; 32]);
         assert!(prepare(wrong_replica, &fixture.catalog).is_err());
@@ -6724,23 +7002,61 @@ mod tests {
         let fixture = fixture(0x24);
         let mut host = open_host(&directory, &fixture);
         host.provision(
-            fixture.provision.clone(), fixture.catalog.clone(), fixture.committee_authority,
-        ).unwrap();
+            fixture.provision.clone(),
+            fixture.catalog.clone(),
+            fixture.committee_authority,
+        )
+        .unwrap();
         let before = host.journal_position(fixture.agent).unwrap();
         for index in 1..=2 {
-            assert_eq!(host.agents[&fixture.agent].driver.ledger()
-                .append_committed_for_test(7, &EntryKind::Data { payload: Vec::new() }).unwrap(), index);
-            assert_eq!(host.apply_next(fixture.agent).unwrap(), SharedAgentApplyOutcome::Applied { index });
+            assert_eq!(
+                host.agents[&fixture.agent]
+                    .driver
+                    .ledger()
+                    .append_committed_for_test(
+                        7,
+                        &EntryKind::Data {
+                            payload: Vec::new()
+                        }
+                    )
+                    .unwrap(),
+                index
+            );
+            assert_eq!(
+                host.apply_next(fixture.agent).unwrap(),
+                SharedAgentApplyOutcome::Applied { index }
+            );
         }
         let database = host.raft_database(fixture.agent).unwrap();
         let transaction = database.begin_write().unwrap();
-        assert!(transaction.open_table(crate::raft::RAFT_LOG).unwrap().remove(1).unwrap().is_some());
+        assert!(
+            transaction
+                .open_table(crate::raft::RAFT_LOG)
+                .unwrap()
+                .remove(1)
+                .unwrap()
+                .is_some()
+        );
         transaction.commit().unwrap();
-        assert_eq!(host.agents[&fixture.agent].driver.ledger()
-            .append_committed_for_test(7, &EntryKind::Data { payload: Vec::new() }).unwrap(), 3);
+        assert_eq!(
+            host.agents[&fixture.agent]
+                .driver
+                .ledger()
+                .append_committed_for_test(
+                    7,
+                    &EntryKind::Data {
+                        payload: Vec::new()
+                    }
+                )
+                .unwrap(),
+            3
+        );
         // Skipping committee-history reconstruction for no-ops must not skip
         // the full recovery audit of earlier durable physical evidence.
-        assert_eq!(host.apply_next(fixture.agent), Err(SharedAgentHostError::CorruptResidue));
+        assert_eq!(
+            host.apply_next(fixture.agent),
+            Err(SharedAgentHostError::CorruptResidue)
+        );
         assert_eq!(host.journal_position(fixture.agent).unwrap(), before);
     }
 
@@ -7978,11 +8294,19 @@ mod tests {
         let source_roots = host_a.lock().unwrap().merge_roots(fixture.agent).unwrap();
         network_b.connect(address);
         assert!(wait_until(std::time::Duration::from_secs(10), || {
-            let Ok(host) = host_b.lock() else { return false; };
+            let Ok(host) = host_b.lock() else {
+                return false;
+            };
             // A staged authenticated blob precedes integration of its merge
             // heads. Convergence requires both under one host observation.
-            host.merge_node(fixture.agent, event).ok().flatten().as_ref() == Some(&source)
-                && host.merge_roots(fixture.agent).is_ok_and(|roots| roots == source_roots)
+            host.merge_node(fixture.agent, event)
+                .ok()
+                .flatten()
+                .as_ref()
+                == Some(&source)
+                && host
+                    .merge_roots(fixture.agent)
+                    .is_ok_and(|roots| roots == source_roots)
         }));
         assert_eq!(
             host_a.lock().unwrap().merge_roots(fixture.agent).unwrap(),

@@ -2526,7 +2526,9 @@ impl ReplaySealedSharedGenesis {
             .validate()
             .map_err(|_| ReplayError::InvalidRecord)?;
         let proposal = provision.proposal();
-        let expected = prepared.ordinary_proposal().map_err(|_| ReplayError::InvalidRecord)?;
+        let expected = prepared
+            .ordinary_proposal()
+            .map_err(|_| ReplayError::InvalidRecord)?;
         let committee = provision.replicas();
         if proposal != &expected
             || committee.profile() != AgentProfile::Shared
@@ -17219,9 +17221,15 @@ pub(crate) mod tests {
             };
             let expected = replay_state_commitment(&state_with(original.clone()));
             for changed in &variants {
-                assert_ne!(expected, replay_state_commitment(&state_with(changed.clone())));
+                assert_ne!(
+                    expected,
+                    replay_state_commitment(&state_with(changed.clone()))
+                );
             }
-            assert!(!lane_commitments.contains(&expected), "lane identity must be bound");
+            assert!(
+                !lane_commitments.contains(&expected),
+                "lane identity must be bound"
+            );
             lane_commitments.push(expected);
         }
         // This proves byte binding only. Trust still requires an authenticated
@@ -19369,9 +19377,10 @@ pub(crate) mod tests {
                             .map(|_| ())
                             .ok_or(())
                     }
-                    crate::agent_sdk::InvocationAuthorization::PublicPreflight(_) => {
-                        authorization.matches_retirement(work).then_some(()).ok_or(())
-                    }
+                    crate::agent_sdk::InvocationAuthorization::PublicPreflight(_) => authorization
+                        .matches_retirement(work)
+                        .then_some(())
+                        .ok_or(()),
                 },
                 ReplayOperation::CleanManage {
                     request,
@@ -19603,16 +19612,36 @@ pub(crate) mod tests {
         let config = shared_admitted_config();
         let create = admitted_clean_create_input_for(&config, 0xc5);
         let mut executor = ExactCreateRejectInvocations::default();
-        let prepared = ReplayPreparedGenesis::prepare(create.clone(), config.replicas[0], &mut executor).unwrap();
+        let prepared =
+            ReplayPreparedGenesis::prepare(create.clone(), config.replicas[0], &mut executor)
+                .unwrap();
         let proposal = prepared.ordinary_proposal().unwrap();
         assert_eq!(executor.executions, 1);
         assert_eq!(proposal.create(), &create);
-        assert_eq!(proposal.locator(), AgentGenesisLocator { space: create.runtime.space, agent: create.runtime.agent });
+        assert_eq!(
+            proposal.locator(),
+            AgentGenesisLocator {
+                space: create.runtime.space,
+                agent: create.runtime.agent
+            }
+        );
         assert_eq!(proposal.catalog(), prepared.artifacts());
-        assert_eq!(proposal.expectations().runtime_binding(), create.runtime.commitment());
-        assert_eq!(proposal.expectations().post_create_state(), system_genesis_post_create_state_commitment(&prepared.post_create).unwrap());
-        assert_eq!(proposal.expectations().artifact_closure(), system_genesis_artifact_closure_commitment(prepared.artifacts()).unwrap());
-        assert_eq!(AgentGenesisProposal::decode(&proposal.encode()).unwrap(), proposal);
+        assert_eq!(
+            proposal.expectations().runtime_binding(),
+            create.runtime.commitment()
+        );
+        assert_eq!(
+            proposal.expectations().post_create_state(),
+            system_genesis_post_create_state_commitment(&prepared.post_create).unwrap()
+        );
+        assert_eq!(
+            proposal.expectations().artifact_closure(),
+            system_genesis_artifact_closure_commitment(prepared.artifacts()).unwrap()
+        );
+        assert_eq!(
+            AgentGenesisProposal::decode(&proposal.encode()).unwrap(),
+            proposal
+        );
         // The opaque prepared value remains reusable for subsequent sealing;
         // constructing a proposal neither publishes nor grants root identity.
         assert_eq!(prepared.ordinary_proposal().unwrap(), proposal);
@@ -22084,7 +22113,9 @@ pub(crate) mod tests {
             let mut rejected_executor = ExactCreateRejectInvocations::default();
             assert!(matches!(
                 materialize_current_reverified(
-                    &mut store, &mut rejected_executor, &NoPrunedOrderedBases,
+                    &mut store,
+                    &mut rejected_executor,
+                    &NoPrunedOrderedBases,
                 ),
                 Err(ReplayError::Source(
                     ReplayMaterializationSourceError::Journal(JournalStoreError::Unavailable)
@@ -22092,7 +22123,8 @@ pub(crate) mod tests {
             ));
             assert_eq!(rejected_executor.executions, 0);
         }
-        let reopened = materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        let reopened =
+            materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
         assert_eq!(reopened.state(), checkpointed.state());
         assert!(reopened.replayed_root().is_none());
         let ownership = GenesisInvocationOwnership {

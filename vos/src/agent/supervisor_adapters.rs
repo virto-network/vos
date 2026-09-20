@@ -6871,12 +6871,27 @@ mod tests {
             let bytes = match query.selector {
                 AuthorityProjectionSelector::Inventory { after, .. } => {
                     let consistent = inventory.consistent.load(Ordering::Acquire);
-                    let descriptors: Vec<_> = projections.iter().map(|projection| projection.descriptor().clone()).collect();
-                    let actors: Vec<_> = projections.iter().flat_map(|projection| projection.actors().iter().cloned()).collect();
+                    let descriptors: Vec<_> = projections
+                        .iter()
+                        .map(|projection| projection.descriptor().clone())
+                        .collect();
+                    let actors: Vec<_> = projections
+                        .iter()
+                        .flat_map(|projection| projection.actors().iter().cloned())
+                        .collect();
                     return super::super::production_owner::inventory_page_fixture(
-                        query, if !consistent && after.is_some() { owner_head(counter + 1) } else { head },
-                        PrincipalId([0xc3; 32]), &descriptors, &actors, if consistent { usize::MAX } else { 1 },
-                    ).map_err(|_| AgentRouteError::Rejected);
+                        query,
+                        if !consistent && after.is_some() {
+                            owner_head(counter + 1)
+                        } else {
+                            head
+                        },
+                        PrincipalId([0xc3; 32]),
+                        &descriptors,
+                        &actors,
+                        if consistent { usize::MAX } else { 1 },
+                    )
+                    .map_err(|_| AgentRouteError::Rejected);
                 }
                 AuthorityProjectionSelector::Credential => AuthorityCredentialProjection {
                     query,

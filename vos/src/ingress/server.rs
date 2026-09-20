@@ -1137,9 +1137,18 @@ mod tests {
             .header(http::header::CONTENT_TYPE, "application/octet-stream")
             .body(vec![0; MAX_BODY_BYTES + 1])
             .unwrap();
-        assert_eq!(handle_local_create(&request, &handle).status().as_u16(), 400);
-        assert_eq!(handle_local_install(&request, &handle).status().as_u16(), 400);
-        assert_eq!(handle_clean_invocation(&request, &handle).status().as_u16(), 413);
+        assert_eq!(
+            handle_local_create(&request, &handle).status().as_u16(),
+            400
+        );
+        assert_eq!(
+            handle_local_install(&request, &handle).status().as_u16(),
+            400
+        );
+        assert_eq!(
+            handle_clean_invocation(&request, &handle).status().as_u16(),
+            413
+        );
     }
 
     use super::*;
@@ -1152,7 +1161,11 @@ mod tests {
         let first = admit_lifecycle_upload(MAX_BODY_BYTES + 1, &budget).unwrap();
         let second = admit_lifecycle_upload(MAX_BODY_BYTES + 1, &budget).unwrap();
         assert!(admit_lifecycle_upload(MAX_BODY_BYTES + 1, &budget).is_err());
-        assert!(admit_lifecycle_upload(MAX_BODY_BYTES, &budget).unwrap().is_none());
+        assert!(
+            admit_lifecycle_upload(MAX_BODY_BYTES, &budget)
+                .unwrap()
+                .is_none()
+        );
         drop(first);
         let replacement = admit_lifecycle_upload(MAX_BODY_BYTES + 1, &budget).unwrap();
         drop((second, replacement));
@@ -1171,18 +1184,25 @@ mod tests {
         ] {
             let (mut client, server) = tokio::io::duplex(2 * MAX_BODY_BYTES);
             let serving = tokio::spawn(serve_connection(
-                server, node.ingress_handle(), Arc::new(Inner::new(0)),
+                server,
+                node.ingress_handle(),
+                Arc::new(Inner::new(0)),
                 Arc::new(Semaphore::new(2)),
             ));
             let body = vec![0; MAX_BODY_BYTES + 1];
-            let headers = format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            let headers = format!(
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
             client.write_all(headers.as_bytes()).await.unwrap();
             if expected.ends_with("400") {
                 client.write_all(&body).await.unwrap();
             }
             let mut response = String::new();
             tokio::time::timeout(Duration::from_secs(5), client.read_to_string(&mut response))
-                .await.unwrap().unwrap();
+                .await
+                .unwrap()
+                .unwrap();
             assert!(response.starts_with(expected), "{path}: {response}");
             serving.await.unwrap();
         }

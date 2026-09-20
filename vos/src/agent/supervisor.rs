@@ -470,9 +470,17 @@ impl AgentSupervisorHandle {
             Ok(admission) => admission,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if self.shared.state.compare_exchange(
-            SUPERVISOR_RUNNING, SUPERVISOR_CLOSING, Ordering::AcqRel, Ordering::Acquire,
-        ).is_ok() {
+        if self
+            .shared
+            .state
+            .compare_exchange(
+                SUPERVISOR_RUNNING,
+                SUPERVISOR_CLOSING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
             self.shared.clear_publication();
             let _ = self.shared.commands.try_send(Command::Wake);
         }

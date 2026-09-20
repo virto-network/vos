@@ -308,7 +308,9 @@ impl StoreRole {
             Self::OrdinaryGenesisQuery => "ordinary-agent.genesis-query.next",
             Self::OrdinaryGenesisReply => "ordinary-agent.genesis-reply.next",
             Self::OrdinaryGenesisPublication => "ordinary-agent.genesis-publication.next",
-            Self::OrdinaryGenesisPublicationReply => "ordinary-agent.genesis-publication-reply.next",
+            Self::OrdinaryGenesisPublicationReply => {
+                "ordinary-agent.genesis-publication-reply.next"
+            }
         }
     }
 
@@ -361,16 +363,32 @@ impl StoreRole {
             Self::Bootstrap => MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES,
             Self::ManagementIssuer => MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
             Self::GenesisArchive => MAX_CLEAN_SYSTEM_AGENT_GENESIS_ARCHIVE_BYTES,
-            Self::OrdinaryGenesisArchive => vos::agent::genesis::MAX_AGENT_GENESIS_ARCHIVE_RECORD_BYTES,
-            Self::OrdinaryGenesisSignature => vos::agent::clean_authority_issuer::MAX_CLEAN_GENESIS_SIGNATURE_IMAGE_BYTES,
-            Self::OrdinaryGenesisQuery => vos::agent::clean_authority_issuer::MAX_CLEAN_GENESIS_QUERY_IMAGE_BYTES,
-            Self::OrdinaryGenesisReply => vos::agent::clean_authority_issuer::MAX_CLEAN_GENESIS_REPLY_IMAGE_BYTES,
-            Self::OrdinaryGenesisPublication => vos::agent::clean_authority_issuer::MAX_CLEAN_GENESIS_PUBLICATION_IMAGE_BYTES,
-            Self::OrdinaryGenesisPublicationReply => vos::agent::clean_authority_issuer::MAX_CLEAN_GENESIS_PUBLICATION_REPLY_IMAGE_BYTES,
+            Self::OrdinaryGenesisArchive => {
+                vos::agent::genesis::MAX_AGENT_GENESIS_ARCHIVE_RECORD_BYTES
+            }
+            Self::OrdinaryGenesisSignature => {
+                vos::agent::clean_authority_issuer::MAX_CLEAN_GENESIS_SIGNATURE_IMAGE_BYTES
+            }
+            Self::OrdinaryGenesisQuery => {
+                vos::agent::clean_authority_issuer::MAX_CLEAN_GENESIS_QUERY_IMAGE_BYTES
+            }
+            Self::OrdinaryGenesisReply => {
+                vos::agent::clean_authority_issuer::MAX_CLEAN_GENESIS_REPLY_IMAGE_BYTES
+            }
+            Self::OrdinaryGenesisPublication => {
+                vos::agent::clean_authority_issuer::MAX_CLEAN_GENESIS_PUBLICATION_IMAGE_BYTES
+            }
+            Self::OrdinaryGenesisPublicationReply => {
+                vos::agent::clean_authority_issuer::MAX_CLEAN_GENESIS_PUBLICATION_REPLY_IMAGE_BYTES
+            }
             Self::ManagementIntent => MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES,
             Self::LifecycleIssuer => MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
-            Self::LocalCreateRequest => vos::agent::local_lifecycle::LocalCreateSubmission::MAX_BYTES,
-            Self::LocalInstallRequest => vos::agent::local_lifecycle::LocalInstallSubmission::MAX_BYTES,
+            Self::LocalCreateRequest => {
+                vos::agent::local_lifecycle::LocalCreateSubmission::MAX_BYTES
+            }
+            Self::LocalInstallRequest => {
+                vos::agent::local_lifecycle::LocalInstallSubmission::MAX_BYTES
+            }
             Self::InvocationRequest => super::local_invocation::MAX_REQUEST_BYTES,
             Self::InvocationResponse => super::local_invocation::MAX_RESPONSE_BYTES,
             Self::InvocationProgress => super::invocation_progress::MAX_PROGRESS_BYTES,
@@ -549,21 +567,43 @@ impl CleanAgentGenesisArchiveFile {
         parent: &Path,
         locator: vos::agent::genesis::AgentGenesisLocator,
     ) -> Result<Self, CleanFileStoreError> {
-        locator.validate().map_err(|_| CleanFileStoreError::Corrupt)?;
-        let path = parent.join(format!("genesis-{}-{}", hex::encode(locator.space.0), hex::encode(locator.agent.0)));
-        let root = Arc::new(StoreRoot::open_with_entries(&path, &[
-            LOCK_FILE, "ordinary-agent.genesis-archive", "ordinary-agent.genesis-archive.next",
-        ])?);
-        Ok(Self { locator, store: Mutex::new(ExactFileStore::new(root, StoreRole::OrdinaryGenesisArchive)) })
+        locator
+            .validate()
+            .map_err(|_| CleanFileStoreError::Corrupt)?;
+        let path = parent.join(format!(
+            "genesis-{}-{}",
+            hex::encode(locator.space.0),
+            hex::encode(locator.agent.0)
+        ));
+        let root = Arc::new(StoreRoot::open_with_entries(
+            &path,
+            &[
+                LOCK_FILE,
+                "ordinary-agent.genesis-archive",
+                "ordinary-agent.genesis-archive.next",
+            ],
+        )?);
+        Ok(Self {
+            locator,
+            store: Mutex::new(ExactFileStore::new(root, StoreRole::OrdinaryGenesisArchive)),
+        })
     }
 }
 
 impl vos::agent::genesis_archive::AgentGenesisArchiveStore for CleanAgentGenesisArchiveFile {
     type Error = CleanFileStoreError;
 
-    fn load(&self, locator: vos::agent::genesis::AgentGenesisLocator) -> Result<Option<Vec<u8>>, Self::Error> {
-        if locator != self.locator { return Err(CleanFileStoreError::Corrupt); }
-        let mut file = self.store.lock().map_err(|_| CleanFileStoreError::LockPoisoned)?;
+    fn load(
+        &self,
+        locator: vos::agent::genesis::AgentGenesisLocator,
+    ) -> Result<Option<Vec<u8>>, Self::Error> {
+        if locator != self.locator {
+            return Err(CleanFileStoreError::Corrupt);
+        }
+        let mut file = self
+            .store
+            .lock()
+            .map_err(|_| CleanFileStoreError::LockPoisoned)?;
         let image = file.load(StoreRole::OrdinaryGenesisArchive.maximum_bytes())?;
         if let Some(bytes) = &image {
             // A prior rename may have succeeded before a directory-sync error.
@@ -573,12 +613,21 @@ impl vos::agent::genesis_archive::AgentGenesisArchiveStore for CleanAgentGenesis
         Ok(image)
     }
 
-    fn insert_if_absent(&self, locator: vos::agent::genesis::AgentGenesisLocator, record: &[u8]) -> Result<(), Self::Error> {
-        if locator != self.locator { return Err(CleanFileStoreError::Corrupt); }
+    fn insert_if_absent(
+        &self,
+        locator: vos::agent::genesis::AgentGenesisLocator,
+        record: &[u8],
+    ) -> Result<(), Self::Error> {
+        if locator != self.locator {
+            return Err(CleanFileStoreError::Corrupt);
+        }
         if record.len() > StoreRole::OrdinaryGenesisArchive.maximum_bytes() {
             return Err(CleanFileStoreError::Oversized);
         }
-        let mut file = self.store.lock().map_err(|_| CleanFileStoreError::LockPoisoned)?;
+        let mut file = self
+            .store
+            .lock()
+            .map_err(|_| CleanFileStoreError::LockPoisoned)?;
         let existing = file.load(StoreRole::OrdinaryGenesisArchive.maximum_bytes())?;
         // Immutable insertion returns the existing winner, even if different;
         // the provider reloads and reports Conflict without overwriting it.
@@ -596,10 +645,15 @@ pub(crate) struct CleanAgentGenesisSignatureFile(ExactFileStore);
 pub(crate) struct CleanAgentGenesisCommitteeFile(ExactFileStore);
 
 const GENESIS_COMMITTEE_ENTRIES: &[&str] = &[
-    LOCK_FILE, "ordinary-agent.genesis-query", "ordinary-agent.genesis-query.next",
-    "ordinary-agent.genesis-reply", "ordinary-agent.genesis-reply.next",
-    "ordinary-agent.genesis-publication", "ordinary-agent.genesis-publication.next",
-    "ordinary-agent.genesis-publication-reply", "ordinary-agent.genesis-publication-reply.next",
+    LOCK_FILE,
+    "ordinary-agent.genesis-query",
+    "ordinary-agent.genesis-query.next",
+    "ordinary-agent.genesis-reply",
+    "ordinary-agent.genesis-reply.next",
+    "ordinary-agent.genesis-publication",
+    "ordinary-agent.genesis-publication.next",
+    "ordinary-agent.genesis-publication-reply",
+    "ordinary-agent.genesis-publication-reply.next",
 ];
 
 /// Descriptor-pinned, space-scoped discovery under a dedicated private parent.
@@ -610,11 +664,15 @@ pub(crate) struct CleanAgentGenesisCommitteeStoreFactory {
     space: vos::service::SpaceId,
 }
 
-pub(crate) type CleanSharedGenesisRecovery = vos::agent::clean_bootstrap::NativeSharedGenesisRecovery<
-    CleanManagementIntentFile, CleanManagementIssuerFile,
-    CleanAgentGenesisCommitteeFile, CleanAgentGenesisCommitteeFile,
-    CleanAgentGenesisCommitteeFile, CleanAgentGenesisCommitteeFile,
->;
+pub(crate) type CleanSharedGenesisRecovery =
+    vos::agent::clean_bootstrap::NativeSharedGenesisRecovery<
+        CleanManagementIntentFile,
+        CleanManagementIssuerFile,
+        CleanAgentGenesisCommitteeFile,
+        CleanAgentGenesisCommitteeFile,
+        CleanAgentGenesisCommitteeFile,
+        CleanAgentGenesisCommitteeFile,
+    >;
 
 impl CleanAgentGenesisCommitteeStoreFactory {
     /// Discover the complete two-directory set before opening records. Returned
@@ -627,18 +685,30 @@ impl CleanAgentGenesisCommitteeStoreFactory {
         maximum: usize,
     ) -> Result<Vec<CleanSharedGenesisRecovery>, CleanFileStoreError> {
         use vos::agent::local_lifecycle::LocalLifecycleStoreFactory as _;
-        if !authority.is_valid() || authority.space.0 != self.space.0 { return Err(CleanFileStoreError::InvalidPath); }
+        if !authority.is_valid() || authority.space.0 != self.space.0 {
+            return Err(CleanFileStoreError::InvalidPath);
+        }
         let agents = lifecycle.discover(authority.space, maximum)?;
         let committees = self.discover(maximum)?;
         // Never silently ignore a query/reply whose owning Create is absent.
-        if committees.iter().any(|locator| agents.binary_search(&vos::agent::sdk::AgentId(locator.agent.0)).is_err()) {
+        if committees.iter().any(|locator| {
+            agents
+                .binary_search(&vos::agent::sdk::AgentId(locator.agent.0))
+                .is_err()
+        }) {
             return Err(CleanFileStoreError::UnexpectedResidue);
         }
         let mut recovered = Vec::with_capacity(agents.len());
         for agent in agents {
-            let locator = vos::agent::genesis::AgentGenesisLocator { space: self.space, agent: vos::service::AgentId(agent.0) };
+            let locator = vos::agent::genesis::AgentGenesisLocator {
+                space: self.space,
+                agent: vos::service::AgentId(agent.0),
+            };
             let (intent, issuer) = lifecycle.open_existing(authority.space, agent)?;
-            let (query, reply) = if committees.binary_search_by_key(&locator.agent, |found| found.agent).is_ok() {
+            let (query, reply) = if committees
+                .binary_search_by_key(&locator.agent, |found| found.agent)
+                .is_ok()
+            {
                 self.open_existing(locator)?
             } else {
                 // A crash may precede the first query reservation. Establish
@@ -650,18 +720,41 @@ impl CleanAgentGenesisCommitteeStoreFactory {
             };
             let publication = query.publication();
             let publication_reply = query.publication_reply();
-            recovered.push(CleanSharedGenesisRecovery::open(authority, locator, intent, issuer, query, reply, publication, publication_reply)
-                .map_err(|_| CleanFileStoreError::Corrupt)?);
+            recovered.push(
+                CleanSharedGenesisRecovery::open(
+                    authority,
+                    locator,
+                    intent,
+                    issuer,
+                    query,
+                    reply,
+                    publication,
+                    publication_reply,
+                )
+                .map_err(|_| CleanFileStoreError::Corrupt)?,
+            );
         }
         Ok(recovered)
     }
 
-    pub(crate) fn open_or_create(parent: &Path, space: vos::service::SpaceId) -> Result<Self, CleanFileStoreError> {
-        if space == vos::service::SpaceId::ZERO { return Err(CleanFileStoreError::InvalidPath); }
-        Ok(Self { parent: parent.to_path_buf(), directory: ensure_private_directory(parent)?, space })
+    pub(crate) fn open_or_create(
+        parent: &Path,
+        space: vos::service::SpaceId,
+    ) -> Result<Self, CleanFileStoreError> {
+        if space == vos::service::SpaceId::ZERO {
+            return Err(CleanFileStoreError::InvalidPath);
+        }
+        Ok(Self {
+            parent: parent.to_path_buf(),
+            directory: ensure_private_directory(parent)?,
+            space,
+        })
     }
 
-    pub(crate) fn discover(&self, maximum: usize) -> Result<Vec<vos::agent::genesis::AgentGenesisLocator>, CleanFileStoreError> {
+    pub(crate) fn discover(
+        &self,
+        maximum: usize,
+    ) -> Result<Vec<vos::agent::genesis::AgentGenesisLocator>, CleanFileStoreError> {
         validate_opened_directory(&self.directory, &self.parent, true)?;
         #[cfg(target_os = "linux")]
         let scan = PathBuf::from(format!("/proc/self/fd/{}", self.directory.as_raw_fd()));
@@ -671,16 +764,33 @@ impl CleanAgentGenesisCommitteeStoreFactory {
         let mut found = Vec::new();
         for entry in fs::read_dir(scan)? {
             let entry = entry?;
-            if found.len() == maximum { return Err(CleanFileStoreError::Oversized); }
-            let name = entry.file_name().into_string().map_err(|_| CleanFileStoreError::UnexpectedResidue)?;
-            let suffix = name.strip_prefix(&prefix).ok_or(CleanFileStoreError::UnexpectedResidue)?;
-            if suffix.len() != 64 || !suffix.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) {
+            if found.len() == maximum {
+                return Err(CleanFileStoreError::Oversized);
+            }
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| CleanFileStoreError::UnexpectedResidue)?;
+            let suffix = name
+                .strip_prefix(&prefix)
+                .ok_or(CleanFileStoreError::UnexpectedResidue)?;
+            if suffix.len() != 64
+                || !suffix
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+            {
                 return Err(CleanFileStoreError::UnexpectedResidue);
             }
             let mut bytes = [0; 32];
-            hex::decode_to_slice(suffix, &mut bytes).map_err(|_| CleanFileStoreError::UnexpectedResidue)?;
-            let locator = vos::agent::genesis::AgentGenesisLocator { space: self.space, agent: vos::service::AgentId(bytes) };
-            locator.validate().map_err(|_| CleanFileStoreError::UnexpectedResidue)?;
+            hex::decode_to_slice(suffix, &mut bytes)
+                .map_err(|_| CleanFileStoreError::UnexpectedResidue)?;
+            let locator = vos::agent::genesis::AgentGenesisLocator {
+                space: self.space,
+                agent: vos::service::AgentId(bytes),
+            };
+            locator
+                .validate()
+                .map_err(|_| CleanFileStoreError::UnexpectedResidue)?;
             let path = self.parent.join(&name);
             let directory = open_child_directory(&self.directory, &path)?;
             validate_opened_directory(&directory, &path, false)?;
@@ -688,43 +798,92 @@ impl CleanAgentGenesisCommitteeStoreFactory {
         }
         validate_opened_directory(&self.directory, &self.parent, true)?;
         found.sort_unstable_by_key(|locator| locator.agent);
-        if found.windows(2).any(|pair| pair[0] == pair[1]) { return Err(CleanFileStoreError::Alias); }
+        if found.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(CleanFileStoreError::Alias);
+        }
         Ok(found)
     }
 
-    pub(crate) fn open_existing(&self, locator: vos::agent::genesis::AgentGenesisLocator)
-        -> Result<(CleanAgentGenesisCommitteeFile, CleanAgentGenesisCommitteeFile), CleanFileStoreError> {
-        if locator.space != self.space { return Err(CleanFileStoreError::InvalidPath); }
-        locator.validate().map_err(|_| CleanFileStoreError::InvalidPath)?;
+    pub(crate) fn open_existing(
+        &self,
+        locator: vos::agent::genesis::AgentGenesisLocator,
+    ) -> Result<
+        (
+            CleanAgentGenesisCommitteeFile,
+            CleanAgentGenesisCommitteeFile,
+        ),
+        CleanFileStoreError,
+    > {
+        if locator.space != self.space {
+            return Err(CleanFileStoreError::InvalidPath);
+        }
+        locator
+            .validate()
+            .map_err(|_| CleanFileStoreError::InvalidPath)?;
         validate_opened_directory(&self.directory, &self.parent, true)?;
-        let path = self.parent.join(format!("genesis-committee-{}-{}", hex::encode(locator.space.0), hex::encode(locator.agent.0)));
-        let root = Arc::new(StoreRoot::open_with_entries_mode(&path, GENESIS_COMMITTEE_ENTRIES, false)?);
+        let path = self.parent.join(format!(
+            "genesis-committee-{}-{}",
+            hex::encode(locator.space.0),
+            hex::encode(locator.agent.0)
+        ));
+        let root = Arc::new(StoreRoot::open_with_entries_mode(
+            &path,
+            GENESIS_COMMITTEE_ENTRIES,
+            false,
+        )?);
         validate_opened_directory(&self.directory, &self.parent, true)?;
-        Ok((CleanAgentGenesisCommitteeFile(ExactFileStore::new(root.clone(), StoreRole::OrdinaryGenesisQuery)),
-            CleanAgentGenesisCommitteeFile(ExactFileStore::new(root, StoreRole::OrdinaryGenesisReply))))
+        Ok((
+            CleanAgentGenesisCommitteeFile(ExactFileStore::new(
+                root.clone(),
+                StoreRole::OrdinaryGenesisQuery,
+            )),
+            CleanAgentGenesisCommitteeFile(ExactFileStore::new(
+                root,
+                StoreRole::OrdinaryGenesisReply,
+            )),
+        ))
     }
 }
 
 impl CleanAgentGenesisCommitteeFile {
     /// Keep the same lifecycle lease alive for publication work retention.
     fn publication(&self) -> Self {
-        Self(ExactFileStore::new(self.0.root.clone(), StoreRole::OrdinaryGenesisPublication))
+        Self(ExactFileStore::new(
+            self.0.root.clone(),
+            StoreRole::OrdinaryGenesisPublication,
+        ))
     }
 
     fn publication_reply(&self) -> Self {
-        Self(ExactFileStore::new(self.0.root.clone(), StoreRole::OrdinaryGenesisPublicationReply))
+        Self(ExactFileStore::new(
+            self.0.root.clone(),
+            StoreRole::OrdinaryGenesisPublicationReply,
+        ))
     }
 
     pub(crate) fn open_pair(
         parent: &Path,
         locator: vos::agent::genesis::AgentGenesisLocator,
     ) -> Result<(Self, Self), CleanFileStoreError> {
-        locator.validate().map_err(|_| CleanFileStoreError::Corrupt)?;
-        let path = parent.join(format!("genesis-committee-{}-{}",
-            hex::encode(locator.space.0), hex::encode(locator.agent.0)));
-        let root = Arc::new(StoreRoot::open_with_entries(&path, GENESIS_COMMITTEE_ENTRIES)?);
-        Ok((Self(ExactFileStore::new(root.clone(), StoreRole::OrdinaryGenesisQuery)),
-            Self(ExactFileStore::new(root, StoreRole::OrdinaryGenesisReply))))
+        locator
+            .validate()
+            .map_err(|_| CleanFileStoreError::Corrupt)?;
+        let path = parent.join(format!(
+            "genesis-committee-{}-{}",
+            hex::encode(locator.space.0),
+            hex::encode(locator.agent.0)
+        ));
+        let root = Arc::new(StoreRoot::open_with_entries(
+            &path,
+            GENESIS_COMMITTEE_ENTRIES,
+        )?);
+        Ok((
+            Self(ExactFileStore::new(
+                root.clone(),
+                StoreRole::OrdinaryGenesisQuery,
+            )),
+            Self(ExactFileStore::new(root, StoreRole::OrdinaryGenesisReply)),
+        ))
     }
 }
 
@@ -744,21 +903,38 @@ impl CleanAgentGenesisSignatureFile {
         locator: vos::agent::genesis::AgentGenesisLocator,
         signer: vos::agent::committee::AuthoritySignerId,
     ) -> Result<Self, CleanFileStoreError> {
-        locator.validate().map_err(|_| CleanFileStoreError::Corrupt)?;
-        if signer.as_bytes() == &[0; 32] { return Err(CleanFileStoreError::Corrupt); }
-        let path = parent.join(format!("genesis-signature-{}-{}-{}",
-            hex::encode(locator.space.0), hex::encode(locator.agent.0), hex::encode(signer.as_bytes())));
-        let root = Arc::new(StoreRoot::open_with_entries(&path, &[
-            LOCK_FILE, "ordinary-agent.genesis-signature", "ordinary-agent.genesis-signature.next",
-        ])?);
-        Ok(Self(ExactFileStore::new(root, StoreRole::OrdinaryGenesisSignature)))
+        locator
+            .validate()
+            .map_err(|_| CleanFileStoreError::Corrupt)?;
+        if signer.as_bytes() == &[0; 32] {
+            return Err(CleanFileStoreError::Corrupt);
+        }
+        let path = parent.join(format!(
+            "genesis-signature-{}-{}-{}",
+            hex::encode(locator.space.0),
+            hex::encode(locator.agent.0),
+            hex::encode(signer.as_bytes())
+        ));
+        let root = Arc::new(StoreRoot::open_with_entries(
+            &path,
+            &[
+                LOCK_FILE,
+                "ordinary-agent.genesis-signature",
+                "ordinary-agent.genesis-signature.next",
+            ],
+        )?);
+        Ok(Self(ExactFileStore::new(
+            root,
+            StoreRole::OrdinaryGenesisSignature,
+        )))
     }
 }
 
 impl CleanManagementIssuerStore for CleanAgentGenesisSignatureFile {
     type Error = CleanFileStoreError;
     fn load(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
-        self.0.load(StoreRole::OrdinaryGenesisSignature.maximum_bytes())
+        self.0
+            .load(StoreRole::OrdinaryGenesisSignature.maximum_bytes())
     }
     fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
         self.0.commit(image)
@@ -3487,8 +3663,14 @@ pub(crate) mod tests {
         let fixture = Fixture::new("local-request");
         let first = local_request(2);
         let second = local_request(3);
-        assert_eq!(StoreRole::LocalCreateRequest.maximum_bytes(), vos::agent::local_lifecycle::LocalCreateSubmission::MAX_BYTES);
-        assert_eq!(StoreRole::LocalInstallRequest.maximum_bytes(), vos::agent::local_lifecycle::LocalInstallSubmission::MAX_BYTES);
+        assert_eq!(
+            StoreRole::LocalCreateRequest.maximum_bytes(),
+            vos::agent::local_lifecycle::LocalCreateSubmission::MAX_BYTES
+        );
+        assert_eq!(
+            StoreRole::LocalInstallRequest.maximum_bytes(),
+            vos::agent::local_lifecycle::LocalInstallSubmission::MAX_BYTES
+        );
         let mut store = CleanLocalCreateRequestFile::open_or_create(&fixture.root).unwrap();
         assert!(store.load().unwrap().is_none());
         assert!(matches!(
@@ -4347,65 +4529,109 @@ pub(crate) mod tests {
     #[ignore = "requires exported AUTHORITY_PUBLICATION_FIXTURE with runtime-catalog"]
     fn ordinary_genesis_provider_persists_signed_fixture_and_recovers_stage() {
         use vos::agent::execution::RuntimeBlob;
-        use vos::agent::genesis::{AgentGenesisArchiveRecord, AgentGenesisProvider, AgentGenesisProviderError, AgentGenesisProvision};
+        use vos::agent::genesis::{
+            AgentGenesisArchiveRecord, AgentGenesisProvider, AgentGenesisProviderError,
+            AgentGenesisProvision,
+        };
         use vos::agent::genesis_archive::ArchivedAgentGenesisProvider;
         use vos::service::ServiceWire as _;
         let source = PathBuf::from(std::env::var("AUTHORITY_PUBLICATION_FIXTURE").unwrap());
         let provision_bytes = fs::read(source.join("provision")).unwrap();
         let provision = AgentGenesisProvision::decode(&provision_bytes).unwrap();
         let runtime = fs::read(source.join("runtime-catalog")).unwrap();
-        let catalog = vec![RuntimeBlob { reference: vos::service::BlobRef::of_bytes(&runtime), bytes: runtime }];
+        let catalog = vec![RuntimeBlob {
+            reference: vos::service::BlobRef::of_bytes(&runtime),
+            bytes: runtime,
+        }];
         let record = AgentGenesisArchiveRecord::new(provision.clone(), catalog.clone()).unwrap();
         let locator = provision.proposal().locator();
         for staged in [false, true] {
             let fixture = Fixture::new("ordinary-genesis-provider-integration");
-            let store = CleanAgentGenesisArchiveFile::open_or_create(&fixture.parent, locator).unwrap();
+            let store =
+                CleanAgentGenesisArchiveFile::open_or_create(&fixture.parent, locator).unwrap();
             if staged {
                 stage(&store.store.lock().unwrap(), None, &record.encode());
                 drop(store);
             } else {
                 let provider = ArchivedAgentGenesisProvider::new(locator.space, store).unwrap();
-                assert_eq!(provider.reproduce(locator), Err(AgentGenesisProviderError::NotConfigured));
+                assert_eq!(
+                    provider.reproduce(locator),
+                    Err(AgentGenesisProviderError::NotConfigured)
+                );
                 provider.publish(&record).unwrap();
                 drop(provider);
             }
-            let store = CleanAgentGenesisArchiveFile::open_or_create(&fixture.parent, locator).unwrap();
+            let store =
+                CleanAgentGenesisArchiveFile::open_or_create(&fixture.parent, locator).unwrap();
             let provider = ArchivedAgentGenesisProvider::new(locator.space, store).unwrap();
-            assert_eq!(provider.reproduce(locator).unwrap().encode(), provision_bytes);
+            assert_eq!(
+                provider.reproduce(locator).unwrap().encode(),
+                provision_bytes
+            );
             provider.publish(&record).unwrap();
-            assert_eq!(provider.create(provision.proposal(), &catalog).unwrap(), provision);
-            assert_eq!(provider.load_catalog(locator, &catalog[0].reference).unwrap(), Some(catalog[0].bytes.clone()));
+            assert_eq!(
+                provider.create(provision.proposal(), &catalog).unwrap(),
+                provision
+            );
+            assert_eq!(
+                provider
+                    .load_catalog(locator, &catalog[0].reference)
+                    .unwrap(),
+                Some(catalog[0].bytes.clone())
+            );
             let mut corrupt_catalog = catalog.clone();
             corrupt_catalog[0].bytes.push(0);
-            assert_eq!(provider.create(provision.proposal(), &corrupt_catalog), Err(AgentGenesisProviderError::Refused));
+            assert_eq!(
+                provider.create(provision.proposal(), &corrupt_catalog),
+                Err(AgentGenesisProviderError::Refused)
+            );
             assert_eq!(provider.reproduce(locator).unwrap(), provision);
             drop(provider);
-            let store = CleanAgentGenesisArchiveFile::open_or_create(&fixture.parent, locator).unwrap();
+            let store =
+                CleanAgentGenesisArchiveFile::open_or_create(&fixture.parent, locator).unwrap();
             let provider = ArchivedAgentGenesisProvider::new(locator.space, store).unwrap();
-            assert_eq!(provider.reproduce(locator).unwrap().encode(), provision_bytes);
+            assert_eq!(
+                provider.reproduce(locator).unwrap().encode(),
+                provision_bytes
+            );
         }
     }
 
     #[test]
     fn ordinary_genesis_signature_is_leased_bounded_and_reopens() {
-        use vos::agent::genesis::AgentGenesisLocator;
         use vos::agent::committee::AuthoritySignerId;
+        use vos::agent::genesis::AgentGenesisLocator;
         let fixture = Fixture::new("ordinary-genesis-signature");
-        let locator = AgentGenesisLocator { space: vos::service::SpaceId([1; 32]), agent: vos::service::AgentId([2; 32]) };
+        let locator = AgentGenesisLocator {
+            space: vos::service::SpaceId([1; 32]),
+            agent: vos::service::AgentId([2; 32]),
+        };
         let signer = AuthoritySignerId::of_raw_ed25519(&[3; 32]);
-        let mut file = CleanAgentGenesisSignatureFile::open_or_create(&fixture.parent, locator, signer).unwrap();
-        assert!(matches!(CleanAgentGenesisSignatureFile::open_or_create(&fixture.parent, locator, signer), Err(CleanFileStoreError::Busy)));
+        let mut file =
+            CleanAgentGenesisSignatureFile::open_or_create(&fixture.parent, locator, signer)
+                .unwrap();
+        assert!(matches!(
+            CleanAgentGenesisSignatureFile::open_or_create(&fixture.parent, locator, signer),
+            Err(CleanFileStoreError::Busy)
+        ));
         let other = AuthoritySignerId::of_raw_ed25519(&[4; 32]);
-        let mut independent = CleanAgentGenesisSignatureFile::open_or_create(&fixture.parent, locator, other).unwrap();
+        let mut independent =
+            CleanAgentGenesisSignatureFile::open_or_create(&fixture.parent, locator, other)
+                .unwrap();
         assert_eq!(independent.load().unwrap(), None);
         let pledge = vec![0x11; 100];
         let signed = vec![0x22; 164];
         file.commit(&pledge).unwrap();
         file.commit(&signed).unwrap();
-        assert!(matches!(file.commit(&vec![0; 165]), Err(CleanFileStoreError::Oversized)));
+        assert!(matches!(
+            file.commit(&vec![0; 165]),
+            Err(CleanFileStoreError::Oversized)
+        ));
         assert_eq!(file.load().unwrap(), Some(signed.clone()));
         drop(file);
-        let mut file = CleanAgentGenesisSignatureFile::open_or_create(&fixture.parent, locator, signer).unwrap();
+        let mut file =
+            CleanAgentGenesisSignatureFile::open_or_create(&fixture.parent, locator, signer)
+                .unwrap();
         assert_eq!(file.load().unwrap(), Some(signed));
         assert_eq!(independent.load().unwrap(), None);
     }
@@ -4414,55 +4640,98 @@ pub(crate) mod tests {
     fn ordinary_genesis_committee_pair_is_immutable_bounded_and_jointly_leased() {
         let fixture = Fixture::new("ordinary-genesis-committee-pair");
         let locator = vos::agent::genesis::AgentGenesisLocator {
-            space: vos::service::SpaceId([1; 32]), agent: vos::service::AgentId([2; 32]),
+            space: vos::service::SpaceId([1; 32]),
+            agent: vos::service::AgentId([2; 32]),
         };
-        let (mut query, mut reply) = CleanAgentGenesisCommitteeFile::open_pair(&fixture.parent, locator).unwrap();
+        let (mut query, mut reply) =
+            CleanAgentGenesisCommitteeFile::open_pair(&fixture.parent, locator).unwrap();
         let mut publication = query.publication();
         let mut publication_reply = query.publication_reply();
-        for file in [&mut query, &mut reply, &mut publication, &mut publication_reply] {
+        for file in [
+            &mut query,
+            &mut reply,
+            &mut publication,
+            &mut publication_reply,
+        ] {
             assert_eq!(file.load().unwrap(), None);
             file.commit(&[1, 2, 3]).unwrap();
             file.commit(&[1, 2, 3]).unwrap();
-            assert!(matches!(file.commit(&[4]), Err(CleanFileStoreError::RequestConflict)));
-            assert!(matches!(file.commit(&vec![0; file.0.role.maximum_bytes() + 1]), Err(CleanFileStoreError::Oversized)));
+            assert!(matches!(
+                file.commit(&[4]),
+                Err(CleanFileStoreError::RequestConflict)
+            ));
+            assert!(matches!(
+                file.commit(&vec![0; file.0.role.maximum_bytes() + 1]),
+                Err(CleanFileStoreError::Oversized)
+            ));
             assert_eq!(file.load().unwrap(), Some(vec![1, 2, 3]));
         }
         drop(query);
-        assert!(matches!(CleanAgentGenesisCommitteeFile::open_pair(&fixture.parent, locator), Err(CleanFileStoreError::Busy)));
+        assert!(matches!(
+            CleanAgentGenesisCommitteeFile::open_pair(&fixture.parent, locator),
+            Err(CleanFileStoreError::Busy)
+        ));
         drop(reply);
-        assert!(matches!(CleanAgentGenesisCommitteeFile::open_pair(&fixture.parent, locator), Err(CleanFileStoreError::Busy)));
+        assert!(matches!(
+            CleanAgentGenesisCommitteeFile::open_pair(&fixture.parent, locator),
+            Err(CleanFileStoreError::Busy)
+        ));
         drop(publication);
-        assert!(matches!(CleanAgentGenesisCommitteeFile::open_pair(&fixture.parent, locator), Err(CleanFileStoreError::Busy)));
+        assert!(matches!(
+            CleanAgentGenesisCommitteeFile::open_pair(&fixture.parent, locator),
+            Err(CleanFileStoreError::Busy)
+        ));
         drop(publication_reply);
-        let (mut query, mut reply) = CleanAgentGenesisCommitteeFile::open_pair(&fixture.parent, locator).unwrap();
+        let (mut query, mut reply) =
+            CleanAgentGenesisCommitteeFile::open_pair(&fixture.parent, locator).unwrap();
         assert_eq!(query.load().unwrap(), Some(vec![1, 2, 3]));
         assert_eq!(reply.load().unwrap(), Some(vec![1, 2, 3]));
         assert_eq!(query.publication().load().unwrap(), Some(vec![1, 2, 3]));
-        assert_eq!(query.publication_reply().load().unwrap(), Some(vec![1, 2, 3]));
+        assert_eq!(
+            query.publication_reply().load().unwrap(),
+            Some(vec![1, 2, 3])
+        );
     }
 
     #[test]
     fn ordinary_genesis_publication_recovers_stage_and_refuses_replacement() {
         for is_reply in [false, true] {
-        let fixture = Fixture::new("ordinary-genesis-publication-stage");
-        let locator = vos::agent::genesis::AgentGenesisLocator {
-            space: vos::service::SpaceId([1; 32]), agent: vos::service::AgentId([2; 32]),
-        };
-        let pair = CleanAgentGenesisCommitteeFile::open_pair(&fixture.parent, locator).unwrap();
-        let publication = if is_reply { pair.0.publication_reply() } else { pair.0.publication() };
-        stage(&publication.0, None, &[1, 2, 3]);
-        drop(publication);
-        drop(pair);
-        let pair = CleanAgentGenesisCommitteeFile::open_pair(&fixture.parent, locator).unwrap();
-        let mut publication = if is_reply { pair.0.publication_reply() } else { pair.0.publication() };
-        assert_eq!(publication.load().unwrap(), Some(vec![1, 2, 3]));
-        let current = publication.0.reconcile(publication.0.role.maximum_bytes()).unwrap().unwrap();
-        stage(&publication.0, Some(current.commitment()), &[4]);
-        drop(publication);
-        drop(pair);
-        let pair = CleanAgentGenesisCommitteeFile::open_pair(&fixture.parent, locator).unwrap();
-        let mut publication = if is_reply { pair.0.publication_reply() } else { pair.0.publication() };
-        assert!(publication.load().is_err());
+            let fixture = Fixture::new("ordinary-genesis-publication-stage");
+            let locator = vos::agent::genesis::AgentGenesisLocator {
+                space: vos::service::SpaceId([1; 32]),
+                agent: vos::service::AgentId([2; 32]),
+            };
+            let pair = CleanAgentGenesisCommitteeFile::open_pair(&fixture.parent, locator).unwrap();
+            let publication = if is_reply {
+                pair.0.publication_reply()
+            } else {
+                pair.0.publication()
+            };
+            stage(&publication.0, None, &[1, 2, 3]);
+            drop(publication);
+            drop(pair);
+            let pair = CleanAgentGenesisCommitteeFile::open_pair(&fixture.parent, locator).unwrap();
+            let mut publication = if is_reply {
+                pair.0.publication_reply()
+            } else {
+                pair.0.publication()
+            };
+            assert_eq!(publication.load().unwrap(), Some(vec![1, 2, 3]));
+            let current = publication
+                .0
+                .reconcile(publication.0.role.maximum_bytes())
+                .unwrap()
+                .unwrap();
+            stage(&publication.0, Some(current.commitment()), &[4]);
+            drop(publication);
+            drop(pair);
+            let pair = CleanAgentGenesisCommitteeFile::open_pair(&fixture.parent, locator).unwrap();
+            let mut publication = if is_reply {
+                pair.0.publication_reply()
+            } else {
+                pair.0.publication()
+            };
+            assert!(publication.load().is_err());
         }
     }
 
@@ -4471,22 +4740,38 @@ pub(crate) mod tests {
         let fixture = Fixture::new("ordinary-genesis-discovery");
         let parent = fixture.parent.join("committee");
         let space = vos::service::SpaceId([1; 32]);
-        let factory = CleanAgentGenesisCommitteeStoreFactory::open_or_create(&parent, space).unwrap();
+        let factory =
+            CleanAgentGenesisCommitteeStoreFactory::open_or_create(&parent, space).unwrap();
         assert!(factory.discover(0).unwrap().is_empty());
-        let low = vos::agent::genesis::AgentGenesisLocator { space, agent: vos::service::AgentId([2; 32]) };
-        let high = vos::agent::genesis::AgentGenesisLocator { space, agent: vos::service::AgentId([3; 32]) };
+        let low = vos::agent::genesis::AgentGenesisLocator {
+            space,
+            agent: vos::service::AgentId([2; 32]),
+        };
+        let high = vos::agent::genesis::AgentGenesisLocator {
+            space,
+            agent: vos::service::AgentId([3; 32]),
+        };
         assert!(factory.open_existing(low).is_err());
         assert!(factory.discover(0).unwrap().is_empty());
         let high_files = CleanAgentGenesisCommitteeFile::open_pair(&parent, high).unwrap();
         let low_files = CleanAgentGenesisCommitteeFile::open_pair(&parent, low).unwrap();
         assert_eq!(factory.discover(2).unwrap(), vec![low, high]);
-        assert!(matches!(factory.discover(1), Err(CleanFileStoreError::Oversized)));
-        assert!(matches!(factory.open_existing(low), Err(CleanFileStoreError::Busy)));
+        assert!(matches!(
+            factory.discover(1),
+            Err(CleanFileStoreError::Oversized)
+        ));
+        assert!(matches!(
+            factory.open_existing(low),
+            Err(CleanFileStoreError::Busy)
+        ));
         drop(low_files);
         let mut reopened = factory.open_existing(low).unwrap();
         assert_eq!(reopened.0.load().unwrap(), None);
         assert_eq!(reopened.1.load().unwrap(), None);
-        let foreign = vos::agent::genesis::AgentGenesisLocator { space: vos::service::SpaceId([9; 32]), ..low };
+        let foreign = vos::agent::genesis::AgentGenesisLocator {
+            space: vos::service::SpaceId([9; 32]),
+            ..low
+        };
         assert!(factory.open_existing(foreign).is_err());
         drop(high_files);
     }
@@ -4498,29 +4783,65 @@ pub(crate) mod tests {
         let (_, authority, _, _) = super::super::local_create::tests::fixture();
         let space = vos::service::SpaceId(authority.space.0);
         let parent = fixture.parent.join("committee");
-        let factory = CleanAgentGenesisCommitteeStoreFactory::open_or_create(&parent, space).unwrap();
-        let mut lifecycle = CleanManagementLifecycleStoreFactory::open_or_create(fixture.parent.join("lifecycle"), authority.space).unwrap();
-        assert!(factory.discover_recovery(&mut lifecycle, authority, 0).unwrap().is_empty());
+        let factory =
+            CleanAgentGenesisCommitteeStoreFactory::open_or_create(&parent, space).unwrap();
+        let mut lifecycle = CleanManagementLifecycleStoreFactory::open_or_create(
+            fixture.parent.join("lifecycle"),
+            authority.space,
+        )
+        .unwrap();
+        assert!(
+            factory
+                .discover_recovery(&mut lifecycle, authority, 0)
+                .unwrap()
+                .is_empty()
+        );
         let agent = vos::agent::sdk::AgentId([2; 32]);
-        let locator = vos::agent::genesis::AgentGenesisLocator { space, agent: vos::service::AgentId(agent.0) };
+        let locator = vos::agent::genesis::AgentGenesisLocator {
+            space,
+            agent: vos::service::AgentId(agent.0),
+        };
         let files = CleanAgentGenesisCommitteeFile::open_pair(&parent, locator).unwrap();
-        assert!(matches!(factory.discover_recovery(&mut lifecycle, authority, 4), Err(CleanFileStoreError::UnexpectedResidue)));
+        assert!(matches!(
+            factory.discover_recovery(&mut lifecycle, authority, 4),
+            Err(CleanFileStoreError::UnexpectedResidue)
+        ));
         drop(files);
         let (mut intent, issuer) = lifecycle.open(authority.space, agent).unwrap();
         intent.commit(b"invalid signed intent").unwrap();
         drop((intent, issuer));
-        assert!(matches!(factory.discover_recovery(&mut lifecycle, authority, 4), Err(CleanFileStoreError::Corrupt)));
+        assert!(matches!(
+            factory.discover_recovery(&mut lifecycle, authority, 4),
+            Err(CleanFileStoreError::Corrupt)
+        ));
         let files = factory.open_existing(locator).unwrap();
-        files.0.publication().commit(b"retained publication phase").unwrap();
+        files
+            .0
+            .publication()
+            .commit(b"retained publication phase")
+            .unwrap();
         drop(files);
-        assert!(matches!(factory.discover_recovery(&mut lifecycle, authority, 4), Err(CleanFileStoreError::Corrupt)));
+        assert!(matches!(
+            factory.discover_recovery(&mut lifecycle, authority, 4),
+            Err(CleanFileStoreError::Corrupt)
+        ));
         let files = factory.open_existing(locator).unwrap();
-        files.0.publication_reply().commit(b"retained publication reply").unwrap();
+        files
+            .0
+            .publication_reply()
+            .commit(b"retained publication reply")
+            .unwrap();
         drop(files);
-        assert!(matches!(factory.discover_recovery(&mut lifecycle, authority, 4), Err(CleanFileStoreError::Corrupt)));
+        assert!(matches!(
+            factory.discover_recovery(&mut lifecycle, authority, 4),
+            Err(CleanFileStoreError::Corrupt)
+        ));
         // A failed scan releases its acquired leases but preserves exact data.
         let (mut intent, _issuer) = lifecycle.open_existing(authority.space, agent).unwrap();
-        assert_eq!(intent.load().unwrap(), Some(b"invalid signed intent".to_vec()));
+        assert_eq!(
+            intent.load().unwrap(),
+            Some(b"invalid signed intent".to_vec())
+        );
         let _files = factory.open_existing(locator).unwrap();
     }
 
@@ -4528,15 +4849,30 @@ pub(crate) mod tests {
     fn ordinary_genesis_committee_discovery_refuses_foreign_space_and_symlinks() {
         let fixture = Fixture::new("ordinary-genesis-discovery-foreign");
         let parent = fixture.parent.join("committee");
-        let factory = CleanAgentGenesisCommitteeStoreFactory::open_or_create(&parent, vos::service::SpaceId([1; 32])).unwrap();
-        let foreign = vos::agent::genesis::AgentGenesisLocator { space: vos::service::SpaceId([9; 32]), agent: vos::service::AgentId([2; 32]) };
+        let factory = CleanAgentGenesisCommitteeStoreFactory::open_or_create(
+            &parent,
+            vos::service::SpaceId([1; 32]),
+        )
+        .unwrap();
+        let foreign = vos::agent::genesis::AgentGenesisLocator {
+            space: vos::service::SpaceId([9; 32]),
+            agent: vos::service::AgentId([2; 32]),
+        };
         let _files = CleanAgentGenesisCommitteeFile::open_pair(&parent, foreign).unwrap();
-        assert!(matches!(factory.discover(4), Err(CleanFileStoreError::UnexpectedResidue)));
+        assert!(matches!(
+            factory.discover(4),
+            Err(CleanFileStoreError::UnexpectedResidue)
+        ));
         let fixture = Fixture::new("ordinary-genesis-discovery-symlink");
         let parent = fixture.parent.join("committee");
         let space = vos::service::SpaceId([1; 32]);
-        let factory = CleanAgentGenesisCommitteeStoreFactory::open_or_create(&parent, space).unwrap();
-        let name = format!("genesis-committee-{}-{}", hex::encode(space.0), hex::encode([2; 32]));
+        let factory =
+            CleanAgentGenesisCommitteeStoreFactory::open_or_create(&parent, space).unwrap();
+        let name = format!(
+            "genesis-committee-{}-{}",
+            hex::encode(space.0),
+            hex::encode([2; 32])
+        );
         std::os::unix::fs::symlink(&fixture.parent, parent.join(name)).unwrap();
         assert!(factory.discover(4).is_err());
     }
@@ -4546,19 +4882,26 @@ pub(crate) mod tests {
         for query_role in [true, false] {
             let fixture = Fixture::new("ordinary-genesis-committee-stage");
             let locator = vos::agent::genesis::AgentGenesisLocator {
-                space: vos::service::SpaceId([1; 32]), agent: vos::service::AgentId([2; 32]),
+                space: vos::service::SpaceId([1; 32]),
+                agent: vos::service::AgentId([2; 32]),
             };
             let pair = CleanAgentGenesisCommitteeFile::open_pair(&fixture.parent, locator).unwrap();
             let file = if query_role { &pair.0 } else { &pair.1 };
             stage(&file.0, None, &[1, 2, 3]);
             drop(pair);
-            let mut pair = CleanAgentGenesisCommitteeFile::open_pair(&fixture.parent, locator).unwrap();
+            let mut pair =
+                CleanAgentGenesisCommitteeFile::open_pair(&fixture.parent, locator).unwrap();
             let file = if query_role { &mut pair.0 } else { &mut pair.1 };
             assert_eq!(file.load().unwrap(), Some(vec![1, 2, 3]));
-            let current = file.0.reconcile(file.0.role.maximum_bytes()).unwrap().unwrap();
+            let current = file
+                .0
+                .reconcile(file.0.role.maximum_bytes())
+                .unwrap()
+                .unwrap();
             stage(&file.0, Some(current.commitment()), &[4]);
             drop(pair);
-            let mut pair = CleanAgentGenesisCommitteeFile::open_pair(&fixture.parent, locator).unwrap();
+            let mut pair =
+                CleanAgentGenesisCommitteeFile::open_pair(&fixture.parent, locator).unwrap();
             let file = if query_role { &mut pair.0 } else { &mut pair.1 };
             assert!(file.load().is_err());
         }
@@ -4566,27 +4909,41 @@ pub(crate) mod tests {
 
     #[test]
     fn ordinary_genesis_signature_recovers_matching_stage_and_refuses_stale_stage() {
-        use vos::agent::genesis::AgentGenesisLocator;
         use vos::agent::committee::AuthoritySignerId;
+        use vos::agent::genesis::AgentGenesisLocator;
         let fixture = Fixture::new("ordinary-genesis-signature-stage");
-        let locator = AgentGenesisLocator { space: vos::service::SpaceId([1; 32]), agent: vos::service::AgentId([2; 32]) };
+        let locator = AgentGenesisLocator {
+            space: vos::service::SpaceId([1; 32]),
+            agent: vos::service::AgentId([2; 32]),
+        };
         let signer = AuthoritySignerId::of_raw_ed25519(&[3; 32]);
-        let file = CleanAgentGenesisSignatureFile::open_or_create(&fixture.parent, locator, signer).unwrap();
+        let file = CleanAgentGenesisSignatureFile::open_or_create(&fixture.parent, locator, signer)
+            .unwrap();
         let pledge = vec![0x11; 100];
         stage(&file.0, None, &pledge);
         drop(file);
-        let mut file = CleanAgentGenesisSignatureFile::open_or_create(&fixture.parent, locator, signer).unwrap();
+        let mut file =
+            CleanAgentGenesisSignatureFile::open_or_create(&fixture.parent, locator, signer)
+                .unwrap();
         assert_eq!(file.load().unwrap(), Some(pledge));
-        let current = file.0.reconcile(StoreRole::OrdinaryGenesisSignature.maximum_bytes()).unwrap().unwrap();
+        let current = file
+            .0
+            .reconcile(StoreRole::OrdinaryGenesisSignature.maximum_bytes())
+            .unwrap()
+            .unwrap();
         let predecessor = current.commitment();
         let signed = vec![0x22; 164];
         stage(&file.0, Some(predecessor), &signed);
         drop(file);
-        let mut file = CleanAgentGenesisSignatureFile::open_or_create(&fixture.parent, locator, signer).unwrap();
+        let mut file =
+            CleanAgentGenesisSignatureFile::open_or_create(&fixture.parent, locator, signer)
+                .unwrap();
         assert_eq!(file.load().unwrap(), Some(signed));
         stage(&file.0, Some(predecessor), &[0x33; 100]);
         drop(file);
-        let mut file = CleanAgentGenesisSignatureFile::open_or_create(&fixture.parent, locator, signer).unwrap();
+        let mut file =
+            CleanAgentGenesisSignatureFile::open_or_create(&fixture.parent, locator, signer)
+                .unwrap();
         assert!(file.load().is_err());
     }
 
@@ -4595,17 +4952,38 @@ pub(crate) mod tests {
         use vos::agent::genesis::AgentGenesisLocator;
         use vos::agent::genesis_archive::AgentGenesisArchiveStore;
         let fixture = Fixture::new("ordinary-genesis-immutable");
-        let locator = AgentGenesisLocator { space: vos::service::SpaceId([1; 32]), agent: vos::service::AgentId([2; 32]) };
-        let archive = CleanAgentGenesisArchiveFile::open_or_create(&fixture.parent, locator).unwrap();
-        assert!(matches!(CleanAgentGenesisArchiveFile::open_or_create(&fixture.parent, locator), Err(CleanFileStoreError::Busy)));
+        let locator = AgentGenesisLocator {
+            space: vos::service::SpaceId([1; 32]),
+            agent: vos::service::AgentId([2; 32]),
+        };
+        let archive =
+            CleanAgentGenesisArchiveFile::open_or_create(&fixture.parent, locator).unwrap();
+        assert!(matches!(
+            CleanAgentGenesisArchiveFile::open_or_create(&fixture.parent, locator),
+            Err(CleanFileStoreError::Busy)
+        ));
         assert_eq!(archive.load(locator).unwrap(), None);
         archive.insert_if_absent(locator, b"first").unwrap();
         archive.insert_if_absent(locator, b"different").unwrap();
-        assert_eq!(archive.load(locator).unwrap().as_deref(), Some(b"first".as_slice()));
-        assert!(archive.load(AgentGenesisLocator { agent: vos::service::AgentId([3; 32]), ..locator }).is_err());
+        assert_eq!(
+            archive.load(locator).unwrap().as_deref(),
+            Some(b"first".as_slice())
+        );
+        assert!(
+            archive
+                .load(AgentGenesisLocator {
+                    agent: vos::service::AgentId([3; 32]),
+                    ..locator
+                })
+                .is_err()
+        );
         drop(archive);
-        let reopened = CleanAgentGenesisArchiveFile::open_or_create(&fixture.parent, locator).unwrap();
-        assert_eq!(reopened.load(locator).unwrap().as_deref(), Some(b"first".as_slice()));
+        let reopened =
+            CleanAgentGenesisArchiveFile::open_or_create(&fixture.parent, locator).unwrap();
+        assert_eq!(
+            reopened.load(locator).unwrap().as_deref(),
+            Some(b"first".as_slice())
+        );
     }
 
     #[test]
@@ -4613,20 +4991,35 @@ pub(crate) mod tests {
         use vos::agent::genesis::AgentGenesisLocator;
         use vos::agent::genesis_archive::AgentGenesisArchiveStore;
         let fixture = Fixture::new("ordinary-genesis-stage");
-        let locator = AgentGenesisLocator { space: vos::service::SpaceId([1; 32]), agent: vos::service::AgentId([2; 32]) };
-        let archive = CleanAgentGenesisArchiveFile::open_or_create(&fixture.parent, locator).unwrap();
+        let locator = AgentGenesisLocator {
+            space: vos::service::SpaceId([1; 32]),
+            agent: vos::service::AgentId([2; 32]),
+        };
+        let archive =
+            CleanAgentGenesisArchiveFile::open_or_create(&fixture.parent, locator).unwrap();
         stage(&archive.store.lock().unwrap(), None, b"initial");
         drop(archive);
-        let archive = CleanAgentGenesisArchiveFile::open_or_create(&fixture.parent, locator).unwrap();
-        assert_eq!(archive.load(locator).unwrap().as_deref(), Some(b"initial".as_slice()));
+        let archive =
+            CleanAgentGenesisArchiveFile::open_or_create(&fixture.parent, locator).unwrap();
+        assert_eq!(
+            archive.load(locator).unwrap().as_deref(),
+            Some(b"initial".as_slice())
+        );
         {
             let file = archive.store.lock().unwrap();
-            let current = file.reconcile(StoreRole::OrdinaryGenesisArchive.maximum_bytes()).unwrap().unwrap();
+            let current = file
+                .reconcile(StoreRole::OrdinaryGenesisArchive.maximum_bytes())
+                .unwrap()
+                .unwrap();
             stage(&file, Some(current.commitment()), b"replacement");
         }
         drop(archive);
-        let archive = CleanAgentGenesisArchiveFile::open_or_create(&fixture.parent, locator).unwrap();
-        assert!(matches!(archive.load(locator), Err(CleanFileStoreError::RequestConflict)));
+        let archive =
+            CleanAgentGenesisArchiveFile::open_or_create(&fixture.parent, locator).unwrap();
+        assert!(matches!(
+            archive.load(locator),
+            Err(CleanFileStoreError::RequestConflict)
+        ));
     }
 
     #[test]
@@ -4634,19 +5027,33 @@ pub(crate) mod tests {
         use vos::agent::genesis::AgentGenesisLocator;
         use vos::agent::genesis_archive::AgentGenesisArchiveStore;
         let fixture = Fixture::new("ordinary-genesis-race");
-        let locator = AgentGenesisLocator { space: vos::service::SpaceId([1; 32]), agent: vos::service::AgentId([2; 32]) };
-        let archive = Arc::new(CleanAgentGenesisArchiveFile::open_or_create(&fixture.parent, locator).unwrap());
+        let locator = AgentGenesisLocator {
+            space: vos::service::SpaceId([1; 32]),
+            agent: vos::service::AgentId([2; 32]),
+        };
+        let archive = Arc::new(
+            CleanAgentGenesisArchiveFile::open_or_create(&fixture.parent, locator).unwrap(),
+        );
         let barrier = Arc::new(std::sync::Barrier::new(2));
-        let threads: Vec<_> = [b"one", b"two"].into_iter().map(|bytes| {
-            let archive = Arc::clone(&archive);
-            let barrier = Arc::clone(&barrier);
-            std::thread::spawn(move || { barrier.wait(); archive.insert_if_absent(locator, bytes).unwrap(); })
-        }).collect();
-        for thread in threads { thread.join().unwrap(); }
+        let threads: Vec<_> = [b"one", b"two"]
+            .into_iter()
+            .map(|bytes| {
+                let archive = Arc::clone(&archive);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    archive.insert_if_absent(locator, bytes).unwrap();
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
         let winner = archive.load(locator).unwrap().unwrap();
         assert!(winner == b"one" || winner == b"two");
         drop(archive);
-        let archive = CleanAgentGenesisArchiveFile::open_or_create(&fixture.parent, locator).unwrap();
+        let archive =
+            CleanAgentGenesisArchiveFile::open_or_create(&fixture.parent, locator).unwrap();
         assert_eq!(archive.load(locator).unwrap(), Some(winner));
     }
 

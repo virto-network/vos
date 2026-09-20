@@ -4307,8 +4307,10 @@ impl SharedAgentNetworkHost {
         authorization: InvocationAuthorization,
         anchor: &crate::agent::clean_management_intent::ManagementJournalAnchor,
     ) -> Result<RuntimeOutcome, SharedAgentHostError> {
-        if !matches!(work.mode, crate::agent_sdk::MethodMode::Linear | crate::agent_sdk::MethodMode::Query)
-            || !matches!(&authorization, InvocationAuthorization::PublicPreflight(preflight) if preflight.matches_work(&work))
+        if !matches!(
+            work.mode,
+            crate::agent_sdk::MethodMode::Linear | crate::agent_sdk::MethodMode::Query
+        ) || !matches!(&authorization, InvocationAuthorization::PublicPreflight(preflight) if preflight.matches_work(&work))
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
@@ -4492,7 +4494,8 @@ impl SharedAgentNetworkHost {
             SupervisorAdmission::ReservedManagementRetirement
                 | SupervisorAdmission::ReservedManagementResult
         ) && (!(work.mode == MethodMode::Linear
-                || (work.mode == MethodMode::Query && matches!(admission, SupervisorAdmission::ReservedManagementResult)))
+            || (work.mode == MethodMode::Query
+                && matches!(admission, SupervisorAdmission::ReservedManagementResult)))
             || !matches!(
                 &request,
                 crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Acknowledge { .. }

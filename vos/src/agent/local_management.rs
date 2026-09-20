@@ -196,7 +196,9 @@ impl LocalManagementHistory {
             return if !changed
                 && matches!(
                     request.as_ref(),
-                    ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources | ManagementRequest::InspectManagementHistory
+                    ManagementRequest::InspectActors { .. }
+                        | ManagementRequest::InspectResources
+                        | ManagementRequest::InspectManagementHistory
                 ) {
                 Ok(self.clone())
             } else {

@@ -205,7 +205,9 @@ fn operation_for(
         ManagementRequest::PrivateControl { .. } => {
             panic!("private control is not a generic Local/Shared management request")
         }
-        ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources | ManagementRequest::InspectManagementHistory => {
+        ManagementRequest::InspectActors { .. }
+        | ManagementRequest::InspectResources
+        | ManagementRequest::InspectManagementHistory => {
             panic!("read-only management does not carry authority")
         }
     }

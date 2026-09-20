@@ -1575,9 +1575,18 @@ impl ReplayOperation {
             Self::Invoke { invocation, .. } | Self::Acknowledge { invocation, .. } => {
                 PersistedLane::from_result_storage(invocation.mode.result_storage())
             }
-            Self::CleanInvoke { work: crate::agent_sdk::InvocationWork { mode, .. }, .. }
-            | Self::CleanResume { work: crate::agent_sdk::InvocationWork { mode, .. }, .. }
-            | Self::CleanAcknowledge { work: crate::agent_sdk::InvocationRetirement { mode, .. }, .. } => match mode.result_storage() {
+            Self::CleanInvoke {
+                work: crate::agent_sdk::InvocationWork { mode, .. },
+                ..
+            }
+            | Self::CleanResume {
+                work: crate::agent_sdk::InvocationWork { mode, .. },
+                ..
+            }
+            | Self::CleanAcknowledge {
+                work: crate::agent_sdk::InvocationRetirement { mode, .. },
+                ..
+            } => match mode.result_storage() {
                 crate::agent_sdk::InvocationResultStorage::Control => PersistedLane::Control,
                 crate::agent_sdk::InvocationResultStorage::Lane(
                     crate::agent_sdk::StateLane::Linear,
@@ -1683,7 +1692,11 @@ impl ReplayInput {
                 if !context.is_valid() {
                     return Err(DecodeError::NonCanonical);
                 }
-                validate_transition_proof_lifecycle_condition(*context, *expected_live, work.invocation)?;
+                validate_transition_proof_lifecycle_condition(
+                    *context,
+                    *expected_live,
+                    work.invocation,
+                )?;
                 validate_clean_invocation_authorization_binding(
                     &self.runtime,
                     work,
@@ -1714,7 +1727,11 @@ impl ReplayInput {
                 work,
                 authorization,
             } => {
-                validate_transition_proof_lifecycle_condition(*context, *expected_live, work.invocation)?;
+                validate_transition_proof_lifecycle_condition(
+                    *context,
+                    *expected_live,
+                    work.invocation,
+                )?;
                 validate_clean_exact_request_binding(&self.runtime, work, authorization)?;
             }
             ReplayOperation::Acknowledge {
@@ -5666,7 +5683,9 @@ mod tests {
 
             match &mut decoded.operation {
                 ReplayOperation::CleanInvoke { work, .. } => work.availability[0].bytes[0] ^= 1,
-                ReplayOperation::CleanAcknowledge { work, .. } => work.required[0].hash = crate::agent_sdk::Hash::ZERO,
+                ReplayOperation::CleanAcknowledge { work, .. } => {
+                    work.required[0].hash = crate::agent_sdk::Hash::ZERO
+                }
                 _ => unreachable!(),
             }
             assert_eq!(decoded.validate(), Err(DecodeError::NonCanonical));

@@ -501,7 +501,11 @@ impl ActorLaneImage {
 
     /// Append directly to an enclosing lane frame; do not materialize a
     /// second multi-megabyte image merely to copy it into that frame.
-    pub(crate) fn append_parts(bytes: &mut Vec<u8>, inline: &[u8], rows: &BTreeMap<Vec<u8>, Vec<u8>>) {
+    pub(crate) fn append_parts(
+        bytes: &mut Vec<u8>,
+        inline: &[u8],
+        rows: &BTreeMap<Vec<u8>, Vec<u8>>,
+    ) {
         bytes.extend_from_slice(MAGIC);
         bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
         let mut encoder = Encoder(bytes);

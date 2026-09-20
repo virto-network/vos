@@ -1408,8 +1408,12 @@ impl ServiceWire for AgentGenesisProvision {
 /// Maximum one-provision archive image, including its exact runtime preimage.
 /// Archives store records per locator; this is not a whole-registry bound.
 pub const MAX_AGENT_GENESIS_ARCHIVE_RECORD_BYTES: usize = SERVICE_WIRE_HEADER_BYTES
-    + 4 + MAX_AGENT_GENESIS_PROVISION_BYTES
-    + 4 + BLOB_REFERENCE_BYTES + 4 + MAX_ARTIFACT_CLOSURE_BYTES;
+    + 4
+    + MAX_AGENT_GENESIS_PROVISION_BYTES
+    + 4
+    + BLOB_REFERENCE_BYTES
+    + 4
+    + MAX_ARTIFACT_CLOSURE_BYTES;
 
 /// Canonical persistence unit for an ordinary genesis provider. Structural
 /// validation and archive recovery confer no finality: every host admission
@@ -1430,8 +1434,12 @@ impl AgentGenesisArchiveRecord {
         Ok(Self { provision, catalog })
     }
 
-    pub const fn provision(&self) -> &AgentGenesisProvision { &self.provision }
-    pub fn catalog(&self) -> &[RuntimeBlob] { &self.catalog }
+    pub const fn provision(&self) -> &AgentGenesisProvision {
+        &self.provision
+    }
+    pub fn catalog(&self) -> &[RuntimeBlob] {
+        &self.catalog
+    }
 }
 
 impl ServiceWire for AgentGenesisArchiveRecord {
@@ -1448,7 +1456,8 @@ impl ServiceWire for AgentGenesisArchiveRecord {
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         enforce_complete_bound(decoder, MAX_AGENT_GENESIS_ARCHIVE_RECORD_BYTES)?;
-        let provision = decode_nested::<AgentGenesisProvision>(decoder, MAX_AGENT_GENESIS_PROVISION_BYTES)?;
+        let provision =
+            decode_nested::<AgentGenesisProvision>(decoder, MAX_AGENT_GENESIS_PROVISION_BYTES)?;
         if decoder.u32()? as usize != GENESIS_CATALOG_REFERENCES {
             return Err(DecodeError::NonCanonical);
         }
@@ -1461,7 +1470,13 @@ impl ServiceWire for AgentGenesisArchiveRecord {
             return Err(DecodeError::NonCanonical);
         }
         // All checks precede copying the potentially large runtime preimage.
-        Ok(Self { provision, catalog: vec![RuntimeBlob { reference, bytes: bytes.to_vec() }] })
+        Ok(Self {
+            provision,
+            catalog: vec![RuntimeBlob {
+                reference,
+                bytes: bytes.to_vec(),
+            }],
+        })
     }
 }
 
@@ -2289,7 +2304,8 @@ mod tests {
                 baseline.proposal.locator().agent,
                 AgentProfile::Shared,
                 maximum_replica_members(),
-            ).unwrap();
+            )
+            .unwrap();
         }
         let key = SigningKey::from_bytes(&[0x81; 32]);
         let public = key.verifying_key().to_bytes();
@@ -2492,13 +2508,21 @@ mod tests {
         let provision = AgentGenesisProvision::new(proposal, replicas, evidence, decision).unwrap();
         if maximum_roster {
             let encoded = provision.encode();
-            println!("full signed provision={} proposal={} roster={} evidence={} decision={} caller_availability={}",
-                encoded.len(), provision.proposal().encode().len(),
-                provision.replicas().encode().len(), provision.evidence().encode().len(),
-                provision.decision().encode().len(), sdk::MAX_RUNTIME_CALLER_AVAILABILITY_BYTES);
+            println!(
+                "full signed provision={} proposal={} roster={} evidence={} decision={} caller_availability={}",
+                encoded.len(),
+                provision.proposal().encode().len(),
+                provision.replicas().encode().len(),
+                provision.evidence().encode().len(),
+                provision.decision().encode().len(),
+                sdk::MAX_RUNTIME_CALLER_AVAILABILITY_BYTES
+            );
             assert_eq!(provision.replicas().members().len(), MAX_AGENT_REPLICAS);
             assert!(encoded.len() <= MAX_CLEAN_CREATE_GENESIS_PROVISION_BYTES);
-            assert!(MAX_CLEAN_CREATE_GENESIS_PROVISION_BYTES <= sdk::MAX_RUNTIME_CALLER_AVAILABILITY_BYTES);
+            assert!(
+                MAX_CLEAN_CREATE_GENESIS_PROVISION_BYTES
+                    <= sdk::MAX_RUNTIME_CALLER_AVAILABILITY_BYTES
+            );
             assert!(encoded.len() <= sdk::MAX_RUNTIME_CALLER_AVAILABILITY_BYTES);
             let reference = crate::service::BlobRef::of_bytes(&encoded);
             let invocation = crate::agent::execution::ActorInvocation {
@@ -2511,12 +2535,16 @@ mod tests {
                 auth: crate::agent::execution::ActorInvocationAuth::anonymous(),
                 message: alloc::vec![1],
                 availability: alloc::vec![crate::agent::execution::RuntimeBlob {
-                    reference: reference.clone(), bytes: encoded,
+                    reference: reference.clone(),
+                    bytes: encoded,
                 }],
                 gas: 1,
             };
             assert!(invocation.validate().is_ok());
-            assert_eq!(invocation.available_preimage(&reference).unwrap().unwrap(), provision.encode());
+            assert_eq!(
+                invocation.available_preimage(&reference).unwrap().unwrap(),
+                provision.encode()
+            );
         }
         let publication = provision.publication_invocation(call.invocation).unwrap();
         assert_ne!(publication, sdk::InvocationId::ZERO);
@@ -2580,8 +2608,12 @@ mod tests {
     #[test]
     fn ordinary_archive_binds_provision_and_exact_catalog_without_granting_finality() {
         let provision = fixture().provision;
-        let runtime = RuntimeBlob { reference: BlobRef::of_bytes(RUNTIME_BYTES), bytes: RUNTIME_BYTES.to_vec() };
-        let record = AgentGenesisArchiveRecord::new(provision.clone(), vec![runtime.clone()]).unwrap();
+        let runtime = RuntimeBlob {
+            reference: BlobRef::of_bytes(RUNTIME_BYTES),
+            bytes: RUNTIME_BYTES.to_vec(),
+        };
+        let record =
+            AgentGenesisArchiveRecord::new(provision.clone(), vec![runtime.clone()]).unwrap();
         let encoded = record.encode();
         assert!(encoded.len() <= MAX_AGENT_GENESIS_ARCHIVE_RECORD_BYTES);
         let reopened = AgentGenesisArchiveRecord::decode(&encoded).unwrap();
@@ -2589,15 +2621,30 @@ mod tests {
         assert_eq!(reopened.encode(), encoded);
         assert_eq!(reopened.catalog(), &[runtime.clone()]);
         assert!(AgentGenesisArchiveRecord::new(provision.clone(), vec![]).is_err());
-        assert!(AgentGenesisArchiveRecord::new(provision.clone(), vec![runtime.clone(), runtime]).is_err());
+        assert!(
+            AgentGenesisArchiveRecord::new(provision.clone(), vec![runtime.clone(), runtime])
+                .is_err()
+        );
         let other_bytes = b"substituted runtime".to_vec();
-        let other = RuntimeBlob { reference: BlobRef::of_bytes(&other_bytes), bytes: other_bytes };
+        let other = RuntimeBlob {
+            reference: BlobRef::of_bytes(&other_bytes),
+            bytes: other_bytes,
+        };
         assert!(AgentGenesisArchiveRecord::new(provision, vec![other]).is_err());
         let count_offset = SERVICE_WIRE_HEADER_BYTES + 4 + record.provision().encode().len();
-        for offset in [0, SERVICE_WIRE_HEADER_BYTES + 4, count_offset, count_offset + 4, encoded.len() - 1] {
+        for offset in [
+            0,
+            SERVICE_WIRE_HEADER_BYTES + 4,
+            count_offset,
+            count_offset + 4,
+            encoded.len() - 1,
+        ] {
             let mut corrupt = encoded.clone();
             corrupt[offset] ^= 1;
-            assert!(AgentGenesisArchiveRecord::decode(&corrupt).is_err(), "offset {offset}");
+            assert!(
+                AgentGenesisArchiveRecord::decode(&corrupt).is_err(),
+                "offset {offset}"
+            );
         }
         assert!(AgentGenesisArchiveRecord::decode(&encoded[..encoded.len() - 1]).is_err());
         let mut oversized_length = encoded.clone();
@@ -2609,20 +2656,27 @@ mod tests {
         assert!(AgentGenesisArchiveRecord::decode(&trailing).is_err());
         struct NotFinalized;
         impl AgentGenesisFinalityVerifier for NotFinalized {
-            fn verify_finalized(&self, _: &AgentGenesisProvision) -> Result<(), AgentGenesisFinalityError> {
+            fn verify_finalized(
+                &self,
+                _: &AgentGenesisProvision,
+            ) -> Result<(), AgentGenesisFinalityError> {
                 Err(AgentGenesisFinalityError::NotFinalized)
             }
         }
         assert!(matches!(
             VerifiedAgentGenesisProvision::verify(reopened.provision().clone(), &NotFinalized),
-            Err(AgentGenesisProvisionVerificationError::Finality(AgentGenesisFinalityError::NotFinalized))
+            Err(AgentGenesisProvisionVerificationError::Finality(
+                AgentGenesisFinalityError::NotFinalized
+            ))
         ));
     }
 
     #[cfg(feature = "std")]
     #[test]
     fn archive_provider_reloads_ambiguous_writes_and_refuses_conflicts() {
-        use super::super::genesis_archive::{AgentGenesisArchiveStore, ArchivedAgentGenesisProvider};
+        use super::super::genesis_archive::{
+            AgentGenesisArchiveStore, ArchivedAgentGenesisProvider,
+        };
         use std::sync::{Arc, Mutex};
         #[derive(Clone, Default)]
         struct Store(Arc<Mutex<(Option<Vec<u8>>, bool, usize)>>);
@@ -2635,46 +2689,108 @@ mod tests {
                 let mut state = self.0.lock().unwrap();
                 state.2 += 1;
                 state.0.get_or_insert_with(|| record.to_vec());
-                if core::mem::take(&mut state.1) { Err(()) } else { Ok(()) }
+                if core::mem::take(&mut state.1) {
+                    Err(())
+                } else {
+                    Ok(())
+                }
             }
         }
         let fixture = fixture();
         let locator = fixture.proposal.locator();
-        let catalog = vec![RuntimeBlob { reference: BlobRef::of_bytes(RUNTIME_BYTES), bytes: RUNTIME_BYTES.to_vec() }];
-        let record = AgentGenesisArchiveRecord::new(fixture.provision.clone(), catalog.clone()).unwrap();
+        let catalog = vec![RuntimeBlob {
+            reference: BlobRef::of_bytes(RUNTIME_BYTES),
+            bytes: RUNTIME_BYTES.to_vec(),
+        }];
+        let record =
+            AgentGenesisArchiveRecord::new(fixture.provision.clone(), catalog.clone()).unwrap();
         let store = Store::default();
         let archive = ArchivedAgentGenesisProvider::new(locator.space, store.clone()).unwrap();
-        assert_eq!(archive.create(&fixture.proposal, &catalog), Err(AgentGenesisProviderError::NotConfigured));
+        assert_eq!(
+            archive.create(&fixture.proposal, &catalog),
+            Err(AgentGenesisProviderError::NotConfigured)
+        );
         store.0.lock().unwrap().1 = true;
-        assert_eq!(archive.publish(&record), Err(AgentGenesisProviderError::Unavailable));
+        assert_eq!(
+            archive.publish(&record),
+            Err(AgentGenesisProviderError::Unavailable)
+        );
         drop(archive);
         let archive = ArchivedAgentGenesisProvider::new(locator.space, store.clone()).unwrap();
         archive.publish(&record).unwrap();
-        assert_eq!(store.0.lock().unwrap().2, 2, "exact retry must reestablish the durability barrier");
-        assert_eq!(store.0.lock().unwrap().0.as_deref(), Some(record.encode().as_slice()));
-        assert_eq!(archive.create(&fixture.proposal, &catalog).unwrap(), fixture.provision);
+        assert_eq!(
+            store.0.lock().unwrap().2,
+            2,
+            "exact retry must reestablish the durability barrier"
+        );
+        assert_eq!(
+            store.0.lock().unwrap().0.as_deref(),
+            Some(record.encode().as_slice())
+        );
+        assert_eq!(
+            archive.create(&fixture.proposal, &catalog).unwrap(),
+            fixture.provision
+        );
         assert_eq!(archive.reproduce(locator).unwrap(), fixture.provision);
-        assert_eq!(archive.load_catalog(locator, &catalog[0].reference).unwrap(), Some(RUNTIME_BYTES.to_vec()));
-        assert_eq!(archive.load_catalog(locator, &BlobRef::of_bytes(b"unknown")).unwrap(), None);
+        assert_eq!(
+            archive
+                .load_catalog(locator, &catalog[0].reference)
+                .unwrap(),
+            Some(RUNTIME_BYTES.to_vec())
+        );
+        assert_eq!(
+            archive
+                .load_catalog(locator, &BlobRef::of_bytes(b"unknown"))
+                .unwrap(),
+            None
+        );
 
         // Structurally consistent alternate evidence for the same locator is
         // still a conflict. Neither fixture is trusted finality evidence.
         let mut claim = fixture.evidence.claim().clone();
         claim.system_genesis = AgentJournalGenesisId::new([0x94; 32]);
         let certificate = AuthorityQuorumCertificate::new(
-            &fixture.authority, claim.authority_claim(), fixture.evidence.certificate().signatures().to_vec(),
-        ).unwrap();
+            &fixture.authority,
+            claim.authority_claim(),
+            fixture.evidence.certificate().signatures().to_vec(),
+        )
+        .unwrap();
         let evidence = AgentGenesisEvidence::new(claim, certificate).unwrap();
-        let decision = AgentGenesisDecision::new(&fixture.proposal, &fixture.replicas, &evidence).unwrap();
-        let other = AgentGenesisProvision::new(fixture.proposal, fixture.replicas, evidence, decision).unwrap();
+        let decision =
+            AgentGenesisDecision::new(&fixture.proposal, &fixture.replicas, &evidence).unwrap();
+        let other =
+            AgentGenesisProvision::new(fixture.proposal, fixture.replicas, evidence, decision)
+                .unwrap();
         let other = AgentGenesisArchiveRecord::new(other, catalog).unwrap();
-        assert_eq!(archive.publish(&other), Err(AgentGenesisProviderError::Conflict));
+        assert_eq!(
+            archive.publish(&other),
+            Err(AgentGenesisProviderError::Conflict)
+        );
         assert_eq!(archive.reproduce(locator).unwrap(), fixture.provision);
-        assert_eq!(store.0.lock().unwrap().2, 2, "conflicting records must not attempt insertion");
-        assert_eq!(archive.reproduce(AgentGenesisLocator { space: SpaceId([0xa1; 32]), ..locator }), Err(AgentGenesisProviderError::Refused));
-        assert_eq!(archive.reproduce(AgentGenesisLocator { agent: AgentId([0xa2; 32]), ..locator }), Err(AgentGenesisProviderError::Corrupt));
+        assert_eq!(
+            store.0.lock().unwrap().2,
+            2,
+            "conflicting records must not attempt insertion"
+        );
+        assert_eq!(
+            archive.reproduce(AgentGenesisLocator {
+                space: SpaceId([0xa1; 32]),
+                ..locator
+            }),
+            Err(AgentGenesisProviderError::Refused)
+        );
+        assert_eq!(
+            archive.reproduce(AgentGenesisLocator {
+                agent: AgentId([0xa2; 32]),
+                ..locator
+            }),
+            Err(AgentGenesisProviderError::Corrupt)
+        );
         store.0.lock().unwrap().0.as_mut().unwrap().push(0);
-        assert_eq!(archive.reproduce(locator), Err(AgentGenesisProviderError::Corrupt));
+        assert_eq!(
+            archive.reproduce(locator),
+            Err(AgentGenesisProviderError::Corrupt)
+        );
     }
 
     #[test]
@@ -2898,23 +3014,49 @@ mod tests {
         let original = fixture.replicas.members()[0].clone();
         let mut logical = original.replica();
         logical.principal = PrincipalId([0x82; 32]);
-        assert_ne!(logical.principal, PrincipalId::of_public_key(original.ed25519_public_key()));
+        assert_ne!(
+            logical.principal,
+            PrincipalId::of_public_key(original.ed25519_public_key())
+        );
         let owner_member = AgentReplicaMember::new(
-            logical, original.peer_id().to_vec(), *original.ed25519_public_key(), original.raft_slot(),
-        ).unwrap();
+            logical,
+            original.peer_id().to_vec(),
+            *original.ed25519_public_key(),
+            original.raft_slot(),
+        )
+        .unwrap();
         let mut members = fixture.replicas.members().to_vec();
         members[0] = owner_member;
         let changed = AgentReplicaCommittee::new(
-            fixture.replicas.space(), fixture.replicas.agent(), fixture.replicas.profile(), members,
-        ).unwrap();
+            fixture.replicas.space(),
+            fixture.replicas.agent(),
+            fixture.replicas.profile(),
+            members,
+        )
+        .unwrap();
         assert_ne!(changed.id(), fixture.replicas.id());
-        assert_eq!(AgentReplicaCommittee::decode(&changed.encode()).unwrap(), changed);
-        assert!(fixture.evidence.claim().validate_against(&fixture.proposal, &changed).is_err());
+        assert_eq!(
+            AgentReplicaCommittee::decode(&changed.encode()).unwrap(),
+            changed
+        );
+        assert!(
+            fixture
+                .evidence
+                .claim()
+                .validate_against(&fixture.proposal, &changed)
+                .is_err()
+        );
         // A self-consistent transport mapping cannot replace the owner in an
         // existing authority-certified provision or its exact descriptor.
-        assert!(AgentGenesisProvision::new(
-            fixture.proposal.clone(), changed, fixture.evidence.clone(), fixture.decision.clone(),
-        ).is_err());
+        assert!(
+            AgentGenesisProvision::new(
+                fixture.proposal.clone(),
+                changed,
+                fixture.evidence.clone(),
+                fixture.decision.clone(),
+            )
+            .is_err()
+        );
     }
 
     #[test]

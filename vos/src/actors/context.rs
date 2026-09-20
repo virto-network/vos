@@ -316,7 +316,8 @@ impl<A: Actor> Context<A> {
         if self.agent_invocation_context.is_none() {
             return Err(InvocationBlobError::NotAgentInvocation);
         }
-        let len = usize::try_from(reference.len).ok()
+        let len = usize::try_from(reference.len)
+            .ok()
             .filter(|len| *len <= crate::agent::execution::MAX_EXECUTION_AVAILABILITY_BYTES)
             .ok_or(InvocationBlobError::InvalidReference)?;
         #[cfg(target_arch = "riscv64")]
@@ -1436,7 +1437,10 @@ impl<A: Actor> Context<A> {
     /// Checkpoint state and yield to other actors. Resumes next tick.
     /// Each invocation runs one iteration; state is saved automatically.
     pub fn yield_now(&mut self) -> super::run::Yield {
-        assert!(!super::storage::transaction_is_open(), "cannot yield inside a storage transaction");
+        assert!(
+            !super::storage::transaction_is_open(),
+            "cannot yield inside a storage transaction"
+        );
         #[cfg(feature = "pvm")]
         {
             // Service actors retain their transitional service scheduler

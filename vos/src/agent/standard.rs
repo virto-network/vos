@@ -1710,7 +1710,9 @@ impl StandardAgentRuntime {
         let mut pending: Vec<_> = state.actors.into_iter().map(Some).collect();
         for (index, actor) in pending.iter().enumerate() {
             match actor.as_ref().unwrap().record.entry.parent {
-                None => { ready.insert(index); }
+                None => {
+                    ready.insert(index);
+                }
                 Some(parent) => children.entry(parent).or_default().push(index),
             }
         }
@@ -2085,7 +2087,8 @@ impl StandardAgentRuntime {
         // Keep only the measured length. Holding this encoded image while
         // usage accounting snapshots/encodes it again doubles peak heap use.
         let state_bytes = super::wire::encode_standard_runtime_state(&self.snapshot())
-            .encoded_len().filter(|bytes| *bytes <= limit)
+            .encoded_len()
+            .filter(|bytes| *bytes <= limit)
             .ok_or(LifecycleError::ResourceLimit)?;
         match (&self.clean_descriptor, self.active_resource_policy) {
             (None, None) => Ok(()),
@@ -2726,7 +2729,10 @@ impl StandardAgentRuntime {
         program: crate::agent_sdk::ProgramId,
     ) -> Result<&ManagedActor, crate::agent_sdk::InvocationError> {
         use crate::agent_sdk::InvocationError;
-        let actor = self.actors.get(&ActorId(actor.0)).ok_or(InvocationError::NotFound)?;
+        let actor = self
+            .actors
+            .get(&ActorId(actor.0))
+            .ok_or(InvocationError::NotFound)?;
         if actor.record.state_generation.0 != incarnation.0 {
             return Err(InvocationError::StaleIncarnation);
         }
@@ -2746,7 +2752,12 @@ impl StandardAgentRuntime {
         use crate::agent_sdk::InvocationError;
 
         let actor_id = ActorId(work.actor.0);
-        let actor = self.clean_invocation_target(work.actor, work.incarnation, work.deployment, work.program)?;
+        let actor = self.clean_invocation_target(
+            work.actor,
+            work.incarnation,
+            work.deployment,
+            work.program,
+        )?;
         let mut program_index = None;
         let mut schema_index = None;
         let mut policy_index = None;
@@ -2882,9 +2893,10 @@ impl StandardAgentRuntime {
         work: &'work crate::agent_sdk::InvocationWork,
     ) -> Result<ResolvedCleanInvocation<'work>, crate::agent_sdk::InvocationError> {
         let parts = self.resolve_clean_invocation(work)?;
-        let actor = self.clean_invocation_target(
-            work.actor, work.incarnation, work.deployment, work.program,
-        )?.record.clone();
+        let actor = self
+            .clean_invocation_target(work.actor, work.incarnation, work.deployment, work.program)?
+            .record
+            .clone();
         Ok(ResolvedCleanInvocation { work, actor, parts })
     }
 
@@ -3387,14 +3399,23 @@ impl StandardAgentRuntime {
         &'a self,
         work: &crate::agent_sdk::InvocationWork,
         schema_blob: &crate::agent_sdk::RuntimeBlob,
-    ) -> Result<super::actor_storage::ActorStorageReader<'a>, super::execution::ActorExecutionError> {
+    ) -> Result<super::actor_storage::ActorStorageReader<'a>, super::execution::ActorExecutionError>
+    {
         let access = self.resolve_clean_storage_access(work, schema_blob)?;
-        let rows = |lane| self.lane_state
-            .lookup(lane, ActorId(work.actor.0), Hash(work.incarnation.0))
-            .map(|entry| &entry.rows);
-        super::actor_storage::ActorStorageReader::from_rows(access, [
-            rows(StateLane::Linear), rows(StateLane::Merge), rows(StateLane::Local),
-        ]).map_err(|_| super::execution::ActorExecutionError::InvalidAvailability)
+        let rows = |lane| {
+            self.lane_state
+                .lookup(lane, ActorId(work.actor.0), Hash(work.incarnation.0))
+                .map(|entry| &entry.rows)
+        };
+        super::actor_storage::ActorStorageReader::from_rows(
+            access,
+            [
+                rows(StateLane::Linear),
+                rows(StateLane::Merge),
+                rows(StateLane::Local),
+            ],
+        )
+        .map_err(|_| super::execution::ActorExecutionError::InvalidAvailability)
     }
 
     #[cfg(feature = "pvm")]
@@ -3925,8 +3946,15 @@ impl StandardAgentRuntime {
         terminal_continuation: Option<u64>,
     ) -> Result<(), super::execution::ActorExecutionError> {
         self.commit_clean_execution_inner(
-            work, authorization, invocation, reply, before, after, observed_slot,
-            terminal_continuation, None,
+            work,
+            authorization,
+            invocation,
+            reply,
+            before,
+            after,
+            observed_slot,
+            terminal_continuation,
+            None,
         )
     }
 
@@ -3945,8 +3973,15 @@ impl StandardAgentRuntime {
         terminal_continuation: Option<u64>,
     ) -> Result<(), super::execution::ActorExecutionError> {
         self.commit_clean_execution_inner(
-            resolved.work, authorization, &resolved.parts.0, reply, before, after,
-            observed_slot, terminal_continuation, Some(&resolved.actor),
+            resolved.work,
+            authorization,
+            &resolved.parts.0,
+            reply,
+            before,
+            after,
+            observed_slot,
+            terminal_continuation,
+            Some(&resolved.actor),
         )
     }
 
@@ -3979,9 +4014,14 @@ impl StandardAgentRuntime {
         // Identity equality alone does not bind message, gas, legacy auth or
         // the application availability selected from the signed SDK work.
         if let Some(expected_actor) = resolved_actor {
-            let current = self.clean_invocation_target(
-                work.actor, work.incarnation, work.deployment, work.program,
-            ).map_err(|_| ActorExecutionError::InvalidActorOutput)?;
+            let current = self
+                .clean_invocation_target(
+                    work.actor,
+                    work.incarnation,
+                    work.deployment,
+                    work.program,
+                )
+                .map_err(|_| ActorExecutionError::InvalidActorOutput)?;
             if current.record != *expected_actor {
                 return Err(ActorExecutionError::InvalidActorOutput);
             }
@@ -4043,14 +4083,20 @@ impl StandardAgentRuntime {
         use super::actor_storage::{ActorLaneImage, StorageAccessError};
         use super::execution::ActorExecutionError;
         let access = self.resolve_clean_storage_access(work, schema)?;
-        let lane = clean_method_mode(work.mode).write_lane()
+        let lane = clean_method_mode(work.mode)
+            .write_lane()
             .ok_or(ActorExecutionError::UnsupportedMethod)?;
-        let clean_lane = work.mode.write_lane().ok_or(ActorExecutionError::UnsupportedMethod)?;
+        let clean_lane = work
+            .mode
+            .write_lane()
+            .ok_or(ActorExecutionError::UnsupportedMethod)?;
         let actor = ActorId(work.actor.0);
         let generation = Hash(work.incarnation.0);
         let mut candidate = self.clone();
         let entries = candidate.lane_state.select_mut(lane);
-        let index = entries.binary_search_by_key(&(actor, generation), |entry| (entry.actor, entry.state_generation));
+        let index = entries.binary_search_by_key(&(actor, generation), |entry| {
+            (entry.actor, entry.state_generation)
+        });
         let mut image = match index {
             Ok(index) => ActorLaneImage::from_parts(
                 core::mem::take(&mut entries[index].value),
@@ -4058,29 +4104,50 @@ impl StandardAgentRuntime {
             ),
             Err(_) => ActorLaneImage::default(),
         };
-        access.apply_batch(clean_lane, &mut image, inline, changes).map_err(|error| match error {
-            StorageAccessError::Image(crate::service::wire::DecodeError::LimitExceeded) => ActorExecutionError::ResultCapacity,
-            _ => ActorExecutionError::InvalidActorOutput,
-        })?;
+        access
+            .apply_batch(clean_lane, &mut image, inline, changes)
+            .map_err(|error| match error {
+                StorageAccessError::Image(crate::service::wire::DecodeError::LimitExceeded) => {
+                    ActorExecutionError::ResultCapacity
+                }
+                _ => ActorExecutionError::InvalidActorOutput,
+            })?;
         let (value, rows) = image.into_parts();
         let empty = value.is_empty() && rows.is_empty();
         match index {
-            Ok(index) if empty => { entries.remove(index); }
-            Ok(index) => { entries[index].value = value; entries[index].rows = rows; }
+            Ok(index) if empty => {
+                entries.remove(index);
+            }
+            Ok(index) => {
+                entries[index].value = value;
+                entries[index].rows = rows;
+            }
             Err(_) if empty => {}
             Err(index) => {
                 if entries.len() >= MAX_LANE_STATE_ENTRIES {
                     return Err(ActorExecutionError::ResultCapacity);
                 }
-                entries.insert(index, StandardLaneEntry { actor, state_generation: generation, value, rows });
+                entries.insert(
+                    index,
+                    StandardLaneEntry {
+                        actor,
+                        state_generation: generation,
+                        value,
+                        rows,
+                    },
+                );
             }
         }
         let result = commit(&mut candidate)?;
-        candidate.validate_restored_lane_state().map_err(|_| ActorExecutionError::InvalidActorOutput)?;
-        candidate.validate_signed_state_resource().map_err(|error| match error {
-            LifecycleError::ResourceLimit => ActorExecutionError::ResultCapacity,
-            _ => ActorExecutionError::InvalidActorOutput,
-        })?;
+        candidate
+            .validate_restored_lane_state()
+            .map_err(|_| ActorExecutionError::InvalidActorOutput)?;
+        candidate
+            .validate_signed_state_resource()
+            .map_err(|error| match error {
+                LifecycleError::ResourceLimit => ActorExecutionError::ResultCapacity,
+                _ => ActorExecutionError::InvalidActorOutput,
+            })?;
         *self = candidate;
         Ok(result)
     }
@@ -4275,7 +4342,8 @@ impl StandardAgentRuntime {
             return Err(crate::agent_sdk::InvocationError::InvalidAuthorization);
         }
         self.acknowledge_clean_retirement_with_status(
-            &crate::agent_sdk::InvocationRetirement::from_work(work), authorization,
+            &crate::agent_sdk::InvocationRetirement::from_work(work),
+            authorization,
         )
     }
 
@@ -4308,17 +4376,23 @@ impl StandardAgentRuntime {
 
         // Recovery validated the immutable metadata and authorization binding.
         // Fresh retirement additionally authenticates scope and receipt signatures.
-        let descriptor = self.clean_descriptor.as_ref().ok_or(InvocationError::NotCreated)?;
+        let descriptor = self
+            .clean_descriptor
+            .as_ref()
+            .ok_or(InvocationError::NotCreated)?;
         if work.space != descriptor.identity.space
             || work.agent != descriptor.identity.agent
             || work.runtime_deployment != descriptor.identity.runtime_deployment
         {
             return Err(InvocationError::InvalidAuthorization);
         }
-        if let crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(receipt) = authorization {
+        if let crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(receipt) = authorization
+        {
             if !descriptor.authority.accepts(receipt)
                 || !super::authority::verify_raw_ed25519(
-                    &receipt.public_key, &receipt.signing_bytes(), &receipt.signature,
+                    &receipt.public_key,
+                    &receipt.signing_bytes(),
+                    &receipt.signature,
                 )
             {
                 return Err(InvocationError::InvalidAuthorization);
@@ -4723,7 +4797,12 @@ impl StandardAgentRuntime {
                         actor.record.entry.actor,
                         actor.record.state_generation,
                     )
-                    .map(|entry| super::actor_storage::ActorLaneImage::encode_parts(&entry.value, &entry.rows));
+                    .map(|entry| {
+                        super::actor_storage::ActorLaneImage::encode_parts(
+                            &entry.value,
+                            &entry.rows,
+                        )
+                    });
                 Hash::digest(
                     b"vos/agent/merge-frontier",
                     &[&actor.record.entry.actor.0, merge.as_deref().unwrap_or(&[])],
@@ -5032,7 +5111,8 @@ impl StandardAgentRuntime {
         &self,
     ) -> Result<crate::agent_sdk::RuntimeResourceUsage, crate::agent_sdk::ManagementError> {
         let state_bytes = super::wire::encode_standard_runtime_state(&self.snapshot())
-            .encoded_len().ok_or(crate::agent_sdk::ManagementError::ResourceLimit)?;
+            .encoded_len()
+            .ok_or(crate::agent_sdk::ManagementError::ResourceLimit)?;
         self.clean_resource_usage_with_state_bytes(state_bytes)
     }
 
@@ -5086,7 +5166,8 @@ impl StandardAgentRuntime {
                 .checked_add(debt.proof_artifacts)
                 .ok_or(ManagementError::ResourceLimit)?;
         }
-        usage.state_bytes = u32::try_from(state_bytes).map_err(|_| ManagementError::ResourceLimit)?;
+        usage.state_bytes =
+            u32::try_from(state_bytes).map_err(|_| ManagementError::ResourceLimit)?;
         Ok(usage)
     }
 
@@ -5252,9 +5333,9 @@ impl StandardAgentRuntime {
                 self.active_resource_policy = Some(descriptor.initial_resource_policy());
                 Ok(ManagementReply::Created(descriptor.identity.clone()))
             }
-            ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources | ManagementRequest::InspectManagementHistory => {
-                Err(ManagementError::InvalidRequest)
-            }
+            ManagementRequest::InspectActors { .. }
+            | ManagementRequest::InspectResources
+            | ManagementRequest::InspectManagementHistory => Err(ManagementError::InvalidRequest),
             ManagementRequest::Install(install) => {
                 let descriptor = self
                     .clean_descriptor
@@ -5829,7 +5910,9 @@ impl StandardAgentRuntime {
 
         if matches!(
             request,
-            ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources | ManagementRequest::InspectManagementHistory
+            ManagementRequest::InspectActors { .. }
+                | ManagementRequest::InspectResources
+                | ManagementRequest::InspectManagementHistory
         ) {
             if authority.is_some() {
                 return Err(ManagementError::InvalidRequest);
@@ -5873,18 +5956,24 @@ impl StandardAgentRuntime {
                     self.clean_resource_usage().map(ManagementReply::Resources)
                 }
                 ManagementRequest::InspectManagementHistory => {
-                    use crate::agent_sdk::recovery::{ManagementHistoryEntry, management_history_commitment};
+                    use crate::agent_sdk::recovery::{
+                        ManagementHistoryEntry, management_history_commitment,
+                    };
                     management_history_commitment(
                         self.clean_acknowledged_through,
-                        self.clean_management_dispositions.iter().map(|record| ManagementHistoryEntry {
-                            authority: record.authority,
-                            request: record.request,
-                            epoch: record.epoch,
-                            sequence: record.sequence,
-                            observed_slot: record.observed_slot,
-                            result: &record.result,
+                        self.clean_management_dispositions.iter().map(|record| {
+                            ManagementHistoryEntry {
+                                authority: record.authority,
+                                request: record.request,
+                                epoch: record.epoch,
+                                sequence: record.sequence,
+                                observed_slot: record.observed_slot,
+                                result: &record.result,
+                            }
                         }),
-                    ).map(ManagementReply::ManagementHistory).map_err(|_| ManagementError::InvalidRequest)
+                    )
+                    .map(ManagementReply::ManagementHistory)
+                    .map_err(|_| ManagementError::InvalidRequest)
                 }
                 _ => unreachable!("read-only branch selected above"),
             };
@@ -6641,7 +6730,11 @@ impl StandardLaneState {
                     entry.actor != ActorId::ZERO
                         && entry.state_generation != Hash::ZERO
                         && !(entry.value.is_empty() && entry.rows.is_empty())
-                        && super::actor_storage::ActorLaneImage::encoded_parts_len(&entry.value, &entry.rows).is_some()
+                        && super::actor_storage::ActorLaneImage::encoded_parts_len(
+                            &entry.value,
+                            &entry.rows,
+                        )
+                        .is_some()
                 })
                 && entries.windows(2).all(|pair| {
                     (pair[0].actor, pair[0].state_generation)
@@ -7929,20 +8022,45 @@ mod tests {
         let actor = installed.entry.actor;
         apply_authorized(&mut runtime, &config, LifecycleRequest::Install(installed)).unwrap();
         set_lane(&mut runtime, actor, StateLane::Merge, &[1]);
-        runtime.lane_state.merge[0].rows.insert(b"s/rows/a".to_vec(), vec![7; 64 * 1024]);
-        let before = runtime.observation(actor, super::super::MethodMode::Merge).unwrap();
-        runtime.lane_state.merge[0].rows.get_mut(b"s/rows/a".as_slice()).unwrap()[0] = 8;
-        let after = runtime.observation(actor, super::super::MethodMode::Merge).unwrap();
-        assert_ne!(before.merge_frontier, after.merge_frontier, "row bytes must bind the observed frontier");
+        runtime.lane_state.merge[0]
+            .rows
+            .insert(b"s/rows/a".to_vec(), vec![7; 64 * 1024]);
+        let before = runtime
+            .observation(actor, super::super::MethodMode::Merge)
+            .unwrap();
+        runtime.lane_state.merge[0]
+            .rows
+            .get_mut(b"s/rows/a".as_slice())
+            .unwrap()[0] = 8;
+        let after = runtime
+            .observation(actor, super::super::MethodMode::Merge)
+            .unwrap();
+        assert_ne!(
+            before.merge_frontier, after.merge_frontier,
+            "row bytes must bind the observed frontier"
+        );
         let rows = runtime.lane_state.merge[0].rows.clone();
         set_lane(&mut runtime, actor, StateLane::Merge, &[]);
         assert!(runtime.lane_state.merge[0].value.is_empty());
-        assert_eq!(runtime.lane_state.merge[0].rows, rows, "empty inline state must not erase rows");
+        assert_eq!(
+            runtime.lane_state.merge[0].rows, rows,
+            "empty inline state must not erase rows"
+        );
         runtime.validate_restored_lane_state().unwrap();
         let encoded = super::super::wire::encode_standard_runtime_state(&runtime.snapshot());
-        let reopened = StandardAgentRuntime::restore(super::super::wire::decode_standard_runtime_state(&encoded).unwrap()).unwrap();
+        let reopened = StandardAgentRuntime::restore(
+            super::super::wire::decode_standard_runtime_state(&encoded).unwrap(),
+        )
+        .unwrap();
         assert_eq!(reopened.lane_state, runtime.lane_state);
-        assert_eq!(reopened.observation(actor, super::super::MethodMode::Merge).unwrap(), runtime.observation(actor, super::super::MethodMode::Merge).unwrap());
+        assert_eq!(
+            reopened
+                .observation(actor, super::super::MethodMode::Merge)
+                .unwrap(),
+            runtime
+                .observation(actor, super::super::MethodMode::Merge)
+                .unwrap()
+        );
     }
 
     #[cfg(feature = "pvm")]
@@ -10761,29 +10879,43 @@ mod tests {
             runtime.install(request, Hash([0xb5; 32])).unwrap();
         }
         let snapshot = runtime.snapshot();
-        assert!(snapshot.actors.iter().enumerate().any(|(index, actor)| {
-            actor.record.entry.parent.is_some_and(|parent| {
-                snapshot.actors[index + 1..].iter().any(|later| later.record.entry.actor == parent)
-            })
-        }), "fixture must include children sorted before their parents");
+        assert!(
+            snapshot.actors.iter().enumerate().any(|(index, actor)| {
+                actor.record.entry.parent.is_some_and(|parent| {
+                    snapshot.actors[index + 1..]
+                        .iter()
+                        .any(|later| later.record.entry.actor == parent)
+                })
+            }),
+            "fixture must include children sorted before their parents"
+        );
         let restored = StandardAgentRuntime::restore(snapshot.clone()).unwrap();
         assert_eq!(restored.snapshot(), snapshot);
 
         let mut duplicate = snapshot.clone();
         duplicate.actors[1].record.installation_id = duplicate.actors[0].record.installation_id;
-        assert!(matches!(StandardAgentRuntime::restore(duplicate), Err(LifecycleError::InvalidRequest)));
+        assert!(matches!(
+            StandardAgentRuntime::restore(duplicate),
+            Err(LifecycleError::InvalidRequest)
+        ));
 
         // Identical references are shared by all actors. A conflicting length
         // on a later actor must still be rejected by incremental accounting.
         let mut ambiguous = snapshot.clone();
         ambiguous.actors[1].record.package.len += 1;
         ambiguous.actors[1].record.entry.package.len += 1;
-        assert!(matches!(StandardAgentRuntime::restore(ambiguous), Err(LifecycleError::InvalidRequest)));
+        assert!(matches!(
+            StandardAgentRuntime::restore(ambiguous),
+            Err(LifecycleError::InvalidRequest)
+        ));
 
         let mut cycle = snapshot;
         let actor = cycle.actors[0].record.entry.actor;
         cycle.actors[0].record.entry.parent = Some(actor);
-        assert!(matches!(StandardAgentRuntime::restore(cycle), Err(LifecycleError::InvalidRequest)));
+        assert!(matches!(
+            StandardAgentRuntime::restore(cycle),
+            Err(LifecycleError::InvalidRequest)
+        ));
     }
 
     #[test]
