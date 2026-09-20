@@ -308,6 +308,25 @@ pub(crate) fn discover_agent(
     })
 }
 
+/// Start strictly before this Agent, after every possible row of its predecessor.
+fn descriptor_lookup_cursor(
+    agent: vos::agent::sdk::AgentId,
+) -> Option<vos::agent::sdk::authority::AuthorityInventoryCursor> {
+    use vos::agent::sdk::authority::{AuthorityInventoryCursor, AuthorityInventoryPosition};
+    let mut previous = agent.0;
+    for byte in previous.iter_mut().rev() {
+        let (value, borrow) = byte.overflowing_sub(1);
+        *byte = value;
+        if !borrow {
+            break;
+        }
+    }
+    (previous != [0; 32]).then_some(AuthorityInventoryCursor {
+        agent: vos::agent::sdk::AgentId(previous),
+        position: AuthorityInventoryPosition::Actor(vos::agent::sdk::ActorId([0xff; 32])),
+    })
+}
+
 fn discover_agent_with(
     operator: &libp2p::identity::Keypair,
     authority: vos::agent::sdk::authority::AuthorityActorTarget,
@@ -319,79 +338,101 @@ fn discover_agent_with(
 ) -> anyhow::Result<vos::agent::sdk::AgentDescriptor> {
     use vos::agent::production_owner::AuthorityProjectionQueryAuthenticator as _;
     use vos::agent::sdk::authority::{
-        AuthorityAgentProjectionPage, AuthorityAgentReplicaProjectionPage,
-        AuthorityProjectionSelector, MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES,
-        MAX_AUTHORITY_REPLICA_PAGE_ENTRIES,
+        AuthorityCredentialKind, AuthorityCredentialStatus, AuthorityInventoryEntry,
+        AuthorityInventoryProjectionPage, AuthorityProjectionSelector,
+        MAX_AUTHORITY_INVENTORY_PAGE_ENTRIES,
     };
     anyhow::ensure!(
-        head.is_valid() && agent != vos::agent::sdk::AgentId::ZERO,
-        "invalid inventory target/head"
+        agent != vos::agent::sdk::AgentId::ZERO && head.is_valid(),
+        "invalid Agent or credential head"
     );
+    let identity = super::clean_identity::CleanOperatorIdentitySigner::new(operator)?;
     let mut signer =
         super::authority_projection_authenticator::OperatorAuthorityProjectionAuthenticator::new(
             operator.clone(),
         )?;
-    let mut after = None;
-    let mut count = 0usize;
-    let row = loop {
-        let request = signer.authenticate(
-            authority,
-            AuthorityProjectionSelector::Agents {
-                after,
-                limit: MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES as u16,
-            },
-        )?;
-        let page = AuthorityAgentProjectionPage::decode(&query(&request)?)
-            .map_err(|error| anyhow::anyhow!("invalid Agent inventory: {error:?}"))?;
-        anyhow::ensure!(
-            page.query == request && page.head == head,
-            "Agent inventory differs from exact query or credential head"
-        );
-        count = count
-            .checked_add(page.entries.len())
-            .ok_or_else(|| anyhow::anyhow!("inventory overflow"))?;
-        anyhow::ensure!(count <= 4096, "Agent inventory exceeds discovery bound");
-        if let Some(row) = page
-            .entries
-            .into_iter()
-            .find(|row| row.identity.agent == agent)
-        {
-            break row;
-        }
-        after = Some(
-            page.next
-                .ok_or_else(|| anyhow::anyhow!("Agent absent from Authority inventory"))?,
-        );
-    };
-    let mut after = None;
+    let mut after = descriptor_lookup_cursor(agent);
+    let mut row: Option<vos::agent::sdk::authority::AuthorityAgentProjection> = None;
     let mut replicas = Vec::new();
+    let mut claims: Option<vos::agent::sdk::authority::AuthorityCredentialProjection> = None;
     loop {
         let request = signer.authenticate(
             authority,
-            AuthorityProjectionSelector::AgentReplicas {
-                agent,
+            AuthorityProjectionSelector::Inventory {
                 after,
-                limit: MAX_AUTHORITY_REPLICA_PAGE_ENTRIES as u16,
+                limit: MAX_AUTHORITY_INVENTORY_PAGE_ENTRIES as u16,
+                known_head: None,
             },
         )?;
-        let page = AuthorityAgentReplicaProjectionPage::decode(&query(&request)?)
-            .map_err(|error| anyhow::anyhow!("invalid replica inventory: {error:?}"))?;
+        let page = AuthorityInventoryProjectionPage::decode(&query(&request)?)
+            .map_err(|error| anyhow::anyhow!("invalid targeted Agent inventory: {error:?}"))?;
         anyhow::ensure!(
-            page.query == request && page.matches_agent_at_head(&row, head),
-            "replica inventory differs from exact query, Agent or credential head"
+            page.credential.query == request
+                && page.credential.head == head
+                && page.credential.principal == identity.principal()
+                && page.credential.status == AuthorityCredentialStatus::Active
+                && page.credential.kind == AuthorityCredentialKind::Api
+                && !page.unchanged,
+            "Agent inventory differs from exact query, active credential or head"
         );
-        replicas.extend(page.entries);
-        anyhow::ensure!(
-            replicas.len() <= usize::from(row.replica_count),
-            "replica inventory overflow"
-        );
-        match page.next {
-            Some(next) => after = Some(next),
-            None => break,
+        let mut comparable = page.credential.clone();
+        if let Some(previous) = &claims {
+            comparable.query = previous.query.clone();
+            anyhow::ensure!(
+                &comparable == previous,
+                "credential claims changed across inventory pages"
+            );
+        } else {
+            claims = Some(comparable);
         }
+        for entry in page.entries {
+            match entry {
+                AuthorityInventoryEntry::Agent(found)
+                    if found.identity.agent == agent && row.is_none() =>
+                {
+                    row = Some(found);
+                }
+                AuthorityInventoryEntry::Replica {
+                    agent: owner,
+                    replica,
+                } if owner == agent => {
+                    let expected = row
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("replica precedes Agent descriptor"))?;
+                    replicas.push(replica);
+                    anyhow::ensure!(
+                        replicas.len() <= usize::from(expected.replica_count),
+                        "replica inventory overflow"
+                    );
+                }
+                _ => {
+                    let expected = row
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("Agent absent from Authority inventory"))?;
+                    anyhow::ensure!(
+                        replicas.len() == usize::from(expected.replica_count),
+                        "incomplete Agent roster"
+                    );
+                    break;
+                }
+            }
+        }
+        let expected = row
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Agent absent from Authority inventory"))?;
+        if replicas.len() == usize::from(expected.replica_count) {
+            return row
+                .unwrap()
+                .reconstruct_descriptor(replicas)
+                .map_err(|error| {
+                    anyhow::anyhow!("incomplete or inconsistent Agent descriptor: {error:?}")
+                });
+        }
+        after = Some(
+            page.next
+                .ok_or_else(|| anyhow::anyhow!("incomplete Agent roster"))?,
+        );
     }
-    row.reconstruct_descriptor(replicas)
-        .map_err(|error| anyhow::anyhow!("incomplete or inconsistent Agent descriptor: {error:?}"))
 }
 
 /// Prepare exact bytes using an already allocated credential sequence and
@@ -1011,13 +1052,31 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_lookup_cursor_covers_id_boundaries() {
+        use vos::agent::sdk::AgentId;
+        let mut minimum = [0; 32];
+        minimum[31] = 1;
+        assert_eq!(descriptor_lookup_cursor(AgentId(minimum)), None);
+        let mut next = minimum;
+        next[31] = 2;
+        assert_eq!(
+            descriptor_lookup_cursor(AgentId(next)).unwrap().agent,
+            AgentId(minimum)
+        );
+        let maximum = AgentId([0xff; 32]);
+        assert!(descriptor_lookup_cursor(maximum).unwrap().agent < maximum);
+    }
+
+    #[test]
     fn descriptor_discovery_requires_exact_query_head_and_complete_roster() {
         use vos::agent::sdk::authority::{
-            AuthorityAgentProjection, AuthorityAgentProjectionPage,
-            AuthorityAgentReplicaProjectionPage, AuthorityProjectionHead,
-            AuthorityProjectionSelector,
+            AuthorityAgentProjection, AuthorityBuiltinRole, AuthorityCredentialKind,
+            AuthorityCredentialProjection, AuthorityCredentialStatus, AuthorityInventoryEntry,
+            AuthorityInventoryProjectionPage, AuthorityProjectionHead, AuthorityProjectionSelector,
         };
         let (operator, authority, descriptor, _) = super::super::local_create::tests::fixture();
+        let identity =
+            super::super::clean_identity::CleanOperatorIdentitySigner::new(&operator).unwrap();
         let head = AuthorityProjectionHead {
             state_revision: NonZeroU64::new(1).unwrap(),
             epoch: NonZeroU64::new(1).unwrap(),
@@ -1040,59 +1099,102 @@ mod tests {
                 &descriptor.replicas,
             ),
         };
-        for mode in 0..6 {
-            let result = discover_agent_with(
-                &operator,
-                authority,
-                head,
-                descriptor.identity.agent,
-                |query| {
-                    let mut returned_head = head;
-                    if mode == 1 {
-                        returned_head.state_commitment = Hash([0x32; 32]);
+        for page_size in [1, 64] {
+            for mode in 0..9 {
+                if mode == 4 && page_size == 64 {
+                    continue;
+                }
+                let mut changed_row = row.clone();
+                if mode == 5 {
+                    changed_row.replica_generation = Hash([0x34; 32]);
+                }
+                let mut entries = vec![AuthorityInventoryEntry::Agent(changed_row)];
+                entries.extend(descriptor.replicas.iter().cloned().map(|replica| {
+                    AuthorityInventoryEntry::Replica {
+                        agent: descriptor.identity.agent,
+                        replica,
                     }
-                    match query.selector {
-                        AuthorityProjectionSelector::Agents { .. } => {
-                            let mut echoed = query.clone();
-                            if mode == 2 {
-                                echoed.nonce = Hash([0x33; 32]);
-                            }
-                            AuthorityAgentProjectionPage {
-                                query: echoed,
-                                head: returned_head,
-                                entries: if mode == 3 { vec![] } else { vec![row.clone()] },
-                                next: None,
-                            }
-                            .encode()
-                            .map_err(|error| anyhow::anyhow!("fixture: {error:?}"))
+                }));
+                if mode == 3 || mode == 6 {
+                    entries.clear();
+                }
+                if mode == 7 {
+                    entries.truncate(1);
+                }
+                if mode == 8 {
+                    entries.remove(0);
+                }
+                let mut calls = 0;
+                let mut offset = 0;
+                let result = discover_agent_with(
+                    &operator,
+                    authority,
+                    head,
+                    descriptor.identity.agent,
+                    |query| {
+                        let AuthorityProjectionSelector::Inventory {
+                            after, known_head, ..
+                        } = query.selector
+                        else {
+                            panic!("descriptor discovery must use targeted Inventory");
+                        };
+                        assert_eq!(known_head, None);
+                        if calls == 0 {
+                            assert_eq!(after, descriptor_lookup_cursor(descriptor.identity.agent));
+                        } else {
+                            assert_eq!(after, Some(entries[offset - 1].cursor()));
                         }
-                        AuthorityProjectionSelector::AgentReplicas { .. } => {
-                            if mode == 4 {
-                                returned_head.state_commitment = Hash([0x34; 32]);
-                            }
-                            AuthorityAgentReplicaProjectionPage {
-                                query: query.clone(),
-                                head: returned_head,
-                                replica_count: row.replica_count,
-                                replica_generation: row.replica_generation,
-                                entries: if mode == 5 {
-                                    vec![]
-                                } else {
-                                    descriptor.replicas.clone()
-                                },
-                                next: None,
-                            }
-                            .encode()
-                            .map_err(|error| anyhow::anyhow!("fixture: {error:?}"))
+                        calls += 1;
+                        let mut credential = AuthorityCredentialProjection {
+                            query: query.clone(),
+                            head,
+                            principal: identity.principal(),
+                            status: AuthorityCredentialStatus::Active,
+                            kind: AuthorityCredentialKind::Api,
+                            builtin_role: AuthorityBuiltinRole::Admin,
+                            management_request_high_water: 0,
+                            operation_request_high_water: 0,
+                            admin_request_high_water: 0,
+                            space_roles: vec![],
+                            actor_roles: vec![],
+                            capabilities: vec![],
+                        };
+                        if mode == 1 {
+                            credential.head.state_commitment = Hash([0x32; 32]);
                         }
-                        _ => panic!("unexpected selector"),
+                        if mode == 2 {
+                            credential.query.nonce = Hash([0x33; 32]);
+                        }
+                        if mode == 4 && calls > 1 {
+                            credential.operation_request_high_water = 1;
+                        }
+                        if mode == 6 {
+                            credential.status = AuthorityCredentialStatus::Revoked;
+                        }
+                        let end = (offset + page_size).min(entries.len());
+                        let page_entries = entries[offset..end].to_vec();
+                        offset = end;
+                        let next =
+                            (end < entries.len()).then(|| page_entries.last().unwrap().cursor());
+                        AuthorityInventoryProjectionPage {
+                            credential,
+                            unchanged: false,
+                            entries: page_entries,
+                            next,
+                        }
+                        .encode()
+                        .map_err(|error| anyhow::anyhow!("fixture: {error:?}"))
+                    },
+                );
+                if mode == 0 {
+                    assert_eq!(result.unwrap(), descriptor);
+                    assert_eq!(calls, entries.len().div_ceil(page_size));
+                    if page_size == 64 {
+                        assert_eq!(calls, 1);
                     }
-                },
-            );
-            if mode == 0 {
-                assert_eq!(result.unwrap(), descriptor);
-            } else {
-                assert!(result.is_err(), "mode {mode}");
+                } else {
+                    assert!(result.is_err(), "mode {mode}, page size {page_size}");
+                }
             }
         }
     }

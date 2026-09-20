@@ -2320,7 +2320,7 @@ impl IngressHandle {
         Ok(projection)
     }
 
-    /// Read one response-bound Agent/replica inventory page through the live
+    /// Read one response-bound Agent/replica or combined inventory page through the live
     /// Authority. Pages are discovery, not management approval or finality.
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
     pub fn query_clean_agent_inventory(
@@ -2329,13 +2329,14 @@ impl IngressHandle {
     ) -> Result<Vec<u8>, IngressAuthenticationError> {
         use crate::agent::sdk::authority::{
             AuthorityAgentProjectionPage, AuthorityAgentReplicaProjectionPage,
-            AuthorityProjectionSelector,
+            AuthorityInventoryProjectionPage, AuthorityProjectionSelector,
         };
         use crate::agent::sdk::wire::CanonicalWire as _;
         if !matches!(
             query.selector,
             AuthorityProjectionSelector::Agents { .. }
                 | AuthorityProjectionSelector::AgentReplicas { .. }
+                | AuthorityProjectionSelector::Inventory { .. }
         ) || query
             .verify_api_with(&crate::agent::clean_bootstrap::RawCredentialVerifier)
             .is_err()
@@ -2361,6 +2362,10 @@ impl IngressHandle {
             AuthorityProjectionSelector::AgentReplicas { .. } => {
                 AuthorityAgentReplicaProjectionPage::decode(&bytes)
                     .is_ok_and(|page| page.query == query)
+            }
+            AuthorityProjectionSelector::Inventory { .. } => {
+                AuthorityInventoryProjectionPage::decode(&bytes)
+                    .is_ok_and(|page| page.credential.query == query)
             }
             _ => false,
         };
@@ -13869,7 +13874,7 @@ fn is_private_read_method(method: &str) -> bool {
 /// (status + zero-length state). Both the length and the leading
 /// status byte are load-bearing for the client-side detection.
 #[cfg(feature = "network")]
-#[allow(dead_code)] // Retained as host-side fallback; see doc comment above.
+#[allow(dead_code)]// Retained as host-side fallback; see doc comment above.
 fn forbidden_envelope() -> Vec<u8> {
     use crate::actors::run::STATUS_FORBIDDEN;
     encode_invoke_envelope(STATUS_FORBIDDEN, &[], &[])
@@ -16804,6 +16809,79 @@ mod tests {
         );
         responder.join().unwrap();
         assert!(node.collect().is_empty());
+    }
+
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    #[test]
+    fn inventory_http_admission_verifies_combined_selector_signature_before_dispatch() {
+        use crate::agent::sdk::authority::{
+            AgentAuthorityBinding, AuthorityActorTarget, AuthorityIngressAuthentication,
+            AuthorityIssuer, AuthorityProjectionQuery, AuthorityProjectionSelector,
+        };
+        use crate::agent::sdk::{
+            ActorId, AgentId, CredentialId, DeploymentId, Hash, PrincipalId, ProducerId, ProgramId,
+            SpaceId,
+        };
+        use ed25519_dalek::{Signer as _, SigningKey};
+        let key = SigningKey::from_bytes(&[0x21; 32]);
+        let public = key.verifying_key().to_bytes();
+        let authority = AuthorityActorTarget {
+            space: SpaceId([0x31; 32]),
+            system_agent: AgentId([0x32; 32]),
+            system_runtime_deployment: DeploymentId([0x33; 32]),
+            binding: AgentAuthorityBinding {
+                policy: Hash([0x34; 32]),
+                issuer: AuthorityIssuer {
+                    principal: PrincipalId([0x35; 32]),
+                    actor: ActorId([0x36; 32]),
+                    deployment: DeploymentId([0x37; 32]),
+                    program: ProgramId([0x38; 32]),
+                    producer: ProducerId::of_public_key(&public),
+                },
+                public_key: public,
+                initial_epoch: 1,
+            },
+        };
+        let mut query = AuthorityProjectionQuery {
+            authority,
+            credential: CredentialId::of_public_key(&public),
+            nonce: Hash([0x39; 32]),
+            selector: AuthorityProjectionSelector::Inventory {
+                after: None,
+                limit: 64,
+                known_head: None,
+            },
+            authentication: AuthorityIngressAuthentication::ApiCredentialSignature {
+                credential_public_key: public,
+                signature: [1; 64],
+            },
+        };
+        let node = VosNode::new();
+        let handle = node.ingress_handle();
+        assert_eq!(
+            handle.query_clean_agent_inventory(query.clone()),
+            Err(IngressAuthenticationError::Invalid)
+        );
+        let signature = key.sign(&query.signing_bytes()).to_bytes();
+        if let AuthorityIngressAuthentication::ApiCredentialSignature {
+            signature: value, ..
+        } = &mut query.authentication
+        {
+            *value = signature;
+        }
+        assert_eq!(
+            handle.query_clean_agent_inventory(query.clone()),
+            Err(IngressAuthenticationError::AuthorityUnavailable)
+        );
+        query.selector = AuthorityProjectionSelector::Inventory {
+            after: None,
+            limit: 1,
+            known_head: None,
+        };
+        assert_eq!(
+            handle.query_clean_agent_inventory(query),
+            Err(IngressAuthenticationError::Invalid)
+        );
     }
 
     #[cfg(feature = "ssh-ingress")]

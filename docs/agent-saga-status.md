@@ -234,6 +234,37 @@ the suffix but does not bound its replay cost in time or gas.
 
 ## Next sequence
 
+Implementation-only targeted CLI discovery now replaces the old Agent-directory
+walk plus separate replica fetch. Install and managed invocation seek immediately
+before the requested Agent using the Inventory cursor order, then stop after its
+complete roster. Minimum/maximum ID boundaries are tested. Exact query/head,
+active API credential/owner, unchanged cross-page claims and roster generation
+remain required. The small fixture uses one descriptor-discovery dispatch instead
+of two; the separate retained credential query remains. This is not touched-state
+guest execution or a claim that all invocation overhead is removed.
+
+The public inventory HTTP route now admits the combined selector while retaining
+API signature verification and exact canonical response binding. Tests reject
+unsigned and selector-substituted requests before dispatch. Two focused discovery
+tests pass (`targeted-cli-discovery-http.log`), as do 25 Local CLI tests, with 18
+explicit live cases ignored (`targeted-cli-local-tests-sockets.log`), and the node
+signature-admission regression (`targeted-inventory-http-admission.log`). The
+first Local suite attempt lacked socket permission; its failure log is preserved.
+
+Matched debug CLI/client functional campaign passes at implementation
+`target/agent-lifecycle-qualification/indexed-lifecycle.YT7BM0/`, console log
+`targeted-cli-lifecycle-http.log`: Create/Install/restart/mutation/retirement/retry
+and read-after-restart all succeed. Exit 1 is the expected readiness-gate failure.
+This run overlaps a test build during early phases, so it is not a performance
+comparison. CLI SHA-256 is
+`c96c327222d8542de2b61ea4062f30e3f0e7c1142130a6b48d295ef5d6374881`;
+client SHA-256 is
+`4fc762b0e03b9306bf0bca79c1b23c797e2cd0af602cdfaa8c14d3b3810dc647`.
+The initial campaign `indexed-lifecycle.r6zMSu/` exposed the HTTP selector gap
+(403 before descriptor dispatch); its evidence is retained. No artifacts or ABI
+changed. Both node and CLI source changes must ship together; the fixed reviewer
+node does not yet expose this selector over HTTP. Optimized timing is pending.
+
 1. Reviewer examines `7bd66a7d..saga/agents` read-only and returns findings.
    Apply fixes on latest implementation source; advance the reviewer branch only
    at qualified checkpoints. Do not mix reviewer edits with implementation work.
