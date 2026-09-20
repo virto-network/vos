@@ -3319,6 +3319,8 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             .runtime_preparation
             .load(runtime_pvm, input, gas)
             .map_err(|_| LocalReplayExecutorError::RuntimeOutput)?;
+        let preparation_us = started.elapsed().as_micros() as u64;
+        let execution_started = std::time::Instant::now();
         #[cfg(test)]
         let invocation = if (input.len() > 700_000
             || std::env::var_os("VOS_AGENT_PROFILE_REFINE_ALL_INPUTS").is_some())
@@ -3338,6 +3340,8 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         let invocation = context.run();
         tracing::debug!(
             elapsed_us = started.elapsed().as_micros() as u64,
+            preparation_us,
+            execution_us = execution_started.elapsed().as_micros() as u64,
             input_bytes = input.len(),
             gas_limit = gas,
             gas_used = invocation.gas_used,

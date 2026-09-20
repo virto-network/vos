@@ -179,19 +179,26 @@ sha256sum --check "$evidence/identities.sha256"
 {
     # Whole daemon phases: startup, maintenance and retry are included. These
     # are not per-user-request counts. Zero means tracing may be disabled.
-    printf 'phase\ttraced_calls\tsummed_physical_us\tsummed_input_bytes\tsummed_gas\n'
+    printf 'phase\ttraced_calls\tsummed_physical_us\tsummed_input_bytes\tsummed_gas\tsplit_timing_calls\tsummed_preparation_us\tsummed_execution_us\tdurable_verification_calls\tdurable_verification_physical_us\n'
     for phase in initial restart mutation read; do
         awk -v phase="$phase" '
             /physical Agent runtime execution/ {
                 count++
+                physical_us=0
                 for(i=1;i<=NF;i++) {
                     split($i,a,"=")
-                    if(a[1]=="elapsed_us") us+=a[2]
+                    if(a[1]=="elapsed_us") {us+=a[2]; physical_us=a[2]}
                     if(a[1]=="input_bytes") bytes+=a[2]
                     if(a[1]=="gas_used") gas+=a[2]
+                    if(a[1]=="preparation_us") {split_count++; preparation+=a[2]}
+                    if(a[1]=="execution_us") execution+=a[2]
+                }
+                if($0 ~ /durable_terminal_verification/) {
+                    verification_count++
+                    verification_us+=physical_us
                 }
             }
-            END {printf "%s\t%d\t%.0f\t%.0f\t%.0f\n",phase,count,us,bytes,gas}
+            END {printf "%s\t%d\t%.0f\t%.0f\t%.0f\t%d\t%.0f\t%.0f\t%d\t%.0f\n",phase,count,us,bytes,gas,split_count,preparation,execution,verification_count,verification_us}
         ' "$evidence/$phase.log"
     done
 } > "$evidence/runtime-execution-summary.tsv"

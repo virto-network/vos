@@ -310,6 +310,47 @@ Additional boundary/clean-break checks:
   updated from r18 to r19. This is not the feature-gated attested-proof suite or
   full workspace test qualification. Initial failures remain in the log root.
 
+### Diagnostic preparation/execution and lifecycle-verification split
+
+The journal executor now traces preparation and execution separately, and a
+`durable_terminal_verification` span identifies physical calls made inside the
+fresh-verifier lifecycle boundary. No request contents are logged and no replay,
+authentication, ledger or exact-state checks are bypassed. The qualification
+summary retains its original columns and adds split-timing coverage plus nested
+verification counts/time. A zero coverage count means missing instrumentation,
+not measured zero preparation. Parsing the previous frozen trace reproduces all
+original totals with zero split coverage.
+
+Diagnostic evidence: implementation
+`target/agent-lifecycle-qualification/indexed-lifecycle.XSj3X4/`, console
+`terminal-replay-tracing-lifecycle.log`. Frozen **debug** CLI SHA-256:
+`1a4f893e50ae9860aa9b496a0800aa3f87e7f7344aa443461de62272d168c41b`;
+client remains `4fc762b0…`. All functional cases pass; all four daemons stop.
+Exit 1 is the expected debug-host readiness failure (13.034/9.014/10.682/10.376s).
+This does not replace the optimized-host qualification above.
+
+| Complete daemon phase | Calls | Preparation seconds | Execution seconds | Calls inside fresh terminal verification |
+| --- | ---: | ---: | ---: | ---: |
+| Bootstrap + Create + Install | 126 | 0.963 | 33.347 | 16 |
+| Restart | 23 | 0.434 | 3.009 | 0 |
+| Mutation/retry | 85 | 0.658 | 14.987 | 0 |
+| Read after restart | 83 | 0.648 | 13.866 | 0 |
+
+Every traced execution has split timing. Create/Install take 21.409/30.692s;
+their fresh durable verifications take 6.425/9.377s, including 14.323s of physical
+execution across both. Mutation/read tests take 24.963/26.008s and **do not enter
+this verification path**. Therefore fresh lifecycle replay is a substantial
+Create/Install cost, but cannot explain ordinary managed invocation latency in
+this campaign. Preparation is a small fraction of the traced execution path;
+these debug measurements do not establish released percentages or account for
+every source of request wall time. No proving-stage timing is inferred.
+
+Feature-scoped host check passes (`terminal-replay-tracing-check.log`). Compiled
+Inventory interrupted recovery passes (`terminal-replay-tracing-recovery.log`,
+one test); management finalization across clock advancement also passes
+(`terminal-replay-tracing-finalization.log`, one test). CLI build, shell syntax
+and diff checks pass. The instrumentation is diagnostic, not a performance fix.
+
 ## Next sequence
 
 1. Reviewer examines `7bd66a7d..saga/agents` read-only and returns findings.
@@ -317,8 +358,10 @@ Additional boundary/clean-break checks:
    at qualified checkpoints. Do not mix reviewer edits with implementation work.
 2. Extend the optimized-host baseline to growing-Agent directories and independent
    versus same-Agent workloads. Shared reopen is now attributed to materialization;
-   distinguish physical work kinds and fresh versus replayed lifecycle verification
-   on the managed invocation/ACK path before changing its boundaries. Keep exact
+   distinguish physical work kinds and repeated authorization/projection execution
+   on the managed invocation/ACK path. Fresh terminal verification is now measured
+   on Create/Install, but absent from the ordinary mutation/read campaign; do not
+   optimize it expecting to solve that separate path. Keep exact
    identities, CPU/RAM/FD and queue/tail measurements. The latest scoped readiness
    pass does not establish production latency/capacity gates.
 3. Address whole-state/touched-state and incremental-publication costs with an

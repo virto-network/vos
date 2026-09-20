@@ -1111,6 +1111,15 @@ where
         request: CleanInvocationReplayRequest,
         anchored_input: Option<ReplayInputId>,
     ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedJournalDriverError> {
+        // Scope nested physical executions without logging request contents or
+        // changing the fresh-verifier boundary used for lifecycle evidence.
+        let span = tracing::debug_span!(
+            "durable_terminal_verification",
+            ordered_index = self.materialization.heads().ordered_index,
+            anchored = anchored_input.is_some(),
+        );
+        let _entered = span.enter();
+        let started = std::time::Instant::now();
         let operation = request.into_operation(0);
         let resolver = self.store.catalog_blob_resolver()?;
         let mut executor = StandardLocalReplayExecutor::new_shared(
@@ -1119,7 +1128,16 @@ where
             self.replay_merge.clone(),
             self.ledger.committee_history()?,
         );
-        let recovered = materialize_current(&mut self.store, &mut executor, &NoPrunedOrderedBases)?;
+        let setup_us = started.elapsed().as_micros() as u64;
+        let materialize_started = std::time::Instant::now();
+        let recovered = materialize_current(&mut self.store, &mut executor, &NoPrunedOrderedBases);
+        tracing::debug!(
+            setup_us,
+            materialize_us = materialize_started.elapsed().as_micros() as u64,
+            succeeded = recovered.is_ok(),
+            "durable terminal materialization complete"
+        );
+        let recovered = recovered?;
         let audit = self.ledger.journal_audit()?;
         if let Some(snapshot) = &audit.snapshot {
             validate_published_shared_checkpoint(&self.store, &recovered, &snapshot.claim)
@@ -1143,6 +1161,10 @@ where
         if !matches!(outcome, crate::agent_sdk::RuntimeOutcome::Completed(_)) {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
+        tracing::debug!(
+            elapsed_us = started.elapsed().as_micros() as u64,
+            "durable terminal verification complete"
+        );
         Ok(outcome)
     }
 
