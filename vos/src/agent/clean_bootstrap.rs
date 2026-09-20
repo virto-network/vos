@@ -1148,6 +1148,7 @@ impl CanonicalWire for PendingAuthorityProjection {
 
 const fn projection_method(selector: AuthorityProjectionSelector) -> &'static str {
     match selector {
+        AuthorityProjectionSelector::Inventory { .. } => "inventory_projection_page",
         AuthorityProjectionSelector::Credential => "credential_projection",
         AuthorityProjectionSelector::Agents { .. } => "agent_projection_page",
         AuthorityProjectionSelector::AgentReplicas { .. } => "agent_replica_projection_page",
@@ -8946,6 +8947,9 @@ mod tests {
                 crate::agent::production_owner::AgentProductionOwnerError,
             > {
                 let group = match selector {
+                    AuthorityProjectionSelector::Inventory { .. } => {
+                        return Err(crate::agent::production_owner::AgentProductionOwnerError::InvalidProjection);
+                    }
                     AuthorityProjectionSelector::Credential => 1,
                     AuthorityProjectionSelector::Agents { .. } => 2,
                     AuthorityProjectionSelector::AgentReplicas { .. } => 3,

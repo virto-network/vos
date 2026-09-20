@@ -6869,6 +6869,7 @@ mod tests {
             let mut projections = inventory.projections.clone();
             projections.sort_by_key(|projection| projection.descriptor().identity.agent);
             let bytes = match query.selector {
+                AuthorityProjectionSelector::Inventory { .. } => return Err(AgentRouteError::Rejected),
                 AuthorityProjectionSelector::Credential => AuthorityCredentialProjection {
                     query,
                     head,

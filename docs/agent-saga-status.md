@@ -178,6 +178,36 @@ Journal store identity binds canonical path and lock nonce; both focused tests
 pass in `resolved-store-identity.log`. Directory relocation is not a qualified
 backup/restore workflow.
 
+### Combined inventory projection: staged source, not enabled
+
+The SDK and system-authority actor now define a signed `Inventory` selector and
+`AIP1` page: fresh credential claims, one complete Authority head, and a cursor
+ordered by Agent then descriptor/replica/actor. An unchanged-head hint suppresses
+rows only after fresh authentication; consumers must still compare the exact
+Authority, credential and complete claims. Revoked credentials receive no rows.
+Pages cap total rows at 64, complex Agent/actor rows at eight, and bytes below
+the existing 16 KiB reply ceiling including its five-byte actor wrapper.
+This preserves dense-roster paging while combining small inventories. The actor
+still validates/reconstructs whole state; this is not touched-state execution.
+
+The production client has **not switched** from its existing separate queries.
+Old-query test transports explicitly refuse the new selector until their
+cutover tests are added. Runtime projection-retirement recognition and method
+dispatch know the new selector; bundled artifacts remain unchanged. Host
+reconstruction, cache/failure behavior, physical query/retirement/recovery,
+reproduced runtime/templates and integrated performance are required before
+enabling this batch or advancing it to the reviewer branch.
+
+Source evidence: 182 SDK tests (`inventory-stream-sdk-final.log`), 75 Authority
+tests with two opt-in tests ignored (`inventory-stream-authority-final.log`),
+17 existing inventory-owner regressions (`inventory-stream-owner-final.log`)
+and 52 Standard tests (`inventory-stream-standard-final.log`) pass. Coverage
+includes canonical/truncated/oversized wire refusal, separate row/byte budgets,
+dense rosters, complete paged reconstruction, Private filtering, signature
+substitution, fresh cache hits, changed-head continuation, revocation and actor
+restart. The no-std Authority guest builds (`inventory-stream-authority-guest-final.log`);
+it is not yet a reproduced/pinned bundled artifact or a physical performance result.
+
 ## Next sequence
 
 1. Reviewer examines `c8028394..saga/agents` read-only and returns findings;
@@ -190,8 +220,8 @@ backup/restore workflow.
 3. Reduce authenticated inventory projection work with explicit revision,
    freshness, availability and ordering. Preserve same-head pagination, cache
    invalidation on refresh failure and durable retirement; no custom-state decoding
-   shortcuts or discarded guest state. Start with a bounded combined projection
-   design to amortize the repeated authenticated invocation/retirement pairs;
+   shortcuts or discarded guest state. Complete the staged combined projection
+   implementation to amortize the repeated authenticated invocation/retirement pairs;
    enforce total response bounds rather than merely increasing page sizes.
    Acceptance must cover exact credential/nonce/Authority binding, one revision,
    revocation and visibility filtering, interrupted pagination, pending-query

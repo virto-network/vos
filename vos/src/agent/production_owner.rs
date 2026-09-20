@@ -1761,6 +1761,9 @@ mod tests {
         ) -> Result<Vec<u8>, AgentProductionOwnerError> {
             self.calls.lock().unwrap().push(query.selector);
             let bytes = match query.selector {
+                AuthorityProjectionSelector::Inventory { .. } => {
+                    return Err(AgentProductionOwnerError::InvalidProjection);
+                }
                 AuthorityProjectionSelector::Credential => AuthorityCredentialProjection {
                     query,
                     head: self.head,

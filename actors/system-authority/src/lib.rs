@@ -30,11 +30,13 @@ use vos::agent_sdk::authority::{
     AuthorityAgentReplicaProjectionPage, AuthorityBuiltinRole, AuthorityCapabilityGrant,
     AuthorityCredentialCall, AuthorityCredentialEnrollment, AuthorityCredentialKind,
     AuthorityCredentialProjection, AuthorityCredentialStatus, AuthorityCredentialVerifier,
-    AuthorityEvidence, AuthorityIngressAuthentication, AuthorityIssuer, AuthorityLaneRoots,
-    AuthorityOperationKind, AuthorityProjectionHead, AuthorityProjectionQuery,
-    AuthorityProjectionSelector, AuthorityVerifier, CompactAgentDescriptor, CompactInstallActor,
-    CompactReplicaSlot, MAX_AUTHORITY_PRINCIPAL_GRANTS, ManagedAgentTarget,
-    ManagementApplicationAck, ManagementApproval, ManagementAuthorizationPlan,
+    AuthorityEvidence, AuthorityIngressAuthentication, AuthorityInventoryCursor,
+    AuthorityInventoryEntry, AuthorityInventoryPosition, AuthorityInventoryProjectionPage,
+    AuthorityIssuer, AuthorityLaneRoots, AuthorityOperationKind, AuthorityProjectionHead,
+    AuthorityProjectionQuery, AuthorityProjectionSelector, AuthorityVerifier,
+    CompactAgentDescriptor, CompactInstallActor, CompactReplicaSlot,
+    MAX_AUTHORITY_PRINCIPAL_GRANTS, ManagedAgentTarget, ManagementApplicationAck,
+    ManagementApproval, ManagementAuthorizationPlan,
 };
 use vos::agent_sdk::authority_operation::{
     AuthorityOperationApproval, AuthorityOperationCall, AuthorityOperationIntent,
@@ -1504,6 +1506,13 @@ impl SystemAuthority {
         credential_projection(&self.configuration, &self.state, &query)
     }
 
+    /// Bounded, revision-consistent credential and directory stream. One
+    /// query authenticates the complete page; no per-row invocation is needed.
+    #[msg(query)]
+    fn inventory_projection_page(&self, query: Vec<u8>) -> Vec<u8> {
+        inventory_projection_page(&self.configuration, &self.state, &query)
+    }
+
     /// Return one bounded, full-ID ordered Agent policy page. Private entries
     /// are visible only to their owner or an Admin and never carry aliases.
     #[msg(query)]
@@ -1794,19 +1803,29 @@ fn credential_projection(
     if query.selector != AuthorityProjectionSelector::Credential {
         return Vec::new();
     }
+    projected_credential(state, query, credential_index, principal, role)
+        .and_then(|projection| projection.encode().ok())
+        .unwrap_or_default()
+}
+
+fn projected_credential(
+    state: &AuthorityLinearState,
+    query: AuthorityProjectionQuery,
+    credential_index: usize,
+    principal: PrincipalId,
+    role: BuiltinPrincipalRole,
+) -> Option<AuthorityCredentialProjection> {
     let credential = &state.credentials[credential_index];
     let kind = match credential.kind {
         value if value == AuthorityCredentialKind::Ssh as u8 => AuthorityCredentialKind::Ssh,
         value if value == AuthorityCredentialKind::Api as u8 => AuthorityCredentialKind::Api,
-        _ => return Vec::new(),
+        _ => return None,
     };
     let status = match credential.status {
         CredentialStatus::Active => AuthorityCredentialStatus::Active,
         CredentialStatus::Revoked => AuthorityCredentialStatus::Revoked,
     };
-    let Some(head) = projection_head(state) else {
-        return Vec::new();
-    };
+    let head = projection_head(state)?;
     let space_roles = state
         .space_role_grants
         .iter()
@@ -1835,7 +1854,7 @@ fn credential_projection(
             capability: CapabilityId(grant.capability),
         })
         .collect();
-    AuthorityCredentialProjection {
+    Some(AuthorityCredentialProjection {
         query,
         head,
         principal,
@@ -1852,9 +1871,7 @@ fn credential_projection(
         space_roles,
         actor_roles,
         capabilities,
-    }
-    .encode()
-    .unwrap_or_default()
+    })
 }
 
 fn private_agent_visible_to(
@@ -1865,6 +1882,157 @@ fn private_agent_visible_to(
     row.profile != AgentProfile::Private as u8
         || row.owner == principal.0
         || role == BuiltinPrincipalRole::Admin
+}
+
+fn inventory_projection_page(
+    configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
+    encoded_query: &[u8],
+) -> Vec<u8> {
+    let Some((query, credential_index, principal, role)) =
+        authenticated_projection_query(configuration, state, encoded_query, true)
+    else {
+        return Vec::new();
+    };
+    let AuthorityProjectionSelector::Inventory {
+        after,
+        limit,
+        known_head,
+    } = query.selector
+    else {
+        return Vec::new();
+    };
+    let Some(credential) = projected_credential(state, query, credential_index, principal, role)
+    else {
+        return Vec::new();
+    };
+    let active = credential.status == AuthorityCredentialStatus::Active;
+    let unchanged = active && after.is_none() && known_head == Some(credential.head);
+    let (entries, mut has_more) = if !active || unchanged {
+        (Vec::new(), false)
+    } else {
+        let Some(rows) = inventory_rows(
+            configuration,
+            state,
+            principal,
+            role,
+            after,
+            usize::from(limit),
+        ) else {
+            return Vec::new();
+        };
+        rows
+    };
+    let mut page = AuthorityInventoryProjectionPage {
+        credential,
+        unchanged,
+        entries,
+        next: None,
+    };
+    loop {
+        if page.entries.is_empty() && has_more {
+            // Claims plus at least one row must fit. Never turn truncation
+            // into a terminal-looking empty inventory or skip an oversized row.
+            return Vec::new();
+        }
+        page.next = has_more
+            .then(|| page.entries.last().map(AuthorityInventoryEntry::cursor))
+            .flatten();
+        if let Ok(encoded) = page.encode() {
+            return encoded;
+        }
+        if page.entries.pop().is_none() {
+            return Vec::new();
+        }
+        has_more = true;
+    }
+}
+
+/// Materialize at most `limit` rows plus one lookahead cursor. The enclosing
+/// query has already verified state and credential once. This is still a
+/// whole-state actor execution, not a claim of touched-state storage access.
+fn inventory_rows(
+    configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
+    principal: PrincipalId,
+    role: BuiltinPrincipalRole,
+    after: Option<AuthorityInventoryCursor>,
+    limit: usize,
+) -> Option<(Vec<AuthorityInventoryEntry>, bool)> {
+    let mut entries = Vec::with_capacity(limit);
+    let mut complex_rows = 0;
+    let first = after.map_or(0, |cursor| {
+        state
+            .managed_agents
+            .partition_point(|row| row.agent < cursor.agent.0)
+    });
+    for row in &state.managed_agents[first..] {
+        if !private_agent_visible_to(row, principal, role) {
+            continue;
+        }
+        let agent = AgentId(row.agent);
+        let cursor = AuthorityInventoryCursor {
+            agent,
+            position: AuthorityInventoryPosition::Agent,
+        };
+        if after.is_none_or(|after| cursor > after) {
+            if entries.len() == limit
+                || complex_rows == vos::agent_sdk::authority::MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES
+            {
+                return Some((entries, true));
+            }
+            complex_rows += 1;
+            entries.push(AuthorityInventoryEntry::Agent(managed_agent_projection(
+                configuration,
+                row,
+            )?));
+        }
+        let replica_start = match after
+            .filter(|cursor| cursor.agent == agent)
+            .map(|cursor| cursor.position)
+        {
+            Some(AuthorityInventoryPosition::Actor(_)) => row.replicas.len(),
+            Some(AuthorityInventoryPosition::Replica(node)) => row
+                .replicas
+                .partition_point(|replica| replica.node <= node.0),
+            _ => 0,
+        };
+        for replica in &row.replicas[replica_start..] {
+            if entries.len() == limit {
+                return Some((entries, true));
+            }
+            entries.push(AuthorityInventoryEntry::Replica {
+                agent,
+                replica: replica.sdk()?,
+            });
+        }
+        let after_actor = match after
+            .filter(|cursor| cursor.agent == agent)
+            .map(|cursor| cursor.position)
+        {
+            Some(AuthorityInventoryPosition::Actor(actor)) => Some(actor.0),
+            _ => None,
+        };
+        let actor_start = state.managed_actors.partition_point(|actor| {
+            actor.agent < row.agent
+                || actor.agent == row.agent && after_actor.is_some_and(|after| actor.actor <= after)
+        });
+        for actor in state.managed_actors[actor_start..]
+            .iter()
+            .take_while(|actor| actor.agent == row.agent)
+        {
+            if entries.len() == limit
+                || complex_rows == vos::agent_sdk::authority::MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES
+            {
+                return Some((entries, true));
+            }
+            complex_rows += 1;
+            entries.push(AuthorityInventoryEntry::Actor(managed_actor_projection(
+                actor,
+            )?));
+        }
+    }
+    Some((entries, false))
 }
 
 fn agent_projection_page(
@@ -10366,6 +10534,321 @@ mod tests {
         );
     }
 
+    fn inventory_query(
+        actor: &SystemAuthority,
+        key: &SigningKey,
+        after: Option<AuthorityInventoryCursor>,
+        limit: u16,
+        known_head: Option<AuthorityProjectionHead>,
+    ) -> AuthorityProjectionQuery {
+        ssh_projection_query(
+            actor.configuration,
+            key,
+            ADMIN_NODE,
+            &signing(0x31),
+            0xb1,
+            AuthorityProjectionSelector::Inventory {
+                after,
+                limit,
+                known_head,
+            },
+        )
+    }
+
+    fn inventory_page(
+        actor: &SystemAuthority,
+        query: &AuthorityProjectionQuery,
+    ) -> AuthorityInventoryProjectionPage {
+        let bytes =
+            inventory_projection_page(&actor.configuration, &actor.state, &query.encode().unwrap());
+        assert!(bytes.len() <= MAX_INVOCATION_REPLY_BYTES);
+        assert!(
+            vos::actors::value::desc::encode_value(&vos::actors::value::Value::Bytes(
+                bytes.clone()
+            ))
+            .len()
+                <= MAX_INVOCATION_REPLY_BYTES
+        );
+        let page = AuthorityInventoryProjectionPage::decode(&bytes).unwrap();
+        assert_eq!(&page.credential.query, query);
+        page
+    }
+
+    fn drain_inventory(
+        actor: &SystemAuthority,
+        key: &SigningKey,
+        limit: u16,
+    ) -> Vec<AuthorityInventoryEntry> {
+        let mut after = None;
+        let mut rows = Vec::new();
+        let mut head = None;
+        for _ in 0..64 {
+            let query = inventory_query(actor, key, after, limit, None);
+            let page = inventory_page(actor, &query);
+            assert!(!page.unchanged);
+            assert_eq!(
+                *head.get_or_insert(page.credential.head),
+                page.credential.head
+            );
+            rows.extend(page.entries);
+            match page.next {
+                Some(next) => {
+                    assert_eq!(rows.last().map(AuthorityInventoryEntry::cursor), Some(next));
+                    after = Some(next);
+                }
+                None => return rows,
+            }
+        }
+        panic!("small fixture must complete with bounded pages");
+    }
+
+    #[test]
+    fn inventory_stream_pages_match_directory_and_filter_private_rows() {
+        let config = configuration();
+        let mut actor = actor();
+        let catalog = install_catalog_projection(&mut actor);
+        let owner = PrincipalId([0x93; 32]);
+        let owner_key = signing(0x94);
+        enroll(
+            &mut actor,
+            &owner_key,
+            owner,
+            node_for_principal(config, owner),
+            BuiltinPrincipalRole::Member,
+        );
+        let foreign = PrincipalId([0x95; 32]);
+        let foreign_key = signing(0x96);
+        enroll(
+            &mut actor,
+            &foreign_key,
+            foreign,
+            node_for_principal(config, foreign),
+            BuiltinPrincipalRole::Member,
+        );
+        let descriptors = [
+            descriptor(config, owner, AgentProfile::Private, 0x97),
+            descriptor(config, foreign, AgentProfile::Private, 0x98),
+            descriptor(config, foreign, AgentProfile::Private, 0x99),
+        ];
+        for descriptor in &descriptors {
+            insert_live(&mut actor, descriptor);
+        }
+        let before = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
+        let rows = drain_inventory(&actor, &signing(0x21), 8);
+        assert!(rows.len() > 8);
+        assert_eq!(drain_inventory(&actor, &signing(0x21), 1), rows);
+        assert_eq!(drain_inventory(&actor, &signing(0x21), 2), rows);
+        assert_eq!(drain_inventory(&actor, &signing(0x21), 64), rows);
+        assert!(
+            inventory_page(
+                &actor,
+                &inventory_query(&actor, &signing(0x21), None, 64, None)
+            )
+            .next
+            .is_none()
+        );
+        assert!(
+            rows.windows(2)
+                .all(|pair| pair[0].cursor() < pair[1].cursor())
+        );
+        let member = drain_inventory(&actor, &owner_key, 2);
+        let visible = rows
+            .iter()
+            .filter(|entry| {
+                entry.cursor().agent != descriptors[1].identity.agent
+                    && entry.cursor().agent != descriptors[2].identity.agent
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            member, visible,
+            "hidden Agents must also hide their replica/actor rows"
+        );
+        for descriptor in &descriptors {
+            let projected = rows
+                .iter()
+                .find_map(|entry| match entry {
+                    AuthorityInventoryEntry::Agent(row)
+                        if row.identity.agent == descriptor.identity.agent =>
+                    {
+                        Some(row)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let replicas = rows
+                .iter()
+                .filter_map(|entry| match entry {
+                    AuthorityInventoryEntry::Replica { agent, replica }
+                        if *agent == descriptor.identity.agent =>
+                    {
+                        Some(replica.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                projected.reconstruct_descriptor(replicas).unwrap(),
+                *descriptor
+            );
+        }
+        assert!(
+            rows.iter()
+                .any(|entry| matches!(entry, AuthorityInventoryEntry::Actor(row)
+            if row.entry == catalog.entry && row.installation_id == catalog.installation_id))
+        );
+        assert_eq!(
+            before,
+            <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear)
+        );
+
+        // A page cursor inside an invisible Agent cannot disclose its children.
+        let query = inventory_query(
+            &actor,
+            &owner_key,
+            Some(AuthorityInventoryCursor {
+                agent: descriptors[1].identity.agent,
+                position: AuthorityInventoryPosition::Agent,
+            }),
+            8,
+            None,
+        );
+        let page = inventory_page(&actor, &query);
+        assert!(
+            page.entries
+                .iter()
+                .all(|entry| entry.cursor().agent != descriptors[1].identity.agent)
+        );
+    }
+
+    #[test]
+    fn inventory_stream_authentication_cache_and_revocation_are_fresh() {
+        let config = configuration();
+        let mut actor = actor();
+        install_catalog_projection(&mut actor);
+        let principal = PrincipalId([0x83; 32]);
+        let key = signing(0x84);
+        enroll(
+            &mut actor,
+            &key,
+            principal,
+            node_for_principal(config, principal),
+            BuiltinPrincipalRole::Member,
+        );
+        let query = inventory_query(&actor, &key, None, 8, None);
+        let first = inventory_page(&actor, &query);
+        assert!(!first.entries.is_empty());
+        let partial = inventory_page(&actor, &inventory_query(&actor, &key, None, 1, None));
+        assert!(partial.next.is_some());
+        let cached_query = inventory_query(&actor, &key, None, 8, Some(first.credential.head));
+        let cached = inventory_page(&actor, &cached_query);
+        assert!(cached.unchanged);
+        assert!(cached.entries.is_empty());
+        assert!(cached.next.is_none());
+
+        let mut wrong_nonce = cached_query.clone();
+        wrong_nonce.nonce = Hash([0xe1; 32]);
+        let mut wrong_authority = cached_query.clone();
+        wrong_authority.authority.binding.initial_epoch += 1;
+        let mut wrong_head = cached_query.clone();
+        let mut head = first.credential.head;
+        head.state_commitment = Hash([0xe2; 32]);
+        wrong_head.selector = AuthorityProjectionSelector::Inventory {
+            after: None,
+            limit: 8,
+            known_head: Some(head),
+        };
+        for substituted in [wrong_nonce, wrong_authority, wrong_head] {
+            // Each field is included in the signature; an unchanged hint does
+            // not bypass authentication or state validation.
+            assert!(
+                inventory_projection_page(&config, &actor.state, &substituted.encode().unwrap())
+                    .is_empty()
+            );
+        }
+        let mut substituted = cached_query.clone();
+        substituted.selector = AuthorityProjectionSelector::Inventory {
+            after: None,
+            limit: 1,
+            known_head: Some(first.credential.head),
+        };
+        assert!(
+            inventory_projection_page(&config, &actor.state, &substituted.encode().unwrap())
+                .is_empty()
+        );
+        let wrong_kind = api_projection_query(config, &key, 0xb2, query.selector);
+        assert!(
+            inventory_projection_page(&config, &actor.state, &wrong_kind.encode().unwrap())
+                .is_empty()
+        );
+
+        dispatch_fixture_admin(
+            &mut actor,
+            InvocationId([0xb3; 32]),
+            AuthorityAdminOperation::SetBuiltinRole {
+                principal,
+                role: AuthorityBuiltinRole::Developer,
+            },
+        );
+        let changed = inventory_page(&actor, &cached_query);
+        assert!(!changed.unchanged);
+        assert_ne!(changed.credential.head, first.credential.head);
+        assert_eq!(
+            changed.credential.builtin_role,
+            AuthorityBuiltinRole::Developer
+        );
+        assert_eq!(changed.entries, first.entries);
+        let continued = inventory_page(
+            &actor,
+            &inventory_query(&actor, &key, partial.next, 1, None),
+        );
+        assert_ne!(
+            continued.credential.head, partial.credential.head,
+            "a consumer must reject pagination across an intervening Authority mutation"
+        );
+        assert_eq!(continued.credential.head, changed.credential.head);
+        dispatch_fixture_admin(
+            &mut actor,
+            InvocationId([0xb5; 32]),
+            AuthorityAdminOperation::AddCredential {
+                principal,
+                credential: enrollment(&signing(0x85), AuthorityCredentialKind::Ssh),
+            },
+        );
+        let credential = CredentialId::of_public_key(&key.verifying_key().to_bytes());
+        dispatch_fixture_admin(
+            &mut actor,
+            InvocationId([0xb4; 32]),
+            AuthorityAdminOperation::RevokeCredential {
+                principal,
+                credential,
+            },
+        );
+        let revoked = inventory_page(&actor, &cached_query);
+        assert_eq!(
+            revoked.credential.status,
+            AuthorityCredentialStatus::Revoked
+        );
+        assert!(!revoked.unchanged);
+        assert!(revoked.entries.is_empty());
+        assert!(revoked.next.is_none());
+        let linear = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
+        let reopened = <SystemAuthority as vos::Actor>::__load_agent_state(
+            Some(&config.encode()),
+            Some(&linear),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(inventory_page(&reopened, &cached_query), revoked);
+        let mut corrupt = actor.state.clone();
+        corrupt.credentials[0].operation_request_high_water ^= 1;
+        assert!(
+            inventory_projection_page(&config, &corrupt, &cached_query.encode().unwrap())
+                .is_empty()
+        );
+    }
+
     #[test]
     fn projection_pages_are_full_ordered_private_filtered_and_head_stable() {
         let config = configuration();
@@ -17663,7 +18146,7 @@ mod tests {
     #[test]
     fn generated_agent_schema_marks_authority_methods_as_explicit_linear_public_preflight() {
         let method = SystemAuthorityMsg::AGENT_METHODS;
-        assert_eq!(method.len(), 13);
+        assert_eq!(method.len(), 14);
         assert_eq!(method[0].name, "authorize");
         assert_eq!(method[0].mode, vos::agent_sdk::schema::MethodMode::Linear);
         assert!(method[0].explicit);
@@ -17690,6 +18173,7 @@ mod tests {
         assert!(method[7].explicit);
         for (index, name) in [
             "credential_projection",
+            "inventory_projection_page",
             "agent_projection_page",
             "agent_replica_projection_page",
             "actor_projection_page",
@@ -17705,7 +18189,7 @@ mod tests {
             );
             assert!(method[index + 8].explicit);
         }
-        assert_eq!(SystemAuthorityMsg::AGENT_AUTHORIZATIONS.len(), 13);
+        assert_eq!(SystemAuthorityMsg::AGENT_AUTHORIZATIONS.len(), 14);
         assert!(
             SystemAuthorityMsg::AGENT_AUTHORIZATIONS
                 .iter()

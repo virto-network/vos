@@ -22,9 +22,14 @@ pub const CREDENTIAL_SIGNATURE_BYTES: usize = 64;
 /// Maximum number of records returned by one authority inventory query.
 /// Encoded reply size remains an independent, stricter bound.
 pub const MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES: usize = 8;
+/// Leave room for the actor reply's canonical Bytes tag and u32 length.
+pub const MAX_AUTHORITY_INVENTORY_PROJECTION_BYTES: usize = crate::MAX_INVOCATION_REPLY_BYTES - 5;
 /// Maximum replicas returned by one Agent-roster query. A complete maximum
 /// roster is reconstructed across bounded pages sharing one projection head.
 pub const MAX_AUTHORITY_REPLICA_PAGE_ENTRIES: usize = 64;
+/// Combined pages preserve dense replica-roster throughput. Agent and actor
+/// rows share the stricter eight-complex-row budget, plus the total byte cap.
+pub const MAX_AUTHORITY_INVENTORY_PAGE_ENTRIES: usize = MAX_AUTHORITY_REPLICA_PAGE_ENTRIES;
 /// Maximum application authorization grants projected for one Principal.
 pub const MAX_AUTHORITY_PRINCIPAL_GRANTS: usize = 64;
 
@@ -1067,11 +1072,24 @@ pub enum AuthorityProjectionSelector {
         after: Option<ActorId>,
         limit: u16,
     },
+    /// One ordered stream of Agent, replica and actor facts. A known head
+    /// may suppress rows only on the first page, after fresh authentication.
+    Inventory {
+        after: Option<AuthorityInventoryCursor>,
+        limit: u16,
+        known_head: Option<AuthorityProjectionHead>,
+    },
 }
 
 impl AuthorityProjectionSelector {
     pub fn validate_shape(self) -> bool {
         match self {
+            Self::Inventory { after, limit, known_head } => {
+                after.is_none_or(|cursor| cursor.is_valid())
+                    && limit != 0
+                    && usize::from(limit) <= MAX_AUTHORITY_INVENTORY_PAGE_ENTRIES
+                    && known_head.is_none_or(|head| after.is_none() && head.is_valid())
+            }
             Self::Credential => true,
             Self::Agents { after, limit } => {
                 after != Some(AgentId::ZERO)
@@ -1263,7 +1281,8 @@ pub struct AuthorityCredentialProjection {
 impl AuthorityCredentialProjection {
     pub fn validate_shape(&self) -> Result<(), AuthorityActorProtocolError> {
         self.query.validate_shape()?;
-        if self.query.selector != AuthorityProjectionSelector::Credential
+        if !matches!(self.query.selector,
+            AuthorityProjectionSelector::Credential | AuthorityProjectionSelector::Inventory { .. })
             || !self.head.is_valid()
             || self.principal == PrincipalId::ZERO
             || self.space_roles.len() + self.actor_roles.len() + self.capabilities.len()
@@ -1279,6 +1298,143 @@ impl AuthorityCredentialProjection {
         }
         if crate::wire::authority_credential_projection_encoded_len(self)
             > crate::MAX_INVOCATION_REPLY_BYTES
+        {
+            return Err(AuthorityActorProtocolError::LimitExceeded);
+        }
+        Ok(())
+    }
+}
+
+/// Exclusive cursor ordered by Agent first, then descriptor, replicas, actors.
+/// Replica/actor identifiers are not interchangeable, even when bytes coincide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AuthorityInventoryCursor {
+    pub agent: AgentId,
+    pub position: AuthorityInventoryPosition,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AuthorityInventoryPosition {
+    Agent,
+    Replica(NodeId),
+    Actor(ActorId),
+}
+
+impl AuthorityInventoryCursor {
+    pub fn is_valid(self) -> bool {
+        self.agent != AgentId::ZERO
+            && match self.position {
+                AuthorityInventoryPosition::Agent => true,
+                AuthorityInventoryPosition::Replica(node) => node != NodeId::ZERO,
+                AuthorityInventoryPosition::Actor(actor) => actor != ActorId::ZERO,
+            }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuthorityInventoryEntry {
+    Agent(AuthorityAgentProjection),
+    Replica {
+        agent: AgentId,
+        replica: AgentReplica,
+    },
+    Actor(AuthorityActorProjection),
+}
+
+impl AuthorityInventoryEntry {
+    pub fn cursor(&self) -> AuthorityInventoryCursor {
+        let (agent, position) = match self {
+            Self::Agent(row) => (row.identity.agent, AuthorityInventoryPosition::Agent),
+            Self::Replica { agent, replica } => {
+                (*agent, AuthorityInventoryPosition::Replica(replica.node))
+            }
+            Self::Actor(row) => (
+                row.agent,
+                AuthorityInventoryPosition::Actor(row.entry.actor),
+            ),
+        };
+        AuthorityInventoryCursor { agent, position }
+    }
+
+    fn valid_for(&self, target: AuthorityActorTarget) -> bool {
+        match self {
+            Self::Agent(row) => {
+                row.validate_shape().is_ok()
+                    && row.identity.space == target.space
+                    && row.authority == target.binding
+                    && (row.identity.agent != target.system_agent
+                        || row.identity.runtime_deployment == target.system_runtime_deployment)
+            }
+            Self::Replica { agent, replica } => {
+                *agent != AgentId::ZERO
+                    && replica.node != NodeId::ZERO
+                    && replica.principal != PrincipalId::ZERO
+            }
+            Self::Actor(row) => row.validate_shape().is_ok(),
+        }
+    }
+}
+
+/// A bounded slice of one authenticated inventory revision. Credential facts
+/// carry the exact signed Inventory query (not a synthetic Credential query).
+/// Revoked credentials receive only their own claims; never inventory rows.
+/// Consumers must reconstruct complete descriptors and verify replica counts,
+/// generations, per-Agent actor limits and the same head/claims across pages.
+/// `unchanged` attests only to the requested state head: cache reuse also
+/// requires matching Authority, credential identity and complete fresh claims.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorityInventoryProjectionPage {
+    pub credential: AuthorityCredentialProjection,
+    pub unchanged: bool,
+    pub entries: Vec<AuthorityInventoryEntry>,
+    pub next: Option<AuthorityInventoryCursor>,
+}
+
+impl AuthorityInventoryProjectionPage {
+    pub fn validate_shape(&self) -> Result<(), AuthorityActorProtocolError> {
+        self.credential.validate_shape()?;
+        let AuthorityProjectionSelector::Inventory {
+            after,
+            limit,
+            known_head,
+        } = self.credential.query.selector
+        else {
+            return Err(AuthorityActorProtocolError::InvalidApplication);
+        };
+        if self.entries.len() > usize::from(limit)
+            || self
+                .entries
+                .iter()
+                .filter(|entry| !matches!(entry, AuthorityInventoryEntry::Replica { .. }))
+                .count()
+                > MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES
+            || self
+                .entries
+                .iter()
+                .any(|entry| !entry.valid_for(self.credential.query.authority))
+            || self
+                .entries
+                .windows(2)
+                .any(|pair| pair[0].cursor() >= pair[1].cursor())
+            || self
+                .entries
+                .first()
+                .is_some_and(|entry| after.is_some_and(|after| entry.cursor() <= after))
+            || self.next.is_some()
+                && self.entries.last().map(AuthorityInventoryEntry::cursor) != self.next
+            || self.unchanged
+                && (after.is_some()
+                    || known_head != Some(self.credential.head)
+                    || !self.entries.is_empty()
+                    || self.next.is_some()
+                    || self.credential.status != AuthorityCredentialStatus::Active)
+            || self.credential.status == AuthorityCredentialStatus::Revoked
+                && (!self.entries.is_empty() || self.next.is_some())
+        {
+            return Err(AuthorityActorProtocolError::InvalidApplication);
+        }
+        if crate::wire::authority_inventory_projection_page_encoded_len(self)
+            > MAX_AUTHORITY_INVENTORY_PROJECTION_BYTES
         {
             return Err(AuthorityActorProtocolError::LimitExceeded);
         }

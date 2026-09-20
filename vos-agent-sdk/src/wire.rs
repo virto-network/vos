@@ -15,13 +15,16 @@ use crate::authority::{
     AuthorityAgentProjection, AuthorityAgentProjectionPage, AuthorityAgentReplicaProjectionPage,
     AuthorityBuiltinRole, AuthorityCapabilityGrant, AuthorityCredentialCall,
     AuthorityCredentialEnrollment, AuthorityCredentialKind, AuthorityCredentialProjection,
-    AuthorityCredentialStatus, AuthorityEvidence, AuthorityIngressAuthentication, AuthorityIssuer,
-    AuthorityLaneRoots, AuthorityOperationKind, AuthorityProjectionHead, AuthorityProjectionQuery,
-    AuthorityProjectionSelector, AuthorityReceipt, AuthorityReceiptSelector,
-    CREDENTIAL_PUBLIC_KEY_BYTES, CREDENTIAL_SIGNATURE_BYTES, CompactAgentDescriptor,
-    CompactInstallActor, CompactReplicaSlot, MAX_AUTHORITY_PRINCIPAL_GRANTS,
-    MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES, MAX_AUTHORITY_REPLICA_PAGE_ENTRIES, ManagedAgentTarget,
-    ManagementApplicationAck, ManagementApproval, ManagementAuthorizationPlan,
+    AuthorityCredentialStatus, AuthorityEvidence, AuthorityIngressAuthentication,
+    AuthorityInventoryCursor, AuthorityInventoryEntry, AuthorityInventoryPosition,
+    AuthorityInventoryProjectionPage, AuthorityIssuer, AuthorityLaneRoots, AuthorityOperationKind,
+    AuthorityProjectionHead, AuthorityProjectionQuery, AuthorityProjectionSelector,
+    AuthorityReceipt, AuthorityReceiptSelector, CREDENTIAL_PUBLIC_KEY_BYTES,
+    CREDENTIAL_SIGNATURE_BYTES, CompactAgentDescriptor, CompactInstallActor, CompactReplicaSlot,
+    MAX_AUTHORITY_INVENTORY_PAGE_ENTRIES, MAX_AUTHORITY_INVENTORY_PROJECTION_BYTES,
+    MAX_AUTHORITY_PRINCIPAL_GRANTS, MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES,
+    MAX_AUTHORITY_REPLICA_PAGE_ENTRIES, ManagedAgentTarget, ManagementApplicationAck,
+    ManagementApproval, ManagementAuthorizationPlan,
 };
 use crate::catalog::{
     CatalogActorTarget, CatalogAlias, CatalogEntry, CatalogMutationCall, CatalogMutationKind,
@@ -1697,6 +1700,12 @@ fn encode_authority_projection_selector(
     value: AuthorityProjectionSelector,
 ) {
     match value {
+        AuthorityProjectionSelector::Inventory { after, limit, known_head } => {
+            encoder.u8(4);
+            encoder.option(&after, |encoder, cursor| encode_inventory_cursor(encoder, *cursor));
+            encoder.u16(limit);
+            encoder.option(&known_head, |encoder, head| encode_authority_projection_head(encoder, *head));
+        }
         AuthorityProjectionSelector::Credential => encoder.u8(0),
         AuthorityProjectionSelector::Agents { after, limit } => {
             encoder.u8(1);
@@ -1731,6 +1740,11 @@ fn decode_authority_projection_selector(
 ) -> Result<AuthorityProjectionSelector, DecodeError> {
     let value = match decoder.u8()? {
         0 => AuthorityProjectionSelector::Credential,
+        4 => AuthorityProjectionSelector::Inventory {
+            after: decoder.option(decode_inventory_cursor)?,
+            limit: decoder.u16()?,
+            known_head: decoder.option(decode_authority_projection_head)?,
+        },
         1 => AuthorityProjectionSelector::Agents {
             after: decoder.option(|decoder| Ok(AgentId(decoder.fixed()?)))?,
             limit: decoder.u16()?,
@@ -1751,6 +1765,118 @@ fn decode_authority_projection_selector(
         .validate_shape()
         .then_some(value)
         .ok_or(DecodeError::NonCanonical)
+}
+
+fn encode_inventory_cursor(encoder: &mut Encoder<'_>, value: AuthorityInventoryCursor) {
+    encoder.fixed(value.agent.as_bytes());
+    match value.position {
+        AuthorityInventoryPosition::Agent => encoder.u8(0),
+        AuthorityInventoryPosition::Replica(node) => {
+            encoder.u8(1);
+            encoder.fixed(node.as_bytes());
+        }
+        AuthorityInventoryPosition::Actor(actor) => {
+            encoder.u8(2);
+            encoder.fixed(actor.as_bytes());
+        }
+    }
+}
+
+fn decode_inventory_cursor(
+    decoder: &mut Decoder<'_>,
+) -> Result<AuthorityInventoryCursor, DecodeError> {
+    let agent = AgentId(decoder.fixed()?);
+    let position = match decoder.u8()? {
+        0 => AuthorityInventoryPosition::Agent,
+        1 => AuthorityInventoryPosition::Replica(NodeId(decoder.fixed()?)),
+        2 => AuthorityInventoryPosition::Actor(ActorId(decoder.fixed()?)),
+        _ => return Err(DecodeError::InvalidTag),
+    };
+    let cursor = AuthorityInventoryCursor { agent, position };
+    cursor
+        .is_valid()
+        .then_some(cursor)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+fn encode_inventory_entry(encoder: &mut Encoder<'_>, value: &AuthorityInventoryEntry) {
+    match value {
+        AuthorityInventoryEntry::Agent(row) => {
+            encoder.u8(0);
+            encode_authority_agent_projection(encoder, row);
+        }
+        AuthorityInventoryEntry::Replica { agent, replica } => {
+            encoder.u8(1);
+            encoder.fixed(agent.as_bytes());
+            encode_replica(encoder, replica);
+        }
+        AuthorityInventoryEntry::Actor(row) => {
+            encoder.u8(2);
+            encode_authority_actor_projection(encoder, row);
+        }
+    }
+}
+
+fn decode_inventory_entry(
+    decoder: &mut Decoder<'_>,
+) -> Result<AuthorityInventoryEntry, DecodeError> {
+    match decoder.u8()? {
+        0 => Ok(AuthorityInventoryEntry::Agent(
+            decode_authority_agent_projection(decoder)?,
+        )),
+        1 => Ok(AuthorityInventoryEntry::Replica {
+            agent: AgentId(decoder.fixed()?),
+            replica: decode_replica(decoder)?,
+        }),
+        2 => Ok(AuthorityInventoryEntry::Actor(
+            decode_authority_actor_projection(decoder)?,
+        )),
+        _ => Err(DecodeError::InvalidTag),
+    }
+}
+
+fn encode_inventory_page_body(encoder: &mut Encoder<'_>, value: &AuthorityInventoryProjectionPage) {
+    encode_authority_credential_projection_body(encoder, &value.credential);
+    encoder.bool(value.unchanged);
+    encoder.list(&value.entries, encode_inventory_entry);
+    encoder.option(&value.next, |encoder, cursor| {
+        encode_inventory_cursor(encoder, *cursor)
+    });
+}
+
+pub(crate) fn authority_inventory_projection_page_encoded_len(
+    value: &AuthorityInventoryProjectionPage,
+) -> usize {
+    let mut body = Vec::new();
+    encode_inventory_page_body(&mut Encoder(&mut body), value);
+    HEADER_BYTES.saturating_add(body.len())
+}
+
+impl CanonicalWire for AuthorityInventoryProjectionPage {
+    const MAGIC: [u8; 4] = *b"AIP1";
+    const MAX_ENCODED_BYTES: usize = MAX_AUTHORITY_INVENTORY_PROJECTION_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate_shape().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_inventory_page_body(encoder, self);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let page = Self {
+            credential: decode_authority_credential_projection_body(decoder)?,
+            unchanged: decoder.bool()?,
+            entries: decoder
+                .list_bounded(MAX_AUTHORITY_INVENTORY_PAGE_ENTRIES, decode_inventory_entry)?,
+            next: decoder.option(decode_inventory_cursor)?,
+        };
+        page.validate_shape()
+            .is_ok()
+            .then_some(page)
+            .ok_or(DecodeError::NonCanonical)
+    }
 }
 
 fn encode_authority_projection_query_unsigned(
@@ -5802,6 +5928,294 @@ mod tests {
         let mut old_query = query_bytes;
         old_query[..4].copy_from_slice(b"APQ0");
         assert!(AuthorityProjectionQuery::decode(&old_query).is_err());
+    }
+
+    fn inventory_page_fixture() -> AuthorityInventoryProjectionPage {
+        let row = authority_agent_projection(0x31);
+        let agent = row.identity.agent;
+        AuthorityInventoryProjectionPage {
+            credential: AuthorityCredentialProjection {
+                query: authority_projection_query(AuthorityProjectionSelector::Inventory {
+                    after: None,
+                    limit: 8,
+                    known_head: None,
+                }),
+                head: authority_projection_head(),
+                principal: row.identity.owner,
+                status: AuthorityCredentialStatus::Active,
+                kind: AuthorityCredentialKind::Api,
+                builtin_role: AuthorityBuiltinRole::Admin,
+                management_request_high_water: 11,
+                operation_request_high_water: 12,
+                admin_request_high_water: 13,
+                space_roles: Vec::new(),
+                actor_roles: Vec::new(),
+                capabilities: Vec::new(),
+            },
+            unchanged: false,
+            entries: alloc::vec![
+                AuthorityInventoryEntry::Agent(row.clone()),
+                AuthorityInventoryEntry::Replica {
+                    agent,
+                    replica: AgentReplica {
+                        node: NodeId([0x4a; 32]),
+                        principal: row.identity.owner,
+                        role: ReplicaRole::Observer,
+                    }
+                },
+                AuthorityInventoryEntry::Actor(authority_actor_projection(agent, 0x52)),
+            ],
+            next: None,
+        }
+    }
+
+    #[test]
+    fn inventory_stream_wire_is_bounded_ordered_and_query_bound() {
+        let mut page = inventory_page_fixture();
+        page.next = page.entries.last().map(AuthorityInventoryEntry::cursor);
+        let bytes = page.encode().unwrap();
+        assert!(bytes.len() <= MAX_INVOCATION_REPLY_BYTES);
+        assert_eq!(&bytes[..4], b"AIP1");
+        assert_eq!(
+            AuthorityInventoryProjectionPage::decode(&bytes),
+            Ok(page.clone())
+        );
+        for length in 0..bytes.len() {
+            assert!(AuthorityInventoryProjectionPage::decode(&bytes[..length]).is_err());
+        }
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(AuthorityInventoryProjectionPage::decode(&trailing).is_err());
+        assert!(
+            AuthorityInventoryProjectionPage::decode(
+                &alloc::vec![0; MAX_AUTHORITY_INVENTORY_PROJECTION_BYTES + 1]
+            )
+            .is_err()
+        );
+        let query = &page.credential.query;
+        let mut changed = query.clone();
+        changed.selector = AuthorityProjectionSelector::Inventory {
+            after: page.next,
+            limit: 8,
+            known_head: None,
+        };
+        assert_ne!(query.signing_bytes(), changed.signing_bytes());
+        assert_eq!(
+            AuthorityProjectionQuery::decode(&changed.encode().unwrap()),
+            Ok(changed.clone())
+        );
+        changed.selector = AuthorityProjectionSelector::Inventory {
+            after: None,
+            limit: 8,
+            known_head: Some(page.credential.head),
+        };
+        assert_ne!(query.signing_bytes(), changed.signing_bytes());
+        assert_eq!(
+            AuthorityProjectionQuery::decode(&changed.encode().unwrap()),
+            Ok(changed)
+        );
+
+        let mut bad = page.clone();
+        bad.entries.swap(1, 2);
+        assert!(bad.encode().is_err());
+        let mut bad = page.clone();
+        bad.entries[1] = bad.entries[0].clone();
+        assert!(bad.encode().is_err());
+        let mut bad = page.clone();
+        bad.next = Some(bad.entries[0].cursor());
+        assert!(bad.encode().is_err());
+        let mut bad = page.clone();
+        bad.entries.clear();
+        assert!(bad.encode().is_err()); // nonterminal page cannot make no progress
+        let mut bad = page.clone();
+        bad.credential.query.selector = AuthorityProjectionSelector::Inventory {
+            after: Some(page.entries[0].cursor()),
+            limit: 8,
+            known_head: None,
+        };
+        assert!(bad.encode().is_err()); // exclusive cursor
+        let mut bad = page.clone();
+        if let AuthorityInventoryEntry::Agent(row) = &mut bad.entries[0] {
+            row.authority.initial_epoch += 1;
+        }
+        assert!(bad.encode().is_err());
+
+        let mut prefix = Vec::new();
+        encode_authority_credential_projection_body(&mut Encoder(&mut prefix), &page.credential);
+        let mut oversized_count = bytes;
+        let count_offset = HEADER_BYTES + prefix.len() + 1;
+        oversized_count[count_offset..count_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(AuthorityInventoryProjectionPage::decode(&oversized_count).is_err());
+    }
+
+    #[test]
+    fn inventory_stream_preserves_dense_rosters_with_separate_complex_row_bound() {
+        let mut page = inventory_page_fixture();
+        let agent = page.entries[0].cursor().agent;
+        page.credential.query.selector = AuthorityProjectionSelector::Inventory {
+            after: Some(AuthorityInventoryCursor {
+                agent,
+                position: AuthorityInventoryPosition::Agent,
+            }),
+            limit: 64,
+            known_head: None,
+        };
+        page.entries = (1..=64)
+            .map(|marker| AuthorityInventoryEntry::Replica {
+                agent,
+                replica: AgentReplica {
+                    node: NodeId([marker; 32]),
+                    principal: page.credential.principal,
+                    role: ReplicaRole::Observer,
+                },
+            })
+            .collect();
+        let encoded = page.encode().unwrap();
+        assert!(encoded.len() + 5 <= MAX_INVOCATION_REPLY_BYTES);
+        assert_eq!(
+            AuthorityInventoryProjectionPage::decode(&encoded),
+            Ok(page.clone())
+        );
+        page.entries.push(AuthorityInventoryEntry::Replica {
+            agent,
+            replica: AgentReplica {
+                node: NodeId([65; 32]),
+                principal: page.credential.principal,
+                role: ReplicaRole::Observer,
+            },
+        });
+        assert!(page.encode().is_err());
+        page.credential.query.selector = AuthorityProjectionSelector::Inventory {
+            after: None,
+            limit: 64,
+            known_head: None,
+        };
+        page.entries = (1..=9)
+            .map(|marker| AuthorityInventoryEntry::Agent(authority_agent_projection(marker)))
+            .collect();
+        page.entries.sort_by_key(AuthorityInventoryEntry::cursor);
+        assert!(
+            page.encode().is_err(),
+            "large rows retain an independent eight-row ceiling"
+        );
+        page.entries.pop();
+        assert!(page.encode().is_ok());
+        // Both row-count budgets can hold while the aggregate claims + rows
+        // exceed the reply byte ceiling. A producer must trim, never truncate.
+        page.credential.query.selector = AuthorityProjectionSelector::Inventory {
+            after: Some(AuthorityInventoryCursor {
+                agent,
+                position: AuthorityInventoryPosition::Agent,
+            }),
+            limit: 64,
+            known_head: None,
+        };
+        page.entries = (1..=56)
+            .map(|marker| AuthorityInventoryEntry::Replica {
+                agent,
+                replica: AgentReplica {
+                    node: NodeId([marker; 32]),
+                    principal: page.credential.principal,
+                    role: ReplicaRole::Observer,
+                },
+            })
+            .chain((1..=8).map(|marker| {
+                AuthorityInventoryEntry::Actor(authority_actor_projection(agent, marker))
+            }))
+            .collect();
+        page.entries.sort_by_key(AuthorityInventoryEntry::cursor);
+        page.credential.capabilities = (1..=64)
+            .map(|marker| AuthorityCapabilityGrant {
+                agent,
+                actor: ActorId([marker; 32]),
+                deployment: DeploymentId([1; 32]),
+                capability: CapabilityId([1; 32]),
+            })
+            .collect();
+        assert_eq!(page.entries.len(), MAX_AUTHORITY_INVENTORY_PAGE_ENTRIES);
+        page.credential.validate_shape().unwrap();
+        assert!(
+            authority_inventory_projection_page_encoded_len(&page)
+                > MAX_AUTHORITY_INVENTORY_PROJECTION_BYTES
+        );
+        assert!(page.encode().is_err());
+        while page.encode().is_err() {
+            page.entries.pop().unwrap();
+            page.next = page.entries.last().map(AuthorityInventoryEntry::cursor);
+        }
+        let bytes = page.encode().unwrap();
+        assert!(bytes.len() + 5 <= MAX_INVOCATION_REPLY_BYTES);
+        assert_eq!(AuthorityInventoryProjectionPage::decode(&bytes), Ok(page));
+    }
+
+    #[test]
+    fn inventory_stream_unchanged_and_revoked_responses_cannot_carry_rows() {
+        let mut page = inventory_page_fixture();
+        page.credential.query.selector = AuthorityProjectionSelector::Inventory {
+            after: None,
+            limit: 8,
+            known_head: Some(page.credential.head),
+        };
+        page.unchanged = true;
+        assert!(page.encode().is_err());
+        page.entries.clear();
+        assert_eq!(
+            AuthorityInventoryProjectionPage::decode(&page.encode().unwrap()),
+            Ok(page.clone())
+        );
+        let mut bad = page.clone();
+        bad.credential.head.state_commitment = Hash([0xee; 32]);
+        assert!(bad.encode().is_err());
+        let mut bad = page.clone();
+        bad.credential.query.selector = AuthorityProjectionSelector::Inventory {
+            after: Some(AuthorityInventoryCursor {
+                agent: AgentId([1; 32]),
+                position: AuthorityInventoryPosition::Agent,
+            }),
+            limit: 8,
+            known_head: Some(page.credential.head),
+        };
+        assert!(bad.encode().is_err());
+        page.credential.status = AuthorityCredentialStatus::Revoked;
+        assert!(page.encode().is_err());
+        page.unchanged = false;
+        assert!(page.encode().is_ok());
+        page.entries = inventory_page_fixture().entries;
+        assert!(page.encode().is_err());
+        for limit in [0, 65, u16::MAX] {
+            assert!(
+                !AuthorityProjectionSelector::Inventory {
+                    after: None,
+                    limit,
+                    known_head: None
+                }
+                .validate_shape()
+            );
+        }
+        for position in [
+            AuthorityInventoryPosition::Agent,
+            AuthorityInventoryPosition::Replica(NodeId::ZERO),
+            AuthorityInventoryPosition::Actor(ActorId::ZERO),
+        ] {
+            assert!(
+                !AuthorityInventoryCursor {
+                    agent: AgentId::ZERO,
+                    position
+                }
+                .is_valid()
+            );
+        }
+        let agent = AgentId([1; 32]);
+        let next_agent = AgentId([2; 32]);
+        assert!(
+            AuthorityInventoryCursor {
+                agent,
+                position: AuthorityInventoryPosition::Actor(ActorId([255; 32]))
+            } < AuthorityInventoryCursor {
+                agent: next_agent,
+                position: AuthorityInventoryPosition::Agent
+            }
+        );
     }
 
     #[test]

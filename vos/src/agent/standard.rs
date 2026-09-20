@@ -1041,6 +1041,7 @@ fn is_system_authority_projection_query(
         return false;
     };
     let expected_method = match query.selector {
+        AuthorityProjectionSelector::Inventory { .. } => "inventory_projection_page",
         AuthorityProjectionSelector::Credential => "credential_projection",
         AuthorityProjectionSelector::Agents { .. } => "agent_projection_page",
         AuthorityProjectionSelector::AgentReplicas { .. } => "agent_replica_projection_page",
