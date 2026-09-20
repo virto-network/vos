@@ -113,6 +113,22 @@ Whole-state transport/publication and sequential directory projections remain.
 
 ## Next sequence
 
+Implementation-only follow-up after review checkpoint `7bd66a7d`: Invoke and
+Resume now retain an immutable resolved-invocation object through execution.
+It borrows the original SDK work and privately owns the resolved inputs plus
+the complete actor record. Commit still authenticates work/authorization and
+requires the current actor record to match, while avoiding a second program
+resolution. Unbound internal callers retain full correspondence validation.
+All 100 source-wire tests pass, including stale-provenance, authorization and
+state/reply equivalence (`resolved-invocation-wire-final.log`); all 52 Standard
+tests pass (`resolved-standard.log`). Candidate guest
+build passes (`resolved-runtime-guest-build.log`). Physical fresh invocation
+preserves exact output and lowers gas from 465,388,608 to 402,186,858 on the
+792,537-byte padded fixture (`resolved-physical-fresh-cost.log`, about 13.6%).
+The multi-megabyte yield/resume/retirement comparison also passes
+(`resolved-physical-resume.log`). This is not whole-query latency evidence or
+artifact integration; `saga/agents` and its bundles stay fixed for review.
+
 1. Reviewer examines `c8028394..saga/agents` read-only and returns findings;
    implementation applies fixes on latest source.
 2. Address repeat Invoke validation through a safely bound resolved-work contract;

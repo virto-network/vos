@@ -2623,8 +2623,8 @@ fn apply_clean_invoke_inner(
         Err(error) => return Ok(clean_completed(legacy_state_to_clean(original_state), Err(error))),
         Ok(None) => {}
     }
-    let (invocation, actor_pvm, actor_schema, actor_policies, installation_data) =
-        match runtime.resolve_clean_invocation(&work) {
+    let resolved =
+        match runtime.resolve_clean_invocation_for_execution(&work) {
             Ok(resolved) => resolved,
             Err(error) if error.is_durable_exact_outcome() => {
                 if let Err(slot_error) =
@@ -2652,6 +2652,7 @@ fn apply_clean_invoke_inner(
             }
             Err(error) => return Ok(clean_completed(legacy_state_to_clean(original_state), Err(error))),
         };
+    let (invocation, actor_pvm, actor_schema, actor_policies, installation_data) = resolved.parts();
     let (mut result, commit_candidate) =
         match runtime.recover_execution(&invocation, observed_slot) {
             Ok(Some(_)) | Err(ActorExecutionError::DivergentInvocation) => {
@@ -2730,10 +2731,9 @@ fn apply_clean_invoke_inner(
                                                 } => {
                                                     if reply.status == ActorExecutionStatus::Done {
                                                         let inline = if rows.is_empty() { Vec::new() } else { invocation.mode.write_lane().and_then(|lane| next_state.get(lane)).unwrap_or_default().to_vec() };
-                                                        let commit = |runtime: &mut StandardAgentRuntime| runtime.commit_clean_execution(
-                                                            &work,
+                                                        let commit = |runtime: &mut StandardAgentRuntime| runtime.commit_resolved_clean_execution(
+                                                            &resolved,
                                                             &authorization,
-                                                            &invocation,
                                                             &mut reply,
                                                             &before,
                                                             next_state,
@@ -2849,8 +2849,8 @@ fn apply_clean_resume(
         .authorization
         .clone()
         .ok_or(DecodeError::NonCanonical)?;
-    let (invocation, actor_pvm, actor_schema, actor_policies, installation_data) =
-        match runtime.resolve_clean_invocation(&work) {
+    let resolved =
+        match runtime.resolve_clean_invocation_for_execution(&work) {
             Ok(value) => value,
             Err(error) if error.is_durable_exact_outcome() => {
                 if let Err(error) = runtime.retain_clean_invocation_error(
@@ -2873,6 +2873,7 @@ fn apply_clean_resume(
             }
             Err(error) => return Ok(clean_completed(legacy_state_to_clean(original_state), Err(error))),
         };
+    let (invocation, actor_pvm, actor_schema, actor_policies, installation_data) = resolved.parts();
     if invocation.commitment() != record.request {
         return Ok(clean_completed(
             legacy_state_to_clean(original_state),
@@ -2931,10 +2932,9 @@ fn apply_clean_resume(
                 } => {
                     if reply.status == ActorExecutionStatus::Done {
                         let inline = if rows.is_empty() { Vec::new() } else { invocation.mode.write_lane().and_then(|lane| next_state.get(lane)).unwrap_or_default().to_vec() };
-                        let commit = |runtime: &mut StandardAgentRuntime| runtime.commit_clean_execution(
-                            &work,
+                        let commit = |runtime: &mut StandardAgentRuntime| runtime.commit_resolved_clean_execution(
+                            &resolved,
                             &authorization,
-                            &invocation,
                             &mut reply,
                             &before,
                             next_state,
@@ -9349,6 +9349,49 @@ pub(crate) mod tests {
             apply_authenticated_attested_standard_runtime_work(&authenticated, wrong_slice),
             Err(DecodeError::NonCanonical),
         );
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn resolved_clean_commit_preserves_binding_and_rejects_changed_provenance() {
+        use crate::agent_sdk::method_policy::AuthorizationPolicySelector;
+        use crate::agent_sdk::{InvocationAuthorization, PublicPreflight};
+        let (mut runtime, work) = clean_policy_fixture(AuthorizationPolicySelector::Public);
+        let authorization = InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&work, 1));
+        let resolved = runtime.resolve_clean_invocation_for_execution(&work).unwrap();
+        let invocation = &resolved.parts().0;
+        let before = runtime.prepare_execution_state(invocation).unwrap();
+        let original = runtime.snapshot();
+        let mut changed = original.clone();
+        changed.actors[0].record.producer = crate::service::ProducerId([0x93; 32]);
+        let mut stale = StandardAgentRuntime::restore(changed.clone()).unwrap();
+        let mut reply = exact_reply(invocation, ActorExecutionStatus::Done);
+        let original_reply = reply.clone();
+        assert_eq!(stale.commit_resolved_clean_execution(
+            &resolved, &authorization, &mut reply, &before, before.clone(), 1, None,
+        ), Err(ActorExecutionError::InvalidActorOutput));
+        assert_eq!(stale.snapshot(), changed);
+        assert_eq!(reply, original_reply);
+
+        let mut substituted_authorization = authorization.clone();
+        let InvocationAuthorization::PublicPreflight(preflight) = &mut substituted_authorization else { unreachable!() };
+        preflight.observed_slot = 2;
+        assert_eq!(runtime.commit_resolved_clean_execution(
+            &resolved, &substituted_authorization, &mut reply, &before, before.clone(), 1, None,
+        ), Err(ActorExecutionError::InvalidAuthorization));
+        assert_eq!(runtime.snapshot(), original);
+        assert_eq!(reply, original_reply);
+
+        let mut reference = StandardAgentRuntime::restore(original).unwrap();
+        let mut reference_reply = original_reply;
+        reference.commit_clean_execution(
+            &work, &authorization, invocation, &mut reference_reply, &before, before.clone(), 1, None,
+        ).unwrap();
+        runtime.commit_resolved_clean_execution(
+            &resolved, &authorization, &mut reply, &before, before.clone(), 1, None,
+        ).unwrap();
+        assert_eq!(runtime.snapshot(), reference.snapshot());
+        assert_eq!(reply, reference_reply);
     }
 
     #[cfg(feature = "pvm")]

@@ -41,6 +41,29 @@ pub const MAX_RETIRED_INSTALLATION_IDS: usize =
 /// item limit. Historical entries are retained until checkpoint compaction.
 pub const MAX_LANE_STATE_ENTRIES: usize = 16_384;
 
+type CleanInvocationParts = (
+    super::execution::ActorInvocation,
+    Vec<u8>,
+    crate::agent_sdk::RuntimeBlob,
+    crate::agent_sdk::RuntimeBlob,
+    Option<crate::agent_sdk::RuntimeBlob>,
+);
+
+/// Immutable result of resolving one borrowed SDK work value against an exact
+/// actor record. Only this module can construct it. It proves correspondence,
+/// not authorization, execution success, or validity against a changed catalog.
+pub(crate) struct ResolvedCleanInvocation<'work> {
+    work: &'work crate::agent_sdk::InvocationWork,
+    actor: ActorRecord,
+    parts: CleanInvocationParts,
+}
+
+impl ResolvedCleanInvocation<'_> {
+    pub(crate) fn parts(&self) -> &CleanInvocationParts {
+        &self.parts
+    }
+}
+
 #[derive(Default)]
 struct ArtifactResourceUsage {
     /// Catalog storage is hash-keyed. Retaining the one admitted length here
@@ -2718,16 +2741,7 @@ impl StandardAgentRuntime {
     pub(crate) fn resolve_clean_invocation(
         &self,
         work: &crate::agent_sdk::InvocationWork,
-    ) -> Result<
-        (
-            super::execution::ActorInvocation,
-            Vec<u8>,
-            crate::agent_sdk::RuntimeBlob,
-            crate::agent_sdk::RuntimeBlob,
-            Option<crate::agent_sdk::RuntimeBlob>,
-        ),
-        crate::agent_sdk::InvocationError,
-    > {
+    ) -> Result<CleanInvocationParts, crate::agent_sdk::InvocationError> {
         use crate::agent_sdk::InvocationError;
 
         let actor_id = ActorId(work.actor.0);
@@ -2860,6 +2874,17 @@ impl StandardAgentRuntime {
             actor_policies,
             installation_data,
         ))
+    }
+
+    pub(crate) fn resolve_clean_invocation_for_execution<'work>(
+        &self,
+        work: &'work crate::agent_sdk::InvocationWork,
+    ) -> Result<ResolvedCleanInvocation<'work>, crate::agent_sdk::InvocationError> {
+        let parts = self.resolve_clean_invocation(work)?;
+        let actor = self.clean_invocation_target(
+            work.actor, work.incarnation, work.deployment, work.program,
+        )?.record.clone();
+        Ok(ResolvedCleanInvocation { work, actor, parts })
     }
 
     #[cfg(feature = "pvm")]
@@ -3898,6 +3923,45 @@ impl StandardAgentRuntime {
         observed_slot: u64,
         terminal_continuation: Option<u64>,
     ) -> Result<(), super::execution::ActorExecutionError> {
+        self.commit_clean_execution_inner(
+            work, authorization, invocation, reply, before, after, observed_slot,
+            terminal_continuation, None,
+        )
+    }
+
+    /// Use the same immutable resolution consumed by execution. Callers cannot
+    /// substitute work or an execution request. Current authorization and actor
+    /// provenance are still checked before any mutation.
+    #[cfg(feature = "pvm")]
+    pub(crate) fn commit_resolved_clean_execution(
+        &mut self,
+        resolved: &ResolvedCleanInvocation<'_>,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        reply: &mut super::execution::ActorExecutionReply,
+        before: &super::execution::ActorStateLanes,
+        after: super::execution::ActorStateLanes,
+        observed_slot: u64,
+        terminal_continuation: Option<u64>,
+    ) -> Result<(), super::execution::ActorExecutionError> {
+        self.commit_clean_execution_inner(
+            resolved.work, authorization, &resolved.parts.0, reply, before, after,
+            observed_slot, terminal_continuation, Some(&resolved.actor),
+        )
+    }
+
+    #[cfg(feature = "pvm")]
+    fn commit_clean_execution_inner(
+        &mut self,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        invocation: &super::execution::ActorInvocation,
+        reply: &mut super::execution::ActorExecutionReply,
+        before: &super::execution::ActorStateLanes,
+        after: super::execution::ActorStateLanes,
+        observed_slot: u64,
+        terminal_continuation: Option<u64>,
+        resolved_actor: Option<&ActorRecord>,
+    ) -> Result<(), super::execution::ActorExecutionError> {
         use super::execution::ActorExecutionError;
 
         self.verify_clean_invocation_authorization(work, authorization, observed_slot)
@@ -3913,11 +3977,20 @@ impl StandardAgentRuntime {
         // lane/result publication, not only when a later ACK reconstructs it.
         // Identity equality alone does not bind message, gas, legacy auth or
         // the application availability selected from the signed SDK work.
-        let (resolved, ..) = self
-            .resolve_clean_invocation(work)
-            .map_err(|_| ActorExecutionError::InvalidActorOutput)?;
-        if resolved != *invocation {
-            return Err(ActorExecutionError::InvalidActorOutput);
+        if let Some(expected_actor) = resolved_actor {
+            let current = self.clean_invocation_target(
+                work.actor, work.incarnation, work.deployment, work.program,
+            ).map_err(|_| ActorExecutionError::InvalidActorOutput)?;
+            if current.record != *expected_actor {
+                return Err(ActorExecutionError::InvalidActorOutput);
+            }
+        } else {
+            let (resolved, ..) = self
+                .resolve_clean_invocation(work)
+                .map_err(|_| ActorExecutionError::InvalidActorOutput)?;
+            if resolved != *invocation {
+                return Err(ActorExecutionError::InvalidActorOutput);
+            }
         }
         if !accepted.validate_accepted()
             || invocation.invocation.0 != work.invocation.0
