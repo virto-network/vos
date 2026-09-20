@@ -94,6 +94,18 @@ projection invocation/acknowledgement or whole-state costs.
 
 ## Next work
 
+Implementation-only foundation: `InvocationRetirement` now has a bounded AIRT
+codec carrying invocation metadata, message and ordered artifact references,
+never their preimages. Its commitment is identical to InvocationWork; structural
+receipt/PublicPreflight matching is available without claiming signature
+verification or prior acceptance. All 176 SDK tests pass
+(`compact-retirement-sdk-final.log`), covering field-by-field commitment parity,
+strict decoding, malformed references, empty installation data, authorization
+substitution and a 1 MiB artifact whose retirement frame is under 1 KiB.
+This type is not yet connected to RuntimeWork or production ACK execution.
+The runtime ABI and artifacts remain unchanged until the coordinated cutover;
+no current-binary latency improvement is claimed from this foundation.
+
 1. Reviewer examines the scoped checkpoint read-only and returns findings.
    Implementation agent applies fixes on latest source.
 2. Implement a versioned reference-only retirement request bound to exact retained

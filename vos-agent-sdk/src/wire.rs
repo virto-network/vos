@@ -3722,6 +3722,64 @@ pub(crate) fn invocation_work_commitment(value: &InvocationWork) -> Hash {
     Hash::digest(b"vos/agent/invocation", &[&bytes])
 }
 
+impl CanonicalWire for InvocationRetirement {
+    const MAGIC: [u8; 4] = *b"AIRT";
+    const MAX_ENCODED_BYTES: usize = HEADER_BYTES + MAX_INVOCATION_MESSAGE_BYTES
+        + MAX_RUNTIME_AVAILABILITY_ITEMS * 40 + 1024;
+
+    fn validate_wire(&self) -> bool { self.validate() }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encoder.fixed(self.space.as_bytes());
+        encoder.fixed(self.agent.as_bytes());
+        encoder.fixed(self.runtime_deployment.as_bytes());
+        encoder.fixed(self.invocation.as_bytes());
+        encoder.fixed(self.actor.as_bytes());
+        encoder.fixed(self.incarnation.as_bytes());
+        encoder.fixed(self.deployment.as_bytes());
+        encoder.fixed(self.program.as_bytes());
+        encoder.u8(self.mode as u8);
+        encode_origin(encoder, self.origin);
+        encode_invocation_roles(encoder, self.roles);
+        encoder.bytes(&self.message);
+        encode_optional_blob(encoder, &self.installation_data);
+        encode_required_refs(encoder, &self.availability);
+        encoder.u64(self.gas);
+        encoder.bool(self.recovery_only);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let space = SpaceId(decoder.fixed()?);
+        let agent = AgentId(decoder.fixed()?);
+        let runtime_deployment = DeploymentId(decoder.fixed()?);
+        let invocation = InvocationId(decoder.fixed()?);
+        let actor = ActorId(decoder.fixed()?);
+        let incarnation = Hash(decoder.fixed()?);
+        let deployment = DeploymentId(decoder.fixed()?);
+        let program = ProgramId(decoder.fixed()?);
+        let mode = decode_method_mode(decoder)?;
+        let origin = decode_origin(decoder)?;
+        let roles = decode_invocation_roles(decoder, origin)?;
+        let message = decoder.bytes_bounded(MAX_INVOCATION_MESSAGE_BYTES)?;
+        let installation_data = decode_optional_blob(decoder)?;
+        let availability = decode_required_refs(decoder, installation_data.as_ref())?;
+        let value = Self {
+            space, agent, runtime_deployment, invocation, actor, incarnation,
+            deployment, program, mode, origin, roles, message, installation_data,
+            availability, gas: decoder.u64()?, recovery_only: decoder.bool()?,
+        };
+        value.validate().then_some(value).ok_or(DecodeError::NonCanonical)
+    }
+}
+
+pub(crate) fn invocation_retirement_commitment(value: &InvocationRetirement) -> Hash {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"AINV");
+    bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    value.encode_body(&mut Encoder(&mut bytes));
+    Hash::digest(b"vos/agent/invocation", &[&bytes])
+}
+
 fn encode_invocation_authorization(encoder: &mut Encoder<'_>, value: &InvocationAuthorization) {
     match value {
         InvocationAuthorization::AuthorityReceipt(receipt) => {
@@ -6396,6 +6454,124 @@ mod tests {
             gas: 1_000,
             recovery_only: false,
         }
+    }
+
+    #[test]
+    fn retirement_wire_preserves_work_commitment_without_artifact_preimages() {
+        let mut work = invocation();
+        let bytes = alloc::vec![0x57; 1024 * 1024];
+        work.availability.push(RuntimeBlob { reference: BlobRef::of_bytes(&bytes), bytes });
+        assert!(work.validate());
+        let retirement = InvocationRetirement::from_work(&work);
+        assert!(retirement.validate());
+        assert_eq!(retirement.commitment(), work.commitment());
+        let encoded = retirement.encode().unwrap();
+        assert!(encoded.len() < 1024, "artifact size must not determine retirement size");
+        assert_eq!(InvocationRetirement::decode(&encoded).unwrap(), retirement);
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(InvocationRetirement::decode(&trailing).is_err());
+        assert!(InvocationRetirement::decode(&encoded[..encoded.len() - 1]).is_err());
+        // A reference-only description makes no claim about a supplied preimage.
+        // Runtime integration must match authenticated retained state instead.
+        work.availability[0].bytes[0] ^= 1;
+        assert!(!work.validate());
+        assert_eq!(InvocationRetirement::from_work(&work), retirement);
+    }
+
+    #[test]
+    fn retirement_commitment_binds_every_invocation_field() {
+        let baseline = invocation();
+        let commitment = baseline.commitment();
+        macro_rules! changed {
+            ($field:ident, $value:expr) => {{
+                let mut work = baseline.clone();
+                work.$field = $value;
+                let retirement = InvocationRetirement::from_work(&work);
+                assert_eq!(retirement.commitment(), work.commitment());
+                assert_ne!(retirement.commitment(), commitment, stringify!($field));
+            }};
+        }
+        changed!(space, SpaceId([0x99; 32]));
+        changed!(agent, AgentId([0x99; 32]));
+        changed!(runtime_deployment, DeploymentId([0x99; 32]));
+        changed!(invocation, InvocationId([0x99; 32]));
+        changed!(actor, ActorId([0x99; 32]));
+        changed!(incarnation, Hash([0x99; 32]));
+        changed!(deployment, DeploymentId([0x99; 32]));
+        changed!(program, ProgramId([0x99; 32]));
+        changed!(mode, MethodMode::Query);
+        changed!(origin, InvocationOrigin::anonymous());
+        changed!(roles, InvocationRoleClaims { space: Some(RoleId([0x99; 32])), actor: None });
+        changed!(message, alloc::vec![0x99]);
+        changed!(installation_data, Some(BlobRef::of_bytes(&[])));
+        changed!(availability, alloc::vec![RuntimeBlob { reference: BlobRef::of_bytes(b"a"), bytes: b"a".to_vec() }]);
+        changed!(gas, 1001);
+        changed!(recovery_only, true);
+    }
+
+    #[test]
+    fn retirement_rejects_noncanonical_or_unbounded_references() {
+        let mut work = invocation();
+        let empty = BlobRef::of_bytes(&[]);
+        work.installation_data = Some(empty.clone());
+        work.availability.push(RuntimeBlob { reference: empty, bytes: Vec::new() });
+        let valid = InvocationRetirement::from_work(&work);
+        assert!(valid.validate());
+        assert_eq!(valid.commitment(), work.commitment());
+        assert_eq!(InvocationRetirement::decode(&valid.encode().unwrap()).unwrap(), valid);
+        let mut cases = Vec::new();
+        let mut invalid = valid.clone();
+        invalid.installation_data = None;
+        cases.push(invalid);
+        let mut invalid = valid.clone();
+        invalid.availability.clear();
+        cases.push(invalid);
+        let mut invalid = valid.clone();
+        invalid.availability.push(invalid.availability[0].clone());
+        cases.push(invalid);
+        let mut invalid = valid.clone();
+        invalid.availability[0].len = u64::MAX;
+        cases.push(invalid);
+        let mut invalid = valid.clone();
+        invalid.message.resize(MAX_INVOCATION_MESSAGE_BYTES + 1, 0);
+        cases.push(invalid);
+        let mut invalid = valid;
+        invalid.actor = ActorId::ZERO;
+        cases.push(invalid);
+        for invalid in cases {
+            assert!(!invalid.validate());
+            assert!(invalid.encode().is_err());
+            let mut hostile = Vec::from(InvocationRetirement::MAGIC);
+            hostile.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+            invalid.encode_body(&mut Encoder(&mut hostile));
+            assert!(InvocationRetirement::decode(&hostile).is_err());
+        }
+    }
+
+    #[test]
+    fn retirement_authorization_matches_original_exact_binding() {
+        let mut work = invocation();
+        work.origin.capability = None;
+        let compact = InvocationRetirement::from_work(&work);
+        for authorization in [
+            InvocationAuthorization::AuthorityReceipt(receipt_for(&work)),
+            InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&work, 45)),
+        ] {
+            assert!(authorization.matches_work(&work));
+            assert!(authorization.matches_retirement(&compact));
+            let mut variants = alloc::vec![compact.clone(); 4];
+            variants[0].agent = AgentId([0x91; 32]);
+            variants[1].message.push(0x91);
+            variants[2].origin.principal = Some(PrincipalId([0x91; 32]));
+            variants[3].recovery_only = true;
+            for changed in variants {
+                assert!(!authorization.matches_retirement(&changed));
+            }
+        }
+        work.origin.capability = Some(CapabilityId([0x91; 32]));
+        let authorization = InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&work, 45));
+        assert!(!authorization.matches_retirement(&InvocationRetirement::from_work(&work)));
     }
 
     fn invocation_context() -> InvocationContext {

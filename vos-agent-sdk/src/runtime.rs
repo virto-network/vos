@@ -289,6 +289,78 @@ impl InvocationWork {
     }
 }
 
+/// Reference-only description of an already accepted invocation for retirement.
+/// This is not executable work and does not authenticate artifact preimages.
+/// A runtime must verify the authorization and match its exact retained result
+/// before using this description to retire anything.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvocationRetirement {
+    pub space: SpaceId,
+    pub agent: crate::AgentId,
+    pub runtime_deployment: DeploymentId,
+    pub invocation: InvocationId,
+    pub actor: ActorId,
+    pub incarnation: Hash,
+    pub deployment: DeploymentId,
+    pub program: ProgramId,
+    pub mode: MethodMode,
+    pub origin: InvocationOrigin,
+    pub roles: InvocationRoleClaims,
+    pub gas: u64,
+    pub recovery_only: bool,
+    pub message: Vec<u8>,
+    pub installation_data: Option<BlobRef>,
+    pub availability: Vec<BlobRef>,
+}
+
+impl InvocationRetirement {
+    /// Project metadata only. This does not assert that the original work was
+    /// valid or accepted; those are checked at invocation and retained-state
+    /// boundaries, not inferred from this projection.
+    pub fn from_work(work: &InvocationWork) -> Self {
+        Self {
+            space: work.space,
+            agent: work.agent,
+            runtime_deployment: work.runtime_deployment,
+            invocation: work.invocation,
+            actor: work.actor,
+            incarnation: work.incarnation,
+            deployment: work.deployment,
+            program: work.program,
+            mode: work.mode,
+            origin: work.origin,
+            roles: work.roles,
+            gas: work.gas,
+            recovery_only: work.recovery_only,
+            message: work.message.clone(),
+            installation_data: work.installation_data.clone(),
+            availability: work.availability.iter().map(|blob| blob.reference.clone()).collect(),
+        }
+    }
+
+    pub fn validate(&self) -> bool {
+        self.space != SpaceId::ZERO
+            && self.agent != crate::AgentId::ZERO
+            && self.runtime_deployment != DeploymentId::ZERO
+            && self.invocation != InvocationId::ZERO
+            && self.actor != ActorId::ZERO
+            && self.incarnation != Hash::ZERO
+            && self.deployment != DeploymentId::ZERO
+            && self.program != ProgramId::ZERO
+            && self.origin.validate()
+            && self.roles.validate_for(self.origin)
+            && self.message.len() <= MAX_INVOCATION_MESSAGE_BYTES
+            && required_refs_valid(&self.availability, self.installation_data.as_ref())
+            && self.gas != 0
+    }
+
+    /// Identical to the originating InvocationWork commitment. References
+    /// bind artifact content without carrying it in a retirement request.
+    pub fn commitment(&self) -> Hash {
+        crate::wire::invocation_retirement_commitment(self)
+    }
+}
+
 /// Unsigned structural admission for one invocation of an installed AMP2
 /// `Public` method. This value authenticates no caller identity: the runtime
 /// must resolve the exact installed policy and accept this variant only when
@@ -398,6 +470,32 @@ impl InvocationAuthorization {
 
     pub fn matches_acknowledgement(&self, work: &InvocationWork) -> bool {
         self.matches_work(work)
+    }
+
+    /// Structural authorization binding for reference-only retirement. This
+    /// neither verifies a receipt signature nor proves prior acceptance. The
+    /// runtime must check both against its authenticated retained state.
+    pub fn matches_retirement(&self, work: &InvocationRetirement) -> bool {
+        match self {
+            Self::AuthorityReceipt(receipt) => {
+                receipt.validate_shape().is_ok()
+                    && receipt.selector.operation == AuthorityOperationKind::InvokeActor
+                    && receipt.selector.space == work.space
+                    && receipt.selector.agent == work.agent
+                    && receipt.selector.runtime_deployment == work.runtime_deployment
+                    && receipt.selector.actor == Some(work.actor)
+                    && receipt.selector.actor_deployment == Some(work.deployment)
+                    && receipt.selector.request == work.commitment()
+            }
+            Self::PublicPreflight(preflight) => {
+                preflight.work != Hash::ZERO
+                    && preflight.origin.validate()
+                    && preflight.work == work.commitment()
+                    && preflight.origin == work.origin
+                    && work.roles == InvocationRoleClaims::none()
+                    && work.origin.capability.is_none()
+            }
+        }
     }
 
     pub fn commitment(&self) -> Hash {
