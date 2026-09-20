@@ -15,6 +15,12 @@ Keep builds, test stores and logs on disk, not RAM-backed `/tmp`. Preserve froze
 clients, failed-operation bytes and release-specific stores. Do not mix stores
 or artifacts from different runtime generations, change master, or push.
 
+Maintain one live plan in the status document. When work supersedes an old
+limitation, label its evidence with the exact checkpoint rather than leaving
+contradictory next steps. Preserve historical evidence in Git instead of growing
+parallel journals. Remove obsolete code only after checking callers, feature
+gates and regression coverage; keep cleanup scoped to the work being changed.
+
 The former chronological handoff is preserved in full at
 `a1ebce16:docs/agent-saga-handoff.md`. Retrieve it using `git show` when a
 particular historical experiment is needed. Its branch tips, pending-work

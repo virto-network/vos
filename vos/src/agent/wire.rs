@@ -852,6 +852,27 @@ pub(crate) fn clean_management_lane_changes_allowed(
 pub fn decode_standard_runtime_state(
     state: &RuntimeState,
 ) -> Result<StandardRuntimeState, DecodeError> {
+    let decoded = decode_standard_runtime_components(state)?;
+    StandardAgentRuntime::restore(decoded.clone()).map_err(|_| DecodeError::NonCanonical)?;
+    Ok(decoded)
+}
+
+/// Execution consumes the validated runtime instead of restoring a validation
+/// clone and then restoring the same components a second time. No unchecked
+/// components leave this helper, including on the empty-state path.
+fn restore_standard_runtime_state(
+    state: &RuntimeState,
+) -> Result<(StandardAgentRuntime, usize), DecodeError> {
+    let decoded = decode_standard_runtime_components(state)?;
+    let state_limit = standard_state_limit(&decoded);
+    let runtime = StandardAgentRuntime::restore(decoded).map_err(|_| DecodeError::NonCanonical)?;
+    Ok((runtime, state_limit))
+}
+
+// Structural decoding only. Callers must restore before using this state.
+fn decode_standard_runtime_components(
+    state: &RuntimeState,
+) -> Result<StandardRuntimeState, DecodeError> {
     if state
         .encoded_len()
         .is_none_or(|bytes| bytes > super::execution::MAX_RUNTIME_STATE_BYTES)
@@ -1309,7 +1330,6 @@ pub fn decode_standard_runtime_state(
         authority_sequence_high_water,
         authority_dispositions,
     };
-    StandardAgentRuntime::restore(state.clone()).map_err(|_| DecodeError::NonCanonical)?;
     Ok(state)
 }
 
@@ -2008,9 +2028,7 @@ fn decode_standard_lane(
 
 /// Apply one management call with the bundled deterministic runtime.
 pub fn apply_standard(call: RuntimeCall) -> Result<RuntimeReturn, DecodeError> {
-    let state = decode_standard_runtime_state(&call.state)?;
-    let mut runtime =
-        StandardAgentRuntime::restore(state).map_err(|_| DecodeError::NonCanonical)?;
+    let (mut runtime, _) = restore_standard_runtime_state(&call.state)?;
     let result = runtime.apply_guest(call.journal_context(), call.request);
     Ok(RuntimeReturn {
         state: encode_standard_runtime_state(&runtime.snapshot()),
@@ -2026,14 +2044,7 @@ pub fn apply_standard_execution(
     call: RuntimeExecutionCall,
 ) -> Result<RuntimeExecutionReturn, DecodeError> {
     let original_state = call.state;
-    let state = decode_standard_runtime_state(&original_state)?;
-    let hard_state_limit = super::execution::MAX_RUNTIME_STATE_BYTES;
-    let signed_state_limit = state.config.as_ref().map_or(hard_state_limit, |config| {
-        config.runtime_contract.resources.max_runtime_state_bytes as usize
-    });
-    let state_limit = hard_state_limit.min(signed_state_limit);
-    let mut runtime =
-        StandardAgentRuntime::restore(state).map_err(|_| DecodeError::NonCanonical)?;
+    let (mut runtime, state_limit) = restore_standard_runtime_state(&original_state)?;
     let (mut result, commit_candidate) = match call.invocation.validate() {
         Err(error) => (Err(error), false),
         Ok(()) => match runtime.verify_invocation_authority(&call.invocation, &call.authority) {
@@ -2372,9 +2383,7 @@ pub(crate) fn apply_authenticated_attested_standard_runtime_work(
         use crate::actors::codec::Decode as _;
         use crate::actors::value::{Msg, TAG_DYNAMIC};
 
-        let decoded = decode_standard_runtime_state(&clean_state_to_legacy(state))?;
-        let runtime =
-            StandardAgentRuntime::restore(decoded).map_err(|_| DecodeError::NonCanonical)?;
+        let (runtime, _) = restore_standard_runtime_state(&clean_state_to_legacy(state))?;
         let (_, accepted_work) = runtime
             .resolve_clean_resume(resume)
             .map_err(|_| DecodeError::NonCanonical)?;
@@ -2435,9 +2444,7 @@ fn apply_clean_manage(
             | crate::agent_sdk::ManagementRequest::InspectResources
             | crate::agent_sdk::ManagementRequest::InspectManagementHistory
     );
-    let decoded = decode_standard_runtime_state(&clean_state_to_legacy(&state))?;
-    let mut runtime =
-        StandardAgentRuntime::restore(decoded).map_err(|_| DecodeError::NonCanonical)?;
+    let (mut runtime, _) = restore_standard_runtime_state(&clean_state_to_legacy(&state))?;
     let result = runtime.apply_clean_management(
         space,
         agent,
@@ -2502,10 +2509,7 @@ fn apply_clean_invoke_inner(
         control: state.control, linear: state.linear,
         merge: state.merge, local: state.local,
     };
-    let decoded = decode_standard_runtime_state(&original_state)?;
-    let state_limit = standard_state_limit(&decoded);
-    let mut runtime =
-        StandardAgentRuntime::restore(decoded).map_err(|_| DecodeError::NonCanonical)?;
+    let (mut runtime, state_limit) = restore_standard_runtime_state(&original_state)?;
     // Retained authenticated errors can name a missing or stale actor.
     // Recovery begins with full work/authorization verification before any
     // mutation, so do not repeat that verification (including blob hashes and
@@ -2836,10 +2840,7 @@ fn apply_clean_resume(
         control: state.control, linear: state.linear,
         merge: state.merge, local: state.local,
     };
-    let decoded = decode_standard_runtime_state(&original_state)?;
-    let state_limit = standard_state_limit(&decoded);
-    let mut runtime =
-        StandardAgentRuntime::restore(decoded).map_err(|_| DecodeError::NonCanonical)?;
+    let (mut runtime, state_limit) = restore_standard_runtime_state(&original_state)?;
     let (record, work) = match runtime.resolve_clean_resume(&resume) {
         Ok(value) => value,
         Err(error) => return Ok(clean_completed(legacy_state_to_clean(original_state), Err(error))),
@@ -3032,10 +3033,7 @@ fn apply_clean_acknowledge_inner(
         control: state.control, linear: state.linear,
         merge: state.merge, local: state.local,
     };
-    let decoded = decode_standard_runtime_state(&original_state)?;
-    let state_limit = standard_state_limit(&decoded);
-    let mut runtime =
-        StandardAgentRuntime::restore(decoded).map_err(|_| DecodeError::NonCanonical)?;
+    let (mut runtime, state_limit) = restore_standard_runtime_state(&original_state)?;
     // Acknowledge retires an already retained exact result; it does not
     // execute the actor method again. Re-running the current AMP2 method
     // policy here would make a Required-attestation result impossible to
@@ -3201,7 +3199,6 @@ fn legacy_state_to_clean(state: RuntimeState) -> crate::agent_sdk::RuntimeState 
     }
 }
 
-#[cfg(feature = "pvm")]
 fn standard_state_limit(state: &StandardRuntimeState) -> usize {
     let hard = super::execution::MAX_RUNTIME_STATE_BYTES;
     state.config.as_ref().map_or(hard, |config| {
@@ -4892,6 +4889,30 @@ pub(crate) mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn execution_restore_matches_validated_decode_and_rejects_invalid_records() {
+        for encoded in [
+            RuntimeState::default(),
+            encode_standard_runtime_state(&sparse_standard_state()),
+        ] {
+            let decoded = decode_standard_runtime_state(&encoded).unwrap();
+            let expected_limit = standard_state_limit(&decoded);
+            let expected = StandardAgentRuntime::restore(decoded).unwrap();
+            let (actual, limit) = restore_standard_runtime_state(&encoded).unwrap();
+            assert_eq!(actual.snapshot(), expected.snapshot());
+            assert_eq!(limit, expected_limit);
+        }
+
+        let mut invalid = sparse_standard_state();
+        invalid.actors[0].record.entry.name = "different-name-with-unchanged-actor-id".into();
+        let encoded = encode_standard_runtime_state(&invalid);
+        // This is structurally valid; restoration, not parsing, enforces the
+        // actor identity invariant. Execution must still perform that check.
+        assert!(decode_standard_runtime_components(&encoded).is_ok());
+        assert_eq!(decode_standard_runtime_state(&encoded), Err(DecodeError::NonCanonical));
+        assert!(matches!(restore_standard_runtime_state(&encoded), Err(DecodeError::NonCanonical)));
     }
 
     fn sparse_standard_state() -> StandardRuntimeState {

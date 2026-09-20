@@ -8,7 +8,7 @@ documents are navigation or evidence, not competing plans. Updated 2026-09-20.
 - Reviewer branch: `saga/agents`, integrated checkpoint `16adf95e`.
 - Implementation: `wip/ch08-runtime-directory`, recovery source `a1ebce16`,
   followed by artifact checkpoint `f9c362cb`, the lifecycle-envelope fix, and
-  newer control-worker isolation work not yet on the review branch.
+  control-worker isolation `caeeac18`, not yet on the review branch.
 - Master is unchanged; nothing has been pushed.
 - Neither current branch is production-qualified. The full Agent Architecture
   Saga remains the objective; these checkpoints do not narrow it.
@@ -84,7 +84,23 @@ That log measures six inventory queries at 26.453s; they still perform full
 invocation and acknowledgement. This is the next cost to address, not evidence
 that background scheduling alone made lifecycle operations fast.
 
-Current debug diagnostic: readiness 27s, Create/resume 54s, Install 65s, restart
+The next source change removes duplicate Standard-runtime restoration from
+management, invocation, resume and acknowledgement execution. Structural decode
+feeds one fully validating restoration; the public state decoder remains fully
+validated. `single-restore-wire-verified.log` records 108 passing wire tests
+(four ignored), including identity-mismatch rejection and empty/sparse-state
+equivalence. The optimized candidate guest builds; three physical comparison
+tests in `single-restore-physical-cost.log` preserve exact outputs. Deterministic
+gas falls from 403,857,168 to 401,982,082 for fresh invocation, 344,973,012 to
+338,562,926 for retry, and 219,057,808 to 212,649,830 for acknowledgement on the
+approximately 793 KiB fixtures. This modest reduction does not solve lifecycle
+latency. Candidate ProgramId:
+`d1569e3fbbbd01da0c6fc98be51129202ecee235a9c46500be36bf967380e76f`.
+Logs/candidate are under the shared target's `task-tmp`; bundled artifacts and
+the reviewer branch remain unchanged. Remaining work is reduced full-state and
+projection execution cost, followed by artifact reproduction and qualification.
+
+Review-checkpoint (`16adf95e`) debug diagnostic: readiness 27s, Create/resume 54s, Install 65s, restart
 37s, both shutdowns under one measured second. These are not production capacity
 benchmarks; the unchanged 10s readiness test fails. Invocation, optimized release
 performance and multi-profile acceptance are not qualified by this campaign.

@@ -37,12 +37,18 @@ substituted-history recovery failure. That failure is fixed in the newer
 Do not keep treating it as an unfixed source defect, or infer that its source
 fix already qualifies the older bundled artifact.
 
-Remaining limits: synchronous node inventory; Attach/retirement callbacks;
+Limits recorded at `1b977731`: synchronous node inventory; Attach/retirement callbacks;
 explicit namespace/lifecycle audits under the registry lock; whole-state VM
 transport/publication; unqualified memory/descriptor budgets; conservative
 whole-host failure on uncertain Local execution; broader Shared/Private,
 backup, capacity and release gates. Targeted responses do not imply
 touched-state execution cost.
+
+Do not use that historical list as the current backlog. Implementation commit
+`caeeac18` moves node inventory/lifecycle work to a bounded control worker;
+it is not yet in review checkpoint `16adf95e`. This isolates scheduling but
+does not reduce physical inventory execution costs. See
+[current status](agent-saga-status.md) for current evidence and remaining gates.
 
 The longer chronological handoff remains at
 `a1ebce16:docs/agent-execution-checkpoint-review.md`.

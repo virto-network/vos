@@ -28,10 +28,12 @@ and [the recovery contract](agent-recovery-contract.md). Distinguish measured
 coordination from throughput, source tests from bundled-binary behavior, and
 historical release results from current qualification.
 
-The latest debug campaign passes bootstrap, HTTP/SSH, retained Create/resume,
+The `16adf95e` debug campaign passes bootstrap, HTTP/SSH, retained Create/resume,
 Counter Install and restart/shutdown. It does not rerun application invocation.
 Readiness remains 27–37s and lifecycle operations 54–65s: unacceptable latency,
 not a throughput benchmark. The ten-second test has not been relaxed or ignored.
+Later implementation-only evidence belongs in the current status, not in this
+checkpoint's qualification claims.
 
 Review read-only: no fixes, formatting, branch movement, commits or pushes.
 Return severity, exact commit/file/line, violated invariant, concrete scenario,
