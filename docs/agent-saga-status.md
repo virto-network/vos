@@ -52,7 +52,7 @@ These scoped passes do not establish every full-saga acceptance gate.
   `r19-physical-yield-retire.log`. Custom physical scheduling/lifecycle and
   attested-context refusal: `r19-custom-physical.log`. Both pass.
 
-Runtime, system templates and builder pin immutable source
+At review checkpoint `7bd66a7d`, runtime, system templates and builder pin source
 `3c5e44c769d4cc16c1c13a9949c60a154f378a57`; exact identities and hashes are
 in `support/production-artifacts.toml`. The clean export
 `r19-reproduction.VgKyCd/` produces byte-identical runtime ELF/PVM.
@@ -127,7 +127,24 @@ preserves exact output and lowers gas from 465,388,608 to 402,186,858 on the
 792,537-byte padded fixture (`resolved-physical-fresh-cost.log`, about 13.6%).
 The multi-megabyte yield/resume/retirement comparison also passes
 (`resolved-physical-resume.log`). This is not whole-query latency evidence or
-artifact integration; `saga/agents` and its bundles stay fixed for review.
+released qualification; `saga/agents` and its bundles stay fixed for review.
+Implementation runtime artifact is integrated, pinned to
+`eef8890a`: isolated clean-source ELF matches the tested candidate byte-for-byte
+(`resolved-reproduction.umoyY0/`). Only the runtime blob and its source/identity
+pins change; ABI r19 and system templates stay unchanged. Bundled suite and
+prescribed reproduction are tracked in `resolved-bundled-wire.log` and
+`resolved-pinned-reproduction.log` (implementation verifier evidence
+`target/agent-release-reproduction/run.MKZjct`). All 110 bundled wire tests pass,
+five ignored, and prescribed runtime reproduction passes. All 21 bundled Local
+recovery tests pass (`resolved-bundled-local.log`). The real Authority query
+profile also passes (`resolved-authority-query-profile.log`): Invoke gas falls
+from checkpoint 853,869,674 to 766,337,681 (10.3%), ACK uses 20,954,277, and the
+pair totals 787,291,958 (24.3% below r18). Invoke alone remains about 0.4% above
+r18. This supports the repeated-resolution attribution but does not establish
+whole-query or released-node latency. Four CLI bundled-admission tests pass
+(`resolved-bundled-admission.log`). The optimized runtime has not repeated the
+full disposable CLI lifecycle campaign; the review checkpoint's recorded CLI
+timings remain specific to that older runtime.
 
 1. Reviewer examines `c8028394..saga/agents` read-only and returns findings;
    implementation applies fixes on latest source.
