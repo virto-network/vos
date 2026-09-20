@@ -96,13 +96,35 @@ projection invocation/acknowledgement or whole-state costs.
 
 1. Reviewer examines the scoped checkpoint read-only and returns findings.
    Implementation agent applies fixes on latest source.
-2. Reduce authenticated inventory projection work with explicit revision,
+2. Implement a versioned reference-only retirement request bound to exact retained
+   work and authorization. The current ACK transports and hashes actor artifact
+   preimages without executing the actor. Preserve scope, receipt verification,
+   exact retries, result identity, expiry/retirement ordering and custom-runtime
+   recovery; do not manufacture an invalid InvocationWork with missing bytes or
+   bypass its current validation. Qualify standard/custom guests and reproduce
+   affected artifacts before integration.
+3. Reduce authenticated inventory projection work with explicit revision,
    freshness, availability and ordering semantics. Do not skip durable
    acknowledgements, discard mutated guest state, or decode custom-runtime
    internals in the host as a shortcut.
-3. Develop bounded touched-state access/incremental publication; qualify costs
+4. Develop bounded touched-state access/incremental publication; qualify costs
    against directory growth, idle Agents and independent workloads.
-4. Continue every full-saga gate below. This checkpoint does not narrow scope.
+5. Continue every full-saga gate below. This checkpoint does not narrow scope.
+
+Current-bundle attribution (implementation investigation after the checkpoint):
+`indexed-authority-query-profile.log` records the exact fresh signed Credential
+query/retirement fixture passing. Invoke carries 1,090,241 bytes and uses
+763,079,916 gas, 224,778,110 outer instructions and 5,552,434 inner instructions.
+ACK carries 1,092,566 bytes and uses 276,552,182 gas, 101,031,943 outer
+instructions and no inner execution. The PC resolver verifies exact PVM/ELF
+equality (`indexed-authority-query-map.log`); the hottest mapped regions are
+within `blake2b_simd::portable::compress1_loop`, with other hot locations in
+program parsing, ActorMachine loading and memcpy
+(`indexed-authority-query-symbols.log`). Observer timings are instrumented,
+not production latency. This evidence prioritizes reducing authenticated byte
+transport/rehashing alongside projection batching, not merely a faster actor
+implementation. The existing client already enforces one complete Authority
+head across pages and invalidates its cache after failed refreshes; retain both.
 
 ## Remaining full-saga acceptance gates
 
