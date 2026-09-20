@@ -422,9 +422,19 @@ and structurally decoded record remain distinct; none is finality. All acquired
 leases remain in the returned entries. The ordinary-genesis suite now passes 14
 tests, one opt-in ignored (`shared-joint-discovery-tests.log`), adding empty-set,
 orphan-before-mutation and malformed-intent preservation coverage. The new joint
-path still needs positive signed-Shared reservation/record coverage, the public
-creation entry point, and lifecycle-controller ownership. Do not activate it in
-startup until owner-authenticated recovery succeeds before route publication.
+path now has positive signed-Shared reservation coverage through
+`NativeSharedGenesisRecovery::reserve_create`. This public storage entry point
+verifies the signature, exact Shared descriptor/locator and admitted runtime
+binding before writing; it grants no authorization, finality or route admission.
+Existing reservations undergo full recovery before exact retry can complete a
+missing runtime. Fresh calls refuse orphan phase images rather than repairing them.
+The ordinary-genesis suite passes 15 tests, one opt-in ignored
+(`shared-signed-reservation-crash-tests.log`), including forged-signature refusal,
+exact and conflicting signed retries, a failure between intent/runtime commits,
+byte-identical intent recovery, and joint lease exclusion with absent/empty archive.
+Published-record positive coverage, a production controller/HTTP creation path,
+and controller ownership across startup remain unfinished. Do not activate routes
+until owner-authenticated recovery succeeds before route publication.
 No wire format, finality acceptance or bundled artifact was changed.
 
 1. Reviewer examines `7bd66a7d..saga/agents` read-only and returns findings.

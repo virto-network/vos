@@ -32,6 +32,129 @@ impl<
     P: CleanManagementIssuerStore,
 > NativeSharedGenesisRecovery<I, J, Q, R, W, P>
 {
+    /// Retain an exact signed Shared Create and its admitted runtime before any
+    /// authorization execution. This reserves durable inputs only: it grants no
+    /// authority receipt, finality or permission to publish a route.
+    ///
+    /// Existing reservations must pass full recovery before retry can fill a
+    /// missing runtime. Orphan phase images are never repaired by a fresh call.
+    pub fn reserve_create(
+        authority: AuthorityActorTarget,
+        locator: super::super::genesis::AgentGenesisLocator,
+        descriptor: AgentDescriptor,
+        call: super::super::sdk::authority::AuthorityCredentialCall,
+        runtime: AdmittedRuntimePackage,
+        stores: (I, J, Q, R, W, P),
+    ) -> Result<Self, SharedAgentHostError> {
+        locator
+            .validate()
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if descriptor.identity.profile != AgentProfile::Shared
+            || descriptor.identity.space.0 != locator.space.0
+            || descriptor.identity.agent.0 != locator.agent.0
+            || authority.space != descriptor.identity.space
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        super::super::driver::verify_clean_runtime_package_binding(&descriptor, &runtime)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let signed = crate::agent::clean_management_intent::CleanManagementIntent::new(
+            authority,
+            call.managed,
+            ManagementRequest::Create(Box::new(descriptor)),
+            call,
+            &RawCredentialVerifier,
+        )
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let (
+            intent_store,
+            mut issuer,
+            mut query,
+            mut reply,
+            mut publication,
+            mut publication_reply,
+        ) = stores;
+        let mut intent = CleanManagementIntentSlot::open(intent_store)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if intent.intent().is_some() {
+            let mut recovered = Self::open(
+                authority,
+                locator,
+                intent.into_store(),
+                issuer,
+                query,
+                reply,
+                publication,
+                publication_reply,
+            )?;
+            recovered
+                .intent
+                .pledge(signed)
+                .map_err(|_| SharedAgentHostError::Conflict)?;
+            recovered
+                .intent
+                .retain_runtime(runtime.exact_bytes())
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            let (intent, issuer, query, reply, publication, publication_reply) =
+                recovered.into_stores();
+            return Self::open(
+                authority,
+                locator,
+                intent,
+                issuer,
+                query,
+                reply,
+                publication,
+                publication_reply,
+            );
+        }
+        if intent
+            .load_runtime()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .is_some()
+            || issuer
+                .load()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .is_some()
+            || query
+                .load()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .is_some()
+            || reply
+                .load()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .is_some()
+            || publication
+                .load()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .is_some()
+            || publication_reply
+                .load()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .is_some()
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        intent
+            .pledge(signed)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        // A crash between these commits leaves a signed reservation with no
+        // runtime; only an exact retry may complete it.
+        intent
+            .retain_runtime(runtime.exact_bytes())
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        Self::open(
+            authority,
+            locator,
+            intent.into_store(),
+            issuer,
+            query,
+            reply,
+            publication,
+            publication_reply,
+        )
+    }
+
     pub fn open(
         authority: AuthorityActorTarget,
         locator: super::super::genesis::AgentGenesisLocator,
