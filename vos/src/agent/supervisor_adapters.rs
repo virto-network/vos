@@ -2737,7 +2737,7 @@ enum RouteHostTransport {
     Worker(SyncSender<RouteHostCommand>),
     // Per-Agent ownership executed on the supervisor's bounded pool. Idle
     // Agents allocate no threads; lifecycle/control calls share the same lock.
-    Inline(Arc<std::sync::Mutex<Box<dyn CleanAgentRouteBackend>>>),
+    Inline(Arc<std::sync::Mutex<Option<Box<dyn CleanAgentRouteBackend>>>>),
 }
 
 impl AgentRouteHostHandle {
@@ -2876,6 +2876,7 @@ impl AgentRouteHostHandle {
                 if !self.is_running() {
                     return Err(AgentRouteError::Unavailable);
                 }
+                let backend = backend.as_mut().ok_or(AgentRouteError::Unavailable)?;
                 let result = panic::catch_unwind(AssertUnwindSafe(|| {
                     execute_route_host_command(backend.as_mut(), command)
                 }));
@@ -2889,6 +2890,49 @@ impl AgentRouteHostHandle {
     }
 
     pub(crate) fn request_retire(&self) -> Result<(), AgentRouteWorkerError> {
+        if let RouteHostTransport::Inline(backend) = &self.transport {
+            // Close admission before waiting for the operation lock. Every
+            // retirement caller drains that lock, including callers observing
+            // CLOSING or FAILED; neither state proves resources were released.
+            let _ = self.state.compare_exchange(
+                ROUTE_WORKER_RUNNING,
+                ROUTE_WORKER_CLOSING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            let (mut slot, poisoned) = match backend.lock() {
+                Ok(slot) => (slot, false),
+                Err(error) => (error.into_inner(), true),
+            };
+            let failed = poisoned || self.state.load(Ordering::Acquire) == ROUTE_WORKER_FAILED;
+            let Some(mut owned) = slot.take() else {
+                return if !failed && self.state.load(Ordering::Acquire) == ROUTE_WORKER_CLOSED {
+                    Ok(())
+                } else {
+                    Err(AgentRouteWorkerError::Failed)
+                };
+            };
+            let retired = panic::catch_unwind(AssertUnwindSafe(|| owned.retire()))
+                .unwrap_or(Err(AgentRouteWorkerError::Panicked));
+            // Drop even after an error/panic, while still holding the drain
+            // lock. Closed clones retain only the empty slot and status.
+            let dropped = panic::catch_unwind(AssertUnwindSafe(|| drop(owned)))
+                .map_err(|_| AgentRouteWorkerError::Panicked);
+            let result = retired.and(dropped).and(if failed {
+                Err(AgentRouteWorkerError::Failed)
+            } else {
+                Ok(())
+            });
+            self.state.store(
+                if result.is_ok() {
+                    ROUTE_WORKER_CLOSED
+                } else {
+                    ROUTE_WORKER_FAILED
+                },
+                Ordering::Release,
+            );
+            return result;
+        }
         let state = self.state.compare_exchange(
             ROUTE_WORKER_RUNNING,
             ROUTE_WORKER_CLOSING,
@@ -2905,22 +2949,7 @@ impl AgentRouteHostHandle {
             RouteHostTransport::Worker(commands) => commands
                 .send(RouteHostCommand::Retire(reply))
                 .map_err(|_| AgentRouteWorkerError::Failed)?,
-            RouteHostTransport::Inline(backend) => {
-                let retired = panic::catch_unwind(AssertUnwindSafe(|| {
-                    let mut backend = backend.lock().map_err(|_| AgentRouteWorkerError::Failed)?;
-                    backend.retire()
-                }))
-                .unwrap_or(Err(AgentRouteWorkerError::Panicked));
-                self.state.store(
-                    if retired.is_ok() {
-                        ROUTE_WORKER_CLOSED
-                    } else {
-                        ROUTE_WORKER_FAILED
-                    },
-                    Ordering::Release,
-                );
-                return retired;
-            }
+            RouteHostTransport::Inline(_) => unreachable!("inline retirement drained above"),
         }
         result.recv().unwrap_or(Err(AgentRouteWorkerError::Failed))
     }
@@ -3064,11 +3093,7 @@ impl AgentRouteWorkerOwner for InlineHostOwner {
     fn join(self: Box<Self>) -> Result<(), AgentRouteWorkerError> {
         // The supervisor drains dispatch ownership before retirement. The
         // mutex also drains an already-admitted direct control operation.
-        if self.0.state.load(Ordering::Acquire) == ROUTE_WORKER_CLOSED {
-            Ok(())
-        } else {
-            Err(AgentRouteWorkerError::Failed)
-        }
+        self.0.request_retire()
     }
 }
 
@@ -3079,7 +3104,9 @@ fn inline_backend<B: CleanAgentRouteBackend>(
         .identities()
         .map_err(AgentRouteAdapterError::Route)?;
     let handle = AgentRouteHostHandle {
-        transport: RouteHostTransport::Inline(Arc::new(std::sync::Mutex::new(Box::new(backend)))),
+        transport: RouteHostTransport::Inline(Arc::new(std::sync::Mutex::new(Some(Box::new(
+            backend,
+        ))))),
         state: Arc::new(AtomicU8::new(ROUTE_WORKER_RUNNING)),
     };
     Ok(AgentRouteHostAttachment {
@@ -4338,13 +4365,124 @@ mod tests {
     }
 
     #[test]
+    fn inline_retirement_and_join_drain_an_admitted_operation() {
+        let request = request(0x63, RuntimeExecutionContext::Direct);
+        let identities = Arc::new(Mutex::new(vec![identity(&request)]));
+        let lifetime = Arc::downgrade(&identities);
+        let (started, observed) = mpsc::sync_channel(1);
+        let (release, wait) = mpsc::sync_channel(1);
+        let attachment = inline_backend(FakeBackend {
+            identities,
+            ready: Some(ReadyGate {
+                started,
+                release: wait,
+            }),
+            reply: FakeReply::RequestBoundError,
+            invokes: Arc::new(AtomicUsize::new(0)),
+            retired: Arc::new(AtomicBool::new(false)),
+        })
+        .unwrap();
+        let handle = attachment.handle();
+        let operation_handle = handle.clone();
+        let operation = std::thread::spawn(move || operation_handle.ready());
+        observed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let (done, completion) = mpsc::sync_channel(1);
+        let retiring = std::thread::spawn(move || {
+            let result = attachment.retire();
+            let _ = done.send(());
+            result
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while handle.is_running() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let closing = handle.state.load(Ordering::Acquire) == ROUTE_WORKER_CLOSING;
+        let pending = completion.try_recv().is_err();
+        let retained_during_operation = lifetime.upgrade().is_some();
+        let join_handle = handle.clone();
+        let joining = std::thread::spawn(move || Box::new(InlineHostOwner(join_handle)).join());
+        release.send(()).unwrap();
+        operation.join().unwrap().unwrap();
+        retiring.join().unwrap().unwrap();
+        joining.join().unwrap().unwrap();
+        assert!(closing && pending && retained_during_operation);
+        assert!(lifetime.upgrade().is_none());
+        assert_eq!(handle.identities(), Err(AgentRouteError::Unavailable));
+    }
+
+    #[test]
+    fn inline_retirement_releases_resources_after_retire_error_or_panic() {
+        struct Backend {
+            _resource: Arc<()>,
+            mode: u8,
+        }
+        impl CleanAgentRouteBackend for Backend {
+            fn identities(&mut self) -> Result<Vec<AgentRouteIdentity>, AgentRouteError> {
+                Ok(Vec::new())
+            }
+            fn invoke(
+                &mut self,
+                _: AgentRouteIdentity,
+                _: AgentInvocationRequest,
+            ) -> Result<AgentInvocationResponse, AgentRouteError> {
+                unreachable!()
+            }
+            fn retire(&mut self) -> Result<(), AgentRouteWorkerError> {
+                match self.mode {
+                    1 => Err(AgentRouteWorkerError::Failed),
+                    2 => panic!("retirement failure"),
+                    _ => Ok(()),
+                }
+            }
+        }
+        impl Drop for Backend {
+            fn drop(&mut self) {
+                if self.mode == 3 {
+                    panic!("backend destructor failure");
+                }
+            }
+        }
+        for mode in 0..=4 {
+            let resource = Arc::new(());
+            let lifetime = Arc::downgrade(&resource);
+            let attachment = inline_backend(Backend {
+                _resource: resource,
+                mode,
+            })
+            .unwrap();
+            let handle = attachment.handle();
+            if mode == 4 {
+                let RouteHostTransport::Inline(slot) = &handle.transport else {
+                    unreachable!()
+                };
+                let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+                    let _guard = slot.lock().unwrap();
+                    panic!("poison backend lock");
+                }));
+            }
+            assert_eq!(attachment.retire().is_ok(), mode == 0);
+            assert!(
+                lifetime.upgrade().is_none(),
+                "mode {mode} retained its resource"
+            );
+            assert!(!handle.is_running());
+            assert_eq!(handle.identities(), Err(AgentRouteError::Unavailable));
+            assert_eq!(handle.request_retire().is_ok(), mode == 0);
+        }
+    }
+
+    #[test]
     fn inline_backend_retirement_closes_all_cloned_handles() {
         let request = request(0x61, RuntimeExecutionContext::Direct);
         let identity = identity(&request);
         let retired = Arc::new(AtomicBool::new(false));
         let invokes = Arc::new(AtomicUsize::new(0));
+        let identities = Arc::new(Mutex::new(vec![identity]));
+        let lifetime = Arc::downgrade(&identities);
         let attachment = inline_backend(FakeBackend {
-            identities: Arc::new(Mutex::new(vec![identity])),
+            identities,
             ready: None,
             reply: FakeReply::RequestBoundError,
             invokes: invokes.clone(),
@@ -4361,6 +4499,10 @@ mod tests {
         );
         assert_eq!(invokes.load(Ordering::Acquire), 1);
         attachment.retire().unwrap();
+        assert!(
+            lifetime.upgrade().is_none(),
+            "closed handles must not own the backend"
+        );
         assert!(retired.load(Ordering::Acquire));
         assert!(!clone.is_running());
         assert_eq!(clone.identities(), Err(AgentRouteError::Unavailable));
@@ -4376,8 +4518,10 @@ mod tests {
     fn inline_backend_panic_unpublishes_and_cannot_reuse_driver() {
         let request = request(0x62, RuntimeExecutionContext::Direct);
         let identity = identity(&request);
+        let identities = Arc::new(Mutex::new(vec![identity]));
+        let lifetime = Arc::downgrade(&identities);
         let attachment = inline_backend(FakeBackend {
-            identities: Arc::new(Mutex::new(vec![identity])),
+            identities,
             ready: None,
             reply: FakeReply::Panic,
             invokes: Arc::new(AtomicUsize::new(0)),
@@ -4390,6 +4534,7 @@ mod tests {
         let snapshot = publication.snapshots()[0];
         assert!(dispatch_invocation(&owner.handle(), snapshot, request).is_err());
         assert!(!handle.is_running());
+        assert!(lifetime.upgrade().is_none());
         assert_eq!(handle.identities(), Err(AgentRouteError::Unavailable));
         assert_eq!(
             owner.handle().snapshot(snapshot.key()),

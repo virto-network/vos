@@ -1,6 +1,32 @@
 # Execution isolation / targeted access review checkpoint
 
 This is a source-review checkpoint, not a deployment or architectural sign-off.
+
+## Reviewer follow-up: inline retirement
+
+The P2 in `target/agent-review-92ce97f4.kUhgwO/REVIEW.md` is fixed in
+the follow-up commit containing this section. Inline handles now share an
+optional backend: retirement closes admission, drains the operation mutex,
+takes and drops the backend, then publishes terminal status. Concurrent
+retirement and join callers drain the same lock. Error, panic and poisoned-lock
+paths still release ownership and report failure rather than success.
+
+Regression evidence: 52 supervisor/adapter tests pass; 11 tests selected by
+`inline_` pass, including a real Local root reopening while a closed handle
+survives. Coverage includes in-flight operation draining, concurrent retirement/
+join, retirement errors/panics, destructor panic, poisoned locks and dispatch
+panic cleanup. Physical coverage uses the explicit candidate ELF described
+below, not a repinned release. Logs: `inline-retirement-final.log` and
+`inline-retirement-supervisor.log` in the shared target's `task-tmp` directory.
+
+The reviewer's performance limits are unchanged: refresh still runs on the
+supervisor coordinator, target-catalog validation still holds the registry
+mutex, VM/image work remains whole-state, and concurrency lacks a measured VM
+memory budget. Candidate recovery and bundled-runtime compatibility remain
+open. This fix does not claim release or high-concurrency qualification.
+
+## Original checkpoint
+
 The implementation checkpoint is `92ce97f4`, now carried on `saga/agents` for
 review. The previous review baseline is `e20cbb76`. Ongoing implementation uses
 `wip/ch08-runtime-directory`. Please report findings without applying fixes.

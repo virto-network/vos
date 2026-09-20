@@ -2895,6 +2895,39 @@ mod tests {
     }
 
     #[test]
+    fn physical_inline_retirement_releases_root_while_closed_handle_survives() {
+        let directory = TestDirectory::new("inline-retirement-root");
+        let root = directory.child("agents");
+        let (_, trust) = clock_trust(1);
+        let mut host = LocalAgentHost::create(&root, space(), node(), trust.clone()).unwrap();
+        let runtime = admitted_runtime();
+        let descriptor = descriptor(&runtime, 7, AgentProfile::Local, space(), node());
+        let agent = host
+            .create_agent(runtime, descriptor.clone(), create_receipt(&descriptor, 10))
+            .unwrap();
+        let shared = Arc::new(Mutex::new(host));
+        let lifetime = Arc::downgrade(&shared);
+        let attachment =
+            super::super::supervisor_adapters::local_agent_supervisor_attachment_for_agent(
+                shared.clone(),
+                agent,
+            )
+            .unwrap();
+        let closed = attachment.handle();
+        drop(shared);
+        assert!(matches!(
+            LocalAgentHost::open(&root, space(), node(), trust.clone()),
+            Err(LocalAgentHostError::Busy)
+        ));
+        attachment.retire().unwrap();
+        assert!(!closed.is_running());
+        assert!(lifetime.upgrade().is_none());
+        let reopened = LocalAgentHost::open(&root, space(), node(), trust).unwrap();
+        assert_eq!(reopened.show(agent).unwrap(), &descriptor);
+        assert!(closed.identities().is_err());
+    }
+
+    #[test]
     fn physical_checkout_pins_its_slot_and_defers_unrelated_namespace_audit() {
         let directory = TestDirectory::new("targeted-slot-validation");
         let root = directory.child("agents");
