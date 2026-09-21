@@ -3420,19 +3420,31 @@ fn encode_management_request(encoder: &mut Encoder<'_>, value: &ManagementReques
     }
 }
 
+// Keep each boxed variant's decode scratch in its own frame. Otherwise the
+// largest variant reserves stack even when decoding a different management
+// request, and that reservation stays live throughout nested validation.
+#[inline(never)]
+fn decode_boxed_management_value<T>(
+    decode: impl FnOnce() -> Result<T, DecodeError>,
+) -> Result<alloc::boxed::Box<T>, DecodeError> {
+    decode().map(alloc::boxed::Box::new)
+}
+
 fn decode_management_request(decoder: &mut Decoder<'_>) -> Result<ManagementRequest, DecodeError> {
     let value = match decoder.u8()? {
-        0 => ManagementRequest::Create(alloc::boxed::Box::new(decode_agent_descriptor(decoder)?)),
+        0 => ManagementRequest::Create(decode_boxed_management_value(|| {
+            decode_agent_descriptor(decoder)
+        })?),
         1 => ManagementRequest::InspectActors {
             after: decoder.option(|decoder| Ok(ActorId(decoder.fixed()?)))?,
             limit: decoder.u16()?,
         },
         2 => ManagementRequest::InspectResources,
         11 => ManagementRequest::InspectManagementHistory,
-        3 => ManagementRequest::Install(alloc::boxed::Box::new(decode_install(decoder)?)),
-        4 => {
-            ManagementRequest::UpgradeActor(alloc::boxed::Box::new(decode_upgrade_actor(decoder)?))
-        }
+        3 => ManagementRequest::Install(decode_boxed_management_value(|| decode_install(decoder))?),
+        4 => ManagementRequest::UpgradeActor(decode_boxed_management_value(|| {
+            decode_upgrade_actor(decoder)
+        })?),
         5 => ManagementRequest::Suspend {
             actor: ActorId(decoder.fixed()?),
             expected_deployment: DeploymentId(decoder.fixed()?),
@@ -3445,9 +3457,9 @@ fn decode_management_request(decoder: &mut Decoder<'_>) -> Result<ManagementRequ
             actor: ActorId(decoder.fixed()?),
             expected_deployment: DeploymentId(decoder.fixed()?),
         },
-        8 => ManagementRequest::UpgradeRuntime(alloc::boxed::Box::new(decode_runtime_upgrade(
-            decoder,
-        )?)),
+        8 => ManagementRequest::UpgradeRuntime(decode_boxed_management_value(|| {
+            decode_runtime_upgrade(decoder)
+        })?),
         9 => ManagementRequest::ChangeReplicas {
             expected_generation: Hash(decoder.fixed()?),
             replicas: decoder.list_bounded(MAX_AGENT_REPLICAS, decode_replica)?,
@@ -3456,14 +3468,12 @@ fn decode_management_request(decoder: &mut Decoder<'_>) -> Result<ManagementRequ
             let control = decoder.bytes_bounded(MAX_PRIVATE_RUNTIME_CONTROL_WIRE_BYTES)?;
             let mutation = decoder.bytes_bounded(MAX_PRIVATE_RUNTIME_MUTATION_WIRE_BYTES)?;
             ManagementRequest::PrivateControl {
-                control: alloc::boxed::Box::new(
-                    PrivateControlRecord::decode(&control)
-                        .map_err(|_| DecodeError::NonCanonical)?,
-                ),
-                mutation: alloc::boxed::Box::new(
-                    PrivateRuntimeMutation::decode(&mutation)
-                        .map_err(|_| DecodeError::NonCanonical)?,
-                ),
+                control: decode_boxed_management_value(|| {
+                    PrivateControlRecord::decode(&control).map_err(|_| DecodeError::NonCanonical)
+                })?,
+                mutation: decode_boxed_management_value(|| {
+                    PrivateRuntimeMutation::decode(&mutation).map_err(|_| DecodeError::NonCanonical)
+                })?,
             }
         }
         _ => return Err(DecodeError::InvalidTag),
