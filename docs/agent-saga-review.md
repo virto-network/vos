@@ -1,7 +1,8 @@
 # Agent saga: Shared lifecycle checkpoint review
 
-Qualified `saga/agents` checkpoint: functional source `42928ddc`, relative to
-`9cd2fa6a`, followed by evidence/documentation consolidation.
+Current follow-up: `8a4751f9` on reviewed checkpoint `2b1e7f56`.
+Previous checkpoint: functional source `42928ddc`, relative to `9cd2fa6a`,
+followed by evidence/documentation consolidation.
 Test-only follow-up `6de58f82` covers the equal-deadline network error race.
 All checkpoint gates are recorded in [current status](agent-saga-status.md).
 The previous frozen guide is at `9cd2fa6a:docs/agent-saga-review.md`.
@@ -9,6 +10,35 @@ The previous frozen guide is at `9cd2fa6a:docs/agent-saga-review.md`.
 Review-readiness is not production or full-saga sign-off. The reviewer reads
 `saga/agents` and returns findings; do not apply fixes, format files, move branches
 or push. Implementation applies feedback on the latest source.
+
+## Mixed-recovery P1 follow-up to `2b1e7f56`
+
+The review found a dependency cycle: unfinished Create reservations block the
+fresh Authority read required for retired generations, while the former code
+waited for every proof before completing any Create. Agent-ID ordering cannot
+resolve it.
+
+The follow-up stages recovery without relaxing either guard:
+
+1. Validate the complete leased entry set, then replay each unfinished
+   publication and its positive ACK.
+2. Temporarily open that generation to authenticate its physical Create
+   application. Keep it out of the host's serving set; finish application ACK,
+   Authority finalization and retirement through existing guarded paths.
+3. Obtain fresh Authority Query/ACK proofs for retired entries and open only the
+   complete exact verified set. No ordinary route is exposed in between.
+
+Review `recover_deferred_shared_generations` / `finish_shared_genesis_application`
+in `clean_bootstrap.rs` and recovery-only opening in `shared_host.rs`. Challenge
+errors between stages, release of the temporary driver, exact finality checks,
+and the unchanged fresh-read/reservation exclusions. Staging replays an unfinished
+generation again at final opening; no startup performance improvement is claimed.
+
+The two-generation regression covers both Agent-ID orders, blocked pre-recovery
+fresh reading, exact new journal work, durable retirement, and installed actor
+Invoke/ACK on both recovered generations. A host test checks rejected finality,
+nonexposure and lease retention during temporary opening. Test results and the
+distinction from the prior full-PVM gate are in [current status](agent-saga-status.md).
 
 ## Two consolidated review groups
 

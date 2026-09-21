@@ -5,11 +5,10 @@ objective; a review checkpoint is not a release.
 
 ## Branch boundary
 
-- Implementation: `wip/ch08-runtime-directory`, functional source `42928ddc`.
-  Test-only network deadline-race follow-up: `6de58f82`.
-- Reviewer: `saga/agents`, fast-forwarded to this qualified checkpoint from
-  `9cd2fa6a`. Functional source and the test-only follow-up are pinned above;
-  the final documentation commit records evidence without changing execution.
+- Implementation: `wip/ch08-runtime-directory`, mixed-recovery P1 fix
+  `8a4751f9`, following reviewed checkpoint `2b1e7f56`.
+- Reviewer: `saga/agents`, fast-forwarded to the P1 fix and this evidence update.
+  Previous functional source: `42928ddc`; network test correction: `6de58f82`.
 - Master is unchanged; nothing is pushed. Review read-only and apply findings
   on implementation to avoid conflicting fixes.
 - Detailed integration chronology: `42928ddc:docs/agent-saga-status.md`.
@@ -17,6 +16,16 @@ objective; a review checkpoint is not a release.
 
 ## Implemented checkpoint
 
+- Mixed retired/unfinished recovery now completes unfinished Creates before
+  fresh retired-generation Authority reads. A temporary physical opening checks
+  application evidence without inserting the generation into the serving set.
+  Normal positive ACK/finalization/retirement releases its reservations; only
+  then can fresh Authority Query/ACK run. The complete exact verified set opens
+  last. Neither the reservation guard nor fresh-decision comparison is relaxed.
+- This recovery-only staging repeats unfinished-generation opening at final
+  admission; it is not a startup performance optimization or incremental-state
+  redesign. Errors keep ordinary routes unavailable and require authoritative
+  store reopening after completion writes, as before.
 - Shared reservation/archive leases survive startup, recovery, serving and
   route shutdown. Discovery does not create missing records.
 - Unfinished Create recovery verifies live publication and positive ACK,
@@ -53,7 +62,48 @@ execution remain.
 Retired startup currently performs one fresh Authority Query/ACK per ordinary
 generation. Its whole-state cost is not qualified at large directory sizes.
 
-## Current qualification
+## P1 follow-up qualification
+
+Review: `target/agent-review-2b1e7f56.qETYMA/REVIEW.md`. The review identified the
+dependency cycle from control flow; the new regression creates two real signed
+generations, crashes with one retired and the other unfinished, then uses the
+production bootstrap/controller recovery entry points. Both Agent-ID orderings
+must pass, with the fresh read blocked before recovery, exactly five new ordered
+operations (finalization/two ACKs plus fresh Query/ACK), durable retirement,
+and actual installed-actor Invoke/ACK on both recovered generations.
+
+Logs under `.worktrees/ch08-c2-native/target/task-tmp/`:
+
+- First mixed-generation/serving run: pass, 201.39s
+  (`mixed-shared-native-serving.log`).
+- Final Shared recovery group (including durable-retirement assertion):
+  7 pass / 1 ignored, 264.33s (`mixed-shared-native-final.log`).
+- Shared host regressions: 23 pass / 1 ignored / 1 listener-startup failure under
+  restricted sockets, 338.40s (`mixed-shared-host-tests.log`). That one network
+  test passes in the socket-enabled rerun below; do not label the restricted
+  suite itself green.
+- Recovery-only staging finality/lease/nonexposure test: 1 pass, 3.55s
+  (`mixed-shared-staging-guard.log`).
+- Two-host merge network regression with local sockets enabled: 1 pass, 6.40s
+  (`mixed-shared-merge-network.log`).
+
+These use a native outer runtime with bundled physical Authority/actor execution.
+The previous full outer-PVM, workspace and CLI results below remain pinned to
+their previous source; they are not fresh qualification of this host-only fix.
+No SDK, guest source, wire format, artifact or admission guard changed.
+Run the new regression with the pinned host toolchain and disk-backed
+`CARGO_TARGET_DIR` / `TMPDIR`:
+
+```sh
+cargo +nightly-2025-05-09 test --offline --locked -p vos --lib \
+  --features 'agent-runtime storage network http-ingress' \
+  native_shared_mixed_retired_unfinished_restart_both_agent_orders -- --nocapture
+```
+
+Setting `VOS_AGENT_PROFILE_REFINE_MACHINES=1` selects the full outer PVM for
+this same two-generation test; that mode has not been rerun for this follow-up.
+
+## Previous checkpoint qualification (`2b1e7f56`)
 
 Logs are under `.worktrees/ch08-c2-native/target/task-tmp/shared-genesis-query.L6OPEp/`
 unless stated otherwise. Counts are scoped, not an additive release total.
@@ -83,8 +133,9 @@ removed; its evidence remains in `shared-inventory-candidate.Jcfgpx/`.
 Run `just test-shared-agent-publication` with disk-backed `CARGO_TARGET_DIR` and
 `JUST_TEMPDIR`. It clears the candidate override and enables the bundled outer
 PVM. Native-outer results do not substitute for that gate. Formatting/diff pass.
-The full-PVM run executed exact functional source `42928ddc`; its only subsequent
-source change is the network test correction `6de58f82`. This is a debug-profile
+The full-PVM run executed exact functional source `42928ddc`; before checkpoint
+`2b1e7f56`, its only subsequent source change was network test correction
+`6de58f82`. This is a debug-profile
 multi-phase correctness scenario, not a per-request or production throughput
 benchmark. Its long duration does not close the performance acceptance gates.
 Before workspace recovery tests, rebuild the generated custom guest with
@@ -121,9 +172,10 @@ separate final network run.
 
 ## Checkpoint handoff and next action
 
-The scoped physical/workspace/CLI/network gates pass and the artifact boundary
-is frozen. `saga/agents` is ready for read-only review, not production sign-off.
-Use [the review guide](agent-saga-review.md) for two consolidated groups:
+The P1 follow-up passes its scoped recovery/staging regressions; the prior
+workspace/CLI/full-PVM gates remain source-specific. `saga/agents` is ready for
+read-only follow-up review, not production sign-off. Artifacts are unchanged.
+Use [the review guide](agent-saga-review.md) for the P1 fix and the prior groups:
 qualification/performance/discovery; and Shared lifecycle/recovery/ownership/
 artifacts. Identify `ac1b2860` separately as mechanical formatting. No new
 scaling redesign joins this checkpoint.
