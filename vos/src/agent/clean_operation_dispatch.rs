@@ -150,7 +150,7 @@ impl<'a> NativeAuthorityOperationStartupAdmission<'a> {
                 || self.retirements.iter().flatten().any(|old| matches!(old, RuntimeWork::Invoke { invocation: existing, .. } if existing.invocation == invocation.invocation))
             { return Err(SharedAgentHostError::Conflict); }
         }
-        self.has_history |= !recovery.pending.is_empty();
+        self.has_history |= recovery.retired || !recovery.pending.is_empty();
         self.pending.extend(recovery.pending.iter().cloned());
         Ok(self)
     }

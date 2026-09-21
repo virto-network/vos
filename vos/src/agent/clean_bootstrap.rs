@@ -1033,9 +1033,141 @@ pub enum CleanSystemAgentBootstrapPhase {
     Complete = 9,
 }
 
+/// Read requests share durable Invoke/ACK recovery, not authentication policy.
+/// Inventory remains ingress-authenticated; genesis decisions are the pinned
+/// Authority's public Query method and never grant management rights.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AuthorityReadRequest {
+    Projection(AuthorityProjectionQuery),
+    GenesisDecision {
+        authority: AuthorityActorTarget,
+        agent: AgentId,
+        nonce: Hash,
+    },
+}
+
+impl AuthorityReadRequest {
+    fn authority(&self) -> AuthorityActorTarget {
+        match self {
+            Self::Projection(query) => query.authority,
+            Self::GenesisDecision { authority, .. } => *authority,
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        match self {
+            Self::Projection(query) => query.validate_shape().is_ok(),
+            Self::GenesisDecision {
+                authority,
+                agent,
+                nonce,
+            } => {
+                authority.is_valid()
+                    && *agent != AgentId::ZERO
+                    && *agent != authority.system_agent
+                    && *nonce != Hash::ZERO
+            }
+        }
+    }
+
+    fn mode(&self) -> MethodMode {
+        match self {
+            Self::Projection(_) => MethodMode::Query,
+            Self::GenesisDecision { .. } => MethodMode::Query,
+        }
+    }
+
+    fn attesting_node(&self) -> Option<super::sdk::NodeId> {
+        match self {
+            Self::Projection(query) => query.attesting_node(),
+            Self::GenesisDecision { .. } => None,
+        }
+    }
+
+    fn invocation(&self) -> InvocationId {
+        let hash = match self {
+            Self::Projection(query) => Hash::digest(
+                b"vos/system-authority/projection-invocation/v2",
+                &[query.commitment().as_bytes()],
+            ),
+            Self::GenesisDecision { .. } => {
+                Hash::digest(b"vos/system-authority/genesis-read/v1", &[&self.encode()])
+            }
+        };
+        InvocationId(hash.0)
+    }
+
+    fn message(&self) -> Vec<u8> {
+        match self {
+            Self::Projection(query) => dynamic_message(
+                projection_method(query.selector),
+                "query",
+                crate::actors::value::Value::Bytes(query.encode().expect("validated query")),
+            ),
+            Self::GenesisDecision { agent, .. } => dynamic_message(
+                "genesis_decision",
+                "agent",
+                crate::actors::value::Value::Bytes(agent.as_bytes().to_vec()),
+            ),
+        }
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut encoder = Encoder(&mut bytes);
+        match self {
+            Self::Projection(query) => {
+                encoder.u8(0);
+                encoder.bytes(&query.encode().expect("validated query"));
+            }
+            Self::GenesisDecision {
+                authority,
+                agent,
+                nonce,
+            } => {
+                encoder.u8(1);
+                encoder.fixed(authority.space.as_bytes());
+                encoder.fixed(authority.system_agent.as_bytes());
+                encoder.fixed(authority.system_runtime_deployment.as_bytes());
+                encode_authority_binding(&mut encoder, authority.binding);
+                encoder.fixed(agent.as_bytes());
+                encoder.fixed(nonce.as_bytes());
+            }
+        }
+        bytes
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut decoder = Decoder::new(bytes);
+        let value = match decoder.u8()? {
+            0 => Self::Projection(
+                AuthorityProjectionQuery::decode(
+                    &decoder.bytes_bounded(MAX_AUTHORITY_PROJECTION_QUERY_WIRE_BYTES)?,
+                )
+                .map_err(|_| DecodeError::NonCanonical)?,
+            ),
+            1 => Self::GenesisDecision {
+                authority: AuthorityActorTarget {
+                    space: SpaceId(decoder.fixed()?),
+                    system_agent: AgentId(decoder.fixed()?),
+                    system_runtime_deployment: super::sdk::DeploymentId(decoder.fixed()?),
+                    binding: decode_authority_binding(&mut decoder)?,
+                },
+                agent: AgentId(decoder.fixed()?),
+                nonce: Hash(decoder.fixed()?),
+            },
+            _ => return Err(DecodeError::NonCanonical),
+        };
+        if !value.is_valid() || value.encode() != bytes {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingAuthorityProjection {
-    query: AuthorityProjectionQuery,
+    query: AuthorityReadRequest,
     work: RuntimeWork,
 }
 
@@ -1054,12 +1186,8 @@ impl PendingAuthorityProjection {
         let InvocationAuthorization::PublicPreflight(preflight) = authorization.as_ref() else {
             return false;
         };
-        let target = self.query.authority;
-        let method = projection_method(self.query.selector);
-        let Ok(query_bytes) = self.query.encode() else {
-            return false;
-        };
-        self.query.validate_shape().is_ok()
+        let target = self.query.authority();
+        self.query.is_valid()
             && *context == RuntimeExecutionContext::Direct
             && state.is_empty()
             && *observed_slot == preflight.observed_slot
@@ -1071,27 +1199,15 @@ impl PendingAuthorityProjection {
             && invocation.actor == target.binding.issuer.actor
             && invocation.deployment == target.binding.issuer.deployment
             && invocation.program == target.binding.issuer.program
-            && invocation.mode == MethodMode::Query
-            && invocation.invocation
-                == InvocationId(
-                    Hash::digest(
-                        b"vos/system-authority/projection-invocation/v2",
-                        &[self.query.commitment().as_bytes()],
-                    )
-                    .0,
-                )
+            && invocation.mode == self.query.mode()
+            && invocation.invocation == self.query.invocation()
             && invocation.origin.principal.is_none()
             && invocation.origin.transport_node == self.query.attesting_node()
             && invocation.origin.credential.is_none()
             && invocation.origin.actor.is_none()
             && invocation.origin.capability.is_none()
             && invocation.roles == InvocationRoleClaims::none()
-            && invocation.message
-                == dynamic_message(
-                    method,
-                    "query",
-                    crate::actors::value::Value::Bytes(query_bytes),
-                )
+            && invocation.message == self.query.message()
             && !invocation.recovery_only
     }
 
@@ -1109,7 +1225,7 @@ impl PendingAuthorityProjection {
 }
 
 impl CanonicalWire for PendingAuthorityProjection {
-    const MAGIC: [u8; 4] = *b"PAP1";
+    const MAGIC: [u8; 4] = *b"PAP2";
     const MAX_ENCODED_BYTES: usize = MAX_PENDING_AUTHORITY_PROJECTION_BYTES;
 
     fn validate_wire(&self) -> bool {
@@ -1117,12 +1233,7 @@ impl CanonicalWire for PendingAuthorityProjection {
     }
 
     fn encode_body(&self, encoder: &mut Encoder<'_>) {
-        encoder.bytes(
-            &self
-                .query
-                .encode()
-                .expect("validated pending query is canonical"),
-        );
+        encoder.bytes(&self.query.encode());
         encoder.bytes(
             &self
                 .work
@@ -1132,8 +1243,8 @@ impl CanonicalWire for PendingAuthorityProjection {
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        let query = AuthorityProjectionQuery::decode(
-            &decoder.bytes_bounded(MAX_AUTHORITY_PROJECTION_QUERY_WIRE_BYTES)?,
+        let query = AuthorityReadRequest::decode(
+            &decoder.bytes_bounded(MAX_AUTHORITY_PROJECTION_QUERY_WIRE_BYTES + 8)?,
         )
         .map_err(|_| DecodeError::NonCanonical)?;
         let work = RuntimeWork::decode(&decoder.bytes_bounded(MAX_RUNTIME_WORK_WIRE_BYTES)?)
@@ -2378,6 +2489,28 @@ where
         Ok(projections)
     }
 
+    /// Export non-owning handles only after the complete deferred set has
+    /// passed recovery. System access keeps its independent pinned adapter.
+    pub(crate) fn ordinary_supervisor_generations(
+        &mut self,
+    ) -> Result<Vec<crate::network::shared_agent::SharedAgentRouteHandle>, SharedAgentHostError>
+    {
+        if self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .has_deferred_open()
+        {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        Ok(self
+            ._network_host
+            .supervisor_generation_handles()?
+            .into_iter()
+            .filter(|handle| handle.agent() != self.pins.agent)
+            .collect())
+    }
+
     pub(crate) fn supervisor_invoke(
         &self,
         expected: super::supervisor::AgentRouteIdentity,
@@ -3412,6 +3545,18 @@ where
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
+        if let Some(work) = recovery
+            .intent
+            .finalization_work()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        {
+            let anchor = recovery
+                .intent
+                .finalization_anchor()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            recovery.pending.push((anchor.clone(), work.clone()));
+        }
         recovery.admission_valid = true;
         Ok((candidate, committee))
     }
@@ -3613,10 +3758,11 @@ where
         ))
     }
 
-    /// Provision only an exactly published and positively retired Shared Create.
+    /// Provision only after exact genesis publication and its positive ACK.
     /// Reauthenticate through this root-pinned owner before touching generation
     /// files. The caller retains the lifecycle/archive leases; routing is a
-    /// separate lifecycle step and is not published by this method.
+    /// separate lifecycle step and is not published by this method. This does
+    /// not acknowledge or finalize the original management Create application.
     pub fn provision_published_shared_genesis<B, J, Q, ReplyStore, W, PubReply, S>(
         &mut self,
         recovery: &mut NativeSharedGenesisRecovery<B, J, Q, ReplyStore, W, PubReply>,
@@ -3731,15 +3877,176 @@ where
             }
         }
         let mut proofs = Vec::with_capacity(entries.len());
-        for (recovery, record) in entries {
-            proofs.push(self.verify_published_shared_genesis(
-                recovery,
-                record.provision().replicas(),
-                receipt_signer,
-                record,
-            )?);
+        for (recovery, record) in entries.iter_mut() {
+            proofs.push(if recovery.retired {
+                self.verify_retired_shared_genesis(recovery, record)?
+            } else {
+                self.verify_published_shared_genesis(
+                    recovery,
+                    record.provision().replicas(),
+                    receipt_signer,
+                    record,
+                )?
+            });
         }
-        self.complete_deferred_shared_genesis(proofs)
+        self.complete_deferred_shared_genesis(proofs)?;
+        for (recovery, _) in entries.iter_mut() {
+            if recovery.retired {
+                continue;
+            }
+            // Startup restores every retained phase. Successful proof replay
+            // above checked both ancillary results and their positive ACKs;
+            // drain those reservations without releasing the original Create.
+            // The network boundary independently rechecks durable positive ACK
+            // evidence before removing each pending member.
+            for (anchor, envelope) in recovery.pending.iter().skip(1).take(2) {
+                self._network_host.finish_pending_management_result(
+                    crate::service::AgentId(self.pins.agent.0),
+                    anchor,
+                    envelope,
+                    false,
+                    || Ok(()),
+                )?;
+            }
+            self.finish_shared_genesis_application(recovery, receipt_signer)?;
+        }
+        Ok(())
+    }
+
+    /// Revalidate completed Create against current Authority state. Historical
+    /// publication replies and local retirement markers are not finality proof.
+    fn verify_retired_shared_genesis<B, J, Q, ReplyStore, W, PubReply>(
+        &mut self,
+        recovery: &NativeSharedGenesisRecovery<B, J, Q, ReplyStore, W, PubReply>,
+        record: &super::genesis::AgentGenesisArchiveRecord,
+    ) -> Result<ReplayVerifiedAgentGenesisFinality, SharedAgentHostError>
+    where
+        B: CleanManagementIssuerStore,
+        J: CleanManagementIssuerStore,
+    {
+        use crate::service::ServiceWire as _;
+        let intent = recovery
+            .intent
+            .intent()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let proposal = record.provision().proposal();
+        let super::journal::ReplayOperation::CleanManage {
+            request,
+            authority: receipt,
+            ..
+        } = &proposal.create().operation
+        else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        if !recovery.retired
+            || !recovery.pending.is_empty()
+            || intent.request() != request
+            || recovery.issued.as_ref() != Some(receipt)
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        // A prior attempt may have committed Invoke/ACK before failing to
+        // clear its durable read record. Drain that exact request before
+        // deriving a nonce from the now-advanced journal head.
+        self.recover_pending_authority_projection()?;
+        let position = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .journal_position(crate::service::AgentId(self.pins.agent.0))?;
+        let authority = self.authority_target();
+        let agent = intent.call().managed.agent;
+        let nonce = Hash::digest(
+            b"vos/shared-genesis/recovery-read/v1",
+            &[
+                position.genesis.as_bytes(),
+                position.admission.as_bytes(),
+                &position.ordered_index.to_le_bytes(),
+                position
+                    .ordered_head
+                    .map(|head| *head.as_bytes())
+                    .unwrap_or([0; 32])
+                    .as_slice(),
+                agent.as_bytes(),
+            ],
+        );
+        let request = AuthorityReadRequest::GenesisDecision {
+            authority,
+            agent,
+            nonce,
+        };
+        let response = self.invoke_authority_read(request)?;
+        if response != record.provision().decision().encode() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        Ok(ReplayVerifiedAgentGenesisFinality(
+            record.provision().clone(),
+        ))
+    }
+
+    /// Complete the original management operation only after physical recovery.
+    /// Publication ACK proves genesis finality, not application acknowledgement.
+    fn finish_shared_genesis_application<B, J, Q, Reply, W, PubReply, S>(
+        &mut self,
+        recovery: &mut NativeSharedGenesisRecovery<B, J, Q, Reply, W, PubReply>,
+        signer: &mut S,
+    ) -> Result<(), SharedAgentHostError>
+    where
+        B: super::clean_authority_issuer::CleanManagementRuntimeStore,
+        J: CleanManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+    {
+        let intent = recovery
+            .intent
+            .intent()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let managed = intent.call().managed;
+        intent
+            .verify(self.authority_target(), managed, &RawCredentialVerifier)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let receipt = recovery
+            .issued
+            .as_ref()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let (application, state, slot) = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .observe_clean_genesis_application(
+                crate::service::AgentId(managed.agent.0),
+                intent.request(),
+                receipt,
+            )?;
+        // From here a failed write may have advanced the durable phase. Only
+        // reopening the leased stores can rebuild an authoritative admission
+        // snapshot; the pre-completion pending list is no longer reusable.
+        recovery.admission_valid = false;
+        // Retried acknowledgements retain their original state and clock, even
+        // if unrelated work has since moved the opened generation's heads.
+        let acknowledgement = match recovery
+            .issuer
+            .recover_application_ack(receipt, &application, signer)
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        {
+            Some(acknowledgement) => acknowledgement,
+            None => recovery
+                .issuer
+                .observe_durable_application(receipt, &application, state, slot, signer)
+                .map_err(|_| SharedAgentHostError::Unavailable)?,
+        };
+        self.finalize_management_intent_with_admission(
+            &mut recovery.intent,
+            managed,
+            &acknowledgement,
+            &mut recovery.issuer,
+            true,
+        )?;
+        self.finish_live_management_intent(
+            &mut recovery.intent,
+            managed,
+            &acknowledgement,
+            &recovery.issuer,
+        )
     }
 
     /// Complete deferred host opening using only exact independently replayed
@@ -5087,8 +5394,15 @@ where
         &mut self,
         query: AuthorityProjectionQuery,
     ) -> Result<Vec<u8>, SharedAgentHostError> {
+        self.invoke_authority_read(AuthorityReadRequest::Projection(query))
+    }
+
+    fn invoke_authority_read(
+        &mut self,
+        query: AuthorityReadRequest,
+    ) -> Result<Vec<u8>, SharedAgentHostError> {
         let started = std::time::Instant::now();
-        if query.validate_shape().is_err() || query.authority != self.authority_target() {
+        if !query.is_valid() || query.authority() != self.authority_target() {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         if let Some(pending) = &self.record.pending_projection {
@@ -5112,7 +5426,7 @@ where
         }
         let agent = crate::service::AgentId(self.pins.agent.0);
         self._network_host.ensure_reattached(agent)?;
-        let pending = self.prepare_authority_projection(query)?;
+        let pending = self.prepare_authority_read(query)?;
         tracing::debug!(
             elapsed_ms = started.elapsed().as_millis() as u64,
             phase = "prepare",
@@ -5204,6 +5518,13 @@ where
         &self,
         query: AuthorityProjectionQuery,
     ) -> Result<PendingAuthorityProjection, SharedAgentHostError> {
+        self.prepare_authority_read(AuthorityReadRequest::Projection(query))
+    }
+
+    fn prepare_authority_read(
+        &self,
+        query: AuthorityReadRequest,
+    ) -> Result<PendingAuthorityProjection, SharedAgentHostError> {
         let mut material =
             self.supervisor_invocation_material(self.pins.agent, self.pins.authority.issuer.actor)?;
         if material.actor.entry.actor != self.pins.authority.issuer.actor
@@ -5216,9 +5537,9 @@ where
         // The authority actor is bootstrapped before the authority's root
         // catalog marker and therefore is not itself root-provenance marked.
         material.root_provenance = false;
-        let query_bytes = query
-            .encode()
-            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if !query.is_valid() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
         let mut availability = vec![
             material.program.clone(),
             material.schema.clone(),
@@ -5236,18 +5557,12 @@ where
             space: self.pins.space,
             agent: self.pins.agent,
             runtime_deployment: material.descriptor.identity.runtime_deployment,
-            invocation: super::sdk::InvocationId(
-                Hash::digest(
-                    b"vos/system-authority/projection-invocation/v2",
-                    &[query.commitment().as_bytes()],
-                )
-                .0,
-            ),
+            invocation: query.invocation(),
             actor: material.actor.entry.actor,
             incarnation: material.actor.incarnation,
             deployment: material.actor.entry.deployment,
             program: material.actor.entry.program,
-            mode: super::sdk::MethodMode::Query,
+            mode: query.mode(),
             origin: super::sdk::InvocationOrigin {
                 principal: None,
                 transport_node: query.attesting_node(),
@@ -5256,11 +5571,7 @@ where
                 capability: None,
             },
             roles: super::sdk::InvocationRoleClaims::none(),
-            message: dynamic_message(
-                projection_method(query.selector),
-                "query",
-                crate::actors::value::Value::Bytes(query_bytes),
-            ),
+            message: query.message(),
             installation_data: material.actor.entry.installation_data.clone(),
             availability,
             gas: self.invocation_gas,
@@ -5302,7 +5613,7 @@ where
             .pending_projection
             .clone()
             .ok_or(SharedAgentHostError::Unavailable)?;
-        if !pending.validate() || pending.query.authority != self.authority_target() {
+        if !pending.validate() || pending.query.authority() != self.authority_target() {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         let (work, authorization) = pending
@@ -5353,6 +5664,20 @@ where
             }
             _ => None,
         };
+        #[cfg(test)]
+        if response.is_none() && std::env::var_os("VOS_TEST_INNER_DIAGNOSTICS").is_some() {
+            match &outcome {
+                super::sdk::RuntimeOutcome::Completed(Ok(reply)) => eprintln!(
+                    "projection returned no bytes: status={:?}, reply_len={}",
+                    reply.status,
+                    reply.reply.len()
+                ),
+                super::sdk::RuntimeOutcome::Completed(Err(error)) => {
+                    eprintln!("projection execution error: {error:?}")
+                }
+                _ => eprintln!("projection did not complete"),
+            }
+        }
         if !matches!(outcome, super::sdk::RuntimeOutcome::Completed(_)) {
             return Err(SharedAgentHostError::Unavailable);
         }
@@ -5390,7 +5715,7 @@ where
         pending: &PendingAuthorityProjection,
         persisted: bool,
     ) -> Result<super::supervisor::AgentRouteIdentity, SharedAgentHostError> {
-        if !pending.validate() || pending.query.authority != self.authority_target() {
+        if !pending.validate() || pending.query.authority() != self.authority_target() {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         let (work, authorization) = pending
@@ -5677,7 +6002,7 @@ fn validate_record_against_plan(
     if record
         .pending_projection
         .as_ref()
-        .is_some_and(|pending| pending.query.authority != plan.authority_target())
+        .is_some_and(|pending| pending.query.authority() != plan.authority_target())
     {
         return Err(rejected(CleanSystemAgentBootstrapRejection::InvalidRecord));
     }
@@ -5806,7 +6131,15 @@ fn apply_actor_install(
         )
         .map_err(CleanSystemAgentBootstrapError::Host)?;
     let (outcome, observed_slot) = match submission {
-        crate::network::shared_agent::CleanManagementSubmission::Denied { .. } => {
+        crate::network::shared_agent::CleanManagementSubmission::Denied {
+            outcome,
+            observed_slot,
+        } => {
+            #[cfg(test)]
+            if std::env::var_os("VOS_TEST_INNER_DIAGNOSTICS").is_some() {
+                eprintln!("bootstrap install denied at {observed_slot}: {outcome:?}");
+            }
+            let _ = (outcome, observed_slot);
             return Err(rejected(CleanSystemAgentBootstrapRejection::GuestDenied));
         }
         crate::network::shared_agent::CleanManagementSubmission::Applied {
@@ -6298,6 +6631,7 @@ mod tests {
         #[derive(Clone, Default)]
         struct BootstrapMemoryStore {
             inner: Arc<Mutex<BootstrapMemoryState>>,
+            bootstrap_clock: Option<Arc<AtomicU64>>,
         }
 
         impl BootstrapMemoryStore {
@@ -6307,6 +6641,7 @@ mod tests {
                         failure,
                         ..BootstrapMemoryState::default()
                     })),
+                    bootstrap_clock: None,
                 }
             }
 
@@ -6351,6 +6686,16 @@ mod tests {
                     return Err(MemoryError);
                 }
                 state.image = Some(image.to_vec());
+                if let Some(clock) = &self.bootstrap_clock {
+                    let record = CleanSystemAgentBootstrapRecord::decode(image)
+                        .expect("bootstrap clock follows valid durable phase records");
+                    let offset = match record.phase {
+                        CleanSystemAgentBootstrapPhase::Created => 1,
+                        CleanSystemAgentBootstrapPhase::CatalogReceiptIssued => 2,
+                        _ => 0,
+                    };
+                    clock.fetch_max(LOGICAL_SLOT + offset, Ordering::AcqRel);
+                }
                 if state.failure == RecordFailure::AfterEveryPhase && commit <= 10 {
                     return Err(MemoryError);
                 }
@@ -9291,16 +9636,44 @@ mod tests {
             }
 
             fn with_fixture(label: &str, fixture: PhysicalFixture) -> Self {
+                Self::with_fixture_bootstrap(label, fixture, false)
+            }
+
+            fn with_real_bootstrap(label: &str, fixture: PhysicalFixture) -> Self {
+                Self::with_fixture_bootstrap(label, fixture, true)
+            }
+
+            fn with_fixture_bootstrap(label: &str, fixture: PhysicalFixture, real: bool) -> Self {
                 let directory = TestDirectory::new(label);
                 let network = network(NODE_SEED);
                 let mut signer = CountingSigner::new();
-                let record = BootstrapMemoryStore::default();
+                // Management mutations require distinct logical slots. Advance
+                // only after durable bootstrap phases, without wall-clock races.
+                let record = BootstrapMemoryStore {
+                    bootstrap_clock: real.then(|| fixture.logical_slot.as_ref().unwrap().clone()),
+                    ..BootstrapMemoryStore::default()
+                };
                 let provider = Arc::new(MemoryProvider::new(fixture.provision.clone()));
                 // Keep native bootstrap/replay on a normal thread stack,
                 // independently of the large multiphase fixture caller.
                 let owner = std::thread::scope(|scope| {
                     scope
                         .spawn(|| {
+                            if real {
+                                return open_owner(
+                                    &fixture,
+                                    &directory,
+                                    BootstrapMemoryStore::default(),
+                                    record.clone(),
+                                    IssuerMemoryStore::default(),
+                                    &mut signer,
+                                    provider.clone(),
+                                    Arc::clone(&network),
+                                )
+                                .expect(
+                                    "real system bootstrap must finalize Catalog registration",
+                                );
+                            }
                             seed_complete_native_projection_owner(
                                 &fixture,
                                 &directory,
@@ -19389,6 +19762,55 @@ mod tests {
         }
 
         #[test]
+        fn native_genesis_read_envelope_binds_target_nonce_and_method() {
+            let harness = NativeProjectionOwnerHarness::new("genesis-read-envelope");
+            let owner = harness.owner.as_ref().unwrap();
+            let query = AuthorityReadRequest::GenesisDecision {
+                authority: owner.authority_target(),
+                agent: AgentId([0xdc; 32]),
+                nonce: Hash([0xdd; 32]),
+            };
+            let pending = owner.prepare_authority_read(query.clone()).unwrap();
+            let encoded = pending.encode().unwrap();
+            assert_eq!(
+                PendingAuthorityProjection::decode(&encoded).unwrap(),
+                pending
+            );
+            let mut trailing = encoded;
+            trailing.push(0);
+            assert!(PendingAuthorityProjection::decode(&trailing).is_err());
+            for mutation in 0..5 {
+                let mut substituted = pending.clone();
+                let AuthorityReadRequest::GenesisDecision {
+                    authority,
+                    agent,
+                    nonce,
+                } = &mut substituted.query
+                else {
+                    unreachable!()
+                };
+                match mutation {
+                    0 => *agent = AgentId([0xde; 32]),
+                    1 => *nonce = Hash([0xde; 32]),
+                    2 => authority.system_agent = AgentId([0xde; 32]),
+                    3 => *nonce = Hash::ZERO,
+                    _ => *agent = authority.system_agent,
+                }
+                assert!(!substituted.validate());
+            }
+            let mut substituted = pending;
+            let RuntimeWork::Invoke { invocation, .. } = &mut substituted.work else {
+                unreachable!()
+            };
+            invocation.mode = MethodMode::Linear;
+            assert!(
+                !substituted.validate(),
+                "a read reservation cannot authorize a Linear mutation"
+            );
+            harness.stop();
+        }
+
+        #[test]
         fn native_shared_proposal_reuses_durable_authorization_and_receipt() {
             check_shared_proposal_and_committee_preparation(
                 native_bundled_authority_fixture(),
@@ -19442,7 +19864,7 @@ mod tests {
             // Do not inherit the generic fixture's permissive finality adapter.
             fixture.finality = Arc::new(NoArchiveFinality);
             let mut harness =
-                NativeProjectionOwnerHarness::with_fixture("shared-proposal-retry", fixture);
+                NativeProjectionOwnerHarness::with_real_bootstrap("shared-proposal-retry", fixture);
             let owner = harness.owner.as_mut().unwrap();
             // The proposed generation must use executable runtime bytes too
             // when qualifying the full physical path, not just its system Agent.
@@ -19484,6 +19906,8 @@ mod tests {
             let request = ManagementRequest::Create(Box::new(descriptor.clone()));
             let key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
             let (mut call, _) = credential_call_and_approval(&descriptor, &request, &key);
+            // The real bootstrap consumed sequence one for Catalog install.
+            call.request_sequence = NonZeroU64::new(2).unwrap();
             call.authority = owner.authority_target();
             call.invocation = call.expected_invocation();
             call.signature = key.sign(&call.signing_bytes()).to_bytes();
@@ -20904,7 +21328,7 @@ mod tests {
             // stores. The valid reply copy is separate from the corruption
             // fixture above.
             let target = owner.authority_target();
-            let recovery = super::super::NativeSharedGenesisRecovery::open(
+            let mut recovery = super::super::NativeSharedGenesisRecovery::open(
                 target,
                 locator,
                 intent_store,
@@ -20915,15 +21339,68 @@ mod tests {
                 missing,
             )
             .unwrap();
+            // Crash after the application ACK and exact finalization envelope
+            // are durable, but before the Authority finalization is invoked.
+            owner.fail_finalization_once_for_test(0);
+            assert_eq!(
+                owner.finish_shared_genesis_application(&mut recovery, &mut signer),
+                Err(SharedAgentHostError::Unavailable)
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), after_ack);
+            // A local completion marker cannot turn the interrupted phase into
+            // finalized issuer evidence or bypass the live recovery contract.
+            let mut premature = recovery.intent.intent().unwrap().encode();
+            premature[..4].copy_from_slice(b"CMR2");
+            let mut premature_store = IssuerMemoryStore::default();
+            premature_store.commit(&premature).unwrap();
+            *premature_store.runtime.lock().unwrap() =
+                Some(recovery.runtime.as_ref().unwrap().exact_bytes().to_vec());
+            let (intent, issuer, query, reply, publication, publication_reply) =
+                recovery.into_stores();
+            assert!(
+                super::super::NativeSharedGenesisRecovery::open(
+                    target,
+                    locator,
+                    premature_store,
+                    issuer.clone(),
+                    query.clone(),
+                    reply.clone(),
+                    publication.clone(),
+                    publication_reply.clone(),
+                )
+                .is_err(),
+                "retirement without finalized issuer evidence must be refused"
+            );
+            let retired_stores = (
+                intent.clone(),
+                issuer.clone(),
+                query.clone(),
+                reply.clone(),
+                publication.clone(),
+                publication_reply.clone(),
+            );
+            let recovery = super::super::NativeSharedGenesisRecovery::open(
+                target,
+                locator,
+                intent,
+                issuer,
+                query,
+                reply,
+                publication,
+                publication_reply,
+            )
+            .expect("interrupted application finalization reopens with exact retained work");
+            assert_eq!(recovery.pending.len(), 4);
             let mut controller = super::super::NativeSharedGenesisController::new(
                 target,
-                vec![(recovery, Some(archive_store))],
+                vec![(recovery, Some(archive_store.clone()))],
             )
             .unwrap();
             let owner = harness.owner.take().unwrap();
             let pins = owner._pins_store.clone();
             let bootstrap_record = owner.record_store.clone();
             let issuer = owner.issuer.into_store();
+            let system_restart_stores = (pins.clone(), bootstrap_record.clone(), issuer.clone());
             drop(owner._network_host);
             drop(owner.host);
             let mut operations = OperationTestJournal(harness._directory.0.clone());
@@ -20968,11 +21445,52 @@ mod tests {
                 Err(SharedAgentHostError::ScopeMismatch)
             );
             assert_eq!(owner.host.lock().unwrap().len(), 1);
-            controller.recover(&mut owner, &mut signer).unwrap();
-            assert!(controller.is_recovered());
+            struct NoLocalStores;
+            impl crate::agent::local_lifecycle::LocalLifecycleStoreFactory for NoLocalStores {
+                type Intent = IssuerMemoryStore;
+                type Issuer = IssuerMemoryStore;
+                type Error = ();
+                fn discover(&mut self, _: SpaceId, _: usize) -> Result<Vec<AgentId>, ()> {
+                    Ok(Vec::new())
+                }
+                fn open_existing(
+                    &mut self,
+                    _: SpaceId,
+                    _: AgentId,
+                ) -> Result<(Self::Intent, Self::Issuer), ()> {
+                    Err(())
+                }
+                fn open(
+                    &mut self,
+                    _: SpaceId,
+                    _: AgentId,
+                ) -> Result<(Self::Intent, Self::Issuer), ()> {
+                    Err(())
+                }
+            }
+            let local = crate::agent::local_sdk_host::LocalAgentHost::create(
+                harness._directory.0.join("shared-production-local"),
+                target.space,
+                harness.fixture.plan.pins.node,
+                harness.fixture.trust.clone(),
+            )
+            .unwrap();
+            let lifecycle = crate::agent::local_lifecycle::LocalLifecycleController::new(
+                owner,
+                local,
+                NoLocalStores,
+                signer,
+            )
+            .unwrap()
+            .with_shared_genesis(controller)
+            .unwrap();
+            let mut owner = lifecycle.system_for_test();
             assert_eq!(owner.host.lock().unwrap().len(), 2);
             assert!(!owner.host.lock().unwrap().has_deferred_open());
-            assert_eq!(owner.ordered_index_for_test().unwrap(), after_ack);
+            // Genesis publication was already retired. Recovery now completes
+            // the original Create with finalization and two positive ACKs.
+            assert_eq!(owner.ordered_index_for_test().unwrap(), after_ack + 3);
+            assert!(!owner.management_admission_held().unwrap());
             let reopened = owner
                 .host
                 .lock()
@@ -21126,9 +21644,309 @@ mod tests {
                 ),
                 Err(SharedAgentHostError::ScopeMismatch),
             );
+            // Exercise real ordinary serving, not just an actor-empty route.
+            // Keep the genesis recovery evidence immutable; subsequent
+            // management continues from that retired issuer checkpoint.
+            let ordinary_package =
+                crate::agent::package_admission::admitted_standard_query_actor_for_test(
+                    "ordinary-query",
+                    StateLane::Linear,
+                    0xb7,
+                );
+            let ordinary_install =
+                install_request(descriptor.identity.agent, &ordinary_package, 0xb8, None);
+            let ordinary_actor = super::super::install_request(&ordinary_install)
+                .unwrap()
+                .entry
+                .actor;
+            let (mut install_call, _) =
+                credential_call_and_approval(&descriptor, &ordinary_install, &key);
+            install_call.request_sequence = NonZeroU64::new(3).unwrap();
+            install_call.authority = target;
+            install_call.invocation = install_call.expected_invocation();
+            install_call.signature = key.sign(&install_call.signing_bytes()).to_bytes();
+            let managed = install_call.managed;
+            let mut install_intent =
+                CleanManagementIntentSlot::open(IssuerMemoryStore::default()).unwrap();
+            install_intent
+                .pledge(
+                    CleanManagementIntent::new(
+                        target,
+                        managed,
+                        ordinary_install.clone(),
+                        install_call,
+                        &RawCredentialVerifier,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let install_issuer_store = IssuerMemoryStore::default();
+            *install_issuer_store.image.lock().unwrap() =
+                retired_stores.1.image.lock().unwrap().clone();
+            let mut install_issuer = DurableCleanManagementIssuer::open(
+                install_issuer_store,
+                target.binding,
+                managed.space,
+                managed.agent,
+            )
+            .unwrap();
+            let mut install_signer = CountingSigner::new();
+            let install_receipt = owner
+                .issue_management_intent_with_admission(
+                    &mut install_intent,
+                    managed,
+                    &mut install_issuer,
+                    &mut install_signer,
+                    true,
+                )
+                .unwrap();
+            harness
+                .fixture
+                .logical_slot
+                .as_ref()
+                .unwrap()
+                .fetch_add(1, Ordering::AcqRel);
+            let installed = owner
+                ._network_host
+                .manage_clean(
+                    locator.agent,
+                    ordinary_install,
+                    install_receipt.clone(),
+                    SdkManagementArtifacts::Actor(&ordinary_package),
+                )
+                .unwrap();
+            let crate::network::shared_agent::CleanManagementSubmission::Applied {
+                outcome: RuntimeOutcome::Management(Ok(application)),
+                observed_slot,
+                ..
+            } = installed
+            else {
+                panic!("ordinary actor installation must apply");
+            };
+            let state = owner
+                .host
+                .lock()
+                .unwrap()
+                .clean_state_commitment(locator.agent)
+                .unwrap();
+            let install_ack = install_issuer
+                .observe_durable_application(
+                    &install_receipt,
+                    &application,
+                    state,
+                    observed_slot,
+                    &mut install_signer,
+                )
+                .unwrap();
+            owner
+                .finalize_management_intent_with_admission(
+                    &mut install_intent,
+                    managed,
+                    &install_ack,
+                    &mut install_issuer,
+                    true,
+                )
+                .unwrap();
+            owner
+                .finish_live_management_intent(
+                    &mut install_intent,
+                    managed,
+                    &install_ack,
+                    &install_issuer,
+                )
+                .unwrap();
+            assert!(!owner.management_admission_held().unwrap());
             let weak_host = Arc::downgrade(&owner.host);
-            harness.owner = Some(owner);
-            harness.stop();
+            struct SharedInventoryAuthenticator(u8);
+            impl crate::agent::production_owner::AuthorityProjectionQueryAuthenticator
+                for SharedInventoryAuthenticator
+            {
+                fn expected_kind(&self) -> AuthorityCredentialKind {
+                    AuthorityCredentialKind::Ssh
+                }
+                fn authenticate(
+                    &mut self,
+                    authority: AuthorityActorTarget,
+                    selector: AuthorityProjectionSelector,
+                ) -> Result<
+                    AuthorityProjectionQuery,
+                    crate::agent::production_owner::AgentProductionOwnerError,
+                > {
+                    self.0 = self.0.checked_add(1).ok_or(
+                        crate::agent::production_owner::AgentProductionOwnerError::InventoryLimit,
+                    )?;
+                    // This fixture installs its bootstrap SSH credential, not
+                    // the API credential used by scripted inventory fixtures.
+                    let credential = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
+                    let public = credential.verifying_key().to_bytes();
+                    let (node_key, _, _, node) = node_material();
+                    let mut query = AuthorityProjectionQuery {
+                        authority,
+                        credential: CredentialId::of_public_key(&public),
+                        nonce: inventory_nonce(0xe9, self.0),
+                        selector,
+                        authentication: AuthorityIngressAuthentication::SshNodeAttestation {
+                            credential_public_key: public,
+                            node: NodeId(node.0),
+                            request_binding: Hash([0xea; 32]),
+                            signature: [1; 64],
+                        },
+                    };
+                    let signature = node_key.sign(&query.signing_bytes()).to_bytes();
+                    if let AuthorityIngressAuthentication::SshNodeAttestation {
+                        signature: actual,
+                        ..
+                    } = &mut query.authentication
+                    {
+                        *actual = signature;
+                    }
+                    Ok(query)
+                }
+            }
+            let mut authenticator = SharedInventoryAuthenticator(0);
+            let query = crate::agent::production_owner::AuthorityProjectionQueryAuthenticator::authenticate(
+                &mut authenticator, target, AuthorityProjectionSelector::Actors {
+                    agent: target.system_agent, after: None, limit: 8,
+                },
+            ).unwrap();
+            let bytes = owner.invoke_authority_projection(query).unwrap();
+            let actors =
+                crate::agent_sdk::authority::AuthorityActorProjectionPage::decode(&bytes).unwrap();
+            assert_eq!(
+                actors
+                    .entries
+                    .iter()
+                    .filter(|actor| actor.root_provenance)
+                    .count(),
+                1,
+                "the authenticated actor directory must retain the system root before inventory admission"
+            );
+            // Retired recovery must not depend on the old publication suffix.
+            // Force a certified checkpoint before dropping the lifecycle owner.
+            let checkpoint_read = owner
+                .prepare_authority_read(AuthorityReadRequest::GenesisDecision {
+                    authority: target,
+                    agent: descriptor.identity.agent,
+                    nonce: Hash([0xed; 32]),
+                })
+                .unwrap();
+            let (checkpoint_work, checkpoint_auth) = checkpoint_read.invocation().unwrap();
+            let checkpoint_committee = owner.pins.replicas.clone();
+            owner
+                ._network_host
+                .certified_checkpoint_for_projection_pair(
+                    HostAgentId(target.system_agent.0),
+                    checkpoint_work,
+                    checkpoint_auth,
+                    &checkpoint_committee,
+                    harness.fixture.merge.as_ref(),
+                )
+                .unwrap();
+            assert!(
+                !owner
+                    .host
+                    .lock()
+                    .unwrap()
+                    .retained_positive_clean_acknowledgement(
+                        HostAgentId(target.system_agent.0),
+                        published_work,
+                        published_auth,
+                    )
+                    .unwrap(),
+                "the retired restart test must actually prune publication ACK evidence"
+            );
+            drop(owner);
+            let mut production = crate::agent::production_owner::AgentProductionOwner::start_local(
+                harness.fixture.plan.pins.node,
+                crate::agent::supervisor::AgentSupervisorLimits::default(),
+                Box::new(lifecycle),
+                4,
+                Box::new(authenticator),
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+            assert!(
+                production.is_ready(),
+                "recovered Shared startup must publish authenticated routes"
+            );
+            production.reconcile().unwrap();
+            let ordinary_serving_work = {
+                use crate::actors::codec::Encode as _;
+                use crate::agent::supervisor_adapters::{
+                    AgentAcknowledgementRequest, AgentInvocationIntent, AgentInvocationRequest,
+                    dispatch_acknowledgement, dispatch_invocation, prepare_invocation,
+                };
+                let supervisor = production.handle();
+                let snapshot = supervisor
+                    .snapshots()
+                    .unwrap()
+                    .into_iter()
+                    .find(|snapshot| {
+                        snapshot.key().agent() == descriptor.identity.agent
+                            && snapshot.key().actor() == ordinary_actor
+                    })
+                    .expect("authenticated inventory must publish the ordinary installed actor");
+                let mut message = vec![crate::actors::value::TAG_DYNAMIC];
+                message.extend(crate::actors::value::Msg::new("read").encode());
+                let prepared = prepare_invocation(
+                    &supervisor,
+                    snapshot,
+                    AgentInvocationIntent::new(
+                        InvocationId([0xf1; 32]),
+                        MethodMode::Query,
+                        InvocationOrigin::anonymous(),
+                        InvocationRoleClaims::none(),
+                        message,
+                        1_000_000,
+                        false,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                let authorization =
+                    InvocationAuthorization::PublicPreflight(prepared.public_preflight().unwrap());
+                let work = prepared.into_work();
+                let invoked = dispatch_invocation(
+                    &supervisor,
+                    snapshot,
+                    AgentInvocationRequest::new(
+                        RuntimeExecutionContext::Direct,
+                        work.clone(),
+                        authorization.clone(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert!(
+                    matches!(invoked, crate::agent::supervisor_adapters::AgentInvocationResponse::Direct { outcome: RuntimeOutcome::Completed(Ok(reply)), .. } if reply.status == InvocationStatus::Done && reply.reply == [0x63])
+                );
+                let acknowledged = dispatch_acknowledgement(
+                    &supervisor,
+                    snapshot,
+                    AgentAcknowledgementRequest::new(
+                        RuntimeExecutionContext::Direct,
+                        None,
+                        work.clone(),
+                        authorization,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert!(matches!(
+                    acknowledged.outcome(),
+                    RuntimeOutcome::Acknowledged(Ok(_))
+                ));
+                work
+            };
+            assert!(
+                production
+                    .handle()
+                    .snapshots()
+                    .unwrap()
+                    .iter()
+                    .any(|snapshot| snapshot.key().agent() == target.system_agent)
+            );
+            production.shutdown_and_join().unwrap();
             assert!(
                 weak_host.upgrade().is_none(),
                 "closed route handles must not retain the physical host"
@@ -21137,6 +21955,156 @@ mod tests {
                 retained_handle.projection(),
                 Err(SharedAgentHostError::TransportNotAttached)
             ));
+            let mut interrupted_read_index = None;
+            for interrupt_read in [true, false] {
+                let (intent, issuer, query, reply, publication, publication_reply) =
+                    retired_stores.clone();
+                let recovery = super::super::NativeSharedGenesisRecovery::open(
+                    target,
+                    locator,
+                    intent,
+                    issuer,
+                    query,
+                    reply,
+                    publication,
+                    publication_reply,
+                )
+                .expect("completed Create must reopen after publication history pruning");
+                assert!(recovery.retired);
+                assert!(recovery.pending.is_empty());
+                let mut controller = super::super::NativeSharedGenesisController::new(
+                    target,
+                    vec![(recovery, Some(archive_store.clone()))],
+                )
+                .unwrap();
+                let mut operations = OperationTestJournal(harness._directory.0.clone());
+                let admission =
+                    NativeAuthorityOperationStartupAdmission::load(&mut operations, target, &[])
+                        .unwrap();
+                let admission = controller.startup_admission(admission).unwrap();
+                assert!(
+                    admission.pending.is_empty(),
+                    "retired work must not pin pruned anchors"
+                );
+                let (pins, record, issuer) = system_restart_stores.clone();
+                let mut signer = CountingSigner::new();
+                let mut reopened = std::thread::scope(|scope| {
+                    scope
+                    .spawn(|| {
+                        CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
+                            pins,
+                            record,
+                            issuer,
+                            &mut signer,
+                            || panic!("retired restart must not bootstrap"),
+                            harness._directory.host(),
+                            harness._directory.lock(),
+                            harness.fixture.plan.pins.space,
+                            harness.fixture.plan.pins.node,
+                            harness.fixture.trust.clone(),
+                            harness.fixture.merge.clone(),
+                            harness.fixture.finality.clone(),
+                            harness.provider.clone(),
+                            harness.network.clone(),
+                            None,
+                            Some(&admission),
+                        )
+                        .unwrap()
+                    })
+                    .join()
+                    .unwrap()
+                });
+                drop(admission);
+                if let Some(expected) = interrupted_read_index {
+                    assert_eq!(
+                        reopened.ordered_index_for_test().unwrap(),
+                        expected,
+                        "recovering a positively ACKed genesis read must not duplicate Invoke or ACK"
+                    );
+                    assert!(reopened.record.pending_projection.is_none());
+                }
+                assert_eq!(reopened.host.lock().unwrap().len(), 1);
+                controller
+                    .recover(&mut reopened, &mut signer)
+                    .expect("fresh Authority decision reopens retired generation");
+                assert_eq!(reopened.host.lock().unwrap().len(), 2);
+                assert!(!reopened.management_admission_held().unwrap());
+                assert_eq!(
+                    reopened
+                        .host
+                        .lock()
+                        .unwrap()
+                        .show(locator.agent)
+                        .unwrap()
+                        .unwrap()
+                        .generation,
+                    provisioned.generation
+                );
+                let generations = reopened.ordinary_supervisor_generations().unwrap();
+                let generation = generations
+                    .into_iter()
+                    .find(|handle| handle.agent() == descriptor.identity.agent)
+                    .expect("retired ordinary generation must reattach for serving");
+                let material = generation.material(ordinary_actor).unwrap();
+                let identity =
+                    crate::agent::supervisor_adapters::physical_material_identity(&material)
+                        .unwrap();
+                let mut work = ordinary_serving_work.clone();
+                work.invocation = InvocationId([if interrupt_read { 0xf2 } else { 0xf3 }; 32]);
+                let authorization = InvocationAuthorization::PublicPreflight(
+                    crate::agent_sdk::PublicPreflight::for_work(&work, material.observed_slot),
+                );
+                let outcome = generation
+                    .execute(
+                        identity,
+                        crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Invoke {
+                            context: RuntimeExecutionContext::Direct,
+                            work: work.clone(),
+                            authorization: authorization.clone(),
+                        },
+                    )
+                    .unwrap();
+                assert!(
+                    matches!(outcome, RuntimeOutcome::Completed(Ok(reply)) if reply.status == InvocationStatus::Done && reply.reply == [0x63])
+                );
+                let outcome = generation.execute(identity, crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Acknowledge {
+                    work, authorization,
+                }).unwrap();
+                assert!(matches!(outcome, RuntimeOutcome::Acknowledged(Ok(_))));
+                if interrupt_read {
+                    let pending = reopened
+                        .prepare_authority_read(AuthorityReadRequest::GenesisDecision {
+                            authority: target,
+                            agent: descriptor.identity.agent,
+                            nonce: Hash([0xef; 32]),
+                        })
+                        .unwrap();
+                    let (work, authorization) = pending.invocation().unwrap();
+                    reopened
+                        ._network_host
+                        .reserve_projection_pair(
+                            HostAgentId(target.system_agent.0),
+                            work,
+                            authorization,
+                            false,
+                        )
+                        .unwrap();
+                    let mut record = reopened.record.clone();
+                    record.pending_projection = Some(pending);
+                    commit_bootstrap_record(&mut reopened.record_store, &record).unwrap();
+                    reopened.record = record;
+                    reopened.record_store.fail_next_before_publish();
+                    assert_eq!(
+                        reopened.execute_pending_authority_projection(),
+                        Err(SharedAgentHostError::Unavailable)
+                    );
+                    assert!(reopened.record.pending_projection.is_some());
+                    interrupted_read_index = Some(reopened.ordered_index_for_test().unwrap());
+                }
+                drop(reopened);
+                drop(controller);
+            }
+            harness.stop();
             assert!(matches!(
                 system_handle.material(authority_actor),
                 Err(SharedAgentHostError::TransportNotAttached)
@@ -21594,7 +22562,7 @@ mod tests {
                 crate::agent::sdk::PublicPreflight::for_work(&invocation, LOGICAL_SLOT),
             );
             let pending = PendingAuthorityProjection {
-                query,
+                query: AuthorityReadRequest::Projection(query),
                 work: RuntimeWork::Invoke {
                     context: RuntimeExecutionContext::Direct,
                     state: RuntimeState::default(),

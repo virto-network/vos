@@ -4083,7 +4083,13 @@ where
             .lock()
             .map_err(|_| AgentRouteError::Unavailable)?
             .invoke_authority_projection(query)
-            .map_err(map_shared_host_error)
+            .map_err(|error| {
+                #[cfg(test)]
+                if std::env::var_os("VOS_TEST_INNER_DIAGNOSTICS").is_some() {
+                    eprintln!("system projection host error: {error:?}");
+                }
+                map_shared_host_error(error)
+            })
     }
 
     fn recover_authority_projection(&mut self) -> Result<bool, AgentRouteError> {

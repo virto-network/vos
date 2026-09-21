@@ -2169,6 +2169,74 @@ impl SharedAgentHost {
             .map_err(map_driver_error)
     }
 
+    /// Observe the initial ordinary Create from authenticated physical replay,
+    /// never from an archive's claimed reply or the runtime's private layout.
+    /// Later management mutations deliberately invalidate this initial evidence;
+    /// callers must recover an already pledged issuer ACK on that retry path.
+    pub(crate) fn observe_clean_genesis_application(
+        &self,
+        agent: AgentId,
+        request: &crate::agent_sdk::ManagementRequest,
+        receipt: &crate::agent_sdk::authority::AuthorityReceipt,
+    ) -> Result<
+        (
+            crate::agent_sdk::ManagementReply,
+            crate::agent_sdk::Hash,
+            u64,
+        ),
+        SharedAgentHostError,
+    > {
+        let hosted = self
+            .agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        let SharedGenesisAuthority::AuthorityFinalized(provision) = &hosted.intent.authority else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        let input = provision.proposal().create();
+        let super::journal::ReplayOperation::CleanManage {
+            request: applied_request,
+            authority,
+            observed_slot,
+        } = &input.operation
+        else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        if !matches!(request, crate::agent_sdk::ManagementRequest::Create(_))
+            || request != applied_request
+            || receipt != authority
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let evidence = hosted
+            .driver
+            .materialization()
+            .clean_management_evidence()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        if evidence.input != input.id()
+            || evidence.ordered != super::journal::OrderedBase::post_genesis()
+            || evidence.authority != receipt.commitment()
+            || evidence.request != request.replay_commitment()
+            || evidence.epoch != receipt.selector.epoch
+            || evidence.sequence != receipt.selector.decision_sequence
+            || evidence.observed_slot != *observed_slot
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let application = evidence
+            .result
+            .clone()
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        Ok((
+            application,
+            hosted
+                .driver
+                .clean_state_commitment()
+                .map_err(map_driver_error)?,
+            *observed_slot,
+        ))
+    }
+
     pub(crate) fn clean_state_commitment(
         &self,
         agent: AgentId,
@@ -5508,6 +5576,20 @@ mod tests {
             .unwrap();
         assert_eq!(status.replicas.len(), 1);
         assert_eq!(status.applied_slots, 0);
+        let ReplayOperation::CleanManage {
+            request: create_request,
+            authority: create_receipt,
+            ..
+        } = &fixture.shared.provision.proposal().create().operation
+        else {
+            panic!("clean Create")
+        };
+        host.observe_clean_genesis_application(
+            fixture.shared.agent,
+            create_request,
+            create_receipt,
+        )
+        .expect("custom-runtime genesis has host-owned application evidence");
         assert_eq!(
             status.engines,
             SharedAgentEnginePlan {
@@ -5806,6 +5888,17 @@ mod tests {
             .latest_clean_management_disposition()
             .unwrap()
             .unwrap();
+        assert!(
+            matches!(
+                host.observe_clean_genesis_application(
+                    fixture.shared.agent,
+                    create_request,
+                    create_receipt
+                ),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ),
+            "later management evidence cannot stand in for initial Create"
+        );
         assert_eq!(management_evidence.authority, install_receipt_commitment);
         assert_eq!(management_evidence.request, install.replay_commitment());
         assert_eq!(
@@ -6806,6 +6899,75 @@ mod tests {
             }],
         );
         assert_multi_replica_genesis_proposals(runtime, true);
+    }
+
+    #[test]
+    #[cfg(feature = "pvm")]
+    fn clean_shared_genesis_application_requires_exact_physical_replay() {
+        let runtime = super::super::package_admission::admitted_scripted_runtime_for_test(
+            "clean-genesis-observation",
+            0x76,
+            vec![super::super::package_admission::ScriptedRuntimeCase {
+                input: vec![0],
+                output: vec![0],
+                copies: Vec::new(),
+            }],
+        );
+        let fixture = standard_projection_fixture_with_runtime(0x25, runtime);
+        let directory = TempDirectory::new("clean_genesis_observation");
+        let clock = Arc::new(AtomicU64::new(20));
+        let mut host = open_native_clean_host_at_slot(&directory, &fixture, Arc::clone(&clock));
+        let ReplayOperation::CleanManage {
+            request,
+            authority,
+            observed_slot,
+        } = &fixture.provision.proposal().create().operation
+        else {
+            panic!("clean Create")
+        };
+        assert!(matches!(
+            host.observe_clean_genesis_application(fixture.agent, request, authority),
+            Err(SharedAgentHostError::AgentNotFound)
+        ));
+        host.provision(
+            fixture.provision.clone(),
+            fixture.catalog.clone(),
+            fixture.committee_authority,
+        )
+        .unwrap();
+        let original = host
+            .observe_clean_genesis_application(fixture.agent, request, authority)
+            .unwrap();
+        assert_eq!(original.2, *observed_slot);
+        assert_ne!(original.1, crate::agent_sdk::Hash::ZERO);
+        let mut substituted = authority.clone();
+        substituted.signature[0] ^= 1;
+        assert!(matches!(
+            host.observe_clean_genesis_application(fixture.agent, request, &substituted),
+            Err(SharedAgentHostError::ScopeMismatch)
+        ));
+        let crate::agent_sdk::ManagementRequest::Create(descriptor) = request else {
+            unreachable!()
+        };
+        let mut other = (**descriptor).clone();
+        other.identity.agent = crate::agent_sdk::AgentId([0xee; 32]);
+        assert!(matches!(
+            host.observe_clean_genesis_application(
+                fixture.agent,
+                &crate::agent_sdk::ManagementRequest::Create(Box::new(other)),
+                authority
+            ),
+            Err(SharedAgentHostError::ScopeMismatch)
+        ));
+        drop(host);
+        clock.store(200, Ordering::SeqCst);
+        let reopened = open_native_clean_host_at_slot(&directory, &fixture, clock);
+        assert_eq!(
+            reopened
+                .observe_clean_genesis_application(fixture.agent, request, authority)
+                .unwrap(),
+            original
+        );
     }
 
     #[test]

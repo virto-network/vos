@@ -2,7 +2,9 @@
 
 use super::genesis_issuance::RetainedCommitteeQuery;
 use super::*;
-use crate::agent::clean_management_intent::{CleanManagementIntentSlot, ManagementJournalAnchor};
+use crate::agent::clean_management_intent::{
+    CleanManagementIntent, CleanManagementIntentSlot, ManagementJournalAnchor,
+};
 
 /// Owns the complete discovered reservation set and its archive leases through
 /// recovery and serving. Construction validates ownership scope, not finality.
@@ -143,6 +145,7 @@ pub struct NativeSharedGenesisRecovery<I, J: CleanManagementIssuerStore, Q, R, W
     pub(super) issuer: DurableCleanManagementIssuer<J>,
     pub(super) issued: Option<AuthorityReceipt>,
     pub(super) admission_valid: bool,
+    pub(super) retired: bool,
 }
 
 impl<
@@ -303,18 +306,14 @@ impl<
             || descriptor.identity.space.0 != locator.space.0
             || descriptor.identity.agent.0 != locator.agent.0
             || intent
-                .finalization_work()
-                .map_err(|_| SharedAgentHostError::Unavailable)?
-                .is_some()
-            || intent
-                .retirement_complete()
-                .map_err(|_| SharedAgentHostError::Unavailable)?
-            || intent
                 .denial_complete()
                 .map_err(|_| SharedAgentHostError::Unavailable)?
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
+        let retired = intent
+            .retirement_complete()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
         let descriptor = (**descriptor).clone();
         let issuer = DurableCleanManagementIssuer::open(
             issuer_store,
@@ -332,7 +331,7 @@ impl<
                 &RawCredentialVerifier,
             )
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-        if issuer
+        let observed = issuer
             .recover_observed_application(
                 authority,
                 request.call().managed,
@@ -340,20 +339,62 @@ impl<
                 request.call(),
                 &RawCredentialVerifier,
             )
-            .map_err(|_| SharedAgentHostError::ScopeMismatch)?
-            .is_some()
-            || (issued.is_none()
-                && !issuer
-                    .can_resume_initial_creation(
-                        authority,
-                        request.call().managed,
-                        request.request(),
-                        request.call(),
-                        &RawCredentialVerifier,
-                    )
-                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if retired
+            && issuer
+                .recover_finalized_application(
+                    authority,
+                    request.call().managed,
+                    request.request(),
+                    request.call(),
+                    &RawCredentialVerifier,
+                )
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+                != observed
         {
             return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if observed.as_ref().is_some_and(|(receipt, _)| {
+            issued.as_ref() != Some(receipt)
+                || issuer.has_pending_decision()
+                || issuer.retained_decisions() != 0
+                || issuer.sequence_high_water() != issuer.acknowledged_through()
+        }) || (issued.is_none()
+            && !issuer
+                .can_resume_initial_creation(
+                    authority,
+                    request.call().managed,
+                    request.request(),
+                    request.call(),
+                    &RawCredentialVerifier,
+                )
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?)
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let finalization = intent
+            .finalization_work()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .cloned();
+        if let Some(work) = &finalization {
+            let (_, acknowledgement) = observed
+                .as_ref()
+                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            let RuntimeWork::Invoke { invocation, .. } = work else {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            };
+            let Some(RuntimeWork::Invoke { observed_slot, .. }) = intent
+                .authorization_work()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            else {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            };
+            if acknowledgement.applied_at < *observed_slot
+                || invocation.message
+                    != CleanManagementIntent::finalization_message(acknowledgement)
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
         }
         let runtime = intent
             .load_runtime()
@@ -464,6 +505,27 @@ impl<
             }
             _ => return Err(SharedAgentHostError::ScopeMismatch),
         }
+        if retired && (finalization.is_none() || observed.is_none()) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if let Some(work) = finalization {
+            // Publication must precede application finalization. An incomplete
+            // earlier phase cannot be hidden by a signed application ACK.
+            if pending.len() != 3 {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            let anchor = intent
+                .finalization_anchor()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            pending.push((anchor.clone(), work));
+        }
+        // A completed lifecycle no longer reserves old journal anchors. Its
+        // archive is still untrusted: recovery must obtain a fresh decision
+        // from the live pinned Authority before opening the generation.
+        if retired {
+            pending.clear();
+        }
         Ok(Self {
             locator,
             authority,
@@ -477,6 +539,7 @@ impl<
             issuer,
             issued,
             admission_valid: true,
+            retired,
         })
     }
 

@@ -2323,6 +2323,14 @@ pub(crate) struct SharedAgentRouteHandle {
 }
 
 impl SharedAgentRouteHandle {
+    pub(crate) fn agent(&self) -> vos_agent_sdk::AgentId {
+        vos_agent_sdk::AgentId(self.fingerprint.durable_route.agent().0)
+    }
+
+    pub(crate) fn same_generation(&self, other: &Self) -> bool {
+        self.coordinator.ptr_eq(&other.coordinator) && self.fingerprint == other.fingerprint
+    }
+
     fn with_generation<T>(
         &self,
         operation: impl FnOnce(
@@ -4260,6 +4268,16 @@ impl SharedAgentNetworkHost {
             fingerprint: attached.fingerprint.clone(),
             stale: Arc::clone(&attached.stale),
         })
+    }
+
+    pub(crate) fn supervisor_generation_handles(
+        &mut self,
+    ) -> Result<Vec<SharedAgentRouteHandle>, SharedAgentHostError> {
+        self.refresh()?;
+        self.generations
+            .keys()
+            .map(|agent| self.supervisor_route_handle(*agent))
+            .collect()
     }
 
     fn supervisor_projections_scoped(

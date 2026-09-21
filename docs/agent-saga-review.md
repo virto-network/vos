@@ -1,7 +1,8 @@
 # Agent saga: inventory checkpoint review guide
 
 [Current status](agent-saga-status.md) is authoritative for evidence and remaining
-work. Review `saga/agents`, with new delta `7bd66a7d..saga/agents`.
+work. This guide is frozen to `saga/agents` checkpoint `9cd2fa6a`,
+with delta `7bd66a7d..9cd2fa6a`; later implementation work is not included.
 This is a scoped Local checkpoint, not production or full-saga sign-off.
 
 Keep two consolidated review groups:
@@ -44,7 +45,9 @@ Keep two consolidated review groups:
 
 ## Evidence and limits
 
-See current status for exact frozen CLI/test-client hashes and log paths.
+For this checkpoint's frozen CLI/test-client hashes and log paths, use
+`git show 9cd2fa6a:docs/agent-saga-status.md`. The live status has been compacted
+and also contains later implementation-only evidence.
 Source hostile-page tests, the 527-query scripted journal rotation campaign,
 compiled endpoint/outer-runtime tests and fresh CLI lifecycle have distinct
 scopes. None alone establishes all-profile recovery or production capacity.

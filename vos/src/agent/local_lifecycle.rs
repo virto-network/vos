@@ -1183,6 +1183,14 @@ pub(crate) trait NativeLocalLifecycle: Send {
     fn local_agents(&self) -> Result<Option<Vec<AgentId>>, AgentRouteAdapterError> {
         Ok(None)
     }
+    fn shared_generations(
+        &self,
+    ) -> Result<
+        Option<Vec<crate::network::shared_agent::SharedAgentRouteHandle>>,
+        SharedAgentHostError,
+    > {
+        Ok(None)
+    }
     fn local_attachment_for_agent(
         &self,
         _agent: AgentId,
@@ -1308,6 +1316,19 @@ where
             self.local.clone(),
             agent,
         )
+    }
+
+    fn shared_generations(
+        &self,
+    ) -> Result<
+        Option<Vec<crate::network::shared_agent::SharedAgentRouteHandle>>,
+        SharedAgentHostError,
+    > {
+        self.system
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .ordinary_supervisor_generations()
+            .map(Some)
     }
     fn create(
         &mut self,
@@ -2178,6 +2199,13 @@ where
             .lock()
             .unwrap()
             .fail_finalization_once_for_test(phase);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn system_for_test(
+        &self,
+    ) -> std::sync::MutexGuard<'_, CleanSystemAgentBootstrapOwner<P, R, I>> {
+        self.system.lock().unwrap()
     }
 
     #[cfg(test)]
