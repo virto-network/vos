@@ -1121,44 +1121,10 @@ impl SharedAgentHost {
         }
         let deferred: Vec<_> = self.deferred_generations.keys().copied().collect();
         for agent in deferred {
-            if self.agents.contains_key(&agent) {
-                return Err(SharedAgentHostError::Conflict);
-            }
-            let mut files = *current_files
+            let files = *current_files
                 .get(&agent)
                 .ok_or(SharedAgentHostError::CorruptResidue)?;
-            let recovery = self.read_portable_restore(agent, files)?;
-            let (intent, encoded) = if let Some(recovery) = &recovery {
-                if files.intent || files.intent_stage {
-                    let pair = self.read_intent(agent, files)?;
-                    if pair.0 != recovery.bundle.intent {
-                        return Err(SharedAgentHostError::CorruptResidue);
-                    }
-                    pair
-                } else {
-                    (
-                        recovery.bundle.intent.clone(),
-                        recovery.bundle.intent.encode(),
-                    )
-                }
-            } else {
-                self.read_intent(agent, files)?
-            };
-            if !matches!(
-                intent.authority,
-                SharedGenesisAuthority::AuthorityFinalized(_)
-            ) {
-                return Err(SharedAgentHostError::InvalidProvision);
-            }
-            let sealed = self.verify_and_prepare_with_finality(&intent, finality.as_ref())?;
-            install_host_record(&self.intent_path(agent), &encoded)?;
-            files.intent = true;
-            let exposed = self.read_exposure(agent, intent.id(), files)?;
-            let hosted =
-                self.open_generation(intent, &sealed, exposed, files, recovery.as_ref())?;
-            if recovery.is_some() {
-                retire_host_record(&self.portable_restore_path(agent))?;
-            }
+            let hosted = self.open_deferred_generation(agent, files, finality.as_ref())?;
             reopened.insert(agent, hosted);
         }
         self.lease.validate_live().map_err(map_outer_lease_error)?;
@@ -1167,6 +1133,87 @@ impl SharedAgentHost {
         self.deferred_open = false;
         self.finality = finality;
         Ok(())
+    }
+
+    /// Recovery-only opening: the returned generation is not inserted into the
+    /// serving set. Dropping it releases its driver before another phase opens it.
+    fn open_deferred_generation(
+        &mut self,
+        agent: AgentId,
+        mut files: GenerationFiles,
+        finality: &dyn AgentGenesisFinalityVerifier,
+    ) -> Result<HostedSharedAgent, SharedAgentHostError> {
+        if !self.deferred_open
+            || !self.deferred_generations.contains_key(&agent)
+            || self.agents.contains_key(&agent)
+        {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let recovery = self.read_portable_restore(agent, files)?;
+        let (intent, encoded) = if let Some(recovery) = &recovery {
+            if files.intent || files.intent_stage {
+                let pair = self.read_intent(agent, files)?;
+                if pair.0 != recovery.bundle.intent {
+                    return Err(SharedAgentHostError::CorruptResidue);
+                }
+                pair
+            } else {
+                (
+                    recovery.bundle.intent.clone(),
+                    recovery.bundle.intent.encode(),
+                )
+            }
+        } else {
+            self.read_intent(agent, files)?
+        };
+        if !matches!(
+            intent.authority,
+            SharedGenesisAuthority::AuthorityFinalized(_)
+        ) {
+            return Err(SharedAgentHostError::InvalidProvision);
+        }
+        let sealed = self.verify_and_prepare_with_finality(&intent, finality)?;
+        install_host_record(&self.intent_path(agent), &encoded)?;
+        files.intent = true;
+        let exposed = self.read_exposure(agent, intent.id(), files)?;
+        let hosted = self.open_generation(intent, &sealed, exposed, files, recovery.as_ref())?;
+        if recovery.is_some() {
+            retire_host_record(&self.portable_restore_path(agent))?;
+        }
+        Ok(hosted)
+    }
+
+    /// Validate an unfinished Create while every ordinary generation remains
+    /// deferred. Its finality must already have been independently proved;
+    /// this method neither publishes routes nor relaxes management admission.
+    pub(crate) fn observe_deferred_clean_genesis_application(
+        &mut self,
+        agent: AgentId,
+        request: &crate::agent_sdk::ManagementRequest,
+        receipt: &crate::agent_sdk::authority::AuthorityReceipt,
+        finality: &dyn AgentGenesisFinalityVerifier,
+    ) -> Result<
+        (
+            crate::agent_sdk::ManagementReply,
+            crate::agent_sdk::Hash,
+            u64,
+        ),
+        SharedAgentHostError,
+    > {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        let current_files = scan_generation_namespaces(&self.lease)?;
+        if current_files.keys().any(|agent| {
+            !self.agents.contains_key(agent) && !self.deferred_generations.contains_key(agent)
+        }) {
+            return Err(SharedAgentHostError::CorruptResidue);
+        }
+        let files = *current_files
+            .get(&agent)
+            .ok_or(SharedAgentHostError::CorruptResidue)?;
+        let hosted = self.open_deferred_generation(agent, files, finality)?;
+        let observed = Self::observe_hosted_clean_genesis_application(&hosted, request, receipt)?;
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        Ok(observed)
     }
 
     pub fn scope(&self) -> AgentHostScope {
@@ -2190,6 +2237,21 @@ impl SharedAgentHost {
             .agents
             .get(&agent)
             .ok_or(SharedAgentHostError::AgentNotFound)?;
+        Self::observe_hosted_clean_genesis_application(hosted, request, receipt)
+    }
+
+    fn observe_hosted_clean_genesis_application(
+        hosted: &HostedSharedAgent,
+        request: &crate::agent_sdk::ManagementRequest,
+        receipt: &crate::agent_sdk::authority::AuthorityReceipt,
+    ) -> Result<
+        (
+            crate::agent_sdk::ManagementReply,
+            crate::agent_sdk::Hash,
+            u64,
+        ),
+        SharedAgentHostError,
+    > {
         let SharedGenesisAuthority::AuthorityFinalized(provision) = &hosted.intent.authority else {
             return Err(SharedAgentHostError::ScopeMismatch);
         };
@@ -7188,6 +7250,23 @@ mod tests {
         );
         assert!(host.agents.is_empty());
         assert_eq!(host.deferred_generations.len(), 1);
+        let files = scan_generation_namespaces(&host.lease).unwrap()[&fixture.agent];
+        assert!(matches!(
+            host.open_deferred_generation(fixture.agent, files, &RejectFinality),
+            Err(SharedAgentHostError::Finality(
+                AgentGenesisFinalityError::NotFinalized
+            ))
+        ));
+        let staged = host
+            .open_deferred_generation(fixture.agent, files, &AcceptFinality)
+            .unwrap();
+        assert!(host.has_deferred_open());
+        assert!(host.agents.is_empty());
+        assert_eq!(host.deferred_generations.len(), 1);
+        assert!(host.show(fixture.agent).unwrap().is_none());
+        assert!(host.route(fixture.agent).is_err());
+        assert!(AgentHostRootLease::acquire(directory.root(), directory.lock(), scope).is_err());
+        drop(staged);
         host.reopen_deferred_generations(Arc::new(AcceptFinality))
             .unwrap();
         assert!(host.deferred_generations.is_empty());

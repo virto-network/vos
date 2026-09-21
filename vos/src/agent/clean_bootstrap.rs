@@ -3877,23 +3877,21 @@ where
             }
         }
         let mut proofs = Vec::with_capacity(entries.len());
+        // Finish unfinished Creates before any fresh retired-generation read:
+        // their restored management reservations intentionally exclude new
+        // projection pairs. Replay their physical application without exposing
+        // an ordinary route, then discharge reservations through normal ACK /
+        // finalization. Sorting entries cannot resolve this dependency cycle.
         for (recovery, record) in entries.iter_mut() {
-            proofs.push(if recovery.retired {
-                self.verify_retired_shared_genesis(recovery, record)?
-            } else {
-                self.verify_published_shared_genesis(
-                    recovery,
-                    record.provision().replicas(),
-                    receipt_signer,
-                    record,
-                )?
-            });
-        }
-        self.complete_deferred_shared_genesis(proofs)?;
-        for (recovery, _) in entries.iter_mut() {
             if recovery.retired {
                 continue;
             }
+            let proof = self.verify_published_shared_genesis(
+                recovery,
+                record.provision().replicas(),
+                receipt_signer,
+                record,
+            )?;
             // Startup restores every retained phase. Successful proof replay
             // above checked both ancillary results and their positive ACKs;
             // drain those reservations without releasing the original Create.
@@ -3908,9 +3906,17 @@ where
                     || Ok(()),
                 )?;
             }
-            self.finish_shared_genesis_application(recovery, receipt_signer)?;
+            self.finish_shared_genesis_application(recovery, receipt_signer, Some(&proof))?;
+            proofs.push(proof);
         }
-        Ok(())
+        for (recovery, record) in entries.iter_mut() {
+            if recovery.retired {
+                proofs.push(self.verify_retired_shared_genesis(recovery, record)?);
+            }
+        }
+        // The complete set is still deferred if any phase above fails. Only
+        // the exact independently proved set can now become available to routes.
+        self.complete_deferred_shared_genesis(proofs)
     }
 
     /// Revalidate completed Create against current Authority state. Historical
@@ -3990,6 +3996,7 @@ where
         &mut self,
         recovery: &mut NativeSharedGenesisRecovery<B, J, Q, Reply, W, PubReply>,
         signer: &mut S,
+        deferred_finality: Option<&ReplayVerifiedAgentGenesisFinality>,
     ) -> Result<(), SharedAgentHostError>
     where
         B: super::clean_authority_issuer::CleanManagementRuntimeStore,
@@ -4008,15 +4015,22 @@ where
             .issued
             .as_ref()
             .ok_or(SharedAgentHostError::ScopeMismatch)?;
-        let (application, state, slot) = self
-            .host
-            .lock()
-            .map_err(|_| SharedAgentHostError::Unavailable)?
-            .observe_clean_genesis_application(
-                crate::service::AgentId(managed.agent.0),
-                intent.request(),
-                receipt,
-            )?;
+        let (application, state, slot) = {
+            let mut host = self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            let agent = crate::service::AgentId(managed.agent.0);
+            match deferred_finality {
+                Some(proof) => host.observe_deferred_clean_genesis_application(
+                    agent,
+                    intent.request(),
+                    receipt,
+                    proof,
+                )?,
+                None => host.observe_clean_genesis_application(agent, intent.request(), receipt)?,
+            }
+        };
         // From here a failed write may have advanced the durable phase. Only
         // reopening the leased stores can rebuild an authoritative admission
         // snapshot; the pre-completion pending list is no longer reusable.
@@ -19829,6 +19843,548 @@ mod tests {
             );
         }
 
+        type MixedSharedRecovery = super::super::NativeSharedGenesisRecovery<
+            IssuerMemoryStore,
+            IssuerMemoryStore,
+            IssuerMemoryStore,
+            IssuerMemoryStore,
+            IssuerMemoryStore,
+            IssuerMemoryStore,
+        >;
+
+        #[derive(Clone, Default)]
+        struct MixedSharedArchive(Arc<Mutex<Option<Vec<u8>>>>);
+
+        impl crate::agent::genesis_archive::AgentGenesisArchiveStore for MixedSharedArchive {
+            type Error = ();
+            fn load(
+                &self,
+                _: crate::agent::genesis::AgentGenesisLocator,
+            ) -> Result<Option<Vec<u8>>, ()> {
+                Ok(self.0.lock().unwrap().clone())
+            }
+            fn insert_if_absent(
+                &self,
+                _: crate::agent::genesis::AgentGenesisLocator,
+                bytes: &[u8],
+            ) -> Result<(), ()> {
+                let mut stored = self.0.lock().unwrap();
+                match stored.as_ref() {
+                    Some(previous) if previous != bytes => Err(()),
+                    _ => {
+                        *stored = Some(bytes.to_vec());
+                        Ok(())
+                    }
+                }
+            }
+        }
+
+        fn reopen_mixed_shared(recovery: MixedSharedRecovery) -> MixedSharedRecovery {
+            let target = recovery.authority;
+            let locator = recovery.locator();
+            let (intent, issuer, query, reply, publication, publication_reply) =
+                recovery.into_stores();
+            MixedSharedRecovery::open(
+                target,
+                locator,
+                intent,
+                issuer,
+                query,
+                reply,
+                publication,
+                publication_reply,
+            )
+            .unwrap()
+        }
+
+        // Prepare real signed publication/application evidence without the
+        // unrelated corruption matrix in the single-generation fixture.
+        fn publish_mixed_shared(
+            owner: &mut MemoryBootstrapOwner,
+            descriptor: AgentDescriptor,
+            runtime: &AdmittedRuntimePackage,
+            sequence: u64,
+        ) -> (
+            MixedSharedRecovery,
+            MixedSharedArchive,
+            IssuerMemoryStore,
+            IssuerMemoryStore,
+        ) {
+            use crate::agent::clean_management_intent::{
+                CleanManagementIntent, CleanManagementIntentSlot,
+            };
+            use crate::agent::genesis::AgentReplicaMember;
+            let original = &owner.pins.replicas.members()[0];
+            let mut replica = original.replica();
+            replica.principal = crate::service::PrincipalId(descriptor.identity.owner.0);
+            let member = AgentReplicaMember::new(
+                replica,
+                original.peer_id().to_vec(),
+                *original.ed25519_public_key(),
+                original.raft_slot(),
+            )
+            .unwrap();
+            let committee = AgentReplicaCommittee::new(
+                crate::service::SpaceId(descriptor.identity.space.0),
+                HostAgentId(descriptor.identity.agent.0),
+                super::super::super::AgentProfile::Shared,
+                vec![member],
+            )
+            .unwrap();
+            let key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
+            let request = ManagementRequest::Create(Box::new(descriptor.clone()));
+            let (mut call, _) = credential_call_and_approval(&descriptor, &request, &key);
+            call.request_sequence = NonZeroU64::new(sequence).unwrap();
+            call.authority = owner.authority_target();
+            call.invocation = call.expected_invocation();
+            call.signature = key.sign(&call.signing_bytes()).to_bytes();
+            let managed = call.managed;
+            let intent_store = IssuerMemoryStore::default();
+            let issuer_store = IssuerMemoryStore::default();
+            let mut intent = CleanManagementIntentSlot::open(intent_store.clone()).unwrap();
+            intent
+                .pledge(
+                    CleanManagementIntent::new(
+                        call.authority,
+                        managed,
+                        request,
+                        call,
+                        &RawCredentialVerifier,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let mut issuer = DurableCleanManagementIssuer::open(
+                issuer_store.clone(),
+                descriptor.authority,
+                descriptor.identity.space,
+                descriptor.identity.agent,
+            )
+            .unwrap();
+            let mut signer = CountingSigner::new();
+            let candidate = owner
+                .prepare_shared_from_management_intent(
+                    &mut intent,
+                    managed,
+                    runtime,
+                    &committee,
+                    &mut issuer,
+                    &mut signer,
+                )
+                .unwrap();
+            let mut recovery = MixedSharedRecovery::open(
+                owner.authority_target(),
+                candidate.proposal().locator(),
+                intent_store.clone(),
+                issuer_store.clone(),
+                IssuerMemoryStore::default(),
+                IssuerMemoryStore::default(),
+                IssuerMemoryStore::default(),
+                IssuerMemoryStore::default(),
+            )
+            .unwrap();
+            struct Signer(SigningKey);
+            impl super::super::genesis_issuance::GenesisClaimSigner for Signer {
+                type Error = ();
+                fn public_key(&self) -> [u8; 32] {
+                    self.0.verifying_key().to_bytes()
+                }
+                fn sign_genesis_claim(&mut self, message: &[u8; 32]) -> Result<[u8; 64], ()> {
+                    Ok(self.0.sign(message).to_bytes())
+                }
+            }
+            let (_, _, signature) = owner
+                .endorse_recovered_shared_genesis(
+                    &mut recovery,
+                    &committee,
+                    &mut signer,
+                    &mut IssuerMemoryStore::default(),
+                    &mut Signer(key),
+                )
+                .unwrap();
+            let archive_store = MixedSharedArchive::default();
+            let archive = crate::agent::genesis_archive::ArchivedAgentGenesisProvider::new(
+                candidate.claim().space(),
+                archive_store.clone(),
+            )
+            .unwrap();
+            let record = owner
+                .publish_recovered_shared_genesis(
+                    &mut recovery,
+                    &committee,
+                    &mut signer,
+                    vec![signature],
+                    &archive,
+                )
+                .unwrap();
+            owner
+                .provision_published_shared_genesis(&mut recovery, &mut signer, &record)
+                .unwrap();
+            (recovery, archive_store, issuer_store, intent_store)
+        }
+
+        fn serve_mixed_shared(
+            owner: &mut MemoryBootstrapOwner,
+            descriptor: &AgentDescriptor,
+            genesis_issuer: &IssuerMemoryStore,
+            clock: &AtomicU64,
+            sequence: u64,
+        ) {
+            use crate::actors::codec::Encode as _;
+            use crate::agent::clean_management_intent::{
+                CleanManagementIntent, CleanManagementIntentSlot,
+            };
+            use crate::agent::supervisor_adapters::physical_material_identity;
+            let package = crate::agent::package_admission::admitted_standard_query_actor_for_test(
+                "mixed-query",
+                StateLane::Linear,
+                0xb7,
+            );
+            let request = install_request(descriptor.identity.agent, &package, 0xb8, None);
+            let actor = super::super::install_request(&request).unwrap().entry.actor;
+            let key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
+            let (mut call, _) = credential_call_and_approval(descriptor, &request, &key);
+            call.request_sequence = NonZeroU64::new(sequence).unwrap();
+            call.authority = owner.authority_target();
+            call.invocation = call.expected_invocation();
+            call.signature = key.sign(&call.signing_bytes()).to_bytes();
+            let managed = call.managed;
+            let mut intent = CleanManagementIntentSlot::open(IssuerMemoryStore::default()).unwrap();
+            intent
+                .pledge(
+                    CleanManagementIntent::new(
+                        call.authority,
+                        managed,
+                        request.clone(),
+                        call,
+                        &RawCredentialVerifier,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            // Continue management from an immutable genesis issuer checkpoint;
+            // this fixture does not qualify the production Shared Install CLI.
+            let store = IssuerMemoryStore::default();
+            *store.image.lock().unwrap() = genesis_issuer.image.lock().unwrap().clone();
+            let mut issuer = DurableCleanManagementIssuer::open(
+                store,
+                descriptor.authority,
+                managed.space,
+                managed.agent,
+            )
+            .unwrap();
+            let mut signer = CountingSigner::new();
+            clock.fetch_add(1, Ordering::AcqRel);
+            let receipt = owner
+                .issue_management_intent_with_admission(
+                    &mut intent,
+                    managed,
+                    &mut issuer,
+                    &mut signer,
+                    true,
+                )
+                .unwrap();
+            clock.fetch_add(1, Ordering::AcqRel);
+            let crate::network::shared_agent::CleanManagementSubmission::Applied {
+                outcome: RuntimeOutcome::Management(Ok(application)),
+                observed_slot,
+                ..
+            } = owner
+                ._network_host
+                .manage_clean(
+                    HostAgentId(managed.agent.0),
+                    request,
+                    receipt.clone(),
+                    SdkManagementArtifacts::Actor(&package),
+                )
+                .unwrap()
+            else {
+                panic!("actor installation must apply after mixed recovery");
+            };
+            let state = owner
+                .host
+                .lock()
+                .unwrap()
+                .clean_state_commitment(HostAgentId(managed.agent.0))
+                .unwrap();
+            let ack = issuer
+                .observe_durable_application(
+                    &receipt,
+                    &application,
+                    state,
+                    observed_slot,
+                    &mut signer,
+                )
+                .unwrap();
+            owner
+                .finalize_management_intent_with_admission(
+                    &mut intent,
+                    managed,
+                    &ack,
+                    &mut issuer,
+                    true,
+                )
+                .unwrap();
+            owner
+                .finish_live_management_intent(&mut intent, managed, &ack, &issuer)
+                .unwrap();
+            let generation = owner
+                .ordinary_supervisor_generations()
+                .unwrap()
+                .into_iter()
+                .find(|generation| generation.agent() == managed.agent)
+                .unwrap();
+            let material = generation.material(actor).unwrap();
+            let identity = physical_material_identity(&material).unwrap();
+            let mut message = vec![crate::actors::value::TAG_DYNAMIC];
+            message.extend(crate::actors::value::Msg::new("read").encode());
+            let mut availability = vec![material.program, material.schema, material.policies];
+            availability.extend(material.installation_data);
+            availability.sort_unstable_by(|left, right| left.reference.cmp(&right.reference));
+            let work = InvocationWork {
+                space: managed.space,
+                agent: managed.agent,
+                runtime_deployment: descriptor.identity.runtime_deployment,
+                invocation: InvocationId([sequence as u8; 32]),
+                actor,
+                incarnation: material.actor.incarnation,
+                deployment: material.actor.entry.deployment,
+                program: material.actor.entry.program,
+                mode: MethodMode::Query,
+                origin: InvocationOrigin::anonymous(),
+                roles: InvocationRoleClaims::none(),
+                message,
+                installation_data: material.actor.entry.installation_data,
+                availability,
+                gas: 1_000_000,
+                recovery_only: false,
+            };
+            let authorization = InvocationAuthorization::PublicPreflight(
+                crate::agent_sdk::PublicPreflight::for_work(&work, material.observed_slot),
+            );
+            let outcome = generation
+                .execute(
+                    identity,
+                    crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Invoke {
+                        context: RuntimeExecutionContext::Direct,
+                        work: work.clone(),
+                        authorization: authorization.clone(),
+                    },
+                )
+                .unwrap();
+            assert!(
+                matches!(outcome, RuntimeOutcome::Completed(Ok(reply)) if reply.status == InvocationStatus::Done && reply.reply == [0x63])
+            );
+            let outcome = generation.execute(identity, crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Acknowledge { work, authorization }).unwrap();
+            assert!(matches!(outcome, RuntimeOutcome::Acknowledged(Ok(_))));
+        }
+
+        #[test]
+        fn native_shared_mixed_retired_unfinished_restart_both_agent_orders() {
+            use crate::agent::genesis::AgentGenesisFinalityError;
+            struct NoArchiveFinality;
+            impl AgentGenesisFinalityVerifier for NoArchiveFinality {
+                fn verify_finalized(
+                    &self,
+                    _: &crate::agent::genesis::AgentGenesisProvision,
+                ) -> Result<(), AgentGenesisFinalityError> {
+                    Err(AgentGenesisFinalityError::NotFinalized)
+                }
+            }
+            for retired_first in [true, false] {
+                eprintln!("mixed Shared: retired-first={retired_first}, bootstrap");
+                let mut fixture = native_bundled_authority_fixture();
+                fixture.finality = Arc::new(NoArchiveFinality);
+                let mut harness = NativeProjectionOwnerHarness::with_real_bootstrap(
+                    "mixed-shared-restart",
+                    fixture,
+                );
+                let owner = harness.owner.as_mut().unwrap();
+                let runtime = test_runtime_package(
+                    std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some(),
+                );
+                let mut descriptors: Vec<_> = [0xd1, 0xd2]
+                    .into_iter()
+                    .map(|nonce| {
+                        let mut descriptor = owner.pins.descriptor.clone();
+                        descriptor.creation_nonce = Hash([nonce; 32]);
+                        descriptor.identity.agent = AgentId::derive(
+                            descriptor.identity.space,
+                            descriptor.identity.owner,
+                            descriptor.creation_nonce.as_bytes(),
+                        );
+                        descriptor.identity.runtime_deployment = runtime.deployment();
+                        descriptor.identity.runtime_program = runtime.program();
+                        descriptor.identity.runtime_producer = runtime.producer();
+                        descriptor.runtime_package = runtime.package_ref().clone();
+                        descriptor.runtime_contract = runtime.manifest().contract;
+                        descriptor.capabilities = runtime.capabilities();
+                        descriptor.replicas[0].principal = descriptor.identity.owner;
+                        descriptor.validate().unwrap();
+                        descriptor
+                    })
+                    .collect();
+                descriptors.sort_by_key(|descriptor| descriptor.identity.agent);
+                if !retired_first {
+                    descriptors.reverse();
+                }
+                let (mut retired, retired_archive, retired_issuer, _) =
+                    publish_mixed_shared(owner, descriptors[0].clone(), &runtime, 2);
+                for (anchor, work) in retired.pending.iter().skip(1).take(2) {
+                    owner
+                        ._network_host
+                        .finish_pending_management_result(
+                            HostAgentId(owner.pins.agent.0),
+                            anchor,
+                            work,
+                            false,
+                            || Ok(()),
+                        )
+                        .unwrap();
+                }
+                owner
+                    .finish_shared_genesis_application(
+                        &mut retired,
+                        &mut CountingSigner::new(),
+                        None,
+                    )
+                    .unwrap();
+                let retired = reopen_mixed_shared(retired);
+                assert!(retired.retired);
+                assert!(!owner.management_admission_held().unwrap());
+                harness
+                    .fixture
+                    .logical_slot
+                    .as_ref()
+                    .unwrap()
+                    .fetch_add(1, Ordering::AcqRel);
+                let (unfinished, unfinished_archive, unfinished_issuer, unfinished_intent) =
+                    publish_mixed_shared(owner, descriptors[1].clone(), &runtime, 3);
+                let unfinished = reopen_mixed_shared(unfinished);
+                eprintln!(
+                    "mixed Shared: retired-first={retired_first}, restart with unfinished Create"
+                );
+                assert!(!unfinished.retired);
+                assert_eq!(unfinished.pending.len(), 3);
+                let target = owner.authority_target();
+                let retired_locator = retired.locator();
+                let unfinished_locator = unfinished.locator();
+                assert_eq!(
+                    retired_locator.agent < unfinished_locator.agent,
+                    retired_first
+                );
+                let mut controller = super::super::NativeSharedGenesisController::new(
+                    target,
+                    vec![
+                        (retired, Some(retired_archive)),
+                        (unfinished, Some(unfinished_archive)),
+                    ],
+                )
+                .unwrap();
+                // Crash with A retired and B physically provisioned but not
+                // application-ACKed, finalized or retired. Rebuild admission
+                // from the same stores, never from an in-memory pending list.
+                let owner = harness.owner.take().unwrap();
+                let pins = owner._pins_store.clone();
+                let record = owner.record_store.clone();
+                let issuer = owner.issuer.into_store();
+                drop(owner._network_host);
+                drop(owner.host);
+                let mut operations = OperationTestJournal(harness._directory.0.clone());
+                let admission =
+                    NativeAuthorityOperationStartupAdmission::load(&mut operations, target, &[])
+                        .unwrap();
+                let admission = controller.startup_admission(admission).unwrap();
+                let mut owner = std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| {
+                            CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
+                                pins,
+                                record,
+                                issuer,
+                                &mut CountingSigner::new(),
+                                || panic!("must not bootstrap over mixed history"),
+                                harness._directory.host(),
+                                harness._directory.lock(),
+                                harness.fixture.plan.pins.space,
+                                harness.fixture.plan.pins.node,
+                                harness.fixture.trust.clone(),
+                                harness.fixture.merge.clone(),
+                                harness.fixture.finality.clone(),
+                                harness.provider.clone(),
+                                harness.network.clone(),
+                                None,
+                                Some(&admission),
+                            ).unwrap()
+                        })
+                        .join()
+                        .unwrap()
+                });
+                drop(admission);
+                assert_eq!(owner.host.lock().unwrap().len(), 1);
+                assert!(owner.management_admission_held().unwrap());
+                assert!(matches!(
+                    owner.ordinary_supervisor_generations(),
+                    Err(SharedAgentHostError::Conflict)
+                ));
+                // The fresh read must remain blocked until B completes. This
+                // proves the fix does not weaken the projection reservation guard.
+                let blocked_read = AuthorityReadRequest::GenesisDecision {
+                    authority: target,
+                    agent: descriptors[0].identity.agent,
+                    nonce: Hash([0xd3; 32]),
+                };
+                assert_eq!(
+                    owner.invoke_authority_read(blocked_read),
+                    Err(SharedAgentHostError::Conflict)
+                );
+                let before = owner.ordered_index_for_test().unwrap();
+                controller
+                    .recover(&mut owner, &mut CountingSigner::new())
+                    .unwrap();
+                assert!(controller.is_recovered());
+                assert!(!owner.management_admission_held().unwrap());
+                assert!(!owner.host.lock().unwrap().has_deferred_open());
+                assert_eq!(owner.host.lock().unwrap().len(), 3);
+                // B's finalize + two ACKs, then A's mandatory fresh Query/ACK.
+                assert_eq!(owner.ordered_index_for_test().unwrap(), before + 5);
+                assert!(
+                    crate::agent::clean_management_intent::CleanManagementIntentSlot::open(
+                        unfinished_intent
+                    )
+                    .unwrap()
+                    .retirement_complete()
+                    .unwrap()
+                );
+                eprintln!(
+                    "mixed Shared: retired-first={retired_first}, recovery complete; invoke both actors"
+                );
+                let generations = owner.ordinary_supervisor_generations().unwrap();
+                assert_eq!(generations.len(), 2);
+                for descriptor in &descriptors {
+                    let generation = generations
+                        .iter()
+                        .find(|generation| generation.agent() == descriptor.identity.agent)
+                        .unwrap();
+                    assert_eq!(generation.projection().unwrap().descriptor, *descriptor);
+                }
+                for (index, issuer) in [retired_issuer, unfinished_issuer].iter().enumerate() {
+                    serve_mixed_shared(
+                        &mut owner,
+                        &descriptors[index],
+                        issuer,
+                        harness.fixture.logical_slot.as_ref().unwrap(),
+                        4 + index as u64,
+                    );
+                }
+                harness.owner = Some(owner);
+                harness.stop();
+                eprintln!(
+                    "mixed Shared: retired-first={retired_first}, both actor Invoke/ACK pairs passed"
+                );
+            }
+        }
+
         #[test]
         #[ignore = "requires an explicit Authority candidate package for full publication/recovery qualification"]
         fn native_shared_committee_query_preparation_uses_candidate_package() {
@@ -21343,7 +21899,7 @@ mod tests {
             // are durable, but before the Authority finalization is invoked.
             owner.fail_finalization_once_for_test(0);
             assert_eq!(
-                owner.finish_shared_genesis_application(&mut recovery, &mut signer),
+                owner.finish_shared_genesis_application(&mut recovery, &mut signer, None),
                 Err(SharedAgentHostError::Unavailable)
             );
             assert_eq!(owner.ordered_index_for_test().unwrap(), after_ack);
