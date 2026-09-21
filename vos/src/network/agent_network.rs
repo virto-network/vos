@@ -1838,6 +1838,13 @@ mod tests {
     #[test]
     fn transport_failures_are_stable_and_protocol_specific() {
         assert_eq!(
+            outbound_failure(&request_response::OutboundFailure::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "remote inbound stream expired",
+            ))),
+            AgentNetworkError::Transport
+        );
+        assert_eq!(
             outbound_failure(&request_response::OutboundFailure::Timeout),
             AgentNetworkError::Timeout
         );
@@ -2264,9 +2271,12 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(calls.lock().unwrap().len(), 2);
 
-        // Handler refusal is a bounded timeout, not a fallback to the legacy
-        // protocol or a fabricated response.
+        // Handler refusal fails within the request deadline, without a legacy
+        // fallback or fabricated response. Both peers use the same timeout:
+        // inbound stream expiry can reach the requester as an I/O failure
+        // before its own outbound timeout fires.
         let timeout_route = test_route(63);
+        let refusal_calls = Arc::new(Mutex::new(Vec::new()));
         let mut timeout_members = vec![node_a, node_receiver];
         timeout_members.sort_unstable();
         receiver
@@ -2274,11 +2284,10 @@ mod tests {
                 timeout_route,
                 timeout_members.clone(),
                 Arc::new(StaticHandler {
-                    calls: Arc::new(Mutex::new(Vec::new())),
+                    calls: refusal_calls.clone(),
                     response: None,
-                    // Retain the inbound response channel beyond the
-                    // requester's deadline so libp2p reports its bounded
-                    // timeout rather than immediate response omission.
+                    // Retain the response channel until the protocol deadline
+                    // rather than immediately omitting a response.
                     delay: Some(AGENT_REQUEST_TIMEOUT + Duration::from_secs(1)),
                 }),
             )
@@ -2294,13 +2303,14 @@ mod tests {
                 }),
             )
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             sender_a
                 .send_agent_merge_fetch_heads(node_receiver, timeout_route)
                 .recv_timeout(Duration::from_secs(4))
                 .unwrap(),
-            Err(AgentNetworkError::Timeout)
-        );
+            Err(AgentNetworkError::Timeout | AgentNetworkError::Transport)
+        ));
+        assert_eq!(*refusal_calls.lock().unwrap(), vec![node_a]);
 
         // Oversize and unknown destinations fail locally without touching the
         // swarm.  A bound but unreachable exact PeerId reports disconnect.
