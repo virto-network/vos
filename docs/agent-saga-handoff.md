@@ -7,7 +7,7 @@ remaining-work list; this file deliberately does not duplicate it.
 - Review worktree: repository root, branch `saga/agents`.
 - Review-only workflow: reviewer returns findings; implementation agent applies
   fixes on the latest work and advances the review branch at qualified checkpoints.
-- Current recovery design, test command and logs:
+- Historical recovery contract and checkpoint-specific evidence:
   [recovery contract](agent-recovery-contract.md).
 - Current review boundary: [review guide](agent-saga-review.md).
 
