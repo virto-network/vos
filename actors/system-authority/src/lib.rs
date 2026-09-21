@@ -1445,8 +1445,8 @@ impl SystemAuthority {
     }
 
     /// Read a permanent decision through an authenticated runtime invocation.
-    #[msg(linear)]
-    fn genesis_decision(&mut self, agent: Vec<u8>, ctx: &mut Context<Self>) -> Vec<u8> {
+    #[msg(query)]
+    fn genesis_decision(&self, agent: Vec<u8>, ctx: &mut Context<Self>) -> Vec<u8> {
         let Some(context) = ctx.agent_invocation_context().copied() else {
             return Vec::new();
         };
@@ -16682,8 +16682,38 @@ mod tests {
             expected
         );
         assert_eq!(restarted.state, actor.state);
+        assert!(
+            genesis_publication::read(&config, &restarted.state, &agent.0, &context).is_empty()
+        );
+        for (actor, invocation) in [
+            (ActorId::ZERO, context.invocation),
+            (context.actor, InvocationId::ZERO),
+        ] {
+            assert!(
+                genesis_publication::read(
+                    &config,
+                    &restarted.state,
+                    &agent.0,
+                    &InvocationContext {
+                        mode: vos::agent_sdk::MethodMode::Query,
+                        actor,
+                        invocation,
+                        ..context
+                    }
+                )
+                .is_empty()
+            );
+        }
         assert_eq!(
-            genesis_publication::read(&config, &restarted.state, &agent.0, &context,),
+            genesis_publication::read(
+                &config,
+                &restarted.state,
+                &agent.0,
+                &InvocationContext {
+                    mode: vos::agent_sdk::MethodMode::Query,
+                    ..context
+                }
+            ),
             expected
         );
         assert_eq!(dispatch(&mut restarted, &call), approval_bytes);
@@ -16767,7 +16797,15 @@ mod tests {
         .expect("publication must remain readable after acknowledged-state restart");
         assert_eq!(after_ack_restart.state, finalized);
         assert_eq!(
-            genesis_publication::read(&config, &after_ack_restart.state, &agent.0, &context,),
+            genesis_publication::read(
+                &config,
+                &after_ack_restart.state,
+                &agent.0,
+                &InvocationContext {
+                    mode: vos::agent_sdk::MethodMode::Query,
+                    ..context
+                }
+            ),
             expected
         );
         let fresh = InvocationId([0xfc; 32]);
@@ -18390,7 +18428,7 @@ mod tests {
         assert_eq!(method[2].mode, vos::agent_sdk::schema::MethodMode::Linear);
         assert!(method[2].explicit);
         assert_eq!(method[3].name, "genesis_decision");
-        assert_eq!(method[3].mode, vos::agent_sdk::schema::MethodMode::Linear);
+        assert_eq!(method[3].mode, vos::agent_sdk::schema::MethodMode::Query);
         assert!(method[3].explicit);
         assert_eq!(method[4].name, "authorize_operation");
         assert_eq!(method[4].mode, vos::agent_sdk::schema::MethodMode::Linear);

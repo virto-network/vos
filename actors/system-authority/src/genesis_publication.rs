@@ -307,7 +307,11 @@ pub(super) fn read(
     agent: &[u8],
     context: &InvocationContext,
 ) -> Vec<u8> {
-    if !authority_state_is_valid(config, state) || !context_matches(config, context) {
+    if !authority_state_is_valid(config, state)
+        || context.actor.0 != config.binding.issuer.actor
+        || context.mode != vos::agent_sdk::MethodMode::Query
+        || context.invocation == InvocationId::ZERO
+    {
         return Vec::new();
     }
     let Ok(agent) = <[u8; 32]>::try_from(agent) else {
