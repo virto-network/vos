@@ -122,6 +122,28 @@ fn run_shutdown_smoke(space_name: &str, external: bool) {
     )
     .expect("write isolated ingress config");
 
+    #[cfg(feature = "experimental-state-blocks")]
+    if external && include_bytes!(env!("VOSX_CANDIDATE_SYSTEM_AUTHORITY_PACKAGE")).is_empty() {
+        let refused = Command::new(vosx_bin())
+            .args(["space", "up", space_name])
+            .env("XDG_DATA_HOME", data_home.path())
+            .env("XDG_CONFIG_HOME", config_home.path())
+            .env("XDG_CACHE_HOME", cache_home.path())
+            .env("VOSX_DISABLE_MDNS", "1")
+            .output()
+            .expect("attempt startup without checked candidates");
+        assert!(!refused.status.success());
+        assert!(
+            String::from_utf8_lossy(&refused.stderr)
+                .contains("both checked experimental artifacts"),
+            "unexpected refusal: {}",
+            String::from_utf8_lossy(&refused.stderr),
+        );
+        assert!(!space_root.join("local-agent-external").exists());
+        assert!(!space_root.join("local-agent-external-lifecycle").exists());
+        return;
+    }
+
     for boot in 0..if external { 2 } else { 1 } {
         let log_path = data_home.path().join(format!("daemon-{boot}.stderr"));
         let log_file = fs::File::create(&log_path).expect("create daemon log");

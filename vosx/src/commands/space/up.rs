@@ -67,6 +67,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         local.local_agent_storage == local_config::LocalAgentStorage::Image,
         "external-state Local startup is not yet available in this binary; image roots were not opened",
     );
+    // Reject an experimental mode without its exact candidate closure before
+    // networking, daemon identity, or either Local root is opened.
+    crate::bundled::system_authority_package_template_for_storage(local.local_agent_storage)?;
     let daemon_keypair = load_daemon_keypair(&data_dir)?;
     let network = build_network_for_daemon(
         entry,
@@ -81,6 +84,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         VosNode::with_prefix(local_prefix).with_program_blobs_dir(blob_store::cache_dir());
     configure_ingress_attester(&mut node, &daemon_keypair)?;
     let operator_keypair = configure_operator(&mut node)?;
+    crate::bundled::prepare_system_packages_for_storage(
+        &operator_keypair,
+        local.local_agent_storage,
+    )?;
 
     let registry_config = AgentConfig::new(registry_pvm.clone())
         .with_name(vos::node::REGISTRY_AGENT_NAME)

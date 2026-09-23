@@ -323,21 +323,27 @@ external journal/lifecycle root. The default released binary returns a clear
 unsupported-mode error for `external-state` before opening the image path.
 The opt-in experimental build selects and recovers the external roots, but
 does not change the default image deployment or establish release readiness.
-The opt-in artifact builder can now compile the current Authority source with
+The opt-in artifact builder compiles the current Authority source with
 `experimental-state-blocks` into a separate public-signer template via
-`just build-agent-state-system-templates`. Two independent candidate outputs
-were byte-identical. This is reproducibility evidence only: the candidate is
-not embedded, selected by startup, or a release pin. The next artifact step is
-a compatible bounded state-runtime candidate and an explicit fresh-root bundle
-selection tested through actual `vosx` startup, while image deployments keep
-their existing bundle.
+`just build-agent-state-system-templates`; two independent outputs were
+byte-identical. An experimental `vosx` build can now embed that exact template
+and the state-runtime PVM only when both explicit
+`VOSX_EXPERIMENTAL_AUTHORITY_TEMPLATE` and
+`VOSX_EXPERIMENTAL_STATE_RUNTIME_PVM` paths are supplied. The build verifies
+their checked BLAKE2b-256 digests (`a03143b7…06fe52d` and
+`e0a615ec…383d9a08`); the committed release blobs remain unchanged. The
+immutable `local.toml` storage choice selects the candidate Authority only for
+fresh external roots. An image Space retains its released Authority identity
+even in that binary; an external Space without both candidates refuses before
+opening its Local roots. These candidates are not final release pins.
 `just build-agent-state-runtime-pvm` now compiles that candidate and physically
 probes an external-state Create through the PVM before writing a separate PVM;
 two conversions of the same guest ELF were byte-identical. The probe checks
-the XSW2 response and bounded state changes, but does not authorize a package,
-publish a journal head, or make the candidate a startup-selected release
-artifact. A source/revision-pinned candidate bundle and real daemon recovery
-remain required.
+the XSW2 response and bounded state changes, but does not authorize a package
+or publish a journal head. The PVM is now embedded alongside the candidate
+Authority for explicit external startup, but no public Local Create package
+or CLI uses it yet. A source/revision-pinned release bundle and real Agent
+daemon recovery remain required.
 Image-format Local Create/Install CLI commands now reject an external-state
 Space before reserving a credential or retaining a request; the opt-in daemon
 cannot accidentally strand an LCQ1 request while typed LCQ2 ingress is absent.
@@ -349,6 +355,11 @@ readiness took 13.18 and 8.24 seconds respectively; paired image runs took
 on this developer host. These observations expose slow system startup; the
 smoke has no external Agent, response-loss retry, crash recovery or throughput
 qualification.
+With both checked candidate artifacts embedded, the same binary-subprocess
+subprocess smoke passed fresh external startup and restart (endpoint ready in
+12.57 and 7.73 seconds); without them, startup refused before opening external
+roots. This verifies artifact selection and empty-root recovery, not the
+file-backed Agent lifecycle or final release artifact set.
 The current released-binary path is `vosx` clean startup -> image-based
 `LocalAgentHost` -> image-backed `LocalLifecycleController` -> Local route backend. The
 older `host::LocalGenesisIntent` file opener accepts r19 only. Next, qualify

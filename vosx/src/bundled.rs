@@ -33,14 +33,29 @@ const BUNDLED_SYSTEM_AUTHORITY_PACKAGE: &[u8] =
     include_bytes!(env!("VOSX_BUNDLED_SYSTEM_AUTHORITY_PACKAGE"));
 const BUNDLED_SYSTEM_CATALOG_PACKAGE: &[u8] =
     include_bytes!(env!("VOSX_BUNDLED_SYSTEM_CATALOG_PACKAGE"));
+#[cfg(feature = "experimental-state-blocks")]
+const CANDIDATE_SYSTEM_AUTHORITY_PACKAGE: &[u8] =
+    include_bytes!(env!("VOSX_CANDIDATE_SYSTEM_AUTHORITY_PACKAGE"));
+#[cfg(feature = "experimental-state-blocks")]
+const CANDIDATE_STATE_RUNTIME_PVM: &[u8] = include_bytes!(env!("VOSX_CANDIDATE_STATE_RUNTIME_PVM"));
 const BUNDLED_AGENT_RUNTIME_PACKAGE_NAME: &str = "standard-agent-runtime";
 
 /// Prepare the complete, root-signed package closure used by native bootstrap.
 /// Caching is availability only: installation still requires Authority approval.
 pub(crate) fn prepare_system_packages(root: &Keypair) -> anyhow::Result<()> {
+    prepare_system_packages_for_storage(
+        root,
+        crate::commands::space::local_config::LocalAgentStorage::Image,
+    )
+}
+
+pub(crate) fn prepare_system_packages_for_storage(
+    root: &Keypair,
+    storage: crate::commands::space::local_config::LocalAgentStorage,
+) -> anyhow::Result<()> {
     let runtime = root_signed_agent_runtime_package(root)?;
     let authority = root_signed_actor_package(
-        system_authority_package_template(),
+        system_authority_package_template_for_storage(storage)?,
         "system-authority",
         root,
     )?;
@@ -95,6 +110,52 @@ pub fn agent_runtime_pvm() -> &'static [u8] {
 
 pub(crate) fn system_authority_package_template() -> &'static [u8] {
     BUNDLED_SYSTEM_AUTHORITY_PACKAGE
+}
+
+/// Select the Authority identity only from the immutable node-local storage
+/// choice. An image deployment retains its released package identity even in
+/// an experimental binary. A missing candidate fails before startup opens a
+/// new external lifecycle root.
+pub(crate) fn system_authority_package_template_for_storage(
+    storage: crate::commands::space::local_config::LocalAgentStorage,
+) -> anyhow::Result<&'static [u8]> {
+    use crate::commands::space::local_config::LocalAgentStorage;
+    match storage {
+        LocalAgentStorage::Image => Ok(system_authority_package_template()),
+        LocalAgentStorage::ExternalState => {
+            #[cfg(feature = "experimental-state-blocks")]
+            {
+                anyhow::ensure!(
+                    !CANDIDATE_SYSTEM_AUTHORITY_PACKAGE.is_empty()
+                        && !CANDIDATE_STATE_RUNTIME_PVM.is_empty(),
+                    "external-state Local storage requires a binary built with both checked experimental artifacts",
+                );
+                Ok(CANDIDATE_SYSTEM_AUTHORITY_PACKAGE)
+            }
+            #[cfg(not(feature = "experimental-state-blocks"))]
+            {
+                anyhow::bail!(
+                    "external-state Local storage requires an experimental-state-blocks build"
+                )
+            }
+        }
+    }
+}
+
+pub(crate) fn system_authority_package_template_for_data_dir(
+    data_dir: &std::path::Path,
+) -> anyhow::Result<&'static [u8]> {
+    let storage = crate::commands::space::local_config::load(data_dir)?.local_agent_storage;
+    system_authority_package_template_for_storage(storage)
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+pub(crate) fn candidate_state_runtime_pvm() -> anyhow::Result<&'static [u8]> {
+    anyhow::ensure!(
+        !CANDIDATE_STATE_RUNTIME_PVM.is_empty(),
+        "checked experimental state runtime is not bundled",
+    );
+    Ok(CANDIDATE_STATE_RUNTIME_PVM)
 }
 
 pub(crate) fn system_catalog_package_template() -> &'static [u8] {
@@ -246,6 +307,37 @@ mod tests {
                     .unwrap()
                     .exact_bytes()
             );
+        }
+    }
+
+    #[test]
+    fn image_authority_identity_does_not_follow_experimental_bundle() {
+        use crate::commands::space::local_config::LocalAgentStorage;
+        assert_eq!(
+            system_authority_package_template_for_storage(LocalAgentStorage::Image).unwrap(),
+            system_authority_package_template(),
+        );
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn external_authority_requires_both_checked_candidates() {
+        use crate::commands::space::local_config::LocalAgentStorage;
+        let selected =
+            system_authority_package_template_for_storage(LocalAgentStorage::ExternalState);
+        if CANDIDATE_SYSTEM_AUTHORITY_PACKAGE.is_empty() {
+            assert!(selected.is_err());
+            assert!(candidate_state_runtime_pvm().is_err());
+        } else {
+            let selected = selected.unwrap();
+            assert_ne!(selected, system_authority_package_template());
+            let root = space_root();
+            let runtime = root_signed_agent_runtime_package(&root).unwrap();
+            let authority = root_signed_actor_package(selected, "system-authority", &root).unwrap();
+            authority
+                .require_runtime(vos::agent::sdk::AgentProfile::Shared, &runtime)
+                .unwrap();
+            assert!(!candidate_state_runtime_pvm().unwrap().is_empty());
         }
     }
 

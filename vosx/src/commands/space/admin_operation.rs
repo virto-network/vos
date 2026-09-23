@@ -48,7 +48,7 @@ pub(crate) fn run(args: SetActorRoleArgs) -> anyhow::Result<()> {
     let identity = super::clean_identity::CleanOperatorIdentitySigner::new(&operator)?;
     let runtime = crate::bundled::root_signed_agent_runtime_package(&operator)?;
     let package = crate::bundled::root_signed_actor_package(
-        crate::bundled::system_authority_package_template(),
+        crate::bundled::system_authority_package_template_for_data_dir(&data)?,
         "system-authority",
         &operator,
     )?;

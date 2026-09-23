@@ -58,6 +58,81 @@ fn main() {
         &SYSTEM_CATALOG_PACKAGE_BLAKE2B_256,
         "system-catalog package template",
     );
+    println!("cargo:rerun-if-env-changed=VOSX_EXPERIMENTAL_AUTHORITY_TEMPLATE");
+    println!("cargo:rerun-if-env-changed=VOSX_EXPERIMENTAL_STATE_RUNTIME_PVM");
+    let authority = env::var_os("VOSX_EXPERIMENTAL_AUTHORITY_TEMPLATE");
+    let runtime = env::var_os("VOSX_EXPERIMENTAL_STATE_RUNTIME_PVM");
+    assert_eq!(
+        authority.is_some(),
+        runtime.is_some(),
+        "experimental Authority template and state runtime PVM must be supplied together",
+    );
+    if authority.is_some() {
+        assert!(
+            env::var_os("CARGO_FEATURE_EXPERIMENTAL_STATE_BLOCKS").is_some(),
+            "experimental artifacts require the experimental-state-blocks feature",
+        );
+    }
+    bundle_candidate_artifact(
+        &out_dir,
+        authority.as_deref(),
+        "candidate_system_authority.vos",
+        "VOSX_CANDIDATE_SYSTEM_AUTHORITY_PACKAGE",
+        CANDIDATE_SYSTEM_AUTHORITY_BLAKE2B_256,
+    );
+    bundle_candidate_artifact(
+        &out_dir,
+        runtime.as_deref(),
+        "candidate_state_runtime.pvm",
+        "VOSX_CANDIDATE_STATE_RUNTIME_PVM",
+        CANDIDATE_STATE_RUNTIME_BLAKE2B_256,
+    );
+}
+
+// Source-built opt-in candidates. These are not replacements for the frozen
+// release blobs above; an experimental binary must name both exact files.
+const CANDIDATE_SYSTEM_AUTHORITY_BLAKE2B_256: &str =
+    "a03143b78162708951d0d10126616caf67c6f2768e82e019d2249199606fe52d";
+const CANDIDATE_STATE_RUNTIME_BLAKE2B_256: &str =
+    "e0a615ec2fb730987bcd53facb29ae8af001d90fca8e2df939d28f0f383d9a08";
+
+fn bundle_candidate_artifact(
+    out_dir: &Path,
+    source: Option<&std::ffi::OsStr>,
+    bundled_file: &str,
+    env_var: &str,
+    expected_digest: &str,
+) {
+    let bytes = match source {
+        Some(source) => {
+            let source = Path::new(source);
+            let bytes = fs::read(source)
+                .unwrap_or_else(|error| panic!("read candidate {}: {error}", source.display()));
+            let digest = blake2b_simd::Params::new().hash_length(32).hash(&bytes);
+            let actual = digest
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            assert_eq!(
+                actual,
+                expected_digest,
+                "candidate {} differs from the source-built checked digest",
+                source.display(),
+            );
+            println!("cargo:rerun-if-changed={}", source.display());
+            println!(
+                "cargo:warning=vosx: embedded opt-in candidate {} ({} bytes)",
+                source.display(),
+                bytes.len(),
+            );
+            bytes
+        }
+        None => Vec::new(),
+    };
+    let dest = out_dir.join(bundled_file);
+    fs::write(&dest, bytes).unwrap_or_else(|error| panic!("write {bundled_file}: {error}"));
+    println!("cargo:rustc-env={env_var}={}", dest.display());
 }
 
 const SPACE_REGISTRY_BLAKE2B_256: [u8; 32] = [

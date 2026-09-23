@@ -177,7 +177,7 @@ pub(crate) fn start_clean_system_agent(
 
     let runtime = crate::bundled::root_signed_agent_runtime_package(operator)?;
     let authority_package = crate::bundled::root_signed_actor_package(
-        crate::bundled::system_authority_package_template(),
+        crate::bundled::system_authority_package_template_for_storage(local_storage)?,
         SYSTEM_AUTHORITY_NAME,
         operator,
     )?;
