@@ -66,9 +66,11 @@ builds opt-in Authority and standard-runtime guests and exercises the complete
 internal Create/retry flow, including a failure after actor finality but before
 local retirement. The released bundled Authority correctly rejects
 the experimental ABI; its artifact is not replaced or implicitly upgraded.
-The coordinator now accepts an operator-selected, filesystem-descriptor-pinned external
-directory owner rather than a request-controlled slot-opening callback;
-replacing that directory pathname cannot redirect a retained owner.
+The coordinator now accepts an operator-selected, filesystem-descriptor-pinned
+external directory owner rather than a request-controlled slot-opening
+callback; replacing that directory pathname cannot redirect a retained owner.
+Retries after saved authorization or retirement reopen an existing stable lock
+only; a missing lock fails without minting a replacement.
 
 No released startup, lifecycle queue or route adapter selects this owner yet;
 the caller must choose Space/Node storage roots independently and attach a

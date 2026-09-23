@@ -5153,9 +5153,22 @@ where
         let intent_hash = external_local_create_intent_hash(
             slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?,
         );
-        let external_slot = directory
-            .acquire(crate::service::AgentId(managed.agent.0), intent_hash)
-            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        // This path acquires the physical slot before it can save any
+        // authorization work. Once that work is durable, loss of the stable
+        // lock is not a fresh Create; never manufacture its replacement.
+        let existing_required = slot
+            .authorization_work()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .is_some()
+            || slot
+                .retirement_complete()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let external_slot = if existing_required {
+            directory.acquire_existing(crate::service::AgentId(managed.agent.0), intent_hash)
+        } else {
+            directory.acquire(crate::service::AgentId(managed.agent.0), intent_hash)
+        }
+        .map_err(|_| SharedAgentHostError::Unavailable)?;
         if external_slot.agent() != crate::service::AgentId(managed.agent.0)
             || external_slot.node() != crate::service::NodeId(self.pins.node.0)
             || external_slot.intent() != intent_hash
@@ -15887,6 +15900,34 @@ mod tests {
                 Err(SharedAgentHostError::Unavailable)
             ));
 
+            // Saved authorization already requires the original stable
+            // lock, even before finalization retirement has completed.
+            let lock = std::fs::read_dir(&root)
+                .unwrap()
+                .map(Result::unwrap)
+                .map(|entry| entry.path())
+                .find(|path| path.extension().is_some_and(|ext| ext == "agent-lock"))
+                .unwrap();
+            let parked_lock = lock.with_extension("parked");
+            std::fs::rename(&lock, &parked_lock).unwrap();
+            let entries_before = std::fs::read_dir(&root).unwrap().count();
+            assert!(matches!(
+                owner.create_external_local_agent(
+                    intent_store.clone(),
+                    issuer_store.clone(),
+                    descriptor.clone(),
+                    call.clone(),
+                    runtime.clone(),
+                    &directory,
+                    &mut ReadBudget::new(10_000, 10_000_000),
+                    &mut signer,
+                ),
+                Err(SharedAgentHostError::Unavailable)
+            ));
+            assert!(!lock.exists());
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), entries_before);
+            std::fs::rename(&parked_lock, &lock).unwrap();
+
             // A syntactically valid CMI4 with the exact signed request and
             // finalized issuer record cannot substitute a different system
             // journal anchor while the retirement is still incomplete.
@@ -15983,11 +16024,11 @@ mod tests {
             let mut retry_budget = ReadBudget::new(10_000, 10_000_000);
             let (retry_agent, retry_ack, reopened) = owner
                 .create_external_local_agent(
-                    intent_store,
-                    issuer_store,
-                    descriptor,
-                    call,
-                    runtime,
+                    intent_store.clone(),
+                    issuer_store.clone(),
+                    descriptor.clone(),
+                    call.clone(),
+                    runtime.clone(),
                     &directory,
                     &mut retry_budget,
                     &mut signer,
@@ -15996,6 +16037,27 @@ mod tests {
             assert_eq!((retry_agent, retry_ack), (agent, acknowledgement));
             assert_eq!(reopened.materialization().unwrap().heads(), &first_head);
             drop(reopened);
+
+            // Retirement is a terminal physical boundary. If its stable
+            // lock disappears, a retry must not create a replacement one.
+            std::fs::rename(&lock, &parked_lock).unwrap();
+            let entries_before = std::fs::read_dir(&root).unwrap().count();
+            assert!(matches!(
+                owner.create_external_local_agent(
+                    intent_store,
+                    issuer_store,
+                    descriptor,
+                    call,
+                    runtime,
+                    &directory,
+                    &mut ReadBudget::new(10_000, 10_000_000),
+                    &mut signer,
+                ),
+                Err(SharedAgentHostError::Unavailable)
+            ));
+            assert!(!lock.exists());
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), entries_before);
+            std::fs::rename(&parked_lock, &lock).unwrap();
 
             // A pathname replacement cannot redirect the pinned owner into
             // a new empty directory or mint a fresh stable lock there.

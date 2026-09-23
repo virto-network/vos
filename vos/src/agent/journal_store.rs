@@ -9969,19 +9969,39 @@ impl ExternalLocalJournalDirectory {
         agent: AgentId,
         intent: Hash,
     ) -> Result<FileLocalAgentJournalSlot, JournalStoreError> {
+        self.open_slot(agent, intent, true)
+    }
+
+    /// Reopen a retired Create's slot without minting a replacement stable
+    /// lock if its physical storage was removed after finality.
+    pub(crate) fn acquire_existing(
+        &self,
+        agent: AgentId,
+        intent: Hash,
+    ) -> Result<FileLocalAgentJournalSlot, JournalStoreError> {
+        self.open_slot(agent, intent, false)
+    }
+
+    fn open_slot(
+        &self,
+        agent: AgentId,
+        intent: Hash,
+        allow_create: bool,
+    ) -> Result<FileLocalAgentJournalSlot, JournalStoreError> {
         if agent == AgentId::ZERO || intent == Hash::ZERO {
             return Err(JournalStoreError::ScopeMismatch);
         }
         let parent = self.parent.get()?;
         validate_owned_directory(parent)?;
         let agent_hex = encode_hex(agent.as_bytes());
-        FileLocalAgentJournalSlot::acquire_with_pinned_parents(
+        FileLocalAgentJournalSlot::open_with_pinned_parents(
             self.root.join(format!("{agent_hex}.agent")),
             self.root.join(format!("{agent_hex}.agent-lock")),
             self.node,
             intent,
             parent,
             parent,
+            allow_create,
         )
     }
 }
@@ -10908,6 +10928,26 @@ impl FileLocalAgentJournalSlot {
         pinned_journal_parent: &File,
         pinned_authority_parent: &File,
     ) -> Result<Self, JournalStoreError> {
+        Self::open_with_pinned_parents(
+            root,
+            stable_lock_path,
+            node,
+            intent,
+            pinned_journal_parent,
+            pinned_authority_parent,
+            true,
+        )
+    }
+
+    fn open_with_pinned_parents(
+        root: impl Into<PathBuf>,
+        stable_lock_path: impl Into<PathBuf>,
+        node: NodeId,
+        intent: Hash,
+        pinned_journal_parent: &File,
+        pinned_authority_parent: &File,
+        allow_create: bool,
+    ) -> Result<Self, JournalStoreError> {
         if node == NodeId::ZERO || intent == Hash::ZERO {
             return Err(JournalStoreError::ScopeMismatch);
         }
@@ -10974,6 +11014,9 @@ impl FileLocalAgentJournalSlot {
             None => {
                 if generation.is_some() {
                     return Err(JournalStoreError::Corrupt);
+                }
+                if !allow_create {
+                    return Err(JournalStoreError::MissingObject);
                 }
                 create_local_stable_lock_at(authority_parent.get()?, stable_lock_leaf, intent)?
             }
