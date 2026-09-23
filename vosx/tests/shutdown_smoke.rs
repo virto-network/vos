@@ -43,7 +43,12 @@ impl Drop for DaemonChild {
 
 impl TempDir {
     fn new(label: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target"));
+        let base = target.join("test-tmp");
+        fs::create_dir_all(&base).expect("create test scratch directory");
+        let path = base.join(format!(
             "vosx-shutdown-{}-{label}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -70,10 +75,19 @@ impl Drop for TempDir {
 
 #[test]
 fn space_up_exits_cleanly_on_sigterm() {
-    let data_home = TempDir::new("data");
-    let config_home = TempDir::new("config");
-    let cache_home = TempDir::new("cache");
-    let space_name = "shutdown-smoke";
+    run_shutdown_smoke("shutdown-smoke", false);
+}
+
+#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+#[test]
+fn external_space_up_uses_fresh_roots_and_exits_cleanly() {
+    run_shutdown_smoke("external-shutdown-smoke", true);
+}
+
+fn run_shutdown_smoke(space_name: &str, external: bool) {
+    let data_home = TempDir::new(&format!("{space_name}-data"));
+    let config_home = TempDir::new(&format!("{space_name}-config"));
+    let cache_home = TempDir::new(&format!("{space_name}-cache"));
 
     let created = Command::new(vosx_bin())
         .args(["space", "new", space_name, "--format", "json"])
@@ -93,66 +107,88 @@ fn space_up_exits_cleanly_on_sigterm() {
     let space_root = PathBuf::from(created_space["data_dir"].as_str().expect("space data dir"));
     // Exercise both ingress services without competing with the developer's
     // default ports or with another test process.
+    let storage = if external {
+        "local_agent_storage = \"external-state\"\n"
+    } else {
+        ""
+    };
     fs::write(
         space_root.join("local.toml"),
-        "listen = [\"/ip4/127.0.0.1/tcp/0\"]\n\
+        format!(
+            "{storage}listen = [\"/ip4/127.0.0.1/tcp/0\"]\n\
          [[ingress.http]]\nname = \"http\"\nlisten = \"127.0.0.1:0\"\n\
-         [[ingress.ssh]]\nname = \"ssh\"\nlisten = \"127.0.0.1:0\"\n",
+         [[ingress.ssh]]\nname = \"ssh\"\nlisten = \"127.0.0.1:0\"\n"
+        ),
     )
     .expect("write isolated ingress config");
 
-    let log_path = data_home.path().join("daemon.stderr");
-    let log_file = fs::File::create(&log_path).expect("create daemon log");
-    let mut child = DaemonChild(
-        Command::new(vosx_bin())
-            .args(["space", "up", space_name])
-            .env("XDG_DATA_HOME", data_home.path())
-            .env("XDG_CONFIG_HOME", config_home.path())
-            .env("XDG_CACHE_HOME", cache_home.path())
-            .env("VOSX_DISABLE_MDNS", "1")
-            .stdout(Stdio::null())
-            .stderr(log_file)
-            .spawn()
-            .expect("start space daemon"),
-    );
+    for boot in 0..if external { 2 } else { 1 } {
+        let log_path = data_home.path().join(format!("daemon-{boot}.stderr"));
+        let log_file = fs::File::create(&log_path).expect("create daemon log");
+        let daemon_started = Instant::now();
+        let mut child = DaemonChild(
+            Command::new(vosx_bin())
+                .args(["space", "up", space_name])
+                .env("XDG_DATA_HOME", data_home.path())
+                .env("XDG_CONFIG_HOME", config_home.path())
+                .env("XDG_CACHE_HOME", cache_home.path())
+                .env("VOSX_DISABLE_MDNS", "1")
+                .stdout(Stdio::null())
+                .stderr(log_file)
+                .spawn()
+                .expect("start space daemon"),
+        );
 
-    let endpoint_deadline = Instant::now() + Duration::from_secs(10);
-    let endpoint = loop {
-        if let Some(path) = find_endpoint(data_home.path()) {
-            break path;
-        }
-        if let Some(status) = child.0.try_wait().expect("poll startup") {
-            panic!(
-                "daemon exited before publishing an endpoint ({status}): {}",
-                fs::read_to_string(&log_path).unwrap_or_default()
-            );
-        }
-        if Instant::now() >= endpoint_deadline {
-            panic!(
-                "daemon did not publish an endpoint: {}",
-                fs::read_to_string(&log_path).unwrap_or_default()
-            );
-        }
-        thread::sleep(Duration::from_millis(100));
-    };
-
-    // SAFETY: `child` is the live process created immediately above.
-    assert_eq!(
-        unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGTERM) },
-        0
-    );
-    let exit_deadline = Instant::now() + Duration::from_secs(5);
-    let status = loop {
-        match child.0.try_wait().expect("poll daemon") {
-            Some(status) => break status,
-            None if Instant::now() < exit_deadline => thread::sleep(Duration::from_millis(50)),
-            None => {
-                let _ = child.0.kill();
-                let _ = child.0.wait();
-                panic!("daemon did not stop after SIGTERM");
+        // This is a shutdown/storage-mode smoke, not the startup-latency gate.
+        // Both modes run full system-Agent bootstrap before publishing an endpoint.
+        let endpoint_deadline = daemon_started + Duration::from_secs(60);
+        let endpoint = loop {
+            if let Some(path) = find_endpoint(data_home.path()) {
+                break path;
             }
+            if let Some(status) = child.0.try_wait().expect("poll startup") {
+                panic!(
+                    "daemon exited before publishing an endpoint ({status}): {}",
+                    fs::read_to_string(&log_path).unwrap_or_default()
+                );
+            }
+            if Instant::now() >= endpoint_deadline {
+                panic!(
+                    "daemon did not publish an endpoint: {}",
+                    fs::read_to_string(&log_path).unwrap_or_default()
+                );
+            }
+            thread::sleep(Duration::from_millis(100));
+        };
+        eprintln!(
+            "{space_name} boot {boot} endpoint ready after {} ms",
+            daemon_started.elapsed().as_millis()
+        );
+        if external {
+            assert!(space_root.join("local-agent-external").is_dir());
+            assert!(space_root.join("local-agent-external-lifecycle").is_dir());
+            assert!(!space_root.join("local-agent-host").exists());
+            assert!(!space_root.join("local-agent-lifecycle").exists());
         }
-    };
-    assert!(status.success(), "daemon exited with {status}");
-    assert!(!endpoint.exists(), "daemon left its endpoint behind");
+
+        // SAFETY: `child` is the live process created immediately above.
+        assert_eq!(
+            unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGTERM) },
+            0
+        );
+        let exit_deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            match child.0.try_wait().expect("poll daemon") {
+                Some(status) => break status,
+                None if Instant::now() < exit_deadline => thread::sleep(Duration::from_millis(50)),
+                None => {
+                    let _ = child.0.kill();
+                    let _ = child.0.wait();
+                    panic!("daemon did not stop after SIGTERM");
+                }
+            }
+        };
+        assert!(status.success(), "daemon exited with {status}");
+        assert!(!endpoint.exists(), "daemon left its endpoint behind");
+    }
 }

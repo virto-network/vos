@@ -83,7 +83,8 @@ fixture checks round-trip and corruption rejection. No released ingress accepts
 The external Create coordinator now also accepts already-open intent and issuer
 slots; a crash-point retry test keeps both slots alive across ambiguous errors.
 This lets a startup controller retain those leases instead of reopening them
-per attempt. It does not yet perform startup recovery or enable `LCQ2` ingress.
+per attempt. The later startup driver and opt-in root selection below now
+perform recovery; `LCQ2` ingress remains disabled.
 Physical Create-seal preparation is separate from the mutable lifecycle
 slot so recovery can consume immutable retained Create facts. This is needed
 before Install handoff: CMI4 may replace the Create intent with Install, while
@@ -123,8 +124,9 @@ schema, policy and constructor layout from pinned catalog blobs; missing or
 altered artifacts fail closed. An internal per-Agent inline route worker now
 connects this locked owner to Direct Invoke/ACK envelopes and compares its
 physical actor closure with the supplied Authority projection. The physical
-fixture supplies a synthetic projection; released startup does not yet attach
-this worker or prove independent route finality. A successful external journal
+fixture supplies a synthetic projection; default startup does not attach this
+worker, and that fixture alone does not prove independent route finality. A
+successful external journal
 publication now returns its exact guest SDK invocation outcome only after the
 head commit succeeds. The external adapter and Standard guest now physically
 admit Resume with the retained
@@ -152,8 +154,9 @@ checkpoint, and recovers exact Invoke and ACK outcomes without changing its
 file tree. An exact Invoke retry also recovers after the receipt validity
 window while a wrong runtime and a validly signed unseen invocation are
 rejected; ACK retirement hides the earlier Invoke result. This proves the owner
-handoff, not public response-loss retry: released startup still cannot attach
-the internal route after recovery. A plain no-change Invoke retry alone is
+handoff, not public response-loss retry: the opt-in startup can now attach the
+internal route, but a publicly routed loss/restart/retry is unqualified. A
+plain no-change Invoke retry alone is
 still not evidence of the original response. Read-only owner inspection now
 distinguishes
 positive guest-reported absence, retained completion and retained ACK; a failed
@@ -229,7 +232,7 @@ through the serving gate. The native physical fixture resumes both a Create
 interrupted before retirement and an Install interrupted after publication
 but before Authority finalization, without a second Install head. A failed
 phase still requires dropping the possibly poisoned handles and rediscovering
-the durable stores; released `vosx` startup does not invoke this driver yet.
+the durable stores; only the opt-in `vosx` startup invokes this driver.
 An intent committed before its runtime/actor sidecar but before authorization
 is still a fail-closed startup case, not an automatically completed one. Its
 exact-request retry or safe per-Agent isolation needs release qualification;
@@ -259,13 +262,15 @@ test passed with rebuilt Standard and Authority guests. This is not full
 prototype, released-binary, publicly
 routed retry, performance or outer-PVM qualification.
 
-No released startup or lifecycle queue selects this owner yet;
-the caller must choose Space/Node storage roots independently and attach a
-route only after authenticated finalization. Unretired Create now checks its
+Only the opt-in startup selects this owner; the default binary and lifecycle
+queue do not. The caller must choose Space/Node storage roots independently
+and attach a route only after authenticated finalization. Unretired Create
+checks its
 saved authorization anchor against the pinned system journal before physical
 recovery; startup must restore its pending/retirement admission first. Keep
-the image Local path active until external selection, file-backed restart and
-near-3-MiB ACK recovery qualify. The external replay adapter covers signed
+the image Local path active until a file-backed external Agent survives restart,
+near-3-MiB ACK recovery and typed lifecycle ingress qualify. The external
+replay adapter covers signed
 Create, Install, Invoke, Resume and ACK without decoding private runtime state,
 subject to the Resume/yield gates above.
 `local.toml` now has an explicit `local_agent_storage` choice. Missing fields
@@ -275,6 +280,14 @@ external journal/lifecycle root. The default released binary returns a clear
 unsupported-mode error for `external-state` before opening the image path.
 The opt-in experimental build selects and recovers the external roots, but
 does not change the default image deployment or establish release readiness.
+An actual `vosx` subprocess smoke created a fresh external Space, published an
+endpoint, verified that both external roots and neither image Local root exist,
+shut down cleanly, and reopened the same roots on a second boot. Endpoint
+readiness took 13.18 and 8.24 seconds respectively; paired image runs took
+13.50 seconds with the opt-in binary and 13.29 seconds with the default binary
+on this developer host. These observations expose slow system startup; the
+smoke has no external Agent, response-loss retry, crash recovery or throughput
+qualification.
 The current released-binary path is `vosx` clean startup -> image-based
 `LocalAgentHost` -> image-backed `LocalLifecycleController` -> Local route backend. The
 older `host::LocalGenesisIntent` file opener accepts r19 only. Next, qualify
