@@ -3,7 +3,7 @@
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
@@ -23,6 +23,132 @@ fn find_endpoint(root: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+fn read_http_head(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    use std::io::Read as _;
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        assert!(head.len() < 16 * 1024, "HTTP header exceeds test bound");
+        let mut byte = [0];
+        stream.read_exact(&mut byte).expect("read HTTP header");
+        head.push(byte[0]);
+    }
+    head
+}
+
+#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+fn http_content_length(head: &[u8]) -> u64 {
+    let head = std::str::from_utf8(head).expect("ASCII HTTP headers");
+    head.split("\r\n")
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("Content-Length"))
+        .map(|(_, value)| value.trim().parse().expect("decimal Content-Length"))
+        .expect("bounded HTTP response declares Content-Length")
+}
+
+#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+fn relay_then_lose_create_reply(listener: std::net::TcpListener, daemon: std::net::SocketAddr) {
+    use std::io::{Read as _, Write as _};
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(90);
+    for _ in 0..4 {
+        let (mut client, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "Create client never reached proxy"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept Create proxy: {error}"),
+            }
+        };
+        client
+            .set_read_timeout(Some(Duration::from_secs(85)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_secs(85)))
+            .unwrap();
+        let mut upstream = std::net::TcpStream::connect(daemon).expect("connect daemon HTTP");
+        upstream
+            .set_read_timeout(Some(Duration::from_secs(85)))
+            .unwrap();
+        upstream
+            .set_write_timeout(Some(Duration::from_secs(85)))
+            .unwrap();
+        let request_head = read_http_head(&mut client);
+        let create = request_head.starts_with(b"POST /__agents/local HTTP/1.1\r\n");
+        upstream.write_all(&request_head).unwrap();
+        let request_len = http_content_length(&request_head);
+        assert_eq!(
+            std::io::copy(
+                &mut std::io::Read::by_ref(&mut client).take(request_len),
+                &mut upstream,
+            )
+            .unwrap(),
+            request_len,
+            "proxy must forward the complete retained request",
+        );
+        upstream.flush().unwrap();
+        let response_head = read_http_head(&mut upstream);
+        if create {
+            assert!(
+                response_head.starts_with(b"HTTP/1.1 201 "),
+                "daemon must commit Create before the reply is lost: {}",
+                String::from_utf8_lossy(&response_head),
+            );
+            // Deliberately give the client no response bytes after the daemon
+            // has produced its successful HTTP status.
+            return;
+        }
+        let response_len = http_content_length(&response_head);
+        client.write_all(&response_head).unwrap();
+        assert_eq!(
+            std::io::copy(
+                &mut std::io::Read::by_ref(&mut upstream).take(response_len),
+                &mut client,
+            )
+            .unwrap(),
+            response_len,
+        );
+        client.flush().unwrap();
+    }
+    panic!("Create proxy never observed the Local Create request");
+}
+
+fn create_local_cli(
+    space_name: &str,
+    address: std::net::SocketAddr,
+    resume: bool,
+    data_home: &Path,
+    config_home: &Path,
+    cache_home: &Path,
+) -> Output {
+    let mut create = Command::new(vosx_bin());
+    create.args([
+        "space",
+        "create-local-agent",
+        space_name,
+        "--http",
+        &address.to_string(),
+        "--format",
+        "json",
+    ]);
+    if resume {
+        create.arg("--resume");
+    }
+    create
+        .env("XDG_DATA_HOME", data_home)
+        .env("XDG_CONFIG_HOME", config_home)
+        .env("XDG_CACHE_HOME", cache_home)
+        .env("VOSX_DISABLE_MDNS", "1")
+        .env("RUST_LOG", "vosx::commands::space::local_create=debug")
+        .output()
+        .expect("submit exact external Local Create")
 }
 
 struct TempDir(PathBuf);
@@ -75,16 +201,24 @@ impl Drop for TempDir {
 
 #[test]
 fn space_up_exits_cleanly_on_sigterm() {
-    run_shutdown_smoke("shutdown-smoke", false);
+    run_shutdown_smoke("shutdown-smoke", false, false);
 }
 
 #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
 #[test]
 fn external_space_create_and_exact_retry_after_restart() {
-    run_shutdown_smoke("external-shutdown-smoke", true);
+    run_shutdown_smoke("external-shutdown-smoke", true, false);
 }
 
-fn run_shutdown_smoke(space_name: &str, external: bool) {
+#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+#[test]
+fn external_create_lost_reply_recovers_before_and_after_restart() {
+    run_shutdown_smoke("external-lost-reply", true, true);
+}
+
+fn run_shutdown_smoke(space_name: &str, external: bool, lose_first_reply: bool) {
+    #[cfg(not(all(target_os = "linux", feature = "experimental-state-blocks")))]
+    let _ = lose_first_reply;
     let data_home = TempDir::new(&format!("{space_name}-data"));
     let config_home = TempDir::new(&format!("{space_name}-config"));
     let cache_home = TempDir::new(&format!("{space_name}-cache"));
@@ -208,28 +342,60 @@ fn run_shutdown_smoke(space_name: &str, external: bool) {
             assert!(space_root.join("local-agent-external-lifecycle").is_dir());
             assert!(!space_root.join("local-agent-host").exists());
             assert!(!space_root.join("local-agent-lifecycle").exists());
-            let mut create = Command::new(vosx_bin());
-            create.args([
-                "space",
-                "create-local-agent",
-                space_name,
-                "--http",
-                &format!("127.0.0.1:{http_port}"),
-                "--format",
-                "json",
-            ]);
-            if boot == 1 {
-                create.arg("--resume");
-            }
+            let daemon_http = format!("127.0.0.1:{http_port}").parse().unwrap();
             let create_started = Instant::now();
-            let created = create
-                .env("XDG_DATA_HOME", data_home.path())
-                .env("XDG_CONFIG_HOME", config_home.path())
-                .env("XDG_CACHE_HOME", cache_home.path())
-                .env("VOSX_DISABLE_MDNS", "1")
-                .env("RUST_LOG", "vosx::commands::space::local_create=debug")
-                .output()
-                .expect("submit exact external Local Create");
+            #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+            let created = if lose_first_reply && boot == 0 {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                    .expect("bind isolated lost-response proxy");
+                let proxy_http = listener.local_addr().unwrap();
+                let proxy =
+                    thread::spawn(move || relay_then_lose_create_reply(listener, daemon_http));
+                let lost = create_local_cli(
+                    space_name,
+                    proxy_http,
+                    false,
+                    data_home.path(),
+                    config_home.path(),
+                    cache_home.path(),
+                );
+                proxy.join().expect("proxy forwarded a committed Create");
+                assert!(
+                    !lost.status.success(),
+                    "proxy unexpectedly delivered Create ACK"
+                );
+                assert!(
+                    String::from_utf8_lossy(&lost.stderr).contains("request retained"),
+                    "lost reply did not retain exact Create: {}",
+                    String::from_utf8_lossy(&lost.stderr),
+                );
+                create_local_cli(
+                    space_name,
+                    daemon_http,
+                    true,
+                    data_home.path(),
+                    config_home.path(),
+                    cache_home.path(),
+                )
+            } else {
+                create_local_cli(
+                    space_name,
+                    daemon_http,
+                    boot == 1,
+                    data_home.path(),
+                    config_home.path(),
+                    cache_home.path(),
+                )
+            };
+            #[cfg(not(all(target_os = "linux", feature = "experimental-state-blocks")))]
+            let created = create_local_cli(
+                space_name,
+                daemon_http,
+                boot == 1,
+                data_home.path(),
+                config_home.path(),
+                cache_home.path(),
+            );
             eprintln!(
                 "{space_name} boot {boot} Local Create/retained retry completed after {} ms",
                 create_started.elapsed().as_millis(),

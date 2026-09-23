@@ -372,9 +372,16 @@ seconds. These are elapsed call spans, not CPU attribution or a release
 benchmark. They implicate synchronous Authority/finality and reconciliation
 composition more than the physical state PVM; inspect their subphases before
 changing semantics or adding caches.
-Without both candidates, startup refused before opening external roots. This qualifies a
-file-backed Create/restart/retry slice, not simulated response loss, Install,
-routed actor Invoke/ACK, throughput or final release artifacts.
+With both candidates, a loopback proxy also withheld the committed Create HTTP
+response after the daemon returned 201. The CLI kept the exact request;
+`--resume` recovered the same signed ACK before and after a daemon restart,
+without republishing Create. This is a deliberately lost reply at the public
+HTTP boundary, not a crash at every lifecycle instruction. The focused
+binary-subprocess test passed in 47.74 seconds on a debug build; it is not a
+release latency claim. Without both candidates, startup refused before opening
+external roots. This qualifies the file-backed Create/restart/response-loss
+slice, not Install, routed actor Invoke/ACK, throughput or final release
+artifacts.
 The current released-binary path is `vosx` clean startup -> image-based
 `LocalAgentHost` -> image-backed `LocalLifecycleController` -> Local route backend. The
 older `host::LocalGenesisIntent` file opener accepts r19 only. Next, qualify
@@ -383,10 +390,10 @@ after authenticated Create publication. Shared common finality and Clerk
 follow within batch 1. Candidate package admission is not release admission;
 the large ACK's 5-billion-gas success is not a release-latency guarantee.
 
-External Local cutover TODOs, in order: (1) qualify response loss during
-file-backed Create delivery, then the complete external Install handoff under
-those leases (the internal actor-sidecar crash window has a physical fixture);
-resolve approved-but-guest-rejected Install without stranding its intent;
+External Local cutover TODOs, in order: (1) complete the external Install
+handoff under the retained leases (the internal actor-sidecar crash window has
+a physical fixture); resolve approved-but-guest-rejected Install without
+stranding its intent, and qualify Install response-loss recovery;
 (2) qualify publicly routed Invoke/ACK and Resume through the locked owner,
 including response-loss retry after restart without an image-host fallback;
 (3) qualify
