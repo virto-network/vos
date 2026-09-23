@@ -1529,13 +1529,13 @@ backup or long-running retention tests.
 
 ## Branch boundary
 
-- Reviewer: `saga/agents` carries the scoped r04/s04 response-recovery
-  checkpoint described in [the review guide](agent-saga-review.md). The
-  previous bounded-state checkpoint was `6bcff6fe`. Neither is production
-  release evidence.
+- Reviewer: `saga/agents` carries the fresh-root external Local Create
+  checkpoint described in [the review guide](agent-saga-review.md), relative
+  to the previous reviewed `0ffe19fc` response-recovery checkpoint. Neither
+  is production release evidence.
 - Implementation continues on `wip/ch08-runtime-directory` after this
   checkpoint. Fresh external-root startup, signed LCQ2 Create through the
-  binary, restart and exact ACK retry now pass with checked opt-in artifacts.
+  binary, restart and exact ACK retry pass with checked opt-in artifacts.
   Install and publicly routed actor Invoke/ACK remain batch-1 gates. No
   production deployment is claimed.
 - Current focused checks are recorded above: binary-subprocess external Create
