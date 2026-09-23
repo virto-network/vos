@@ -266,9 +266,12 @@ generations and the exact ACK. It first stages that second Agent's runtime
 without an intent, rejects an unexpected actor sidecar, then excludes the
 valid unpledged candidate from startup admission. Its lifecycle stores are
 memory-backed, not the `vosx` file leases. A signed wrong-node Create is
-rejected before the store factory can create a lifecycle directory. The new Create wrapper also
-passed on a dedicated 2-MiB thread stack; the all-in-one fixture still uses
-4 MiB. No LCQ2 production queue or HTTP path is enabled.
+rejected before the store factory can create a lifecycle directory. The new
+Create wrapper also passed on a dedicated 2-MiB thread stack; the all-in-one
+fixture still uses 4 MiB. No LCQ2 production queue or HTTP path is enabled.
+The file-store regression independently confirms that a runtime-only candidate
+is discoverable after lease release/reopen with no intent or issuer image. It
+does not replace the pending end-to-end file-backed lifecycle test.
 Focused r04/s04 evidence: SDK feature-on/off suites passed (248 passed/1
 ignored and 247 passed/1 ignored); the compiled Standard physical
 Create/Install/Invoke/ACK/checkpoint/reopen test passed, including retained

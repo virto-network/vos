@@ -4071,6 +4071,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn lifecycle_discovers_unpledged_runtime_staging_after_file_reopen() {
+        use vos::agent::local_lifecycle::LocalLifecycleStoreFactory as _;
+        use vos::agent::sdk::{AgentId, SpaceId};
+        let fixture = Fixture::new("lifecycle-runtime-only-candidate");
+        let space = SpaceId([1; 32]);
+        let agent = AgentId([2; 32]);
+        let mut factory =
+            CleanManagementLifecycleStoreFactory::open_or_create(&fixture.root, space).unwrap();
+        let (mut intent, mut issuer) = factory.open(space, agent).unwrap();
+        intent.commit_runtime(b"staged-package").unwrap();
+        assert_eq!(intent.load().unwrap(), None);
+        assert_eq!(issuer.load().unwrap(), None);
+        drop((intent, issuer));
+
+        assert_eq!(factory.discover(space, 1).unwrap(), vec![agent]);
+        let (mut intent, mut issuer) = factory.open_existing(space, agent).unwrap();
+        assert_eq!(intent.load().unwrap(), None);
+        assert_eq!(issuer.load().unwrap(), None);
+        assert_eq!(
+            intent.load_runtime().unwrap(),
+            Some(b"staged-package".to_vec())
+        );
+        assert!(matches!(
+            factory.open_existing(space, agent),
+            Err(CleanFileStoreError::Busy)
+        ));
+    }
+
+    #[test]
     fn lifecycle_discovery_rejects_residue_and_non_directories() {
         use vos::agent::local_lifecycle::LocalLifecycleStoreFactory as _;
         use vos::agent::sdk::SpaceId;
