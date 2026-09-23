@@ -105,19 +105,33 @@ the Standard runtime's private result layout or relax the signed work
 commitment's `recovery_only` binding. The file-backed physical lifecycle now
 drops the previous store handle, reopens the locked production owner after
 checkpoint, and recovers exact Invoke and ACK outcomes without changing its
-file tree. A wrong runtime and a validly signed unseen invocation are rejected,
-and ACK retirement hides the earlier Invoke result. This proves the owner
-handoff, not public response-loss retry:
-route admission and startup recovery are still disconnected. A plain no-change
-Invoke retry alone is still not evidence of the original response.
+file tree. An exact Invoke retry also recovers after the receipt validity
+window while a wrong runtime and a validly signed unseen invocation are
+rejected; ACK retirement hides the earlier Invoke result. This proves the owner
+handoff, not public response-loss retry: route admission and startup recovery
+are still disconnected. A plain no-change Invoke retry alone is still not
+evidence of the original response. Read-only owner inspection now distinguishes
+positive guest-reported absence, retained completion and retained ACK; a failed
+inspection is never permission to execute. ACK inspection needs a trusted
+current logical slot to recognize a live pre-ACK result. The host invocation-
+ownership index intentionally excludes clean SDK operations, so it cannot be
+used as a cheap absence hint for this route. The locked owner now has a
+correctness-first Direct Invoke/ACK submission primitive: guest inspection
+decides whether to recover, execute or refuse before any journal mutation.
+A physical file-backed query advanced its head once, returned the same result
+without another write on retry, and recovered it after owner restart and
+receipt expiry. Its ACK then published once, exact ACK retry made no new write,
+and the retired Invoke was refused. This is still an internal primitive, not a
+supervisor route; it inspects the guest on every new call, so measure that
+overhead before optimizing without moving result authority into the host.
 Focused r04/s04 evidence: SDK feature-on/off suites passed (248 passed/1
 ignored and 247 passed/1 ignored); the compiled Standard physical
 Create/Install/Invoke/ACK/checkpoint/reopen test passed, including retained
 result, ACK, unseen-input refusal and retired-Invoke refusal; the file-backed
 locked-owner handoff passed through the same physical lifecycle; the candidate
 signed external Local Create/finality/retry test passed with rebuilt Standard
-and Authority guests. This is not full prototype, released-binary, file-owner
-retry, performance or outer-PVM qualification.
+and Authority guests. This is not full prototype, released-binary, publicly
+routed retry, performance or outer-PVM qualification.
 
 No released startup, lifecycle queue or route adapter selects this owner yet;
 the caller must choose Space/Node storage roots independently and attach a

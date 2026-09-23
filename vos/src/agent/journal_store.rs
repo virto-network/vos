@@ -17483,6 +17483,21 @@ mod tests {
                                     &mut ReadBudget::new(10000, 10000000),
                                 )
                                 .unwrap();
+                            use super::super::external_local_executor::RetainedExternalDisposition;
+                            assert_eq!(
+                                owned
+                                    .inspect_retained_disposition(
+                                        input,
+                                        101,
+                                        &mut ReadBudget::new(10000, 10000000),
+                                    )
+                                    .unwrap(),
+                                if matches!(&input.operation, ReplayOperation::CleanInvoke { .. }) {
+                                    RetainedExternalDisposition::Completed(expected.clone())
+                                } else {
+                                    RetainedExternalDisposition::Acknowledged(expected.clone())
+                                },
+                            );
                             assert_eq!(
                                 owned
                                     .recover_retained_outcome(
@@ -17503,6 +17518,53 @@ mod tests {
                                 Err(JournalStoreError::Conflict),
                             );
                             if matches!(&input.operation, ReplayOperation::CleanInvoke { .. }) {
+                                let ReplayOperation::CleanInvoke {
+                                    work,
+                                    authorization,
+                                    ..
+                                } = &input.operation
+                                else {
+                                    unreachable!()
+                                };
+                                let pending_ack = ReplayInput {
+                                    runtime: input.runtime.clone(),
+                                    operation: ReplayOperation::CleanAcknowledge {
+                                        context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                                        expected_live: None,
+                                        work: crate::agent_sdk::InvocationRetirement::from_work(
+                                            work,
+                                        ),
+                                        authorization: authorization.clone(),
+                                    },
+                                };
+                                assert_eq!(
+                                    owned
+                                        .inspect_retained_disposition(
+                                            &pending_ack,
+                                            12,
+                                            &mut ReadBudget::new(10000, 10000000),
+                                        )
+                                        .unwrap(),
+                                    RetainedExternalDisposition::Completed(expected.clone()),
+                                    "pending ACK must see the live Invoke result",
+                                );
+                                let mut delayed_retry = input.clone();
+                                let ReplayOperation::CleanInvoke { observed_slot, .. } =
+                                    &mut delayed_retry.operation
+                                else {
+                                    unreachable!()
+                                };
+                                *observed_slot = 101;
+                                assert_eq!(
+                                    owned
+                                        .recover_retained_outcome(
+                                            &delayed_retry,
+                                            &mut ReadBudget::new(10000, 10000000),
+                                        )
+                                        .unwrap(),
+                                    *expected,
+                                    "retained response must survive the receipt validity window",
+                                );
                                 let mut unseen = input.clone();
                                 let ReplayOperation::CleanInvoke {
                                     work,
@@ -17520,6 +17582,16 @@ mod tests {
                                 receipt.signature = SigningKey::from_bytes(&[0x31; 32])
                                     .sign(&receipt.signing_bytes())
                                     .to_bytes();
+                                assert_eq!(
+                                    owned
+                                        .inspect_retained_disposition(
+                                            &unseen,
+                                            12,
+                                            &mut ReadBudget::new(10000, 10000000),
+                                        )
+                                        .unwrap(),
+                                    RetainedExternalDisposition::Absent,
+                                );
                                 assert_eq!(
                                     owned.recover_retained_outcome(
                                         &unseen,
@@ -17541,6 +17613,16 @@ mod tests {
                                     ),
                                     Err(JournalStoreError::Unavailable),
                                     "retirement must hide the earlier Invoke result",
+                                );
+                                assert_eq!(
+                                    owned
+                                        .inspect_retained_disposition(
+                                            retained_invoke.as_ref().unwrap(),
+                                            101,
+                                            &mut ReadBudget::new(10000, 10000000),
+                                        )
+                                        .unwrap(),
+                                    RetainedExternalDisposition::Acknowledged(expected.clone()),
                                 );
                             }
                             assert_eq!(file_tree_snapshot(&root), snapshot);
@@ -17573,7 +17655,7 @@ mod tests {
                                     sealed.replica().node,
                                 )
                                 .unwrap();
-                            let owned = super::super::external_local_executor::ExternalLocalJournalOwner::open(
+                            let mut owned = super::super::external_local_executor::ExternalLocalJournalOwner::open(
                                 acquire_production_local_slot(&directory, sealed),
                                 recreated,
                                 &mut ReadBudget::new(10000, 10000000),
@@ -17584,6 +17666,183 @@ mod tests {
                             owned
                                 .verify_finalized_create_ack(&signed_external_create_ack(sealed))
                                 .unwrap();
+                            use crate::actors::{
+                                codec::{Decode, Encode},
+                                value::{Msg, TAG_DYNAMIC, Value},
+                            };
+                            use crate::agent_sdk as sdk;
+                            let record = owned
+                                .inspect_actors(None, 1, 50, &mut ReadBudget::new(10000, 10000000))
+                                .unwrap()
+                                .entries
+                                .remove(0);
+                            let material = owned
+                                .physical_invocation_material(
+                                    record.entry.actor,
+                                    50,
+                                    &mut ReadBudget::new(10000, 10000000),
+                                )
+                                .unwrap();
+                            let mut availability =
+                                vec![material.program, material.schema, material.policies];
+                            availability.extend(material.installation_data);
+                            availability.sort_by(|a, b| a.reference.cmp(&b.reference));
+                            let mut message = vec![TAG_DYNAMIC];
+                            message.extend(Msg::new("stored").encode());
+                            let work = sdk::InvocationWork {
+                                space: material.descriptor.identity.space,
+                                agent: material.descriptor.identity.agent,
+                                runtime_deployment: admitted.deployment(),
+                                invocation: sdk::InvocationId([0xb0; 32]),
+                                actor: record.entry.actor,
+                                incarnation: record.incarnation,
+                                deployment: record.entry.deployment,
+                                program: record.entry.program,
+                                mode: sdk::MethodMode::LinearizableQuery,
+                                origin: sdk::InvocationOrigin::anonymous(),
+                                roles: sdk::InvocationRoleClaims::none(),
+                                message,
+                                installation_data: record.entry.installation_data.clone(),
+                                availability,
+                                gas: 100_000_000,
+                                recovery_only: false,
+                            };
+                            let ReplayOperation::CleanManage {
+                                authority: mut receipt,
+                                ..
+                            } = sealed.genesis().create.operation.clone()
+                            else {
+                                unreachable!()
+                            };
+                            receipt.selector.operation =
+                                sdk::authority::AuthorityOperationKind::InvokeActor;
+                            receipt.selector.actor = Some(work.actor);
+                            receipt.selector.actor_deployment = Some(work.deployment);
+                            receipt.selector.request = work.commitment();
+                            receipt.selector.decision_sequence = 0;
+                            receipt.signature = SigningKey::from_bytes(&[0x31; 32])
+                                .sign(&receipt.signing_bytes())
+                                .to_bytes();
+                            let input = ReplayInput {
+                                runtime: sealed.genesis().runtime().clone(),
+                                operation: ReplayOperation::CleanInvoke {
+                                    context: sdk::RuntimeExecutionContext::Direct,
+                                    work,
+                                    authorization: sdk::InvocationAuthorization::AuthorityReceipt(
+                                        receipt,
+                                    ),
+                                    observed_slot: 50,
+                                },
+                            };
+                            let first = owned
+                                .submit_direct_clean(
+                                    input.clone(),
+                                    50,
+                                    &mut ReadBudget::new(10000, 10000000),
+                                )
+                                .unwrap();
+                            let sdk::RuntimeOutcome::Completed(Ok(reply)) = &first else {
+                                panic!("locked owner query failed: {first:?}");
+                            };
+                            assert_eq!(Value::decode(&reply.reply), Value::U64(43));
+                            let committed = owned.materialization().unwrap().heads().clone();
+                            assert_ne!(committed, advanced);
+                            assert_eq!(
+                                owned
+                                    .submit_direct_clean(
+                                        input.clone(),
+                                        50,
+                                        &mut ReadBudget::new(10000, 10000000),
+                                    )
+                                    .unwrap(),
+                                first,
+                            );
+                            assert_eq!(owned.materialization().unwrap().heads(), &committed);
+                            drop(owned);
+                            let recreated =
+                                super::super::local_journal_driver::LocalJournalAgentDriver::<
+                                    MemoryAgentJournalStore,
+                                >::prepare_external_local_genesis(
+                                    sealed.genesis().create.clone(),
+                                    sealed.replica(),
+                                    &catalog,
+                                    sealed.replica().node,
+                                )
+                                .unwrap();
+                            let mut reopened =
+                                super::super::external_local_executor::ExternalLocalJournalOwner::open(
+                                    acquire_production_local_slot(&directory, sealed),
+                                    recreated,
+                                    &mut ReadBudget::new(10000, 10000000),
+                                )
+                                .unwrap();
+                            let mut delayed = input;
+                            let ReplayOperation::CleanInvoke { observed_slot, .. } =
+                                &mut delayed.operation
+                            else {
+                                unreachable!()
+                            };
+                            *observed_slot = 101;
+                            let ReplayOperation::CleanInvoke {
+                                work,
+                                authorization,
+                                ..
+                            } = &delayed.operation
+                            else {
+                                unreachable!()
+                            };
+                            let acknowledge = ReplayInput {
+                                runtime: delayed.runtime.clone(),
+                                operation: ReplayOperation::CleanAcknowledge {
+                                    context: sdk::RuntimeExecutionContext::Direct,
+                                    expected_live: None,
+                                    work: sdk::InvocationRetirement::from_work(work),
+                                    authorization: authorization.clone(),
+                                },
+                            };
+                            assert_eq!(
+                                reopened
+                                    .submit_direct_clean(
+                                        delayed.clone(),
+                                        101,
+                                        &mut ReadBudget::new(10000, 10000000),
+                                    )
+                                    .unwrap(),
+                                first,
+                            );
+                            assert_eq!(reopened.materialization().unwrap().heads(), &committed);
+                            let acknowledged = reopened
+                                .submit_direct_clean(
+                                    acknowledge.clone(),
+                                    101,
+                                    &mut ReadBudget::new(10000, 10000000),
+                                )
+                                .unwrap();
+                            assert!(matches!(
+                                acknowledged,
+                                sdk::RuntimeOutcome::Acknowledged(Ok(_))
+                            ));
+                            let retired = reopened.materialization().unwrap().heads().clone();
+                            assert_ne!(retired, committed);
+                            assert_eq!(
+                                reopened
+                                    .submit_direct_clean(
+                                        acknowledge,
+                                        101,
+                                        &mut ReadBudget::new(10000, 10000000),
+                                    )
+                                    .unwrap(),
+                                acknowledged,
+                            );
+                            assert_eq!(reopened.materialization().unwrap().heads(), &retired);
+                            assert_eq!(
+                                reopened.submit_direct_clean(
+                                    delayed,
+                                    101,
+                                    &mut ReadBudget::new(10000, 10000000),
+                                ),
+                                Err(JournalStoreError::Conflict),
+                            );
                         },
                     );
                     assert!(

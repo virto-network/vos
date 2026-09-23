@@ -970,11 +970,22 @@ pub(crate) fn replayed_committed_suffix_outcome<
         .ok_or(JournalStoreError::Unavailable)
 }
 
+/// The guest's authenticated read-only answer. `Absent` is a positive guest
+/// statement that this exact invocation has no retained terminal disposition;
+/// storage, execution, and invalid-work failures remain errors, never absence.
+#[cfg(feature = "experimental-state-blocks")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RetainedExternalDisposition {
+    Absent,
+    Completed(RuntimeOutcome),
+    Acknowledged(RuntimeOutcome),
+}
+
 /// Physically inspect an exact terminal disposition against one independently
 /// authenticated runtime head. The caller must keep the store/head pinned;
 /// neither this read nor the guest may publish or mutate external blocks.
 #[cfg(feature = "experimental-state-blocks")]
-pub(crate) fn inspect_retained_external_outcome<
+pub(crate) fn inspect_retained_external_disposition<
     S: super::journal_store::AgentJournalStore,
     R: CatalogBlobResolver,
 >(
@@ -982,31 +993,27 @@ pub(crate) fn inspect_retained_external_outcome<
     recovered: &super::replay::ReplayMaterialization,
     executor: &ExternalLocalReplayExecutor<R>,
     input: &ReplayInput,
+    inspection_slot: u64,
     budget: &mut ReadBudget,
-) -> Result<RuntimeOutcome, super::journal_store::JournalStoreError> {
+) -> Result<RetainedExternalDisposition, super::journal_store::JournalStoreError> {
     use super::journal_store::JournalStoreError;
     use crate::agent_sdk::{RuntimeExecutionContext, RuntimeWork};
     if input.runtime != executor.binding().map_err(|_| JournalStoreError::Corrupt)? {
         return Err(JournalStoreError::Conflict);
     }
-    let (invocation, authorization, observed_slot, acknowledge) = match &input.operation {
+    let (invocation, authorization) = match &input.operation {
         ReplayOperation::CleanInvoke {
             context: RuntimeExecutionContext::Direct,
             work,
             authorization,
-            observed_slot,
-        } => (
-            InvocationRetirement::from_work(work),
-            authorization.clone(),
-            *observed_slot,
-            false,
-        ),
+            ..
+        } => (InvocationRetirement::from_work(work), authorization.clone()),
         ReplayOperation::CleanAcknowledge {
             context: RuntimeExecutionContext::Direct,
             work,
             authorization,
             ..
-        } => (work.clone(), authorization.clone(), 0, true),
+        } => (work.clone(), authorization.clone()),
         _ => return Err(JournalStoreError::NonCanonical),
     };
     let work = crate::agent_sdk::state_execution::StateExecutionWork::new(
@@ -1020,7 +1027,7 @@ pub(crate) fn inspect_retained_external_outcome<
             },
             invocation: Box::new(invocation.clone()),
             authorization: Box::new(authorization.clone()),
-            observed_slot,
+            observed_slot: inspection_slot,
         },
         recovered
             .external_inspection_lanes()
@@ -1032,26 +1039,63 @@ pub(crate) fn inspect_retained_external_outcome<
         .execute_admitted_work(&executor.runtime, &work, DEFAULT_MANAGEMENT_GAS)
         .map_err(|_| JournalStoreError::Unavailable)?;
     let outcome = output.transition().outcome.clone();
-    match (&outcome, acknowledge) {
-        (RuntimeOutcome::Completed(Ok(reply)), false)
+    match &outcome {
+        RuntimeOutcome::Completed(Ok(reply))
             if reply.invocation == invocation.invocation
                 && reply.actor == invocation.actor
                 && reply.incarnation == invocation.incarnation
                 && reply.deployment == invocation.deployment
                 && reply.mode == invocation.mode =>
         {
-            Ok(outcome)
+            Ok(RetainedExternalDisposition::Completed(outcome))
         }
-        (RuntimeOutcome::Completed(Err(error)), false) if error.is_durable_exact_outcome() => {
-            Ok(outcome)
+        RuntimeOutcome::Completed(Err(crate::agent_sdk::InvocationError::NotReady)) => {
+            Ok(RetainedExternalDisposition::Absent)
         }
-        (RuntimeOutcome::Acknowledged(Ok(reply)), true)
+        RuntimeOutcome::Completed(Err(error)) if error.is_durable_exact_outcome() => {
+            Ok(RetainedExternalDisposition::Completed(outcome))
+        }
+        RuntimeOutcome::Acknowledged(Ok(reply))
             if reply.invocation == invocation.invocation
                 && reply.work == invocation.commitment()
                 && reply.authorization == authorization.commitment() =>
         {
-            Ok(outcome)
+            Ok(RetainedExternalDisposition::Acknowledged(outcome))
         }
+        _ => Err(JournalStoreError::Unavailable),
+    }
+}
+
+/// Legacy exact-response projection: the requested terminal kind must match.
+/// A positive absence or the opposite lifecycle stage is still unavailable.
+#[cfg(feature = "experimental-state-blocks")]
+pub(crate) fn inspect_retained_external_outcome<
+    S: super::journal_store::AgentJournalStore,
+    R: CatalogBlobResolver,
+>(
+    store: &S,
+    recovered: &super::replay::ReplayMaterialization,
+    executor: &ExternalLocalReplayExecutor<R>,
+    input: &ReplayInput,
+    budget: &mut ReadBudget,
+) -> Result<RuntimeOutcome, super::journal_store::JournalStoreError> {
+    use super::journal_store::JournalStoreError;
+    let acknowledge = matches!(&input.operation, ReplayOperation::CleanAcknowledge { .. });
+    let inspection_slot = match &input.operation {
+        ReplayOperation::CleanInvoke { observed_slot, .. } => *observed_slot,
+        ReplayOperation::CleanAcknowledge { .. } => 0,
+        _ => return Err(JournalStoreError::NonCanonical),
+    };
+    match inspect_retained_external_disposition(
+        store,
+        recovered,
+        executor,
+        input,
+        inspection_slot,
+        budget,
+    )? {
+        RetainedExternalDisposition::Completed(outcome) if !acknowledge => Ok(outcome),
+        RetainedExternalDisposition::Acknowledged(outcome) if acknowledge => Ok(outcome),
         _ => Err(JournalStoreError::Unavailable),
     }
 }
@@ -1189,6 +1233,29 @@ impl ExternalLocalJournalOwner {
         })
     }
 
+    /// Preserve positive absence separately from I/O, guest execution, and
+    /// mismatched lifecycle stages. Invoke admission may execute only after
+    /// `Absent`; ACK admission may execute only after `Completed`. An
+    /// `Unavailable` error is never a license to run work. `inspection_slot`
+    /// must come from the host's trusted logical clock, not the request.
+    pub(crate) fn inspect_retained_disposition(
+        &self,
+        input: &ReplayInput,
+        inspection_slot: u64,
+        budget: &mut ReadBudget,
+    ) -> Result<RetainedExternalDisposition, super::journal_store::JournalStoreError> {
+        self.cursor.inspect(|store, recovered| {
+            inspect_retained_external_disposition(
+                store,
+                recovered,
+                &self.executor,
+                input,
+                inspection_slot,
+                budget,
+            )
+        })
+    }
+
     /// Recover a lost Invoke/ACK response from the authenticated committed
     /// suffix when it remains replayable, otherwise ask the guest at the
     /// current committed root. A conflict is never converted into a guest
@@ -1206,6 +1273,110 @@ impl ExternalLocalJournalOwner {
             Err(JournalStoreError::Unavailable) => self.inspect_retained_outcome(input, budget),
             Err(error) => Err(error),
         }
+    }
+
+    /// Admit one Direct Invoke or ACK through this locked, per-Agent owner.
+    /// Guest inspection is deliberately first: only a positive `Absent`
+    /// permits a new Invoke, and only a live `Completed` result permits ACK.
+    /// An inspection failure never falls through to execution. This is the
+    /// correctness-first route primitive; its extra read-only guest execution
+    /// must be measured before the release performance gate.
+    pub(crate) fn submit_direct_clean(
+        &mut self,
+        input: ReplayInput,
+        inspection_slot: u64,
+        budget: &mut ReadBudget,
+    ) -> Result<RuntimeOutcome, super::journal_store::JournalStoreError> {
+        use super::journal::{LocalEntry, OrderedEntry};
+        use super::journal_store::JournalStoreError;
+        use super::replay::{ExternalJournalCommit, ReplayError};
+        use crate::agent_sdk::RuntimeExecutionContext;
+
+        if input.validate().is_err() || input.runtime != *self.materialization()?.runtime() {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        let (invoke, recovery_only) = match &input.operation {
+            ReplayOperation::CleanInvoke {
+                context: RuntimeExecutionContext::Direct,
+                work,
+                observed_slot,
+                ..
+            } if *observed_slot == inspection_slot => (true, work.recovery_only),
+            ReplayOperation::CleanAcknowledge {
+                context: RuntimeExecutionContext::Direct,
+                ..
+            } => (false, false),
+            _ => return Err(JournalStoreError::NonCanonical),
+        };
+        let lane = input.persisted_lane();
+        if lane == PersistedLane::Merge {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        match (
+            invoke,
+            self.inspect_retained_disposition(&input, inspection_slot, budget)?,
+        ) {
+            (true, RetainedExternalDisposition::Absent) if !recovery_only => {}
+            (false, RetainedExternalDisposition::Completed(_)) => {}
+            (true, RetainedExternalDisposition::Completed(outcome))
+            | (false, RetainedExternalDisposition::Acknowledged(outcome)) => return Ok(outcome),
+            _ => return Err(JournalStoreError::Conflict),
+        }
+
+        for attempt in 0..2 {
+            let recovered = self.materialization()?;
+            let heads = recovered.heads();
+            let committed = match lane {
+                PersistedLane::Control | PersistedLane::Linear => {
+                    let entry = OrderedEntry {
+                        genesis: heads.genesis,
+                        index: heads
+                            .ordered_index
+                            .checked_add(1)
+                            .ok_or(JournalStoreError::LimitExceeded)?,
+                        parent: heads.ordered_head,
+                        merge_frontier: heads.merge_frontier,
+                        merge_seal: None,
+                        input: input.clone(),
+                    };
+                    self.apply_ordered(&entry, budget)
+                }
+                PersistedLane::Local => {
+                    let entry = LocalEntry {
+                        genesis: heads.genesis,
+                        node: heads.node,
+                        revision: heads
+                            .local_revision
+                            .checked_add(1)
+                            .ok_or(JournalStoreError::LimitExceeded)?,
+                        parent: heads.local_head,
+                        ordered_base: recovered.ordered_base(),
+                        merge_frontier: heads.merge_frontier,
+                        input: input.clone(),
+                    };
+                    self.apply_local(&entry, budget)
+                }
+                PersistedLane::Merge => unreachable!(),
+            };
+            match committed {
+                Ok(ExternalJournalCommit::Published(_, _, Some(outcome))) => return Ok(outcome),
+                Ok(ExternalJournalCommit::AlreadyCommitted(_)) => {
+                    return self.recover_retained_outcome(&input, budget);
+                }
+                Ok(ExternalJournalCommit::Published(_, _, None)) => {
+                    return Err(JournalStoreError::Corrupt);
+                }
+                Err(ReplayError::ReplayLimit) if attempt == 0 => {
+                    self.checkpoint(budget)
+                        .map_err(|_| JournalStoreError::Unavailable)?;
+                }
+                Err(ReplayError::Source(
+                    super::replay::ReplayMaterializationSourceError::Journal(error),
+                )) => return Err(error),
+                Err(_) => return Err(JournalStoreError::Unavailable),
+            }
+        }
+        Err(JournalStoreError::LimitExceeded)
     }
 
     /// The issuer may sign Create application only after the initial
