@@ -5041,6 +5041,36 @@ where
         Ok((agent, acknowledgement))
     }
 
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    fn verify_external_local_authorization_anchor<B: CleanManagementIssuerStore>(
+        &self,
+        slot: &super::clean_management_intent::CleanManagementIntentSlot<B>,
+    ) -> Result<(), SharedAgentHostError> {
+        let anchor = slot
+            .authorization_anchor()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let work = slot
+            .authorization_work()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let applied = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .management_invocation_after_anchor(
+                crate::service::AgentId(self.pins.agent.0),
+                anchor,
+                work,
+            )?;
+        applied.ok_or(SharedAgentHostError::ScopeMismatch)?;
+        Ok(())
+    }
+
     /// Drive external-state Local Create through the same signed CMI4/CIS2
     /// Authority lifecycle as image Local. A returned owner is physically
     /// reopened and finalized, but route attachment is the caller's separate
@@ -5192,6 +5222,16 @@ where
             {
                 return Err(SharedAgentHostError::ScopeMismatch);
             }
+            // Unretired recovery needs the saved authorization's exact
+            // system-journal witness. A completed retirement may have crossed
+            // a checkpoint which pruned that old anchor; its finalized issuer
+            // record and authenticated external generation are checked below.
+            if !slot
+                .retirement_complete()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            {
+                self.verify_external_local_authorization_anchor(&slot)?;
+            }
             let prepared =
                 RetainedExternalLocalCreate::prepare(&mut slot, target, &receipt, self.pins.node)?;
             if prepared.intent() != intent_hash {
@@ -5230,6 +5270,7 @@ where
                 return Err(error);
             }
         };
+        self.verify_external_local_authorization_anchor(&slot)?;
         let prepared =
             RetainedExternalLocalCreate::prepare(&mut slot, target, &receipt, self.pins.node)?;
         if prepared.intent() != intent_hash {
@@ -15763,6 +15804,9 @@ mod tests {
         #[test]
         #[ignore = "requires experimental standard and Authority guests"]
         fn native_external_local_create_finalizes_and_retries() {
+            use crate::agent::clean_management_intent::{
+                CleanManagementIntent, CleanManagementIntentSlot,
+            };
             use crate::agent::journal_store::FileLocalAgentJournalSlot;
             use crate::agent::sdk::state_blocks::ReadBudget;
 
@@ -15863,6 +15907,61 @@ mod tests {
                 ),
                 Err(SharedAgentHostError::Unavailable)
             ));
+
+            // A syntactically valid CMI4 with the exact signed request and
+            // finalized issuer record cannot substitute a different system
+            // journal anchor while the retirement is still incomplete.
+            let original = CleanManagementIntentSlot::open(intent_store.clone()).unwrap();
+            let mut wrong_authorization = original.authorization_anchor().unwrap().unwrap().clone();
+            let mut wrong_finalization = original.finalization_anchor().unwrap().unwrap().clone();
+            wrong_authorization.runtime.0[0] ^= 1;
+            wrong_finalization.runtime.0[0] ^= 1;
+            let forged_store = IssuerMemoryStore::default();
+            let mut forged = CleanManagementIntentSlot::open(forged_store.clone()).unwrap();
+            forged
+                .pledge(
+                    CleanManagementIntent::new(
+                        owner.authority_target(),
+                        call.managed,
+                        request.clone(),
+                        call.clone(),
+                        &RawCredentialVerifier,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            forged.retain_runtime(runtime.exact_bytes()).unwrap();
+            forged
+                .pledge_authorization_work(
+                    original.authorization_work().unwrap().unwrap().clone(),
+                    wrong_authorization,
+                )
+                .unwrap();
+            forged
+                .pledge_finalization_work(
+                    original.finalization_work().unwrap().unwrap().clone(),
+                    wrong_finalization,
+                )
+                .unwrap();
+            drop(forged);
+            let issuer_before = issuer_store.image.lock().unwrap().clone();
+            let signer_calls = signer.calls;
+            assert!(matches!(
+                owner.create_external_local_agent(
+                    forged_store,
+                    issuer_store.clone(),
+                    descriptor.clone(),
+                    call.clone(),
+                    runtime.clone(),
+                    &open_slot,
+                    &mut ReadBudget::new(10_000, 10_000_000),
+                    &mut signer,
+                ),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
+            assert_eq!(*issuer_store.image.lock().unwrap(), issuer_before);
+            assert_eq!(signer.calls, signer_calls);
+
             let mut recovery_budget = ReadBudget::new(10_000, 10_000_000);
             let (agent, acknowledgement, external) = owner
                 .create_external_local_agent(

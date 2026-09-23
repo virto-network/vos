@@ -69,8 +69,9 @@ the experimental ABI; its artifact is not replaced or implicitly upgraded.
 
 No released startup, lifecycle queue or route adapter selects this owner yet;
 the caller must choose Space/Node storage roots independently and attach a
-route only after authenticated finalization. Startup must verify the saved
-authorization anchor against the pinned system journal before recovery. Keep
+route only after authenticated finalization. Unretired Create now checks its
+saved authorization anchor against the pinned system journal before physical
+recovery; startup must restore its pending/retirement admission first. Keep
 the image Local path active until external selection, file-backed restart and
 near-3-MiB ACK recovery qualify. The external replay adapter covers signed
 Create, Install, Invoke and ACK without decoding private runtime state.
@@ -81,6 +82,18 @@ recover the external owner through the existing lifecycle controller, then
 route only after authenticated Create publication. Shared common finality and
 Clerk follow within batch 1. Candidate signed packages are not live admission;
 the large ACK's 5-billion-gas success is not a release-latency guarantee.
+
+External Local cutover TODOs, in order: (1) give the lifecycle controller a
+Space/Node-pinned external directory and explicit per-Agent format selection,
+then recover mixed image/external intents under one startup admission before
+publishing either kind of route; (2) attach an external per-Agent route owner
+with Install, Invoke, Resume and ACK using the existing signed journal
+semantics, not an image-host fallback; (3) qualify file-backed restart,
+near-ceiling ACK, candidate artifact identities and released-binary behavior.
+`LocalLifecycleController::with_recovery` currently assumes every discovered
+Agent is present in `LocalAgentHost`; merely accepting an external Create
+submission would strand it on restart. Keep that ingress disabled until these
+gates pass.
 
 Provisional acceptance envelope (customer confirmation required before sign-off):
 
