@@ -5597,6 +5597,33 @@ impl ReplayTransitionProofShadow {
 }
 
 impl ReplayMaterialization {
+    /// Read-only execution gets only authenticated external descriptors at
+    /// this exact head. The opaque component bytes are root descriptors, not
+    /// a host-side reconstruction of the runtime's private state.
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    pub(crate) fn external_inspection_lanes(
+        &self,
+    ) -> Result<Vec<crate::agent_sdk::state_execution::ExternalLaneWork>, JournalStoreError> {
+        if self.external_roots.is_empty()
+            || self.external_roots.len() > 3
+            || self.external_roots.contains_key(&PersistedLane::Control)
+        {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        self.external_roots
+            .iter()
+            .map(|(lane, root)| {
+                if root.descriptor.encode() != state_component(&self.state, *lane) {
+                    return Err(JournalStoreError::Corrupt);
+                }
+                Ok(crate::agent_sdk::state_execution::ExternalLaneWork {
+                    base: root.descriptor,
+                    next: root.descriptor.context(),
+                })
+            })
+            .collect()
+    }
+
     /// Advance only declared Ordered/Local roots using an accepted replay
     /// step. An execution cannot invent a lane's format, and a no-op must keep
     /// the old root-producing identity. Availability and publication are separate.
@@ -15833,6 +15860,22 @@ mod aggregate {
             }
         }
 
+        /// Scoped immutable view of the pinned head for read-only physical
+        /// inspection. No mutable store or publication capability escapes.
+        pub(crate) fn inspect<T>(
+            &self,
+            inspect: impl for<'a> FnOnce(
+                &'a S,
+                &'a ReplayMaterialization,
+            ) -> Result<T, JournalStoreError>,
+        ) -> Result<T, JournalStoreError> {
+            let materialization = self.materialization()?;
+            if self.store.heads()?.as_ref() != Some(materialization.heads()) {
+                return Err(JournalStoreError::Conflict);
+            }
+            inspect(&*self.store, materialization)
+        }
+
         /// Explicit maintenance checkpoint. Full root audits are budgeted here,
         /// never in the ordinary mutation path. Preserve the pinned store and
         /// poison on uncertain publication exactly as for mutations.
@@ -22957,20 +23000,15 @@ pub(crate) mod tests {
                 runtime_deployment: admitted.deployment(),
                 state: sdk_runtime_state(recovered.state()),
                 request: Box::new(sdk::ManagementRequest::InspectActors {
-                    after: None,
-                    limit: 16,
+                    after: super::super::external_local_executor::actor_cursor_before(
+                        install.entry.actor,
+                    ),
+                    limit: 1,
                 }),
                 authority: None,
                 observed_slot: 11,
             },
-            recovered
-                .external_roots
-                .values()
-                .map(|root| sdk::state_execution::ExternalLaneWork {
-                    base: root.descriptor,
-                    next: root.descriptor.context(),
-                })
-                .collect(),
+            recovered.external_inspection_lanes().unwrap(),
             admitted.external_state_limits(),
         )
         .unwrap();

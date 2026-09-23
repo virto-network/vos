@@ -28,6 +28,26 @@ struct AuthenticatedExternalInput {
     position: ReplayPosition,
 }
 
+/// The greatest valid directory cursor strictly below one nonzero ActorId.
+/// InspectActors is exclusive of `after`, so a one-entry page is a targeted
+/// lookup even when unrelated actors occupy the same Agent directory.
+pub(crate) fn actor_cursor_before(
+    actor: crate::agent_sdk::ActorId,
+) -> Option<crate::agent_sdk::ActorId> {
+    if actor == crate::agent_sdk::ActorId::ZERO {
+        return None;
+    }
+    let mut bytes = actor.0;
+    for byte in bytes.iter_mut().rev() {
+        if *byte != 0 {
+            *byte -= 1;
+            break;
+        }
+        *byte = u8::MAX;
+    }
+    (bytes != [0; 32]).then_some(crate::agent_sdk::ActorId(bytes))
+}
+
 /// One admitted external runtime, immutable actor catalog resolver and exact
 /// genesis descriptor. No standard-runtime private state is decoded here.
 /// Unsupported lifecycle forms fail closed until their external lane and
@@ -412,6 +432,92 @@ impl ExternalLocalJournalOwner {
         self.cursor.materialization()
     }
 
+    /// Inspect the installed directory against this owner's exact pinned
+    /// roots and locked store. Read-only guest output cannot publish changes
+    /// or replace the authenticated cursor. This is an internal route-building
+    /// primitive, not admission of a public route or lifecycle operation.
+    pub(crate) fn inspect_actors(
+        &self,
+        after: Option<crate::agent_sdk::ActorId>,
+        limit: u16,
+        observed_slot: u64,
+        budget: &mut ReadBudget,
+    ) -> Result<crate::agent_sdk::ActorDirectoryPage, super::journal_store::JournalStoreError> {
+        use super::journal_store::JournalStoreError;
+        use crate::agent_sdk::{self as sdk, RuntimeOutcome, state_execution::StateExecutionWork};
+
+        let binding = self
+            .executor
+            .binding()
+            .map_err(|_| JournalStoreError::ScopeMismatch)?;
+        self.cursor.inspect(|store, recovered| {
+            if recovered.runtime() != &binding {
+                return Err(JournalStoreError::ScopeMismatch);
+            }
+            let state = sdk::RuntimeState {
+                control: recovered.state().control.clone(),
+                linear: recovered.state().linear.clone(),
+                merge: recovered.state().merge.clone(),
+                local: recovered.state().local.clone(),
+            };
+            let work = StateExecutionWork::new(
+                sdk::RuntimeWork::Manage {
+                    context: sdk::RuntimeExecutionContext::Direct,
+                    space: self.executor.descriptor.identity.space,
+                    agent: self.executor.descriptor.identity.agent,
+                    runtime_deployment: self.executor.runtime.deployment(),
+                    state,
+                    request: Box::new(ManagementRequest::InspectActors { after, limit }),
+                    authority: None,
+                    observed_slot,
+                },
+                recovered.external_inspection_lanes()?,
+                self.executor.runtime.external_state_limits(),
+            )
+            .map_err(|_| JournalStoreError::NonCanonical)?;
+            let output = MultiLaneStateBlockHost { store, budget }
+                .execute_admitted_work(&self.executor.runtime, &work, DEFAULT_MANAGEMENT_GAS)
+                .map_err(|_| JournalStoreError::Unavailable)?;
+            match &output.transition().outcome {
+                RuntimeOutcome::Management(Ok(sdk::ManagementReply::Actors(page))) => {
+                    if page.entries.len() > usize::from(limit)
+                        || page.entries.first().is_some_and(|record| {
+                            after.is_some_and(|after| record.entry.actor <= after)
+                        })
+                        || (page.next.is_some() && page.entries.len() != usize::from(limit))
+                    {
+                        return Err(JournalStoreError::Corrupt);
+                    }
+                    Ok(page.clone())
+                }
+                _ => Err(JournalStoreError::Unavailable),
+            }
+        })
+    }
+
+    /// One guest directory execution for a single ActorId. This avoids
+    /// fetching every page for routed work, though the current ABI still
+    /// transports the runtime's complete metadata for this one execution.
+    pub(crate) fn inspect_actor(
+        &self,
+        actor: crate::agent_sdk::ActorId,
+        observed_slot: u64,
+        budget: &mut ReadBudget,
+    ) -> Result<
+        Option<crate::agent_sdk::ActorDirectoryRecord>,
+        super::journal_store::JournalStoreError,
+    > {
+        if actor == crate::agent_sdk::ActorId::ZERO {
+            return Err(super::journal_store::JournalStoreError::NonCanonical);
+        }
+        let page = self.inspect_actors(actor_cursor_before(actor), 1, observed_slot, budget)?;
+        Ok(page
+            .entries
+            .into_iter()
+            .next()
+            .filter(|record| record.entry.actor == actor))
+    }
+
     pub(crate) fn apply_ordered(
         &mut self,
         entry: &super::journal::OrderedEntry,
@@ -447,5 +553,25 @@ impl ExternalLocalJournalOwner {
         budget: &mut ReadBudget,
     ) -> Result<super::journal_store::JournalPublication, super::replay::RecoveryError> {
         self.cursor.checkpoint(&self.seal, budget)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::actor_cursor_before;
+    use crate::agent_sdk::ActorId;
+
+    #[test]
+    fn targeted_actor_cursor_handles_first_id_and_borrow() {
+        assert_eq!(actor_cursor_before(ActorId::ZERO), None);
+        let mut first = [0; 32];
+        first[31] = 1;
+        assert_eq!(actor_cursor_before(ActorId(first)), None);
+        first[30] = 1;
+        first[31] = 0;
+        let mut expected = [0; 32];
+        expected[31] = u8::MAX;
+        assert_eq!(actor_cursor_before(ActorId(first)), Some(ActorId(expected)));
+        assert!(ActorId(expected) < ActorId(first));
     }
 }

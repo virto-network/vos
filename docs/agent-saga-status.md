@@ -60,6 +60,12 @@ intent or expose a route. The owner reuses the durable head's validated
 materialization from the locked file opener, bound to that opener's ephemeral
 identity, while a staged successor remains separately validated and never
 becomes the serving cursor. Startup cost is still unmeasured.
+The owner can now physically inspect actors through that pinned head and
+locked store without publishing any state, but the active lifecycle and route
+adapter still do not use it. A single-Actor lookup uses one exclusive-cursor
+page instead of enumerating all actors. That execution still carries the
+runtime's full metadata through the guest; measure it during release
+qualification.
 `LocalJournalAgentDriver::prepare_local_genesis` still builds an r19 binding
 and `StandardLocalReplayExecutor`. A separate external Local preparer now
 authenticates the signed package, exact catalog closure, Create receipt and
@@ -676,6 +682,17 @@ correct pinned root. Missing blocks mean unavailable state, never absent keys.
   The complete prototype gate passed at
   `task-tmp/validated-cursor-prototype.log` (SDK 247/1 ignored, replay 69,
   physical PVM 17, journal-store 105 and feature-disabled groups).
+  Read-only serving follow-up: the locked owner now runs physical actor
+  inspection from the pinned authenticated roots and checks that the guest
+  changes neither state nor files. A named ActorId uses one exclusive-cursor
+  page, with boundary arithmetic tested independently; the recovered standard
+  Install test exercises that cursor and the materialization's current roots.
+  The focused file-backed test passed at `task-tmp/external-targeted-physical.log`,
+  the cursor unit test at `task-tmp/external-targeted-unit.log`, and the
+  feature-off check at `task-tmp/external-targeted-feature-off.log`. The full
+  prototype gate has not been rerun after this read-only follow-up. No route
+  currently selects this owner, and per-execution full-metadata transport
+  remains a measured-performance TODO.
   Production actor-package issuance and authoritative heads remain separate.
   Local Create-preparation follow-up: the new external preparer consumes a
   bounded immutable supplied catalog, rejects a missing package, verifies the

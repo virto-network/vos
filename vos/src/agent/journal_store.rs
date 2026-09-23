@@ -16915,6 +16915,24 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(owned.materialization().unwrap(), &recovered);
+                if !probe_mutations {
+                    let page = owned
+                        .inspect_actors(None, 1, 10, &mut ReadBudget::new(100, 100000))
+                        .unwrap();
+                    assert!(page.entries.is_empty());
+                    assert!(
+                        owned
+                            .inspect_actor(
+                                crate::agent_sdk::ActorId([1; 32]),
+                                10,
+                                &mut ReadBudget::new(100, 100000),
+                            )
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert_eq!(owned.materialization().unwrap().heads(), &expected);
+                    assert_eq!(file_tree_snapshot(&root), before_replay);
+                }
                 let parent = File::open(&directory.0).unwrap();
                 assert!(matches!(
                     FileLocalAgentJournalSlot::acquire_with_pinned_parents(
