@@ -1189,6 +1189,25 @@ impl ExternalLocalJournalOwner {
         })
     }
 
+    /// Recover a lost Invoke/ACK response from the authenticated committed
+    /// suffix when it remains replayable, otherwise ask the guest at the
+    /// current committed root. A conflict is never converted into a guest
+    /// lookup, and a missing guest disposition remains unavailable. This is
+    /// the response handoff that a future routed external Local adapter must
+    /// use after restart; it never re-executes an unseen invocation.
+    pub(crate) fn recover_retained_outcome(
+        &self,
+        input: &ReplayInput,
+        budget: &mut ReadBudget,
+    ) -> Result<RuntimeOutcome, super::journal_store::JournalStoreError> {
+        use super::journal_store::JournalStoreError;
+        match self.committed_suffix_outcome(input) {
+            Ok(outcome) => Ok(outcome),
+            Err(JournalStoreError::Unavailable) => self.inspect_retained_outcome(input, budget),
+            Err(error) => Err(error),
+        }
+    }
+
     /// The issuer may sign Create application only after the initial
     /// checkpoint-bearing head is durably reopened and exactly matches this
     /// owner seal. Later journal work cannot be mistaken for the first Create

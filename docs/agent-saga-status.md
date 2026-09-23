@@ -102,14 +102,19 @@ owner exposes this guest query for checkpoint-pruned Invoke and ACK responses;
 the Standard PVM physically recovered both after checkpoint/reopen. An ACK
 marker cannot resurrect the original Invoke response. The host does not decode
 the Standard runtime's private result layout or relax the signed work
-commitment's `recovery_only` binding. Before route attachment, qualify this
-handoff through the locked file owner (including unseen/mismatched inputs),
-then connect it to response-loss retry admission and startup recovery. A plain
-no-change Invoke retry alone is still not evidence of the original response.
+commitment's `recovery_only` binding. The file-backed physical lifecycle now
+drops the previous store handle, reopens the locked production owner after
+checkpoint, and recovers exact Invoke and ACK outcomes without changing its
+file tree. A wrong runtime and a validly signed unseen invocation are rejected,
+and ACK retirement hides the earlier Invoke result. This proves the owner
+handoff, not public response-loss retry:
+route admission and startup recovery are still disconnected. A plain no-change
+Invoke retry alone is still not evidence of the original response.
 Focused r04/s04 evidence: SDK feature-on/off suites passed (248 passed/1
 ignored and 247 passed/1 ignored); the compiled Standard physical
 Create/Install/Invoke/ACK/checkpoint/reopen test passed, including retained
-result, ACK, unseen-input refusal and retired-Invoke refusal; the candidate
+result, ACK, unseen-input refusal and retired-Invoke refusal; the file-backed
+locked-owner handoff passed through the same physical lifecycle; the candidate
 signed external Local Create/finality/retry test passed with rebuilt Standard
 and Authority guests. This is not full prototype, released-binary, file-owner
 retry, performance or outer-PVM qualification.

@@ -22726,6 +22726,12 @@ pub(crate) mod tests {
             &ExternalCheckpointValidation<'_>,
         ) -> Result<JournalPublication, JournalStoreError>,
         mut reopen: impl FnMut(S, &mut CapturedExternalExecutor) -> S,
+        mut verify_locked_owner: impl FnMut(
+            S,
+            &ReplayInput,
+            &crate::agent_sdk::RuntimeOutcome,
+            &mut CapturedExternalExecutor,
+        ) -> S,
         verify_final_head: impl FnOnce(S),
     ) where
         S: super::super::journal_store::ExternalMutationStore
@@ -23409,6 +23415,8 @@ pub(crate) mod tests {
                     Err(JournalStoreError::Unavailable),
                     "a valid unseen authorization cannot create a recovered response",
                 );
+                drop(production);
+                store = verify_locked_owner(store, &invoke, &first, &mut executor);
             }
             let ack = ReplayInput {
                 runtime: entry.input.runtime.clone(),
@@ -23491,6 +23499,9 @@ pub(crate) mod tests {
             executor.captures.clear();
             executor.pending = None;
             store = reopen(store, &mut executor);
+            if index == 0 {
+                store = verify_locked_owner(store, &ack, &acknowledged, &mut executor);
+            }
             if index == 0 {
                 // A checkpoint includes the latest input in its base, so
                 // reopening does not physically replay that input. Its
@@ -24855,6 +24866,7 @@ pub(crate) mod tests {
                 },
                 |_, _, _| unreachable!("memory fixture has no actor fault injection"),
                 |store, _| store,
+                |store, _, _, _| store,
                 |_| {},
             );
         }

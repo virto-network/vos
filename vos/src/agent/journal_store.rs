@@ -17385,6 +17385,7 @@ mod tests {
                             &mut ReadBudget::new(10000, 10000000),
                         )
                         .unwrap();
+                    let mut retained_invoke = None;
                     super::super::replay::tests::qualify_standard_durable_install(
                         store,
                         sealed,
@@ -17456,6 +17457,103 @@ mod tests {
                                 "reopen must not promote or repair interrupted publication"
                             );
                             reopened
+                        },
+                        |store, input, expected, executor| {
+                            let root = store.root().to_owned();
+                            let snapshot = file_tree_snapshot(&root);
+                            drop(store);
+                            let catalog = [super::super::execution::RuntimeBlob {
+                                reference: sealed.genesis().runtime().package.clone(),
+                                bytes: admitted.exact_bytes().to_vec(),
+                            }];
+                            let recreated =
+                                super::super::local_journal_driver::LocalJournalAgentDriver::<
+                                    MemoryAgentJournalStore,
+                                >::prepare_external_local_genesis(
+                                    sealed.genesis().create.clone(),
+                                    sealed.replica(),
+                                    &catalog,
+                                    sealed.replica().node,
+                                )
+                                .unwrap();
+                            let owned =
+                                super::super::external_local_executor::ExternalLocalJournalOwner::open(
+                                    acquire_production_local_slot(&directory, sealed),
+                                    recreated,
+                                    &mut ReadBudget::new(10000, 10000000),
+                                )
+                                .unwrap();
+                            assert_eq!(
+                                owned
+                                    .recover_retained_outcome(
+                                        input,
+                                        &mut ReadBudget::new(10000, 10000000),
+                                    )
+                                    .unwrap(),
+                                *expected,
+                                "locked file owner must recover the exact lost response",
+                            );
+                            let mut wrong_runtime = input.clone();
+                            wrong_runtime.runtime.agent = AgentId([0x77; 32]);
+                            assert_eq!(
+                                owned.recover_retained_outcome(
+                                    &wrong_runtime,
+                                    &mut ReadBudget::new(10000, 10000000),
+                                ),
+                                Err(JournalStoreError::Conflict),
+                            );
+                            if matches!(&input.operation, ReplayOperation::CleanInvoke { .. }) {
+                                let mut unseen = input.clone();
+                                let ReplayOperation::CleanInvoke {
+                                    work,
+                                    authorization:
+                                        crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
+                                            receipt,
+                                        ),
+                                    ..
+                                } = &mut unseen.operation
+                                else {
+                                    unreachable!()
+                                };
+                                work.invocation = crate::agent_sdk::InvocationId([0xa2; 32]);
+                                receipt.selector.request = work.commitment();
+                                receipt.signature = SigningKey::from_bytes(&[0x31; 32])
+                                    .sign(&receipt.signing_bytes())
+                                    .to_bytes();
+                                assert_eq!(
+                                    owned.recover_retained_outcome(
+                                        &unseen,
+                                        &mut ReadBudget::new(10000, 10000000),
+                                    ),
+                                    Err(JournalStoreError::Unavailable),
+                                    "a signed unseen invocation must not gain a response",
+                                );
+                                retained_invoke = Some(input.clone());
+                            } else {
+                                assert!(matches!(
+                                    &input.operation,
+                                    ReplayOperation::CleanAcknowledge { .. }
+                                ));
+                                assert_eq!(
+                                    owned.recover_retained_outcome(
+                                        retained_invoke.as_ref().unwrap(),
+                                        &mut ReadBudget::new(10000, 10000000),
+                                    ),
+                                    Err(JournalStoreError::Unavailable),
+                                    "retirement must hide the earlier Invoke result",
+                                );
+                            }
+                            assert_eq!(file_tree_snapshot(&root), snapshot);
+                            drop(owned);
+                            acquire_production_local_slot(&directory, sealed)
+                                .open_external_journal(
+                                    sealed,
+                                    true,
+                                    executor,
+                                    &super::super::replay::NoPrunedOrderedBases,
+                                    &mut ReadBudget::new(10000, 10000000),
+                                )
+                                .unwrap()
                         },
                         |store| {
                             let advanced = store.heads().unwrap().unwrap();
