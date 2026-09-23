@@ -272,11 +272,11 @@ pub fn admit_runtime_package(
 /// exposed, even when both contracts are compiled into the same host.
 #[cfg(feature = "experimental-state-blocks")]
 #[derive(Clone, Debug)]
-pub(crate) struct AdmittedStateRuntimePackage(AdmittedRuntimePackage);
+pub struct AdmittedStateRuntimePackage(AdmittedRuntimePackage);
 
 #[cfg(feature = "experimental-state-blocks")]
 impl AdmittedStateRuntimePackage {
-    pub(crate) fn exact_bytes(&self) -> &[u8] {
+    pub fn exact_bytes(&self) -> &[u8] {
         self.0.exact_bytes()
     }
 
@@ -309,31 +309,29 @@ impl AdmittedStateRuntimePackage {
         Ok(binding)
     }
 
-    pub(crate) fn manifest(&self) -> &AgentRuntimePackageManifest {
+    pub fn manifest(&self) -> &AgentRuntimePackageManifest {
         self.0.manifest()
     }
 
-    pub(crate) fn external_state_limits(
-        &self,
-    ) -> vos_agent_sdk::contract::ExternalStateResourceLimits {
+    pub fn external_state_limits(&self) -> vos_agent_sdk::contract::ExternalStateResourceLimits {
         self.manifest()
             .external_state_limits
             .expect("admitted external runtime carries signed limits")
     }
 
-    pub(crate) fn program_bytes(&self) -> &[u8] {
+    pub fn program_bytes(&self) -> &[u8] {
         self.0.program_bytes()
     }
 
-    pub(crate) fn program(&self) -> ProgramId {
+    pub fn program(&self) -> ProgramId {
         self.0.program()
     }
 
-    pub(crate) fn package_ref(&self) -> &BlobRef {
+    pub fn package_ref(&self) -> &BlobRef {
         self.0.package_ref()
     }
 
-    pub(crate) fn deployment(&self) -> DeploymentId {
+    pub fn deployment(&self) -> DeploymentId {
         self.0.deployment()
     }
 }
@@ -342,7 +340,7 @@ impl AdmittedStateRuntimePackage {
 /// experimental contract. This grants no journal/finality authority and does
 /// not open publication, bootstrap or production runtime selection.
 #[cfg(feature = "experimental-state-blocks")]
-pub(crate) fn admit_state_runtime_package(
+pub fn admit_state_runtime_package(
     bytes: &[u8],
 ) -> Result<AdmittedStateRuntimePackage, PackageAdmissionError> {
     let mut allowed = vos_pvm::spi::REFINE_HOST_CALL_ALLOWLIST.to_vec();

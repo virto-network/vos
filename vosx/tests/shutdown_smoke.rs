@@ -80,7 +80,7 @@ fn space_up_exits_cleanly_on_sigterm() {
 
 #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
 #[test]
-fn external_space_up_uses_fresh_roots_and_exits_cleanly() {
+fn external_space_create_and_exact_retry_after_restart() {
     run_shutdown_smoke("external-shutdown-smoke", true);
 }
 
@@ -105,6 +105,18 @@ fn run_shutdown_smoke(space_name: &str, external: bool) {
     let created_space: serde_json::Value =
         serde_json::from_slice(&created.stdout).expect("space creation JSON");
     let space_root = PathBuf::from(created_space["data_dir"].as_str().expect("space data dir"));
+    #[cfg(feature = "experimental-state-blocks")]
+    let candidate_present =
+        !include_bytes!(env!("VOSX_CANDIDATE_SYSTEM_AUTHORITY_PACKAGE")).is_empty();
+    #[cfg(not(feature = "experimental-state-blocks"))]
+    let candidate_present = false;
+    let http_port = if external && candidate_present {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("reserve an isolated HTTP test port");
+        listener.local_addr().unwrap().port()
+    } else {
+        0
+    };
     // Exercise both ingress services without competing with the developer's
     // default ports or with another test process.
     let storage = if external {
@@ -116,14 +128,14 @@ fn run_shutdown_smoke(space_name: &str, external: bool) {
         space_root.join("local.toml"),
         format!(
             "{storage}listen = [\"/ip4/127.0.0.1/tcp/0\"]\n\
-         [[ingress.http]]\nname = \"http\"\nlisten = \"127.0.0.1:0\"\n\
+         [[ingress.http]]\nname = \"http\"\nlisten = \"127.0.0.1:{http_port}\"\n\
          [[ingress.ssh]]\nname = \"ssh\"\nlisten = \"127.0.0.1:0\"\n"
         ),
     )
     .expect("write isolated ingress config");
 
     #[cfg(feature = "experimental-state-blocks")]
-    if external && include_bytes!(env!("VOSX_CANDIDATE_SYSTEM_AUTHORITY_PACKAGE")).is_empty() {
+    if external && !candidate_present {
         let refused = Command::new(vosx_bin())
             .args(["space", "up", space_name])
             .env("XDG_DATA_HOME", data_home.path())
@@ -144,6 +156,7 @@ fn run_shutdown_smoke(space_name: &str, external: bool) {
         return;
     }
 
+    let mut first_create: Option<serde_json::Value> = None;
     for boot in 0..if external { 2 } else { 1 } {
         let log_path = data_home.path().join(format!("daemon-{boot}.stderr"));
         let log_file = fs::File::create(&log_path).expect("create daemon log");
@@ -191,6 +204,49 @@ fn run_shutdown_smoke(space_name: &str, external: bool) {
             assert!(space_root.join("local-agent-external-lifecycle").is_dir());
             assert!(!space_root.join("local-agent-host").exists());
             assert!(!space_root.join("local-agent-lifecycle").exists());
+            let mut create = Command::new(vosx_bin());
+            create.args([
+                "space",
+                "create-local-agent",
+                space_name,
+                "--http",
+                &format!("127.0.0.1:{http_port}"),
+                "--format",
+                "json",
+            ]);
+            if boot == 1 {
+                create.arg("--resume");
+            }
+            let create_started = Instant::now();
+            let created = create
+                .env("XDG_DATA_HOME", data_home.path())
+                .env("XDG_CONFIG_HOME", config_home.path())
+                .env("XDG_CACHE_HOME", cache_home.path())
+                .env("VOSX_DISABLE_MDNS", "1")
+                .env("RUST_LOG", "vosx::commands::space::local_create=debug")
+                .output()
+                .expect("submit exact external Local Create");
+            eprintln!(
+                "{space_name} boot {boot} Local Create/retained retry completed after {} ms",
+                create_started.elapsed().as_millis(),
+            );
+            assert!(
+                created.status.success(),
+                "external Create boot {boot} failed: {}",
+                String::from_utf8_lossy(&created.stderr),
+            );
+            eprintln!("{}", String::from_utf8_lossy(&created.stderr));
+            let acknowledgement: serde_json::Value =
+                serde_json::from_slice(&created.stdout).expect("external Create JSON");
+            assert!(acknowledgement["agent"].is_string());
+            if let Some(first) = &first_create {
+                assert_eq!(
+                    &acknowledgement, first,
+                    "restart changed the exact Create ACK"
+                );
+            } else {
+                first_create = Some(acknowledgement);
+            }
         }
 
         // SAFETY: `child` is the live process created immediately above.

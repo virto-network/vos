@@ -1,8 +1,8 @@
 //! Preparation of an exact signed Local Create request for the native operator.
 //!
 //! Sequence allocation and durable request-file publication belong to the
-//! caller. This module never reads a clock, generates a nonce, loads a key, or
-//! submits a request: retries must reuse the persisted LCQ1 bytes.
+//! caller. Preparation never reads a clock, generates a nonce, loads a key, or
+//! submits a request: retries must reuse the persisted LCQ1/LCQ2 bytes.
 
 use std::num::NonZeroU64;
 
@@ -90,7 +90,14 @@ pub(crate) fn create_local(
         ensure_private_directory,
     };
     use vos::agent::sdk::{Hash, wire::CanonicalWire as _};
-    super::local_config::require_image_local_lifecycle(data)?;
+    let started = std::time::Instant::now();
+    let storage = super::local_config::load(data)?.local_agent_storage;
+    super::local_config::validate_local_storage_roots(data, storage)?;
+    #[cfg(not(feature = "experimental-state-blocks"))]
+    anyhow::ensure!(
+        storage == super::local_config::LocalAgentStorage::Image,
+        "external-state Local Create requires an experimental-state-blocks build",
+    );
     anyhow::ensure!(
         address.ip().is_loopback() && address.port() != 0,
         "Local Create requires a nonzero loopback endpoint"
@@ -98,7 +105,7 @@ pub(crate) fn create_local(
     let identity = CleanOperatorIdentitySigner::new(operator)?;
     let runtime = crate::bundled::root_signed_agent_runtime_package(operator)?;
     let authority_package = crate::bundled::root_signed_actor_package(
-        crate::bundled::system_authority_package_template(),
+        crate::bundled::system_authority_package_template_for_storage(storage)?,
         "system-authority",
         operator,
     )?;
@@ -156,25 +163,48 @@ pub(crate) fn create_local(
             let expires = now
                 .checked_add(3600)
                 .ok_or_else(|| anyhow::anyhow!("validity window overflow"))?;
-            let bytes = prepare_fresh(
-                operator,
-                space,
-                node_public,
-                nonce,
-                sequence,
-                now.saturating_sub(60),
-                expires,
-            )?
-            .encode();
+            let bytes = match storage {
+                super::local_config::LocalAgentStorage::Image => prepare_fresh(
+                    operator,
+                    space,
+                    node_public,
+                    nonce,
+                    sequence,
+                    now.saturating_sub(60),
+                    expires,
+                )?
+                .encode(),
+                super::local_config::LocalAgentStorage::ExternalState => {
+                    #[cfg(not(feature = "experimental-state-blocks"))]
+                    anyhow::bail!("external-state Local Create is unavailable in this build");
+                    #[cfg(feature = "experimental-state-blocks")]
+                    prepare_fresh_external(
+                        operator,
+                        space,
+                        node_public,
+                        nonce,
+                        sequence,
+                        now.saturating_sub(60),
+                        expires,
+                    )?
+                    .encode()
+                }
+            };
             store.publish(&bytes)?;
             bytes
         }
     };
-    let (descriptor, call, _) = LocalCreateSubmission::decode(&bytes)
-        .map_err(|error| anyhow::anyhow!("invalid retained Create: {error:?}"))?
-        .into_parts();
+    tracing::debug!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        retained_bytes = bytes.len(),
+        "Local Create request ready",
+    );
+    let (descriptor, call) = decode_retained_request(&bytes)?;
     anyhow::ensure!(
-        descriptor.creation_nonce == nonce
+        (storage == super::local_config::LocalAgentStorage::Image && bytes.starts_with(b"LCQ1")
+            || storage == super::local_config::LocalAgentStorage::ExternalState
+                && bytes.starts_with(b"LCQ2"))
+            && descriptor.creation_nonce == nonce
             && descriptor.identity.space == space
             && descriptor.identity.owner == identity.principal()
             && call.principal == identity.principal()
@@ -211,6 +241,7 @@ pub(crate) fn create_local(
         status != CredentialReservationStatus::Denied,
         "denied operation is missing its retained certificate"
     );
+    let submission_started = std::time::Instant::now();
     let ack = match submit_retained_disposition(&request_root, address)? {
         vos::agent::local_lifecycle::LocalCreateDisposition::Created(_, ack) => ack,
         vos::agent::local_lifecycle::LocalCreateDisposition::Denied(denial) => {
@@ -225,6 +256,10 @@ pub(crate) fn create_local(
             );
         }
     };
+    tracing::debug!(
+        elapsed_ms = submission_started.elapsed().as_millis() as u64,
+        "Local Create verified daemon response",
+    );
     let encoded = ack
         .encode()
         .map_err(|error| anyhow::anyhow!("encode acknowledgement: {error:?}"))?;
@@ -611,6 +646,81 @@ pub(crate) fn prepare_fresh(
     )
 }
 
+#[cfg(feature = "experimental-state-blocks")]
+pub(crate) fn prepare_fresh_external(
+    operator: &Keypair,
+    space: vos::agent::sdk::SpaceId,
+    node_public: [u8; 32],
+    nonce: vos::agent::sdk::Hash,
+    sequence: NonZeroU64,
+    valid_from: u64,
+    expires_at: u64,
+) -> anyhow::Result<vos::agent::local_lifecycle::LocalStateCreateSubmission> {
+    use vos::agent::sdk::{
+        AgentId, AgentIdentity, AgentProfile, AgentReplica, ProducerId, ReplicaRole,
+    };
+    let signer = CleanOperatorIdentitySigner::new(operator)?;
+    anyhow::ensure!(
+        node_public != signer.raw_public_key(),
+        "root and node identities must be distinct"
+    );
+    let node_key = libp2p::identity::ed25519::PublicKey::try_from_bytes(&node_public)
+        .map_err(|_| anyhow::anyhow!("invalid node public key"))?;
+    let node_peer = libp2p::identity::PublicKey::from(node_key).to_peer_id();
+    let system_runtime = crate::bundled::root_signed_agent_runtime_package(operator)?;
+    let authority_package = crate::bundled::root_signed_actor_package(
+        crate::bundled::system_authority_package_template_for_storage(
+            super::local_config::LocalAgentStorage::ExternalState,
+        )?,
+        "system-authority",
+        operator,
+    )?;
+    let (authority, _) = super::clean_startup::derive_system_authority_target(
+        space,
+        signer.raw_public_key(),
+        &system_runtime,
+        &authority_package,
+    )?;
+    let runtime = crate::bundled::root_signed_candidate_state_runtime_package(operator)?;
+    let descriptor = AgentDescriptor {
+        identity: AgentIdentity {
+            space,
+            agent: AgentId::derive(space, signer.principal(), nonce.as_bytes()),
+            owner: signer.principal(),
+            profile: AgentProfile::Local,
+            runtime_deployment: runtime.deployment(),
+            runtime_program: runtime.program(),
+            runtime_producer: runtime.manifest().signing.producer,
+            transition_producer: ProducerId::of_public_key(&node_public),
+        },
+        creation_nonce: nonce,
+        authority: authority.binding,
+        private_recovery: None,
+        runtime_package: runtime.package_ref().clone(),
+        runtime_contract: runtime.manifest().contract,
+        capabilities: runtime.manifest().capabilities,
+        replicas: vec![AgentReplica {
+            node: super::clean_identity::node_id_from_authenticated_peer(&node_peer),
+            principal: signer.principal(),
+            role: ReplicaRole::Voter,
+        }],
+    };
+    let call = sign_create_call(
+        operator,
+        authority,
+        &descriptor,
+        sequence,
+        valid_from,
+        expires_at,
+    )?;
+    vos::agent::local_lifecycle::LocalStateCreateSubmission::new(
+        descriptor,
+        call,
+        runtime.exact_bytes(),
+    )
+    .map_err(|error| anyhow::anyhow!("invalid signed external Local Create: {error:?}"))
+}
+
 /// Submit an already persisted request to a local daemon. No signing or
 /// sequence allocation occurs here; every error leaves the request retained.
 pub(crate) fn submit_retained(
@@ -651,9 +761,7 @@ fn submit_retained_disposition(
             None,
         )?;
         if status == 403 {
-            let denial = LocalCreateSubmission::decode(&bytes)
-                .and_then(|submission| submission.verify_denial(&reply))
-                .map_err(|error| anyhow::anyhow!("invalid signed denial: {error:?}"))?;
+            let denial = verify_denial(&bytes, &reply)?;
             Ok(LocalCreateDisposition::Denied(denial))
         } else {
             let ack = verify_acknowledgement(&bytes, &reply)?;
@@ -695,10 +803,47 @@ pub(crate) fn verify_acknowledgement(
     request: &[u8],
     response: &[u8],
 ) -> anyhow::Result<vos::agent::sdk::authority::ManagementApplicationAck> {
-    let submission = LocalCreateSubmission::decode(request)
-        .map_err(|error| anyhow::anyhow!("invalid retained Local Create: {error:?}"))?;
-    let (_, call, _) = submission.into_parts();
+    let (_, call) = decode_retained_request(request)?;
     verify_call_acknowledgement(&call, response)
+}
+
+/// Authenticate either exact Create format without converting the runtime
+/// package type or allowing an image request on the external owner.
+pub(crate) fn decode_retained_request(
+    request: &[u8],
+) -> anyhow::Result<(AgentDescriptor, AuthorityCredentialCall)> {
+    match request.get(..4) {
+        Some(b"LCQ1") => {
+            let (descriptor, call, _) = LocalCreateSubmission::decode(request)
+                .map_err(|error| anyhow::anyhow!("invalid retained LCQ1: {error:?}"))?
+                .into_parts();
+            Ok((descriptor, call))
+        }
+        #[cfg(feature = "experimental-state-blocks")]
+        Some(b"LCQ2") => {
+            let submission =
+                vos::agent::local_lifecycle::LocalStateCreateSubmission::decode(request)
+                    .map_err(|error| anyhow::anyhow!("invalid retained LCQ2: {error:?}"))?;
+            Ok((submission.descriptor().clone(), submission.call().clone()))
+        }
+        _ => anyhow::bail!("unrecognized Local Create request format"),
+    }
+}
+
+pub(crate) fn verify_denial(
+    request: &[u8],
+    response: &[u8],
+) -> anyhow::Result<vos::agent::local_lifecycle::LocalCreateDenial> {
+    match request.get(..4) {
+        Some(b"LCQ1") => LocalCreateSubmission::decode(request)
+            .and_then(|submission| submission.verify_denial(response))
+            .map_err(|error| anyhow::anyhow!("invalid signed denial (LCQ1): {error:?}")),
+        #[cfg(feature = "experimental-state-blocks")]
+        Some(b"LCQ2") => vos::agent::local_lifecycle::LocalStateCreateSubmission::decode(request)
+            .and_then(|submission| submission.verify_denial(response))
+            .map_err(|error| anyhow::anyhow!("invalid signed denial (LCQ2): {error:?}")),
+        _ => anyhow::bail!("unrecognized Local Create request format"),
+    }
 }
 
 /// The caller must first authenticate the retained Create/Install submission;
@@ -761,6 +906,26 @@ pub(crate) fn prepare(
     valid_from: u64,
     expires_at: u64,
 ) -> anyhow::Result<LocalCreateSubmission> {
+    let call = sign_create_call(
+        operator,
+        authority,
+        &descriptor,
+        sequence,
+        valid_from,
+        expires_at,
+    )?;
+    LocalCreateSubmission::new(descriptor, call, runtime)
+        .map_err(|error| anyhow::anyhow!("invalid signed Local Create: {error:?}"))
+}
+
+fn sign_create_call(
+    operator: &Keypair,
+    authority: AuthorityActorTarget,
+    descriptor: &AgentDescriptor,
+    sequence: NonZeroU64,
+    valid_from: u64,
+    expires_at: u64,
+) -> anyhow::Result<AuthorityCredentialCall> {
     let identity = CleanOperatorIdentitySigner::new(operator)?;
     anyhow::ensure!(
         descriptor.identity.owner == identity.principal(),
@@ -797,8 +962,7 @@ pub(crate) fn prepare(
         .map_err(|_| anyhow::anyhow!("Local Create signing failed"))?
         .try_into()
         .map_err(|_| anyhow::anyhow!("Local Create signature must be Ed25519"))?;
-    LocalCreateSubmission::new(descriptor, call, runtime)
-        .map_err(|error| anyhow::anyhow!("invalid signed Local Create: {error:?}"))
+    Ok(call)
 }
 
 #[cfg(test)]
@@ -809,6 +973,36 @@ pub(crate) mod tests {
         ActorId, AgentId, AgentIdentity, AgentProfile, AgentReplica, DeploymentId, Hash, NodeId,
         ProducerId, ProgramId, ReplicaRole, SpaceId,
     };
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn checked_external_package_prepares_distinct_exact_create() {
+        if crate::bundled::candidate_state_runtime_pvm().is_err() {
+            return;
+        }
+        let operator = Keypair::ed25519_from_bytes([0x63; 32]).unwrap();
+        let node = Keypair::ed25519_from_bytes([0x64; 32]).unwrap();
+        let node_public = node.public().try_into_ed25519().unwrap().to_bytes();
+        let prepared = prepare_fresh_external(
+            &operator,
+            SpaceId([1; 32]),
+            node_public,
+            Hash([2; 32]),
+            NonZeroU64::new(1).unwrap(),
+            10,
+            100,
+        )
+        .unwrap();
+        let bytes = prepared.encode();
+        assert!(bytes.starts_with(b"LCQ2"));
+        assert!(LocalCreateSubmission::decode(&bytes).is_err());
+        let (descriptor, call) = decode_retained_request(&bytes).unwrap();
+        assert_eq!(descriptor, *prepared.descriptor());
+        assert_eq!(call, *prepared.call());
+        let mut altered = bytes;
+        *altered.last_mut().unwrap() ^= 1;
+        assert!(decode_retained_request(&altered).is_err());
+    }
 
     pub(crate) fn fixture() -> (
         Keypair,

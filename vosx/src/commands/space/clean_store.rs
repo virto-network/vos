@@ -1673,9 +1673,8 @@ impl CleanCredentialReservation {
         use vos::agent::sdk::Hash;
         let ack = super::local_create::verify_acknowledgement(request, acknowledgement)
             .map_err(|_| CleanFileStoreError::Corrupt)?;
-        let submission = vos::agent::local_lifecycle::LocalCreateSubmission::decode(request)
+        let (descriptor, call) = super::local_create::decode_retained_request(request)
             .map_err(|_| CleanFileStoreError::Corrupt)?;
-        let (descriptor, call, _) = submission.into_parts();
         if descriptor.identity.space != self.space || call.credential != self.credential {
             return Err(CleanFileStoreError::Corrupt);
         }
@@ -1746,10 +1745,8 @@ impl CleanCredentialReservation {
     ) -> Result<(), CleanFileStoreError> {
         use vos::agent::sdk::Hash;
         let bytes = denial.load()?.ok_or(CleanFileStoreError::RequestConflict)?;
-        let submission =
-            vos::agent::local_lifecycle::LocalCreateSubmission::decode(&denial.request)
-                .map_err(|_| CleanFileStoreError::Corrupt)?;
-        let (descriptor, call, _) = submission.into_parts();
+        let (descriptor, call) = super::local_create::decode_retained_request(&denial.request)
+            .map_err(|_| CleanFileStoreError::Corrupt)?;
         if descriptor.identity.space != self.space || call.credential != self.credential {
             return Err(CleanFileStoreError::Corrupt);
         }
@@ -2133,8 +2130,7 @@ impl CleanLocalCreateDenialFile {
         if bytes.len() > StoreRole::LocalCreateDenial.maximum_bytes() {
             return Err(CleanFileStoreError::Oversized);
         }
-        vos::agent::local_lifecycle::LocalCreateSubmission::decode(&self.request)
-            .and_then(|submission| submission.verify_denial(bytes))
+        super::local_create::verify_denial(&self.request, bytes)
             .map(|_| ())
             .map_err(|_| CleanFileStoreError::Corrupt)
     }
@@ -2172,9 +2168,9 @@ impl CleanLocalCreateRequestFile {
         if bytes.len() > StoreRole::LocalCreateRequest.maximum_bytes() {
             return Err(CleanFileStoreError::Oversized);
         }
-        let submission = vos::agent::local_lifecycle::LocalCreateSubmission::decode(bytes)
+        let (_, call) = super::local_create::decode_retained_request(bytes)
             .map_err(|_| CleanFileStoreError::Corrupt)?;
-        if submission.into_parts().1.authenticated_node.is_some() {
+        if call.authenticated_node.is_some() {
             return Err(CleanFileStoreError::Corrupt);
         }
         Ok(())

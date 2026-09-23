@@ -39,6 +39,14 @@ const CANDIDATE_SYSTEM_AUTHORITY_PACKAGE: &[u8] =
 #[cfg(feature = "experimental-state-blocks")]
 const CANDIDATE_STATE_RUNTIME_PVM: &[u8] = include_bytes!(env!("VOSX_CANDIDATE_STATE_RUNTIME_PVM"));
 const BUNDLED_AGENT_RUNTIME_PACKAGE_NAME: &str = "standard-agent-runtime";
+#[cfg(feature = "experimental-state-blocks")]
+const CANDIDATE_STATE_RUNTIME_PACKAGE_NAME: &str = "standard-agent-runtime-state";
+#[cfg(feature = "experimental-state-blocks")]
+const FIRST_CUSTOMER_LOCAL_STATE_LIMITS: vos::agent::sdk::contract::ExternalStateResourceLimits =
+    vos::agent::sdk::contract::ExternalStateResourceLimits {
+        max_rows_per_lane: 500_000,
+        max_row_bytes_per_lane: 512 * 1024 * 1024,
+    };
 
 /// Prepare the complete, root-signed package closure used by native bootstrap.
 /// Caching is availability only: installation still requires Authority approval.
@@ -173,20 +181,55 @@ pub(crate) fn system_catalog_package_template() -> &'static [u8] {
 pub(crate) fn root_signed_agent_runtime_package(
     root: &Keypair,
 ) -> anyhow::Result<AdmittedRuntimePackage> {
+    let bytes = root_signed_runtime_package_bytes(
+        root,
+        agent_runtime_pvm(),
+        BUNDLED_AGENT_RUNTIME_PACKAGE_NAME,
+        RuntimePackageContract::canonical(),
+        None,
+    )?;
+    // Return only the host-admitted value. This proves canonical encoding,
+    // signer/producer binding, exact Ed25519 verification, and that the
+    // bundled outer artifact parses as a canonical standard PVM.
+    admit_runtime_package(&bytes).map_err(Into::into)
+}
+
+/// A separately admitted, explicitly capped package for new external Local
+/// Agents. No image deployment or Shared system Agent selects this runtime.
+#[cfg(feature = "experimental-state-blocks")]
+pub(crate) fn root_signed_candidate_state_runtime_package(
+    root: &Keypair,
+) -> anyhow::Result<vos::agent::package_admission::AdmittedStateRuntimePackage> {
+    let bytes = root_signed_runtime_package_bytes(
+        root,
+        candidate_state_runtime_pvm()?,
+        CANDIDATE_STATE_RUNTIME_PACKAGE_NAME,
+        RuntimePackageContract::experimental_state_blocks(),
+        Some(FIRST_CUSTOMER_LOCAL_STATE_LIMITS),
+    )?;
+    vos::agent::package_admission::admit_state_runtime_package(&bytes).map_err(Into::into)
+}
+
+fn root_signed_runtime_package_bytes(
+    root: &Keypair,
+    runtime_pvm: &[u8],
+    name: &str,
+    contract: RuntimePackageContract,
+    external_state_limits: Option<vos::agent::sdk::contract::ExternalStateResourceLimits>,
+) -> anyhow::Result<Vec<u8>> {
     require_ed25519_space_root(root.key_type())?;
     let public_key = root
         .public()
         .try_into_ed25519()
         .map_err(|_| anyhow!("space root did not yield a raw Ed25519 public key"))?
         .to_bytes();
-    let runtime_pvm = agent_runtime_pvm();
     let outer_program = BlobRef::of_bytes(runtime_pvm);
     let mut envelope = PackageEnvelope {
         manifest: PackageManifest::AgentRuntime(AgentRuntimePackageManifest {
-            name: BUNDLED_AGENT_RUNTIME_PACKAGE_NAME.into(),
-            external_state_limits: None,
+            name: name.into(),
+            external_state_limits,
             outer_program: outer_program.clone(),
-            contract: RuntimePackageContract::canonical(),
+            contract,
             capabilities: RuntimeCapabilities::standard(),
             signing: PackageSigning {
                 producer: ProducerId::of_public_key(&public_key),
@@ -211,12 +254,7 @@ pub(crate) fn root_signed_agent_runtime_package(
             )
         })?;
     envelope.manifest.signing_mut().signature = signature;
-    let bytes = envelope.encode()?;
-
-    // Return only the host-admitted value. This proves canonical encoding,
-    // signer/producer binding, exact Ed25519 verification, and that the
-    // bundled outer artifact parses as a canonical standard PVM.
-    admit_runtime_package(&bytes).map_err(Into::into)
+    envelope.encode().map_err(Into::into)
 }
 
 /// Rebind a checked source-derived actor package template to the explicit
@@ -337,7 +375,22 @@ mod tests {
             authority
                 .require_runtime(vos::agent::sdk::AgentProfile::Shared, &runtime)
                 .unwrap();
-            assert!(!candidate_state_runtime_pvm().unwrap().is_empty());
+            let state = root_signed_candidate_state_runtime_package(&root).unwrap();
+            assert_eq!(
+                state.program_bytes(),
+                candidate_state_runtime_pvm().unwrap()
+            );
+            assert_eq!(
+                state.external_state_limits(),
+                FIRST_CUSTOMER_LOCAL_STATE_LIMITS
+            );
+            assert_eq!(
+                state.exact_bytes(),
+                root_signed_candidate_state_runtime_package(&root)
+                    .unwrap()
+                    .exact_bytes(),
+            );
+            assert!(admit_runtime_package(state.exact_bytes()).is_err());
         }
     }
 

@@ -269,9 +269,9 @@ an image host. An opt-in `vosx` build with `experimental-state-blocks` now
 selects fresh external lifecycle and journal roots, completes this recovery,
 and hands its finalized owners to production reconciliation. The default
 binary still rejects the option before opening a Local root. The opt-in path
-is candidate-only: the bundled released Authority/runtime artifacts are not
-the experimental ABI, and the backing rejects image-shaped Create/Install
-calls; no usable external Create/Install ingress is claimed.
+uses a separate checked Authority and state runtime candidate; the backing
+rejects image-shaped Create/Install calls. External Install ingress remains
+disabled.
 The same internal controller can now drive a typed new external Create under
 retained lifecycle leases. Exact Create retry verifies the immutable signed
 archive and original physical generation through the already-held owner; it
@@ -287,11 +287,10 @@ Create wrapper also passed on a dedicated 2-MiB thread stack; the all-in-one
 fixture still uses 4 MiB. The opt-in production queue now retains LCQ2 as a
 distinct variant, and HTTP accepts it at the existing Local Create endpoint
 only with `experimental-state-blocks`. The production owner uses the same
-route reconciliation as image Create after external physical finality. No
-external Create CLI or full file-backed/public retry qualification is claimed.
-The physical fixture exercises the typed queue, shutdown rejection and
-type-erased Create on a 2-MiB thread, then exact retry/restart. Feature-on and
-default HTTP validation tests pass; neither is an end-to-end ingress test.
+route reconciliation as image Create after external physical finality. The
+physical fixture exercises the typed queue, shutdown rejection and
+type-erased Create on a 2-MiB thread, then exact retry/restart. The new CLI
+and daemon-subprocess evidence below supersede the earlier ingress-only gate.
 The file-store regression independently confirms that a runtime-only candidate
 is discoverable after lease release/reopen with no intent or issuer image. It
 does not replace the pending end-to-end file-backed lifecycle test.
@@ -311,8 +310,8 @@ and attach a route only after authenticated finalization. Unretired Create
 checks its
 saved authorization anchor against the pinned system journal before physical
 recovery; startup must restore its pending/retirement admission first. Keep
-the image Local path active until a file-backed external Agent survives restart,
-near-3-MiB ACK recovery and typed lifecycle ingress qualify. The external
+the image Local path active until Install, publicly routed Invoke/ACK retry,
+near-3-MiB ACK recovery and final artifact qualification pass. The external
 replay adapter covers signed
 Create, Install, Invoke, Resume and ACK without decoding private runtime state,
 subject to the Resume/yield gates above.
@@ -341,44 +340,45 @@ probes an external-state Create through the PVM before writing a separate PVM;
 two conversions of the same guest ELF were byte-identical. The probe checks
 the XSW2 response and bounded state changes, but does not authorize a package
 or publish a journal head. The PVM is now embedded alongside the candidate
-Authority for explicit external startup, but no public Local Create package
-or CLI uses it yet. A source/revision-pinned release bundle and real Agent
-daemon recovery remain required.
-Image-format Local Create/Install CLI commands now reject an external-state
-Space before reserving a credential or retaining a request; the opt-in daemon
-cannot accidentally strand an LCQ1 request while typed LCQ2 ingress is absent.
-An actual `vosx` subprocess smoke created a fresh external Space, published an
-endpoint, verified that both external roots and neither image Local root exist,
-shut down cleanly, and reopened the same roots on a second boot. Endpoint
-readiness took 13.18 and 8.24 seconds respectively; paired image runs took
-13.50 seconds with the opt-in binary and 13.29 seconds with the default binary
-on this developer host. These observations expose slow system startup; the
-smoke has no external Agent, response-loss retry, crash recovery or throughput
-qualification.
-With both checked candidate artifacts embedded, the same binary-subprocess
-subprocess smoke passed fresh external startup and restart (endpoint ready in
-12.57 and 7.73 seconds); without them, startup refused before opening external
-roots. This verifies artifact selection and empty-root recovery, not the
-file-backed Agent lifecycle or final release artifact set.
+Authority for explicit external startup and signed into a distinct admitted
+LCQ2 Local runtime package. The provisional package ceilings are 500,000 rows
+and 512 MiB logical row bytes per lane; these are explicit signed limits, not
+measured service capacity. A source/revision-pinned release bundle remains
+required.
+The Local Create CLI now selects LCQ1 for image Spaces and LCQ2 for fresh
+external Spaces before reserving a request. Its retained file stores verify
+either exact type, denial and ACK, while checking that the persisted type still
+matches the selected storage mode. Image-format Install continues to reject
+external Spaces before reserving a credential; external Install is not wired.
+With both checked candidate artifacts embedded, a binary-subprocess smoke
+passed fresh external startup, Local Create over HTTP, full daemon shutdown,
+restart and exact `--resume` returning the same signed ACK. On a developer
+debug binary, endpoint readiness was 12.98 and 9.90 seconds; fresh Create took
+21.46 seconds (3.26 seconds before request retention, 17.96 seconds awaiting
+the verified daemon response) and post-restart exact retry 4.26 seconds
+(0.16 seconds before request retention, 3.84 seconds awaiting the response).
+The complete test took 50.46 seconds. These are diagnostic timings, not release
+latency claims. Most fresh-Create time is beyond client preparation; separate
+daemon/Authority, physical execution and durable-publication spans before
+optimizing or blaming the PVM.
+Without both candidates, startup refused before opening external roots. This qualifies a
+file-backed Create/restart/retry slice, not simulated response loss, Install,
+routed actor Invoke/ACK, throughput or final release artifacts.
 The current released-binary path is `vosx` clean startup -> image-based
 `LocalAgentHost` -> image-backed `LocalLifecycleController` -> Local route backend. The
 older `host::LocalGenesisIntent` file opener accepts r19 only. Next, qualify
-real file-backed restart through the opt-in external selection, then enable
-its correctly typed CLI/client request and qualify route refresh after
-authenticated Create publication. Shared common finality and Clerk follow
-within batch 1. Candidate signed packages are not live admission;
+external Install under the same file-backed owner and a public actor route
+after authenticated Create publication. Shared common finality and Clerk
+follow within batch 1. Candidate package admission is not release admission;
 the large ACK's 5-billion-gas success is not a release-latency guarantee.
 
-External Local cutover TODOs, in order: (1) qualify the opt-in `vosx` fresh-root
-startup with an Agent under real file-backed lifecycle leases, a response-loss
-restart and the complete Install handoff under those leases (the internal
-actor-sidecar crash window has a physical fixture); existing image roots stay
-on their current path, and mixed-format migration is deferred;
-(2) qualify the opt-in typed LCQ2 production dispatch and connect external
-Install to it, resolving approved-but-guest-rejected Install
-without stranding its intent; add Resume using the existing signed journal
-semantics, not an image-host fallback; (3) qualify
-publicly routed response-loss retry after file-backed restart,
+External Local cutover TODOs, in order: (1) qualify response loss during
+file-backed Create delivery, then the complete external Install handoff under
+those leases (the internal actor-sidecar crash window has a physical fixture);
+resolve approved-but-guest-rejected Install without stranding its intent;
+(2) qualify publicly routed Invoke/ACK and Resume through the locked owner,
+including response-loss retry after restart without an image-host fallback;
+(3) qualify
 near-ceiling ACK, candidate artifact identities and released-binary behavior.
 The image `with_recovery` still assumes an image host; the separate external
 startup path retains locked journal owners. Do not enable external mode in the
@@ -1534,13 +1534,14 @@ backup or long-running retention tests.
   previous bounded-state checkpoint was `6bcff6fe`. Neither is production
   release evidence.
 - Implementation continues on `wip/ch08-runtime-directory` after this
-  checkpoint. Locked file-owner retry and an internal Direct route worker have
-  qualified. Next: explicit fresh-root external startup recovery and route
-  attachment, then remaining batch 1. This signed Create/Invoke seam is
-  internal, not deployed.
-- Current focused checks are recorded above: candidate signed Local Create,
-  physical Standard Invoke/ACK checkpoint recovery, SDK feature-on/off and
-  feature-disabled `vos` pass. Full prototype, released-binary and workspace
+  checkpoint. Fresh external-root startup, signed LCQ2 Create through the
+  binary, restart and exact ACK retry now pass with checked opt-in artifacts.
+  Install and publicly routed actor Invoke/ACK remain batch-1 gates. No
+  production deployment is claimed.
+- Current focused checks are recorded above: binary-subprocess external Create
+  and exact restart retry, image startup and Create regressions, candidate
+  signed runtime admission, physical Standard Invoke/ACK checkpoint recovery,
+  and SDK feature-on/off. Full prototype, final release-binary and workspace
   qualification have not been rerun for r04/s04.
 - Master is unchanged; nothing is pushed. Review read-only and apply findings
   on the implementation branch to avoid conflicting fixes.

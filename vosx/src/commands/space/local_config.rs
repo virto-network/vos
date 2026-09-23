@@ -115,6 +115,7 @@ pub(crate) fn require_image_local_lifecycle(data_dir: &Path) -> anyhow::Result<(
         load(data_dir)?.local_agent_storage == LocalAgentStorage::Image,
         "image-format Local Create/Install cannot target external-state storage; no lifecycle request was retained",
     );
+    validate_local_storage_roots(data_dir, LocalAgentStorage::Image)?;
     Ok(())
 }
 
