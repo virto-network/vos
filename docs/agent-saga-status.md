@@ -1287,20 +1287,21 @@ backup or long-running retention tests.
 
 ## Branch boundary
 
-- Reviewer: `saga/agents` is at bounded-state checkpoint `6bcff6fe`;
-  see [the review guide](agent-saga-review.md). This is
-  prototype qualification, not production release evidence.
-- Implementation continues on `wip/ch08-runtime-directory` from that checkpoint.
-  The next work is external Local startup selection/recovery and route attachment,
-  then remaining batch 1. This signed Create seam is internal, not deployed.
-- Current WIP checks: candidate Authority/standard-guest signed Local Create,
-  interrupted retirement and expired-window retry pass; existing physical
-  external-genesis publication/crash-recovery passes after the ACK clock fix.
-  Feature-disabled `vos` and default Authority builds still check. None of
-  these is released-binary or full-workspace qualification.
+- Reviewer: `saga/agents` carries the scoped r04/s04 response-recovery
+  checkpoint described in [the review guide](agent-saga-review.md). The
+  previous bounded-state checkpoint was `6bcff6fe`. Neither is production
+  release evidence.
+- Implementation continues on `wip/ch08-runtime-directory` after this
+  checkpoint. Next: qualify locked file-owner retry, connect mixed image/
+  external startup selection and route attachment, then remaining batch 1.
+  This signed Create/Invoke seam is internal, not deployed.
+- Current focused checks are recorded above: candidate signed Local Create,
+  physical Standard Invoke/ACK checkpoint recovery, SDK feature-on/off and
+  feature-disabled `vos` pass. Full prototype, released-binary and workspace
+  qualification have not been rerun for r04/s04.
 - Master is unchanged; nothing is pushed. Review read-only and apply findings
   on the implementation branch to avoid conflicting fixes.
-- Exact formatted-tree checkpoint gate passed at
+- Historical bounded-state checkpoint gate passed at
   `task-tmp/state-review-checkpoint-prototype.log`: SDK 247/1 ignored,
   replay 69, physical PVM 16, journal-store 105 and feature-disabled groups.
   `cargo fmt --all -- --check`, `git diff --check`, and offline/locked

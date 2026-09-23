@@ -1,41 +1,39 @@
-# Agent saga: bounded-state checkpoint review
+# Agent saga: external Local response-recovery checkpoint
 
-Review `saga/agents` relative to `7bae9269`. This checkpoint is one scoped
-experimental storage/runtime slice, not the first-customer release or a
-deployable node path. Do not apply fixes on the review branch; return findings
-for the implementation branch. The [live plan](agent-saga-status.md) records
-all remaining production, performance and release gates.
+Review `saga/agents` relative to `39109358`. This is one scoped experimental
+retry/recovery slice, not a deployable node path or first-customer release. Do
+not apply fixes on the review branch; return findings for the implementation
+branch. The [live plan](agent-saga-status.md) records the remaining gates.
 
-Review the slice as three connected contracts:
+Review three connected contracts:
 
-1. `vos-agent-sdk/src/state_*`, `actor_storage.rs` and the standard guest in
-   `wire.rs`: independently selected authenticated roots, bounded touched-row
-   reads/writes, lane-wide counters, atomic opaque metadata/results, exact
-   retries, fail-closed missing blocks and quota/budget exhaustion. The signed
-   experimental package has a 3-MiB state admission cap; r19 is unchanged.
-2. `state_block_pvm.rs`, `state_block_store.rs`, `journal.rs`, `replay.rs` and
-   `journal_store.rs`: exact package/ABI and lane-context binding, physical
-   capture, immutable staging, sealed publication, ordered/Local replay,
-   checkpoint/GC and crash/reopen. Challenge all three file-publication fault
-   points for real Create, Install, Invoke and ACK, including stale/poisoned
-   owners and exact committed retry without duplicate effects.
-3. `package_admission.rs`, `state_block_pvm_lifecycle_tests.rs` and
-   `local_journal_driver.rs`: the compiled macro actor has a signed admitted
-   package; the separate external Local Create preparer checks the supplied
-   catalog, receipt and replica before minting a root-bearing seal. Its output
-   is compared to the fixture path, but it is **not** wired into the production
-   Local intent, file-slot owner or route.
+1. `external_local_executor.rs` and `local_journal_driver.rs`: exact-head and
+   bounded older-head responses require the authenticated durable suffix and
+   matching physical replay output. A newer lifecycle step blocks an older
+   response; cache eviction and checkpoint pruning fail closed.
+2. `vos-agent-sdk/src/runtime.rs`, `state_execution.rs`, `wire.rs`, and the
+   Standard guest in `vos/src/agent/{standard,wire}.rs`: experimental r04/s04
+   `InspectInvocation` reads the original reference-only work/authorization
+   against guest-owned retained result/ACK state. Absence is not a retained
+   `NotFound`; inspection cannot execute unseen work or mutate state/blocks.
+   Feature-off r19 rejects the new tag, and released bundled artifacts are
+   unchanged.
+3. `state_block_pvm.rs`, `replay.rs` and the pinned owner: the physical guest
+   recovers an Invoke result and ACK after checkpoint/reopen, rejects a valid
+   unseen input and refuses to resurrect Invoke after ACK. Challenge scope,
+   signature, runtime-package, root, head, and staged-successor substitutions.
+   The locked file-owner retry handoff and public route are **not** qualified
+   or enabled; do not infer them from the memory-store physical fixture.
 
-Run `just test-agent-state-prototype` with a disk-backed target and `TMPDIR`;
-the latest complete log is
-`.worktrees/ch08-c2-native/target/task-tmp/state-review-checkpoint-prototype.log`
-from the repository root. The test recipe builds
-the pinned experimental guests and covers SDK/feature-off, physical PVM,
-replay and journal-store groups. It does not qualify released binaries, real
-Authority/finality, Shared lifecycle, Clerk, backup or throughput. A valid
-standard-runtime ACK near the 3-MiB cap remains untested; the smaller
-exact-signed-limit ACK and worst-case opaque metadata rewrite are separate
-evidence. Yield/Resume and external Merge writes fail closed.
+Focused checks passed with a disk-backed target: SDK feature-on/off suites
+(248/1 ignored and 247/1 ignored),
+`compiled_standard_external_genesis_publication_and_crash_recovery` with the
+rebuilt Standard candidate guest, and `just test-agent-state-local-create` with
+rebuilt Standard/Authority candidates. Feature-on/off `vos` checks, formatting
+and diff checks passed. The previous full prototype log below is historical;
+`just test-agent-state-prototype` was not rerun for r04/s04. None of this
+qualifies released binaries, Shared lifecycle, Clerk, backup or throughput.
+External yielded writes and Merge writes remain disabled.
 
 Please report severity, file/line, violated invariant, concrete failure
 scenario, and a regression. Distinguish demonstrated bugs from design risks.
