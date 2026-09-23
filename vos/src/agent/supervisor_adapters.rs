@@ -3307,7 +3307,7 @@ pub(crate) fn route_identities(
     Ok(identities)
 }
 
-fn collect_actor_directory(
+pub(crate) fn collect_actor_directory(
     maximum: usize,
     mut inspect: impl FnMut(Option<ActorId>, u16) -> Result<ActorDirectoryPage, AgentRouteError>,
 ) -> Result<Vec<ActorDirectoryRecord>, AgentRouteError> {

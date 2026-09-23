@@ -16108,6 +16108,12 @@ mod tests {
                 .unwrap();
             assert_eq!((retry_agent, retry_ack), (agent, acknowledgement));
             assert_eq!(reopened.materialization().unwrap().heads(), &first_head);
+            assert!(
+                reopened
+                    .route_identities(LOGICAL_SLOT + 20, &mut ReadBudget::new(10_000, 10_000_000),)
+                    .unwrap()
+                    .is_empty()
+            );
             drop(reopened);
 
             // Retirement is a terminal physical boundary. If its stable

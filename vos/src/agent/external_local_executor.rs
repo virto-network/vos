@@ -895,6 +895,27 @@ impl ExternalLocalJournalOwner {
             .filter(|record| record.entry.actor == actor))
     }
 
+    /// Build the current Local route identities from this authenticated
+    /// journal's runtime directory. This does not publish or authorize a
+    /// route; the lifecycle controller must finish recovery/finality first.
+    pub(crate) fn route_identities(
+        &self,
+        observed_slot: u64,
+        budget: &mut ReadBudget,
+    ) -> Result<Vec<super::supervisor::AgentRouteIdentity>, super::supervisor::AgentRouteError>
+    {
+        use super::supervisor::AgentRouteError;
+        let descriptor = &self.executor.descriptor;
+        let records = super::supervisor_adapters::collect_actor_directory(
+            descriptor.capabilities.max_actors as usize,
+            |after, limit| {
+                self.inspect_actors(after, limit, observed_slot, budget)
+                    .map_err(|_| AgentRouteError::Unavailable)
+            },
+        )?;
+        super::supervisor_adapters::route_identities(descriptor, records, AgentProfile::Local)
+    }
+
     pub(crate) fn apply_ordered(
         &mut self,
         entry: &super::journal::OrderedEntry,

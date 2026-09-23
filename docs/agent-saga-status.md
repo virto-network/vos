@@ -76,6 +76,9 @@ candidates, rejecting malformed names, orphan generations and limit overflow.
 The startup recovery model matches those candidates against independently
 verified lifecycle stores. Discovery is not authority: controller integration
 must still replay every matched generation before route attachment.
+The external owner can build route identities from its authenticated read-only
+directory, reusing the same bounded paging and identity checks as image Local.
+No external route worker or public attachment exists yet.
 
 No released startup, lifecycle queue or route adapter selects this owner yet;
 the caller must choose Space/Node storage roots independently and attach a
