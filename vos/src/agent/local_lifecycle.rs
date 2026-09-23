@@ -2175,6 +2175,7 @@ enum LocalBacking {
     External {
         // The pinned directory and every locked owner outlive route workers.
         _directory: super::journal_store::ExternalLocalJournalDirectory,
+        maximum: usize,
         owners: BTreeMap<
             AgentId,
             Arc<Mutex<super::external_local_executor::ExternalLocalJournalOwner>>,
@@ -2270,6 +2271,7 @@ where
             system: Arc::new(Mutex::new(system)),
             local: LocalBacking::External {
                 _directory: directory,
+                maximum,
                 owners,
                 clock,
             },
@@ -2293,6 +2295,161 @@ where
             }
         }
         Ok(controller)
+    }
+
+    /// Drive an opt-in external Create under retained lifecycle leases. An
+    /// exact retry of an already-serving generation verifies its immutable
+    /// Create archive against the same locked owner; it must not reacquire
+    /// the stable lock or publish a second physical head. Public LCQ2 ingress
+    /// remains closed until the production queue and client retain this type.
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    pub fn create_external(
+        &mut self,
+        submission: LocalStateCreateSubmission,
+        budget: &mut super::sdk::state_blocks::ReadBudget,
+    ) -> Result<(AgentId, ManagementApplicationAck), SharedAgentHostError>
+    where
+        F::Intent: super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore,
+    {
+        use super::clean_authority_issuer::DurableCleanManagementIssuer;
+        use super::clean_management_intent::{CleanManagementIntent, CleanManagementIntentSlot};
+        use super::external_local_executor::ExternalLocalCreateArchive;
+
+        let LocalBacking::External {
+            _directory: directory,
+            maximum,
+            owners,
+            ..
+        } = &mut self.local
+        else {
+            return Err(SharedAgentHostError::Unavailable);
+        };
+        let (descriptor, call, runtime) = submission.into_parts();
+        let agent = descriptor.identity.agent;
+        let request = ManagementRequest::Create(Box::new(descriptor));
+        let mut system = self
+            .system
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let target = system.authority_target();
+        let node = system.pins().node();
+        let intent = CleanManagementIntent::new(
+            target,
+            call.managed,
+            request,
+            call,
+            &super::clean_bootstrap::RawCredentialVerifier,
+        )
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let ManagementRequest::Create(created_descriptor) = intent.request() else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        if intent.call().managed.agent != agent
+            || created_descriptor.identity.profile != AgentProfile::Local
+            || created_descriptor.identity.space != system.pins().space()
+            || created_descriptor.authority != target.binding
+            || created_descriptor.replicas.len() != 1
+            || created_descriptor.replicas[0].node != node
+            || created_descriptor.replicas[0].role != super::sdk::ReplicaRole::Voter
+            || !super::external_local_executor::state_runtime_matches_descriptor(
+                created_descriptor,
+                &runtime,
+            )
+            || directory.space() != crate::service::SpaceId(target.space.0)
+            || directory.node() != crate::service::NodeId(node.0)
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let (intent_store, issuer_store) = match self.retained_stores.entry(agent) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                if owners.contains_key(&agent) {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                if owners.len() >= *maximum {
+                    return Err(SharedAgentHostError::CapacityExhausted);
+                }
+                let stores = self
+                    .stores
+                    .open(target.space, agent)
+                    .map_err(|_| SharedAgentHostError::Unavailable)?;
+                entry.insert(stores)
+            }
+        };
+        let mut slot = CleanManagementIntentSlot::open(intent_store)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let mut issuer =
+            DurableCleanManagementIssuer::open(issuer_store, target.binding, target.space, agent)
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if let Some(owner) = owners.get(&agent) {
+            let archive = slot
+                .load_external_create_archive()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .ok_or(SharedAgentHostError::ScopeMismatch)
+                .and_then(|bytes| {
+                    ExternalLocalCreateArchive::decode(&bytes)
+                        .map_err(|_| SharedAgentHostError::ScopeMismatch)
+                })?;
+            let runtime_bytes = slot
+                .load_runtime()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            let current = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
+            let owner = owner
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            if archive.intent().request() != intent.request()
+                || archive.intent().call() != intent.call()
+                || runtime_bytes != runtime.exact_bytes()
+                || !archive.matches_owner(current, target, node, &owner)
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            if matches!(current.request(), ManagementRequest::Create(_)) {
+                let finalized = issuer
+                    .recover_finalized_application(
+                        target,
+                        intent.call().managed,
+                        intent.request(),
+                        intent.call(),
+                        &super::clean_bootstrap::RawCredentialVerifier,
+                    )
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+                    .ok_or(SharedAgentHostError::Conflict)?;
+                if finalized.1 != *archive.acknowledgement() {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+            }
+            return Ok((agent, archive.acknowledgement().clone()));
+        }
+        if owners.len() >= *maximum {
+            return Err(SharedAgentHostError::CapacityExhausted);
+        }
+        let (created, acknowledgement, owner) = system.create_external_local_agent_on_slots(
+            &mut slot,
+            &mut issuer,
+            intent,
+            runtime,
+            directory,
+            budget,
+            &mut self.signer,
+        )?;
+        if created != agent {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        match owners.entry(agent) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(Arc::new(Mutex::new(owner)));
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+        }
+        Ok((created, acknowledgement))
     }
 
     /// Recover the complete Shared set before this controller can be handed to
@@ -2991,6 +3148,49 @@ where
             .into_inner()
             .unwrap();
         (system, local, stores, signer)
+    }
+
+    #[cfg(all(
+        test,
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    pub(crate) fn into_external_parts_for_test(
+        self,
+    ) -> (
+        CleanSystemAgentBootstrapOwner<P, R, I>,
+        super::journal_store::ExternalLocalJournalDirectory,
+        F,
+        S,
+    ) {
+        let Self {
+            system,
+            local,
+            stores,
+            retained_stores,
+            signer,
+            operations,
+            admins,
+            shared_genesis,
+        } = self;
+        assert!(operations.is_none() && admins.is_none() && shared_genesis.is_none());
+        drop(retained_stores);
+        let LocalBacking::External {
+            _directory: directory,
+            owners,
+            ..
+        } = local
+        else {
+            panic!("external test extraction requires an external Local backing");
+        };
+        drop(owners);
+        let system = Arc::try_unwrap(system)
+            .ok()
+            .expect("retire system route workers first")
+            .into_inner()
+            .unwrap();
+        (system, directory, stores, signer)
     }
 
     /// Install into an existing Local Agent, retaining the same exclusive

@@ -84,6 +84,14 @@ impl ExternalLocalCreateArchive {
     pub(crate) const MAX_BYTES: usize =
         super::clean_authority_issuer::MAX_CLEAN_EXTERNAL_LOCAL_CREATE_ARCHIVE_BYTES;
 
+    pub(crate) fn intent(&self) -> &super::clean_management_intent::CleanManagementIntent {
+        &self.intent
+    }
+
+    pub(crate) fn acknowledgement(&self) -> &crate::agent_sdk::authority::ManagementApplicationAck {
+        &self.acknowledgement
+    }
+
     pub(crate) fn new(
         intent: super::clean_management_intent::CleanManagementIntent,
         receipt: crate::agent_sdk::authority::AuthorityReceipt,

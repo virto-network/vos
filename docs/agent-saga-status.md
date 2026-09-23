@@ -252,6 +252,17 @@ binary still rejects the option before opening a Local root. The opt-in path
 is candidate-only: the bundled released Authority/runtime artifacts are not
 the experimental ABI, and the backing rejects image-shaped Create/Install
 calls; no usable external Create/Install ingress is claimed.
+The same internal controller can now drive a typed new external Create under
+retained lifecycle leases. Exact Create retry verifies the immutable signed
+archive and original physical generation through the already-held owner; it
+does not reacquire its own stable lock. The candidate physical fixture creates
+a second Agent through this method, retries both a newly created and a later-
+installed Agent, then reconstructs the controller and recovers both physical
+generations and the exact ACK. Its lifecycle stores are memory-backed, not
+the `vosx` file leases. A signed wrong-node Create is rejected before the
+store factory can create a lifecycle directory. The new Create wrapper also
+passed on a dedicated 2-MiB thread stack; the all-in-one fixture still uses
+4 MiB. No LCQ2 production queue or HTTP path is enabled.
 Focused r04/s04 evidence: SDK feature-on/off suites passed (248 passed/1
 ignored and 247 passed/1 ignored); the compiled Standard physical
 Create/Install/Invoke/ACK/checkpoint/reopen test passed, including retained
@@ -301,10 +312,10 @@ within batch 1. Candidate signed packages are not live admission;
 the large ACK's 5-billion-gas success is not a release-latency guarantee.
 
 External Local cutover TODOs, in order: (1) qualify the opt-in `vosx` fresh-root
-startup with real file-backed lifecycle leases, a response-loss restart and
-the pre-sidecar crash window; existing image roots stay on their current path,
-and mixed-format migration is deferred;
-(2) connect typed LCQ2 Create and external Install to production lifecycle
+startup with an Agent under real file-backed lifecycle leases, a response-loss
+restart and the pre-sidecar crash window; existing image roots stay on their
+current path, and mixed-format migration is deferred;
+(2) connect the internal typed LCQ2 Create and external Install to production lifecycle
 dispatch and route refresh, resolving approved-but-guest-rejected Install
 without stranding its intent; add Resume using the existing signed journal
 semantics, not an image-host fallback; (3) qualify

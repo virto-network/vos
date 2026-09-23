@@ -16080,6 +16080,7 @@ mod tests {
                 agent: AgentId,
                 intent: IssuerMemoryStore,
                 issuer: IssuerMemoryStore,
+                fresh: Option<(AgentId, IssuerMemoryStore, IssuerMemoryStore)>,
             }
 
             impl LocalLifecycleStoreFactory for ExternalStores {
@@ -16091,7 +16092,14 @@ mod tests {
                     if space != self.space || maximum == 0 {
                         return Err(());
                     }
-                    Ok(vec![self.agent])
+                    let mut agents = vec![self.agent];
+                    if let Some((agent, intent, _)) = &self.fresh
+                        && intent.image.lock().unwrap().is_some()
+                    {
+                        agents.push(*agent);
+                    }
+                    agents.sort_unstable();
+                    (agents.len() <= maximum).then_some(agents).ok_or(())
                 }
 
                 fn open_existing(
@@ -16099,10 +16107,19 @@ mod tests {
                     space: SpaceId,
                     agent: AgentId,
                 ) -> Result<(Self::Intent, Self::Issuer), ()> {
-                    if space != self.space || agent != self.agent {
+                    if space != self.space {
                         return Err(());
                     }
-                    Ok((self.intent.clone(), self.issuer.clone()))
+                    if agent == self.agent {
+                        return Ok((self.intent.clone(), self.issuer.clone()));
+                    }
+                    let Some((fresh, intent, issuer)) = &self.fresh else {
+                        return Err(());
+                    };
+                    if agent != *fresh || intent.image.lock().unwrap().is_none() {
+                        return Err(());
+                    }
+                    Ok((intent.clone(), issuer.clone()))
                 }
 
                 fn open(
@@ -16110,6 +16127,12 @@ mod tests {
                     space: SpaceId,
                     agent: AgentId,
                 ) -> Result<(Self::Intent, Self::Issuer), ()> {
+                    if let Some((fresh, intent, issuer)) = &self.fresh
+                        && space == self.space
+                        && agent == *fresh
+                    {
+                        return Ok((intent.clone(), issuer.clone()));
+                    }
                     self.open_existing(space, agent)
                 }
             }
@@ -16298,6 +16321,7 @@ mod tests {
                 agent: descriptor.identity.agent,
                 intent: intent_store.clone(),
                 issuer: issuer_store.clone(),
+                fresh: None,
             };
             let mut recovery =
                 discover_local_lifecycle_recovery(&mut stores, owner.authority_target(), 1)
@@ -16594,7 +16618,7 @@ mod tests {
                     &mut signer,
                 )
                 .unwrap();
-            assert_eq!((retry_agent, retry_ack), (agent, acknowledgement));
+            assert_eq!((retry_agent, retry_ack), (agent, acknowledgement.clone()));
             assert_eq!(reopened.materialization().unwrap().heads(), &first_head);
             assert!(
                 reopened
@@ -16696,6 +16720,7 @@ mod tests {
                 agent: descriptor.identity.agent,
                 intent: intent_store.clone(),
                 issuer: issuer_store.clone(),
+                fresh: None,
             };
             let mut post_install_recovery = discover_local_lifecycle_recovery(
                 &mut post_install_stores,
@@ -16802,6 +16827,7 @@ mod tests {
                 agent: descriptor.identity.agent,
                 intent: intent_store.clone(),
                 issuer: issuer_store.clone(),
+                fresh: None,
             };
             let recovery =
                 discover_local_lifecycle_recovery(&mut orphan_stores, owner.authority_target(), 1)
@@ -16832,16 +16858,40 @@ mod tests {
             // The production controller must adopt the recovered locked
             // generation without constructing an image host. The attachment
             // is created only after signed startup finality has passed.
+            let mut fresh_descriptor = descriptor.clone();
+            fresh_descriptor.creation_nonce = Hash([0xde; 32]);
+            fresh_descriptor.identity.agent = AgentId::derive(
+                fresh_descriptor.identity.space,
+                fresh_descriptor.identity.owner,
+                fresh_descriptor.creation_nonce.as_bytes(),
+            );
+            fresh_descriptor.validate().unwrap();
+            let fresh_request = ManagementRequest::Create(Box::new(fresh_descriptor.clone()));
+            let (mut fresh_call, _) =
+                credential_call_and_approval(&fresh_descriptor, &fresh_request, &credential_key);
+            fresh_call.authority = owner.authority_target();
+            fresh_call.request_sequence = core::num::NonZeroU64::new(3).unwrap();
+            fresh_call.requested_valid_from = LOGICAL_SLOT + 20;
+            fresh_call.requested_expires_at = LOGICAL_SLOT + 60;
+            fresh_call.invocation = fresh_call.expected_invocation();
+            fresh_call.signature = credential_key.sign(&fresh_call.signing_bytes()).to_bytes();
+            let fresh_intent = IssuerMemoryStore::default();
+            let fresh_issuer = IssuerMemoryStore::default();
             let mut controller_stores = ExternalStores {
                 space: descriptor.identity.space,
                 agent: descriptor.identity.agent,
                 intent: intent_store.clone(),
                 issuer: issuer_store.clone(),
+                fresh: Some((
+                    fresh_descriptor.identity.agent,
+                    fresh_intent.clone(),
+                    fresh_issuer.clone(),
+                )),
             };
             let controller_recovery = discover_local_lifecycle_recovery(
                 &mut controller_stores,
                 owner.authority_target(),
-                1,
+                2,
             )
             .unwrap();
             let controller =
@@ -16852,21 +16902,122 @@ mod tests {
                     signer,
                     controller_recovery,
                     Arc::clone(&harness.fixture.trust),
-                    1,
+                    2,
                     &mut ReadBudget::new(10_000, 10_000_000),
                 )
                 .unwrap();
-            use crate::agent::local_lifecycle::NativeLocalLifecycle as _;
+            let mut controller = controller;
+            let exact_create = crate::agent::local_lifecycle::LocalStateCreateSubmission::new(
+                descriptor.clone(),
+                call.clone(),
+                runtime.exact_bytes(),
+            )
+            .unwrap();
             assert_eq!(
-                controller.local_agents().unwrap(),
-                Some(vec![descriptor.identity.agent])
+                controller
+                    .create_external(exact_create, &mut ReadBudget::new(10_000, 10_000_000),)
+                    .unwrap(),
+                (agent, acknowledgement.clone()),
+                "the post-Install Create retry must reuse the locked generation",
             );
+            let mut wrong_node = fresh_descriptor.clone();
+            wrong_node.creation_nonce = Hash([0xdf; 32]);
+            wrong_node.identity.agent = AgentId::derive(
+                wrong_node.identity.space,
+                wrong_node.identity.owner,
+                wrong_node.creation_nonce.as_bytes(),
+            );
+            wrong_node.replicas[0].node = crate::agent::sdk::NodeId([0x99; 32]);
+            wrong_node.validate().unwrap();
+            let wrong_request = ManagementRequest::Create(Box::new(wrong_node.clone()));
+            let (mut wrong_call, _) =
+                credential_call_and_approval(&wrong_node, &wrong_request, &credential_key);
+            wrong_call.authority = fresh_call.authority;
+            wrong_call.request_sequence = core::num::NonZeroU64::new(3).unwrap();
+            wrong_call.requested_valid_from = LOGICAL_SLOT + 20;
+            wrong_call.requested_expires_at = LOGICAL_SLOT + 60;
+            wrong_call.invocation = wrong_call.expected_invocation();
+            wrong_call.signature = credential_key.sign(&wrong_call.signing_bytes()).to_bytes();
+            assert!(matches!(
+                controller.create_external(
+                    crate::agent::local_lifecycle::LocalStateCreateSubmission::new(
+                        wrong_node,
+                        wrong_call,
+                        runtime.exact_bytes(),
+                    )
+                    .unwrap(),
+                    &mut ReadBudget::new(10_000, 10_000_000),
+                ),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
+            let fresh_submission = || {
+                crate::agent::local_lifecycle::LocalStateCreateSubmission::new(
+                    fresh_descriptor.clone(),
+                    fresh_call.clone(),
+                    runtime.exact_bytes(),
+                )
+                .unwrap()
+            };
+            let fresh_input = fresh_submission();
+            let (fresh_agent, fresh_ack) = std::thread::scope(|scope| {
+                std::thread::Builder::new()
+                    .name("external-local-controller-create-stack".into())
+                    .stack_size(2 * 1024 * 1024)
+                    .spawn_scoped(scope, || {
+                        controller
+                            .create_external(fresh_input, &mut ReadBudget::new(10_000, 10_000_000))
+                    })
+                    .unwrap()
+                    .join()
+                    .unwrap()
+            })
+            .unwrap();
+            assert_eq!(fresh_agent, fresh_descriptor.identity.agent);
+            assert_eq!(
+                controller
+                    .create_external(fresh_submission(), &mut ReadBudget::new(10_000, 10_000_000),)
+                    .unwrap(),
+                (fresh_agent, fresh_ack.clone()),
+                "a live exact retry must reuse the newly locked generation",
+            );
+            use crate::agent::local_lifecycle::NativeLocalLifecycle as _;
+            let mut expected = vec![descriptor.identity.agent, fresh_agent];
+            expected.sort_unstable();
+            assert_eq!(controller.local_agents().unwrap(), Some(expected.clone()));
             controller
                 .local_attachment_for_agent(descriptor.identity.agent)
                 .unwrap()
                 .retire()
                 .unwrap();
-            drop(controller);
+            let (system, directory, mut controller_stores, signer) =
+                controller.into_external_parts_for_test();
+            let restarted_recovery = discover_local_lifecycle_recovery(
+                &mut controller_stores,
+                system.authority_target(),
+                2,
+            )
+            .unwrap();
+            let mut restarted =
+                crate::agent::local_lifecycle::LocalLifecycleController::with_external_recovery(
+                    system,
+                    directory,
+                    controller_stores,
+                    signer,
+                    restarted_recovery,
+                    Arc::clone(&harness.fixture.trust),
+                    2,
+                    &mut ReadBudget::new(10_000, 10_000_000),
+                )
+                .unwrap();
+            assert_eq!(restarted.local_agents().unwrap(), Some(expected));
+            assert_eq!(
+                restarted
+                    .create_external(fresh_submission(), &mut ReadBudget::new(10_000, 10_000_000),)
+                    .unwrap(),
+                (fresh_agent, fresh_ack),
+                "recovered Create must keep its exact ACK and original file generation",
+            );
+            drop(restarted);
             harness.stop();
         }
 
