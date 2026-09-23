@@ -976,31 +976,44 @@ mod tests {
         bytes: u64,
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum PhysicalStateSize {
+        Ordinary,
+        ExactSignedLimit,
+        NearCeiling,
+    }
+
     #[test]
     #[ignore = "requires just build-agent-standard-state-guest"]
     fn compiled_standard_ack_retires_metadata_without_changing_rows() {
-        standard_external_execution_fixture(false, false, false);
+        standard_external_execution_fixture(false, false, PhysicalStateSize::Ordinary);
     }
 
     #[test]
     #[ignore = "requires just build-agent-standard-state-guest"]
     fn compiled_standard_ack_at_exact_signed_state_limit() {
-        standard_external_execution_fixture(false, false, true);
+        standard_external_execution_fixture(false, false, PhysicalStateSize::ExactSignedLimit);
+    }
+
+    #[test]
+    #[ignore = "requires just build-agent-standard-state-guest"]
+    fn compiled_standard_ack_near_signed_state_limit() {
+        standard_external_execution_fixture(false, false, PhysicalStateSize::NearCeiling);
     }
 
     #[test]
     #[ignore = "requires just build-agent-standard-state-guest"]
     fn compiled_standard_invoke_reads_and_commits_external_rows() {
-        standard_external_execution_fixture(true, false, false);
+        standard_external_execution_fixture(true, false, PhysicalStateSize::Ordinary);
     }
 
     #[test]
     #[ignore = "requires just build-agent-standard-state-guest"]
     fn compiled_standard_external_yield_publishes_neither_rows_nor_continuation() {
-        standard_external_execution_fixture(true, true, false);
+        standard_external_execution_fixture(true, true, PhysicalStateSize::Ordinary);
     }
 
-    fn standard_external_execution_fixture(invoke: bool, yielded: bool, tight_state_limit: bool) {
+    fn standard_external_execution_fixture(invoke: bool, yielded: bool, size: PhysicalStateSize) {
         use super::super::{
             actor_storage::tests::TestBlocks,
             journal_store::{AgentJournalStore, MemoryAgentJournalStore},
@@ -1032,8 +1045,11 @@ mod tests {
         let mut inner = if invoke {
             super::super::wire::tests::external_invocation_fixture(&admitted, yielded)
         } else {
-            let (state, retirement, authorization) =
-                super::super::wire::tests::external_retirement_fixture(&admitted);
+            let (state, retirement, authorization) = if size == PhysicalStateSize::NearCeiling {
+                super::super::wire::tests::external_retirement_fixture_near_state_limit(&admitted)
+            } else {
+                super::super::wire::tests::external_retirement_fixture(&admitted)
+            };
             RuntimeWork::Acknowledge {
                 context: RuntimeExecutionContext::Direct,
                 state,
@@ -1042,7 +1058,7 @@ mod tests {
             }
         };
         let mut native = super::super::wire::apply_standard_runtime_work(inner.clone()).unwrap();
-        if tight_state_limit {
+        if size == PhysicalStateSize::ExactSignedLimit {
             assert!(!invoke && !yielded);
             let RuntimeWork::Acknowledge { state, .. } = &inner else {
                 unreachable!()
@@ -1170,12 +1186,31 @@ mod tests {
             _ => unreachable!(),
         }
         let work = StateExecutionWork::new(inner, lanes, admitted.external_state_limits()).unwrap();
+        // Qualify a near-ceiling ACK against the currently configured
+        // management budget, not an arbitrarily generous test allowance.
+        let gas = if size == PhysicalStateSize::NearCeiling {
+            super::super::driver::DEFAULT_MANAGEMENT_GAS
+        } else {
+            1_000_000_000
+        };
+        let started = std::time::Instant::now();
         let acknowledged = MultiLaneStateBlockHost {
             store: &store,
             budget: &mut ReadBudget::new(10000, 10000000),
         }
-        .execute_admitted_work(&admitted, &work, 1_000_000_000)
+        .execute_admitted_work(&admitted, &work, gas)
         .unwrap();
+        if size == PhysicalStateSize::NearCeiling {
+            let RuntimeWork::Acknowledge { state, .. } = work.work() else {
+                unreachable!()
+            };
+            eprintln!(
+                "near-ceiling external ACK: root_frame_bytes={} gas_budget={} physical_elapsed_ms={}",
+                state.encoded_len().unwrap(),
+                gas,
+                started.elapsed().as_millis(),
+            );
+        }
         if yielded {
             assert!(matches!(native.outcome, RuntimeOutcome::Yielded(_)));
             assert_eq!(
@@ -1201,7 +1236,7 @@ mod tests {
                 store: &store,
                 budget: &mut ReadBudget::new(0, 0),
             }
-            .execute_admitted_work(&admitted, &work, 1_000_000_000)
+            .execute_admitted_work(&admitted, &work, gas)
             .is_err()
         );
         let mut bad = work.work().clone();
@@ -1233,7 +1268,7 @@ mod tests {
             store: &store,
             budget: &mut ReadBudget::new(10000, 10000000),
         }
-        .execute_admitted_work(&admitted, &bad, 1_000_000_000)
+        .execute_admitted_work(&admitted, &bad, gas)
         .unwrap();
         assert!(matches!(
             denied.transition().outcome,
@@ -1321,7 +1356,7 @@ mod tests {
             store: &store,
             budget: &mut ReadBudget::new(10000, 10000000),
         }
-        .execute_admitted_work(&admitted, &retry, 1_000_000_000)
+        .execute_admitted_work(&admitted, &retry, gas)
         .unwrap();
         assert_eq!(repeated.transition(), acknowledged.transition());
         assert!(repeated.changes().is_empty());

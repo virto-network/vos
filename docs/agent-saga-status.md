@@ -54,15 +54,23 @@ pass prototype recovery tests, but no production route selects them.
 and `StandardLocalReplayExecutor`. A separate external Local preparer now
 authenticates the signed package, exact catalog closure, Create receipt and
 replica before executing the admitted guest and returning a root-bearing seal.
-`host::LocalGenesisIntent` and its file opener still store and recover an r19
-`Package` and seal only. Connect a distinct external intent and Local owner to
-the existing trusted lifecycle, stable file slot, publication and recovery;
-expose it only after authenticated Create publication. Keep the r19 path
-intact. That Local vertical slice is the next integration step;
+The active released-binary Local path is `vosx` clean startup -> image-based
+`LocalAgentHost` -> `LocalLifecycleController` -> Local route backend. Its
+Create admission uses `AdmittedRuntimePackage`; the experimental package has
+the distinct `AdmittedStateRuntimePackage` type. The older journal
+`host::LocalGenesisIntent` and file opener accept r19 only; changing that
+intent alone would not cut over the active production path. Next, extend the
+existing signed Local lifecycle with an explicitly selected external owner,
+distinct durable intent/slot and recovery, then route only after authenticated
+Create publication. Reuse the existing issuer/finality and keep r19 intact;
+do not build a parallel unguarded management flow. That Local vertical slice is
+the next integration step;
 Shared common finality and Clerk follow it within batch 1. Do not treat the
 fixture issuer or signed test package as live admission. Before activation,
-qualify a physical standard-runtime ACK near the new 3-MiB admitted metadata
-ceiling, not merely at a small exact signed limit.
+complete file-backed restart qualification for the now-tested physical
+standard-runtime ACK near the 3-MiB admitted metadata ceiling. The large
+ACK passes within the current 5-billion management-gas budget, but this is
+neither a release-latency measurement nor a production-route guarantee.
 
 Provisional acceptance envelope (customer confirmation required before sign-off):
 
@@ -583,10 +591,22 @@ correct pinned root. Missing blocks mean unavailable state, never absent keys.
   at `task-tmp/state-metadata-cap-prototype.log` (SDK 247/1 ignored, replay 69,
   physical PVM 16, journal-store 105 and feature-disabled groups). This is a
   conservative admission policy backed by a worst-case opaque-metadata rewrite
-  and a small physical ACK; it does not yet prove an ACK from a valid standard
-  runtime actually filled near 3 MiB, nor include large row-tree overhead.
-  Before activation, construct that physical near-ceiling retained-result case
-  and keep its publication, restart and retry within the admitted budgets.
+  and a small physical ACK. After the `b2457ddf` checkpoint, a further physical
+  regression fills a valid standard-runtime retained-result predecessor to
+  within 48 KiB of the signed 3-MiB ceiling using historical Linear images,
+  then executes ACK, stages its rewritten metadata, verifies unchanged rows
+  and exact retry under the current 5-billion management-gas budget. The
+  earlier 1-billion fixture allowance ran out of gas; that allowance is not
+  the production management default. The larger case still uses in-memory
+  staging, not file-backed restart, and does not exercise large row-tree
+  overhead or establish release latency. Before activation, qualify its
+  file-backed publication/restart and retry within the admitted budgets.
+  The complete prototype gate passed after adding this case at
+  `task-tmp/state-near-cap-prototype.log` (SDK 247/1 ignored, replay 69,
+  physical PVM 17, journal-store 105 and feature-disabled groups). The focused
+  final-tree ACK variants passed at `task-tmp/state-near-cap-ack-final.log`;
+  the new predecessor encoded to 3,129,456 bytes and its physical debug ACK
+  took 1,994 ms in that run. This timing is diagnostic, not a release benchmark.
   Production actor-package issuance and authoritative heads remain separate.
   Local Create-preparation follow-up: the new external preparer consumes a
   bounded immutable supplied catalog, rejects a missing package, verifies the

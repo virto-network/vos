@@ -10987,6 +10987,69 @@ pub(crate) mod tests {
         )
     }
 
+    /// A valid retained-result ACK predecessor close to the signed external
+    /// metadata ceiling. Historical lane images are reachable through normal
+    /// actor removal and remain authenticated until explicit compaction; they
+    /// must not make retirement of an unrelated live result unpublishable.
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    pub(crate) fn external_retirement_fixture_near_state_limit(
+        admitted: &super::super::package_admission::AdmittedStateRuntimePackage,
+    ) -> (
+        crate::agent_sdk::RuntimeState,
+        crate::agent_sdk::InvocationRetirement,
+        crate::agent_sdk::InvocationAuthorization,
+    ) {
+        use super::super::standard::{StandardAgentRuntime, StandardLaneEntry};
+        let (state, retirement, authorization) = external_retirement_fixture(admitted);
+        let mut snapshot = decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap();
+        let ceiling = admitted
+            .manifest()
+            .contract
+            .resources
+            .max_runtime_state_bytes as usize;
+        assert_eq!(
+            ceiling,
+            crate::agent_sdk::state_execution::MAX_ADMITTED_EXTERNAL_RUNTIME_STATE_BYTES
+        );
+        let target = ceiling - 16 * 1024;
+        for index in 0u16..128 {
+            let current = legacy_state_to_clean(encode_standard_runtime_state(&snapshot))
+                .encoded_len()
+                .unwrap();
+            if current >= target {
+                break;
+            }
+            let mut actor = [0u8; 32];
+            actor[0] = 0xfe;
+            actor[1..3].copy_from_slice(&index.to_be_bytes());
+            let actor = super::ActorId(actor);
+            assert!(
+                snapshot
+                    .actors
+                    .iter()
+                    .all(|entry| entry.record.entry.actor != actor)
+            );
+            snapshot.lane_state.linear.push(StandardLaneEntry {
+                actor,
+                state_generation: super::Hash([0x7c; 32]),
+                value: vec![0x5a; (target - current).min(32 * 1024)],
+                rows: Default::default(),
+            });
+            snapshot
+                .lane_state
+                .linear
+                .sort_unstable_by_key(|entry| (entry.actor, entry.state_generation));
+            snapshot.lane_revisions.linear = snapshot.lane_revisions.linear.max(1);
+        }
+        let runtime = StandardAgentRuntime::restore(snapshot).unwrap();
+        let state = legacy_state_to_clean(encode_standard_runtime_state(&runtime.snapshot()));
+        let bytes = state.encoded_len().unwrap();
+        assert!(bytes >= ceiling - 48 * 1024, "state only {bytes} bytes");
+        assert!(bytes <= ceiling, "state exceeds signed ceiling: {bytes}");
+        eprintln!("near-ceiling external ACK predecessor metadata_bytes={bytes}");
+        (state, retirement, authorization)
+    }
+
     #[cfg(feature = "pvm")]
     fn clean_terminal_fixture_with_program_size(
         program_size: usize,
