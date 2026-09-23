@@ -38,6 +38,21 @@ pub(crate) fn external_local_create_intent_hash(
     )
 }
 
+#[cfg(all(target_os = "linux", feature = "storage"))]
+pub(crate) fn state_runtime_matches_descriptor(
+    descriptor: &AgentDescriptor,
+    runtime: &AdmittedStateRuntimePackage,
+) -> bool {
+    descriptor.validate().is_ok()
+        && descriptor.identity.profile == AgentProfile::Local
+        && descriptor.runtime_package == *runtime.package_ref()
+        && descriptor.identity.runtime_deployment == runtime.deployment()
+        && descriptor.identity.runtime_program == runtime.program()
+        && descriptor.identity.runtime_producer == runtime.manifest().signing.producer
+        && descriptor.runtime_contract == runtime.manifest().contract
+        && descriptor.capabilities == runtime.manifest().capabilities
+}
+
 /// Reconstructed only from the existing signed Local lifecycle's durable
 /// intent/runtime sidecar and the exact receipt recovered from its issuer.
 /// Preparing this value executes physical Create but does not stage a journal,
@@ -113,13 +128,7 @@ impl RetainedExternalLocalCreate {
             .ok_or(SharedAgentHostError::Unavailable)?;
         let runtime = super::package_admission::admit_state_runtime_package(&runtime_package)
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-        if descriptor.runtime_package != *runtime.package_ref()
-            || descriptor.identity.runtime_deployment != runtime.deployment()
-            || descriptor.identity.runtime_program != runtime.program()
-            || descriptor.identity.runtime_producer != runtime.manifest().signing.producer
-            || descriptor.runtime_contract != runtime.manifest().contract
-            || descriptor.capabilities != runtime.manifest().capabilities
-        {
+        if !state_runtime_matches_descriptor(&descriptor, &runtime) {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         let binding = runtime
@@ -768,7 +777,6 @@ impl ExternalLocalJournalOwner {
             || acknowledgement.application != ManagementReply::Created(descriptor.identity.clone())
             || acknowledgement.reopened_state != expected_state
             || acknowledgement.applied_at != *observed_slot
-            || acknowledgement.authorization_sequence.get() != authority.selector.decision_sequence
             || acknowledgement.managed.space != descriptor.identity.space
             || acknowledgement.managed.agent != descriptor.identity.agent
             || acknowledgement.managed.owner != descriptor.identity.owner
@@ -777,11 +785,12 @@ impl ExternalLocalJournalOwner {
             || acknowledgement.managed.transition_producer
                 != descriptor.identity.transition_producer
             || acknowledgement.authority.binding != descriptor.authority
-            || !super::authority::verify_raw_ed25519(
-                &descriptor.authority.public_key,
-                &acknowledgement.signing_bytes(),
-                &acknowledgement.signature,
-            )
+            // Actor authorization and issuer decision sequences are distinct
+            // replay clocks. The finalized issuer record binds the former to
+            // its approval; the receipt and both signatures are checked here.
+            || acknowledgement
+                .verify_with(&super::clean_bootstrap::RawCredentialVerifier)
+                .is_err()
         {
             return Err(JournalStoreError::ScopeMismatch);
         }

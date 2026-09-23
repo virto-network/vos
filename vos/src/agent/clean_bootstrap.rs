@@ -5041,6 +5041,223 @@ where
         Ok((agent, acknowledgement))
     }
 
+    /// Drive external-state Local Create through the same signed CMI4/CIS2
+    /// Authority lifecycle as image Local. A returned owner is physically
+    /// reopened and finalized, but route attachment is the caller's separate
+    /// responsibility. The slot factory must derive its paths from this
+    /// owner's independently selected Space and Node, never request bytes.
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_external_local_agent<B, J, S, Open>(
+        &mut self,
+        intent_store: B,
+        issuer_store: J,
+        descriptor: super::sdk::AgentDescriptor,
+        call: AuthorityCredentialCall,
+        runtime: super::package_admission::AdmittedStateRuntimePackage,
+        open_slot: Open,
+        budget: &mut super::sdk::state_blocks::ReadBudget,
+        signer: &mut S,
+    ) -> Result<
+        (
+            AgentId,
+            ManagementApplicationAck,
+            super::external_local_executor::ExternalLocalJournalOwner,
+        ),
+        SharedAgentHostError,
+    >
+    where
+        B: super::clean_authority_issuer::CleanManagementRuntimeStore,
+        J: CleanManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+        Open:
+            FnOnce(
+                crate::service::AgentId,
+                crate::service::NodeId,
+                crate::service::Hash,
+            )
+                -> Result<super::journal_store::FileLocalAgentJournalSlot, SharedAgentHostError>,
+    {
+        use super::external_local_executor::{
+            ExternalLocalJournalOwner, RetainedExternalLocalCreate,
+            external_local_create_intent_hash, state_runtime_matches_descriptor,
+        };
+
+        let target = self.authority_target();
+        let managed = call.managed;
+        if descriptor.identity.space != self.pins.space
+            || descriptor.replicas.len() != 1
+            || descriptor.replicas[0].node != self.pins.node
+            || descriptor.replicas[0].role != super::sdk::ReplicaRole::Voter
+            || !state_runtime_matches_descriptor(&descriptor, &runtime)
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let intent = super::clean_management_intent::CleanManagementIntent::new(
+            target,
+            managed,
+            ManagementRequest::Create(Box::new(descriptor.clone())),
+            call,
+            &RawCredentialVerifier,
+        )
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let mut slot =
+            super::clean_management_intent::CleanManagementIntentSlot::open(intent_store)
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let mut issuer = DurableCleanManagementIssuer::open(
+            issuer_store,
+            descriptor.authority,
+            descriptor.identity.space,
+            descriptor.identity.agent,
+        )
+        .map_err(|_| SharedAgentHostError::Unavailable)?;
+        slot.pledge(intent).map_err(|error| {
+            use super::clean_management_intent::IntentSlotError;
+            match error {
+                IntentSlotError::Conflict => SharedAgentHostError::Conflict,
+                IntentSlotError::Invalid => SharedAgentHostError::ScopeMismatch,
+                IntentSlotError::Storage(_) | IntentSlotError::Poisoned => {
+                    SharedAgentHostError::Unavailable
+                }
+            }
+        })?;
+        let intent_hash = external_local_create_intent_hash(
+            slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?,
+        );
+        let external_slot = open_slot(
+            crate::service::AgentId(managed.agent.0),
+            crate::service::NodeId(self.pins.node.0),
+            intent_hash,
+        )?;
+        if external_slot.agent() != crate::service::AgentId(managed.agent.0)
+            || external_slot.node() != crate::service::NodeId(self.pins.node.0)
+            || external_slot.intent() != intent_hash
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if slot
+            .denial_complete()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        {
+            self.finish_denied_external_local_intent(&mut slot, &issuer, &external_slot, signer)?;
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        slot.retain_runtime(runtime.exact_bytes())
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if slot
+            .authorization_work()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .is_some()
+            && self.finish_denied_external_local_intent(
+                &mut slot,
+                &issuer,
+                &external_slot,
+                signer,
+            )?
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let retained = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
+        if let Some((receipt, acknowledgement)) = issuer
+            .recover_finalized_application(
+                target,
+                managed,
+                retained.request(),
+                retained.call(),
+                &RawCredentialVerifier,
+            )
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+        {
+            let Some(RuntimeWork::Invoke { observed_slot, .. }) = slot
+                .authorization_work()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            else {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            };
+            let Some(RuntimeWork::Invoke { invocation, .. }) = slot
+                .finalization_work()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            else {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            };
+            if acknowledgement.applied_at < *observed_slot
+                || invocation.message
+                    != super::clean_management_intent::CleanManagementIntent::finalization_message(
+                        &acknowledgement,
+                    )
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            let prepared =
+                RetainedExternalLocalCreate::prepare(&mut slot, target, &receipt, self.pins.node)?;
+            if prepared.intent() != intent_hash {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            let (seal, _) = prepared.into_parts();
+            let owner = ExternalLocalJournalOwner::open(external_slot, seal, budget)
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            owner
+                .verify_finalized_create_ack(&acknowledgement)
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            self.finish_live_management_intent(&mut slot, managed, &acknowledgement, &issuer)?;
+            return Ok((descriptor.identity.agent, acknowledgement, owner));
+        }
+        let receipt = match self.issue_management_intent_with_admission(
+            &mut slot,
+            managed,
+            &mut issuer,
+            signer,
+            true,
+        ) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                if error == SharedAgentHostError::ScopeMismatch
+                    && issuer.sequence_high_water() == 0
+                    && !issuer.has_pending_decision()
+                    && slot.authorization_work().ok().flatten().is_some()
+                {
+                    self.finish_denied_external_local_intent(
+                        &mut slot,
+                        &issuer,
+                        &external_slot,
+                        signer,
+                    )?;
+                }
+                return Err(error);
+            }
+        };
+        let prepared =
+            RetainedExternalLocalCreate::prepare(&mut slot, target, &receipt, self.pins.node)?;
+        if prepared.intent() != intent_hash {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let owner = prepared
+            .publish_initial(external_slot, budget)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let observation = owner
+            .observe_create_application()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let acknowledgement = issuer
+            .observe_external_local_application(&observation, signer)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        owner
+            .verify_finalized_create_ack(&acknowledgement)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        self.finalize_management_intent_with_admission(
+            &mut slot,
+            managed,
+            &acknowledgement,
+            &mut issuer,
+            true,
+        )?;
+        self.finish_live_management_intent(&mut slot, managed, &acknowledgement, &issuer)?;
+        Ok((descriptor.identity.agent, acknowledgement, owner))
+    }
+
     /// Distinguish a canonical Authority denial from transport/runtime errors
     /// or an approval awaiting issuance. This does not sign, acknowledge,
     /// publish a marker, release admission, or execute a missing invocation.
@@ -11847,6 +12064,45 @@ mod tests {
             native_bundled_authority_fixture_with_query_catalog(false)
         }
 
+        #[cfg(feature = "experimental-state-blocks")]
+        fn native_candidate_state_authority_fixture(target: &Path) -> PhysicalFixture {
+            let mut package =
+                PackageEnvelope::decode(include_bytes!("../../../vosx/blobs/system_authority.vos"))
+                    .unwrap();
+            let program = vos_pvm_compiler::link_elf_spi(
+                &std::fs::read(
+                    target.join("agent-state-authority/riscv64em-vos/release/system_authority.elf"),
+                )
+                .expect("build experimental Authority guest first"),
+            )
+            .unwrap();
+            let program_ref = BlobRef::of_bytes(&program);
+            let PackageManifest::Actor(manifest) = &mut package.manifest else {
+                unreachable!()
+            };
+            let old_program = core::mem::replace(&mut manifest.program, program_ref.clone());
+            package
+                .artifacts
+                .retain(|artifact| artifact.identity != old_program);
+            package.artifacts.push(PackageArtifact {
+                identity: program_ref,
+                bytes: program,
+            });
+            package
+                .artifacts
+                .sort_unstable_by(|left, right| left.identity.cmp(&right.identity));
+            let key = SigningKey::from_bytes(&[RECEIPT_SEED; 32]);
+            let public_key = key.verifying_key().to_bytes();
+            *package.manifest.signing_mut() = PackageSigning {
+                producer: ProducerId::of_public_key(&public_key),
+                public_key,
+                signature: [0; 64],
+            };
+            package.manifest.signing_mut().signature =
+                key.sign(&package.signing_bytes().unwrap()).to_bytes();
+            native_authority_package_fixture(false, &package.encode().unwrap())
+        }
+
         #[test]
         fn native_bundled_authority_fresh_credential_query_retires_exact_pair() {
             check_bundled_authority_fresh_query(false);
@@ -15500,6 +15756,168 @@ mod tests {
                     retained.envelope(),
                 )
                 .unwrap();
+            harness.stop();
+        }
+
+        #[cfg(feature = "experimental-state-blocks")]
+        #[test]
+        #[ignore = "requires experimental standard and Authority guests"]
+        fn native_external_local_create_finalizes_and_retries() {
+            use crate::agent::journal_store::FileLocalAgentJournalSlot;
+            use crate::agent::sdk::state_blocks::ReadBudget;
+
+            // The native system fixture drives the real Authority actor, while
+            // the ordinary Local Create executes the physical state guest.
+            let target = std::env::var_os("CARGO_TARGET_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| {
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target")
+                });
+            let fixture = native_candidate_state_authority_fixture(&target);
+            let mut harness = NativeProjectionOwnerHarness::with_fixture(
+                "candidate-authority-external-local-create",
+                fixture,
+            );
+            let owner = harness.owner.as_mut().unwrap();
+            let program = vos_pvm_compiler::link_elf_spi(
+                &std::fs::read(
+                    target.join("agent-state-standard/riscv64em-vos/release/agent_runtime.elf"),
+                )
+                .expect("build experimental standard guest first"),
+            )
+            .unwrap();
+            let runtime = crate::agent::package_admission::tests::admitted_state_fixture(program);
+            let mut descriptor = owner.pins.descriptor.clone();
+            descriptor.identity.runtime_deployment = runtime.deployment();
+            descriptor.identity.runtime_program = runtime.program();
+            descriptor.identity.runtime_producer = runtime.manifest().signing.producer;
+            descriptor.runtime_package = runtime.package_ref().clone();
+            descriptor.runtime_contract = runtime.manifest().contract.clone();
+            descriptor.capabilities = runtime.manifest().capabilities;
+            descriptor.creation_nonce = Hash([0xdd; 32]);
+            descriptor.identity.agent = AgentId::derive(
+                descriptor.identity.space,
+                descriptor.identity.owner,
+                descriptor.creation_nonce.as_bytes(),
+            );
+            descriptor.identity.profile = AgentProfile::Local;
+            descriptor.replicas[0].principal = descriptor.identity.owner;
+            descriptor.validate().unwrap();
+            assert_ne!(
+                descriptor.identity.transition_producer,
+                descriptor.identity.runtime_producer
+            );
+            assert!(
+                crate::agent::external_local_executor::state_runtime_matches_descriptor(
+                    &descriptor,
+                    &runtime
+                )
+            );
+            let request = ManagementRequest::Create(Box::new(descriptor.clone()));
+            let credential_key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
+            let (mut call, _) =
+                credential_call_and_approval(&descriptor, &request, &credential_key);
+            call.authority = owner.authority_target();
+            call.invocation = call.expected_invocation();
+            call.signature = credential_key.sign(&call.signing_bytes()).to_bytes();
+
+            let root = harness._directory.0.join("external-local");
+            std::fs::create_dir(&root).unwrap();
+            let open_slot = |agent: crate::service::AgentId,
+                             node: crate::service::NodeId,
+                             intent: crate::service::Hash| {
+                let agent_hex = agent
+                    .0
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                let parent =
+                    std::fs::File::open(&root).map_err(|_| SharedAgentHostError::Unavailable)?;
+                FileLocalAgentJournalSlot::acquire_with_pinned_parents(
+                    root.join(format!("{agent_hex}.agent")),
+                    root.join(format!("{agent_hex}.agent-lock")),
+                    node,
+                    intent,
+                    &parent,
+                    &parent,
+                )
+                .map_err(|_| SharedAgentHostError::Unavailable)
+            };
+            let intent_store = IssuerMemoryStore::default();
+            let issuer_store = IssuerMemoryStore::default();
+            let mut signer = CountingSigner::new();
+            // Simulate a crash after the actor has consumed the ACK but
+            // before CMI4 retirement releases the pending admission.
+            owner.fail_finalization_once_for_test(7);
+            let mut budget = ReadBudget::new(10_000, 10_000_000);
+            assert!(matches!(
+                owner.create_external_local_agent(
+                    intent_store.clone(),
+                    issuer_store.clone(),
+                    descriptor.clone(),
+                    call.clone(),
+                    runtime.clone(),
+                    &open_slot,
+                    &mut budget,
+                    &mut signer,
+                ),
+                Err(SharedAgentHostError::Unavailable)
+            ));
+            let mut recovery_budget = ReadBudget::new(10_000, 10_000_000);
+            let (agent, acknowledgement, external) = owner
+                .create_external_local_agent(
+                    intent_store.clone(),
+                    issuer_store.clone(),
+                    descriptor.clone(),
+                    call.clone(),
+                    runtime.clone(),
+                    &open_slot,
+                    &mut recovery_budget,
+                    &mut signer,
+                )
+                .unwrap();
+            assert_eq!(agent, descriptor.identity.agent);
+            external
+                .verify_finalized_create_ack(&acknowledgement)
+                .unwrap();
+            assert!(
+                DurableCleanManagementIssuer::open(
+                    issuer_store.clone(),
+                    descriptor.authority,
+                    descriptor.identity.space,
+                    descriptor.identity.agent,
+                )
+                .unwrap()
+                .application_finalization_status(&acknowledgement)
+                .unwrap()
+            );
+            let first_head = external.materialization().unwrap().heads().clone();
+            drop(external);
+
+            // Finalized exact retry must reopen the already-published owner,
+            // even after the physical receipt's original validity window.
+            harness
+                .fixture
+                .logical_slot
+                .as_ref()
+                .unwrap()
+                .store(LOGICAL_SLOT + 20, Ordering::Release);
+            let mut retry_budget = ReadBudget::new(10_000, 10_000_000);
+            let (retry_agent, retry_ack, reopened) = owner
+                .create_external_local_agent(
+                    intent_store,
+                    issuer_store,
+                    descriptor,
+                    call,
+                    runtime,
+                    &open_slot,
+                    &mut retry_budget,
+                    &mut signer,
+                )
+                .unwrap();
+            assert_eq!((retry_agent, retry_ack), (agent, acknowledgement));
+            assert_eq!(reopened.materialization().unwrap().heads(), &first_head);
+            drop(reopened);
             harness.stop();
         }
 

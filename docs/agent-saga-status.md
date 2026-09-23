@@ -47,66 +47,40 @@ batch 1; subsequent integration stays on `wip/ch08-runtime-directory`:
    regressions, formatting and targeted lint before the final reviewed merge.
    Customer deployment/data cutover still needs operator approval.
 
-Immediate integration seam: the external-state package, physical Create,
-sealed Local genesis, file journal and pinned Invoke/ACK owner now exist and
-pass prototype recovery tests, but no production route selects them. The
-pinned cursor can now own its file store and stable lock across mutations.
-An experimental external replay adapter now authenticates signed Create,
-Install, Invoke and ACK, resolves exact Install artifacts and replays the
-physical guest without decoding its private state. A file-backed owner now
-holds the locked slot, catalog-bound executor and pinned materialization
-together; the active Local lifecycle still does not select it from durable
-intent or expose a route. The owner reuses the durable head's validated
-materialization from the locked file opener, bound to that opener's ephemeral
-identity, while a staged successor remains separately validated and never
-becomes the serving cursor. Startup cost is still unmeasured.
-The owner can now physically inspect actors through that pinned head and
-locked store without publishing any state, but the active lifecycle and route
-adapter still do not use it. A single-Actor lookup uses one exclusive-cursor
-page instead of enumerating all actors. That execution still carries the
-runtime's full metadata through the guest; measure it during release
-qualification.
-The locked owner can also re-observe physical Create from the exact initial
-external head; the existing management issuer now accepts that evidence through
-its shared acknowledgement logic. A separate read-only check now verifies a
-previously finalized signed Create ACK against the authenticated external
-generation even after later work advances the head; it cannot sign a fresh ACK
-or substitute for issuer-side actor finality. Production lifecycle wiring must
-use the fresh initial-head observation before finalization and this exact
-generation check only for finalized recovery. That wiring remains open.
-The experimental Create preparer can now reconstruct its physical seal from
-the existing signed lifecycle's reopened intent, immutable retained package,
-saved authorization slot, and issuer-recovered receipt. Its exact-intent file
-slot can publish and reopen the initial checkpoint without producing a route.
-The caller must still prove the saved authorization anchor against the pinned
-system journal before using this seam; production startup/dispatch and the
-format-specific route owner are not wired yet.
-Denied external Create can now use the image path's existing durable denial
-replay, signed retirement and pending-admission release with a rechecked
-exact-intent file-slot absence proof. That is a protocol seam, not an active
-external Create endpoint; startup still has to select and recover the slot
-before invoking either the successful or denied branch.
-`LocalJournalAgentDriver::prepare_local_genesis` still builds an r19 binding
-and `StandardLocalReplayExecutor`. A separate external Local preparer now
-authenticates the signed package, exact catalog closure, Create receipt and
-replica before executing the admitted guest and returning a root-bearing seal.
-The active released-binary Local path is `vosx` clean startup -> image-based
-`LocalAgentHost` -> `LocalLifecycleController` -> Local route backend. Its
-Create admission uses `AdmittedRuntimePackage`; the experimental package has
-the distinct `AdmittedStateRuntimePackage` type. The older journal
-`host::LocalGenesisIntent` and its file opener accept r19 only; changing that
-intent alone would not cut over the active production path. Next, extend the
-existing signed Local lifecycle with an explicitly selected external owner,
-distinct durable intent/slot and recovery, then route only after authenticated
-Create publication. Reuse the existing issuer/finality and keep r19 intact;
-do not build a parallel unguarded management flow. That Local vertical slice is
-the next integration step; Shared common finality and Clerk follow it within
-batch 1. Do not treat the
-fixture issuer or signed test package as live admission. Before activation,
-complete file-backed restart qualification for the now-tested physical
-standard-runtime ACK near the 3-MiB admitted metadata ceiling. The large
-ACK passes within the current 5-billion management-gas budget, but this is
-neither a release-latency measurement nor a production-route guarantee.
+Immediate integration seam: the experimental external-state package, physical
+Create, sealed Local genesis, file journal, pinned Invoke/ACK owner, and
+authenticated actor inspection exist. The owner retains its locked slot,
+catalog-bound executor and validated materialization across mutations; staged
+successors cannot become serving cursors before publication. Targeted actor
+lookup uses one exclusive-cursor page, but still transports full runtime
+metadata. Startup and request costs are unmeasured.
+
+The internal external Local Create coordinator now uses the existing signed
+CMI4/CIS2 lifecycle: retained package and authorization anchor, exact-intent
+file slot, physical checkpoint publication, issuer ACK, Authority actor
+finalization and retirement. Finalized exact retry reopens and checks the
+original authenticated generation even after the receipt window. Its denial
+branch shares the image path's durable signed retirement and verifies physical
+absence before releasing pending admission. `just test-agent-state-local-create`
+builds opt-in Authority and standard-runtime guests and exercises the complete
+internal Create/retry flow, including a failure after actor finality but before
+local retirement. The released bundled Authority correctly rejects
+the experimental ABI; its artifact is not replaced or implicitly upgraded.
+
+No released startup, lifecycle queue or route adapter selects this owner yet;
+the caller must choose Space/Node storage roots independently and attach a
+route only after authenticated finalization. Startup must verify the saved
+authorization anchor against the pinned system journal before recovery. Keep
+the image Local path active until external selection, file-backed restart and
+near-3-MiB ACK recovery qualify. The external replay adapter covers signed
+Create, Install, Invoke and ACK without decoding private runtime state.
+The current released-binary path is `vosx` clean startup -> image-based
+`LocalAgentHost` -> `LocalLifecycleController` -> Local route backend. The
+older `host::LocalGenesisIntent` file opener accepts r19 only. Next, select and
+recover the external owner through the existing lifecycle controller, then
+route only after authenticated Create publication. Shared common finality and
+Clerk follow within batch 1. Candidate signed packages are not live admission;
+the large ACK's 5-billion-gas success is not a release-latency guarantee.
 
 Provisional acceptance envelope (customer confirmation required before sign-off):
 
@@ -1251,11 +1225,17 @@ backup or long-running retention tests.
 
 ## Branch boundary
 
-- Reviewer: `saga/agents` contains the bounded-state architecture checkpoint
-  after `7bae9269`; see [the review guide](agent-saga-review.md). This is
+- Reviewer: `saga/agents` is at bounded-state checkpoint `6bcff6fe`;
+  see [the review guide](agent-saga-review.md). This is
   prototype qualification, not production release evidence.
 - Implementation continues on `wip/ch08-runtime-directory` from that checkpoint.
-  The next work is external Local intent/owner routing, then remaining batch 1.
+  The next work is external Local startup selection/recovery and route attachment,
+  then remaining batch 1. This signed Create seam is internal, not deployed.
+- Current WIP checks: candidate Authority/standard-guest signed Local Create,
+  interrupted retirement and expired-window retry pass; existing physical
+  external-genesis publication/crash-recovery passes after the ACK clock fix.
+  Feature-disabled `vos` and default Authority builds still check. None of
+  these is released-binary or full-workspace qualification.
 - Master is unchanged; nothing is pushed. Review read-only and apply findings
   on the implementation branch to avoid conflicting fixes.
 - Exact formatted-tree checkpoint gate passed at

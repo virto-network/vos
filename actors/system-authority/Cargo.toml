@@ -10,6 +10,9 @@ license = "AGPL-3.0-or-later"
 [features]
 default = ["bin"]
 bin = []
+# Candidate Authority policy can recognize the opt-in external-state runtime
+# contract. The released bundled actor remains built without this feature.
+experimental-state-blocks = ["vos/experimental-state-blocks"]
 
 [lib]
 crate-type = ["rlib", "cdylib"]

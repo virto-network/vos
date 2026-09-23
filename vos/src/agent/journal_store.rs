@@ -17031,7 +17031,11 @@ mod tests {
                     .to_bytes();
                 assert!(owned.verify_finalized_create_ack(&substituted).is_err());
                 let mut substituted = create_ack.clone();
-                substituted.authorization_sequence = std::num::NonZeroU64::new(2).unwrap();
+                // Authorization sequence is bound by the issuer's retained
+                // approval, not derivable from the physical Create receipt.
+                // The physical verifier must still reject a re-signed ACK
+                // carrying a corrupt underlying receipt.
+                substituted.receipt.signature[0] ^= 1;
                 substituted.signature = SigningKey::from_bytes(&[0x31; 32])
                     .sign(&substituted.signing_bytes())
                     .to_bytes();

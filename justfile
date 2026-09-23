@@ -185,6 +185,34 @@ build-agent-standard-state-guest:
     cd "$repository_root/services/agent-runtime"
     CARGO_TARGET_DIR="$state_target/agent-state-standard" cargo +nightly-2026-03-20 actor --offline --locked --features experimental-state-blocks
 
+# Candidate Authority only. Do not overwrite the released bundled actor.
+build-agent-state-authority-guest:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    repository_root="{{justfile_directory()}}"
+    state_target="${CARGO_TARGET_DIR:-$repository_root/target}"
+    mkdir -p "$state_target"
+    state_target=$(cd "$state_target" && pwd)
+    export TMPDIR="$state_target/task-tmp"
+    mkdir -p "$TMPDIR"
+    cd "$repository_root/actors/system-authority"
+    CARGO_TARGET_DIR="$state_target/agent-state-authority" cargo +nightly-2026-03-20 actor --offline --locked --features experimental-state-blocks
+
+# Physical signed external Local Create and finalized exact retry. This is a
+# candidate lifecycle gate, not released-binary admission or route selection.
+test-agent-state-local-create: build-agent-standard-state-guest build-agent-state-authority-guest
+    #!/usr/bin/env bash
+    set -euo pipefail
+    repository_root="{{justfile_directory()}}"
+    state_target="${CARGO_TARGET_DIR:-$repository_root/target}"
+    mkdir -p "$state_target"
+    state_target=$(cd "$state_target" && pwd)
+    export CARGO_TARGET_DIR="$state_target"
+    export TMPDIR="$state_target/task-tmp"
+    mkdir -p "$TMPDIR"
+    cd "$repository_root"
+    cargo +nightly-2025-05-09 test --offline --locked -p vos --lib --features 'agent-runtime storage network http-ingress experimental-state-blocks' agent::clean_bootstrap::tests::physical::native_external_local_create_finalizes_and_retries -- --ignored --exact --test-threads=1
+
 build-agent-state-actor:
     #!/usr/bin/env bash
     set -euo pipefail
