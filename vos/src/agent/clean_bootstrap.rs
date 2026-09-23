@@ -5379,6 +5379,170 @@ where
         Ok((managed.agent, acknowledgement, owner))
     }
 
+    /// Apply one retained external Local Install under the existing CMI4/CIS2
+    /// leases. This is an internal lifecycle phase, not ingress: the caller
+    /// must own the exact selected file generation and later finalize, retire
+    /// and refresh routes before returning a successful public response.
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn install_external_local_on_slots<B, J, S>(
+        &mut self,
+        slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
+        issuer: &mut DurableCleanManagementIssuer<J>,
+        external: &mut super::external_local_executor::ExternalLocalJournalOwner,
+        package: &AdmittedActorPackage,
+        budget: &mut super::sdk::state_blocks::ReadBudget,
+        signer: &mut S,
+    ) -> Result<ManagementApplicationAck, SharedAgentHostError>
+    where
+        B: super::clean_authority_issuer::CleanManagementActorStore
+            + super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore,
+        J: CleanManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+    {
+        use super::external_local_executor::ExternalLocalCreateArchive;
+        use super::journal::{ReplayInput, ReplayOperation};
+        use super::journal_store::JournalStoreError;
+        use super::replay::ExternalJournalCommit;
+
+        let intent = slot
+            .intent()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?
+            .clone();
+        let request = intent.request().clone();
+        if !matches!(request, ManagementRequest::Install(_)) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let descriptor = external.descriptor();
+        let managed = ManagedAgentTarget {
+            space: descriptor.identity.space,
+            agent: descriptor.identity.agent,
+            owner: descriptor.identity.owner,
+            profile: descriptor.identity.profile,
+            runtime_deployment: descriptor.identity.runtime_deployment,
+            transition_producer: descriptor.identity.transition_producer,
+        };
+        if descriptor.identity.space != self.pins.space
+            || descriptor.authority != self.pins.authority
+            || descriptor.replicas.len() != 1
+            || descriptor.replicas[0].node != self.pins.node
+            || intent
+                .verify(self.authority_target(), managed, &RawCredentialVerifier)
+                .is_err()
+            || validate_actor_install(descriptor, &request, package).is_err()
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let archive = slot
+            .load_external_create_archive()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .ok_or(SharedAgentHostError::ScopeMismatch)
+            .and_then(|bytes| {
+                ExternalLocalCreateArchive::decode(&bytes)
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)
+            })?;
+        if !archive.matches_owner(&intent, self.authority_target(), self.pins.node, external) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if let Some((receipt, acknowledgement)) = issuer
+            .recover_finalized_application(
+                self.authority_target(),
+                managed,
+                &request,
+                intent.call(),
+                &RawCredentialVerifier,
+            )
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+        {
+            let Some(RuntimeWork::Invoke { observed_slot, .. }) = slot
+                .authorization_work()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            else {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            };
+            let Some(RuntimeWork::Invoke { invocation, .. }) = slot
+                .finalization_work()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            else {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            };
+            if acknowledgement.applied_at < *observed_slot
+                || invocation.message
+                    != super::clean_management_intent::CleanManagementIntent::finalization_message(
+                        &acknowledgement,
+                    )
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            if !slot
+                .retirement_complete()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            {
+                self.verify_external_local_authorization_anchor(slot)?;
+            }
+            external
+                .verify_finalized_install_ack(&request, &receipt, &acknowledgement)
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            return Ok(acknowledgement);
+        }
+        slot.retain_actor(package)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let retained = slot
+            .load_actor()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .ok_or(SharedAgentHostError::Unavailable)?;
+        let receipt =
+            self.issue_management_intent_with_admission(slot, managed, issuer, signer, true)?;
+        self.verify_external_local_authorization_anchor(slot)?;
+        let Some(RuntimeWork::Invoke { observed_slot, .. }) = slot
+            .authorization_work()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        let input = ReplayInput {
+            runtime: external
+                .materialization()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .runtime()
+                .clone(),
+            operation: ReplayOperation::CleanManage {
+                request: request.clone(),
+                authority: receipt.clone(),
+                observed_slot: *observed_slot,
+            },
+        };
+        match external.publish_install(input, &retained, budget) {
+            Ok(ExternalJournalCommit::Published(_, _, None))
+            | Ok(ExternalJournalCommit::AlreadyCommitted(_))
+            | Err(JournalStoreError::Conflict) => {}
+            Ok(ExternalJournalCommit::Rejected(_)) => {
+                // A positive application ACK cannot represent a guest
+                // rejection. Keep this approval pending and ingress closed
+                // until an explicit failure finality protocol exists.
+                return Err(SharedAgentHostError::Conflict);
+            }
+            Ok(ExternalJournalCommit::Published(_, _, Some(_))) => {
+                return Err(SharedAgentHostError::Unavailable);
+            }
+            Err(_) => return Err(SharedAgentHostError::Unavailable),
+        }
+        let observation = external
+            .observe_install_application(&request, &receipt)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let acknowledgement = issuer
+            .observe_external_local_application(&observation, signer)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        external
+            .verify_finalized_install_ack(&request, &receipt, &acknowledgement)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        Ok(acknowledgement)
+    }
+
     /// Distinguish a canonical Authority denial from transport/runtime errors
     /// or an approval awaiting issuance. This does not sign, acknowledge,
     /// publish a marker, release admission, or execute a missing invocation.
@@ -16290,6 +16454,8 @@ mod tests {
                 credential_call_and_approval(&descriptor, &install_request, &credential_key);
             install_call.authority = owner.authority_target();
             install_call.request_sequence = core::num::NonZeroU64::new(2).unwrap();
+            install_call.requested_valid_from = LOGICAL_SLOT + 20;
+            install_call.requested_expires_at = LOGICAL_SLOT + 40;
             install_call.invocation = install_call.expected_invocation();
             install_call.signature = credential_key
                 .sign(&install_call.signing_bytes())
@@ -16302,10 +16468,18 @@ mod tests {
                 &RawCredentialVerifier,
             )
             .unwrap();
+            validate_actor_install(&descriptor, install_intent.request(), &install_package)
+                .unwrap();
             assert!(reopened_archive.matches_current_scope(
                 &install_intent,
                 owner.authority_target(),
                 owner.pins.node,
+            ));
+            assert!(reopened_archive.matches_owner(
+                &install_intent,
+                owner.authority_target(),
+                owner.pins.node,
+                &external,
             ));
             assert!(!reopened_archive.matches_current_scope(
                 &install_intent,
@@ -16410,11 +16584,11 @@ mod tests {
             let entries_before = std::fs::read_dir(&root).unwrap().count();
             assert!(matches!(
                 owner.create_external_local_agent(
-                    intent_store,
-                    issuer_store,
-                    descriptor,
-                    call,
-                    runtime,
+                    intent_store.clone(),
+                    issuer_store.clone(),
+                    descriptor.clone(),
+                    call.clone(),
+                    runtime.clone(),
                     &directory,
                     &mut ReadBudget::new(10_000, 10_000_000),
                     &mut signer,
@@ -16424,6 +16598,192 @@ mod tests {
             assert!(!lock.exists());
             assert_eq!(std::fs::read_dir(&root).unwrap().count(), entries_before);
             std::fs::rename(&parked_lock, &lock).unwrap();
+
+            // The retained Install takes over CMI4 only after Create
+            // retirement. Its physical application is then recovered from
+            // the same archived, locked generation after a simulated crash.
+            let mut install_slot = CleanManagementIntentSlot::open(intent_store.clone()).unwrap();
+            let mut install_issuer = DurableCleanManagementIssuer::open(
+                issuer_store.clone(),
+                descriptor.authority,
+                descriptor.identity.space,
+                descriptor.identity.agent,
+            )
+            .unwrap();
+            assert!(
+                install_issuer
+                    .can_resume_install(
+                        owner.authority_target(),
+                        install_intent.call().managed,
+                        install_intent.request(),
+                        install_intent.call(),
+                        &RawCredentialVerifier,
+                    )
+                    .unwrap()
+            );
+            install_slot
+                .handoff_retired(
+                    original.intent().unwrap(),
+                    install_intent.clone(),
+                    &RawCredentialVerifier,
+                )
+                .unwrap();
+            let mut external = reopened_archive
+                .open_existing(
+                    runtime.exact_bytes().to_vec(),
+                    owner.authority_target(),
+                    owner.pins.node,
+                    &directory,
+                    &mut ReadBudget::new(10_000, 10_000_000),
+                )
+                .unwrap();
+            let install_ack = owner
+                .install_external_local_on_slots(
+                    &mut install_slot,
+                    &mut install_issuer,
+                    &mut external,
+                    &install_package,
+                    &mut ReadBudget::new(10_000, 10_000_000),
+                    &mut signer,
+                )
+                .unwrap();
+            let install_receipt = install_ack.receipt.clone();
+            assert_ne!(
+                install_ack.authorization_sequence.get(),
+                install_receipt.selector.decision_sequence,
+                "Authority authorization and issuer decision are separate clocks",
+            );
+            let installed_head = external.materialization().unwrap().heads().clone();
+            drop(external);
+            drop(install_slot);
+            drop(install_issuer);
+            let mut install_slot = CleanManagementIntentSlot::open(intent_store.clone()).unwrap();
+            let mut install_issuer = DurableCleanManagementIssuer::open(
+                issuer_store.clone(),
+                descriptor.authority,
+                descriptor.identity.space,
+                descriptor.identity.agent,
+            )
+            .unwrap();
+            let mut external = reopened_archive
+                .open_existing(
+                    runtime.exact_bytes().to_vec(),
+                    owner.authority_target(),
+                    owner.pins.node,
+                    &directory,
+                    &mut ReadBudget::new(10_000, 10_000_000),
+                )
+                .unwrap();
+            assert_eq!(external.materialization().unwrap().heads(), &installed_head);
+            assert_eq!(
+                owner
+                    .install_external_local_on_slots(
+                        &mut install_slot,
+                        &mut install_issuer,
+                        &mut external,
+                        &install_package,
+                        &mut ReadBudget::new(10_000, 10_000_000),
+                        &mut signer,
+                    )
+                    .unwrap(),
+                install_ack
+            );
+            assert_eq!(external.materialization().unwrap().heads(), &installed_head);
+            external
+                .verify_finalized_install_ack(
+                    install_intent.request(),
+                    &install_receipt,
+                    &install_ack,
+                )
+                .unwrap();
+            drop(external);
+            owner
+                .finalize_management_intent_with_admission(
+                    &mut install_slot,
+                    install_intent.call().managed,
+                    &install_ack,
+                    &mut install_issuer,
+                    true,
+                )
+                .unwrap();
+            owner
+                .finish_live_management_intent(
+                    &mut install_slot,
+                    install_intent.call().managed,
+                    &install_ack,
+                    &install_issuer,
+                )
+                .unwrap();
+            assert!(install_slot.retirement_complete().unwrap());
+            assert!(
+                install_issuer
+                    .application_finalization_status(&install_ack)
+                    .unwrap()
+            );
+            drop(install_slot);
+            drop(install_issuer);
+            let mut post_install_stores = ExternalStores {
+                space: descriptor.identity.space,
+                agent: descriptor.identity.agent,
+                intent: intent_store.clone(),
+                issuer: issuer_store.clone(),
+            };
+            let mut post_install_recovery = discover_local_lifecycle_recovery(
+                &mut post_install_stores,
+                owner.authority_target(),
+                1,
+            )
+            .unwrap();
+            let mut post_install_owners = post_install_recovery
+                .open_external_finalized_owners(
+                    &directory,
+                    owner.pins.node,
+                    1,
+                    &mut ReadBudget::new(10_000, 10_000_000),
+                )
+                .unwrap();
+            assert_eq!(
+                post_install_owners
+                    .get(&descriptor.identity.agent)
+                    .unwrap()
+                    .materialization()
+                    .unwrap()
+                    .heads(),
+                &installed_head,
+            );
+            let mut finalized_slot = CleanManagementIntentSlot::open(intent_store.clone()).unwrap();
+            let mut finalized_issuer = DurableCleanManagementIssuer::open(
+                issuer_store.clone(),
+                descriptor.authority,
+                descriptor.identity.space,
+                descriptor.identity.agent,
+            )
+            .unwrap();
+            assert_eq!(
+                owner
+                    .install_external_local_on_slots(
+                        &mut finalized_slot,
+                        &mut finalized_issuer,
+                        post_install_owners
+                            .get_mut(&descriptor.identity.agent)
+                            .unwrap(),
+                        &install_package,
+                        &mut ReadBudget::new(10_000, 10_000_000),
+                        &mut signer,
+                    )
+                    .unwrap(),
+                install_ack,
+            );
+            assert_eq!(
+                post_install_owners
+                    .get(&descriptor.identity.agent)
+                    .unwrap()
+                    .materialization()
+                    .unwrap()
+                    .heads(),
+                &installed_head,
+            );
+            drop(post_install_owners);
 
             let orphan = crate::service::AgentId([0x77; 32]);
             assert_ne!(orphan.0, agent.0);

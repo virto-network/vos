@@ -18,12 +18,13 @@ backup. Human-friendly create/install/invoke commands must preserve exact
 protocol requests and resumability.
 
 Approved first-release Local storage selection: a new external-state Local
-deployment uses a fresh dedicated root; existing image-based Local deployments
-keep their current path. Do not migrate an image root in place or silently
-interpret mixed formats. Mixed-format migration is deferred, not a release
-gate. An external root still must recover every pending lifecycle generation
-before its first route is published. The external root is never inferred from
-the image root's contents; startup must select the two paths explicitly.
+deployment uses fresh dedicated journal and lifecycle roots for its Space/Node;
+existing image-based Local deployments keep their current path. Do not migrate
+an image root in place or silently interpret mixed formats. Mixed-format
+migration is deferred, not a release gate. An external deployment still must
+recover every pending lifecycle generation before its first route is published.
+The external format is never inferred from the image root's contents; startup
+must select the two paths explicitly.
 
 Three release-work batches remain. The bounded-state vertical slice is a
 separate intermediate review checkpoint on `saga/agents`, not completion of
@@ -183,14 +184,13 @@ current head. The physical fixture returns the same observation after
 checkpoint/reopen and later actor work, and checks a signed final ACK against
 it while rejecting substituted receipt, Agent identity and application hash.
 The existing issuer must still authorize, finalize and retire each Install
-before the next management operation; neither this evidence helper nor the
-publication helper is released ingress or a complete Install coordinator.
+before the next management operation; neither helper is released ingress.
 The pinned journal can now persist Install's Merge fence from its own
 authenticated current Merge projection; the physical test compares this
 against the independent fixture fence and uses it for an artifact-free
-candidate Install. Install coordinator TODO: use this locked-owner path under
-the retained issuer/lifecycle leases, handle a guest rejection without
-stranding an approved intent, and qualify crash/retry through route refresh.
+candidate Install. Release-controller TODO: handle a guest rejection without
+stranding an approved intent, then qualify startup/route refresh around the
+retained issuer/lifecycle handoff below.
 The publisher now physically preflights Install against that same pinned
 predecessor. A conflicting installation identity returns a guest rejection
 without advancing heads or retaining newly staged catalog bytes; an exact
@@ -205,9 +205,19 @@ actor package, derives its exact catalog and Merge fence from its pinned
 generation, and invokes that preflight/publication helper. It refuses to
 append an already observed approval: a retry must re-observe the durable
 application instead. A physical Standard guest test publishes through this
-owner, reopens the file generation, and recovers the same observation. The
-retained issuer/lifecycle Install coordinator and rejected-approval resolution
-are still missing; this owner method is not released ingress.
+owner, reopens the file generation, and recovers the same observation.
+An internal retained-slot Install phase now binds the immutable Create archive
+to that same locked generation, re-admits the actor package, uses the existing
+CMI4/CIS2 Authority receipt, publishes through the physical owner and derives
+the ACK from replay-authenticated evidence. The native test reopens the file,
+intent and issuer after lost response, obtains the same ACK without another
+Install head, then finalizes/retires with the Authority and reopens the
+post-Install startup inventory. It also caught and removed a false equality
+between Authority authorization and issuer decision sequences; those are
+separate clocks, with their relationship retained by the issuer record.
+This is not a released controller/route path. A permanently guest-rejected
+approved Install has no terminal failure transition; ingress remains disabled
+until that case and startup cutover are resolved.
 Focused r04/s04 evidence: SDK feature-on/off suites passed (248 passed/1
 ignored and 247 passed/1 ignored); the compiled Standard physical
 Create/Install/Invoke/ACK/checkpoint/reopen test passed, including retained

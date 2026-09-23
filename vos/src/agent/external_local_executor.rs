@@ -281,6 +281,28 @@ impl ExternalLocalCreateArchive {
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
         Ok(owner)
     }
+
+    /// Bind a later Install slot to the original signed Create generation
+    /// while its file owner is already locked. This avoids releasing the
+    /// owner merely to reopen the same generation for lifecycle admission.
+    pub(crate) fn matches_owner(
+        &self,
+        current: &super::clean_management_intent::CleanManagementIntent,
+        selected_authority: crate::agent_sdk::authority::AuthorityActorTarget,
+        selected_node: crate::agent_sdk::NodeId,
+        owner: &ExternalLocalJournalOwner,
+    ) -> bool {
+        let crate::agent_sdk::ManagementRequest::Create(descriptor) = self.intent.request() else {
+            return false;
+        };
+        self.matches_current_scope(current, selected_authority, selected_node)
+            && self.acknowledgement.authority == selected_authority
+            && self.genesis == owner.genesis_id()
+            && descriptor.as_ref() == owner.descriptor()
+            && owner
+                .verify_finalized_create_ack(&self.acknowledgement)
+                .is_ok()
+    }
 }
 
 #[cfg(all(target_os = "linux", feature = "storage"))]
@@ -707,6 +729,9 @@ pub(crate) fn verify_external_install_ack(
     let observation =
         observe_external_install_application(recovered, descriptor, request, receipt)?;
     let identity = &descriptor.identity;
+    // Authorization and issuer decision sequences are distinct clocks. The
+    // retained issuer approval binds the former to this receipt; physical
+    // verification must not equate their numeric values.
     if acknowledgement.validate_shape().is_err()
         || acknowledgement
             .verify_with(&super::clean_bootstrap::RawCredentialVerifier)
@@ -719,7 +744,6 @@ pub(crate) fn verify_external_install_ack(
         || acknowledgement.managed.profile != identity.profile
         || acknowledgement.managed.runtime_deployment != identity.runtime_deployment
         || acknowledgement.managed.transition_producer != identity.transition_producer
-        || acknowledgement.authorization_sequence.get() != receipt.selector.decision_sequence
         || acknowledgement.request != request.replay_commitment()
         || acknowledgement.receipt != *receipt
         || acknowledgement.application != *observation.result()
