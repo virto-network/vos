@@ -170,9 +170,12 @@ same primitive after physical material and signed-work checks. It still makes
 multiple guest reads per request, so measure that cost before optimizing
 without moving result authority into the host.
 The pinned external journal now has exact-predecessor catalog staging with
-rollback only while the authenticated head is unchanged. A successful
-file-backed physical Install/crash test exercises stage visibility and
-rollback; this is a prerequisite for Install, not yet the lifecycle Install
+rollback only while the authenticated head is unchanged. Its Install
+publication helper refreshes snapshot catalog resolvers after staging or
+rollback, and never restages an exact current-head retry. The physical test
+executes Install from a candidate lacking its artifacts and reruns the
+file-backed crash/reopen cases; an invalid fence rolls back newly staged
+bytes. This is a prerequisite for Install, not yet the lifecycle Install
 coordinator or released ingress.
 Focused r04/s04 evidence: SDK feature-on/off suites passed (248 passed/1
 ignored and 247 passed/1 ignored); the compiled Standard physical

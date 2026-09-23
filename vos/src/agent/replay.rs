@@ -16038,6 +16038,110 @@ mod aggregate {
             })
         }
 
+        /// Stage an Install's exact catalog under the pinned predecessor,
+        /// then let physical replay and the sealed publication decide the
+        /// result. A failed or already-committed attempt rolls back only
+        /// newly introduced blobs while that predecessor is still current.
+        /// An ambiguous publish poisons the cursor, preserving blobs for
+        /// authenticated reopen instead of risking deletion of live inputs.
+        pub(crate) fn apply_install_with_catalog<E: ReplayExecutor>(
+            &mut self,
+            executor: &mut E,
+            entry: &OrderedEntry,
+            catalog: &[super::super::execution::RuntimeBlob],
+            budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+            refresh: impl FnMut(&S, &mut E) -> Result<(), JournalStoreError>,
+        ) -> Result<ExternalJournalCommit, MaterializeError<core::convert::Infallible, E::Error>>
+        where
+            S: super::super::journal_store::UnpublishedCatalogBlobStore,
+        {
+            self.apply_install_with_catalog_using(
+                executor,
+                entry,
+                catalog,
+                budget,
+                refresh,
+                |store, seal, availability| store.publish_external_mutation(seal, availability),
+            )
+        }
+
+        #[cfg(test)]
+        pub(super) fn apply_install_with_catalog_with_fault_for_test<E: ReplayExecutor>(
+            &mut self,
+            executor: &mut E,
+            entry: &OrderedEntry,
+            catalog: &[super::super::execution::RuntimeBlob],
+            budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+            refresh: impl FnMut(&S, &mut E) -> Result<(), JournalStoreError>,
+            publish: impl FnOnce(
+                &mut S,
+                &ReplaySealedPublication,
+                &ExternalCheckpointValidation<'_>,
+            ) -> Result<JournalPublication, JournalStoreError>,
+        ) -> Result<ExternalJournalCommit, MaterializeError<core::convert::Infallible, E::Error>>
+        where
+            S: super::super::journal_store::UnpublishedCatalogBlobStore,
+        {
+            self.apply_install_with_catalog_using(
+                executor, entry, catalog, budget, refresh, publish,
+            )
+        }
+
+        fn apply_install_with_catalog_using<E: ReplayExecutor>(
+            &mut self,
+            executor: &mut E,
+            entry: &OrderedEntry,
+            catalog: &[super::super::execution::RuntimeBlob],
+            budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+            mut refresh: impl FnMut(&S, &mut E) -> Result<(), JournalStoreError>,
+            publish: impl FnOnce(
+                &mut S,
+                &ReplaySealedPublication,
+                &ExternalCheckpointValidation<'_>,
+            ) -> Result<JournalPublication, JournalStoreError>,
+        ) -> Result<ExternalJournalCommit, MaterializeError<core::convert::Infallible, E::Error>>
+        where
+            S: super::super::journal_store::UnpublishedCatalogBlobStore,
+        {
+            if !matches!(
+                &entry.input.operation,
+                ReplayOperation::CleanManage {
+                    request: crate::agent_sdk::ManagementRequest::Install(_),
+                    ..
+                }
+            ) {
+                return Err(journal(JournalStoreError::NonCanonical));
+            }
+            let heads = self.materialization().map_err(journal)?.heads();
+            // A current-head exact retry must authenticate the committed
+            // entry against the store as it stands. Restaging caller bytes
+            // first could hide a missing committed catalog artifact.
+            if heads.ordered_head == Some(entry.id()) && heads.ordered_index == entry.index {
+                return self.apply_using(
+                    executor,
+                    ExternalJournalEntry::Ordered(entry),
+                    budget,
+                    publish,
+                );
+            }
+            let staged = self.stage_catalog(catalog).map_err(journal)?;
+            if let Err(error) = refresh(&*self.store, executor) {
+                self.rollback_catalog(staged).map_err(journal)?;
+                return Err(journal(error));
+            }
+            let committed = self.apply_using(
+                executor,
+                ExternalJournalEntry::Ordered(entry),
+                budget,
+                publish,
+            );
+            if !matches!(committed, Ok(ExternalJournalCommit::Published(..))) {
+                self.rollback_catalog(staged).map_err(journal)?;
+                refresh(&*self.store, executor).map_err(journal)?;
+            }
+            committed
+        }
+
         #[cfg(test)]
         pub(super) fn apply_with_fault_for_test<E: ReplayExecutor>(
             &mut self,
@@ -22837,6 +22941,18 @@ pub(crate) mod tests {
             })
             .collect::<Vec<_>>();
         actor_availability.sort_by(|a, b| a.reference.cmp(&b.reference));
+        let install_catalog = blobs
+            .iter()
+            .chain(core::iter::once(&package))
+            .map(|bytes| super::super::execution::RuntimeBlob {
+                reference: BlobRef::of_bytes(bytes),
+                bytes: bytes.clone(),
+            })
+            .collect::<Vec<_>>();
+        // The duplicate starts before any Install artifact is present. Its
+        // production executor must see the newly staged catalog after a
+        // resolver refresh; preloading the main crash fixture is not proof.
+        let duplicate = duplicate_candidate(&store);
         for bytes in blobs.into_iter().chain([package]) {
             store
                 .put_blob(
@@ -22944,9 +23060,11 @@ pub(crate) mod tests {
             Some(Ok(sdk::ManagementReply::Installed(install.entry.clone())))
         );
         executor.captures.push(captured);
-        if let Some(mut candidate) = duplicate_candidate(&store) {
+        if let Some(mut candidate) = duplicate {
             // Fresh execution through the same adapter used by the file
             // owner, not only recovery of the fixture's captured response.
+            candidate.put(&merge).unwrap();
+            candidate.put(&fence).unwrap();
             let resolver =
                 super::super::journal_store::CatalogBlobResolverFactory::catalog_blob_resolver(
                     &candidate,
@@ -22968,10 +23086,15 @@ pub(crate) mod tests {
             )
             .unwrap();
             let committed = owner
-                .apply(
+                .apply_install_with_catalog(
                     &mut production,
-                    ExternalJournalEntry::Ordered(&entry),
+                    &entry,
+                    &install_catalog,
                     &mut ReadBudget::new(10000, 10000000),
+                    |store, executor| {
+                        executor.replace_resolver(store.catalog_blob_resolver()?);
+                        Ok(())
+                    },
                 )
                 .unwrap();
             let ExternalJournalCommit::Published(_, results, None) = committed else {
@@ -23044,20 +23167,36 @@ pub(crate) mod tests {
         let mut wrong_entry = entry.clone();
         wrong_entry.merge_seal = Some(wrong_fence.id());
         let executions_before = executor.executions;
+        let failed_catalog_bytes = b"external-install-failed-fence".to_vec();
+        let failed_catalog_reference = BlobRef::of_bytes(&failed_catalog_bytes);
         assert!(matches!(
-            pinned.apply(
+            pinned.apply_install_with_catalog(
                 &mut executor,
-                ExternalJournalEntry::Ordered(&wrong_entry),
-                &mut ReadBudget::new(10000, 10000000)
+                &wrong_entry,
+                &[super::super::execution::RuntimeBlob {
+                    reference: failed_catalog_reference.clone(),
+                    bytes: failed_catalog_bytes,
+                }],
+                &mut ReadBudget::new(10000, 10000000),
+                |_, _| Ok(())
             ),
             Err(ReplayError::InvalidFence)
         ));
+        assert!(
+            pinned
+                .store_for_test()
+                .load_blob(JournalBlobClass::CatalogArtifact, &failed_catalog_reference)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(executor.executions, executions_before);
         assert_eq!(pinned.materialization().unwrap().heads(), before.heads());
-        let attempted = pinned.apply_with_fault_for_test(
+        let attempted = pinned.apply_install_with_catalog_with_fault_for_test(
             &mut executor,
-            ExternalJournalEntry::Ordered(&entry),
+            &entry,
+            &install_catalog,
             &mut ReadBudget::new(10000, 10000000),
+            |_, _| Ok(()),
             publish,
         );
         let committed = match attempted {
@@ -23103,10 +23242,12 @@ pub(crate) mod tests {
                     executor.captures.push(capture(pinned.store_for_test()));
                 }
                 pinned
-                    .apply(
+                    .apply_install_with_catalog(
                         &mut executor,
-                        ExternalJournalEntry::Ordered(&entry),
+                        &entry,
+                        &install_catalog,
                         &mut ReadBudget::new(10000, 10000000),
+                        |_, _| Ok(()),
                     )
                     .unwrap()
             }
@@ -23127,10 +23268,12 @@ pub(crate) mod tests {
         let executions = executor.executions;
         assert!(matches!(
             pinned
-                .apply(
+                .apply_install_with_catalog(
                     &mut executor,
-                    ExternalJournalEntry::Ordered(&entry),
-                    &mut ReadBudget::new(0, 0)
+                    &entry,
+                    &install_catalog,
+                    &mut ReadBudget::new(0, 0),
+                    |_, _| Ok(()),
                 )
                 .unwrap(),
             ExternalJournalCommit::AlreadyCommitted(_)

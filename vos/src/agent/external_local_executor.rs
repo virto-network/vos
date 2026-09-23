@@ -647,6 +647,13 @@ pub(crate) struct ExternalLocalReplayExecutor<R> {
 const MAX_EXTERNAL_REPLAY_OUTCOMES_PER_DOMAIN: usize = 32;
 
 impl<R: CatalogBlobResolver> ExternalLocalReplayExecutor<R> {
+    /// Rebind a snapshot resolver after catalog staging or rollback. The file
+    /// resolver is live, but the in-memory adapter deliberately snapshots its
+    /// blob map; neither may retain a rolled-back artifact as an input.
+    pub(crate) fn replace_resolver(&mut self, resolver: R) {
+        self.resolver = resolver;
+    }
+
     pub(crate) fn new(
         runtime: AdmittedStateRuntimePackage,
         descriptor: AgentDescriptor,
