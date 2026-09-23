@@ -48,6 +48,50 @@ pub(crate) fn actor_cursor_before(
     (bytes != [0; 32]).then_some(crate::agent_sdk::ActorId(bytes))
 }
 
+/// A Create result re-observed from the locked external Local journal's
+/// authenticated initial head. It is application evidence for the existing
+/// management issuer, not Authority approval or route-publication finality.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExternalLocalManagementObservation {
+    receipt: crate::agent_sdk::authority::AuthorityReceipt,
+    result: crate::agent_sdk::ManagementReply,
+    reopened_state: crate::agent_sdk::Hash,
+    applied_at: u64,
+}
+
+impl ExternalLocalManagementObservation {
+    #[cfg(test)]
+    pub(crate) fn for_issuer_test(
+        receipt: crate::agent_sdk::authority::AuthorityReceipt,
+        result: crate::agent_sdk::ManagementReply,
+        reopened_state: crate::agent_sdk::Hash,
+        applied_at: u64,
+    ) -> Self {
+        Self {
+            receipt,
+            result,
+            reopened_state,
+            applied_at,
+        }
+    }
+
+    pub(crate) fn receipt(&self) -> &crate::agent_sdk::authority::AuthorityReceipt {
+        &self.receipt
+    }
+
+    pub(crate) fn result(&self) -> &crate::agent_sdk::ManagementReply {
+        &self.result
+    }
+
+    pub(crate) fn reopened_state(&self) -> crate::agent_sdk::Hash {
+        self.reopened_state
+    }
+
+    pub(crate) fn applied_at(&self) -> u64 {
+        self.applied_at
+    }
+}
+
 /// One admitted external runtime, immutable actor catalog resolver and exact
 /// genesis descriptor. No standard-runtime private state is decoded here.
 /// Unsupported lifecycle forms fail closed until their external lane and
@@ -430,6 +474,47 @@ impl ExternalLocalJournalOwner {
     ) -> Result<&super::replay::ReplayMaterialization, super::journal_store::JournalStoreError>
     {
         self.cursor.materialization()
+    }
+
+    /// The issuer may sign Create application only after the initial
+    /// checkpoint-bearing head is durably reopened and exactly matches this
+    /// owner seal. Later journal work cannot be mistaken for the first Create
+    /// observation; result and receipt come from replay, never caller input.
+    pub(crate) fn observe_create_application(
+        &self,
+    ) -> Result<ExternalLocalManagementObservation, super::journal_store::JournalStoreError> {
+        use super::journal_store::JournalStoreError;
+
+        let initial = self
+            .seal
+            .initial_heads()
+            .map_err(|_| JournalStoreError::NonCanonical)?;
+        let expected = super::replay::clean_create_management_evidence(&self.seal.genesis().create)
+            .ok_or(JournalStoreError::NonCanonical)?;
+        let ReplayOperation::CleanManage { authority, .. } = &self.seal.genesis().create.operation
+        else {
+            return Err(JournalStoreError::NonCanonical);
+        };
+        self.cursor.inspect(|_, recovered| {
+            if recovered.heads() != &initial
+                || recovered.clean_management_evidence() != Some(&expected)
+                || recovered.state() != self.seal.post_create()
+            {
+                return Err(JournalStoreError::Conflict);
+            }
+            let Ok(result) = &expected.result else {
+                return Err(JournalStoreError::Corrupt);
+            };
+            Ok(ExternalLocalManagementObservation {
+                receipt: authority.clone(),
+                result: result.clone(),
+                reopened_state: crate::agent_sdk::Hash::digest(
+                    b"vos/agent/local/reopened-external-head/v1",
+                    &[&recovered.heads_id().0],
+                ),
+                applied_at: expected.observed_slot,
+            })
+        })
     }
 
     /// Inspect the installed directory against this owner's exact pinned

@@ -66,6 +66,11 @@ adapter still do not use it. A single-Actor lookup uses one exclusive-cursor
 page instead of enumerating all actors. That execution still carries the
 runtime's full metadata through the guest; measure it during release
 qualification.
+The locked owner can also re-observe physical Create from the exact initial
+external head; the existing management issuer now accepts that evidence through
+its shared acknowledgement logic. Production lifecycle wiring and finalized
+Create retry after later Agent work remain open—an initial-head-only observation
+must not be used as the post-finalization generation check.
 `LocalJournalAgentDriver::prepare_local_genesis` still builds an r19 binding
 and `StandardLocalReplayExecutor`. A separate external Local preparer now
 authenticates the signed package, exact catalog closure, Create receipt and
@@ -693,6 +698,20 @@ correct pinned root. Missing blocks mean unavailable state, never absent keys.
   prototype gate has not been rerun after this read-only follow-up. No route
   currently selects this owner, and per-execution full-metadata transport
   remains a measured-performance TODO.
+  Initial Create-observation follow-up: the external owner derives a positive
+  result, receipt and stable reopened-head commitment only from the locked,
+  replay-validated initial head. Both Local formats now use the same issuer
+  acknowledgement path; a focused issuer retry test passed at
+  `task-tmp/external-observation-issuer-exact.log`, and the file-backed physical
+  Create observation passed at `task-tmp/external-observation-physical.log`.
+  The released image path's 26 Local lifecycle recovery tests passed at
+  `task-tmp/external-observation-local-lifecycle.log`; the feature-off build
+  passed at `task-tmp/external-observation-feature-off.log`.
+  This is not yet a production Create path. Its initial-head restriction is
+  appropriate before finalization; a later finalized Create retry must instead
+  verify the same generation and original application without requiring the
+  current head to remain at revision one. This remains a correctness TODO for
+  lifecycle cutover.
   Production actor-package issuance and authoritative heads remain separate.
   Local Create-preparation follow-up: the new external preparer consumes a
   bounded immutable supplied catalog, rejects a missing package, verifies the

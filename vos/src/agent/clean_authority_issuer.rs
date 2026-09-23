@@ -1460,18 +1460,45 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         let application = observation.result().as_ref().map_err(|_| {
             CleanManagementIssuerError::Rejected(CleanManagementIssuerRejection::InvalidObservation)
         })?;
-        if let Some(acknowledgement) =
-            self.recover_application_ack(observation.receipt(), application, signer)?
-        {
-            return Ok(acknowledgement);
-        }
-        self.observe_durable_application(
+        self.observe_verified_local_application(
             observation.receipt(),
             application,
             observation.reopened_state(),
             observation.applied_at(),
             signer,
         )
+    }
+
+    /// The external journal owner supplies independently replayed application
+    /// evidence. Both Local persistence formats use the same issuer pledge,
+    /// exact retry, signing and finalization sequence.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn observe_external_local_application<S: CleanManagementReceiptSigner>(
+        &mut self,
+        observation: &super::external_local_executor::ExternalLocalManagementObservation,
+        signer: &mut S,
+    ) -> Result<ManagementApplicationAck, CleanManagementIssuerError<B::Error, S::Error>> {
+        self.observe_verified_local_application(
+            observation.receipt(),
+            observation.result(),
+            observation.reopened_state(),
+            observation.applied_at(),
+            signer,
+        )
+    }
+
+    fn observe_verified_local_application<S: CleanManagementReceiptSigner>(
+        &mut self,
+        receipt: &AuthorityReceipt,
+        application: &ManagementReply,
+        reopened_state: Hash,
+        applied_at: u64,
+        signer: &mut S,
+    ) -> Result<ManagementApplicationAck, CleanManagementIssuerError<B::Error, S::Error>> {
+        if let Some(acknowledgement) = self.recover_application_ack(receipt, application, signer)? {
+            return Ok(acknowledgement);
+        }
+        self.observe_durable_application(receipt, application, reopened_state, applied_at, signer)
     }
 
     /// Retire the issuer-side two-phase barrier only after the authority
@@ -3236,6 +3263,51 @@ mod tests {
             receipt
         );
         assert_eq!(unavailable.calls, 0);
+    }
+
+    #[test]
+    #[cfg(feature = "experimental-state-blocks")]
+    fn external_local_observation_uses_exact_issuer_ack_path() {
+        let store = MemoryImageStore::default();
+        let mut signer = CountingSigner::new(0x28);
+        let fixture = fixture(&signer);
+        let management_request = request(0x2c);
+        let application = application(&management_request);
+        let (call, approval) = approved_call(&fixture, 1, &management_request);
+        let decision = AuthorizedCleanManagementDecision::from_approval(
+            call.authority,
+            call.managed,
+            &management_request,
+            &call,
+            &approval,
+            &TestCredentialVerifier,
+        )
+        .unwrap();
+        let mut issuer = open(store.clone(), &fixture);
+        let receipt = issuer.issue(&decision, &mut signer).unwrap();
+        let observation = super::super::external_local_executor::ExternalLocalManagementObservation::for_issuer_test(
+            receipt.clone(),
+            application.clone(),
+            Hash([0x2e; 32]),
+            fixture.context.valid_from,
+        );
+        let acknowledgement = issuer
+            .observe_external_local_application(&observation, &mut signer)
+            .unwrap();
+        assert_eq!(
+            issuer
+                .observe_external_local_application(&observation, &mut signer)
+                .unwrap(),
+            acknowledgement
+        );
+        drop(issuer);
+        let mut reopened = open(store, &fixture);
+        assert_eq!(
+            reopened
+                .observe_external_local_application(&observation, &mut signer)
+                .unwrap(),
+            acknowledgement
+        );
     }
 
     #[test]

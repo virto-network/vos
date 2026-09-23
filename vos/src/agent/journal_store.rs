@@ -16915,6 +16915,22 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(owned.materialization().unwrap(), &recovered);
+                let observation = owned.observe_create_application().unwrap();
+                let ReplayOperation::CleanManage {
+                    request: crate::agent_sdk::ManagementRequest::Create(descriptor),
+                    authority,
+                    observed_slot,
+                } = &sealed.genesis().create.operation
+                else {
+                    unreachable!()
+                };
+                assert_eq!(observation.receipt(), authority);
+                assert_eq!(observation.applied_at(), *observed_slot);
+                assert_eq!(
+                    observation.result(),
+                    &crate::agent_sdk::ManagementReply::Created(descriptor.identity.clone(),)
+                );
+                assert_ne!(observation.reopened_state(), crate::agent_sdk::Hash::ZERO);
                 if !probe_mutations {
                     let page = owned
                         .inspect_actors(None, 1, 10, &mut ReadBudget::new(100, 100000))
