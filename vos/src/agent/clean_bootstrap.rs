@@ -5053,17 +5053,39 @@ where
         issuer: &DurableCleanManagementIssuer<J>,
         local: &super::local_sdk_host::LocalAgentHost,
     ) -> Result<Option<VerifiedManagementDenial>, SharedAgentHostError> {
+        if local.space() != self.pins.space || local.node() != self.pins.node {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self.verify_management_denial_with_absence(slot, issuer, &mut |agent| match local
+            .show(agent)
+        {
+            Err(super::local_sdk_host::LocalAgentHostError::NotFound) => Ok(true),
+            Ok(_) => Ok(false),
+            Err(_) => Err(SharedAgentHostError::Unavailable),
+        })
+    }
+
+    /// Reuse the same signed denial and retirement proof with a physical
+    /// Local-generation selector. The caller must bind `absent` to its own
+    /// pinned image/journal root; an AgentId alone is not a namespace proof.
+    fn verify_management_denial_with_absence<
+        B: CleanManagementIssuerStore,
+        J: CleanManagementIssuerStore,
+    >(
+        &mut self,
+        slot: &super::clean_management_intent::CleanManagementIntentSlot<B>,
+        issuer: &DurableCleanManagementIssuer<J>,
+        absent: &mut impl FnMut(AgentId) -> Result<bool, SharedAgentHostError>,
+    ) -> Result<Option<VerifiedManagementDenial>, SharedAgentHostError> {
         let target = self.authority_target();
         let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
         let managed = intent.call().managed;
         intent
             .verify(target, managed, &RawCredentialVerifier)
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-        if local.space() != self.pins.space
-            || local.node() != self.pins.node
-            || slot
-                .retirement_complete()
-                .map_err(|_| SharedAgentHostError::Unavailable)?
+        if slot
+            .retirement_complete()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
             || slot
                 .finalization_work()
                 .map_err(|_| SharedAgentHostError::Unavailable)?
@@ -5083,10 +5105,8 @@ where
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        match local.show(managed.agent) {
-            Err(super::local_sdk_host::LocalAgentHostError::NotFound) => {}
-            Ok(_) => return Err(SharedAgentHostError::Conflict),
-            Err(_) => return Err(SharedAgentHostError::Unavailable),
+        if !absent(managed.agent)? {
+            return Err(SharedAgentHostError::Conflict);
         }
         let anchor = slot
             .authorization_anchor()
@@ -5170,6 +5190,85 @@ where
         local: &super::local_sdk_host::LocalAgentHost,
         signer: &mut S,
     ) -> Result<bool, SharedAgentHostError> {
+        if local.space() != self.pins.space || local.node() != self.pins.node {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self.finish_denied_management_intent_with_absence(
+            slot,
+            issuer,
+            &mut |agent| match local.show(agent) {
+                Err(super::local_sdk_host::LocalAgentHostError::NotFound) => Ok(true),
+                Ok(_) => Ok(false),
+                Err(_) => Err(SharedAgentHostError::Unavailable),
+            },
+            signer,
+        )
+    }
+
+    /// The experimental external Local format uses the same denial replay,
+    /// signed retirement and pending-admission release as image Local. Its
+    /// physical absence proof comes from the exact intent-bound file slot,
+    /// not from an unrelated image host. The caller must have acquired that
+    /// slot beneath the independently selected Space's pinned journal root.
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    pub(crate) fn finish_denied_external_local_intent<
+        B: CleanManagementIssuerStore,
+        J: CleanManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+    >(
+        &mut self,
+        slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
+        issuer: &DurableCleanManagementIssuer<J>,
+        external: &super::journal_store::FileLocalAgentJournalSlot,
+        signer: &mut S,
+    ) -> Result<bool, SharedAgentHostError> {
+        let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let ManagementRequest::Create(descriptor) = intent.request() else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        let managed = intent.call().managed;
+        if descriptor.identity.space != self.pins.space
+            || descriptor.replicas.len() != 1
+            || descriptor.replicas[0].node != self.pins.node
+            || external.agent() != crate::service::AgentId(managed.agent.0)
+            || external.node() != crate::service::NodeId(self.pins.node.0)
+            || external.intent()
+                != super::external_local_executor::external_local_create_intent_hash(intent)
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self.finish_denied_management_intent_with_absence(
+            slot,
+            issuer,
+            &mut |agent| {
+                if agent != managed.agent {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                match external.verify_absent() {
+                    Ok(()) => Ok(true),
+                    Err(super::journal_store::JournalStoreError::Conflict) => Ok(false),
+                    Err(_) => Err(SharedAgentHostError::Unavailable),
+                }
+            },
+            signer,
+        )
+    }
+
+    fn finish_denied_management_intent_with_absence<
+        B: CleanManagementIssuerStore,
+        J: CleanManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+    >(
+        &mut self,
+        slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
+        issuer: &DurableCleanManagementIssuer<J>,
+        absent: &mut impl FnMut(AgentId) -> Result<bool, SharedAgentHostError>,
+        signer: &mut S,
+    ) -> Result<bool, SharedAgentHostError> {
         let completed = slot
             .denial_complete()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
@@ -5187,12 +5286,7 @@ where
             .verify(target, managed, &RawCredentialVerifier)
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
         if completed {
-            if local.space() != self.pins.space
-                || local.node() != self.pins.node
-                || !matches!(
-                    local.show(managed.agent),
-                    Err(super::local_sdk_host::LocalAgentHostError::NotFound)
-                )
+            if !absent(managed.agent)?
                 || issuer.sequence_high_water() != 0
                 || issuer.has_pending_decision()
                 || issuer.retained_decisions() != 0
@@ -5209,7 +5303,8 @@ where
                 return Err(SharedAgentHostError::ScopeMismatch);
             }
         } else {
-            let Some(proof) = self.verify_management_denial(slot, issuer, local)? else {
+            let Some(proof) = self.verify_management_denial_with_absence(slot, issuer, absent)?
+            else {
                 return Ok(false);
             };
             let RuntimeWork::Invoke {
@@ -5247,6 +5342,12 @@ where
             {
                 return Err(SharedAgentHostError::ScopeMismatch);
             }
+        }
+        // A denial must still have no managed generation after Authority
+        // result acknowledgement, immediately before the durable CND1 marker
+        // and pending-admission release.
+        if !absent(managed.agent)? {
+            return Err(SharedAgentHostError::ScopeMismatch);
         }
         let anchor = slot
             .authorization_anchor()
@@ -11418,6 +11519,67 @@ mod tests {
                                 .unwrap()
                         });
                     }
+                }
+                #[cfg(all(
+                    target_os = "linux",
+                    feature = "storage",
+                    feature = "experimental-state-blocks"
+                ))]
+                if scenario == 29 {
+                    // Complete the same denied signed Create through an
+                    // exact-intent external file slot after the image-path
+                    // signer failed. No external journal may have appeared;
+                    // the Authority result retirement is shared.
+                    let directory = harness._directory.0.join("denial-external");
+                    std::fs::create_dir(&directory).unwrap();
+                    let agent_hex = descriptor
+                        .identity
+                        .agent
+                        .0
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>();
+                    let agent_root = directory.join(format!("{agent_hex}.agent"));
+                    let agent_lock = directory.join(format!("{agent_hex}.agent-lock"));
+                    let parent = std::fs::File::open(&directory).unwrap();
+                    let mut slot =
+                        crate::agent::clean_management_intent::CleanManagementIntentSlot::open(
+                            intent_store.clone(),
+                        )
+                        .unwrap();
+                    let intent_hash =
+                        crate::agent::external_local_executor::external_local_create_intent_hash(
+                            slot.intent().unwrap(),
+                        );
+                    let external = crate::agent::journal_store::FileLocalAgentJournalSlot::acquire_with_pinned_parents(
+                        agent_root,
+                        agent_lock,
+                        crate::service::NodeId(owner.pins.node.0),
+                        intent_hash,
+                        &parent,
+                        &parent,
+                    )
+                    .unwrap();
+                    let issuer = DurableCleanManagementIssuer::open(
+                        issuer_store.clone(),
+                        descriptor.authority,
+                        descriptor.identity.space,
+                        descriptor.identity.agent,
+                    )
+                    .unwrap();
+                    external.verify_absent().unwrap();
+                    assert!(
+                        owner
+                            .finish_denied_external_local_intent(
+                                &mut slot,
+                                &issuer,
+                                &external,
+                                &mut signer,
+                            )
+                            .unwrap()
+                    );
+                    assert!(slot.denial_complete().unwrap());
+                    external.verify_absent().unwrap();
                 }
                 if scenario >= 29 {
                     assert_eq!(

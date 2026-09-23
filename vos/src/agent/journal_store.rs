@@ -10953,6 +10953,33 @@ impl FileLocalAgentJournalSlot {
         self.intent
     }
 
+    pub(crate) fn agent(&self) -> AgentId {
+        self.agent
+    }
+
+    pub(crate) fn node(&self) -> NodeId {
+        self.node
+    }
+
+    /// Recheck physical absence under the exact stable-lock lease. A cached
+    /// `generation_exists == false` from acquisition cannot by itself prove a
+    /// denied Create left no journal after another filesystem change.
+    pub(crate) fn verify_absent(&self) -> Result<(), JournalStoreError> {
+        if self.generation_exists {
+            return Err(JournalStoreError::Conflict);
+        }
+        self.verify_lock()?;
+        let parent = self.journal_parent.get()?;
+        reject_legacy_generation_at(parent, self.agent)?;
+        if stat_at(parent, &self.root_name)
+            .map_err(|_| JournalStoreError::Unavailable)?
+            .is_some()
+        {
+            return Err(JournalStoreError::Conflict);
+        }
+        self.verify_lock()
+    }
+
     /// Resolve only the `heads.next` state created by a host-retained,
     /// quorum-authenticated portable restore marker. The caller has already
     /// verified the complete bundle and supplies both exact endpoints; this

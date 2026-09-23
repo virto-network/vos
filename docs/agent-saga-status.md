@@ -81,6 +81,11 @@ slot can publish and reopen the initial checkpoint without producing a route.
 The caller must still prove the saved authorization anchor against the pinned
 system journal before using this seam; production startup/dispatch and the
 format-specific route owner are not wired yet.
+Denied external Create can now use the image path's existing durable denial
+replay, signed retirement and pending-admission release with a rechecked
+exact-intent file-slot absence proof. That is a protocol seam, not an active
+external Create endpoint; startup still has to select and recover the slot
+before invoking either the successful or denied branch.
 `LocalJournalAgentDriver::prepare_local_genesis` still builds an r19 binding
 and `StandardLocalReplayExecutor`. A separate external Local preparer now
 authenticates the signed package, exact catalog closure, Create receipt and

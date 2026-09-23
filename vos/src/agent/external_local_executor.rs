@@ -22,6 +22,22 @@ use crate::agent_sdk::{
 };
 use crate::service::{AgentId, BlobRef, SpaceId};
 
+/// Stable across CMI4 authorization/finalization envelope updates. The
+/// request and credential call are immutable for one pledged Create, so the
+/// file slot cannot be rebound by a later lifecycle phase or another caller.
+#[cfg(all(target_os = "linux", feature = "storage"))]
+pub(crate) fn external_local_create_intent_hash(
+    intent: &super::clean_management_intent::CleanManagementIntent,
+) -> crate::service::Hash {
+    crate::service::Hash::digest(
+        b"vos/agent/local/external-create-intent/v1",
+        &[
+            &intent.request().commitment().0,
+            &intent.call().commitment().0,
+        ],
+    )
+}
+
 /// Reconstructed only from the existing signed Local lifecycle's durable
 /// intent/runtime sidecar and the exact receipt recovered from its issuer.
 /// Preparing this value executes physical Create but does not stage a journal,
@@ -75,10 +91,7 @@ impl RetainedExternalLocalCreate {
             )
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
         let request = intent.request().clone();
-        let intent_hash = crate::service::Hash::digest(
-            b"vos/agent/local/external-create-intent/v1",
-            &[&request.commitment().0, &intent.call().commitment().0],
-        );
+        let intent_hash = external_local_create_intent_hash(intent);
         let Some(RuntimeWork::Invoke { observed_slot, .. }) = slot
             .authorization_work()
             .map_err(|_| SharedAgentHostError::Unavailable)?
@@ -1145,6 +1158,7 @@ mod tests {
             &parent,
         )
         .unwrap();
+        file_slot.verify_absent().unwrap();
         let owner = prepared
             .publish_initial(
                 file_slot,
@@ -1170,6 +1184,10 @@ mod tests {
             &parent,
         )
         .unwrap();
+        assert!(matches!(
+            file_slot.verify_absent(),
+            Err(crate::agent::journal_store::JournalStoreError::Conflict)
+        ));
         let owner = prepared
             .publish_initial(
                 file_slot,
