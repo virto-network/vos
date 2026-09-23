@@ -64,6 +64,7 @@ fn install_local(
         ensure_private_directory,
     };
     use vos::agent::sdk::{AgentProfile, Hash, InstallationId, ProducerId};
+    super::local_config::require_image_local_lifecycle(data)?;
     anyhow::ensure!(
         address.ip().is_loopback()
             && address.port() != 0

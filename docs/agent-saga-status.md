@@ -280,6 +280,9 @@ external journal/lifecycle root. The default released binary returns a clear
 unsupported-mode error for `external-state` before opening the image path.
 The opt-in experimental build selects and recovers the external roots, but
 does not change the default image deployment or establish release readiness.
+Image-format Local Create/Install CLI commands now reject an external-state
+Space before reserving a credential or retaining a request; the opt-in daemon
+cannot accidentally strand an LCQ1 request while typed LCQ2 ingress is absent.
 An actual `vosx` subprocess smoke created a fresh external Space, published an
 endpoint, verified that both external roots and neither image Local root exist,
 shut down cleanly, and reopened the same roots on a second boot. Endpoint

@@ -107,6 +107,17 @@ pub(crate) fn validate_local_storage_roots(
     Ok(())
 }
 
+/// The opt-in external daemon can recover and serve finalized generations,
+/// but LCQ2 Create and external Install are not yet public lifecycle ingress.
+/// Reject before the CLI reserves a credential or writes a request file.
+pub(crate) fn require_image_local_lifecycle(data_dir: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        load(data_dir)?.local_agent_storage == LocalAgentStorage::Image,
+        "external-state Local Create/Install is not yet available; no lifecycle request was retained",
+    );
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct IngressLocal {
@@ -264,13 +275,25 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = TestRoot(std::env::temp_dir().join(format!(
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target")
+            });
+        let scratch = target.join("test-tmp");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let root = TestRoot(scratch.join(format!(
             "vosx-local-storage-{}-{suffix}",
             std::process::id()
         )));
         std::fs::create_dir(&root.0).unwrap();
         validate_local_storage_roots(&root.0, LocalAgentStorage::Image).unwrap();
         validate_local_storage_roots(&root.0, LocalAgentStorage::ExternalState).unwrap();
+        save(&root.0, &config).unwrap();
+        assert!(require_image_local_lifecycle(&root.0).is_err());
+        assert!(!root.0.join("agent-client").exists());
+        save(&root.0, &LocalConfig::default()).unwrap();
+        require_image_local_lifecycle(&root.0).unwrap();
 
         let image = root.0.join(IMAGE_LOCAL_LIFECYCLE_DIRECTORY);
         std::fs::create_dir(&image).unwrap();

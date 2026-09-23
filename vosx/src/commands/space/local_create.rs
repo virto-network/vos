@@ -90,6 +90,7 @@ pub(crate) fn create_local(
         ensure_private_directory,
     };
     use vos::agent::sdk::{Hash, wire::CanonicalWire as _};
+    super::local_config::require_image_local_lifecycle(data)?;
     anyhow::ensure!(
         address.ip().is_loopback() && address.port() != 0,
         "Local Create requires a nonzero loopback endpoint"
