@@ -16320,6 +16320,15 @@ mod tests {
                 Err(SharedAgentHostError::ScopeMismatch)
             ));
             *intent_store.external_create_archive.lock().unwrap() = saved_archive;
+            assert!(matches!(
+                recovery.external_finalized_startup_owners(
+                    &directory,
+                    owner.pins.node,
+                    1,
+                    &mut ReadBudget::new(10_000, 10_000_000),
+                ),
+                Err(SharedAgentHostError::Conflict)
+            ));
             let reopened_owners = recovery
                 .open_external_finalized_owners(
                     &directory,
@@ -16735,7 +16744,7 @@ mod tests {
             )
             .unwrap();
             let mut post_install_owners = post_install_recovery
-                .open_external_finalized_owners(
+                .external_finalized_startup_owners(
                     &directory,
                     owner.pins.node,
                     1,

@@ -215,6 +215,12 @@ Install head, then finalizes/retires with the Authority and reopens the
 post-Install startup inventory. It also caught and removed a false equality
 between Authority authorization and issuer decision sequences; those are
 separate clocks, with their relationship retained by the issuer record.
+A fail-closed external startup gate now accepts owners only after every
+non-denied lifecycle entry is retired and its issuer-finalized ACK matches the
+physical Create/Install generation; denied Creates must retain a verified
+absent file generation. The native fixture rejects route readiness before
+Create retirement and accepts the same generation after Install retirement.
+This gate does not complete interrupted entries or attach routes.
 This is not a released controller/route path. A permanently guest-rejected
 approved Install has no terminal failure transition; ingress remains disabled
 until that case and startup cutover are resolved.

@@ -935,6 +935,103 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
         Ok(owners)
     }
 
+    /// Return serving candidates only when every external lifecycle entry is
+    /// already terminal and its signed issuer finality matches the physical
+    /// file generation. This is a fail-closed checkpoint for explicit fresh-
+    /// root startup, not recovery of an interrupted lifecycle: pending work
+    /// must be completed under startup admission before this gate can pass.
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    pub(crate) fn external_finalized_startup_owners(
+        &mut self,
+        directory: &super::journal_store::ExternalLocalJournalDirectory,
+        node: super::sdk::NodeId,
+        maximum: usize,
+        budget: &mut super::sdk::state_blocks::ReadBudget,
+    ) -> Result<
+        BTreeMap<AgentId, super::external_local_executor::ExternalLocalJournalOwner>,
+        SharedAgentHostError,
+    >
+    where
+        I: super::clean_authority_issuer::CleanManagementRuntimeStore
+            + super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore,
+    {
+        let owners = self.open_external_finalized_owners(directory, node, maximum, budget)?;
+        for entry in &self.entries {
+            if entry
+                .intent
+                .denial_complete()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            {
+                if owners.contains_key(&entry.agent) {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                let intent = entry
+                    .intent
+                    .intent()
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                if !matches!(intent.request(), ManagementRequest::Create(_)) {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                let slot = directory
+                    .acquire_existing(
+                        crate::service::AgentId(entry.agent.0),
+                        super::external_local_executor::external_local_create_intent_hash(intent),
+                    )
+                    .map_err(|_| SharedAgentHostError::Unavailable)?;
+                slot.verify_absent()
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                continue;
+            }
+            if entry.unissued_authorization
+                || !entry
+                    .intent
+                    .retirement_complete()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?
+            {
+                return Err(SharedAgentHostError::Conflict);
+            }
+            let intent = entry
+                .intent
+                .intent()
+                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            let (receipt, acknowledgement) = entry
+                .issuer
+                .recover_finalized_application(
+                    self.authority,
+                    intent.call().managed,
+                    intent.request(),
+                    intent.call(),
+                    &super::clean_bootstrap::RawCredentialVerifier,
+                )
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+                .ok_or(SharedAgentHostError::Conflict)?;
+            if entry.finalized.as_ref() != Some(&acknowledgement)
+                || entry
+                    .observed
+                    .as_ref()
+                    .is_some_and(|observed| observed != &acknowledgement)
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            let owner = owners
+                .get(&entry.agent)
+                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            let physical = match intent.request() {
+                ManagementRequest::Create(_) => owner.verify_finalized_create_ack(&acknowledgement),
+                ManagementRequest::Install(_) => {
+                    owner.verify_finalized_install_ack(intent.request(), &receipt, &acknowledgement)
+                }
+                _ => return Err(SharedAgentHostError::ScopeMismatch),
+            };
+            physical.map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        }
+        Ok(owners)
+    }
+
     pub fn startup_admission(
         &self,
     ) -> Result<LocalLifecycleStartupAdmission, SharedAgentHostError> {
