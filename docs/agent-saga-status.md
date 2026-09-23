@@ -63,7 +63,8 @@ authenticated actor inspection exist. The owner retains its locked slot,
 catalog-bound executor and validated materialization across mutations; staged
 successors cannot become serving cursors before publication. Targeted actor
 lookup uses one exclusive-cursor page, but still transports full runtime
-metadata. Startup and request costs are unmeasured.
+metadata. Debug Create timings below diagnose specific delays; startup,
+service throughput and recovery latency are not release-qualified.
 
 The internal external Local Create coordinator now uses the existing signed
 CMI4/CIS2 lifecycle: retained package and authorization anchor, exact-intent
@@ -204,6 +205,11 @@ Install but does not terminalize an already Authority-approved intent: the
 issuer has no cancellation transition for that case. Keep external Install
 ingress disabled until lifecycle handling of permanent guest rejection and
 response-loss recovery is qualified.
+Release-scope decision pending: either add an authenticated, recoverable
+terminal-failure transition for that approved Install, or retain image Local
+Install for the first customer release and defer public external Local Install.
+Do not expose the existing internal external Install method as ingress while
+approval can be stranded.
 The locked file owner now accepts a validated signed Install plus the admitted
 actor package, derives its exact catalog and Merge fence from its pinned
 generation, and invokes that preflight/publication helper. It refuses to
@@ -372,6 +378,20 @@ seconds. These are elapsed call spans, not CPU attribution or a release
 benchmark. They implicate synchronous Authority/finality and reconciliation
 composition more than the physical state PVM; inspect their subphases before
 changing semantics or adding caches.
+A further debug trace of the same binary-subprocess Create scenario split one
+changed-head inventory reconciliation's 4.12 seconds into a 3.66-second
+Authority projection query and about 0.46 seconds of route reconciliation.
+Within that query, preparation through durable reservation/identity/pending
+record took about 1.26 seconds, physical projection Invoke a further 1.86
+seconds, and acknowledgement plus completion about 0.42 seconds. The
+post-restart exact retry still ran a 2.91-second projection query, including
+about 1.86 seconds in Invoke, plus about 0.47 seconds of route reconciliation.
+The query's `Invoke` span includes the system-Agent route and execution; it is
+not isolated PVM CPU time. This narrows the service delay to a durable
+query-and-ACK workflow on the synchronous publication path, with a measurable
+route-publication tail. Preserve the authenticated-head and retry guarantees
+when later isolating or reducing that work; these debug timings are not a
+release benchmark.
 With both candidates, a loopback proxy also withheld the committed Create HTTP
 response after the daemon returned 201. The CLI kept the exact request;
 `--resume` recovered the same signed ACK before and after a daemon restart,

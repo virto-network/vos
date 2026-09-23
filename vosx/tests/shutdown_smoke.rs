@@ -421,6 +421,12 @@ fn run_shutdown_smoke(space_name: &str, external: bool, lose_first_reply: bool) 
                 if line.contains("external Local Create")
                     || line.contains("Local Create publication complete")
                     || line.contains("Local Create exact publication reused")
+                    || line.contains("Authority inventory query")
+                    || line.contains("Authority inventory pending recovery")
+                    || line.contains("Authority inventory loaded")
+                    || line.contains("Authority route reconciliation complete")
+                    || line.contains("Authority projection phase complete")
+                    || line.contains("Authority projection execution phase complete")
                 {
                     eprintln!("{line}");
                 }
