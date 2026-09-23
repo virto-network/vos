@@ -198,6 +198,22 @@ build-agent-state-authority-guest:
     cd "$repository_root/actors/system-authority"
     CARGO_TARGET_DIR="$state_target/agent-state-authority" cargo +nightly-2026-03-20 actor --offline --locked --features experimental-state-blocks
 
+# Reproduce source-built experimental Authority/Catalog templates separately
+# from the pinned release blobs. Keep each candidate under target, not /tmp.
+build-agent-state-system-templates:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    repository_root="{{justfile_directory()}}"
+    state_target="${CARGO_TARGET_DIR:-$repository_root/target}"
+    mkdir -p "$state_target"
+    state_target=$(cd "$state_target" && pwd)
+    export TMPDIR="$state_target/task-tmp"
+    mkdir -p "$TMPDIR"
+    candidate_root=$(mktemp -d "$state_target/agent-state-system-templates.XXXXXX")
+    cd "$repository_root"
+    CARGO_TARGET_DIR="$state_target" cargo +nightly-2025-05-09 run --offline --locked -p vosx --features experimental-state-blocks -- release build-system-templates --source "$repository_root" --out "$candidate_root/templates" --experimental-state-blocks
+    echo "candidate templates: $candidate_root/templates"
+
 # Physical signed external Local Create and finalized exact retry. This is a
 # candidate lifecycle gate, not released-binary admission or route selection.
 test-agent-state-local-create: build-agent-standard-state-guest build-agent-state-authority-guest

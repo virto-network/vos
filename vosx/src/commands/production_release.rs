@@ -36,6 +36,9 @@ pub enum ReleaseCommand {
         /// Fresh candidate output directory; existing paths are rejected.
         #[arg(long)]
         out: PathBuf,
+        /// Build an experimental Authority candidate; never replaces release pins.
+        #[arg(long)]
+        experimental_state_blocks: bool,
     },
     /// Materialize the programs pinned inside this binary and their manifest.
     Bundle {
@@ -79,9 +82,11 @@ enum ReleaseArtifactKind {
 
 pub fn run(command: ReleaseCommand) -> anyhow::Result<()> {
     match command {
-        ReleaseCommand::BuildSystemTemplates { source, out } => {
-            build_system_templates(&source, &out)
-        }
+        ReleaseCommand::BuildSystemTemplates {
+            source,
+            out,
+            experimental_state_blocks,
+        } => build_system_templates(&source, &out, experimental_state_blocks),
         ReleaseCommand::Bundle { out } => bundle(&out),
         ReleaseCommand::Verify { directory } => verify(&directory).map(|manifest| {
             println!(
@@ -102,7 +107,15 @@ fn system_template_signer() -> anyhow::Result<libp2p::identity::Keypair> {
         .context("construct public system-template signer")
 }
 
-fn build_system_templates(source: &Path, out: &Path) -> anyhow::Result<()> {
+fn build_system_templates(
+    source: &Path,
+    out: &Path,
+    experimental_state_blocks: bool,
+) -> anyhow::Result<()> {
+    #[cfg(not(feature = "experimental-state-blocks"))]
+    if experimental_state_blocks {
+        bail!("experimental Authority templates require an experimental-state-blocks vosx build");
+    }
     let source = fs::canonicalize(source).context("resolve system-template source")?;
     for name in ["system-authority", "system-catalog"] {
         if !source
@@ -127,6 +140,11 @@ fn build_system_templates(source: &Path, out: &Path) -> anyhow::Result<()> {
         super::build::run_with_signer(
             super::build::Args {
                 program: source.join("actors").join(name),
+                features: if experimental_state_blocks && name == "system-authority" {
+                    vec!["experimental-state-blocks".into()]
+                } else {
+                    vec![]
+                },
                 name: Some(name.into()),
                 out_dir: out.to_path_buf(),
                 method_policy: None,
@@ -505,7 +523,7 @@ mod tests {
         let sentinel = out.0.join("keep");
         fs::write(&sentinel, b"unchanged").unwrap();
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        assert!(build_system_templates(source, &out.0).is_err());
+        assert!(build_system_templates(source, &out.0, false).is_err());
         assert_eq!(fs::read(sentinel).unwrap(), b"unchanged");
     }
 
@@ -513,7 +531,19 @@ mod tests {
     fn system_templates_validate_source_before_creating_output() {
         let source = TestDir::new("templates-missing-source");
         let out = source.0.join("output");
-        assert!(build_system_templates(&source.0, &out).is_err());
+        assert!(build_system_templates(&source.0, &out, false).is_err());
+        assert!(!out.exists());
+    }
+
+    #[cfg(not(feature = "experimental-state-blocks"))]
+    #[test]
+    fn default_binary_refuses_experimental_template_build() {
+        let source = TestDir::new("templates-experimental-disabled");
+        let out = source.0.join("output");
+        assert!(build_system_templates(&source.0, &out, true)
+            .unwrap_err()
+            .to_string()
+            .contains("experimental-state-blocks vosx build"));
         assert!(!out.exists());
     }
 

@@ -121,6 +121,9 @@ enum Command {
 struct ActorBuildOptions {
     /// AgentActor project directory, ELF, or canonical standard PVM.
     program: PathBuf,
+    /// Cargo feature for a project-directory build. Repeat as needed.
+    #[arg(long = "feature", value_name = "FEATURE")]
+    features: Vec<String>,
     #[arg(long)]
     name: Option<String>,
     #[arg(long, default_value = "dist")]
@@ -156,6 +159,7 @@ impl ActorBuildOptions {
     fn into_build_args(self) -> commands::build::Args {
         commands::build::Args {
             program: self.program,
+            features: self.features,
             name: self.name,
             out_dir: self.out_dir,
             method_policy: self.method_policy,

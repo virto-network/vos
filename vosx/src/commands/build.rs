@@ -36,6 +36,9 @@ impl RustcUnitIdentity {
 
 pub struct Args {
     pub program: PathBuf,
+    /// Explicit Cargo features when PROGRAM is a project directory. Prebuilt
+    /// inputs must carry their own compiled feature selection.
+    pub features: Vec<String>,
     pub name: Option<String>,
     pub out_dir: PathBuf,
     /// Optional prebuilt AMP2 bytes. Actor builds accept them only when they
@@ -59,6 +62,9 @@ pub(super) fn run_with_signer(
     args: Args,
     keypair: &libp2p::identity::Keypair,
 ) -> anyhow::Result<()> {
+    if !args.program.is_dir() && !args.features.is_empty() {
+        bail!("--feature requires an actor project directory, not a prebuilt program");
+    }
     if args.tasks.len() > sdk::task::MAX_TASK_DEPENDENCIES {
         bail!(
             "actor package has {} Task dependencies; the canonical maximum is {}",
@@ -67,7 +73,7 @@ pub(super) fn run_with_signer(
         );
     }
 
-    let program = resolve_program_input(&args.program)?;
+    let program = resolve_program_input(&args.program, &args.features)?;
     let input = std::fs::read(&program).with_context(|| format!("read {}", program.display()))?;
     let is_pvm = program.extension().and_then(|extension| extension.to_str()) == Some("pvm");
     let actor_pvm = if is_pvm {
@@ -728,7 +734,7 @@ fn resolve_task_input(input: &Path) -> anyhow::Result<PathBuf> {
     }
 }
 
-fn resolve_program_input(input: &Path) -> anyhow::Result<PathBuf> {
+fn resolve_program_input(input: &Path, features: &[String]) -> anyhow::Result<PathBuf> {
     if !input.is_dir() {
         return Ok(input.to_path_buf());
     }
@@ -750,6 +756,9 @@ fn resolve_program_input(input: &Path) -> anyhow::Result<PathBuf> {
     command.args([CANONICAL_GUEST_TOOLCHAIN, "actor"]);
     if build_root != project {
         command.args(["-p", &package_name]);
+    }
+    if !features.is_empty() {
+        command.arg("--features").arg(features.join(","));
     }
     command
         .env("RUSTC_WRAPPER", std::env::current_exe()?)
@@ -1375,6 +1384,7 @@ mod tests {
         .unwrap();
         let build_args = |out_dir| Args {
             program: temp.0.join("actor.pvm"),
+            features: vec![],
             name: None,
             out_dir,
             method_policy: None,
@@ -1389,10 +1399,19 @@ mod tests {
         let first = temp.0.join("first");
         let second = temp.0.join("second");
         let signer = libp2p::identity::Keypair::generate_ed25519();
+        let mut mismatched_features = build_args(temp.0.join("prebuilt-with-feature"));
+        mismatched_features.features = vec!["experimental-state-blocks".into()];
+        assert!(
+            run_with_signer(mismatched_features, &signer)
+                .unwrap_err()
+                .to_string()
+                .contains("requires an actor project directory")
+        );
 
         let missing_metadata = run_with_signer(
             Args {
                 program: temp.0.join("actor.pvm"),
+                features: vec![],
                 name: None,
                 out_dir: temp.0.join("missing-metadata"),
                 method_policy: None,
@@ -1412,6 +1431,7 @@ mod tests {
         let missing_execution_schema = run_with_signer(
             Args {
                 program: temp.0.join("actor.pvm"),
+                features: vec![],
                 name: None,
                 out_dir: temp.0.join("missing-agent-schema"),
                 method_policy: None,

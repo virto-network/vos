@@ -323,6 +323,14 @@ external journal/lifecycle root. The default released binary returns a clear
 unsupported-mode error for `external-state` before opening the image path.
 The opt-in experimental build selects and recovers the external roots, but
 does not change the default image deployment or establish release readiness.
+The opt-in artifact builder can now compile the current Authority source with
+`experimental-state-blocks` into a separate public-signer template via
+`just build-agent-state-system-templates`. Two independent candidate outputs
+were byte-identical. This is reproducibility evidence only: the candidate is
+not embedded, selected by startup, or a release pin. The next artifact step is
+a compatible bounded state-runtime candidate and an explicit fresh-root bundle
+selection tested through actual `vosx` startup, while image deployments keep
+their existing bundle.
 Image-format Local Create/Install CLI commands now reject an external-state
 Space before reserving a credential or retaining a request; the opt-in daemon
 cannot accidentally strand an LCQ1 request while typed LCQ2 ingress is absent.
