@@ -16800,6 +16800,46 @@ mod tests {
                         .as_ref()
                 );
                 assert_eq!(file_tree_snapshot(&root), before_replay);
+                // The long-lived serving cursor owns the exact file slot,
+                // not only a borrowed replay view. A competing opener cannot
+                // take the lock until that cursor is dropped; dropping it
+                // releases the backend even without a separate host handle.
+                drop(store);
+                let reopened = acquire_production_local_slot(&directory, sealed)
+                    .open_external_journal(
+                        sealed,
+                        true,
+                        executor,
+                        &super::super::replay::NoPrunedOrderedBases,
+                        &mut ReadBudget::new(100, 100000),
+                    )
+                    .unwrap();
+                let owned = super::super::replay::PinnedExternalJournal::open(
+                    Box::new(reopened),
+                    sealed,
+                    executor,
+                    &super::super::replay::NoPrunedOrderedBases,
+                    &mut ReadBudget::new(100, 100000),
+                )
+                .unwrap();
+                assert_eq!(owned.materialization().unwrap(), &recovered);
+                let parent = File::open(&directory.0).unwrap();
+                assert!(matches!(
+                    FileLocalAgentJournalSlot::acquire_with_pinned_parents(
+                        directory.agent_root(sealed.genesis().runtime().agent),
+                        directory.lock(sealed.genesis().runtime().agent),
+                        sealed.replica().node,
+                        PRODUCTION_LOCAL_INTENT,
+                        &parent,
+                        &parent,
+                    ),
+                    Err(JournalStoreError::DirectoryInUse)
+                ));
+                drop(owned);
+                let mut store = acquire_production_local_slot(&directory, sealed)
+                    .open_external_genesis(sealed, true, &mut ReadBudget::new(100, 100000))
+                    .unwrap();
+                assert_eq!(file_tree_snapshot(&root), before_replay);
                 if !probe_mutations {
                     use crate::agent_sdk::{
                         self as sdk,

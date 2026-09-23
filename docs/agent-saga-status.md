@@ -49,7 +49,10 @@ batch 1; subsequent integration stays on `wip/ch08-runtime-directory`:
 
 Immediate integration seam: the external-state package, physical Create,
 sealed Local genesis, file journal and pinned Invoke/ACK owner now exist and
-pass prototype recovery tests, but no production route selects them.
+pass prototype recovery tests, but no production route selects them. The
+pinned cursor can now own its file store and stable lock across mutations;
+the active Local lifecycle still needs an external replay executor, durable
+intent/slot selection and route adapter before it can use that owner.
 `LocalJournalAgentDriver::prepare_local_genesis` still builds an r19 binding
 and `StandardLocalReplayExecutor`. A separate external Local preparer now
 authenticates the signed package, exact catalog closure, Create receipt and
@@ -607,6 +610,22 @@ correct pinned root. Missing blocks mean unavailable state, never absent keys.
   final-tree ACK variants passed at `task-tmp/state-near-cap-ack-final.log`;
   the new predecessor encoded to 3,129,456 bytes and its physical debug ACK
   took 1,994 ms in that run. This timing is diagnostic, not a release benchmark.
+  Owner-lifetime follow-up after `8488c133`: `PinnedExternalJournal` now holds
+  either a borrowed store or an owned `Box<FileAgentJournalStore>` while
+  retaining its authenticated materialization between mutations. A focused
+  file-backed regression reopens an exposed generation into the owned cursor,
+  proves a competing stable-slot opener is excluded until that cursor drops,
+  then reopens the same unchanged generation. The owned in-memory cursor also
+  publishes a checkpoint. These are internal lifecycle contracts, not a
+  production Local route or evidence that the live issuer selects this ABI.
+  The current file opener validates the durable/staged external head and
+  `PinnedExternalJournal::open` materializes the durable head again. Preserve
+  staged-head validation, but eliminate this duplicate replay when wiring the
+  production owner; measure its startup cost before accepting it. The focused
+  owned-file regression passed at `task-tmp/state-owned-file-cursor-focused.log`;
+  the complete prototype gate passed at `task-tmp/state-owned-cursor-prototype.log`
+  (SDK 247/1 ignored, replay 69, physical PVM 17, journal-store 105 and
+  feature-disabled groups).
   Production actor-package issuance and authoritative heads remain separate.
   Local Create-preparation follow-up: the new external preparer consumes a
   bounded immutable supplied catalog, rejects a missing package, verifies the

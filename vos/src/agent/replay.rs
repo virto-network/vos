@@ -15725,13 +15725,19 @@ mod aggregate {
     }
 
     /// One independently ordered Local journal, pinned from recovery through
-    /// successive commits. No mutable store handle or transferable availability
-    /// token escapes. Opening audits once; mutations verify changed paths only.
-    /// A failed CAS poisons the owner because durable publication may have won
-    /// before the error; callers must recover, never execute on a stale cursor.
+    /// successive commits. `H` can be a borrowed test handle or an owned
+    /// process-local handle (for example `Box<FileAgentJournalStore>`), so a
+    /// serving owner can retain the stable file-slot lock and the authenticated
+    /// materialization together without replaying on every checkout. No raw
+    /// mutable store or transferable availability token escapes. Opening audits
+    /// once; mutations verify changed paths only. A failed CAS poisons this
+    /// owner because durable publication may have won before the error.
     #[cfg(feature = "experimental-state-blocks")]
-    pub(crate) struct PinnedExternalJournal<'store, S: AgentJournalStore> {
-        store: &'store mut S,
+    pub(crate) struct PinnedExternalJournal<H, S: AgentJournalStore>
+    where
+        H: core::ops::DerefMut<Target = S>,
+    {
+        store: H,
         materialization: ReplayMaterialization,
         checkpoint_lanes: BTreeSet<LaneStateId>,
         poisoned: bool,
@@ -15750,22 +15756,23 @@ mod aggregate {
     }
 
     #[cfg(feature = "experimental-state-blocks")]
-    impl<'store, S> PinnedExternalJournal<'store, S>
+    impl<H, S> PinnedExternalJournal<H, S>
     where
+        H: core::ops::DerefMut<Target = S>,
         S: super::super::journal_store::ExternalMutationStore
             + ReplaySource<Error = JournalStoreError>,
     {
         pub(crate) fn open<E: ReplayExecutor, R: OrderedBaseResolver>(
-            store: &'store mut S,
+            mut store: H,
             seal: &ReplaySealedExternalLocalGenesis,
             executor: &mut E,
             resolver: &R,
             budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
         ) -> Result<Self, MaterializeError<R::Error, E::Error>> {
             let materialization =
-                materialize_external_genesis(store, seal, executor, resolver, budget)?;
+                materialize_external_genesis(&mut *store, seal, executor, resolver, budget)?;
             let checkpoint_lanes =
-                external_checkpoint_lanes(store, materialization.heads()).map_err(journal)?;
+                external_checkpoint_lanes(&*store, materialization.heads()).map_err(journal)?;
             Ok(Self {
                 store,
                 materialization,
@@ -15816,7 +15823,7 @@ mod aggregate {
             if self.poisoned {
                 return Err(journal(JournalStoreError::Unavailable));
             }
-            let prepared = prepare_checkpoint(self.store, &self.materialization)?;
+            let prepared = prepare_checkpoint(&mut *self.store, &self.materialization)?;
             let audited = prepared
                 .audit_external_checkpoint_from_genesis(genesis, budget)
                 .map_err(journal)?;
@@ -15849,7 +15856,7 @@ mod aggregate {
 
         #[cfg(test)]
         pub(super) fn store_for_test(&self) -> &S {
-            self.store
+            &*self.store
         }
 
         pub(crate) fn apply<E: ReplayExecutor>(
@@ -15897,10 +15904,10 @@ mod aggregate {
             }
             let prepared = match entry {
                 ExternalJournalEntry::Ordered(entry) => {
-                    prepare_ordered(self.store, executor, &self.materialization, entry)?
+                    prepare_ordered(&mut *self.store, executor, &self.materialization, entry)?
                 }
                 ExternalJournalEntry::Local(entry) => {
-                    prepare_local(self.store, executor, &self.materialization, entry)?
+                    prepare_local(&mut *self.store, executor, &self.materialization, entry)?
                 }
             };
             let ReplayPreparation::Ready(prepared) = prepared else {
@@ -20078,6 +20085,8 @@ pub(crate) use aggregate::{
 };
 
 #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+pub(crate) use aggregate::PinnedExternalJournal;
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
 #[allow(unused_imports)]
 pub(crate) use aggregate::materialize_external_checkpoint;
 #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
@@ -23039,7 +23048,7 @@ pub(crate) mod tests {
                 }
             }
         }
-        let physical_capture = |pinned: &PinnedExternalJournal<'_, S>, entry: &Entry| {
+        let physical_capture = |pinned: &PinnedExternalJournal<&mut S, S>, entry: &Entry| {
             let before = pinned.materialization().unwrap();
             let lanes = before
                 .external_roots
@@ -24027,6 +24036,29 @@ pub(crate) mod tests {
                 sealed.lane_manifest(lane).external_root.as_ref()
             );
         }
+        // A serving owner may move the locked store into the pinned cursor;
+        // it must retain the same authenticated materialization and be able
+        // to publish without borrowing a second, detached store handle.
+        let mut owned = aggregate::PinnedExternalJournal::open(
+            Box::new(initialized.clone()),
+            &sealed,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &mut ReadBudget::new(100, 100000),
+        )
+        .unwrap();
+        assert_eq!(owned.materialization().unwrap(), &recovered);
+        assert!(
+            owned
+                .checkpoint(&sealed, &mut ReadBudget::new(100, 100000))
+                .unwrap()
+                .heads_advanced
+        );
+        assert_eq!(
+            owned.store_for_test().heads().unwrap().as_ref(),
+            Some(owned.materialization().unwrap().heads())
+        );
+        drop(owned);
         let mut other_create = create.clone();
         let ReplayOperation::CleanManage { observed_slot, .. } = &mut other_create.operation else {
             unreachable!()
