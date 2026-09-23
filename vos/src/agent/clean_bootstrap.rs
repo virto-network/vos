@@ -5074,22 +5074,22 @@ where
     /// Drive external-state Local Create through the same signed CMI4/CIS2
     /// Authority lifecycle as image Local. A returned owner is physically
     /// reopened and finalized, but route attachment is the caller's separate
-    /// responsibility. The slot factory must derive its paths from this
-    /// owner's independently selected Space and Node, never request bytes.
+    /// responsibility. The directory is pinned to this owner's independently
+    /// selected Space and Node, never to request-supplied paths.
     #[cfg(all(
         target_os = "linux",
         feature = "storage",
         feature = "experimental-state-blocks"
     ))]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn create_external_local_agent<B, J, S, Open>(
+    pub(crate) fn create_external_local_agent<B, J, S>(
         &mut self,
         intent_store: B,
         issuer_store: J,
         descriptor: super::sdk::AgentDescriptor,
         call: AuthorityCredentialCall,
         runtime: super::package_admission::AdmittedStateRuntimePackage,
-        open_slot: Open,
+        directory: &super::journal_store::ExternalLocalJournalDirectory,
         budget: &mut super::sdk::state_blocks::ReadBudget,
         signer: &mut S,
     ) -> Result<
@@ -5104,13 +5104,6 @@ where
         B: super::clean_authority_issuer::CleanManagementRuntimeStore,
         J: CleanManagementIssuerStore,
         S: CleanManagementReceiptSigner,
-        Open:
-            FnOnce(
-                crate::service::AgentId,
-                crate::service::NodeId,
-                crate::service::Hash,
-            )
-                -> Result<super::journal_store::FileLocalAgentJournalSlot, SharedAgentHostError>,
     {
         use super::external_local_executor::{
             ExternalLocalJournalOwner, RetainedExternalLocalCreate,
@@ -5120,6 +5113,8 @@ where
         let target = self.authority_target();
         let managed = call.managed;
         if descriptor.identity.space != self.pins.space
+            || directory.space() != crate::service::SpaceId(self.pins.space.0)
+            || directory.node() != crate::service::NodeId(self.pins.node.0)
             || descriptor.replicas.len() != 1
             || descriptor.replicas[0].node != self.pins.node
             || descriptor.replicas[0].role != super::sdk::ReplicaRole::Voter
@@ -5158,11 +5153,9 @@ where
         let intent_hash = external_local_create_intent_hash(
             slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?,
         );
-        let external_slot = open_slot(
-            crate::service::AgentId(managed.agent.0),
-            crate::service::NodeId(self.pins.node.0),
-            intent_hash,
-        )?;
+        let external_slot = directory
+            .acquire(crate::service::AgentId(managed.agent.0), intent_hash)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
         if external_slot.agent() != crate::service::AgentId(managed.agent.0)
             || external_slot.node() != crate::service::NodeId(self.pins.node.0)
             || external_slot.intent() != intent_hash
@@ -15804,10 +15797,10 @@ mod tests {
         #[test]
         #[ignore = "requires experimental standard and Authority guests"]
         fn native_external_local_create_finalizes_and_retries() {
+            use crate::agent::ExternalLocalJournalDirectory;
             use crate::agent::clean_management_intent::{
                 CleanManagementIntent, CleanManagementIntentSlot,
             };
-            use crate::agent::journal_store::FileLocalAgentJournalSlot;
             use crate::agent::sdk::state_blocks::ReadBudget;
 
             // The native system fixture drives the real Authority actor, while
@@ -15867,26 +15860,12 @@ mod tests {
 
             let root = harness._directory.0.join("external-local");
             std::fs::create_dir(&root).unwrap();
-            let open_slot = |agent: crate::service::AgentId,
-                             node: crate::service::NodeId,
-                             intent: crate::service::Hash| {
-                let agent_hex = agent
-                    .0
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>();
-                let parent =
-                    std::fs::File::open(&root).map_err(|_| SharedAgentHostError::Unavailable)?;
-                FileLocalAgentJournalSlot::acquire_with_pinned_parents(
-                    root.join(format!("{agent_hex}.agent")),
-                    root.join(format!("{agent_hex}.agent-lock")),
-                    node,
-                    intent,
-                    &parent,
-                    &parent,
-                )
-                .map_err(|_| SharedAgentHostError::Unavailable)
-            };
+            let directory = ExternalLocalJournalDirectory::open_existing(
+                root.clone(),
+                crate::service::SpaceId(owner.pins.space.0),
+                crate::service::NodeId(owner.pins.node.0),
+            )
+            .unwrap();
             let intent_store = IssuerMemoryStore::default();
             let issuer_store = IssuerMemoryStore::default();
             let mut signer = CountingSigner::new();
@@ -15901,7 +15880,7 @@ mod tests {
                     descriptor.clone(),
                     call.clone(),
                     runtime.clone(),
-                    &open_slot,
+                    &directory,
                     &mut budget,
                     &mut signer,
                 ),
@@ -15953,7 +15932,7 @@ mod tests {
                     descriptor.clone(),
                     call.clone(),
                     runtime.clone(),
-                    &open_slot,
+                    &directory,
                     &mut ReadBudget::new(10_000, 10_000_000),
                     &mut signer,
                 ),
@@ -15970,7 +15949,7 @@ mod tests {
                     descriptor.clone(),
                     call.clone(),
                     runtime.clone(),
-                    &open_slot,
+                    &directory,
                     &mut recovery_budget,
                     &mut signer,
                 )
@@ -16009,7 +15988,7 @@ mod tests {
                     descriptor,
                     call,
                     runtime,
-                    &open_slot,
+                    &directory,
                     &mut retry_budget,
                     &mut signer,
                 )
@@ -16017,6 +15996,20 @@ mod tests {
             assert_eq!((retry_agent, retry_ack), (agent, acknowledgement));
             assert_eq!(reopened.materialization().unwrap().heads(), &first_head);
             drop(reopened);
+
+            // A pathname replacement cannot redirect the pinned owner into
+            // a new empty directory or mint a fresh stable lock there.
+            std::fs::rename(&root, root.with_extension("moved")).unwrap();
+            std::fs::create_dir(&root).unwrap();
+            assert!(
+                directory
+                    .acquire(
+                        crate::service::AgentId(agent.0),
+                        crate::service::Hash([0x55; 32]),
+                    )
+                    .is_err()
+            );
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
             harness.stop();
         }
 

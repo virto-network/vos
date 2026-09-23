@@ -104,6 +104,12 @@ use super::transition_proof_journal::{
 use super::wire::RuntimeState;
 use super::{LifecycleReply, LifecycleRequest};
 use crate::agent_sdk::wire::CanonicalWire as AgentCanonicalWire;
+#[cfg(all(
+    target_os = "linux",
+    feature = "storage",
+    feature = "experimental-state-blocks"
+))]
+use crate::service::SpaceId;
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 use crate::service::{AgentId, BlobRef, Hash, NodeId};
 
@@ -9905,6 +9911,79 @@ pub(crate) struct FileLocalAgentJournalSlot {
     intent: Hash,
     exposure_committed: bool,
     stable_lock: File,
+}
+
+/// Operator-selected Space/Node directory retained across Local lifecycle
+/// calls. It never derives a parent path from a signed Create request. Every
+/// slot acquisition rechecks the pinned ancestor chain before creating or
+/// reopening that Agent's stable lock.
+#[cfg(all(
+    target_os = "linux",
+    feature = "storage",
+    feature = "experimental-state-blocks"
+))]
+pub struct ExternalLocalJournalDirectory {
+    root: PathBuf,
+    space: SpaceId,
+    node: NodeId,
+    parent: AbsoluteDirectoryCapability,
+}
+
+#[cfg(all(
+    target_os = "linux",
+    feature = "storage",
+    feature = "experimental-state-blocks"
+))]
+impl ExternalLocalJournalDirectory {
+    /// Open an existing private directory chosen from the node's configured
+    /// Space root. Creation and ownership of that root remain with startup.
+    pub fn open_existing(
+        root: impl Into<PathBuf>,
+        space: SpaceId,
+        node: NodeId,
+    ) -> Result<Self, JournalStoreError> {
+        if space == SpaceId::ZERO || node == NodeId::ZERO {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        let root = clean_absolute_path(root.into())?;
+        let parent = AbsoluteDirectoryCapability::open(&root)?;
+        validate_owned_directory(parent.get()?)?;
+        Ok(Self {
+            root,
+            space,
+            node,
+            parent,
+        })
+    }
+
+    pub fn space(&self) -> SpaceId {
+        self.space
+    }
+
+    pub fn node(&self) -> NodeId {
+        self.node
+    }
+
+    pub(crate) fn acquire(
+        &self,
+        agent: AgentId,
+        intent: Hash,
+    ) -> Result<FileLocalAgentJournalSlot, JournalStoreError> {
+        if agent == AgentId::ZERO || intent == Hash::ZERO {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        let parent = self.parent.get()?;
+        validate_owned_directory(parent)?;
+        let agent_hex = encode_hex(agent.as_bytes());
+        FileLocalAgentJournalSlot::acquire_with_pinned_parents(
+            self.root.join(format!("{agent_hex}.agent")),
+            self.root.join(format!("{agent_hex}.agent-lock")),
+            self.node,
+            intent,
+            parent,
+            parent,
+        )
+    }
 }
 
 #[cfg(all(target_os = "linux", feature = "storage"))]

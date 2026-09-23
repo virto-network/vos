@@ -66,6 +66,9 @@ builds opt-in Authority and standard-runtime guests and exercises the complete
 internal Create/retry flow, including a failure after actor finality but before
 local retirement. The released bundled Authority correctly rejects
 the experimental ABI; its artifact is not replaced or implicitly upgraded.
+The coordinator now accepts an operator-selected, filesystem-descriptor-pinned external
+directory owner rather than a request-controlled slot-opening callback;
+replacing that directory pathname cannot redirect a retained owner.
 
 No released startup, lifecycle queue or route adapter selects this owner yet;
 the caller must choose Space/Node storage roots independently and attach a
@@ -83,8 +86,8 @@ route only after authenticated Create publication. Shared common finality and
 Clerk follow within batch 1. Candidate signed packages are not live admission;
 the large ACK's 5-billion-gas success is not a release-latency guarantee.
 
-External Local cutover TODOs, in order: (1) give the lifecycle controller a
-Space/Node-pinned external directory and explicit per-Agent format selection,
+External Local cutover TODOs, in order: (1) pass the Space/Node-pinned external
+directory into the lifecycle controller and select format per Agent,
 then recover mixed image/external intents under one startup admission before
 publishing either kind of route; (2) attach an external per-Agent route owner
 with Install, Invoke, Resume and ACK using the existing signed journal

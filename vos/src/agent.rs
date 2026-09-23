@@ -56,6 +56,12 @@ pub(crate) mod invocation_preparation;
 pub mod journal;
 #[cfg(feature = "std")]
 pub(crate) mod journal_store;
+#[cfg(all(
+    target_os = "linux",
+    feature = "storage",
+    feature = "experimental-state-blocks"
+))]
+pub use journal_store::{ExternalLocalJournalDirectory, JournalStoreError};
 #[cfg(feature = "std")]
 pub(crate) mod local_journal_driver;
 #[cfg(all(
