@@ -23168,6 +23168,53 @@ pub(crate) mod tests {
                 &mut ReadBudget::new(10000, 10000000),
             )
             .unwrap();
+            let mut head_recovery = None;
+            if index == 0 {
+                let id = before_retry.heads().ordered_head.unwrap();
+                let committed: OrderedEntry = store.get(id).unwrap().unwrap();
+                assert_eq!(committed.input, invoke);
+                let resolver =
+                    super::super::journal_store::CatalogBlobResolverFactory::catalog_blob_resolver(
+                        &store,
+                    )
+                    .unwrap();
+                let mut production =
+                    super::super::external_local_executor::ExternalLocalReplayExecutor::new(
+                        admitted.clone(),
+                        descriptor.as_ref().clone(),
+                        resolver,
+                    )
+                    .unwrap();
+                let mut reopened = PinnedExternalJournal::open(
+                    &mut store,
+                    sealed,
+                    &mut production,
+                    &NoPrunedOrderedBases,
+                    &mut ReadBudget::new(10000, 10000000),
+                )
+                .unwrap();
+                let ExternalJournalCommit::AlreadyCommitted(recovery) = reopened
+                    .apply(
+                        &mut production,
+                        ExternalJournalEntry::Ordered(&committed),
+                        &mut ReadBudget::new(0, 0),
+                    )
+                    .unwrap()
+                else {
+                    panic!("reopened exact head was not committed");
+                };
+                assert_eq!(
+                    production.replayed_outcome(recovery.input(), recovery.position()),
+                    Some(first.clone())
+                );
+                assert!(
+                    super::super::external_local_executor::committed_recovery_is_domain_head(
+                        &before_retry,
+                        recovery,
+                    )
+                );
+                head_recovery = Some(recovery);
+            }
             assert_eq!(
                 publish_standard_invocation(
                     &mut store,
@@ -23187,6 +23234,14 @@ pub(crate) mod tests {
             )
             .unwrap();
             assert_eq!(after_retry.state(), before_retry.state());
+            if let Some(recovery) = head_recovery {
+                assert!(
+                    !super::super::external_local_executor::committed_recovery_is_domain_head(
+                        &after_retry,
+                        recovery,
+                    )
+                );
+            }
             let ack = ReplayInput {
                 runtime: entry.input.runtime.clone(),
                 operation: ReplayOperation::CleanAcknowledge {
@@ -23256,6 +23311,53 @@ pub(crate) mod tests {
             executor.captures.clear();
             executor.pending = None;
             store = reopen(store, &mut executor);
+            if index == 0 {
+                // A checkpoint includes the latest input in its base, so
+                // reopening does not physically replay that input. Its
+                // AlreadyCommitted token must not invent a cached reply.
+                let resolver =
+                    super::super::journal_store::CatalogBlobResolverFactory::catalog_blob_resolver(
+                        &store,
+                    )
+                    .unwrap();
+                let mut production =
+                    super::super::external_local_executor::ExternalLocalReplayExecutor::new(
+                        admitted.clone(),
+                        descriptor.as_ref().clone(),
+                        resolver,
+                    )
+                    .unwrap();
+                let mut reopened = PinnedExternalJournal::open(
+                    &mut store,
+                    sealed,
+                    &mut production,
+                    &NoPrunedOrderedBases,
+                    &mut ReadBudget::new(10000, 10000000),
+                )
+                .unwrap();
+                let id = reopened
+                    .materialization()
+                    .unwrap()
+                    .heads()
+                    .ordered_head
+                    .unwrap();
+                let entry: OrderedEntry = reopened.store_for_test().get(id).unwrap().unwrap();
+                let ExternalJournalCommit::AlreadyCommitted(recovery) = reopened
+                    .apply(
+                        &mut production,
+                        ExternalJournalEntry::Ordered(&entry),
+                        &mut ReadBudget::new(0, 0),
+                    )
+                    .unwrap()
+                else {
+                    panic!("checkpointed exact head was not committed");
+                };
+                assert!(
+                    production
+                        .replayed_outcome(recovery.input(), recovery.position())
+                        .is_none()
+                );
+            }
         }
         // Recover the complete physical lifecycle through the production
         // authorization adapter, independently of the fixture's captured

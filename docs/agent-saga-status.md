@@ -87,11 +87,15 @@ adapter and Standard guest now physically admit Resume with the retained
 invocation's authorization and gas bound; an absent continuation returns a
 no-change guest error. A successful retained external Resume has not been
 physically qualified, and yielded external writes still fail closed until
-continuation budgets are retained. An `AlreadyCommitted` retry still lacks an
-authenticated response handoff, including after restart; do not attach a
-route that can execute without it. A fresh no-change guest retry is not by
-itself evidence of the original response; bind any recovery path to the
-authenticated committed input and retained result/lifecycle state.
+continuation budgets are retained. An exact-current-domain-head
+`AlreadyCommitted` retry can now recover the outcome from physical suffix
+replay after restart, but only while the locked journal still names that input
+and position. The cache keeps at most two outcomes per Ordered/Local domain;
+a checkpoint-pruned result after reopen or older-head retry remains unavailable.
+Do not attach a route until
+those retry cases have an authenticated response policy. A fresh no-change
+guest retry alone is not evidence of the original response; bind recovery to
+the committed input and retained result/lifecycle state.
 
 No released startup, lifecycle queue or route adapter selects this owner yet;
 the caller must choose Space/Node storage roots independently and attach a

@@ -5,8 +5,8 @@
 use super::driver::{DEFAULT_MANAGEMENT_GAS, SdkManagementArtifacts};
 use super::execution::MAX_EXECUTION_GAS;
 use super::journal::{
-    AgentJournalGenesis, CanonicalJournalRecord, LaneCursor, LaneStateManifest, ReplayInput,
-    ReplayInputId, ReplayOperation, RuntimeBinding,
+    AgentJournalGenesis, AgentJournalGenesisId, CanonicalJournalRecord, LaneCursor,
+    LaneStateManifest, ReplayInput, ReplayInputId, ReplayOperation, RuntimeBinding,
 };
 use super::journal_store::CatalogBlobResolver;
 use super::local_journal_driver::LocalReplayExecutorError;
@@ -18,7 +18,7 @@ use super::state_block_pvm::{BlockPvmError, MultiLaneStateBlockHost};
 use super::wire::RuntimeState;
 use crate::agent_sdk::{
     AgentDescriptor, AgentProfile, InvocationAuthorization, InvocationRetirement,
-    ManagementRequest, state_blocks::ReadBudget,
+    ManagementRequest, RuntimeOutcome, state_blocks::ReadBudget,
 };
 use crate::service::{AgentId, BlobRef, SpaceId};
 
@@ -394,8 +394,14 @@ pub(crate) struct ExternalLocalReplayExecutor<R> {
     descriptor: AgentDescriptor,
     resolver: R,
     seeded: bool,
+    seeded_genesis: Option<AgentJournalGenesisId>,
     authenticated: Option<AuthenticatedExternalInput>,
     pending: Option<ReplayExternalExecution>,
+    // Keep only the two newest outcomes per Ordered/Local domain: a durable
+    // head and one staged successor. Execution is a candidate until the pinned
+    // journal's durable head names its exact position; this cache alone never
+    // authorizes a response.
+    recent_outcomes: Vec<(ReplayInputId, ReplayPosition, RuntimeOutcome)>,
 }
 
 impl<R: CatalogBlobResolver> ExternalLocalReplayExecutor<R> {
@@ -428,9 +434,74 @@ impl<R: CatalogBlobResolver> ExternalLocalReplayExecutor<R> {
             descriptor,
             resolver,
             seeded: false,
+            seeded_genesis: None,
             authenticated: None,
             pending: None,
+            recent_outcomes: Vec::new(),
         })
+    }
+
+    fn remember_outcome(
+        &mut self,
+        input: ReplayInputId,
+        position: ReplayPosition,
+        outcome: RuntimeOutcome,
+    ) -> Result<(), LocalReplayExecutorError> {
+        if let Some((_, _, retained)) = self
+            .recent_outcomes
+            .iter()
+            .find(|(seen, at, _)| *seen == input && *at == position)
+        {
+            return if *retained == outcome {
+                Ok(())
+            } else {
+                Err(LocalReplayExecutorError::InvalidState)
+            };
+        }
+        if !matches!(
+            position,
+            ReplayPosition::Ordered { .. } | ReplayPosition::Local { .. }
+        ) {
+            return Err(LocalReplayExecutorError::InvalidState);
+        }
+        let same_domain = |candidate| {
+            matches!(
+                (candidate, position),
+                (
+                    ReplayPosition::Ordered { .. },
+                    ReplayPosition::Ordered { .. }
+                ) | (ReplayPosition::Local { .. }, ReplayPosition::Local { .. })
+            )
+        };
+        if self
+            .recent_outcomes
+            .iter()
+            .filter(|(_, at, _)| same_domain(*at))
+            .count()
+            == 2
+        {
+            let oldest = self
+                .recent_outcomes
+                .iter()
+                .position(|(_, at, _)| same_domain(*at))
+                .expect("two entries in the same domain have an oldest member");
+            self.recent_outcomes.remove(oldest);
+        }
+        self.recent_outcomes.push((input, position, outcome));
+        Ok(())
+    }
+
+    pub(crate) fn replayed_outcome(
+        &self,
+        input: ReplayInputId,
+        position: ReplayPosition,
+    ) -> Option<RuntimeOutcome> {
+        self.recent_outcomes
+            .iter()
+            .find(|(retained_input, retained_position, _)| {
+                *retained_input == input && *retained_position == position
+            })
+            .map(|(_, _, outcome)| outcome.clone())
     }
 
     fn binding(&self) -> Result<RuntimeBinding, LocalReplayExecutorError> {
@@ -541,6 +612,10 @@ impl<R: CatalogBlobResolver> ReplayExecutor for ExternalLocalReplayExecutor<R> {
     type Error = LocalReplayExecutorError;
 
     fn seed_genesis(&mut self, genesis: &AgentJournalGenesis) -> Result<(), Self::Error> {
+        if self.seeded_genesis != Some(genesis.id()) {
+            self.recent_outcomes.clear();
+            self.seeded_genesis = Some(genesis.id());
+        }
         self.seeded = false;
         self.authenticated = None;
         self.pending = None;
@@ -696,6 +771,18 @@ impl<R: CatalogBlobResolver> ReplayExecutor for ExternalLocalReplayExecutor<R> {
             return Err(LocalReplayExecutorError::InvalidState);
         }
         let transition = execution.transition().clone();
+        if matches!(
+            input.operation,
+            ReplayOperation::CleanInvoke { .. }
+                | ReplayOperation::CleanResume { .. }
+                | ReplayOperation::CleanAcknowledge { .. }
+        ) {
+            self.remember_outcome(
+                input.id(),
+                position,
+                execution.output().transition().outcome.clone(),
+            )?;
+        }
         self.pending = Some(execution);
         Ok(transition)
     }
@@ -727,6 +814,40 @@ pub(crate) struct ExternalLocalJournalOwner {
         super::journal_store::FileAgentJournalStore,
     >,
     executor: ExternalLocalReplayExecutor<super::journal_store::FileCatalogBlobResolver>,
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+pub(crate) fn committed_recovery_is_domain_head(
+    recovered: &super::replay::ReplayMaterialization,
+    recovery: super::replay::ReplayCommittedRecovery,
+) -> bool {
+    let heads = recovered.heads();
+    match recovery.position() {
+        ReplayPosition::Ordered {
+            id,
+            index,
+            merge_frontier,
+            merge_seal: None,
+        } => {
+            heads.ordered_head == Some(id)
+                && heads.ordered_index == index
+                && heads.merge_frontier == merge_frontier
+        }
+        ReplayPosition::Local {
+            id,
+            node,
+            revision,
+            ordered_base,
+            merge_frontier,
+        } => {
+            heads.local_head == Some(id)
+                && heads.node == node
+                && heads.local_revision == revision
+                && recovered.ordered_base() == ordered_base
+                && heads.merge_frontier == merge_frontier
+        }
+        _ => false,
+    }
 }
 
 #[cfg(all(target_os = "linux", feature = "storage"))]
@@ -812,6 +933,26 @@ impl ExternalLocalJournalOwner {
     ) -> Result<&super::replay::ReplayMaterialization, super::journal_store::JournalStoreError>
     {
         self.cursor.materialization()
+    }
+
+    /// Return an exact-head response-loss result only while the locked store
+    /// still names the same committed input/position. The executor may have
+    /// seen an uncommitted staged head during open or a failed preparation;
+    /// neither can authorize a response through this check. Checkpoint-pruned
+    /// results absent from the replay cache remain unavailable.
+    pub(crate) fn committed_outcome(
+        &self,
+        recovery: super::replay::ReplayCommittedRecovery,
+    ) -> Result<RuntimeOutcome, super::journal_store::JournalStoreError> {
+        use super::journal_store::JournalStoreError;
+        self.cursor.inspect(|_, recovered| {
+            if !committed_recovery_is_domain_head(recovered, recovery) {
+                return Err(JournalStoreError::Conflict);
+            }
+            self.executor
+                .replayed_outcome(recovery.input(), recovery.position())
+                .ok_or(JournalStoreError::Unavailable)
+        })
     }
 
     /// The issuer may sign Create application only after the initial
@@ -1115,8 +1256,8 @@ mod tests {
             MethodMode,
             genesis::AgentGenesisAdmissionId,
             journal::{
-                AgentJournalGenesis, CanonicalJournalRecord, MergeFrontierId, OrderedEntryId,
-                ReplayOperation,
+                AgentJournalGenesis, CanonicalJournalRecord, LocalEntryId, MergeFrontierId,
+                OrderedBase, OrderedEntryId, ReplayOperation,
             },
             journal_store::{CatalogBlobResolver, JournalStoreError},
             package_admission::tests::admitted_state_fixture,
@@ -1124,7 +1265,7 @@ mod tests {
             wire::RuntimeState,
         };
         use crate::agent_sdk::{
-            self as sdk, RuntimeExecutionContext, YieldReason, YieldedInvocation,
+            self as sdk, RuntimeExecutionContext, RuntimeOutcome, YieldReason, YieldedInvocation,
         };
 
         #[derive(Clone)]
@@ -1154,12 +1295,11 @@ mod tests {
         let mut executor =
             ExternalLocalReplayExecutor::new(runtime, descriptor.as_ref().clone(), EmptyCatalog)
                 .unwrap();
-        executor
-            .seed_genesis(&AgentJournalGenesis {
-                admission: AgentGenesisAdmissionId::from_bytes([0x71; 32]),
-                create: create.clone(),
-            })
-            .unwrap();
+        let genesis = AgentJournalGenesis {
+            admission: AgentGenesisAdmissionId::from_bytes([0x71; 32]),
+            create: create.clone(),
+        };
+        executor.seed_genesis(&genesis).unwrap();
         let invoke = clean_admitted_invocation(&create.runtime, MethodMode::Linear, 0x72);
         let ReplayOperation::CleanInvoke {
             work,
@@ -1188,7 +1328,7 @@ mod tests {
             reason: YieldReason::Cooperative,
         };
         let resume = crate::agent::journal::ReplayInput {
-            runtime: create.runtime,
+            runtime: create.runtime.clone(),
             operation: ReplayOperation::CleanResume {
                 context: RuntimeExecutionContext::Direct,
                 expected_live: None,
@@ -1218,6 +1358,79 @@ mod tests {
         executor
             .authenticate(&resume, &RuntimeState::default(), position)
             .unwrap();
+        let outcome = RuntimeOutcome::Completed(Err(sdk::InvocationError::NotFound));
+        executor
+            .remember_outcome(resume.id(), position, outcome.clone())
+            .unwrap();
+        assert_eq!(
+            executor.replayed_outcome(resume.id(), position),
+            Some(outcome.clone())
+        );
+        assert!(
+            executor
+                .replayed_outcome(
+                    resume.id(),
+                    ReplayPosition::Ordered {
+                        id: OrderedEntryId([0x75; 32]),
+                        index: 1,
+                        merge_frontier: MergeFrontierId([0x74; 32]),
+                        merge_seal: None,
+                    }
+                )
+                .is_none()
+        );
+        assert!(
+            executor
+                .remember_outcome(
+                    resume.id(),
+                    position,
+                    RuntimeOutcome::Completed(Err(sdk::InvocationError::InvalidAvailability)),
+                )
+                .is_err()
+        );
+        executor.seed_genesis(&genesis).unwrap();
+        assert_eq!(
+            executor.replayed_outcome(resume.id(), position),
+            Some(outcome)
+        );
+        let local = ReplayPosition::Local {
+            id: LocalEntryId([0x77; 32]),
+            node: crate::service::NodeId([0x35; 32]),
+            revision: 1,
+            ordered_base: OrderedBase::post_genesis(),
+            merge_frontier: MergeFrontierId([0x74; 32]),
+        };
+        executor
+            .remember_outcome(
+                resume.id(),
+                local,
+                RuntimeOutcome::Completed(Err(sdk::InvocationError::NotFound)),
+            )
+            .unwrap();
+        for (id, index) in [(0x78, 2), (0x79, 3)] {
+            executor
+                .remember_outcome(
+                    resume.id(),
+                    ReplayPosition::Ordered {
+                        id: OrderedEntryId([id; 32]),
+                        index,
+                        merge_frontier: MergeFrontierId([0x74; 32]),
+                        merge_seal: None,
+                    },
+                    RuntimeOutcome::Completed(Err(sdk::InvocationError::NotFound)),
+                )
+                .unwrap();
+        }
+        assert_eq!(executor.recent_outcomes.len(), 3);
+        assert!(executor.replayed_outcome(resume.id(), position).is_none());
+        assert!(executor.replayed_outcome(resume.id(), local).is_some());
+        executor
+            .seed_genesis(&AgentJournalGenesis {
+                admission: AgentGenesisAdmissionId::from_bytes([0x76; 32]),
+                create: create.clone(),
+            })
+            .unwrap();
+        assert!(executor.replayed_outcome(resume.id(), position).is_none());
         let mut stale = resume.clone();
         let ReplayOperation::CleanResume { observed_slot, .. } = &mut stale.operation else {
             unreachable!()
