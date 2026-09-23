@@ -23,6 +23,8 @@ use vos::agent::authority_operation_issuer::{
     AuthorityOperationIssuerStore, MAX_AUTHORITY_OPERATION_ISSUER_IMAGE_BYTES,
 };
 use vos::agent::bootstrap::MAX_SYSTEM_AGENT_GENESIS_PROVISION_BYTES;
+#[cfg(feature = "experimental-state-blocks")]
+use vos::agent::clean_authority_issuer::CleanExternalLocalPendingInstallStore;
 use vos::agent::clean_authority_issuer::{
     CleanExternalLocalCreateArchiveStore, CleanManagementActorStore, CleanManagementIssuerStore,
     CleanManagementRuntimeStore, MAX_CLEAN_EXTERNAL_LOCAL_CREATE_ARCHIVE_BYTES,
@@ -65,6 +67,8 @@ const LIFECYCLE_ACTOR_FILE: &str = "management.actor";
 const LIFECYCLE_ACTOR_STAGE_FILE: &str = "management.actor.next";
 const LIFECYCLE_EXTERNAL_CREATE_ARCHIVE_FILE: &str = "management.external-create";
 const LIFECYCLE_EXTERNAL_CREATE_ARCHIVE_STAGE_FILE: &str = "management.external-create.next";
+const LIFECYCLE_PENDING_INSTALL_FILE: &str = "management.pending-install";
+const LIFECYCLE_PENDING_INSTALL_STAGE_FILE: &str = "management.pending-install.next";
 pub(crate) const SHARED_LIFECYCLE_DIRECTORY: &str = "shared-agent-lifecycle";
 pub(crate) const SHARED_COMMITTEE_DIRECTORY: &str = "shared-agent-committee";
 pub(crate) const SHARED_ARCHIVE_DIRECTORY: &str = "shared-agent-genesis";
@@ -99,6 +103,21 @@ const LIFECYCLE_ENTRIES: [&str; 11] = [
     LIFECYCLE_ACTOR_STAGE_FILE,
     LIFECYCLE_EXTERNAL_CREATE_ARCHIVE_FILE,
     LIFECYCLE_EXTERNAL_CREATE_ARCHIVE_STAGE_FILE,
+];
+const EXTERNAL_LIFECYCLE_ENTRIES: [&str; 13] = [
+    LOCK_FILE,
+    INTENT_FILE,
+    INTENT_STAGE_FILE,
+    LIFECYCLE_ISSUER_FILE,
+    LIFECYCLE_ISSUER_STAGE_FILE,
+    LIFECYCLE_RUNTIME_FILE,
+    LIFECYCLE_RUNTIME_STAGE_FILE,
+    LIFECYCLE_ACTOR_FILE,
+    LIFECYCLE_ACTOR_STAGE_FILE,
+    LIFECYCLE_EXTERNAL_CREATE_ARCHIVE_FILE,
+    LIFECYCLE_EXTERNAL_CREATE_ARCHIVE_STAGE_FILE,
+    LIFECYCLE_PENDING_INSTALL_FILE,
+    LIFECYCLE_PENDING_INSTALL_STAGE_FILE,
 ];
 
 pub(crate) const MAX_CLEAN_SYSTEM_AGENT_GENESIS_ARCHIVE_BYTES: usize =
@@ -220,6 +239,7 @@ enum StoreRole {
     OrdinaryGenesisPublication = 43,
     OrdinaryGenesisPublicationReply = 44,
     ExternalLocalCreateArchive = 45,
+    ExternalLocalPendingInstall = 46,
 }
 
 impl StoreRole {
@@ -239,6 +259,7 @@ impl StoreRole {
             Self::LocalCreateDenial => LOCAL_DENIAL_FILE,
             Self::LifecycleActor => LIFECYCLE_ACTOR_FILE,
             Self::ExternalLocalCreateArchive => LIFECYCLE_EXTERNAL_CREATE_ARCHIVE_FILE,
+            Self::ExternalLocalPendingInstall => LIFECYCLE_PENDING_INSTALL_FILE,
             Self::LocalInstallRequest => "local-install.request",
             Self::LocalInstallAcknowledgement => "local-install.acknowledgement",
             Self::InvocationRequest => "invocation.request",
@@ -289,6 +310,7 @@ impl StoreRole {
             Self::LocalCreateDenial => LOCAL_DENIAL_STAGE_FILE,
             Self::LifecycleActor => LIFECYCLE_ACTOR_STAGE_FILE,
             Self::ExternalLocalCreateArchive => LIFECYCLE_EXTERNAL_CREATE_ARCHIVE_STAGE_FILE,
+            Self::ExternalLocalPendingInstall => LIFECYCLE_PENDING_INSTALL_STAGE_FILE,
             Self::LocalInstallRequest => "local-install.request.next",
             Self::LocalInstallAcknowledgement => "local-install.acknowledgement.next",
             Self::InvocationRequest => "invocation.request.next",
@@ -443,6 +465,9 @@ impl StoreRole {
             Self::LifecycleRuntime => MAX_PACKAGE_ENCODED_BYTES,
             Self::LifecycleActor => MAX_PACKAGE_ENCODED_BYTES,
             Self::ExternalLocalCreateArchive => MAX_CLEAN_EXTERNAL_LOCAL_CREATE_ARCHIVE_BYTES,
+            Self::ExternalLocalPendingInstall => {
+                vos::agent::local_lifecycle::LocalInstallSubmission::MAX_BYTES
+            }
             Self::LocalCreateDenial => vos::agent::local_lifecycle::LocalCreateDenial::MAX_BYTES,
             Self::CredentialReservation | Self::AdminCredentialReservation => 165,
             Self::LocalCreateAcknowledgement | Self::LocalInstallAcknowledgement => {
@@ -486,6 +511,7 @@ impl StoreRole {
             43 => Some(Self::OrdinaryGenesisPublication),
             44 => Some(Self::OrdinaryGenesisPublicationReply),
             45 => Some(Self::ExternalLocalCreateArchive),
+            46 => Some(Self::ExternalLocalPendingInstall),
             1 => Some(Self::Pins),
             2 => Some(Self::Bootstrap),
             3 => Some(Self::ManagementIssuer),
@@ -1212,17 +1238,21 @@ pub(crate) struct CleanManagementLifecycleFiles {
 
 impl CleanManagementLifecycleFiles {
     pub(crate) fn open_or_create(root: impl AsRef<Path>) -> Result<Self, CleanFileStoreError> {
-        Ok(Self::from_root(StoreRoot::open_with_entries(
-            root.as_ref(),
-            &LIFECYCLE_ENTRIES,
-        )?))
+        Self::open(root.as_ref(), false, false)
     }
 
     fn open_existing(root: &Path) -> Result<Self, CleanFileStoreError> {
+        Self::open(root, false, true)
+    }
+
+    fn open(root: &Path, external: bool, existing: bool) -> Result<Self, CleanFileStoreError> {
+        let entries: &[&str] = if external {
+            &EXTERNAL_LIFECYCLE_ENTRIES
+        } else {
+            &LIFECYCLE_ENTRIES
+        };
         Ok(Self::from_root(StoreRoot::open_with_entries_mode(
-            root,
-            &LIFECYCLE_ENTRIES,
-            false,
+            root, entries, !existing,
         )?))
     }
 
@@ -1234,6 +1264,7 @@ impl CleanManagementLifecycleFiles {
                 ExactFileStore::new(Arc::clone(&root), StoreRole::LifecycleRuntime),
                 ExactFileStore::new(Arc::clone(&root), StoreRole::LifecycleActor),
                 ExactFileStore::new(Arc::clone(&root), StoreRole::ExternalLocalCreateArchive),
+                ExactFileStore::new(Arc::clone(&root), StoreRole::ExternalLocalPendingInstall),
             ),
             issuer: CleanManagementIssuerFile(ExactFileStore::new(
                 root,
@@ -1248,6 +1279,7 @@ impl CleanManagementLifecycleFiles {
 }
 
 pub(crate) struct CleanManagementIntentFile(
+    ExactFileStore,
     ExactFileStore,
     ExactFileStore,
     ExactFileStore,
@@ -2156,6 +2188,7 @@ pub(crate) struct CleanManagementLifecycleStoreFactory {
     parent: PathBuf,
     directory: File,
     space: vos::agent::sdk::SpaceId,
+    external: bool,
 }
 
 impl CleanManagementLifecycleStoreFactory {
@@ -2163,15 +2196,31 @@ impl CleanManagementLifecycleStoreFactory {
         parent: impl AsRef<Path>,
         space: vos::agent::sdk::SpaceId,
     ) -> Result<Self, CleanFileStoreError> {
+        Self::open_or_create_format(parent.as_ref(), space, false)
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn open_or_create_external(
+        parent: impl AsRef<Path>,
+        space: vos::agent::sdk::SpaceId,
+    ) -> Result<Self, CleanFileStoreError> {
+        Self::open_or_create_format(parent.as_ref(), space, true)
+    }
+
+    fn open_or_create_format(
+        path: &Path,
+        space: vos::agent::sdk::SpaceId,
+        external: bool,
+    ) -> Result<Self, CleanFileStoreError> {
         if space == vos::agent::sdk::SpaceId::ZERO {
             return Err(CleanFileStoreError::InvalidPath);
         }
-        let path = parent.as_ref();
         let directory = ensure_private_directory(path)?;
         Ok(Self {
             parent: path.to_path_buf(),
             directory,
             space,
+            external,
         })
     }
 
@@ -2188,6 +2237,7 @@ impl CleanManagementLifecycleStoreFactory {
             parent,
             directory,
             space,
+            external: false,
         })
     }
 }
@@ -2279,8 +2329,11 @@ impl vos::agent::local_lifecycle::LocalLifecycleStoreFactory
             return Err(CleanFileStoreError::InvalidPath);
         }
         validate_opened_directory(&self.directory, &self.parent, true)?;
-        let stores =
-            CleanManagementLifecycleFiles::open_existing(&self.parent.join(hex::encode(agent.0)))?;
+        let stores = CleanManagementLifecycleFiles::open(
+            &self.parent.join(hex::encode(agent.0)),
+            self.external,
+            true,
+        )?;
         validate_opened_directory(&self.directory, &self.parent, true)?;
         Ok(stores.into_parts())
     }
@@ -2294,8 +2347,11 @@ impl vos::agent::local_lifecycle::LocalLifecycleStoreFactory
             return Err(CleanFileStoreError::InvalidPath);
         }
         validate_opened_directory(&self.directory, &self.parent, true)?;
-        let stores =
-            CleanManagementLifecycleFiles::open_or_create(self.parent.join(hex::encode(agent.0)))?;
+        let stores = CleanManagementLifecycleFiles::open(
+            &self.parent.join(hex::encode(agent.0)),
+            self.external,
+            false,
+        )?;
         validate_opened_directory(&self.directory, &self.parent, true)?;
         Ok(stores.into_parts())
     }
@@ -2352,6 +2408,23 @@ impl CleanExternalLocalCreateArchiveStore for CleanManagementIntentFile {
 
     fn commit_external_create_archive(&mut self, archive: &[u8]) -> Result<(), Self::Error> {
         self.3.commit_with_replacement(archive, false)
+    }
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+impl CleanExternalLocalPendingInstallStore for CleanManagementIntentFile {
+    fn load_pending_install(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        let image = self
+            .4
+            .load(StoreRole::ExternalLocalPendingInstall.maximum_bytes())?;
+        if let Some(bytes) = &image {
+            self.4.commit_with_replacement(bytes, false)?;
+        }
+        Ok(image)
+    }
+
+    fn commit_pending_install(&mut self, submission: &[u8]) -> Result<(), Self::Error> {
+        self.4.commit(submission)
     }
 }
 
@@ -4096,6 +4169,38 @@ pub(crate) mod tests {
         assert!(matches!(
             factory.open_existing(space, agent),
             Err(CleanFileStoreError::Busy)
+        ));
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn external_pending_install_survives_reopen_without_entering_image_format() {
+        use vos::agent::local_lifecycle::LocalLifecycleStoreFactory as _;
+        use vos::agent::sdk::{AgentId, SpaceId};
+        let fixture = Fixture::new("external-pending-install");
+        let space = SpaceId([1; 32]);
+        let agent = AgentId([2; 32]);
+        let mut external =
+            CleanManagementLifecycleStoreFactory::open_or_create_external(&fixture.root, space)
+                .unwrap();
+        let (mut intent, issuer) = external.open(space, agent).unwrap();
+        intent
+            .commit_pending_install(b"exact-pending-install")
+            .unwrap();
+        assert_eq!(intent.load().unwrap(), None);
+        drop((intent, issuer));
+        assert_eq!(external.discover(space, 1).unwrap(), vec![agent]);
+        let (mut intent, issuer) = external.open_existing(space, agent).unwrap();
+        assert_eq!(
+            intent.load_pending_install().unwrap(),
+            Some(b"exact-pending-install".to_vec())
+        );
+        drop((intent, issuer, external));
+        let mut image =
+            CleanManagementLifecycleStoreFactory::open_or_create(&fixture.root, space).unwrap();
+        assert!(matches!(
+            image.open_existing(space, agent),
+            Err(CleanFileStoreError::UnexpectedResidue)
         ));
     }
 

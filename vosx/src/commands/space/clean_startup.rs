@@ -416,12 +416,25 @@ pub(crate) fn start_clean_system_agent(
         )
         .map(|prepared| prepared.into_parts().0)
     };
-    let lifecycle_root = match local_storage {
-        super::local_config::LocalAgentStorage::Image => LOCAL_LIFECYCLE_DIRECTORY,
-        super::local_config::LocalAgentStorage::ExternalState => EXTERNAL_LOCAL_LIFECYCLE_DIRECTORY,
+    let mut lifecycle_stores = match local_storage {
+        super::local_config::LocalAgentStorage::Image => {
+            CleanManagementLifecycleStoreFactory::open_or_create(
+                data_dir.join(LOCAL_LIFECYCLE_DIRECTORY),
+                space,
+            )?
+        }
+        super::local_config::LocalAgentStorage::ExternalState => {
+            #[cfg(not(feature = "experimental-state-blocks"))]
+            anyhow::bail!(
+                "external-state Local startup requires the experimental-state-blocks build"
+            );
+            #[cfg(feature = "experimental-state-blocks")]
+            CleanManagementLifecycleStoreFactory::open_or_create_external(
+                data_dir.join(EXTERNAL_LOCAL_LIFECYCLE_DIRECTORY),
+                space,
+            )?
+        }
     };
-    let mut lifecycle_stores =
-        CleanManagementLifecycleStoreFactory::open_or_create(data_dir.join(lifecycle_root), space)?;
     #[cfg_attr(not(feature = "experimental-state-blocks"), allow(unused_mut))]
     let mut lifecycle_recovery = vos::agent::local_lifecycle::discover_local_lifecycle_recovery(
         &mut lifecycle_stores,

@@ -7406,6 +7406,8 @@ mod tests {
             runtime: Arc<Mutex<Option<Vec<u8>>>>,
             actor: Arc<Mutex<Option<Vec<u8>>>>,
             external_create_archive: Arc<Mutex<Option<Vec<u8>>>>,
+            #[cfg(feature = "experimental-state-blocks")]
+            external_pending_install: Arc<Mutex<Option<Vec<u8>>>>,
             actor_failure: Arc<AtomicUsize>,
             advance_clock_after_commits: Option<(Arc<AtomicU64>, usize)>,
             fail_retirement_after_commit: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -7438,6 +7440,19 @@ mod tests {
                     return Err(MemoryError);
                 }
                 *archive = Some(bytes.to_vec());
+                Ok(())
+            }
+        }
+
+        #[cfg(feature = "experimental-state-blocks")]
+        impl crate::agent::clean_authority_issuer::CleanExternalLocalPendingInstallStore
+            for IssuerMemoryStore
+        {
+            fn load_pending_install(&mut self) -> Result<Option<Vec<u8>>, MemoryError> {
+                Ok(self.external_pending_install.lock().unwrap().clone())
+            }
+            fn commit_pending_install(&mut self, bytes: &[u8]) -> Result<(), MemoryError> {
+                *self.external_pending_install.lock().unwrap() = Some(bytes.to_vec());
                 Ok(())
             }
         }
@@ -16722,6 +16737,71 @@ mod tests {
                     )
                     .unwrap()
             );
+            let ManagementRequest::Install(install) = install_intent.request() else {
+                unreachable!();
+            };
+            let signed_install = crate::agent::local_lifecycle::LocalInstallSubmission::new(
+                (**install).clone(),
+                install_intent.call().clone(),
+                install_package.clone(),
+            )
+            .unwrap();
+            install_slot
+                .stage_external_pending_install(
+                    original.intent().unwrap(),
+                    &install_intent,
+                    &signed_install,
+                )
+                .unwrap();
+            assert!(intent_store.actor.lock().unwrap().is_none());
+            drop(install_slot);
+            drop(install_issuer);
+            // A crash before the handoff keeps the retired Create routable
+            // and preserves the exact future LIQ1 for its signed retry.
+            let mut pre_handoff_stores = ExternalStores {
+                space: descriptor.identity.space,
+                agent: descriptor.identity.agent,
+                intent: intent_store.clone(),
+                issuer: issuer_store.clone(),
+                fresh: None,
+            };
+            let mut pre_handoff = discover_local_lifecycle_recovery(
+                &mut pre_handoff_stores,
+                owner.authority_target(),
+                1,
+            )
+            .unwrap();
+            let retained_pending = intent_store.external_pending_install.lock().unwrap().take();
+            *intent_store.external_pending_install.lock().unwrap() = Some(vec![0x01]);
+            assert!(matches!(
+                pre_handoff.external_finalized_startup_owners(
+                    &directory,
+                    owner.pins.node,
+                    1,
+                    &mut ReadBudget::new(10_000, 10_000_000),
+                ),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
+            *intent_store.external_pending_install.lock().unwrap() = retained_pending;
+            let pre_handoff_owners = pre_handoff
+                .external_finalized_startup_owners(
+                    &directory,
+                    owner.pins.node,
+                    1,
+                    &mut ReadBudget::new(10_000, 10_000_000),
+                )
+                .unwrap();
+            assert!(pre_handoff_owners.contains_key(&descriptor.identity.agent));
+            let create_head = pre_handoff_owners
+                .get(&descriptor.identity.agent)
+                .unwrap()
+                .materialization()
+                .unwrap()
+                .heads()
+                .clone();
+            drop(pre_handoff_owners);
+            drop(pre_handoff);
+            let mut install_slot = CleanManagementIntentSlot::open(intent_store.clone()).unwrap();
             install_slot
                 .handoff_retired(
                     original.intent().unwrap(),
@@ -16729,35 +16809,8 @@ mod tests {
                     &RawCredentialVerifier,
                 )
                 .unwrap();
-            let mut external = reopened_archive
-                .open_existing(
-                    runtime.exact_bytes().to_vec(),
-                    owner.authority_target(),
-                    owner.pins.node,
-                    &directory,
-                    &mut ReadBudget::new(10_000, 10_000_000),
-                )
-                .unwrap();
-            let install_ack = owner
-                .install_external_local_on_slots(
-                    &mut install_slot,
-                    &mut install_issuer,
-                    &mut external,
-                    &install_package,
-                    &mut ReadBudget::new(10_000, 10_000_000),
-                    &mut signer,
-                )
-                .unwrap();
-            let install_receipt = install_ack.receipt.clone();
-            assert_ne!(
-                install_ack.authorization_sequence.get(),
-                install_receipt.selector.decision_sequence,
-                "Authority authorization and issuer decision are separate clocks",
-            );
-            let installed_head = external.materialization().unwrap().heads().clone();
-            drop(external);
+            assert!(intent_store.actor.lock().unwrap().is_none());
             drop(install_slot);
-            drop(install_issuer);
             let mut post_install_stores = ExternalStores {
                 space: descriptor.identity.space,
                 agent: descriptor.identity.agent,
@@ -16791,14 +16844,24 @@ mod tests {
                     &mut signer,
                 )
                 .unwrap();
+            let install_ack = post_install_recovery.entries[0].finalized.clone().unwrap();
+            let install_receipt = install_ack.receipt.clone();
+            assert_ne!(
+                install_ack.authorization_sequence.get(),
+                install_receipt.selector.decision_sequence,
+                "Authority authorization and issuer decision are separate clocks",
+            );
+            let installed_head = post_install_owners
+                .get(&descriptor.identity.agent)
+                .unwrap()
+                .materialization()
+                .unwrap()
+                .heads()
+                .clone();
+            assert_ne!(installed_head, create_head);
             assert_eq!(
-                post_install_owners
-                    .get(&descriptor.identity.agent)
-                    .unwrap()
-                    .materialization()
-                    .unwrap()
-                    .heads(),
-                &installed_head,
+                intent_store.actor.lock().unwrap().as_deref(),
+                Some(install_package.exact_bytes())
             );
             post_install_owners
                 .get(&descriptor.identity.agent)
@@ -16991,6 +17054,13 @@ mod tests {
                 (agent, acknowledgement.clone()),
                 "the post-Install Create retry must reuse the locked generation",
             );
+            assert_eq!(
+                controller
+                    .install_external(signed_install, &mut ReadBudget::new(10_000, 10_000_000),)
+                    .unwrap(),
+                install_ack,
+                "the retained controller must recover exact Install finality",
+            );
             let mut wrong_node = fresh_descriptor.clone();
             wrong_node.creation_nonce = Hash([0xdf; 32]);
             wrong_node.identity.agent = AgentId::derive(
@@ -17053,6 +17123,69 @@ mod tests {
                 (fresh_agent, fresh_ack.clone()),
                 "a live exact retry must reuse the newly locked generation",
             );
+            harness
+                .fixture
+                .logical_slot
+                .as_ref()
+                .unwrap()
+                .store(LOGICAL_SLOT + 21, Ordering::Release);
+            let fresh_install_request =
+                self::install_request(fresh_agent, &install_package, 0x6a, None);
+            let (mut fresh_install_call, _) = credential_call_and_approval(
+                &fresh_descriptor,
+                &fresh_install_request,
+                &credential_key,
+            );
+            fresh_install_call.authority = fresh_call.authority;
+            fresh_install_call.request_sequence = core::num::NonZeroU64::new(4).unwrap();
+            fresh_install_call.requested_valid_from = LOGICAL_SLOT + 21;
+            fresh_install_call.requested_expires_at = LOGICAL_SLOT + 60;
+            fresh_install_call.invocation = fresh_install_call.expected_invocation();
+            fresh_install_call.signature = credential_key
+                .sign(&fresh_install_call.signing_bytes())
+                .to_bytes();
+            let ManagementRequest::Install(fresh_install) = fresh_install_request else {
+                unreachable!();
+            };
+            let fresh_install_bytes = crate::agent::local_lifecycle::LocalInstallSubmission::new(
+                *fresh_install,
+                fresh_install_call,
+                install_package.clone(),
+            )
+            .unwrap()
+            .encode();
+            let fresh_install_ack = std::thread::scope(|scope| {
+                std::thread::Builder::new()
+                    .name("external-local-controller-install-stack".into())
+                    .stack_size(2 * 1024 * 1024)
+                    .spawn_scoped(scope, || {
+                        controller.install_external(
+                            crate::agent::local_lifecycle::LocalInstallSubmission::decode(
+                                &fresh_install_bytes,
+                            )
+                            .unwrap(),
+                            &mut ReadBudget::new(10_000, 10_000_000),
+                        )
+                    })
+                    .unwrap()
+                    .join()
+                    .unwrap()
+            })
+            .unwrap();
+            assert_eq!(fresh_install_ack.managed.agent, fresh_agent);
+            assert_eq!(
+                controller
+                    .install_external(
+                        crate::agent::local_lifecycle::LocalInstallSubmission::decode(
+                            &fresh_install_bytes,
+                        )
+                        .unwrap(),
+                        &mut ReadBudget::new(10_000, 10_000_000),
+                    )
+                    .unwrap(),
+                fresh_install_ack,
+                "a live exact Install retry must reuse the published generation",
+            );
             use crate::agent::local_lifecycle::NativeLocalLifecycle as _;
             let mut expected = vec![descriptor.identity.agent, fresh_agent];
             expected.sort_unstable();
@@ -17083,6 +17216,19 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(restarted.local_agents().unwrap(), Some(expected));
+            assert_eq!(
+                restarted
+                    .install_external(
+                        crate::agent::local_lifecycle::LocalInstallSubmission::decode(
+                            &fresh_install_bytes,
+                        )
+                        .unwrap(),
+                        &mut ReadBudget::new(10_000, 10_000_000),
+                    )
+                    .unwrap(),
+                fresh_install_ack,
+                "recovered Install must keep its exact ACK and original file generation",
+            );
             assert_eq!(
                 restarted
                     .create_external(fresh_submission(), &mut ReadBudget::new(10_000, 10_000_000),)

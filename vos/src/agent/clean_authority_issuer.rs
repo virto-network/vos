@@ -103,6 +103,35 @@ pub trait CleanExternalLocalCreateArchiveStore: CleanManagementIssuerStore {
     fn commit_external_create_archive(&mut self, archive: &[u8]) -> Result<(), Self::Error>;
 }
 
+/// A signed LIQ1 Install and its exact actor package, durably staged before
+/// replacing a retired external Local intent. It is not an approval or an
+/// application; the old actor sidecar remains intact until handoff commits.
+#[cfg(all(
+    target_os = "linux",
+    feature = "storage",
+    feature = "experimental-state-blocks"
+))]
+pub trait CleanExternalLocalPendingInstallStore: CleanManagementIssuerStore {
+    fn load_pending_install(&mut self) -> Result<Option<Vec<u8>>, Self::Error>;
+    fn commit_pending_install(&mut self, submission: &[u8]) -> Result<(), Self::Error>;
+}
+
+#[cfg(all(
+    target_os = "linux",
+    feature = "storage",
+    feature = "experimental-state-blocks"
+))]
+impl<B: CleanExternalLocalPendingInstallStore + ?Sized> CleanExternalLocalPendingInstallStore
+    for &mut B
+{
+    fn load_pending_install(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        (**self).load_pending_install()
+    }
+    fn commit_pending_install(&mut self, submission: &[u8]) -> Result<(), Self::Error> {
+        (**self).commit_pending_install(submission)
+    }
+}
+
 impl<B: CleanExternalLocalCreateArchiveStore + ?Sized> CleanExternalLocalCreateArchiveStore
     for &mut B
 {

@@ -696,7 +696,8 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
     where
         B: super::clean_authority_issuer::CleanManagementRuntimeStore
             + super::clean_authority_issuer::CleanManagementActorStore
-            + super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore,
+            + super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore
+            + super::clean_authority_issuer::CleanExternalLocalPendingInstallStore,
     {
         if self.poisoned {
             return Err(IntentSlotError::Poisoned);
@@ -714,6 +715,11 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
                 .load_external_create_archive()
                 .map_err(IntentSlotError::Storage)?
                 .is_some()
+            || self
+                .store
+                .load_pending_install()
+                .map_err(IntentSlotError::Storage)?
+                .is_some()
         {
             return Err(IntentSlotError::Conflict);
         }
@@ -721,6 +727,106 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
             super::package_admission::admit_state_runtime_package(&bytes)
                 .map_err(|_| IntentSlotError::Invalid)?;
         }
+        Ok(())
+    }
+
+    /// Re-admit an exact signed future Install retained before intent handoff.
+    /// Its caller must still bind the claim to the selected Authority/Agent.
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    pub(crate) fn load_external_pending_install(
+        &mut self,
+    ) -> Result<Option<super::local_lifecycle::LocalInstallSubmission>, IntentSlotError<B::Error>>
+    where
+        B: super::clean_authority_issuer::CleanExternalLocalPendingInstallStore,
+    {
+        if self.poisoned {
+            return Err(IntentSlotError::Poisoned);
+        }
+        self.store
+            .load_pending_install()
+            .map_err(IntentSlotError::Storage)?
+            .map(|bytes| {
+                let submission = super::local_lifecycle::LocalInstallSubmission::decode(&bytes)
+                    .map_err(|_| IntentSlotError::Invalid)?;
+                (submission.encode() == bytes)
+                    .then_some(submission)
+                    .ok_or(IntentSlotError::Invalid)
+            })
+            .transpose()
+    }
+
+    /// Stage LIQ1 while the previous Create/Install intent remains retired.
+    /// A crash before handoff leaves that previous actor sidecar untouched;
+    /// a crash afterward can restore the new actor from this exact request.
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    pub(crate) fn stage_external_pending_install(
+        &mut self,
+        expected: &CleanManagementIntent,
+        next: &CleanManagementIntent,
+        submission: &super::local_lifecycle::LocalInstallSubmission,
+    ) -> Result<(), IntentSlotError<B::Error>>
+    where
+        B: super::clean_authority_issuer::CleanExternalLocalPendingInstallStore,
+    {
+        if self.poisoned {
+            return Err(IntentSlotError::Poisoned);
+        }
+        let ManagementRequest::Install(install) = next.request() else {
+            return Err(IntentSlotError::Invalid);
+        };
+        if install.as_ref() != submission.install()
+            || next.call() != submission.call()
+            || next.authorization_work().is_some()
+            || next.finalization_work().is_some()
+            || next
+                .verify(
+                    next.call().authority,
+                    next.call().managed,
+                    &super::clean_bootstrap::RawCredentialVerifier,
+                )
+                .is_err()
+        {
+            return Err(IntentSlotError::Invalid);
+        }
+        let current = self.intent.clone().ok_or(IntentSlotError::Conflict)?;
+        let exact = submission.encode();
+        let retained = self.load_external_pending_install()?;
+        if current.request() == next.request() && current.call() == next.call() {
+            return if retained
+                .as_ref()
+                .is_some_and(|saved| saved.encode() == exact)
+            {
+                Ok(())
+            } else {
+                Err(IntentSlotError::Conflict)
+            };
+        }
+        if !self.retired || &current != expected {
+            return Err(IntentSlotError::Conflict);
+        }
+        if let Some(saved) = retained {
+            if saved.encode() == exact {
+                return Ok(());
+            }
+            if !matches!(current.request(), ManagementRequest::Install(old) if old.as_ref() == saved.install())
+                || current.call() != saved.call()
+            {
+                return Err(IntentSlotError::Conflict);
+            }
+        }
+        self.poisoned = true;
+        self.store
+            .commit_pending_install(&exact)
+            .map_err(IntentSlotError::Storage)?;
+        self.poisoned = false;
         Ok(())
     }
 

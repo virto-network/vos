@@ -65,6 +65,18 @@ pub struct LocalInstallSubmission {
 impl LocalInstallSubmission {
     pub const MAX_BYTES: usize = LocalCreateSubmission::MAX_BYTES;
 
+    pub(crate) fn install(&self) -> &super::sdk::InstallActor {
+        &self.install
+    }
+
+    pub(crate) fn call(&self) -> &AuthorityCredentialCall {
+        &self.call
+    }
+
+    pub(crate) fn package(&self) -> &super::package_admission::AdmittedActorPackage {
+        &self.package
+    }
+
     pub(crate) fn has_transport_node_claim(&self) -> bool {
         self.call.authenticated_node.is_some()
     }
@@ -809,7 +821,8 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
     where
         I: super::clean_authority_issuer::CleanManagementRuntimeStore
             + super::clean_authority_issuer::CleanManagementActorStore
-            + super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore,
+            + super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore
+            + super::clean_authority_issuer::CleanExternalLocalPendingInstallStore,
     {
         for entry in &mut self.entries {
             if entry.intent.intent().is_some() {
@@ -895,7 +908,8 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
         maximum: usize,
     ) -> Result<Vec<AgentId>, SharedAgentHostError>
     where
-        I: super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore,
+        I: super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore
+            + super::clean_authority_issuer::CleanExternalLocalPendingInstallStore,
     {
         use super::external_local_executor::ExternalLocalCreateArchive;
         if self.entries.len() > maximum {
@@ -919,7 +933,38 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
             let current = entry
                 .intent
                 .intent()
-                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                .ok_or(SharedAgentHostError::ScopeMismatch)?
+                .clone();
+            if let Some(pending) = entry
+                .intent
+                .load_external_pending_install()
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+            {
+                let future = external_pending_install_intent(&pending, self.authority)?;
+                if future.call().managed != current.call().managed
+                    || future.call().managed.agent != entry.agent
+                {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                if future.request() != current.request() || future.call() != current.call() {
+                    if !retired
+                        || !entry
+                            .issuer
+                            .can_resume_install(
+                                self.authority,
+                                future.call().managed,
+                                future.request(),
+                                future.call(),
+                                &super::clean_bootstrap::RawCredentialVerifier,
+                            )
+                            .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+                    {
+                        return Err(SharedAgentHostError::ScopeMismatch);
+                    }
+                } else if !matches!(current.request(), ManagementRequest::Install(_)) {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+            }
             match current.request() {
                 ManagementRequest::Create(_) => {
                     let authorized = entry
@@ -947,7 +992,7 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
                 }
                 let archive = ExternalLocalCreateArchive::decode(&bytes)
                     .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-                if !archive.matches_current_scope(current, self.authority, node) {
+                if !archive.matches_current_scope(&current, self.authority, node) {
                     return Err(SharedAgentHostError::ScopeMismatch);
                 }
             }
@@ -978,7 +1023,8 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
     >
     where
         I: super::clean_authority_issuer::CleanManagementRuntimeStore
-            + super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore,
+            + super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore
+            + super::clean_authority_issuer::CleanExternalLocalPendingInstallStore,
     {
         use super::external_local_executor::ExternalLocalCreateArchive;
         self.external_startup_inventory(directory, node, maximum)?;
@@ -1040,7 +1086,8 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
     >
     where
         I: super::clean_authority_issuer::CleanManagementRuntimeStore
-            + super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore,
+            + super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore
+            + super::clean_authority_issuer::CleanExternalLocalPendingInstallStore,
     {
         let owners = self.open_external_finalized_owners(directory, node, maximum, budget)?;
         for entry in &self.entries {
@@ -1146,7 +1193,8 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
         K: CleanManagementIssuerStore,
         I: super::clean_authority_issuer::CleanManagementRuntimeStore
             + super::clean_authority_issuer::CleanManagementActorStore
-            + super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore,
+            + super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore
+            + super::clean_authority_issuer::CleanExternalLocalPendingInstallStore,
         S: CleanManagementReceiptSigner,
     {
         use super::clean_bootstrap::RawCredentialVerifier;
@@ -1267,6 +1315,21 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
                         .ok_or(SharedAgentHostError::Unavailable)?;
                     let mut owner =
                         archive.open_existing(runtime, self.authority, node, directory, budget)?;
+                    if let Some(pending) = entry
+                        .intent
+                        .load_external_pending_install()
+                        .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+                    {
+                        let staged = external_pending_install_intent(&pending, self.authority)?;
+                        if staged.request() == intent.request() && staged.call() == intent.call() {
+                            // This is the only recoverable pre-sidecar window:
+                            // no authorization can precede the actor commit.
+                            entry
+                                .intent
+                                .retain_actor(pending.package())
+                                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                        }
+                    }
                     let package = entry
                         .intent
                         .load_actor()
@@ -1806,6 +1869,26 @@ fn load_create_runtime<B: super::clean_authority_issuer::CleanManagementRuntimeS
     super::driver::verify_clean_runtime_package_binding(descriptor, &runtime)
         .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
     Ok(runtime)
+}
+
+#[cfg(all(
+    target_os = "linux",
+    feature = "storage",
+    feature = "experimental-state-blocks"
+))]
+fn external_pending_install_intent(
+    submission: &LocalInstallSubmission,
+    authority: super::sdk::authority::AuthorityActorTarget,
+) -> Result<super::clean_management_intent::CleanManagementIntent, SharedAgentHostError> {
+    let call = submission.call();
+    super::clean_management_intent::CleanManagementIntent::new(
+        authority,
+        call.managed,
+        ManagementRequest::Install(Box::new(submission.install().clone())),
+        call.clone(),
+        &super::clean_bootstrap::RawCredentialVerifier,
+    )
+    .map_err(|_| SharedAgentHostError::ScopeMismatch)
 }
 
 /// Type-erased, node-owned lifecycle access. It is deliberately not an ingress
@@ -2445,7 +2528,8 @@ where
         budget: &mut super::sdk::state_blocks::ReadBudget,
     ) -> Result<Self, SharedAgentHostError>
     where
-        F::Intent: super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore,
+        F::Intent: super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore
+            + super::clean_authority_issuer::CleanExternalLocalPendingInstallStore,
     {
         let node = system.pins().node();
         if directory.space() != crate::service::SpaceId(system.pins().space().0)
@@ -3383,6 +3467,164 @@ where
             .into_inner()
             .unwrap();
         (system, directory, stores, signer)
+    }
+
+    /// Drive an external Install only under an already-finalized locked owner.
+    /// The signed LIQ1 is staged before replacing the retired intent; public
+    /// ingress stays closed until permanent guest rejection has terminal
+    /// finality rather than stranding an approved operation.
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    pub fn install_external(
+        &mut self,
+        submission: LocalInstallSubmission,
+        budget: &mut super::sdk::state_blocks::ReadBudget,
+    ) -> Result<ManagementApplicationAck, SharedAgentHostError>
+    where
+        F::Intent: super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore
+            + super::clean_authority_issuer::CleanExternalLocalPendingInstallStore,
+    {
+        use super::clean_authority_issuer::DurableCleanManagementIssuer;
+        use super::clean_bootstrap::RawCredentialVerifier;
+        use super::clean_management_intent::{CleanManagementIntent, CleanManagementIntentSlot};
+        use super::driver::SdkManagementArtifacts;
+
+        let LocalBacking::External { owners, .. } = &mut self.local else {
+            return Err(SharedAgentHostError::Unavailable);
+        };
+        let agent = submission.call().managed.agent;
+        let external = owners
+            .get(&agent)
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let mut system = self
+            .system
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let target = system.authority_target();
+        let managed = submission.call().managed;
+        let request = ManagementRequest::Install(Box::new(submission.install().clone()));
+        let next = CleanManagementIntent::new(
+            target,
+            managed,
+            request.clone(),
+            submission.call().clone(),
+            &RawCredentialVerifier,
+        )
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let mut external = external
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let descriptor = external.descriptor();
+        let physical_managed = super::sdk::authority::ManagedAgentTarget {
+            space: descriptor.identity.space,
+            agent: descriptor.identity.agent,
+            owner: descriptor.identity.owner,
+            profile: descriptor.identity.profile,
+            runtime_deployment: descriptor.identity.runtime_deployment,
+            transition_producer: descriptor.identity.transition_producer,
+        };
+        if managed != physical_managed
+            || descriptor.authority != target.binding
+            || descriptor.replicas.len() != 1
+            || descriptor.replicas[0].node != system.pins().node()
+            || super::driver::validate_sdk_management_artifacts(
+                descriptor,
+                &request,
+                SdkManagementArtifacts::Actor(submission.package()),
+            )
+            .is_err()
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let (intent_store, issuer_store) = match self.retained_stores.entry(agent) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let stores = self
+                    .stores
+                    .open_existing(managed.space, agent)
+                    .map_err(|_| SharedAgentHostError::Unavailable)?;
+                entry.insert(stores)
+            }
+        };
+        let mut slot = CleanManagementIntentSlot::open(intent_store)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let mut issuer =
+            DurableCleanManagementIssuer::open(issuer_store, target.binding, managed.space, agent)
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let previous = slot
+            .intent()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?
+            .clone();
+        if previous.request() != next.request() || previous.call() != next.call() {
+            if !slot
+                .retirement_complete()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                || !issuer
+                    .can_resume_install(
+                        target,
+                        managed,
+                        &request,
+                        next.call(),
+                        &RawCredentialVerifier,
+                    )
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+            {
+                return Err(SharedAgentHostError::Conflict);
+            }
+            previous
+                .verify(target, managed, &RawCredentialVerifier)
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            let (receipt, ack) = issuer
+                .recover_finalized_application(
+                    target,
+                    managed,
+                    previous.request(),
+                    previous.call(),
+                    &RawCredentialVerifier,
+                )
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            match previous.request() {
+                ManagementRequest::Create(_) => external.verify_finalized_create_ack(&ack),
+                ManagementRequest::Install(_) => {
+                    external.verify_finalized_install_ack(previous.request(), &receipt, &ack)
+                }
+                _ => return Err(SharedAgentHostError::ScopeMismatch),
+            }
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            slot.stage_external_pending_install(&previous, &next, &submission)
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            slot.handoff_retired(&previous, next, &RawCredentialVerifier)
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+        } else {
+            slot.stage_external_pending_install(&previous, &next, &submission)
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        }
+        let acknowledgement = system.install_external_local_on_slots(
+            &mut slot,
+            &mut issuer,
+            &mut external,
+            submission.package(),
+            budget,
+            &mut self.signer,
+        )?;
+        if !slot
+            .retirement_complete()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        {
+            system.finalize_management_intent_with_admission(
+                &mut slot,
+                managed,
+                &acknowledgement,
+                &mut issuer,
+                true,
+            )?;
+            system.finish_live_management_intent(&mut slot, managed, &acknowledgement, &issuer)?;
+        }
+        Ok(acknowledgement)
     }
 
     /// Install into an existing Local Agent, retaining the same exclusive

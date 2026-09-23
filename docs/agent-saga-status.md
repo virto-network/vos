@@ -240,11 +240,20 @@ startup verifies its empty issuer, absent actor/archive sidecars and valid
 optional package before excluding it from lifecycle admission. The later
 physical inventory still rejects an orphan journal slot. This ordering applies
 only to fresh external roots; pre-change intent-without-runtime roots remain
-fail-closed. Install's actor-sidecar crash window, multi-Agent credential
-ordering and real file-backed lifecycle leases still need qualification.
-This is not a released controller/route path. A permanently guest-rejected
-approved Install has no terminal failure transition; ingress remains disabled
-until that case and startup cutover are resolved.
+fail-closed. Install now uses a separate signed LIQ1/package sidecar staged
+before replacing a retired Create/Install intent, leaving the previous actor
+sidecar untouched until handoff. Startup validates the staged request against
+the selected Agent/Authority and issuer; after handoff, recovery can restore
+the actor sidecar before authorization. A physical crash-point fixture covers
+both sides of that handoff, exact ACK recovery and corrupted staged bytes; a
+file-store test confirms persistence across lease reopening and image-format
+rejection. The retained controller fixture also executes a fresh Install on a
+second Agent on a 2-MiB worker stack, then verifies exact retry and recovery
+after controller restart. This remains internal candidate behavior: the full
+file-backed lifecycle/route retry and multi-Agent credential ordering need
+qualification.
+A permanently guest-rejected approved Install has no terminal failure
+transition, so public Install ingress remains disabled.
 The internal lifecycle controller now has an explicit external backing that
 consumes the complete signed startup recovery, retains each locked file owner
 and its selected directory, and creates per-Agent Direct route attachments
@@ -330,8 +339,9 @@ the large ACK's 5-billion-gas success is not a release-latency guarantee.
 
 External Local cutover TODOs, in order: (1) qualify the opt-in `vosx` fresh-root
 startup with an Agent under real file-backed lifecycle leases, a response-loss
-restart and the Install actor-sidecar crash window; existing image roots stay on their
-current path, and mixed-format migration is deferred;
+restart and the complete Install handoff under those leases (the internal
+actor-sidecar crash window has a physical fixture); existing image roots stay
+on their current path, and mixed-format migration is deferred;
 (2) qualify the opt-in typed LCQ2 production dispatch and connect external
 Install to it, resolving approved-but-guest-rejected Install
 without stranding its intent; add Resume using the existing signed journal
