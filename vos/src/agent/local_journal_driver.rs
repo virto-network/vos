@@ -277,7 +277,7 @@ fn clean_ordered_operation_after_with_denial_ack<S: AgentJournalStore>(
     Ok(found)
 }
 
-fn recent_clean_ordered_operation_bounded<S: AgentJournalStore>(
+pub(super) fn recent_clean_ordered_operation_bounded<S: AgentJournalStore>(
     store: &S,
     materialization: &ReplayMaterialization,
     operation: &ReplayOperation,
@@ -335,7 +335,7 @@ pub(super) fn recent_clean_local_operation<S: AgentJournalStore>(
     )
 }
 
-fn recent_clean_local_operation_bounded<S: AgentJournalStore>(
+pub(super) fn recent_clean_local_operation_bounded<S: AgentJournalStore>(
     store: &S,
     materialization: &ReplayMaterialization,
     operation: &ReplayOperation,

@@ -6,7 +6,7 @@ use super::driver::{DEFAULT_MANAGEMENT_GAS, SdkManagementArtifacts};
 use super::execution::MAX_EXECUTION_GAS;
 use super::journal::{
     AgentJournalGenesis, AgentJournalGenesisId, CanonicalJournalRecord, LaneCursor,
-    LaneStateManifest, ReplayInput, ReplayInputId, ReplayOperation, RuntimeBinding,
+    LaneStateManifest, PersistedLane, ReplayInput, ReplayInputId, ReplayOperation, RuntimeBinding,
 };
 use super::journal_store::CatalogBlobResolver;
 use super::local_journal_driver::LocalReplayExecutorError;
@@ -397,12 +397,16 @@ pub(crate) struct ExternalLocalReplayExecutor<R> {
     seeded_genesis: Option<AgentJournalGenesisId>,
     authenticated: Option<AuthenticatedExternalInput>,
     pending: Option<ReplayExternalExecution>,
-    // Keep only the two newest outcomes per Ordered/Local domain: a durable
-    // head and one staged successor. Execution is a candidate until the pinned
-    // journal's durable head names its exact position; this cache alone never
-    // authorizes a response.
+    // Keep a bounded replay window in each Ordered/Local domain. Execution is
+    // a candidate until an authenticated durable suffix names its exact input
+    // and position; this cache alone never authorizes a response.
     recent_outcomes: Vec<(ReplayInputId, ReplayPosition, RuntimeOutcome)>,
 }
+
+// Runtime result lanes retain at most 32 results. Keep the same bounded
+// response-loss window per journal domain, including ACK outcomes; a miss must
+// never cause a second physical execution or an invented response.
+const MAX_EXTERNAL_REPLAY_OUTCOMES_PER_DOMAIN: usize = 32;
 
 impl<R: CatalogBlobResolver> ExternalLocalReplayExecutor<R> {
     pub(crate) fn new(
@@ -478,13 +482,13 @@ impl<R: CatalogBlobResolver> ExternalLocalReplayExecutor<R> {
             .iter()
             .filter(|(_, at, _)| same_domain(*at))
             .count()
-            == 2
+            == MAX_EXTERNAL_REPLAY_OUTCOMES_PER_DOMAIN
         {
             let oldest = self
                 .recent_outcomes
                 .iter()
                 .position(|(_, at, _)| same_domain(*at))
-                .expect("two entries in the same domain have an oldest member");
+                .expect("full domain has an oldest entry");
             self.recent_outcomes.remove(oldest);
         }
         self.recent_outcomes.push((input, position, outcome));
@@ -850,6 +854,122 @@ pub(crate) fn committed_recovery_is_domain_head(
     }
 }
 
+/// Recover a physically replayed response only when an authenticated,
+/// bounded journal suffix still contains the exact clean operation. A newer
+/// lifecycle step for the same invocation blocks an older response. The
+/// lookup proves durable ancestry; the cache supplies bytes, never authority.
+/// A checkpoint-pruned or evicted result deliberately remains unavailable.
+#[cfg(feature = "experimental-state-blocks")]
+pub(crate) fn replayed_committed_suffix_outcome<
+    S: super::journal_store::AgentJournalStore,
+    R: CatalogBlobResolver,
+>(
+    store: &S,
+    materialization: &super::replay::ReplayMaterialization,
+    executor: &ExternalLocalReplayExecutor<R>,
+    input: &ReplayInput,
+) -> Result<RuntimeOutcome, super::journal_store::JournalStoreError> {
+    use super::journal::{LocalEntry, OrderedEntry};
+    use super::journal_store::JournalStoreError;
+    if !matches!(
+        input.operation,
+        ReplayOperation::CleanInvoke { .. }
+            | ReplayOperation::CleanResume { .. }
+            | ReplayOperation::CleanAcknowledge { .. }
+    ) {
+        return Err(JournalStoreError::NonCanonical);
+    }
+    let (committed_input, position) = match input.persisted_lane() {
+        PersistedLane::Control | PersistedLane::Linear => {
+            let id = super::local_journal_driver::recent_clean_ordered_operation_bounded(
+                store,
+                materialization,
+                &input.operation,
+                MAX_EXTERNAL_REPLAY_OUTCOMES_PER_DOMAIN,
+            )
+            .map_err(|error| {
+                if error == JournalStoreError::Backpressure {
+                    JournalStoreError::Unavailable
+                } else {
+                    error
+                }
+            })?
+            .ok_or(JournalStoreError::Unavailable)?;
+            let mut cursor = materialization.heads().ordered_head;
+            let mut position = None;
+            for _ in 0..MAX_EXTERNAL_REPLAY_OUTCOMES_PER_DOMAIN {
+                let current = cursor.ok_or(JournalStoreError::Corrupt)?;
+                let entry = store
+                    .get::<OrderedEntry>(current)?
+                    .ok_or(JournalStoreError::MissingObject)?;
+                if entry.id() != current || entry.genesis != materialization.heads().genesis {
+                    return Err(JournalStoreError::Corrupt);
+                }
+                if entry.input.id() == id {
+                    if entry.input.runtime != input.runtime {
+                        return Err(JournalStoreError::Conflict);
+                    }
+                    position = Some(ReplayPosition::Ordered {
+                        id: current,
+                        index: entry.index,
+                        merge_frontier: entry.merge_frontier,
+                        merge_seal: entry.merge_seal,
+                    });
+                    break;
+                }
+                cursor = entry.parent;
+            }
+            (id, position.ok_or(JournalStoreError::Unavailable)?)
+        }
+        PersistedLane::Local => {
+            let id = super::local_journal_driver::recent_clean_local_operation_bounded(
+                store,
+                materialization,
+                &input.operation,
+                MAX_EXTERNAL_REPLAY_OUTCOMES_PER_DOMAIN,
+            )
+            .map_err(|error| {
+                if error == JournalStoreError::Backpressure {
+                    JournalStoreError::Unavailable
+                } else {
+                    error
+                }
+            })?
+            .ok_or(JournalStoreError::Unavailable)?;
+            let (_, _, mut cursor) = materialization.local_cursor();
+            let mut position = None;
+            for _ in 0..MAX_EXTERNAL_REPLAY_OUTCOMES_PER_DOMAIN {
+                let current = cursor.ok_or(JournalStoreError::Corrupt)?;
+                let entry = store
+                    .get::<LocalEntry>(current)?
+                    .ok_or(JournalStoreError::MissingObject)?;
+                if entry.id() != current || entry.genesis != materialization.heads().genesis {
+                    return Err(JournalStoreError::Corrupt);
+                }
+                if entry.input.id() == id {
+                    if entry.input.runtime != input.runtime {
+                        return Err(JournalStoreError::Conflict);
+                    }
+                    position = Some(ReplayPosition::Local {
+                        id: current,
+                        node: entry.node,
+                        revision: entry.revision,
+                        ordered_base: entry.ordered_base,
+                        merge_frontier: entry.merge_frontier,
+                    });
+                    break;
+                }
+                cursor = entry.parent;
+            }
+            (id, position.ok_or(JournalStoreError::Unavailable)?)
+        }
+        PersistedLane::Merge => return Err(JournalStoreError::NonCanonical),
+    };
+    executor
+        .replayed_outcome(committed_input, position)
+        .ok_or(JournalStoreError::Unavailable)
+}
+
 #[cfg(all(target_os = "linux", feature = "storage"))]
 impl ExternalLocalJournalOwner {
     fn executor_from_store(
@@ -952,6 +1072,18 @@ impl ExternalLocalJournalOwner {
             self.executor
                 .replayed_outcome(recovery.input(), recovery.position())
                 .ok_or(JournalStoreError::Unavailable)
+        })
+    }
+
+    /// Response-loss recovery after an unrelated entry advanced this domain.
+    /// Only a still-retained authenticated suffix and its physical replay can
+    /// supply the result; checkpoint-pruned history remains a release gate.
+    pub(crate) fn committed_suffix_outcome(
+        &self,
+        input: &ReplayInput,
+    ) -> Result<RuntimeOutcome, super::journal_store::JournalStoreError> {
+        self.cursor.inspect(|store, recovered| {
+            replayed_committed_suffix_outcome(store, recovered, &self.executor, input)
         })
     }
 
@@ -1407,12 +1539,12 @@ mod tests {
                 RuntimeOutcome::Completed(Err(sdk::InvocationError::NotFound)),
             )
             .unwrap();
-        for (id, index) in [(0x78, 2), (0x79, 3)] {
+        for index in 2..=33 {
             executor
                 .remember_outcome(
                     resume.id(),
                     ReplayPosition::Ordered {
-                        id: OrderedEntryId([id; 32]),
+                        id: OrderedEntryId([0x78 + index as u8 - 2; 32]),
                         index,
                         merge_frontier: MergeFrontierId([0x74; 32]),
                         merge_seal: None,
@@ -1421,9 +1553,22 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert_eq!(executor.recent_outcomes.len(), 3);
+        assert_eq!(executor.recent_outcomes.len(), 33);
         assert!(executor.replayed_outcome(resume.id(), position).is_none());
         assert!(executor.replayed_outcome(resume.id(), local).is_some());
+        assert!(
+            executor
+                .replayed_outcome(
+                    resume.id(),
+                    ReplayPosition::Ordered {
+                        id: OrderedEntryId([0x78; 32]),
+                        index: 2,
+                        merge_frontier: MergeFrontierId([0x74; 32]),
+                        merge_seal: None,
+                    }
+                )
+                .is_some()
+        );
         executor
             .seed_genesis(&AgentJournalGenesis {
                 admission: AgentGenesisAdmissionId::from_bytes([0x76; 32]),

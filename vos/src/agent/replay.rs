@@ -23193,6 +23193,32 @@ pub(crate) mod tests {
                     &mut ReadBudget::new(10000, 10000000),
                 )
                 .unwrap();
+                assert_eq!(
+                    reopened
+                        .inspect(|store, recovered| {
+                            super::super::external_local_executor::replayed_committed_suffix_outcome(
+                                store,
+                                recovered,
+                                &production,
+                                &invoke,
+                            )
+                        })
+                        .unwrap(),
+                    first,
+                );
+                let mut foreign_runtime = invoke.clone();
+                foreign_runtime.runtime.agent = AgentId([0x77; 32]);
+                assert_eq!(
+                    reopened.inspect(|store, recovered| {
+                        super::super::external_local_executor::replayed_committed_suffix_outcome(
+                            store,
+                            recovered,
+                            &production,
+                            &foreign_runtime,
+                        )
+                    }),
+                    Err(JournalStoreError::Conflict),
+                );
                 let ExternalJournalCommit::AlreadyCommitted(recovery) = reopened
                     .apply(
                         &mut production,
@@ -23240,6 +23266,74 @@ pub(crate) mod tests {
                         &after_retry,
                         recovery,
                     )
+                );
+            }
+            if index == 0 {
+                // An unrelated accepted read advances the Ordered head, but
+                // the earlier mutation's result is still retained. Recover
+                // it from the authenticated suffix, not a current-head token.
+                let mut read_work = work.clone();
+                read_work.invocation = sdk::InvocationId([0xa0; 32]);
+                read_work.mode = sdk::MethodMode::LinearizableQuery;
+                read_work.message = vec![TAG_DYNAMIC];
+                read_work.message.extend(Msg::new("stored").encode());
+                let sdk::InvocationAuthorization::AuthorityReceipt(mut read_receipt) =
+                    authorization.clone()
+                else {
+                    unreachable!()
+                };
+                read_receipt.selector.request = read_work.commitment();
+                read_receipt.signature = signing.sign(&read_receipt.signing_bytes()).to_bytes();
+                let read = ReplayInput {
+                    runtime: entry.input.runtime.clone(),
+                    operation: ReplayOperation::CleanInvoke {
+                        context: sdk::RuntimeExecutionContext::Direct,
+                        work: read_work,
+                        authorization: sdk::InvocationAuthorization::AuthorityReceipt(read_receipt),
+                        observed_slot: 12,
+                    },
+                };
+                let read_outcome =
+                    publish_standard_invocation(&mut store, sealed, admitted, &mut executor, read);
+                let sdk::RuntimeOutcome::Completed(Ok(read_reply)) = &read_outcome else {
+                    panic!("unrelated stored read failed: {read_outcome:?}");
+                };
+                assert_eq!(Value::decode(&read_reply.reply), Value::U64(expected));
+                executor.captures.clear();
+                executor.pending = None;
+                store = reopen(store, &mut executor);
+                let resolver =
+                    super::super::journal_store::CatalogBlobResolverFactory::catalog_blob_resolver(
+                        &store,
+                    )
+                    .unwrap();
+                let mut production =
+                    super::super::external_local_executor::ExternalLocalReplayExecutor::new(
+                        admitted.clone(),
+                        descriptor.as_ref().clone(),
+                        resolver,
+                    )
+                    .unwrap();
+                let reopened = PinnedExternalJournal::open(
+                    &mut store,
+                    sealed,
+                    &mut production,
+                    &NoPrunedOrderedBases,
+                    &mut ReadBudget::new(10000, 10000000),
+                )
+                .unwrap();
+                assert_eq!(
+                    reopened
+                        .inspect(|store, recovered| {
+                            super::super::external_local_executor::replayed_committed_suffix_outcome(
+                                store,
+                                recovered,
+                                &production,
+                                &invoke,
+                            )
+                        })
+                        .unwrap(),
+                    first,
                 );
             }
             let ack = ReplayInput {
@@ -23356,6 +23450,17 @@ pub(crate) mod tests {
                     production
                         .replayed_outcome(recovery.input(), recovery.position())
                         .is_none()
+                );
+                assert_eq!(
+                    reopened.inspect(|store, recovered| {
+                        super::super::external_local_executor::replayed_committed_suffix_outcome(
+                            store,
+                            recovered,
+                            &production,
+                            &entry.input,
+                        )
+                    }),
+                    Err(JournalStoreError::Unavailable),
                 );
             }
         }

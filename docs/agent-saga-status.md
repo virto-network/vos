@@ -88,14 +88,25 @@ invocation's authorization and gas bound; an absent continuation returns a
 no-change guest error. A successful retained external Resume has not been
 physically qualified, and yielded external writes still fail closed until
 continuation budgets are retained. An exact-current-domain-head
-`AlreadyCommitted` retry can now recover the outcome from physical suffix
-replay after restart, but only while the locked journal still names that input
-and position. The cache keeps at most two outcomes per Ordered/Local domain;
-a checkpoint-pruned result after reopen or older-head retry remains unavailable.
-Do not attach a route until
-those retry cases have an authenticated response policy. A fresh no-change
+`AlreadyCommitted` retry can recover the outcome from physical suffix replay
+after restart, but only while the locked journal still names that input and
+position. A bounded older-head lookup also requires the exact clean operation
+to remain in the authenticated suffix, with no newer lifecycle step for that
+invocation, before using physically replayed outcome bytes. The cache retains
+at most 32 outcomes per Ordered/Local domain; eviction fails closed. A
+checkpoint-pruned result after reopen remains unavailable, even if the guest
+retains its runtime result. Do not attach a route until that retry case has an
+authenticated response policy. A fresh no-change
 guest retry alone is not evidence of the original response; bind recovery to
 the committed input and retained result/lifecycle state.
+The narrow follow-up is a read-only SDK inspection of an exact retained
+invocation disposition, authenticated by the original work/authorization and
+current committed runtime root. It must explicitly report absence (not execute
+unseen work), return no state or external block changes, and be physically
+qualified after checkpoint/reopen. ACK recovery must likewise prove the exact
+retained retirement marker. Keep this in the experimental ABI; do not decode
+the Standard runtime's private result layout in the host or relax the signed
+work commitment's `recovery_only` binding.
 
 No released startup, lifecycle queue or route adapter selects this owner yet;
 the caller must choose Space/Node storage roots independently and attach a
