@@ -20,6 +20,11 @@ include = [
     "blobs/system_catalog.vos",
 ]
 
+[features]
+# Candidate-only external Local startup. The default released binary keeps
+# the image path and does not accept the experimental state ABI.
+experimental-state-blocks = ["vos/experimental-state-blocks"]
+
 [dependencies]
 ureq = { version = "2", default-features = false, features = ["tls"] }
 vos = { path = "../vos", version = "0.1.0", features = ["std", "http-client", "http-ingress", "ssh-ingress", "storage", "network", "private-agent-crypto"] }

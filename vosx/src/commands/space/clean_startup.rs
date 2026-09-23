@@ -64,6 +64,11 @@ const SYSTEM_AGENT_CONTROL_DIRECTORY: &str = "system-agent";
 const SHARED_AGENT_HOST_DIRECTORY: &str = "agent-host";
 const LOCAL_AGENT_HOST_DIRECTORY: &str = super::local_config::IMAGE_LOCAL_HOST_DIRECTORY;
 const LOCAL_LIFECYCLE_DIRECTORY: &str = super::local_config::IMAGE_LOCAL_LIFECYCLE_DIRECTORY;
+#[cfg(feature = "experimental-state-blocks")]
+const EXTERNAL_LOCAL_JOURNAL_DIRECTORY: &str =
+    super::local_config::EXTERNAL_LOCAL_JOURNAL_DIRECTORY;
+const EXTERNAL_LOCAL_LIFECYCLE_DIRECTORY: &str =
+    super::local_config::EXTERNAL_LOCAL_LIFECYCLE_DIRECTORY;
 const OPERATION_IMAGES_DIRECTORY: &str = "authority-operation";
 const OPERATION_JOURNAL_DIRECTORY: &str = "authority-operation-journal";
 const OPERATION_COMPLETIONS_DIRECTORY: &str = "authority-operation-completions";
@@ -136,7 +141,14 @@ pub(crate) fn start_clean_system_agent(
     space_bytes: [u8; 32],
     operator: &Keypair,
     daemon: &Keypair,
+    local_storage: super::local_config::LocalAgentStorage,
 ) -> anyhow::Result<()> {
+    super::local_config::validate_local_storage_roots(data_dir, local_storage)?;
+    #[cfg(not(feature = "experimental-state-blocks"))]
+    anyhow::ensure!(
+        local_storage == super::local_config::LocalAgentStorage::Image,
+        "external-state Local startup requires an experimental-state-blocks build",
+    );
     let startup_started = std::time::Instant::now();
     let report_phase = |phase: &'static str| {
         tracing::debug!(
@@ -404,10 +416,12 @@ pub(crate) fn start_clean_system_agent(
         )
         .map(|prepared| prepared.into_parts().0)
     };
-    let mut lifecycle_stores = CleanManagementLifecycleStoreFactory::open_or_create(
-        data_dir.join(LOCAL_LIFECYCLE_DIRECTORY),
-        space,
-    )?;
+    let lifecycle_root = match local_storage {
+        super::local_config::LocalAgentStorage::Image => LOCAL_LIFECYCLE_DIRECTORY,
+        super::local_config::LocalAgentStorage::ExternalState => EXTERNAL_LOCAL_LIFECYCLE_DIRECTORY,
+    };
+    let mut lifecycle_stores =
+        CleanManagementLifecycleStoreFactory::open_or_create(data_dir.join(lifecycle_root), space)?;
     let lifecycle_recovery = vos::agent::local_lifecycle::discover_local_lifecycle_recovery(
         &mut lifecycle_stores,
         authority_target,
@@ -522,32 +536,67 @@ pub(crate) fn start_clean_system_agent(
             )
         })?;
     report_phase("admin_recovery");
-    let local_root = data_dir.join(LOCAL_AGENT_HOST_DIRECTORY);
-    let local = match std::fs::symlink_metadata(&local_root) {
-        Ok(_) => vos::agent::local_sdk_host::LocalAgentHost::open(
-            &local_root,
-            space,
-            clean_node,
-            Arc::clone(&trust),
-        )?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            vos::agent::local_sdk_host::LocalAgentHost::create(
-                &local_root,
-                space,
-                clean_node,
-                Arc::clone(&trust),
+    let lifecycle = match local_storage {
+        super::local_config::LocalAgentStorage::Image => {
+            let local_root = data_dir.join(LOCAL_AGENT_HOST_DIRECTORY);
+            let local = match std::fs::symlink_metadata(&local_root) {
+                Ok(_) => vos::agent::local_sdk_host::LocalAgentHost::open(
+                    &local_root,
+                    space,
+                    clean_node,
+                    Arc::clone(&trust),
+                )?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    vos::agent::local_sdk_host::LocalAgentHost::create(
+                        &local_root,
+                        space,
+                        clean_node,
+                        Arc::clone(&trust),
+                    )?
+                }
+                Err(error) => return Err(error.into()),
+            };
+            report_phase("local_host");
+            vos::agent::local_lifecycle::LocalLifecycleController::with_recovery(
+                owner,
+                local,
+                lifecycle_stores,
+                OwnedCleanOperatorIdentitySigner::new(operator.clone())?,
+                lifecycle_recovery,
             )?
         }
-        Err(error) => return Err(error.into()),
+        super::local_config::LocalAgentStorage::ExternalState => {
+            #[cfg(not(feature = "experimental-state-blocks"))]
+            anyhow::bail!(
+                "external-state Local startup requires the experimental-state-blocks build"
+            );
+            #[cfg(feature = "experimental-state-blocks")]
+            {
+                let journal_root = data_dir.join(EXTERNAL_LOCAL_JOURNAL_DIRECTORY);
+                drop(super::clean_store::ensure_private_directory(&journal_root)?);
+                let directory = vos::agent::ExternalLocalJournalDirectory::open_existing(
+                    journal_root,
+                    HostSpaceId(space.0),
+                    HostNodeId(clean_node.0),
+                )?;
+                let mut budget =
+                    vos::agent::sdk::state_blocks::ReadBudget::new(1_000_000, 1_000_000_000);
+                let lifecycle =
+                    vos::agent::local_lifecycle::LocalLifecycleController::with_external_recovery(
+                        owner,
+                        directory,
+                        lifecycle_stores,
+                        OwnedCleanOperatorIdentitySigner::new(operator.clone())?,
+                        lifecycle_recovery,
+                        Arc::clone(&trust),
+                        LOCAL_LIFECYCLE_RECOVERY_LIMIT,
+                        &mut budget,
+                    )?;
+                report_phase("external_local_recovery");
+                lifecycle
+            }
+        }
     };
-    report_phase("local_host");
-    let lifecycle = vos::agent::local_lifecycle::LocalLifecycleController::with_recovery(
-        owner,
-        local,
-        lifecycle_stores,
-        OwnedCleanOperatorIdentitySigner::new(operator.clone())?,
-        lifecycle_recovery,
-    )?;
     let lifecycle = match shared_genesis {
         Some(shared) => lifecycle.with_shared_genesis(shared).map_err(|error| {
             anyhow::anyhow!("complete Shared recovery before routes; preserved stores: {error:?}")

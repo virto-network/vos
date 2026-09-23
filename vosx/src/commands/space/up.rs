@@ -62,6 +62,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     verify_local_genesis(&data_dir, &space_id)?;
     let local = local_config::load(&data_dir)?;
     local_config::validate_local_storage_roots(&data_dir, local.local_agent_storage)?;
+    #[cfg(not(feature = "experimental-state-blocks"))]
     anyhow::ensure!(
         local.local_agent_storage == local_config::LocalAgentStorage::Image,
         "external-state Local startup is not yet available in this binary; image roots were not opened",
@@ -112,6 +113,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         space_id,
         &operator_keypair,
         &daemon_keypair,
+        local.local_agent_storage,
     )?;
     let extension_caps = register_extensions_from_local(
         &mut node,
