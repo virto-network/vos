@@ -53,9 +53,10 @@ pass prototype recovery tests, but no production route selects them. The
 pinned cursor can now own its file store and stable lock across mutations.
 An experimental external replay adapter now authenticates signed Create,
 Install, Invoke and ACK, resolves exact Install artifacts and replays the
-physical guest without decoding its private state. The active Local lifecycle
-still needs durable intent/slot selection, a retained owner using that adapter,
-and a route adapter before serving it.
+physical guest without decoding its private state. A file-backed owner now
+holds the locked slot, catalog-bound executor and pinned materialization
+together; the active Local lifecycle still does not select it from durable
+intent or expose a route.
 `LocalJournalAgentDriver::prepare_local_genesis` still builds an r19 binding
 and `StandardLocalReplayExecutor`. A separate external Local preparer now
 authenticates the signed package, exact catalog closure, Create receipt and
@@ -64,14 +65,14 @@ The active released-binary Local path is `vosx` clean startup -> image-based
 `LocalAgentHost` -> `LocalLifecycleController` -> Local route backend. Its
 Create admission uses `AdmittedRuntimePackage`; the experimental package has
 the distinct `AdmittedStateRuntimePackage` type. The older journal
-`host::LocalGenesisIntent` and file opener accept r19 only; changing that
+`host::LocalGenesisIntent` and its file opener accept r19 only; changing that
 intent alone would not cut over the active production path. Next, extend the
 existing signed Local lifecycle with an explicitly selected external owner,
 distinct durable intent/slot and recovery, then route only after authenticated
 Create publication. Reuse the existing issuer/finality and keep r19 intact;
 do not build a parallel unguarded management flow. That Local vertical slice is
-the next integration step;
-Shared common finality and Clerk follow it within batch 1. Do not treat the
+the next integration step; Shared common finality and Clerk follow it within
+batch 1. Do not treat the
 fixture issuer or signed test package as live admission. Before activation,
 complete file-backed restart qualification for the now-tested physical
 standard-runtime ACK near the 3-MiB admitted metadata ceiling. The large
@@ -636,9 +637,30 @@ correct pinned root. Missing blocks mean unavailable state, never absent keys.
   The complete prototype gate passed after the missing-artifact check at
   `task-tmp/external-local-prototype.log` (SDK 247/1 ignored, replay 69,
   physical PVM 17, journal-store 105 and feature-disabled groups).
-  This is a replay seam, not an active production owner: its caller must derive
-  the descriptor and admitted package from exact durable intent and retain the
-  slot lock. The fixture's credentials are not released-binary admission.
+  This was a replay seam, not active production routing; the fixture's
+  credentials are not released-binary admission.
+  File-owner follow-up: the owner now admits its exact signed runtime package
+  through a resolver minted from the already-locked file store, validates both
+  durable and staged heads, and keeps the executor with the cursor and lock.
+  A restart fixture independently re-executes Create from the saved request
+  inputs before opening it and verifies lock exclusion until owner drop.
+  Live Ordered/Local preparation now passes replay-selected lane roots and the
+  aggregate budget to physical execution; the earlier opaque hook could replay
+  history but could not publish a first Install through this adapter. A fresh
+  physical Install is now exercised on a cloned in-memory journal. The active
+  `vosx` lifecycle has not selected this owner, and its retained Create seal
+  still carries candidate output; reconstruct/compact that evidence from exact
+  durable intent and measure startup memory/latency before release. The file
+  opener still validates then replays the durable head again, as noted above.
+  The full prototype gate passed on this owner/live-execution tree at
+  `task-tmp/external-live-prototype-final.log` (SDK 247/1 ignored, replay 69,
+  physical PVM 17, journal-store 105 and feature-disabled groups). The focused
+  standard lifecycle and synthetic block probe passed separately at
+  `task-tmp/external-live-focused2.log` and
+  `task-tmp/external-live-probe-focused.log`. The probe now charges guest reads
+  and changed-link verification to one live budget and refuses later-position
+  ACK with zero fetch allowance; exact committed retry still costs no guest
+  execution.
   Production actor-package issuance and authoritative heads remain separate.
   Local Create-preparation follow-up: the new external preparer consumes a
   bounded immutable supplied catalog, rejects a missing package, verifies the

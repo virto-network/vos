@@ -11094,6 +11094,40 @@ impl FileLocalAgentJournalSlot {
         })
     }
 
+    /// Open an exposed external generation while constructing the replay
+    /// executor from this exact locked store. The factory may obtain a pinned
+    /// catalog resolver; neither that capability nor a recovered route can be
+    /// selected from a separate, path-reopened namespace. This still performs
+    /// read-only validation of both durable and staged heads before returning.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn open_external_journal_with_executor<
+        E: super::replay::ReplayExecutor,
+        R: super::replay::OrderedBaseResolver,
+    >(
+        self,
+        sealed: &super::replay::ReplaySealedExternalLocalGenesis,
+        executor_from_store: impl FnOnce(&FileAgentJournalStore) -> Result<E, JournalStoreError>,
+        resolver: &R,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<(FileAgentJournalStore, E), JournalStoreError> {
+        let mut make = Some(executor_from_store);
+        let mut executor = None;
+        let store = self.open_with_head_validation(sealed, true, |store, heads| {
+            if executor.is_none() {
+                executor = Some(make.take().ok_or(JournalStoreError::Corrupt)?(store)?);
+            }
+            super::replay::validate_external_genesis_head(
+                store,
+                sealed,
+                heads,
+                executor.as_mut().ok_or(JournalStoreError::Corrupt)?,
+                resolver,
+                budget,
+            )
+        })?;
+        Ok((store, executor.ok_or(JournalStoreError::NotInitialized)?))
+    }
+
     fn open_with_head_validation<T: ReplaySealedOrdinaryGenesis>(
         self,
         sealed: &T,
@@ -16805,20 +16839,24 @@ mod tests {
                 // take the lock until that cursor is dropped; dropping it
                 // releases the backend even without a separate host handle.
                 drop(store);
-                let reopened = acquire_production_local_slot(&directory, sealed)
-                    .open_external_journal(
-                        sealed,
-                        true,
-                        executor,
-                        &super::super::replay::NoPrunedOrderedBases,
-                        &mut ReadBudget::new(100, 100000),
-                    )
-                    .unwrap();
-                let owned = super::super::replay::PinnedExternalJournal::open(
-                    Box::new(reopened),
-                    sealed,
-                    executor,
-                    &super::super::replay::NoPrunedOrderedBases,
+                let catalog = [super::super::execution::RuntimeBlob {
+                    reference: sealed.genesis().runtime().package.clone(),
+                    bytes: admitted.exact_bytes().to_vec(),
+                }];
+                let recreated = super::super::local_journal_driver::LocalJournalAgentDriver::<
+                    MemoryAgentJournalStore,
+                >::prepare_external_local_genesis(
+                    sealed.genesis().create.clone(),
+                    sealed.replica(),
+                    &catalog,
+                    sealed.replica().node,
+                )
+                .unwrap();
+                assert_eq!(recreated.genesis(), sealed.genesis());
+                assert_eq!(recreated.post_create(), sealed.post_create());
+                let owned = super::super::external_local_executor::ExternalLocalJournalOwner::open(
+                    acquire_production_local_slot(&directory, sealed),
+                    recreated,
                     &mut ReadBudget::new(100, 100000),
                 )
                 .unwrap();
@@ -16955,6 +16993,7 @@ mod tests {
                         admitted,
                         true,
                         true,
+                        |_| None,
                         |store, publication, availability| {
                             store.publish_sealed_with_availability(
                                 publication,

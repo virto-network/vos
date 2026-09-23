@@ -14742,6 +14742,8 @@ mod aggregate {
         input: &ReplayInput,
         before: &RuntimeState,
         position: ReplayPosition,
+        unseen_admission: Option<UnseenInvocationAdmission>,
+        transition_proof_access: ReplayTransitionProofAccess,
         #[cfg(feature = "experimental-state-blocks")] external: Option<(
             &AgentJournalGenesis,
             &BTreeMap<PersistedLane, super::super::journal::ExternalStateRoot>,
@@ -14832,8 +14834,8 @@ mod aggregate {
                 input,
                 before,
                 position,
-                None,
-                ReplayTransitionProofAccess::PublishedOnly,
+                unseen_admission,
+                transition_proof_access,
                 true,
                 Some(&mut |ownership, executor| {
                     executor.execute_with_external_state(
@@ -15265,6 +15267,8 @@ mod aggregate {
                             ordered_base: entry.ordered_base,
                             merge_frontier: entry.merge_frontier,
                         },
+                        None,
+                        ReplayTransitionProofAccess::PublishedOnly,
                         #[cfg(feature = "experimental-state-blocks")]
                         match external_genesis.as_deref() {
                             Some(genesis) => Some((
@@ -15373,6 +15377,8 @@ mod aggregate {
                             merge_frontier: entry.merge_frontier,
                             merge_seal: entry.merge_seal,
                         },
+                        None,
+                        ReplayTransitionProofAccess::PublishedOnly,
                         #[cfg(feature = "experimental-state-blocks")]
                         match external_genesis.as_deref() {
                             Some(genesis) => Some((
@@ -15903,12 +15909,20 @@ mod aggregate {
                 return Err(journal(JournalStoreError::Unavailable));
             }
             let prepared = match entry {
-                ExternalJournalEntry::Ordered(entry) => {
-                    prepare_ordered(&mut *self.store, executor, &self.materialization, entry)?
-                }
-                ExternalJournalEntry::Local(entry) => {
-                    prepare_local(&mut *self.store, executor, &self.materialization, entry)?
-                }
+                ExternalJournalEntry::Ordered(entry) => prepare_external_ordered(
+                    &mut *self.store,
+                    executor,
+                    &self.materialization,
+                    entry,
+                    budget,
+                )?,
+                ExternalJournalEntry::Local(entry) => prepare_external_local(
+                    &mut *self.store,
+                    executor,
+                    &self.materialization,
+                    entry,
+                    budget,
+                )?,
             };
             let ReplayPreparation::Ready(prepared) = prepared else {
                 let ReplayPreparation::AlreadyCommitted(recovery) = prepared else {
@@ -17472,8 +17486,59 @@ mod aggregate {
         S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
         E: ReplayExecutor,
     {
+        prepare_ordered_inner(
+            store,
+            executor,
+            materialization,
+            entry,
+            #[cfg(feature = "experimental-state-blocks")]
+            None,
+        )
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    fn prepare_external_ordered<'store, S, E>(
+        store: &'store mut S,
+        executor: &mut E,
+        materialization: &ReplayMaterialization,
+        entry: &OrderedEntry,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<ReplayPreparation<'store, S>, MaterializeError<core::convert::Infallible, E::Error>>
+    where
+        S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
+        E: ReplayExecutor,
+    {
+        prepare_ordered_inner(store, executor, materialization, entry, Some(budget))
+    }
+
+    fn prepare_ordered_inner<'store, S, E>(
+        store: &'store mut S,
+        executor: &mut E,
+        materialization: &ReplayMaterialization,
+        entry: &OrderedEntry,
+        #[cfg(feature = "experimental-state-blocks")] external_budget: Option<
+            &mut crate::agent_sdk::state_blocks::ReadBudget,
+        >,
+    ) -> Result<ReplayPreparation<'store, S>, MaterializeError<core::convert::Infallible, E::Error>>
+    where
+        S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
+        E: ReplayExecutor,
+    {
         require_current_materialization(store, materialization)?;
         let current = &materialization.heads;
+        #[cfg(feature = "experimental-state-blocks")]
+        let external_genesis = if external_budget.is_some() {
+            let genesis = store
+                .genesis()
+                .map_err(journal)?
+                .ok_or_else(|| journal(JournalStoreError::NotInitialized))?;
+            if genesis.id() != current.genesis {
+                return Err(ReplayError::InvalidRecord);
+            }
+            Some(genesis)
+        } else {
+            None
+        };
         let id = entry.id();
         if current.ordered_head == Some(id) && current.ordered_index == entry.index {
             let stored: OrderedEntry = require_record(store, id)?;
@@ -17769,22 +17834,55 @@ mod aggregate {
             None if entry.merge_seal.is_none() => None,
             None => return Err(ReplayError::InvalidFence),
         };
-        let mut step = machine
-            .apply_with_unseen_capacity::<
+        let position = ReplayPosition::Ordered {
+            id,
+            index: entry.index,
+            merge_frontier: entry.merge_frontier,
+            merge_seal: entry.merge_seal,
+        };
+        #[cfg(feature = "experimental-state-blocks")]
+        let mut step =
+            if let (Some(genesis), Some(budget)) = (external_genesis.as_ref(), external_budget) {
+                apply_recovery_step::<_, _, core::convert::Infallible>(
+                    &mut machine,
+                    executor,
+                    &entry.input,
+                    &materialization.state,
+                    position,
+                    Some(unseen_capacity),
+                    ReplayTransitionProofAccess::PrepareAllowed,
+                    Some((
+                        genesis,
+                        &materialization.external_roots,
+                        LaneCursor::Ordered {
+                            base: materialization.ordered_base(),
+                        },
+                        budget,
+                    )),
+                )?
+            } else {
+                machine.apply_with_unseen_capacity::<
                 _,
                 ReplayMaterializationSourceError<core::convert::Infallible>,
             >(
                 executor,
                 &entry.input,
                 &materialization.state,
-                ReplayPosition::Ordered {
-                    id,
-                    index: entry.index,
-                    merge_frontier: entry.merge_frontier,
-                    merge_seal: entry.merge_seal,
-                },
+                position,
                 Some(unseen_capacity),
-            )?;
+            )?
+            };
+        #[cfg(not(feature = "experimental-state-blocks"))]
+        let mut step = machine.apply_with_unseen_capacity::<
+            _,
+            ReplayMaterializationSourceError<core::convert::Infallible>,
+        >(
+            executor,
+            &entry.input,
+            &materialization.state,
+            position,
+            Some(unseen_capacity),
+        )?;
         step.ownership_delta.ordered |= finalized_delta.ordered;
         step.ownership_delta.merge |= finalized_delta.merge;
         step.ownership_delta.local |= finalized_delta.local;
@@ -18808,8 +18906,59 @@ mod aggregate {
         S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
         E: ReplayExecutor,
     {
+        prepare_local_inner(
+            store,
+            executor,
+            materialization,
+            entry,
+            #[cfg(feature = "experimental-state-blocks")]
+            None,
+        )
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    fn prepare_external_local<'store, S, E>(
+        store: &'store mut S,
+        executor: &mut E,
+        materialization: &ReplayMaterialization,
+        entry: &LocalEntry,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<ReplayPreparation<'store, S>, MaterializeError<core::convert::Infallible, E::Error>>
+    where
+        S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
+        E: ReplayExecutor,
+    {
+        prepare_local_inner(store, executor, materialization, entry, Some(budget))
+    }
+
+    fn prepare_local_inner<'store, S, E>(
+        store: &'store mut S,
+        executor: &mut E,
+        materialization: &ReplayMaterialization,
+        entry: &LocalEntry,
+        #[cfg(feature = "experimental-state-blocks")] external_budget: Option<
+            &mut crate::agent_sdk::state_blocks::ReadBudget,
+        >,
+    ) -> Result<ReplayPreparation<'store, S>, MaterializeError<core::convert::Infallible, E::Error>>
+    where
+        S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
+        E: ReplayExecutor,
+    {
         require_current_materialization(store, materialization)?;
         let current = &materialization.heads;
+        #[cfg(feature = "experimental-state-blocks")]
+        let external_genesis = if external_budget.is_some() {
+            let genesis = store
+                .genesis()
+                .map_err(journal)?
+                .ok_or_else(|| journal(JournalStoreError::NotInitialized))?;
+            if genesis.id() != current.genesis {
+                return Err(ReplayError::InvalidRecord);
+            }
+            Some(genesis)
+        } else {
+            None
+        };
         let id = entry.id();
         if current.local_head == Some(id) && current.local_revision == entry.revision {
             let stored: LocalEntry = require_record(store, id)?;
@@ -18887,8 +19036,30 @@ mod aggregate {
         let mut machine = ReplayMachine::from_materialization(materialization, indexes)
             .map_err(ReplayError::InvocationOwnership)?;
         machine.reset_transition_proof_shadows(proof_shadow);
-        let step = machine
-            .apply_with_unseen_capacity::<
+        #[cfg(feature = "experimental-state-blocks")]
+        let step =
+            if let (Some(genesis), Some(budget)) = (external_genesis.as_ref(), external_budget) {
+                apply_recovery_step::<_, _, core::convert::Infallible>(
+                    &mut machine,
+                    executor,
+                    &entry.input,
+                    &materialization.state,
+                    position,
+                    Some(unseen_capacity),
+                    ReplayTransitionProofAccess::PrepareAllowed,
+                    Some((
+                        genesis,
+                        &materialization.external_roots,
+                        LaneCursor::Local {
+                            node: current.node,
+                            revision: current.local_revision,
+                            head: current.local_head,
+                        },
+                        budget,
+                    )),
+                )?
+            } else {
+                machine.apply_with_unseen_capacity::<
                 _,
                 ReplayMaterializationSourceError<core::convert::Infallible>,
             >(
@@ -18897,7 +19068,19 @@ mod aggregate {
                 &materialization.state,
                 position,
                 Some(unseen_capacity),
-            )?;
+            )?
+            };
+        #[cfg(not(feature = "experimental-state-blocks"))]
+        let step = machine.apply_with_unseen_capacity::<
+            _,
+            ReplayMaterializationSourceError<core::convert::Infallible>,
+        >(
+            executor,
+            &entry.input,
+            &materialization.state,
+            position,
+            Some(unseen_capacity),
+        )?;
         let (ordered_invocations, merge_invocations, local_invocations) = machine
             .ownership_ids(current.node)
             .map_err(ReplayError::InvocationOwnership)?;
@@ -20093,6 +20276,8 @@ pub(crate) use aggregate::materialize_external_checkpoint;
 pub(crate) use aggregate::materialize_external_genesis;
 #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
 pub(crate) use aggregate::validate_external_genesis_head;
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+pub(crate) use aggregate::{ExternalJournalCommit, ExternalJournalEntry, RecoveryError};
 
 #[cfg(all(feature = "std", feature = "storage"))]
 #[allow(unused_imports)]
@@ -22419,6 +22604,7 @@ pub(crate) mod tests {
         admitted: &super::super::package_admission::AdmittedStateRuntimePackage,
         expect_interruption: bool,
         interrupt_actor_operations: bool,
+        duplicate_candidate: impl FnOnce(&S) -> Option<S>,
         publish: impl FnOnce(
             &mut S,
             &ReplaySealedPublication,
@@ -22564,6 +22750,44 @@ pub(crate) mod tests {
             Some(Ok(sdk::ManagementReply::Installed(install.entry.clone())))
         );
         executor.captures.push(captured);
+        if let Some(mut candidate) = duplicate_candidate(&store) {
+            // Fresh execution through the same adapter used by the file
+            // owner, not only recovery of the fixture's captured response.
+            let resolver =
+                super::super::journal_store::CatalogBlobResolverFactory::catalog_blob_resolver(
+                    &candidate,
+                )
+                .unwrap();
+            let mut production =
+                super::super::external_local_executor::ExternalLocalReplayExecutor::new(
+                    admitted.clone(),
+                    descriptor.as_ref().clone(),
+                    resolver,
+                )
+                .unwrap();
+            let mut owner = PinnedExternalJournal::open(
+                &mut candidate,
+                sealed,
+                &mut production,
+                &NoPrunedOrderedBases,
+                &mut ReadBudget::new(10000, 10000000),
+            )
+            .unwrap();
+            let committed = owner
+                .apply(
+                    &mut production,
+                    ExternalJournalEntry::Ordered(&entry),
+                    &mut ReadBudget::new(10000, 10000000),
+                )
+                .unwrap();
+            let ExternalJournalCommit::Published(_, results) = committed else {
+                panic!("fresh Install must publish through physical executor");
+            };
+            assert_eq!(
+                results.last().unwrap().clean_management_result(),
+                Some(&Ok(sdk::ManagementReply::Installed(install.entry.clone())))
+            );
+        }
         let mut pinned = PinnedExternalJournal::open(
             &mut store,
             sealed,
@@ -23328,12 +23552,14 @@ pub(crate) mod tests {
                     before.state
                 };
             }
-            // No recovery/full-base audit is charged again on an ordinary
-            // mutation: exactly the changed-link verifier's fetches are used.
-            assert_eq!(
-                publication_budget.remaining(),
-                incremental_budget.remaining()
-            );
+            // Live publication now executes the physical guest under this
+            // same budget before incremental changed-link verification. It
+            // consumes strictly more than the verifier alone; no separate
+            // full-base audit is requested on the mutation path.
+            let (remaining_fetches, remaining_bytes) = publication_budget.remaining();
+            let (verification_fetches, verification_bytes) = incremental_budget.remaining();
+            assert!(remaining_fetches < verification_fetches);
+            assert!(remaining_bytes < verification_bytes);
             last = Some(entry);
         }
         let physical_replays = executor.physical_replays;
@@ -23442,17 +23668,26 @@ pub(crate) mod tests {
         assert_eq!(executor.executions, executed);
         // Clean runtimes own result retention: a later-position ACK executes
         // the runtime again. Only retrying the exact publication skips it.
-        // The probe returns a captured no-change transition, not a new root.
+        // The physical guest returns a no-change transition, not a new root.
         let repeated_ack = Entry::new(recovered.materialization().unwrap(), ack.input().clone());
         let repeated_capture = physical_capture(&recovered, &repeated_ack);
         assert!(repeated_capture.output().changes().is_empty());
         assert_eq!(repeated_capture.transition().state, acknowledged_state);
         executor.captures.push(repeated_capture);
+        assert!(
+            recovered
+                .apply(
+                    &mut executor,
+                    repeated_ack.borrowed(),
+                    &mut ReadBudget::new(0, 0),
+                )
+                .is_err()
+        );
         let published = recovered
             .apply(
                 &mut executor,
                 repeated_ack.borrowed(),
-                &mut ReadBudget::new(0, 0),
+                &mut ReadBudget::new(100, 100000),
             )
             .unwrap();
         assert!(
@@ -23540,7 +23775,16 @@ pub(crate) mod tests {
             .captures
             .push(physical_capture(&recovered, &after_checkpoint_ack));
         assert!(
-            matches!(recovered.apply(&mut executor, after_checkpoint_ack.borrowed(), &mut ReadBudget::new(0, 0)).unwrap(), ExternalJournalCommit::Published(publication, _) if publication.heads_advanced)
+            recovered
+                .apply(
+                    &mut executor,
+                    after_checkpoint_ack.borrowed(),
+                    &mut ReadBudget::new(0, 0),
+                )
+                .is_err()
+        );
+        assert!(
+            matches!(recovered.apply(&mut executor, after_checkpoint_ack.borrowed(), &mut ReadBudget::new(100, 100000)).unwrap(), ExternalJournalCommit::Published(publication, _) if publication.heads_advanced)
         );
         assert!(
             recovered
@@ -24155,6 +24399,7 @@ pub(crate) mod tests {
                 &admitted,
                 false,
                 false,
+                |store| Some(store.clone()),
                 |store, publication, availability| {
                     super::super::journal_store::ExternalMutationStore::publish_external_mutation(
                         store,

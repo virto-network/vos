@@ -350,3 +350,108 @@ impl<R: CatalogBlobResolver> ReplayExecutor for ExternalLocalReplayExecutor<R> {
         Ok(self.pending.take())
     }
 }
+
+/// The exposed Local generation's locked store, authenticated replay cursor,
+/// and catalog-bound physical executor share one owner lifetime. The caller
+/// must first select the exact durable external Create intent and seal; this
+/// type neither issues Authority receipts nor publishes an ingress route.
+#[cfg(all(target_os = "linux", feature = "storage"))]
+pub(crate) struct ExternalLocalJournalOwner {
+    seal: super::replay::ReplaySealedExternalLocalGenesis,
+    cursor: super::replay::PinnedExternalJournal<
+        Box<super::journal_store::FileAgentJournalStore>,
+        super::journal_store::FileAgentJournalStore,
+    >,
+    executor: ExternalLocalReplayExecutor<super::journal_store::FileCatalogBlobResolver>,
+}
+
+#[cfg(all(target_os = "linux", feature = "storage"))]
+impl ExternalLocalJournalOwner {
+    pub(crate) fn open(
+        slot: super::journal_store::FileLocalAgentJournalSlot,
+        seal: super::replay::ReplaySealedExternalLocalGenesis,
+        budget: &mut ReadBudget,
+    ) -> Result<Self, super::journal_store::JournalStoreError> {
+        use super::journal_store::{CatalogBlobResolverFactory, JournalStoreError};
+        let (store, mut executor) = slot.open_external_journal_with_executor(
+            &seal,
+            |store| {
+                let resolver = store.catalog_blob_resolver()?;
+                let package = &seal.genesis().runtime().package;
+                let bytes = resolver
+                    .load_catalog(package)?
+                    .ok_or(JournalStoreError::MissingObject)?;
+                let runtime = super::package_admission::admit_state_runtime_package(&bytes)
+                    .map_err(|_| JournalStoreError::Corrupt)?;
+                let ReplayOperation::CleanManage {
+                    request: ManagementRequest::Create(descriptor),
+                    ..
+                } = &seal.genesis().create.operation
+                else {
+                    return Err(JournalStoreError::Corrupt);
+                };
+                ExternalLocalReplayExecutor::new(runtime, descriptor.as_ref().clone(), resolver)
+                    .map_err(|_| JournalStoreError::Corrupt)
+            },
+            &super::replay::NoPrunedOrderedBases,
+            budget,
+        )?;
+        let cursor = super::replay::PinnedExternalJournal::open(
+            Box::new(store),
+            &seal,
+            &mut executor,
+            &super::replay::NoPrunedOrderedBases,
+            budget,
+        )
+        .map_err(|_| JournalStoreError::Unavailable)?;
+        Ok(Self {
+            seal,
+            cursor,
+            executor,
+        })
+    }
+
+    pub(crate) fn materialization(
+        &self,
+    ) -> Result<&super::replay::ReplayMaterialization, super::journal_store::JournalStoreError>
+    {
+        self.cursor.materialization()
+    }
+
+    pub(crate) fn apply_ordered(
+        &mut self,
+        entry: &super::journal::OrderedEntry,
+        budget: &mut ReadBudget,
+    ) -> Result<
+        super::replay::ExternalJournalCommit,
+        super::replay::MaterializeError<core::convert::Infallible, LocalReplayExecutorError>,
+    > {
+        self.cursor.apply(
+            &mut self.executor,
+            super::replay::ExternalJournalEntry::Ordered(entry),
+            budget,
+        )
+    }
+
+    pub(crate) fn apply_local(
+        &mut self,
+        entry: &super::journal::LocalEntry,
+        budget: &mut ReadBudget,
+    ) -> Result<
+        super::replay::ExternalJournalCommit,
+        super::replay::MaterializeError<core::convert::Infallible, LocalReplayExecutorError>,
+    > {
+        self.cursor.apply(
+            &mut self.executor,
+            super::replay::ExternalJournalEntry::Local(entry),
+            budget,
+        )
+    }
+
+    pub(crate) fn checkpoint(
+        &mut self,
+        budget: &mut ReadBudget,
+    ) -> Result<super::journal_store::JournalPublication, super::replay::RecoveryError> {
+        self.cursor.checkpoint(&self.seal, budget)
+    }
+}
