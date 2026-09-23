@@ -5105,10 +5105,7 @@ where
         J: CleanManagementIssuerStore,
         S: CleanManagementReceiptSigner,
     {
-        use super::external_local_executor::{
-            ExternalLocalJournalOwner, RetainedExternalLocalCreate,
-            external_local_create_intent_hash, state_runtime_matches_descriptor,
-        };
+        use super::external_local_executor::state_runtime_matches_descriptor;
 
         let target = self.authority_target();
         let managed = call.managed;
@@ -5140,6 +5137,73 @@ where
             descriptor.identity.agent,
         )
         .map_err(|_| SharedAgentHostError::Unavailable)?;
+        self.create_external_local_agent_on_slots(
+            &mut slot,
+            &mut issuer,
+            intent,
+            runtime,
+            directory,
+            budget,
+            signer,
+        )
+    }
+
+    /// Drive the same Create protocol while the lifecycle controller keeps
+    /// the intent and issuer leases across ambiguous errors and later retries.
+    /// The caller must open both stores from independently selected scope;
+    /// this method rechecks the signed request and physical directory before
+    /// pledging or executing it.
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_external_local_agent_on_slots<B, J, S>(
+        &mut self,
+        slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
+        issuer: &mut DurableCleanManagementIssuer<J>,
+        intent: super::clean_management_intent::CleanManagementIntent,
+        runtime: super::package_admission::AdmittedStateRuntimePackage,
+        directory: &super::journal_store::ExternalLocalJournalDirectory,
+        budget: &mut super::sdk::state_blocks::ReadBudget,
+        signer: &mut S,
+    ) -> Result<
+        (
+            AgentId,
+            ManagementApplicationAck,
+            super::external_local_executor::ExternalLocalJournalOwner,
+        ),
+        SharedAgentHostError,
+    >
+    where
+        B: super::clean_authority_issuer::CleanManagementRuntimeStore,
+        J: CleanManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+    {
+        use super::external_local_executor::{
+            ExternalLocalJournalOwner, RetainedExternalLocalCreate,
+            external_local_create_intent_hash, state_runtime_matches_descriptor,
+        };
+
+        let target = self.authority_target();
+        let managed = intent.call().managed;
+        let ManagementRequest::Create(descriptor) = intent.request() else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        if intent
+            .verify(target, managed, &RawCredentialVerifier)
+            .is_err()
+            || descriptor.identity.space != self.pins.space
+            || directory.space() != crate::service::SpaceId(self.pins.space.0)
+            || directory.node() != crate::service::NodeId(self.pins.node.0)
+            || descriptor.replicas.len() != 1
+            || descriptor.replicas[0].node != self.pins.node
+            || descriptor.replicas[0].role != super::sdk::ReplicaRole::Voter
+            || !state_runtime_matches_descriptor(descriptor, &runtime)
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
         slot.pledge(intent).map_err(|error| {
             use super::clean_management_intent::IntentSlotError;
             match error {
@@ -5179,7 +5243,7 @@ where
             .denial_complete()
             .map_err(|_| SharedAgentHostError::Unavailable)?
         {
-            self.finish_denied_external_local_intent(&mut slot, &issuer, &external_slot, signer)?;
+            self.finish_denied_external_local_intent(slot, issuer, &external_slot, signer)?;
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         slot.retain_runtime(runtime.exact_bytes())
@@ -5188,12 +5252,7 @@ where
             .authorization_work()
             .map_err(|_| SharedAgentHostError::Unavailable)?
             .is_some()
-            && self.finish_denied_external_local_intent(
-                &mut slot,
-                &issuer,
-                &external_slot,
-                signer,
-            )?
+            && self.finish_denied_external_local_intent(slot, issuer, &external_slot, signer)?
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
@@ -5236,10 +5295,10 @@ where
                 .retirement_complete()
                 .map_err(|_| SharedAgentHostError::Unavailable)?
             {
-                self.verify_external_local_authorization_anchor(&slot)?;
+                self.verify_external_local_authorization_anchor(slot)?;
             }
             let prepared =
-                RetainedExternalLocalCreate::prepare(&mut slot, target, &receipt, self.pins.node)?;
+                RetainedExternalLocalCreate::prepare(slot, target, &receipt, self.pins.node)?;
             if prepared.intent() != intent_hash {
                 return Err(SharedAgentHostError::ScopeMismatch);
             }
@@ -5249,16 +5308,12 @@ where
             owner
                 .verify_finalized_create_ack(&acknowledgement)
                 .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-            self.finish_live_management_intent(&mut slot, managed, &acknowledgement, &issuer)?;
-            return Ok((descriptor.identity.agent, acknowledgement, owner));
+            self.finish_live_management_intent(slot, managed, &acknowledgement, issuer)?;
+            return Ok((managed.agent, acknowledgement, owner));
         }
-        let receipt = match self.issue_management_intent_with_admission(
-            &mut slot,
-            managed,
-            &mut issuer,
-            signer,
-            true,
-        ) {
+        let receipt = match self
+            .issue_management_intent_with_admission(slot, managed, issuer, signer, true)
+        {
             Ok(receipt) => receipt,
             Err(error) => {
                 if error == SharedAgentHostError::ScopeMismatch
@@ -5266,19 +5321,14 @@ where
                     && !issuer.has_pending_decision()
                     && slot.authorization_work().ok().flatten().is_some()
                 {
-                    self.finish_denied_external_local_intent(
-                        &mut slot,
-                        &issuer,
-                        &external_slot,
-                        signer,
-                    )?;
+                    self.finish_denied_external_local_intent(slot, issuer, &external_slot, signer)?;
                 }
                 return Err(error);
             }
         };
-        self.verify_external_local_authorization_anchor(&slot)?;
+        self.verify_external_local_authorization_anchor(slot)?;
         let prepared =
-            RetainedExternalLocalCreate::prepare(&mut slot, target, &receipt, self.pins.node)?;
+            RetainedExternalLocalCreate::prepare(slot, target, &receipt, self.pins.node)?;
         if prepared.intent() != intent_hash {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
@@ -5295,14 +5345,14 @@ where
             .verify_finalized_create_ack(&acknowledgement)
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
         self.finalize_management_intent_with_admission(
-            &mut slot,
+            slot,
             managed,
             &acknowledgement,
-            &mut issuer,
+            issuer,
             true,
         )?;
-        self.finish_live_management_intent(&mut slot, managed, &acknowledgement, &issuer)?;
-        Ok((descriptor.identity.agent, acknowledgement, owner))
+        self.finish_live_management_intent(slot, managed, &acknowledgement, issuer)?;
+        Ok((managed.agent, acknowledgement, owner))
     }
 
     /// Distinguish a canonical Authority denial from transport/runtime errors
@@ -15947,17 +15997,35 @@ mod tests {
             .unwrap();
             let intent_store = IssuerMemoryStore::default();
             let issuer_store = IssuerMemoryStore::default();
+            let mut retained_intent =
+                CleanManagementIntentSlot::open(intent_store.clone()).unwrap();
+            let mut retained_issuer = DurableCleanManagementIssuer::open(
+                issuer_store.clone(),
+                descriptor.authority,
+                descriptor.identity.space,
+                descriptor.identity.agent,
+            )
+            .unwrap();
+            let create_intent = || {
+                CleanManagementIntent::new(
+                    call.authority,
+                    call.managed,
+                    request.clone(),
+                    call.clone(),
+                    &RawCredentialVerifier,
+                )
+                .unwrap()
+            };
             let mut signer = CountingSigner::new();
             // Simulate a crash after the actor has consumed the ACK but
             // before CMI4 retirement releases the pending admission.
             owner.fail_finalization_once_for_test(7);
             let mut budget = ReadBudget::new(10_000, 10_000_000);
             assert!(matches!(
-                owner.create_external_local_agent(
-                    intent_store.clone(),
-                    issuer_store.clone(),
-                    descriptor.clone(),
-                    call.clone(),
+                owner.create_external_local_agent_on_slots(
+                    &mut retained_intent,
+                    &mut retained_issuer,
+                    create_intent(),
                     runtime.clone(),
                     &directory,
                     &mut budget,
@@ -15978,11 +16046,10 @@ mod tests {
             std::fs::rename(&lock, &parked_lock).unwrap();
             let entries_before = std::fs::read_dir(&root).unwrap().count();
             assert!(matches!(
-                owner.create_external_local_agent(
-                    intent_store.clone(),
-                    issuer_store.clone(),
-                    descriptor.clone(),
-                    call.clone(),
+                owner.create_external_local_agent_on_slots(
+                    &mut retained_intent,
+                    &mut retained_issuer,
+                    create_intent(),
                     runtime.clone(),
                     &directory,
                     &mut ReadBudget::new(10_000, 10_000_000),
@@ -15993,6 +16060,8 @@ mod tests {
             assert!(!lock.exists());
             assert_eq!(std::fs::read_dir(&root).unwrap().count(), entries_before);
             std::fs::rename(&parked_lock, &lock).unwrap();
+            drop(retained_intent);
+            drop(retained_issuer);
 
             // Startup matches every physical candidate against the separate
             // signed lifecycle store before deciding which format to recover.

@@ -77,6 +77,10 @@ An opt-in `LCQ2` Create envelope now preserves the exact signed external-state
 package and keeps it type-disjoint from image `LCQ1`; its physical Create
 fixture checks round-trip and corruption rejection. No released ingress accepts
 `LCQ2` until startup recovery and route publication qualify.
+The external Create coordinator now also accepts already-open intent and issuer
+slots; a crash-point retry test keeps both slots alive across ambiguous errors.
+This lets a startup controller retain those leases instead of reopening them
+per attempt. It does not yet perform startup recovery or enable `LCQ2` ingress.
 The coordinator now accepts an operator-selected, filesystem-descriptor-pinned
 external directory owner rather than a request-controlled slot-opening
 callback; replacing that directory pathname cannot redirect a retained owner.
