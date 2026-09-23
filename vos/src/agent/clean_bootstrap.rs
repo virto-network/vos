@@ -5893,7 +5893,7 @@ where
         Ok(true)
     }
 
-    fn finish_live_management_intent<
+    pub(crate) fn finish_live_management_intent<
         B: CleanManagementIssuerStore,
         J: CleanManagementIssuerStore,
     >(
@@ -16413,6 +16413,31 @@ mod tests {
             assert_eq!(*issuer_store.image.lock().unwrap(), issuer_before);
             assert_eq!(signer.calls, signer_calls);
 
+            // Startup consumes the retained admission and finishes the
+            // interrupted Create before any returned owner may serve. The
+            // later explicit Create call is an exact finalized retry.
+            let selected_node = owner.pins.node;
+            let recovered_owners = recovery
+                .recover_external_pending(
+                    owner,
+                    &directory,
+                    selected_node,
+                    1,
+                    &mut ReadBudget::new(10_000, 10_000_000),
+                    &mut signer,
+                )
+                .unwrap();
+            assert_eq!(recovered_owners.len(), 1);
+            assert_eq!(
+                recovered_owners
+                    .get(&descriptor.identity.agent)
+                    .unwrap()
+                    .descriptor(),
+                &descriptor
+            );
+            drop(recovered_owners);
+            drop(recovery);
+
             let mut recovery_budget = ReadBudget::new(10_000, 10_000_000);
             let (agent, acknowledgement, external) = owner
                 .create_external_local_agent(
@@ -16666,71 +16691,6 @@ mod tests {
             drop(external);
             drop(install_slot);
             drop(install_issuer);
-            let mut install_slot = CleanManagementIntentSlot::open(intent_store.clone()).unwrap();
-            let mut install_issuer = DurableCleanManagementIssuer::open(
-                issuer_store.clone(),
-                descriptor.authority,
-                descriptor.identity.space,
-                descriptor.identity.agent,
-            )
-            .unwrap();
-            let mut external = reopened_archive
-                .open_existing(
-                    runtime.exact_bytes().to_vec(),
-                    owner.authority_target(),
-                    owner.pins.node,
-                    &directory,
-                    &mut ReadBudget::new(10_000, 10_000_000),
-                )
-                .unwrap();
-            assert_eq!(external.materialization().unwrap().heads(), &installed_head);
-            assert_eq!(
-                owner
-                    .install_external_local_on_slots(
-                        &mut install_slot,
-                        &mut install_issuer,
-                        &mut external,
-                        &install_package,
-                        &mut ReadBudget::new(10_000, 10_000_000),
-                        &mut signer,
-                    )
-                    .unwrap(),
-                install_ack
-            );
-            assert_eq!(external.materialization().unwrap().heads(), &installed_head);
-            external
-                .verify_finalized_install_ack(
-                    install_intent.request(),
-                    &install_receipt,
-                    &install_ack,
-                )
-                .unwrap();
-            drop(external);
-            owner
-                .finalize_management_intent_with_admission(
-                    &mut install_slot,
-                    install_intent.call().managed,
-                    &install_ack,
-                    &mut install_issuer,
-                    true,
-                )
-                .unwrap();
-            owner
-                .finish_live_management_intent(
-                    &mut install_slot,
-                    install_intent.call().managed,
-                    &install_ack,
-                    &install_issuer,
-                )
-                .unwrap();
-            assert!(install_slot.retirement_complete().unwrap());
-            assert!(
-                install_issuer
-                    .application_finalization_status(&install_ack)
-                    .unwrap()
-            );
-            drop(install_slot);
-            drop(install_issuer);
             let mut post_install_stores = ExternalStores {
                 space: descriptor.identity.space,
                 agent: descriptor.identity.agent,
@@ -16743,12 +16703,24 @@ mod tests {
                 1,
             )
             .unwrap();
-            let mut post_install_owners = post_install_recovery
-                .external_finalized_startup_owners(
+            assert!(matches!(
+                post_install_recovery.external_finalized_startup_owners(
                     &directory,
                     owner.pins.node,
                     1,
                     &mut ReadBudget::new(10_000, 10_000_000),
+                ),
+                Err(SharedAgentHostError::Conflict)
+            ));
+            let selected_node = owner.pins.node;
+            let mut post_install_owners = post_install_recovery
+                .recover_external_pending(
+                    owner,
+                    &directory,
+                    selected_node,
+                    1,
+                    &mut ReadBudget::new(10_000, 10_000_000),
+                    &mut signer,
                 )
                 .unwrap();
             assert_eq!(
@@ -16759,6 +16731,32 @@ mod tests {
                     .unwrap()
                     .heads(),
                 &installed_head,
+            );
+            post_install_owners
+                .get(&descriptor.identity.agent)
+                .unwrap()
+                .verify_finalized_install_ack(
+                    install_intent.request(),
+                    &install_receipt,
+                    &install_ack,
+                )
+                .unwrap();
+            assert!(
+                CleanManagementIntentSlot::open(intent_store.clone())
+                    .unwrap()
+                    .retirement_complete()
+                    .unwrap()
+            );
+            assert!(
+                DurableCleanManagementIssuer::open(
+                    issuer_store.clone(),
+                    descriptor.authority,
+                    descriptor.identity.space,
+                    descriptor.identity.agent,
+                )
+                .unwrap()
+                .application_finalization_status(&install_ack)
+                .unwrap()
             );
             let mut finalized_slot = CleanManagementIntentSlot::open(intent_store.clone()).unwrap();
             let mut finalized_issuer = DurableCleanManagementIssuer::open(
@@ -16799,6 +16797,15 @@ mod tests {
             let orphan_slot = directory
                 .acquire(orphan, crate::service::Hash([0x66; 32]))
                 .unwrap();
+            let mut orphan_stores = ExternalStores {
+                space: descriptor.identity.space,
+                agent: descriptor.identity.agent,
+                intent: intent_store.clone(),
+                issuer: issuer_store.clone(),
+            };
+            let recovery =
+                discover_local_lifecycle_recovery(&mut orphan_stores, owner.authority_target(), 1)
+                    .unwrap();
             assert!(matches!(
                 recovery.external_slot_candidates(&directory, owner.pins.node, 2),
                 Err(SharedAgentHostError::ScopeMismatch)

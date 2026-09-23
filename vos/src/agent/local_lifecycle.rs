@@ -1032,6 +1032,206 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
         Ok(owners)
     }
 
+    /// Complete the retained external Local lifecycle set before any route
+    /// attachment. The system owner must already have been opened with this
+    /// recovery set's startup admission, preserving all pending journal
+    /// anchors. Each operation uses its original signed request, package
+    /// sidecar and stable file slot. A failed/ambiguous phase leaves leases
+    /// with this recovery object; the caller must drop it and rediscover from
+    /// durable stores rather than continuing on possibly poisoned handles.
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn recover_external_pending<P, R, K, S>(
+        &mut self,
+        system: &mut CleanSystemAgentBootstrapOwner<P, R, K>,
+        directory: &super::journal_store::ExternalLocalJournalDirectory,
+        node: super::sdk::NodeId,
+        maximum: usize,
+        budget: &mut super::sdk::state_blocks::ReadBudget,
+        signer: &mut S,
+    ) -> Result<
+        BTreeMap<AgentId, super::external_local_executor::ExternalLocalJournalOwner>,
+        SharedAgentHostError,
+    >
+    where
+        P: CleanSystemAgentBootstrapStore,
+        R: CleanSystemAgentBootstrapStore,
+        K: CleanManagementIssuerStore,
+        I: super::clean_authority_issuer::CleanManagementRuntimeStore
+            + super::clean_authority_issuer::CleanManagementActorStore
+            + super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore,
+        S: CleanManagementReceiptSigner,
+    {
+        use super::clean_bootstrap::RawCredentialVerifier;
+        use super::external_local_executor::{
+            ExternalLocalCreateArchive, external_local_create_intent_hash,
+        };
+
+        if self.authority != system.authority_target()
+            || directory.space() != crate::service::SpaceId(self.authority.space.0)
+            || directory.node() != crate::service::NodeId(node.0)
+            || system.pins().node() != node
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self.external_startup_inventory(directory, node, maximum)?;
+        self.startup_admission()?;
+        let mut order = (0..self.entries.len()).collect::<Vec<_>>();
+        order.sort_unstable_by_key(|index| {
+            let call = self.entries[*index]
+                .intent
+                .intent()
+                .expect("verified lifecycle entry has a signed intent")
+                .call();
+            (call.credential, call.request_sequence.get())
+        });
+        for index in order {
+            let entry = &mut self.entries[index];
+            if entry
+                .intent
+                .denial_complete()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            {
+                continue;
+            }
+            let intent = entry
+                .intent
+                .intent()
+                .ok_or(SharedAgentHostError::ScopeMismatch)?
+                .clone();
+            match intent.request() {
+                ManagementRequest::Create(_) => {
+                    let existing_required = entry
+                        .intent
+                        .authorization_work()
+                        .map_err(|_| SharedAgentHostError::Unavailable)?
+                        .is_some()
+                        || entry
+                            .intent
+                            .retirement_complete()
+                            .map_err(|_| SharedAgentHostError::Unavailable)?;
+                    let physical = if existing_required {
+                        directory.acquire_existing(
+                            crate::service::AgentId(entry.agent.0),
+                            external_local_create_intent_hash(&intent),
+                        )
+                    } else {
+                        directory.acquire(
+                            crate::service::AgentId(entry.agent.0),
+                            external_local_create_intent_hash(&intent),
+                        )
+                    }
+                    .map_err(|_| SharedAgentHostError::Unavailable)?;
+                    if system.finish_denied_external_local_intent(
+                        &mut entry.intent,
+                        &entry.issuer,
+                        &physical,
+                        signer,
+                    )? {
+                        entry.unissued_authorization = false;
+                        continue;
+                    }
+                    drop(physical);
+                    let bytes = entry
+                        .intent
+                        .load_runtime()
+                        .map_err(|_| SharedAgentHostError::Unavailable)?
+                        .ok_or(SharedAgentHostError::Unavailable)?;
+                    let runtime = super::package_admission::admit_state_runtime_package(&bytes)
+                        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                    let (agent, acknowledgement, owner) = system
+                        .create_external_local_agent_on_slots(
+                            &mut entry.intent,
+                            &mut entry.issuer,
+                            intent,
+                            runtime,
+                            directory,
+                            budget,
+                            signer,
+                        )?;
+                    if agent != entry.agent
+                        || entry
+                            .finalized
+                            .as_ref()
+                            .is_some_and(|saved| saved != &acknowledgement)
+                    {
+                        return Err(SharedAgentHostError::ScopeMismatch);
+                    }
+                    entry.issued = Some(acknowledgement.receipt.clone());
+                    entry.observed = Some(acknowledgement.clone());
+                    entry.finalized = Some(acknowledgement);
+                    entry.unissued_authorization = false;
+                    drop(owner);
+                }
+                ManagementRequest::Install(_) => {
+                    let archive = entry
+                        .intent
+                        .load_external_create_archive()
+                        .map_err(|_| SharedAgentHostError::Unavailable)?
+                        .ok_or(SharedAgentHostError::ScopeMismatch)
+                        .and_then(|bytes| {
+                            ExternalLocalCreateArchive::decode(&bytes)
+                                .map_err(|_| SharedAgentHostError::ScopeMismatch)
+                        })?;
+                    let runtime = entry
+                        .intent
+                        .load_runtime()
+                        .map_err(|_| SharedAgentHostError::Unavailable)?
+                        .ok_or(SharedAgentHostError::Unavailable)?;
+                    let mut owner =
+                        archive.open_existing(runtime, self.authority, node, directory, budget)?;
+                    let package = entry
+                        .intent
+                        .load_actor()
+                        .map_err(|_| SharedAgentHostError::Unavailable)?
+                        .ok_or(SharedAgentHostError::Unavailable)?;
+                    let acknowledgement = system.install_external_local_on_slots(
+                        &mut entry.intent,
+                        &mut entry.issuer,
+                        &mut owner,
+                        &package,
+                        budget,
+                        signer,
+                    )?;
+                    if entry
+                        .finalized
+                        .as_ref()
+                        .is_some_and(|saved| saved != &acknowledgement)
+                    {
+                        return Err(SharedAgentHostError::ScopeMismatch);
+                    }
+                    if entry.finalized.is_none() {
+                        system.finalize_management_intent_with_admission(
+                            &mut entry.intent,
+                            intent.call().managed,
+                            &acknowledgement,
+                            &mut entry.issuer,
+                            true,
+                        )?;
+                    }
+                    system.finish_live_management_intent(
+                        &mut entry.intent,
+                        intent.call().managed,
+                        &acknowledgement,
+                        &entry.issuer,
+                    )?;
+                    entry.issued = Some(acknowledgement.receipt.clone());
+                    entry.observed = Some(acknowledgement.clone());
+                    entry.finalized = Some(acknowledgement);
+                    entry.unissued_authorization = false;
+                }
+                _ => return Err(SharedAgentHostError::ScopeMismatch),
+            }
+        }
+        // Reopen every file generation after the last lifecycle mutation;
+        // route readiness cannot inherit an in-memory candidate cursor.
+        self.external_finalized_startup_owners(directory, node, maximum, budget)
+    }
+
     pub fn startup_admission(
         &self,
     ) -> Result<LocalLifecycleStartupAdmission, SharedAgentHostError> {

@@ -221,6 +221,19 @@ physical Create/Install generation; denied Creates must retain a verified
 absent file generation. The native fixture rejects route readiness before
 Create retirement and accepts the same generation after Install retirement.
 This gate does not complete interrupted entries or attach routes.
+An internal startup recovery driver now consumes the same independently
+discovered lifecycle leases and selected external directory. In signed
+credential order it resumes retained Create or Install, completes Authority
+finalization/retirement, drops candidate owners, and reopens all generations
+through the serving gate. The native physical fixture resumes both a Create
+interrupted before retirement and an Install interrupted after publication
+but before Authority finalization, without a second Install head. A failed
+phase still requires dropping the possibly poisoned handles and rediscovering
+the durable stores; released `vosx` startup does not invoke this driver yet.
+An intent committed before its runtime/actor sidecar but before authorization
+is still a fail-closed startup case, not an automatically completed one. Its
+exact-request retry or safe per-Agent isolation needs release qualification;
+so do multi-Agent credential ordering and real file-backed lifecycle leases.
 This is not a released controller/route path. A permanently guest-rejected
 approved Install has no terminal failure transition; ingress remains disabled
 until that case and startup cutover are resolved.
