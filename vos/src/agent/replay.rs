@@ -15791,6 +15791,15 @@ mod aggregate {
         poisoned: bool,
     }
 
+    /// Blobs introduced under one exact authenticated predecessor. A failed
+    /// publication may have committed despite its error, so rollback is
+    /// allowed only while the pinned head is still that predecessor.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) struct StagedExternalCatalog {
+        predecessor: JournalHeadsId,
+        created: Vec<super::super::journal_store::UnpublishedCatalogBlob>,
+    }
+
     #[cfg(feature = "experimental-state-blocks")]
     pub(crate) enum ExternalJournalEntry<'a> {
         Ordered(&'a OrderedEntry),
@@ -15878,6 +15887,73 @@ mod aggregate {
                 return Err(JournalStoreError::Conflict);
             }
             inspect(&*self.store, materialization)
+        }
+
+        pub(crate) fn stage_catalog(
+            &mut self,
+            catalog: &[super::super::execution::RuntimeBlob],
+        ) -> Result<StagedExternalCatalog, JournalStoreError>
+        where
+            S: super::super::journal_store::UnpublishedCatalogBlobStore,
+        {
+            let predecessor = self.materialization()?.heads().id();
+            if self.store.heads()?.as_ref() != Some(self.materialization.heads()) {
+                return Err(JournalStoreError::Conflict);
+            }
+            let mut unique = BTreeMap::new();
+            for blob in catalog {
+                if !blob.reference.matches(&blob.bytes) {
+                    return Err(JournalStoreError::NonCanonical);
+                }
+                match unique.insert(
+                    (blob.reference.hash, blob.reference.len),
+                    blob.bytes.as_slice(),
+                ) {
+                    Some(previous) if previous != blob.bytes.as_slice() => {
+                        return Err(JournalStoreError::NonCanonical);
+                    }
+                    _ => {}
+                }
+            }
+            let mut staged = StagedExternalCatalog {
+                predecessor,
+                created: Vec::new(),
+            };
+            for blob in catalog {
+                match self
+                    .store
+                    .stage_catalog_blob(predecessor, &blob.reference, &blob.bytes)
+                {
+                    Ok(Some(token)) => staged.created.push(token),
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.rollback_catalog(staged)?;
+                        return Err(error);
+                    }
+                }
+            }
+            Ok(staged)
+        }
+
+        pub(crate) fn rollback_catalog(
+            &mut self,
+            staged: StagedExternalCatalog,
+        ) -> Result<(), JournalStoreError>
+        where
+            S: super::super::journal_store::UnpublishedCatalogBlobStore,
+        {
+            // A poisoned cursor or an unreadable/moved head may conceal a
+            // successful CAS. Preserve bytes for authenticated reopen.
+            if self.poisoned
+                || self.store.heads().ok().flatten().map(|heads| heads.id())
+                    != Some(staged.predecessor)
+            {
+                return Ok(());
+            }
+            for token in staged.created.into_iter().rev() {
+                self.store.rollback_catalog_blob(token)?;
+            }
+            Ok(())
         }
 
         /// Explicit maintenance checkpoint. Full root audits are budgeted here,
@@ -22737,6 +22813,7 @@ pub(crate) mod tests {
         S: super::super::journal_store::ExternalMutationStore
             + super::super::journal_store::AuditedCheckpointStore
             + super::super::journal_store::CatalogBlobResolverFactory
+            + super::super::journal_store::UnpublishedCatalogBlobStore
             + TransitionProofPublicationStore
             + ReplaySource<Error = JournalStoreError>,
     {
@@ -22913,6 +22990,57 @@ pub(crate) mod tests {
             &mut ReadBudget::new(10000, 10000000),
         )
         .unwrap();
+        let staged_bytes = b"external-install-stage-rollback".to_vec();
+        let staged_reference = BlobRef::of_bytes(&staged_bytes);
+        let invalid = super::super::execution::RuntimeBlob {
+            reference: BlobRef::of_bytes(b"not-the-staged-bytes"),
+            bytes: staged_bytes.clone(),
+        };
+        assert!(matches!(
+            pinned.stage_catalog(&[invalid]),
+            Err(JournalStoreError::NonCanonical)
+        ));
+        assert!(
+            pinned
+                .store_for_test()
+                .load_blob(JournalBlobClass::CatalogArtifact, &staged_reference)
+                .unwrap()
+                .is_none()
+        );
+        let staged = pinned
+            .stage_catalog(&[super::super::execution::RuntimeBlob {
+                reference: staged_reference.clone(),
+                bytes: staged_bytes,
+            }])
+            .unwrap();
+        assert!(
+            pinned
+                .store_for_test()
+                .load_blob(JournalBlobClass::CatalogArtifact, &staged_reference)
+                .unwrap()
+                .is_some()
+        );
+        pinned.rollback_catalog(staged).unwrap();
+        assert!(
+            pinned
+                .store_for_test()
+                .load_blob(JournalBlobClass::CatalogArtifact, &staged_reference)
+                .unwrap()
+                .is_none()
+        );
+        let preexisting = super::super::execution::RuntimeBlob {
+            reference: sealed.genesis().runtime().package.clone(),
+            bytes: admitted.exact_bytes().to_vec(),
+        };
+        let staged = pinned.stage_catalog(&[preexisting.clone()]).unwrap();
+        pinned.rollback_catalog(staged).unwrap();
+        assert_eq!(
+            pinned
+                .store_for_test()
+                .load_blob(JournalBlobClass::CatalogArtifact, &preexisting.reference)
+                .unwrap(),
+            Some(preexisting.bytes)
+        );
         let mut wrong_entry = entry.clone();
         wrong_entry.merge_seal = Some(wrong_fence.id());
         let executions_before = executor.executions;

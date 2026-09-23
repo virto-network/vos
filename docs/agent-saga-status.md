@@ -17,12 +17,13 @@ self-custodial clients. Both Local and Shared require durable recovery and
 backup. Human-friendly create/install/invoke commands must preserve exact
 protocol requests and resumability.
 
-First-release Local storage selection is explicit: a new external-state Local
+Approved first-release Local storage selection: a new external-state Local
 deployment uses a fresh dedicated root; existing image-based Local deployments
 keep their current path. Do not migrate an image root in place or silently
 interpret mixed formats. Mixed-format migration is deferred, not a release
 gate. An external root still must recover every pending lifecycle generation
-before its first route is published.
+before its first route is published. The external root is never inferred from
+the image root's contents; startup must select the two paths explicitly.
 
 Three release-work batches remain. The bounded-state vertical slice is a
 separate intermediate review checkpoint on `saga/agents`, not completion of
@@ -52,7 +53,8 @@ batch 1; subsequent integration stays on `wip/ch08-runtime-directory`:
    interrupted lifecycle, whole restart and restore using release binaries.
    Finish artifact reproduction, full outer-PVM mixed recovery, workspace/CLI
    regressions, formatting and targeted lint before the final reviewed merge.
-   Customer deployment/data cutover still needs operator approval.
+   Production deployment and data cutover still need operator approval; the
+   first-release Local fresh-root storage rule above is already approved.
 
 Immediate integration seam: the experimental external-state package, physical
 Create, sealed Local genesis, file journal, pinned Invoke/ACK owner, and
@@ -167,6 +169,11 @@ and the retired Invoke was refused. The internal supervisor worker uses the
 same primitive after physical material and signed-work checks. It still makes
 multiple guest reads per request, so measure that cost before optimizing
 without moving result authority into the host.
+The pinned external journal now has exact-predecessor catalog staging with
+rollback only while the authenticated head is unchanged. A successful
+file-backed physical Install/crash test exercises stage visibility and
+rollback; this is a prerequisite for Install, not yet the lifecycle Install
+coordinator or released ingress.
 Focused r04/s04 evidence: SDK feature-on/off suites passed (248 passed/1
 ignored and 247 passed/1 ignored); the compiled Standard physical
 Create/Install/Invoke/ACK/checkpoint/reopen test passed, including retained
