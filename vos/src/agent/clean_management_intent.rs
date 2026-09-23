@@ -635,6 +635,95 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
         }
     }
 
+    /// External Local Create stages its exact package before the signed
+    /// intent. A crash in between leaves an inert candidate; after the intent
+    /// is pledged, startup always has the package needed for recovery.
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    pub(crate) fn stage_external_create_runtime(
+        &mut self,
+        intent: &CleanManagementIntent,
+        package: &super::package_admission::AdmittedStateRuntimePackage,
+    ) -> Result<(), IntentSlotError<B::Error>>
+    where
+        B: super::clean_authority_issuer::CleanManagementRuntimeStore,
+    {
+        if self.poisoned {
+            return Err(IntentSlotError::Poisoned);
+        }
+        let ManagementRequest::Create(descriptor) = intent.request() else {
+            return Err(IntentSlotError::Invalid);
+        };
+        if intent.validate().is_err()
+            || !super::external_local_executor::state_runtime_matches_descriptor(
+                descriptor, package,
+            )
+        {
+            return Err(IntentSlotError::Invalid);
+        }
+        if let Some(existing) = &self.intent
+            && (existing.request != intent.request || existing.call != intent.call)
+        {
+            return Err(IntentSlotError::Conflict);
+        }
+        match self.load_runtime()? {
+            Some(bytes) if bytes == package.exact_bytes() => Ok(()),
+            Some(_) => Err(IntentSlotError::Conflict),
+            None => {
+                self.poisoned = true;
+                self.store
+                    .commit_runtime(package.exact_bytes())
+                    .map_err(IntentSlotError::Storage)?;
+                self.poisoned = false;
+                Ok(())
+            }
+        }
+    }
+
+    /// Only an absent intent, empty actor/archive sidecars, and a valid
+    /// optional staged state package may be ignored during external startup.
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    pub(crate) fn verify_unpledged_external_staging(
+        &mut self,
+    ) -> Result<(), IntentSlotError<B::Error>>
+    where
+        B: super::clean_authority_issuer::CleanManagementRuntimeStore
+            + super::clean_authority_issuer::CleanManagementActorStore
+            + super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore,
+    {
+        if self.poisoned {
+            return Err(IntentSlotError::Poisoned);
+        }
+        if self.intent.is_some() || self.retired || self.denied {
+            return Err(IntentSlotError::Invalid);
+        }
+        if self
+            .store
+            .load_actor()
+            .map_err(IntentSlotError::Storage)?
+            .is_some()
+            || self
+                .store
+                .load_external_create_archive()
+                .map_err(IntentSlotError::Storage)?
+                .is_some()
+        {
+            return Err(IntentSlotError::Conflict);
+        }
+        if let Some(bytes) = self.load_runtime()? {
+            super::package_admission::admit_state_runtime_package(&bytes)
+                .map_err(|_| IntentSlotError::Invalid)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn intent(&self) -> Option<&CleanManagementIntent> {
         self.intent.as_ref()
     }

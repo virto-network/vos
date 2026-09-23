@@ -422,12 +422,21 @@ pub(crate) fn start_clean_system_agent(
     };
     let mut lifecycle_stores =
         CleanManagementLifecycleStoreFactory::open_or_create(data_dir.join(lifecycle_root), space)?;
-    let lifecycle_recovery = vos::agent::local_lifecycle::discover_local_lifecycle_recovery(
+    #[cfg_attr(not(feature = "experimental-state-blocks"), allow(unused_mut))]
+    let mut lifecycle_recovery = vos::agent::local_lifecycle::discover_local_lifecycle_recovery(
         &mut lifecycle_stores,
         authority_target,
         LOCAL_LIFECYCLE_RECOVERY_LIMIT,
     )
     .map_err(|error| anyhow::anyhow!("verify Local lifecycle stores before startup: {error:?}"))?;
+    #[cfg(feature = "experimental-state-blocks")]
+    if local_storage == super::local_config::LocalAgentStorage::ExternalState {
+        lifecycle_recovery
+            .discard_unpledged_external_staging()
+            .map_err(|error| {
+                anyhow::anyhow!("verify external Local staging before startup: {error:?}")
+            })?;
+    }
     let lifecycle_admission = lifecycle_recovery.startup_admission()
         .map_err(|error| anyhow::anyhow!("Local lifecycle requires incomplete-phase recovery before startup; preserved all stores: {error:?}"))?;
     report_phase("lifecycle_discovery");

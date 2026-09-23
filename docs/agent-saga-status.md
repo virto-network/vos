@@ -233,10 +233,14 @@ interrupted before retirement and an Install interrupted after publication
 but before Authority finalization, without a second Install head. A failed
 phase still requires dropping the possibly poisoned handles and rediscovering
 the durable stores; only the opt-in `vosx` startup invokes this driver.
-An intent committed before its runtime/actor sidecar but before authorization
-is still a fail-closed startup case, not an automatically completed one. Its
-exact-request retry or safe per-Agent isolation needs release qualification;
-so do multi-Agent credential ordering and real file-backed lifecycle leases.
+External Create now stages its exact state-runtime package before pledging the
+signed intent. A crash before the pledge leaves only an inert candidate: opt-in
+startup verifies its empty issuer, absent actor/archive sidecars and valid
+optional package before excluding it from lifecycle admission. The later
+physical inventory still rejects an orphan journal slot. This ordering applies
+only to fresh external roots; pre-change intent-without-runtime roots remain
+fail-closed. Install's actor-sidecar crash window, multi-Agent credential
+ordering and real file-backed lifecycle leases still need qualification.
 This is not a released controller/route path. A permanently guest-rejected
 approved Install has no terminal failure transition; ingress remains disabled
 until that case and startup cutover are resolved.
@@ -258,9 +262,11 @@ archive and original physical generation through the already-held owner; it
 does not reacquire its own stable lock. The candidate physical fixture creates
 a second Agent through this method, retries both a newly created and a later-
 installed Agent, then reconstructs the controller and recovers both physical
-generations and the exact ACK. Its lifecycle stores are memory-backed, not
-the `vosx` file leases. A signed wrong-node Create is rejected before the
-store factory can create a lifecycle directory. The new Create wrapper also
+generations and the exact ACK. It first stages that second Agent's runtime
+without an intent, rejects an unexpected actor sidecar, then excludes the
+valid unpledged candidate from startup admission. Its lifecycle stores are
+memory-backed, not the `vosx` file leases. A signed wrong-node Create is
+rejected before the store factory can create a lifecycle directory. The new Create wrapper also
 passed on a dedicated 2-MiB thread stack; the all-in-one fixture still uses
 4 MiB. No LCQ2 production queue or HTTP path is enabled.
 Focused r04/s04 evidence: SDK feature-on/off suites passed (248 passed/1
@@ -313,7 +319,7 @@ the large ACK's 5-billion-gas success is not a release-latency guarantee.
 
 External Local cutover TODOs, in order: (1) qualify the opt-in `vosx` fresh-root
 startup with an Agent under real file-backed lifecycle leases, a response-loss
-restart and the pre-sidecar crash window; existing image roots stay on their
+restart and the Install actor-sidecar crash window; existing image roots stay on their
 current path, and mixed-format migration is deferred;
 (2) connect the internal typed LCQ2 Create and external Install to production lifecycle
 dispatch and route refresh, resolving approved-but-guest-rejected Install

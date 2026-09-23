@@ -752,6 +752,45 @@ pub(crate) struct LocalLifecycleRecoveryEntry<
 }
 
 impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycleRecovery<I, J> {
+    /// A fresh external root can contain a directory created just before a
+    /// crash, or an exact state package durably staged before its signed
+    /// Create intent. Neither state is an Agent. Retain all pledged entries;
+    /// the later physical inventory still rejects any slot without one.
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    pub fn discard_unpledged_external_staging(&mut self) -> Result<(), SharedAgentHostError>
+    where
+        I: super::clean_authority_issuer::CleanManagementRuntimeStore
+            + super::clean_authority_issuer::CleanManagementActorStore
+            + super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore,
+    {
+        for entry in &mut self.entries {
+            if entry.intent.intent().is_some() {
+                continue;
+            }
+            if entry.issuer.sequence_high_water() != 0
+                || entry.issuer.acknowledged_through() != 0
+                || entry.issuer.has_pending_decision()
+                || entry.issuer.retained_decisions() != 0
+                || entry.finalized.is_some()
+                || entry.observed.is_some()
+                || entry.issued.is_some()
+                || entry.unissued_authorization
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            entry
+                .intent
+                .verify_unpledged_external_staging()
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        }
+        self.entries.retain(|entry| entry.intent.intent().is_some());
+        Ok(())
+    }
+
     /// Match bounded external slot names to independently verified lifecycle
     /// stores before any startup route can be published. This is only candidate
     /// selection; each matched slot still needs its exact signed-intent lock,

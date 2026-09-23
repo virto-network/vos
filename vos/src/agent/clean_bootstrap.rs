@@ -5206,6 +5206,17 @@ where
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
+        slot.stage_external_create_runtime(&intent, &runtime)
+            .map_err(|error| {
+                use super::clean_management_intent::IntentSlotError;
+                match error {
+                    IntentSlotError::Conflict => SharedAgentHostError::Conflict,
+                    IntentSlotError::Invalid => SharedAgentHostError::ScopeMismatch,
+                    IntentSlotError::Storage(_) | IntentSlotError::Poisoned => {
+                        SharedAgentHostError::Unavailable
+                    }
+                }
+            })?;
         slot.pledge(intent).map_err(|error| {
             use super::clean_management_intent::IntentSlotError;
             match error {
@@ -5248,8 +5259,6 @@ where
             self.finish_denied_external_local_intent(slot, issuer, &external_slot, signer)?;
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        slot.retain_runtime(runtime.exact_bytes())
-            .map_err(|_| SharedAgentHostError::Unavailable)?;
         if slot
             .authorization_work()
             .map_err(|_| SharedAgentHostError::Unavailable)?
@@ -16094,7 +16103,8 @@ mod tests {
                     }
                     let mut agents = vec![self.agent];
                     if let Some((agent, intent, _)) = &self.fresh
-                        && intent.image.lock().unwrap().is_some()
+                        && (intent.image.lock().unwrap().is_some()
+                            || intent.runtime.lock().unwrap().is_some())
                     {
                         agents.push(*agent);
                     }
@@ -16116,7 +16126,10 @@ mod tests {
                     let Some((fresh, intent, issuer)) = &self.fresh else {
                         return Err(());
                     };
-                    if agent != *fresh || intent.image.lock().unwrap().is_none() {
+                    if agent != *fresh
+                        || (intent.image.lock().unwrap().is_none()
+                            && intent.runtime.lock().unwrap().is_none())
+                    {
                         return Err(());
                     }
                     Ok((intent.clone(), issuer.clone()))
@@ -16877,6 +16890,20 @@ mod tests {
             fresh_call.signature = credential_key.sign(&fresh_call.signing_bytes()).to_bytes();
             let fresh_intent = IssuerMemoryStore::default();
             let fresh_issuer = IssuerMemoryStore::default();
+            let staged_create = CleanManagementIntent::new(
+                fresh_call.authority,
+                fresh_call.managed,
+                fresh_request.clone(),
+                fresh_call.clone(),
+                &RawCredentialVerifier,
+            )
+            .unwrap();
+            let mut staged_slot = CleanManagementIntentSlot::open(fresh_intent.clone()).unwrap();
+            staged_slot
+                .stage_external_create_runtime(&staged_create, &runtime)
+                .unwrap();
+            assert!(staged_slot.intent().is_none());
+            drop(staged_slot);
             let mut controller_stores = ExternalStores {
                 space: descriptor.identity.space,
                 agent: descriptor.identity.agent,
@@ -16888,12 +16915,26 @@ mod tests {
                     fresh_issuer.clone(),
                 )),
             };
-            let controller_recovery = discover_local_lifecycle_recovery(
+            let mut controller_recovery = discover_local_lifecycle_recovery(
                 &mut controller_stores,
                 owner.authority_target(),
                 2,
             )
             .unwrap();
+            *fresh_intent.actor.lock().unwrap() = Some(vec![0x01]);
+            assert!(matches!(
+                controller_recovery.discard_unpledged_external_staging(),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
+            *fresh_intent.actor.lock().unwrap() = None;
+            assert!(matches!(
+                controller_recovery.external_startup_inventory(&directory, owner.pins.node, 2),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
+            controller_recovery
+                .discard_unpledged_external_staging()
+                .unwrap();
+            assert_eq!(controller_recovery.entries.len(), 1);
             let controller =
                 crate::agent::local_lifecycle::LocalLifecycleController::with_external_recovery(
                     harness.owner.take().unwrap(),
