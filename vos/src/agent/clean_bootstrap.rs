@@ -16114,6 +16114,14 @@ mod tests {
                     .unwrap()
                     .is_empty()
             );
+            assert!(matches!(
+                reopened.physical_invocation_material(
+                    crate::agent::sdk::ActorId([0x21; 32]),
+                    LOGICAL_SLOT + 20,
+                    &mut ReadBudget::new(10_000, 10_000_000),
+                ),
+                Err(crate::agent::JournalStoreError::MissingObject)
+            ));
             drop(reopened);
 
             // Retirement is a terminal physical boundary. If its stable

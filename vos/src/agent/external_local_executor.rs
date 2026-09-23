@@ -234,6 +234,113 @@ pub(crate) fn actor_cursor_before(
     (bytes != [0; 32]).then_some(crate::agent_sdk::ActorId(bytes))
 }
 
+/// Reconstruct one immutable route closure from an authenticated directory
+/// record and exact catalog blobs. The caller supplies only a resolver owned
+/// by its pinned journal; every returned byte is checked against the signed
+/// package and current directory, including schema and constructor layout.
+#[cfg(all(target_os = "linux", feature = "storage"))]
+fn physical_material_from_catalog(
+    descriptor: &AgentDescriptor,
+    record: crate::agent_sdk::ActorDirectoryRecord,
+    observed_slot: u64,
+    mut load: impl FnMut(
+        &crate::agent_sdk::BlobRef,
+    ) -> Result<Vec<u8>, super::journal_store::JournalStoreError>,
+) -> Result<
+    super::invocation_preparation::PhysicalInvocationMaterial,
+    super::journal_store::JournalStoreError,
+> {
+    use super::journal_store::JournalStoreError;
+    use crate::agent_sdk::{self as sdk, RuntimeBlob};
+
+    fn exact(
+        reference: &sdk::BlobRef,
+        load: &mut impl FnMut(&sdk::BlobRef) -> Result<Vec<u8>, JournalStoreError>,
+    ) -> Result<Vec<u8>, JournalStoreError> {
+        let bytes = load(reference)?;
+        reference
+            .matches(&bytes)
+            .then_some(bytes)
+            .ok_or(JournalStoreError::Corrupt)
+    }
+
+    if descriptor.validate().is_err()
+        || descriptor.identity.profile != AgentProfile::Local
+        || record.validate().is_err()
+        || record.entry.suspended
+    {
+        return Err(JournalStoreError::ScopeMismatch);
+    }
+    let entry = &record.entry;
+    let package_bytes = exact(&entry.package, &mut load)?;
+    let package = admit_actor_package(&package_bytes).map_err(|_| JournalStoreError::Corrupt)?;
+    let program = exact(&package.manifest().program, &mut load)?;
+    let schema = exact(&entry.agent_schema, &mut load)?;
+    let policies = exact(&entry.method_policy, &mut load)?;
+    let parsed = sdk::schema::decode(&schema).map_err(|_| JournalStoreError::Corrupt)?;
+    let installation_data = entry
+        .installation_data
+        .as_ref()
+        .map(|reference| {
+            exact(reference, &mut load).map(|bytes| RuntimeBlob {
+                reference: reference.clone(),
+                bytes,
+            })
+        })
+        .transpose()?;
+    if package.deployment() != entry.deployment
+        || package.program() != entry.program
+        || package.package_ref() != &entry.package
+        || package.manifest().state_lane_schema != entry.agent_schema
+        || package.manifest().method_policy != entry.method_policy
+        || program != package.program_bytes()
+        || schema != package.state_lane_schema_bytes()
+        || policies != package.method_policy_bytes()
+        || parsed
+            .constructor_abi()
+            .map_err(|_| JournalStoreError::Corrupt)?
+            != entry.constructor_abi
+        || parsed
+            .state_layout_hash()
+            .map_err(|_| JournalStoreError::Corrupt)?
+            != entry.state_layout
+        || parsed.lanes() != entry.lanes
+        || parsed.requires_installation_data() != installation_data.is_some()
+        || !package.requirements().supported_by(AgentProfile::Local)
+        || !descriptor
+            .runtime_contract
+            .supports(package.manifest().contract)
+        || !descriptor.capabilities.satisfies(package.requirements())
+    {
+        return Err(JournalStoreError::Corrupt);
+    }
+    let schema_ref = entry.agent_schema.clone();
+    let policy_ref = entry.method_policy.clone();
+    Ok(super::invocation_preparation::PhysicalInvocationMaterial {
+        descriptor: descriptor.clone(),
+        install_request: record.install_request,
+        actor: record,
+        producer: package.producer(),
+        contract: package.manifest().contract,
+        requirements: package.requirements(),
+        root_provenance: false,
+        observed_slot,
+        program: RuntimeBlob {
+            reference: package.manifest().program.clone(),
+            bytes: program,
+        },
+        schema: RuntimeBlob {
+            reference: schema_ref,
+            bytes: schema,
+        },
+        policies: RuntimeBlob {
+            reference: policy_ref,
+            bytes: policies,
+        },
+        installation_data,
+    })
+}
+
 /// A Create result re-observed from the locked external Local journal's
 /// authenticated initial head. It is application evidence for the existing
 /// management issuer, not Authority approval or route-publication finality.
@@ -916,6 +1023,40 @@ impl ExternalLocalJournalOwner {
         super::supervisor_adapters::route_identities(descriptor, records, AgentProfile::Local)
     }
 
+    /// Resolve one installed Actor's complete immutable invocation inputs
+    /// from the current authenticated runtime directory and pinned catalog.
+    /// Ingress must still compare the returned material to its route snapshot
+    /// and authorize the exact signed work before execution.
+    pub(crate) fn physical_invocation_material(
+        &self,
+        actor: crate::agent_sdk::ActorId,
+        observed_slot: u64,
+        budget: &mut ReadBudget,
+    ) -> Result<
+        super::invocation_preparation::PhysicalInvocationMaterial,
+        super::journal_store::JournalStoreError,
+    > {
+        use super::journal_store::JournalStoreError;
+        let record = self
+            .inspect_actor(actor, observed_slot, budget)?
+            .ok_or(JournalStoreError::MissingObject)?;
+        physical_material_from_catalog(
+            &self.executor.descriptor,
+            record,
+            observed_slot,
+            |reference| {
+                let reference = BlobRef {
+                    hash: crate::service::Hash(reference.hash.0),
+                    len: reference.len,
+                };
+                self.executor
+                    .resolver
+                    .load_catalog(&reference)?
+                    .ok_or(JournalStoreError::MissingObject)
+            },
+        )
+    }
+
     pub(crate) fn apply_ordered(
         &mut self,
         entry: &super::journal::OrderedEntry,
@@ -971,6 +1112,116 @@ mod tests {
         expected[31] = u8::MAX;
         assert_eq!(actor_cursor_before(ActorId(first)), Some(ActorId(expected)));
         assert!(ActorId(expected) < ActorId(first));
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    #[test]
+    fn external_material_requires_exact_current_actor_artifacts() {
+        use std::collections::BTreeMap;
+
+        use super::physical_material_from_catalog;
+        use crate::agent::journal::ReplayOperation;
+        use crate::agent::journal_store::JournalStoreError;
+        use crate::agent::package_admission::tests::{
+            admitted_actor_fixture, admitted_state_fixture,
+        };
+        use crate::agent_sdk::{self as sdk, Hash, InstallationId};
+
+        let runtime = admitted_state_fixture(
+            vos_pvm_compiler::assembler::Assembler::new()
+                .trap()
+                .build_standard(),
+        );
+        let (create, _, _) = crate::agent::replay::tests::external_create_fixture(&runtime);
+        let ReplayOperation::CleanManage {
+            request: sdk::ManagementRequest::Create(descriptor),
+            ..
+        } = create.operation
+        else {
+            unreachable!()
+        };
+        let package = admitted_actor_fixture();
+        let schema = sdk::schema::decode(package.state_lane_schema_bytes()).unwrap();
+        let record = sdk::ActorDirectoryRecord {
+            entry: sdk::ActorEntry {
+                actor: ActorId([0x21; 32]),
+                name: "fixture".into(),
+                parent: None,
+                deployment: package.deployment(),
+                program: package.program(),
+                package: package.package_ref().clone(),
+                agent_schema: package.manifest().state_lane_schema.clone(),
+                method_policy: package.manifest().method_policy.clone(),
+                constructor_abi: schema.constructor_abi().unwrap(),
+                installation_data: None,
+                state_layout: schema.state_layout_hash().unwrap(),
+                lanes: schema.lanes(),
+                suspended: false,
+            },
+            incarnation: Hash([0x22; 32]),
+            installation_id: InstallationId([0x23; 32]),
+            registry_reservation: Hash([0x24; 32]),
+            install_request: Hash([0x25; 32]),
+        };
+        let mut blobs = BTreeMap::from([
+            (
+                package.package_ref().clone(),
+                package.exact_bytes().to_vec(),
+            ),
+            (
+                package.manifest().program.clone(),
+                package.program_bytes().to_vec(),
+            ),
+            (
+                package.manifest().state_lane_schema.clone(),
+                package.state_lane_schema_bytes().to_vec(),
+            ),
+            (
+                package.manifest().method_policy.clone(),
+                package.method_policy_bytes().to_vec(),
+            ),
+        ]);
+        let resolve = |record: sdk::ActorDirectoryRecord,
+                       blobs: &BTreeMap<sdk::BlobRef, Vec<u8>>| {
+            physical_material_from_catalog(&descriptor, record, 10, |reference| {
+                blobs
+                    .get(reference)
+                    .cloned()
+                    .ok_or(JournalStoreError::MissingObject)
+            })
+        };
+        let material = resolve(record.clone(), &blobs).unwrap();
+        assert_eq!(material.actor, record);
+        assert_eq!(material.program.bytes, package.program_bytes());
+        assert_eq!(material.producer, package.producer());
+        assert!(!material.root_provenance);
+
+        let mut wrong_layout = record.clone();
+        wrong_layout.entry.state_layout.0[0] ^= 1;
+        assert_eq!(
+            resolve(wrong_layout, &blobs),
+            Err(JournalStoreError::Corrupt)
+        );
+        let mut suspended = record.clone();
+        suspended.entry.suspended = true;
+        assert_eq!(
+            resolve(suspended, &blobs),
+            Err(JournalStoreError::ScopeMismatch)
+        );
+        blobs.get_mut(&record.entry.agent_schema).unwrap()[0] ^= 1;
+        assert_eq!(
+            resolve(record.clone(), &blobs),
+            Err(JournalStoreError::Corrupt)
+        );
+        blobs.remove(&record.entry.agent_schema);
+        assert_eq!(
+            resolve(record, &blobs),
+            Err(JournalStoreError::MissingObject)
+        );
     }
 
     #[cfg(all(

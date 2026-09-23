@@ -1084,6 +1084,10 @@ pub(super) mod tests {
         admit_actor_package(&bytes).unwrap()
     }
 
+    pub(crate) fn admitted_actor_fixture() -> AdmittedActorPackage {
+        admit_actor(ActorFixture::default())
+    }
+
     fn admit_runtime(capabilities: RuntimeCapabilities) -> AdmittedRuntimePackage {
         let bytes = runtime_package(capabilities, true).encode().unwrap();
         admit_runtime_package(&bytes).unwrap()

@@ -78,7 +78,10 @@ verified lifecycle stores. Discovery is not authority: controller integration
 must still replay every matched generation before route attachment.
 The external owner can build route identities from its authenticated read-only
 directory, reusing the same bounded paging and identity checks as image Local.
-No external route worker or public attachment exists yet.
+It can also reconstruct an installed Actor's exact signed package, program,
+schema, policy and constructor layout from pinned catalog blobs; missing or
+altered artifacts fail closed. No external route worker or public attachment
+exists yet.
 
 No released startup, lifecycle queue or route adapter selects this owner yet;
 the caller must choose Space/Node storage roots independently and attach a
