@@ -15800,7 +15800,11 @@ mod aggregate {
     #[cfg(feature = "experimental-state-blocks")]
     pub(crate) enum ExternalJournalCommit {
         AlreadyCommitted(ReplayCommittedRecovery),
-        Published(JournalPublication, Vec<ReplayExecutionResult>),
+        Published(
+            JournalPublication,
+            Vec<ReplayExecutionResult>,
+            Option<crate::agent_sdk::RuntimeOutcome>,
+        ),
     }
 
     #[cfg(feature = "experimental-state-blocks")]
@@ -16068,6 +16072,30 @@ mod aggregate {
             {
                 return Err(journal(JournalStoreError::NonCanonical));
             }
+            let operation = match &prepared.sealed.anchor {
+                ReplayPublicationAnchor::Ordered(entry) => &entry.input.operation,
+                ReplayPublicationAnchor::Local(entry) => &entry.input.operation,
+                _ => return Err(journal(JournalStoreError::NonCanonical)),
+            };
+            let invocation_outcome = if matches!(
+                operation,
+                ReplayOperation::CleanInvoke { .. }
+                    | ReplayOperation::CleanResume { .. }
+                    | ReplayOperation::CleanAcknowledge { .. }
+            ) {
+                Some(
+                    prepared
+                        .sealed
+                        .external_execution()
+                        .ok_or_else(|| journal(JournalStoreError::NonCanonical))?
+                        .output()
+                        .transition()
+                        .outcome
+                        .clone(),
+                )
+            } else {
+                None
+            };
             availability.mutation = Some((&prepared.sealed, true));
             self.poisoned = true;
             let publication =
@@ -16077,6 +16105,7 @@ mod aggregate {
             Ok(ExternalJournalCommit::Published(
                 publication,
                 prepared.executions,
+                invocation_outcome,
             ))
         }
     }
@@ -22534,7 +22563,7 @@ pub(crate) mod tests {
                     &mut ReadBudget::new(10000, 10000000)
                 )
                 .unwrap(),
-            ExternalJournalCommit::Published(_, _)
+            ExternalJournalCommit::Published(_, _, Some(returned)) if returned == outcome
         ));
         assert_eq!(pinned.materialization().unwrap().state(), &expected);
         let executions = executor.executions;
@@ -22862,7 +22891,7 @@ pub(crate) mod tests {
                     &mut ReadBudget::new(10000, 10000000),
                 )
                 .unwrap();
-            let ExternalJournalCommit::Published(_, results) = committed else {
+            let ExternalJournalCommit::Published(_, results, None) = committed else {
                 panic!("fresh Install must publish through physical executor");
             };
             assert_eq!(
@@ -22952,7 +22981,7 @@ pub(crate) mod tests {
                 executor.executions
             ),
         };
-        if let ExternalJournalCommit::Published(_, results) = committed {
+        if let ExternalJournalCommit::Published(_, results, None) = committed {
             assert_eq!(
                 results.last().unwrap().clean_management_result(),
                 Some(&Ok(sdk::ManagementReply::Installed(install.entry.clone())))
@@ -23572,7 +23601,7 @@ pub(crate) mod tests {
                 let committed = pinned
                     .apply(&mut executor, entry.borrowed(), &mut publication_budget)
                     .unwrap();
-                let ExternalJournalCommit::Published(publication, executions) = committed else {
+                let ExternalJournalCommit::Published(publication, executions, _) = committed else {
                     panic!("new mutation must publish");
                 };
                 assert!(publication.heads_advanced);
@@ -23733,7 +23762,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert!(
-            matches!(published, ExternalJournalCommit::Published(publication, _) if publication.heads_advanced)
+            matches!(published, ExternalJournalCommit::Published(publication, _, Some(_)) if publication.heads_advanced)
         );
         assert_eq!(
             recovered.materialization().unwrap().state(),
@@ -23772,7 +23801,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert!(
-            matches!(published, ExternalJournalCommit::Published(publication, _) if publication.heads_advanced)
+            matches!(published, ExternalJournalCommit::Published(publication, _, Some(_)) if publication.heads_advanced)
         );
         assert_eq!(executor.executions, executed + 1);
         assert_eq!(
@@ -23865,7 +23894,7 @@ pub(crate) mod tests {
                 .is_err()
         );
         assert!(
-            matches!(recovered.apply(&mut executor, after_checkpoint_ack.borrowed(), &mut ReadBudget::new(100, 100000)).unwrap(), ExternalJournalCommit::Published(publication, _) if publication.heads_advanced)
+            matches!(recovered.apply(&mut executor, after_checkpoint_ack.borrowed(), &mut ReadBudget::new(100, 100000)).unwrap(), ExternalJournalCommit::Published(publication, _, Some(_)) if publication.heads_advanced)
         );
         assert!(
             recovered

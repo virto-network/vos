@@ -81,10 +81,10 @@ directory, reusing the same bounded paging and identity checks as image Local.
 It can also reconstruct an installed Actor's exact signed package, program,
 schema, policy and constructor layout from pinned catalog blobs; missing or
 altered artifacts fail closed. No external route worker or public attachment
-exists yet. Route execution must also recover the exact SDK outcome after a
-published mutation or `AlreadyCommitted` retry; the current external replay
-commit surface exposes management replies but not that invocation handoff.
-Do not attach a route that can execute without a durable retry response.
+exists yet. A successful external journal publication now returns its exact
+guest SDK invocation outcome only after the head commit succeeds. An
+`AlreadyCommitted` retry still lacks an authenticated response handoff,
+including after restart; do not attach a route that can execute without it.
 
 No released startup, lifecycle queue or route adapter selects this owner yet;
 the caller must choose Space/Node storage roots independently and attach a
