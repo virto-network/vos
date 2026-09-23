@@ -5188,6 +5188,8 @@ where
             external_local_create_intent_hash, state_runtime_matches_descriptor,
         };
 
+        let started = std::time::Instant::now();
+
         let target = self.authority_target();
         let managed = intent.call().managed;
         let ManagementRequest::Create(descriptor) = intent.request() else {
@@ -5227,6 +5229,7 @@ where
                 }
             }
         })?;
+        tracing::debug!(agent = ?managed.agent, elapsed_ms = started.elapsed().as_millis() as u64, "external Local Create intent pledged");
         let intent_hash = external_local_create_intent_hash(
             slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?,
         );
@@ -5348,7 +5351,9 @@ where
                 return Err(error);
             }
         };
+        tracing::debug!(agent = ?managed.agent, elapsed_ms = started.elapsed().as_millis() as u64, "external Local Create Authority receipt issued");
         self.verify_external_local_authorization_anchor(slot)?;
+        tracing::debug!(agent = ?managed.agent, elapsed_ms = started.elapsed().as_millis() as u64, "external Local Create Authority anchor verified");
         let prepared =
             RetainedExternalLocalCreate::prepare(slot, target, &receipt, self.pins.node)?;
         if prepared.intent() != intent_hash {
@@ -5357,12 +5362,14 @@ where
         let owner = prepared
             .publish_initial(external_slot, budget)
             .map_err(|_| SharedAgentHostError::Unavailable)?;
+        tracing::debug!(agent = ?managed.agent, elapsed_ms = started.elapsed().as_millis() as u64, "external Local Create physical genesis published");
         let observation = owner
             .observe_create_application()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
         let acknowledgement = issuer
             .observe_external_local_application(&observation, signer)
             .map_err(|_| SharedAgentHostError::Unavailable)?;
+        tracing::debug!(agent = ?managed.agent, elapsed_ms = started.elapsed().as_millis() as u64, "external Local Create issuer ACK observed");
         owner
             .verify_finalized_create_ack(&acknowledgement)
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
@@ -5373,6 +5380,7 @@ where
             issuer,
             true,
         )?;
+        tracing::debug!(agent = ?managed.agent, elapsed_ms = started.elapsed().as_millis() as u64, "external Local Create Authority finalized");
         let archive = ExternalLocalCreateArchive::new(
             slot.intent()
                 .ok_or(SharedAgentHostError::ScopeMismatch)?
@@ -5385,6 +5393,7 @@ where
         slot.retain_external_create_archive(&archive.encode())
             .map_err(|_| SharedAgentHostError::Unavailable)?;
         self.finish_live_management_intent(slot, managed, &acknowledgement, issuer)?;
+        tracing::debug!(agent = ?managed.agent, elapsed_ms = started.elapsed().as_millis() as u64, "external Local Create retired");
         Ok((managed.agent, acknowledgement, owner))
     }
 

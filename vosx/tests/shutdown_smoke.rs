@@ -168,6 +168,10 @@ fn run_shutdown_smoke(space_name: &str, external: bool) {
                 .env("XDG_CONFIG_HOME", config_home.path())
                 .env("XDG_CACHE_HOME", cache_home.path())
                 .env("VOSX_DISABLE_MDNS", "1")
+                .env(
+                    "RUST_LOG",
+                    "vos::agent::clean_bootstrap=debug,vos::agent::production_owner=debug",
+                )
                 .stdout(Stdio::null())
                 .stderr(log_file)
                 .spawn()
@@ -246,6 +250,14 @@ fn run_shutdown_smoke(space_name: &str, external: bool) {
                 );
             } else {
                 first_create = Some(acknowledgement);
+            }
+            for line in fs::read_to_string(&log_path).unwrap_or_default().lines() {
+                if line.contains("external Local Create")
+                    || line.contains("Local Create publication complete")
+                    || line.contains("Local Create exact publication reused")
+                {
+                    eprintln!("{line}");
+                }
             }
         }
 

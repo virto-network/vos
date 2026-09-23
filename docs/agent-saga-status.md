@@ -361,6 +361,17 @@ The complete test took 50.46 seconds. These are diagnostic timings, not release
 latency claims. Most fresh-Create time is beyond client preparation; separate
 daemon/Authority, physical execution and durable-publication spans before
 optimizing or blaming the PVM.
+Post-checkpoint daemon tracing on the same debug scenario narrowed that wait:
+fresh Create spent about 2.27 seconds issuing the Authority receipt, 0.49
+seconds publishing physical genesis after anchor verification, 8.64 seconds
+inside Authority finalization, 1.21 seconds in retirement, and 4.19 seconds
+after slot refresh through route reconciliation/publication. The exact retry
+spent 0.16 seconds in lifecycle recovery and about 3.47 seconds after slot
+refresh through reconciliation. The complete second run still took 48.66
+seconds. These are elapsed call spans, not CPU attribution or a release
+benchmark. They implicate synchronous Authority/finality and reconciliation
+composition more than the physical state PVM; inspect their subphases before
+changing semantics or adding caches.
 Without both candidates, startup refused before opening external roots. This qualifies a
 file-backed Create/restart/retry slice, not simulated response loss, Install,
 routed actor Invoke/ACK, throughput or final release artifacts.

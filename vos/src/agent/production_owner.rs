@@ -947,12 +947,14 @@ impl AgentProductionOwner {
         let result = lifecycle
             .create_external(submission)
             .map_err(AgentProductionOwnerError::Lifecycle)?;
+        tracing::debug!(agent = ?agent, elapsed_ms = started.elapsed().as_millis() as u64, "external Local Create lifecycle complete");
         ensure_local_slots(
             lifecycle.as_ref(),
             *capacity,
             &mut self.local,
             &mut self.local_by_agent,
         )?;
+        tracing::debug!(agent = ?agent, elapsed_ms = started.elapsed().as_millis() as u64, "external Local Create slots refreshed");
         self.finish_local_create_publication(result, previous, had_local_attachment, started)
     }
 
