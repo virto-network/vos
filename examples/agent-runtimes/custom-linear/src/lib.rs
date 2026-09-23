@@ -2259,6 +2259,7 @@ mod tests {
         let mut package = PackageEnvelope {
             manifest: PackageManifest::AgentRuntime(AgentRuntimePackageManifest {
                 name: "custom-scheduled-linear-test".to_string(),
+                external_state_limits: None,
                 outer_program: artifact.identity.clone(),
                 contract: RuntimePackageContract::canonical(),
                 capabilities: CUSTOM_LINEAR_CAPABILITIES,

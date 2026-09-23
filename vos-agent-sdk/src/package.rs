@@ -14,8 +14,8 @@ use core::fmt;
 use vos_protocol::wire::{DecodeError, Decoder, Encoder};
 
 use crate::contract::{
-    ActorAbiRange, ActorPackageContract, RuntimeMigrationPolicy, RuntimePackageContract,
-    RuntimeResourceLimits,
+    ActorAbiRange, ActorPackageContract, ExternalStateResourceLimits, RuntimeMigrationPolicy,
+    RuntimePackageContract, RuntimeResourceLimits,
 };
 use crate::method_policy::ActorMethodPolicyArtifact;
 use crate::task::TaskDependencySetArtifact;
@@ -106,6 +106,9 @@ pub struct AgentRuntimePackageManifest {
     /// Content-addressed canonical outer standard PVM bytes.
     pub outer_program: BlobRef,
     pub contract: RuntimePackageContract,
+    /// Signed experimental extension. Absent for the byte-identical r19 tag;
+    /// required for external-state runtimes, refused when unsupported.
+    pub external_state_limits: Option<ExternalStateResourceLimits>,
     pub capabilities: RuntimeCapabilities,
     pub signing: PackageSigning,
 }
@@ -171,7 +174,10 @@ impl PackageManifest {
             }
             Self::AgentRuntime(manifest) => {
                 validate_name(&manifest.name)?;
-                if !manifest.contract.is_valid() || !valid_capabilities(manifest.capabilities) {
+                if !manifest.contract.is_valid()
+                    || !valid_capabilities(manifest.capabilities)
+                    || !valid_external_state_limits(manifest)
+                {
                     return Err(PackageError::InvalidManifest);
                 }
                 references
@@ -183,6 +189,19 @@ impl PackageManifest {
         validate_reference_set(&mut references)?;
         Ok(())
     }
+}
+
+fn valid_external_state_limits(manifest: &AgentRuntimePackageManifest) -> bool {
+    if manifest.contract.lifecycle_abi == RUNTIME_ABI_ID {
+        return manifest.external_state_limits.is_none();
+    }
+    #[cfg(feature = "experimental-state-blocks")]
+    if manifest.contract.lifecycle_abi == crate::state_execution::STATE_EXECUTION_ABI_ID {
+        return manifest
+            .external_state_limits
+            .is_some_and(ExternalStateResourceLimits::is_valid);
+    }
+    false
 }
 
 /// One member of the exact, identity-ordered package closure.
@@ -864,11 +883,20 @@ fn encode_manifest(encoder: &mut Encoder<'_>, manifest: &PackageManifest, includ
             encode_signing(encoder, &manifest.signing, include_signature);
         }
         PackageManifest::AgentRuntime(manifest) => {
-            encoder.u8(1);
+            // Released tag 1 retains its exact byte/signature format.
+            encoder.u8(if manifest.external_state_limits.is_some() {
+                2
+            } else {
+                1
+            });
             encoder.string(&manifest.name);
             encode_blob(encoder, &manifest.outer_program);
             encode_runtime_contract(encoder, manifest.contract);
             encode_capabilities(encoder, manifest.capabilities);
+            if let Some(limits) = manifest.external_state_limits {
+                encoder.u64(limits.max_rows_per_lane);
+                encoder.u64(limits.max_row_bytes_per_lane);
+            }
             encode_signing(encoder, &manifest.signing, include_signature);
         }
     }
@@ -893,6 +921,19 @@ fn decode_manifest(decoder: &mut Decoder<'_>) -> Result<PackageManifest, DecodeE
             outer_program: decode_blob(decoder)?,
             contract: decode_runtime_contract(decoder)?,
             capabilities: decode_capabilities(decoder)?,
+            external_state_limits: None,
+            signing: decode_signing(decoder)?,
+        })),
+        #[cfg(feature = "experimental-state-blocks")]
+        2 => Ok(PackageManifest::AgentRuntime(AgentRuntimePackageManifest {
+            name: decoder.string_bounded(MAX_PACKAGE_NAME_BYTES)?,
+            outer_program: decode_blob(decoder)?,
+            contract: decode_runtime_contract(decoder)?,
+            capabilities: decode_capabilities(decoder)?,
+            external_state_limits: Some(ExternalStateResourceLimits {
+                max_rows_per_lane: decoder.u64()?,
+                max_row_bytes_per_lane: decoder.u64()?,
+            }),
             signing: decode_signing(decoder)?,
         })),
         _ => Err(DecodeError::InvalidTag),
@@ -948,6 +989,11 @@ fn manifest_encoded_len(
                     + 1
                     + 1
                     + manifest.capabilities.proof_systems.len() * 32
+                    + if manifest.external_state_limits.is_some() {
+                        16
+                    } else {
+                        0
+                    }
                     + 4,
             )
             .ok_or(PackageError::LimitExceeded),
@@ -1225,6 +1271,7 @@ mod tests {
         sign(PackageEnvelope {
             manifest: PackageManifest::AgentRuntime(AgentRuntimePackageManifest {
                 name: "standard-agent-runtime".into(),
+                external_state_limits: None,
                 outer_program: BlobRef::of_bytes(outer_program),
                 contract: RuntimePackageContract::canonical(),
                 capabilities: RuntimeCapabilities {
@@ -1557,6 +1604,84 @@ mod tests {
             requirements: _,
             signing: _,
         } = manifest;
+    }
+
+    #[test]
+    fn released_runtime_manifest_keeps_exact_layout_and_rejects_external_limits() {
+        let mut envelope = runtime_package();
+        let PackageManifest::AgentRuntime(manifest) = &envelope.manifest else {
+            unreachable!()
+        };
+        let mut legacy = Vec::new();
+        let mut encoder = Encoder(&mut legacy);
+        encoder.u8(1);
+        encoder.string(&manifest.name);
+        encode_blob(&mut encoder, &manifest.outer_program);
+        encode_runtime_contract(&mut encoder, manifest.contract);
+        encode_capabilities(&mut encoder, manifest.capabilities);
+        encode_signing(&mut encoder, &manifest.signing, true);
+        let mut current = Vec::new();
+        encode_manifest(&mut Encoder(&mut current), &envelope.manifest, true);
+        assert_eq!(current, legacy);
+        let PackageManifest::AgentRuntime(manifest) = &mut envelope.manifest else {
+            unreachable!()
+        };
+        manifest.external_state_limits = Some(ExternalStateResourceLimits {
+            max_rows_per_lane: 1,
+            max_row_bytes_per_lane: 1,
+        });
+        assert!(envelope.encode().is_err());
+        assert!(PackageEnvelope::decode(&encode_unchecked(&envelope)).is_err());
+    }
+
+    #[cfg(not(feature = "experimental-state-blocks"))]
+    #[test]
+    fn external_manifest_tag_is_refused_without_feature() {
+        let mut bytes = runtime_package().encode().unwrap();
+        bytes[4 + 2 + 32] = 2;
+        assert!(PackageEnvelope::decode(&bytes).is_err());
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn external_manifest_requires_explicit_signed_nonzero_limits() {
+        let mut envelope = runtime_package();
+        let PackageManifest::AgentRuntime(manifest) = &mut envelope.manifest else {
+            unreachable!()
+        };
+        manifest.contract = RuntimePackageContract::experimental_state_blocks();
+        assert!(envelope.encode().is_err());
+        assert!(PackageEnvelope::decode(&encode_unchecked(&envelope)).is_err());
+        let PackageManifest::AgentRuntime(manifest) = &mut envelope.manifest else {
+            unreachable!()
+        };
+        manifest.external_state_limits = Some(ExternalStateResourceLimits {
+            max_rows_per_lane: 200_000,
+            max_row_bytes_per_lane: 1 << 30,
+        });
+        let signed = sign(envelope);
+        let bytes = signed.encode().unwrap();
+        assert_eq!(bytes[4 + 2 + 32], 2);
+        assert_eq!(PackageEnvelope::decode(&bytes).unwrap(), signed);
+        signed.verify(&TestVerifier).unwrap();
+        for limit in [
+            ExternalStateResourceLimits {
+                max_rows_per_lane: 0,
+                max_row_bytes_per_lane: 1,
+            },
+            ExternalStateResourceLimits {
+                max_rows_per_lane: 1,
+                max_row_bytes_per_lane: 0,
+            },
+        ] {
+            let mut invalid = signed.clone();
+            let PackageManifest::AgentRuntime(manifest) = &mut invalid.manifest else {
+                unreachable!()
+            };
+            manifest.external_state_limits = Some(limit);
+            assert!(invalid.encode().is_err());
+            assert!(PackageEnvelope::decode(&encode_unchecked(&invalid)).is_err());
+        }
     }
 
     #[test]

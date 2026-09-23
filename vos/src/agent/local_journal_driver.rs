@@ -1756,81 +1756,16 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         runtime_state_limit: usize,
         allow_native_standard_for_test: bool,
     ) -> Result<ReplayTransition, LocalReplayExecutorError> {
-        let (work, sdk_work, acknowledgement) = match &input.operation {
-            ReplayOperation::CleanInvoke {
-                context,
-                work,
-                authorization,
-                observed_slot,
-            } => (
-                crate::agent_sdk::InvocationRetirement::from_work(work),
-                crate::agent_sdk::RuntimeWork::Invoke {
-                    context: *context,
-                    state: crate::agent_sdk::RuntimeState {
-                        control: before.control.clone(),
-                        linear: before.linear.clone(),
-                        merge: before.merge.clone(),
-                        local: before.local.clone(),
-                    },
-                    invocation: Box::new(work.clone()),
-                    authorization: Box::new(authorization.clone()),
-                    observed_slot: *observed_slot,
-                },
-                false,
-            ),
-            ReplayOperation::CleanResume {
-                context,
-                work,
-                yielded,
-                ..
-            } => (
-                crate::agent_sdk::InvocationRetirement::from_work(work),
-                crate::agent_sdk::RuntimeWork::Resume {
-                    context: *context,
-                    state: crate::agent_sdk::RuntimeState {
-                        control: before.control.clone(),
-                        linear: before.linear.clone(),
-                        merge: before.merge.clone(),
-                        local: before.local.clone(),
-                    },
-                    resume: Box::new(crate::agent_sdk::ResumeWork {
-                        invocation: yielded.invocation,
-                        actor: yielded.actor,
-                        incarnation: yielded.incarnation,
-                        deployment: yielded.deployment,
-                        program: yielded.program,
-                        mode: yielded.mode,
-                        continuation: yielded.continuation.clone(),
-                        ready_sequence: yielded.ready_sequence,
-                        installation_data: yielded.installation_data.clone(),
-                        availability: work.availability.clone(),
-                        input: None,
-                    }),
-                },
-                false,
-            ),
-            ReplayOperation::CleanAcknowledge {
-                context,
-                work,
-                authorization,
-                ..
-            } => (
-                work.clone(),
-                crate::agent_sdk::RuntimeWork::Acknowledge {
-                    context: *context,
-                    state: crate::agent_sdk::RuntimeState {
-                        control: before.control.clone(),
-                        linear: before.linear.clone(),
-                        merge: before.merge.clone(),
-                        local: before.local.clone(),
-                    },
-                    invocation: Box::new(work.clone()),
-                    authorization: Box::new(authorization.clone()),
-                },
-                true,
-            ),
+        let work = match &input.operation {
+            ReplayOperation::CleanInvoke { work, .. }
+            | ReplayOperation::CleanResume { work, .. } => {
+                crate::agent_sdk::InvocationRetirement::from_work(work)
+            }
+            ReplayOperation::CleanAcknowledge { work, .. } => work.clone(),
             _ => return Err(LocalReplayExecutorError::InvalidRequest),
         };
+        let sdk_work = super::replay::canonical_clean_runtime_work(input, before)
+            .ok_or(LocalReplayExecutorError::InvalidRequest)?;
         let encoded = sdk_work
             .encode()
             .map_err(|_| LocalReplayExecutorError::InvalidRequest)?;
@@ -1949,50 +1884,16 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
                 )?
             }
         };
-        match (&returned.outcome, acknowledgement) {
-            (crate::agent_sdk::RuntimeOutcome::Completed(Ok(reply)), false)
-                if reply.invocation == work.invocation
-                    && reply.actor == work.actor
-                    && reply.incarnation == work.incarnation
-                    && reply.deployment == work.deployment
-                    && reply.mode == work.mode
-                    && reply.lane == work.mode.write_lane()
-                    && reply.gas_remaining <= work.gas => {}
-            (crate::agent_sdk::RuntimeOutcome::Completed(Err(_)), false) => {}
-            (crate::agent_sdk::RuntimeOutcome::Yielded(yielded), false)
-                if yielded.invocation == work.invocation
-                    && yielded.actor == work.actor
-                    && yielded.incarnation == work.incarnation
-                    && yielded.deployment == work.deployment
-                    && yielded.program == work.program
-                    && yielded.mode == work.mode
-                    && yielded.installation_data == work.installation_data
-                    && yielded.required == work.required
-                    && match &input.operation {
-                        ReplayOperation::CleanResume {
-                            yielded: previous, ..
-                        } => yielded.ready_sequence > previous.ready_sequence,
-                        ReplayOperation::CleanInvoke { .. } => true,
-                        _ => false,
-                    } => {}
-            (crate::agent_sdk::RuntimeOutcome::Acknowledged(Ok(acknowledged)), true)
-                if acknowledged.invocation == work.invocation
-                    && acknowledged.actor == work.actor
-                    && acknowledged.incarnation == work.incarnation
-                    && acknowledged.deployment == work.deployment
-                    && acknowledged.mode == work.mode
-                    && acknowledged.work == work.commitment()
-                    && matches!(
-                        &input.operation,
-                        ReplayOperation::CleanAcknowledge { authorization, .. }
-                            if acknowledged.authorization == authorization.commitment()
-                    ) => {}
-            (crate::agent_sdk::RuntimeOutcome::Acknowledged(Err(_)), true)
-                if returned.state.control == before.control
-                    && returned.state.linear == before.linear
-                    && returned.state.merge == before.merge
-                    && returned.state.local == before.local => {}
-            _ => return Err(LocalReplayExecutorError::InvalidState),
+        if !super::replay::clean_invocation_outcome_matches(input, &returned.outcome)
+            || matches!(
+                returned.outcome,
+                crate::agent_sdk::RuntimeOutcome::Acknowledged(Err(_))
+            ) && (returned.state.control != before.control
+                || returned.state.linear != before.linear
+                || returned.state.merge != before.merge
+                || returned.state.local != before.local)
+        {
+            return Err(LocalReplayExecutorError::InvalidState);
         }
         let state = RuntimeState {
             control: returned.state.control.clone(),
@@ -3877,12 +3778,7 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
             return Err(LocalReplayExecutorError::InvalidAuthority);
         }
         let runtime_pvm = authenticated.runtime_pvm;
-        if let ReplayOperation::CleanManage {
-            request,
-            authority,
-            observed_slot,
-        } = &input.operation
-        {
+        if let ReplayOperation::CleanManage { request, .. } = &input.operation {
             if journal_context.is_some() {
                 return Err(LocalReplayExecutorError::InvalidState);
             }
@@ -3890,21 +3786,8 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
                 .clean_descriptor
                 .as_ref()
                 .ok_or(LocalReplayExecutorError::InvalidState)?;
-            let work = crate::agent_sdk::RuntimeWork::Manage {
-                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
-                space: crate::agent_sdk::SpaceId(input.runtime.space.0),
-                agent: crate::agent_sdk::AgentId(input.runtime.agent.0),
-                runtime_deployment: authority.selector.runtime_deployment,
-                state: crate::agent_sdk::RuntimeState {
-                    control: before.control.clone(),
-                    linear: before.linear.clone(),
-                    merge: before.merge.clone(),
-                    local: before.local.clone(),
-                },
-                request: Box::new(request.clone()),
-                authority: Some(Box::new(authority.clone())),
-                observed_slot: *observed_slot,
-            };
+            let work = super::replay::canonical_clean_runtime_work(input, before)
+                .ok_or(LocalReplayExecutorError::InvalidRequest)?;
             let encoded = work
                 .encode()
                 .map_err(|_| LocalReplayExecutorError::InvalidRequest)?;
@@ -4932,6 +4815,184 @@ where
             return Err(LocalJournalDriverError::InvalidResult);
         }
         ReplaySealedLocalGenesis::from_prepared(prepared).map_err(|error| {
+            LocalJournalDriverError::Replay(
+                error
+                    .map_source(|never| match never {})
+                    .map_executor(|never| match never {}),
+            )
+        })
+    }
+
+    /// Prepare an experimental Local Create from the same immutable catalog
+    /// supplied with its trusted intent. This does not stage a destination,
+    /// publish heads or expose a route; the root-bearing seal must be consumed
+    /// by a distinct external Local owner after normal lifecycle admission.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn prepare_external_local_genesis(
+        create: ReplayInput,
+        replica: AgentReplica,
+        catalog: &[RuntimeBlob],
+        expected_node: NodeId,
+    ) -> Result<super::replay::ReplaySealedExternalLocalGenesis, LocalJournalDriverError> {
+        use super::replay::{
+            ExternalGenesisExecutor, ReplayPreparedExternalGenesis, ScopedBlockReader,
+        };
+        use crate::agent_sdk::{
+            state_blocks::{BlockRef, BlockScope, ReadBudget},
+            state_tree::TreeError,
+        };
+
+        struct NoGenesisBlocks;
+        impl ScopedBlockReader for NoGenesisBlocks {
+            fn read_scoped(
+                &self,
+                _: BlockScope,
+                _: BlockRef,
+                _: &mut [u8],
+            ) -> Result<bool, TreeError> {
+                Err(TreeError::Storage)
+            }
+        }
+
+        struct Executor {
+            admitted: super::package_admission::AdmittedStateRuntimePackage,
+            replica: AgentReplica,
+            authenticated: Option<ReplayInputId>,
+        }
+        impl ReplayExecutor for Executor {
+            type Error = LocalReplayExecutorError;
+
+            fn verify_merge_event(&mut self, _: &MergeEvent) -> Result<bool, Self::Error> {
+                Err(LocalReplayExecutorError::InvalidRequest)
+            }
+
+            fn authenticate(
+                &mut self,
+                input: &ReplayInput,
+                before: &RuntimeState,
+                position: ReplayPosition,
+            ) -> Result<(), Self::Error> {
+                self.authenticated = None;
+                let ReplayOperation::CleanManage {
+                    request: request @ crate::agent_sdk::ManagementRequest::Create(descriptor),
+                    authority,
+                    observed_slot,
+                } = &input.operation
+                else {
+                    return Err(LocalReplayExecutorError::InvalidRequest);
+                };
+                let expected = self
+                    .admitted
+                    .binding(input.runtime.space, input.runtime.agent)
+                    .map_err(|_| LocalReplayExecutorError::InvalidState)?;
+                if !before.is_empty()
+                    || position != ReplayPosition::Genesis
+                    || input.runtime != expected
+                    || descriptor.validate().is_err()
+                    || descriptor.identity.profile != crate::agent_sdk::AgentProfile::Local
+                    || descriptor.replicas.len() != 1
+                    || descriptor.replicas[0].node.0 != self.replica.node.0
+                    || descriptor.replicas[0].principal.0 != self.replica.principal.0
+                    || descriptor.replicas[0].role != crate::agent_sdk::ReplicaRole::Voter
+                    || descriptor.identity.runtime_deployment != self.admitted.deployment()
+                    || descriptor.identity.runtime_program != self.admitted.program()
+                    || descriptor.identity.runtime_producer
+                        != self.admitted.manifest().signing.producer
+                    || descriptor.runtime_package != *self.admitted.package_ref()
+                    || descriptor.runtime_contract != self.admitted.manifest().contract
+                    || descriptor.capabilities != self.admitted.manifest().capabilities
+                {
+                    return Err(LocalReplayExecutorError::InvalidState);
+                }
+                super::driver::verify_clean_management_receipt(
+                    descriptor,
+                    request,
+                    authority,
+                    *observed_slot,
+                    true,
+                )
+                .map_err(|_| LocalReplayExecutorError::InvalidAuthority)?;
+                self.authenticated = Some(input.id());
+                Ok(())
+            }
+
+            fn execute(
+                &mut self,
+                _: &ReplayInput,
+                _: &RuntimeState,
+                _: ReplayPosition,
+            ) -> Result<ReplayTransition, Self::Error> {
+                Err(LocalReplayExecutorError::InvalidRequest)
+            }
+        }
+        impl ExternalGenesisExecutor for Executor {
+            fn execute_external_create(
+                &mut self,
+                create: &ReplayInput,
+                replica: AgentReplica,
+            ) -> Result<super::state_block_pvm::ExternalCreateExecution, Self::Error> {
+                if self.authenticated.take() != Some(create.id()) || replica != self.replica {
+                    return Err(LocalReplayExecutorError::InvalidAuthority);
+                }
+                let sdk_replica = crate::agent_sdk::AgentReplica {
+                    node: crate::agent_sdk::NodeId(replica.node.0),
+                    principal: crate::agent_sdk::PrincipalId(replica.principal.0),
+                    role: match replica.role {
+                        super::ReplicaRole::Voter => crate::agent_sdk::ReplicaRole::Voter,
+                        super::ReplicaRole::Observer => crate::agent_sdk::ReplicaRole::Observer,
+                    },
+                };
+                super::state_block_pvm::MultiLaneStateBlockHost {
+                    store: &NoGenesisBlocks,
+                    budget: &mut ReadBudget::new(0, 0),
+                }
+                .execute_admitted_create(
+                    &self.admitted,
+                    create,
+                    sdk_replica,
+                    DEFAULT_MANAGEMENT_GAS,
+                )
+                .map_err(|error| match error {
+                    super::state_block_pvm::BlockPvmError::Exit { reason, pc } => {
+                        LocalReplayExecutorError::RuntimeExit { reason, pc }
+                    }
+                    super::state_block_pvm::BlockPvmError::InvalidRequest
+                    | super::state_block_pvm::BlockPvmError::ProgramMismatch => {
+                        LocalReplayExecutorError::InvalidRequest
+                    }
+                    _ => LocalReplayExecutorError::RuntimeOutput,
+                })
+            }
+        }
+
+        if replica.node != expected_node || replica.role != super::ReplicaRole::Voter {
+            return Err(LocalReplayExecutorError::WrongReplica.into());
+        }
+        let supplied = SuppliedCatalogBlobResolver::from_catalog(catalog)?;
+        let package_ref = create.runtime.package.clone();
+        let package = supplied
+            .load_catalog(&package_ref)?
+            .ok_or_else(|| LocalReplayExecutorError::ArtifactUnavailable(package_ref.clone()))?;
+        let admitted = super::package_admission::admit_state_runtime_package(&package)
+            .map_err(|_| LocalReplayExecutorError::InvalidArtifact(package_ref.clone()))?;
+        let mut executor = Executor {
+            admitted,
+            replica,
+            authenticated: None,
+        };
+        let prepared = ReplayPreparedExternalGenesis::prepare(create, replica, &mut executor)
+            .map_err(lift_prepared_genesis_error)?;
+        if supplied.blobs.len() != prepared.artifacts().len()
+            || prepared.artifacts().iter().any(|reference| {
+                supplied
+                    .blobs
+                    .get(&(reference.hash, reference.len))
+                    .is_none_or(|bytes| !reference.matches(bytes))
+            })
+        {
+            return Err(LocalJournalDriverError::InvalidResult);
+        }
+        super::replay::ReplaySealedExternalLocalGenesis::from_prepared(prepared).map_err(|error| {
             LocalJournalDriverError::Replay(
                 error
                     .map_source(|never| match never {})

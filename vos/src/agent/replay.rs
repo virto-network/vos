@@ -6,6 +6,8 @@
 //! engine then proves chain continuity, causal ordering, lane isolation,
 //! lifecycle fences, duplicate handling, and Merge replay purity.
 
+#[cfg(feature = "experimental-state-blocks")]
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -395,6 +397,158 @@ pub struct ReplayTransition {
     pub attested_transition: Option<crate::agent_sdk::Hash>,
 }
 
+/// Read-only physical block access; scope is explicit on every fetch. This
+/// interface grants neither store mutation nor publication authority.
+#[cfg(feature = "experimental-state-blocks")]
+pub trait ScopedBlockReader {
+    fn read_scoped(
+        &self,
+        scope: crate::agent_sdk::state_blocks::BlockScope,
+        reference: crate::agent_sdk::state_blocks::BlockRef,
+        output: &mut [u8],
+    ) -> Result<bool, crate::agent_sdk::state_tree::TreeError>;
+}
+
+/// Exact experimental physical execution handoff. Private fields prevent
+/// callers from attaching independently supplied candidates to a replay step.
+/// This is not a publication seal or a durable availability certificate.
+#[cfg(feature = "experimental-state-blocks")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplayExternalExecution {
+    input: ReplayInputId,
+    before: Hash,
+    position: ReplayPosition,
+    transition: ReplayTransition,
+    output: crate::agent_sdk::state_execution::StateExecutionOutput,
+    lanes: Vec<crate::agent_sdk::state_execution::ExternalLaneWork>,
+    // Install changes Control metadata only; all external data lanes are reads.
+    owning_lane: Option<usize>,
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+impl ReplayExternalExecution {
+    /// Called only by the physical execution adapter after exact request and
+    /// public transition validation. Runtime admission remains its owner's job.
+    pub(super) fn from_physical_response(
+        input: &ReplayInput,
+        before: &RuntimeState,
+        position: ReplayPosition,
+        work: &crate::agent_sdk::state_execution::StateExecutionWork,
+        output: crate::agent_sdk::state_execution::StateExecutionOutput,
+    ) -> Result<Self, ReplayValidationError> {
+        let transition = external_state_replay_transition(input, before, position, work, &output)?;
+        let owning = input.persisted_lane().state_lane();
+        if owning.is_none()
+            && (!matches!(
+                &input.operation,
+                ReplayOperation::CleanManage {
+                    request: crate::agent_sdk::ManagementRequest::Install(_),
+                    ..
+                }
+            ) || transition.state.linear != before.linear
+                || transition.state.merge != before.merge
+                || transition.state.local != before.local)
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
+        let owning_lane = owning
+            .map(|owning| {
+                work.lanes()
+                    .iter()
+                    .position(|lane| lane.base.context().scope().lane() as u8 == owning as u8)
+                    .ok_or(ReplayError::InvalidRecord)
+            })
+            .transpose()?;
+        // Additional declarations grant reads only. The one journal ordering
+        // domain remains the only candidate/publication domain for this step.
+        if work
+            .lanes()
+            .iter()
+            .enumerate()
+            .any(|(index, lane)| Some(index) != owning_lane && lane.next != lane.base.context())
+            || output.changes().iter().any(|change| {
+                Some(change.next().context().scope().lane() as u8) != owning.map(|lane| lane as u8)
+            })
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
+        Ok(Self {
+            input: input.id(),
+            before: replay_state_commitment(before),
+            position,
+            transition,
+            output,
+            lanes: work.lanes().to_vec(),
+            owning_lane,
+        })
+    }
+
+    pub(crate) fn transition(&self) -> &ReplayTransition {
+        &self.transition
+    }
+    pub(crate) fn output(&self) -> &crate::agent_sdk::state_execution::StateExecutionOutput {
+        &self.output
+    }
+    /// Exact public management result for ReplayExecutor's existing evidence
+    /// hook. No native decoding of the standard runtime's private state.
+    pub(crate) fn management_result_for(
+        &self,
+        input: &ReplayInput,
+        transition: &ReplayTransition,
+    ) -> Option<Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError>> {
+        if self.input != input.id() || self.transition != *transition {
+            return None;
+        }
+        match &self.output.transition().outcome {
+            crate::agent_sdk::RuntimeOutcome::Management(result) => Some(result.clone()),
+            _ => None,
+        }
+    }
+    pub(crate) fn lanes(&self) -> &[crate::agent_sdk::state_execution::ExternalLaneWork] {
+        &self.lanes
+    }
+
+    pub(crate) fn owning_lane(
+        &self,
+    ) -> Option<&crate::agent_sdk::state_execution::ExternalLaneWork> {
+        self.owning_lane.map(|index| &self.lanes[index])
+    }
+
+    /// Every read base must be the replay owner's current committed projection,
+    /// not merely a well-formed root with available blocks.
+    fn matches_roots(
+        &self,
+        roots: &BTreeMap<PersistedLane, super::journal::ExternalStateRoot>,
+    ) -> bool {
+        // The declaration set is canonical, not caller-selected. Otherwise a
+        // guest could observe fewer lanes live than it receives during replay.
+        self.lanes.len() == roots.len()
+            && self.lanes.iter().all(|selected| {
+                let lane = match selected.base.context().scope().lane() {
+                    crate::agent_sdk::StateLane::Linear => PersistedLane::Linear,
+                    crate::agent_sdk::StateLane::Merge => PersistedLane::Merge,
+                    crate::agent_sdk::StateLane::Local => PersistedLane::Local,
+                };
+                roots
+                    .get(&lane)
+                    .is_some_and(|root| root.descriptor == selected.base)
+            })
+    }
+
+    fn matches(
+        &self,
+        input: &ReplayInput,
+        before: &RuntimeState,
+        position: ReplayPosition,
+        transition: &ReplayTransition,
+    ) -> bool {
+        self.input == input.id()
+            && self.before == replay_state_commitment(before)
+            && self.position == position
+            && self.transition == *transition
+    }
+}
+
 /// Carry decoded management semantics across the executor/replay boundary.
 /// The executor authenticates the input and checks the exact guest reply;
 /// replay independently requires its success/failure to match the accepted
@@ -435,33 +589,62 @@ fn canonical_attested_runtime_work(
     input: &ReplayInput,
     before: &RuntimeState,
 ) -> Option<crate::agent_sdk::RuntimeWork> {
-    let state = sdk_runtime_state(before);
     match &input.operation {
         ReplayOperation::CleanInvoke {
             context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+            ..
+        }
+        | ReplayOperation::CleanResume {
+            context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+            ..
+        } => canonical_clean_runtime_work(input, before),
+        _ => None,
+    }
+}
+
+/// One canonical journal-input mapping shared by execution and replay binding.
+/// This is deliberately independent of a runtime's private state encoding.
+/// Authentication, retained invocation ownership and position/freshness checks
+/// remain the caller's responsibility; constructing work grants no authority.
+pub(crate) fn canonical_clean_runtime_work(
+    input: &ReplayInput,
+    before: &RuntimeState,
+) -> Option<crate::agent_sdk::RuntimeWork> {
+    let state = sdk_runtime_state(before);
+    match &input.operation {
+        ReplayOperation::CleanManage {
+            request,
+            authority,
+            observed_slot,
+        } => Some(crate::agent_sdk::RuntimeWork::Manage {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+            space: crate::agent_sdk::SpaceId(input.runtime.space.0),
+            agent: crate::agent_sdk::AgentId(input.runtime.agent.0),
+            runtime_deployment: authority.selector.runtime_deployment,
+            state,
+            request: alloc::boxed::Box::new(request.clone()),
+            authority: Some(alloc::boxed::Box::new(authority.clone())),
+            observed_slot: *observed_slot,
+        }),
+        ReplayOperation::CleanInvoke {
+            context,
             work,
             authorization,
             observed_slot,
         } => Some(crate::agent_sdk::RuntimeWork::Invoke {
-            context: match &input.operation {
-                ReplayOperation::CleanInvoke { context, .. } => *context,
-                _ => unreachable!(),
-            },
+            context: *context,
             state,
             invocation: alloc::boxed::Box::new(work.clone()),
             authorization: alloc::boxed::Box::new(authorization.clone()),
             observed_slot: *observed_slot,
         }),
         ReplayOperation::CleanResume {
-            context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+            context,
             work,
             yielded,
             ..
         } => Some(crate::agent_sdk::RuntimeWork::Resume {
-            context: match &input.operation {
-                ReplayOperation::CleanResume { context, .. } => *context,
-                _ => unreachable!(),
-            },
+            context: *context,
             state,
             resume: alloc::boxed::Box::new(crate::agent_sdk::ResumeWork {
                 invocation: yielded.invocation,
@@ -477,15 +660,164 @@ fn canonical_attested_runtime_work(
                 input: None,
             }),
         }),
+        ReplayOperation::CleanAcknowledge {
+            context,
+            work,
+            authorization,
+            ..
+        } => Some(crate::agent_sdk::RuntimeWork::Acknowledge {
+            context: *context,
+            state,
+            invocation: alloc::boxed::Box::new(work.clone()),
+            authorization: alloc::boxed::Box::new(authorization.clone()),
+        }),
         ReplayOperation::Management { .. }
-        | ReplayOperation::CleanManage { .. }
         | ReplayOperation::Invoke { .. }
-        | ReplayOperation::CleanInvoke { .. }
-        | ReplayOperation::CleanResume { .. }
-        | ReplayOperation::CleanAcknowledge { .. }
         | ReplayOperation::Acknowledge { .. }
         | ReplayOperation::SealMerge => None,
     }
+}
+
+/// Public clean-runtime outcome contract, independent of its private state.
+/// Authentication and state/lane mutation checks are separate and mandatory.
+pub(crate) fn clean_invocation_outcome_matches(
+    input: &ReplayInput,
+    outcome: &crate::agent_sdk::RuntimeOutcome,
+) -> bool {
+    use crate::agent_sdk::{InvocationRetirement, RuntimeOutcome};
+    let (work, acknowledgement) = match &input.operation {
+        ReplayOperation::CleanInvoke { work, .. } | ReplayOperation::CleanResume { work, .. } => {
+            (InvocationRetirement::from_work(work), false)
+        }
+        ReplayOperation::CleanAcknowledge { work, .. } => (work.clone(), true),
+        _ => return false,
+    };
+    match (outcome, acknowledgement) {
+        (RuntimeOutcome::Completed(Ok(reply)), false) => {
+            reply.invocation == work.invocation
+                && reply.actor == work.actor
+                && reply.incarnation == work.incarnation
+                && reply.deployment == work.deployment
+                && reply.mode == work.mode
+                && reply.lane == work.mode.write_lane()
+                && reply.gas_remaining <= work.gas
+        }
+        (RuntimeOutcome::Completed(Err(_)), false) => true,
+        (RuntimeOutcome::Yielded(yielded), false) => {
+            yielded.invocation == work.invocation
+                && yielded.actor == work.actor
+                && yielded.incarnation == work.incarnation
+                && yielded.deployment == work.deployment
+                && yielded.program == work.program
+                && yielded.mode == work.mode
+                && yielded.installation_data == work.installation_data
+                && yielded.required == work.required
+                && match &input.operation {
+                    ReplayOperation::CleanResume {
+                        yielded: previous, ..
+                    } => yielded.ready_sequence > previous.ready_sequence,
+                    ReplayOperation::CleanInvoke { .. } => true,
+                    _ => false,
+                }
+        }
+        (RuntimeOutcome::Acknowledged(Ok(ack)), true) => {
+            ack.invocation == work.invocation
+                && ack.actor == work.actor
+                && ack.incarnation == work.incarnation
+                && ack.deployment == work.deployment
+                && ack.mode == work.mode
+                && ack.work == work.commitment()
+                && matches!(&input.operation, ReplayOperation::CleanAcknowledge { authorization, .. }
+                    if ack.authorization == authorization.commitment())
+        }
+        // The transition validator must additionally require unchanged state.
+        (RuntimeOutcome::Acknowledged(Err(_)), true) => true,
+        _ => false,
+    }
+}
+
+/// Convert an exact experimental invocation response through the ordinary
+/// replay semantic checks. This is not an authenticated ReplayStep or seal:
+/// the owner must still authenticate/admit the runtime, establish journal
+/// ancestry and run ownership/retry processing before publication.
+#[cfg(feature = "experimental-state-blocks")]
+pub(crate) fn external_state_replay_transition(
+    input: &ReplayInput,
+    before: &RuntimeState,
+    position: ReplayPosition,
+    work: &crate::agent_sdk::state_execution::StateExecutionWork,
+    output: &crate::agent_sdk::state_execution::StateExecutionOutput,
+) -> Result<ReplayTransition, ReplayValidationError> {
+    use crate::agent_sdk::{InvocationStatus, RuntimeOutcome};
+    if canonical_clean_runtime_work(input, before).as_ref() != Some(work.work())
+        || output.validate_for(work).is_err()
+        || !match (&input.operation, &output.transition().outcome) {
+            (
+                ReplayOperation::CleanManage {
+                    request: crate::agent_sdk::ManagementRequest::Install(install),
+                    ..
+                },
+                RuntimeOutcome::Management(result),
+            ) => match result {
+                Ok(crate::agent_sdk::ManagementReply::Installed(entry)) => entry == &install.entry,
+                Err(_) => true,
+                _ => false,
+            },
+            (ReplayOperation::CleanManage { .. }, _) => false,
+            _ => clean_invocation_outcome_matches(input, &output.transition().outcome),
+        }
+    {
+        return Err(ReplayError::InvalidRecord);
+    }
+    input.validate().map_err(|_| ReplayError::InvalidRecord)?;
+    validate_position(input, position)?;
+    let returned = output.transition();
+    let state = RuntimeState {
+        control: returned.state.control.clone(),
+        linear: returned.state.linear.clone(),
+        merge: returned.state.merge.clone(),
+        local: returned.state.local.clone(),
+    };
+    if matches!(returned.outcome, RuntimeOutcome::Acknowledged(Err(_))) && state != *before {
+        return Err(ReplayError::TerminalMutation);
+    }
+    let disposition = match &returned.outcome {
+        RuntimeOutcome::Completed(Ok(reply)) => match reply.status {
+            InvocationStatus::Done => ReplayDisposition::Applied,
+            InvocationStatus::Forbidden => ReplayDisposition::Forbidden,
+            InvocationStatus::Panicked => ReplayDisposition::Panicked,
+            InvocationStatus::OutOfGas => ReplayDisposition::OutOfGas,
+        },
+        RuntimeOutcome::Completed(Err(_)) | RuntimeOutcome::Acknowledged(Err(_)) => {
+            ReplayDisposition::Rejected
+        }
+        RuntimeOutcome::Yielded(_) | RuntimeOutcome::Acknowledged(Ok(_)) => {
+            ReplayDisposition::Applied
+        }
+        RuntimeOutcome::Management(Ok(_)) => ReplayDisposition::Applied,
+        RuntimeOutcome::Management(Err(_)) => ReplayDisposition::Rejected,
+    };
+    let transition = ReplayTransition {
+        state,
+        disposition,
+        result: None,
+        next_runtime: input.runtime.clone(),
+        products: ReplayProducts::default(),
+        attested_transition: None,
+    };
+    validate_runtime_state_bound(&transition.state)?;
+    validate_transition(
+        input,
+        before,
+        &transition,
+        position,
+        &input.runtime,
+        false,
+        false,
+        None,
+        None,
+    )?;
+    Ok(transition)
 }
 
 fn canonical_attested_transition_commitment(
@@ -495,54 +827,18 @@ fn canonical_attested_transition_commitment(
 ) -> Option<crate::agent_sdk::Hash> {
     use crate::agent_sdk::{RuntimeOutcome, RuntimeTransition};
 
-    let work = match &input.operation {
+    match &input.operation {
         ReplayOperation::CleanInvoke {
             context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
-            work,
             ..
         }
         | ReplayOperation::CleanResume {
             context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
-            work,
             ..
-        } => work,
+        } => {}
         _ => return None,
     };
-    let outcome_matches = match &transition.outcome {
-        RuntimeOutcome::Completed(Ok(reply)) => {
-            reply.invocation == work.invocation
-                && reply.actor == work.actor
-                && reply.incarnation == work.incarnation
-                && reply.deployment == work.deployment
-                && reply.mode == work.mode
-                && reply.lane == work.mode.write_lane()
-                && reply.gas_remaining <= work.gas
-        }
-        RuntimeOutcome::Completed(Err(_)) => true,
-        RuntimeOutcome::Yielded(yielded) => {
-            yielded.invocation == work.invocation
-                && yielded.actor == work.actor
-                && yielded.incarnation == work.incarnation
-                && yielded.deployment == work.deployment
-                && yielded.program == work.program
-                && yielded.mode == work.mode
-                && yielded.installation_data == work.installation_data
-                && yielded.required
-                    == work
-                        .availability
-                        .iter()
-                        .map(|blob| blob.reference.clone())
-                        .collect::<Vec<_>>()
-                && match &input.operation {
-                    ReplayOperation::CleanResume {
-                        yielded: previous, ..
-                    } => yielded.ready_sequence > previous.ready_sequence,
-                    ReplayOperation::CleanInvoke { .. } => true,
-                    _ => false,
-                }
-        }
-        RuntimeOutcome::Management(_) | RuntimeOutcome::Acknowledged(_) => false,
-    };
+    let outcome_matches = clean_invocation_outcome_matches(input, &transition.outcome);
     let disposition = match &transition.outcome {
         RuntimeOutcome::Completed(Ok(reply)) => match reply.status {
             crate::agent_sdk::InvocationStatus::Done => ReplayDisposition::Applied,
@@ -701,6 +997,41 @@ pub trait ReplayExecutor {
         position: ReplayPosition,
     ) -> Result<ReplayTransition, Self::Error>;
 
+    /// Consume the exact external-state handoff produced by physical execution.
+    /// Clear stale handoffs at authentication/execute entry and on failure.
+    /// The default r19 executor has no external-state execution to report.
+    /// Replay checks this against its accepted transition before ownership
+    /// mutation. Storage publication remains gated until availability is sealed.
+    #[cfg(feature = "experimental-state-blocks")]
+    fn take_external_execution(&mut self) -> Result<Option<ReplayExternalExecution>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Execute against replay-selected external lane declarations and read-only
+    /// persisted blocks. Called after authentication, while recovery retains its
+    /// exclusive store borrow. This grants neither publication nor repair access.
+    /// The same aggregate recovery budget covers guest reads and root validation.
+    #[cfg(feature = "experimental-state-blocks")]
+    #[allow(clippy::too_many_arguments)]
+    fn execute_with_external_state(
+        &mut self,
+        input: &ReplayInput,
+        before: &RuntimeState,
+        position: ReplayPosition,
+        _genesis: &AgentJournalGenesis,
+        _lanes: &[(LaneStateManifest, LaneCursor)],
+        _reader: &dyn ScopedBlockReader,
+        _budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<ReplayTransition, Self::Error> {
+        self.execute_with_journal_context(
+            input,
+            before,
+            position,
+            ReplayTransitionProofAccess::PublishedOnly,
+            None,
+        )
+    }
+
     /// Consume the exact already-verified public binding produced while an
     /// Attested transition was executed. Replay calls this only after the
     /// transition itself has passed native validation and requires a binding
@@ -752,9 +1083,12 @@ pub trait ReplayExecutor {
 ///
 /// Fields are deliberately private and this module exposes no constructor.
 /// The future Shared resolver adapter will verify its Raft ordered-snapshot QC
-/// before constructing this value. A caller cannot turn raw bytes, or an
+/// before constructing this value, including the explicit Linear manifest/root
+/// declaration, not just its state-blob commitment. A caller cannot turn raw bytes, or an
 /// ordinary checkpoint, into old-base replay authority.
 pub struct ResolvedOrderedSnapshot {
+    #[cfg(feature = "experimental-state-blocks")]
+    linear_root: Option<super::journal::ExternalStateRoot>,
     genesis: AgentJournalGenesisId,
     canonical_head: OrderedBase,
     base: OrderedBase,
@@ -1573,6 +1907,8 @@ where
     }
 
     let manifest = LaneStateManifest {
+        #[cfg(feature = "experimental-state-blocks")]
+        external_root: None,
         genesis: entry.genesis,
         runtime: entry.input.runtime.clone(),
         lane: PersistedLane::Merge,
@@ -1748,6 +2084,8 @@ impl ReplaySystemAuthorityStoragePlan {
 /// Validated successor of one replay step.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplayStep {
+    #[cfg(feature = "experimental-state-blocks")]
+    external_execution: Option<ReplayExternalExecution>,
     state: RuntimeState,
     runtime: RuntimeBinding,
     outcome: ReplayStepOutcome,
@@ -1775,6 +2113,127 @@ struct MergeExecutionFact {
 }
 
 impl ReplayStep {
+    /// Derive a single Ordered/Local external lane projection from an accepted
+    /// step and its independently authenticated predecessor manifest. This
+    /// returns record data, NOT a seal or availability proof. The publication
+    /// owner must bind the predecessor to its actual checkpoint/head.
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    fn external_lane_successor(
+        &self,
+        genesis: &AgentJournalGenesis,
+        previous: &LaneStateManifest,
+    ) -> Result<LaneStateManifest, ReplayValidationError> {
+        use super::journal::ExternalStateRoot;
+        use super::state_block_store::journal_root_context;
+        previous
+            .validate()
+            .map_err(|_| ReplayError::InvalidRecord)?;
+        if previous.genesis != genesis.id()
+            || self.runtime.space != previous.runtime.space
+            || self.runtime.agent != previous.runtime.agent
+        {
+            return Err(ReplayError::ScopeMismatch);
+        }
+        let root = previous
+            .external_root
+            .as_ref()
+            .ok_or(ReplayError::InvalidRecord)?;
+        let (cursor, node) = match (&previous.cursor, self.position, previous.lane) {
+            (
+                LaneCursor::Ordered { base },
+                ReplayPosition::Ordered { id, index, .. },
+                PersistedLane::Linear,
+            ) if index > base.index => (
+                LaneCursor::Ordered {
+                    base: OrderedBase {
+                        index,
+                        head: Some(id),
+                    },
+                },
+                None,
+            ),
+            (
+                LaneCursor::Local { node, revision, .. },
+                ReplayPosition::Local {
+                    id,
+                    node: owner,
+                    revision: next,
+                    ..
+                },
+                PersistedLane::Local,
+            ) if *node == owner && next > *revision => (
+                LaneCursor::Local {
+                    node: owner,
+                    revision: next,
+                    head: Some(id),
+                },
+                Some(owner),
+            ),
+            _ => return Err(ReplayError::InvalidPosition),
+        };
+        let expected_base =
+            journal_root_context(genesis, &root.runtime, previous.lane, node, &root.cursor)
+                .map_err(|_| ReplayError::InvalidRecord)?;
+        if expected_base != root.descriptor.context() {
+            return Err(ReplayError::InvalidRecord);
+        }
+        let bytes = state_component(&self.state, previous.lane);
+        let mut successor_root = root.clone();
+        if let Some(execution) = &self.external_execution {
+            let lane = execution.lanes().iter().find(|lane| {
+                Some(lane.base.context().scope().lane() as u8)
+                    == previous.lane.state_lane().map(|lane| lane as u8)
+            });
+            if let Some(lane) = lane {
+                if lane.base != root.descriptor || execution.transition.next_runtime != self.runtime
+                {
+                    return Err(ReplayError::InvalidRecord);
+                }
+                let expected_next =
+                    journal_root_context(genesis, &self.runtime, previous.lane, node, &cursor)
+                        .map_err(|_| ReplayError::InvalidRecord)?;
+                if lane.next != expected_next {
+                    return Err(ReplayError::InvalidPosition);
+                }
+                if let Some(change) = execution.output().changes().iter().find(|change| {
+                    change.next().context().scope().lane() == lane.base.context().scope().lane()
+                }) {
+                    successor_root = ExternalStateRoot {
+                        descriptor: change.next(),
+                        runtime: self.runtime.clone(),
+                        cursor: cursor.clone(),
+                    };
+                }
+            }
+        }
+        // No capture/no candidate can authorize changing an external descriptor.
+        if bytes != successor_root.descriptor.encode() {
+            return Err(ReplayError::InvalidRecord);
+        }
+        let successor = LaneStateManifest {
+            genesis: genesis.id(),
+            runtime: self.runtime.clone(),
+            lane: previous.lane,
+            cursor,
+            state: BlobRef::of_bytes(bytes),
+            external_root: Some(successor_root),
+        };
+        successor
+            .validate()
+            .map_err(|_| ReplayError::InvalidRecord)?;
+        Ok(successor)
+    }
+
+    /// Temporary fail-closed gate until checkpoint provenance and incremental
+    /// availability travel through the sealed publication closure together.
+    fn require_integrated_state_products<S, E>(&self) -> Result<(), ReplayError<S, E>> {
+        #[cfg(feature = "experimental-state-blocks")]
+        if self.external_execution.is_some() {
+            return Err(ReplayError::InvalidRecord);
+        }
+        Ok(())
+    }
+
     fn management_evidence(
         &self,
         input: &ReplayInput,
@@ -2004,6 +2463,52 @@ impl ReplayPreparedGenesis {
         replica: AgentReplica,
         executor: &mut E,
     ) -> Result<Self, ReplayError<core::convert::Infallible, E::Error>> {
+        // External bootstrap must carry authenticated roots and captured
+        // execution into the genesis closure; the opaque path cannot do so.
+        #[cfg(feature = "experimental-state-blocks")]
+        if create.runtime.is_external_state() {
+            return Err(ReplayError::InvalidRecord);
+        }
+        Self::prepare_with_execution(create, replica, executor, |executor, create, before| {
+            let transition = executor
+                .execute(create, before, ReplayPosition::Genesis)
+                .map_err(ReplayError::Executor)?;
+            validated_clean_management_result(executor, create, &transition)?;
+            validate_runtime_state_bound(&transition.state)?;
+            let system_authority_write = validate_transition(
+                create,
+                before,
+                &transition,
+                ReplayPosition::Genesis,
+                &create.runtime,
+                false,
+                false,
+                None,
+                None,
+            )?;
+            if system_authority_write.is_some() {
+                return Err(ReplayError::InvalidManagementTransition);
+            }
+            Ok(transition)
+        })
+    }
+
+    /// Shared authentication and genesis semantic checks. Each execution
+    /// adapter must validate its ABI-specific lane changes before returning.
+    /// Kept private so external results only escape in their root wrapper.
+    fn prepare_with_execution<E: ReplayExecutor>(
+        create: ReplayInput,
+        replica: AgentReplica,
+        executor: &mut E,
+        execute: impl FnOnce(
+            &mut E,
+            &ReplayInput,
+            &RuntimeState,
+        ) -> Result<
+            ReplayTransition,
+            ReplayError<core::convert::Infallible, E::Error>,
+        >,
+    ) -> Result<Self, ReplayError<core::convert::Infallible, E::Error>> {
         if create.validate().is_err() {
             return Err(ReplayError::InvalidRecord);
         }
@@ -2044,28 +2549,13 @@ impl ReplayPreparedGenesis {
         executor
             .authenticate(&create, &before, ReplayPosition::Genesis)
             .map_err(ReplayError::Executor)?;
-        let transition = executor
-            .execute(&create, &before, ReplayPosition::Genesis)
-            .map_err(ReplayError::Executor)?;
-        validated_clean_management_result(executor, &create, &transition)?;
+        let transition = execute(executor, &create, &before)?;
         validate_runtime_state_bound(&transition.state)?;
-        let system_authority_write = validate_transition(
-            &create,
-            &before,
-            &transition,
-            ReplayPosition::Genesis,
-            &create.runtime,
-            false,
-            false,
-            None,
-            None,
-        )?;
-        if system_authority_write.is_some() {
-            return Err(ReplayError::InvalidManagementTransition);
-        }
         if transition.disposition != ReplayDisposition::Applied
             || transition.result.is_some()
             || transition.next_runtime != create.runtime
+            || !transition.products.is_empty()
+            || transition.attested_transition.is_some()
         {
             return Err(ReplayError::InvalidManagementTransition);
         }
@@ -2174,6 +2664,115 @@ impl ReplayPreparedGenesis {
             )?,
             self.artifacts.clone(),
         )
+    }
+}
+
+/// Fresh external Create execution after ordinary input authentication. The
+/// executor must also enforce execution-time freshness/admission, just as
+/// ReplayExecutor::execute does. It must not return a cached unauthenticated
+/// candidate or execute through the opaque runtime ABI.
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+pub(crate) trait ExternalGenesisExecutor: ReplayExecutor {
+    fn execute_external_create(
+        &mut self,
+        create: &ReplayInput,
+        replica: AgentReplica,
+    ) -> Result<super::state_block_pvm::ExternalCreateExecution, Self::Error>;
+}
+
+/// Authenticated initial execution with its root declarations still attached.
+/// Deliberately cannot be passed to opaque genesis sealing: initialization must
+/// first integrate availability and the complete root-bearing durable closure.
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ReplayPreparedExternalGenesis {
+    prepared: ReplayPreparedGenesis,
+    execution: super::state_block_pvm::ExternalCreateExecution,
+}
+
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+impl ReplayPreparedExternalGenesis {
+    pub(crate) fn prepare<E: ExternalGenesisExecutor>(
+        create: ReplayInput,
+        replica: AgentReplica,
+        executor: &mut E,
+    ) -> Result<Self, ReplayError<core::convert::Infallible, E::Error>> {
+        if !create.runtime.is_external_state() {
+            return Err(ReplayError::InvalidRecord);
+        }
+        let sdk_replica = crate::agent_sdk::AgentReplica {
+            node: crate::agent_sdk::NodeId(replica.node.0),
+            principal: crate::agent_sdk::PrincipalId(replica.principal.0),
+            role: match replica.role {
+                super::ReplicaRole::Voter => crate::agent_sdk::ReplicaRole::Voter,
+                super::ReplicaRole::Observer => crate::agent_sdk::ReplicaRole::Observer,
+            },
+        };
+        let mut captured = None;
+        let prepared = ReplayPreparedGenesis::prepare_with_execution(
+            create,
+            replica,
+            executor,
+            |executor, create, _before| {
+                let execution = executor
+                    .execute_external_create(create, replica)
+                    .map_err(ReplayError::Executor)?;
+                if !execution.matches(create, sdk_replica) {
+                    return Err(ReplayError::ScopeMismatch);
+                }
+                // The physical capture constructor checked the exact Created
+                // identity, package binding, lane work and returned changes.
+                // These declared initial roots replace r19's opaque empty-lane
+                // encoding rule; undeclared lane changes were rejected there.
+                // Never ask an unrelated opaque/native execution for its reply.
+                let state = &execution.output().transition().state;
+                let transition = ReplayTransition {
+                    state: RuntimeState {
+                        control: state.control.clone(),
+                        linear: state.linear.clone(),
+                        merge: state.merge.clone(),
+                        local: state.local.clone(),
+                    },
+                    disposition: ReplayDisposition::Applied,
+                    result: None,
+                    next_runtime: create.runtime.clone(),
+                    products: ReplayProducts::default(),
+                    attested_transition: None,
+                };
+                captured = Some(execution);
+                Ok(transition)
+            },
+        )?;
+        Ok(Self {
+            prepared,
+            execution: captured.ok_or(ReplayError::InvalidRecord)?,
+        })
+    }
+
+    pub(crate) fn execution(&self) -> &super::state_block_pvm::ExternalCreateExecution {
+        &self.execution
+    }
+
+    pub(crate) fn artifacts(&self) -> &[BlobRef] {
+        self.prepared.artifacts()
+    }
+
+    /// Local proposal material only; neither finality nor permission to initialize.
+    /// Shared admission needs a common commitment independent of each replica's
+    /// node-bound Local roots. Do not submit this full per-replica state as one
+    /// Shared quorum proposal until that projection is defined and checked.
+    pub(crate) fn ordinary_proposal(
+        &self,
+    ) -> Result<super::genesis::AgentGenesisProposal, super::genesis::AgentGenesisError> {
+        if !matches!(
+            &self.prepared.create.operation,
+            ReplayOperation::CleanManage {
+                request: crate::agent_sdk::ManagementRequest::Create(descriptor), ..
+            } if descriptor.identity.profile == crate::agent_sdk::AgentProfile::Local
+        ) {
+            return Err(super::genesis::AgentGenesisError::InvalidProposal);
+        }
+        self.prepared.ordinary_proposal()
     }
 }
 
@@ -2332,6 +2931,14 @@ impl ReplaySealedLocalGenesis {
     pub(crate) fn from_prepared(
         prepared: ReplayPreparedGenesis,
     ) -> Result<Self, ReplayValidationError> {
+        #[cfg(feature = "experimental-state-blocks")]
+        if prepared.create.runtime.is_external_state() {
+            return Err(ReplayError::InvalidRecord);
+        }
+        Self::from_prepared_inner(prepared)
+    }
+
+    fn from_prepared_inner(prepared: ReplayPreparedGenesis) -> Result<Self, ReplayValidationError> {
         let admission = ReplayedLocalGenesisAdmission::from_prepared(&prepared)?;
         let genesis = AgentJournalGenesis {
             admission: admission.id(),
@@ -2433,6 +3040,8 @@ impl ReplaySealedLocalGenesis {
             },
         };
         LaneStateManifest {
+            #[cfg(feature = "experimental-state-blocks")]
+            external_root: None,
             genesis: self.genesis.id(),
             runtime: self.genesis.runtime().clone(),
             lane,
@@ -2454,6 +3063,403 @@ impl ReplaySealedLocalGenesis {
     pub(crate) fn validate(&self) -> Result<(), ReplayValidationError> {
         self.admission
             .validate_against(&self.genesis, &self.post_create, &self.artifacts)
+    }
+}
+
+/// Expected public Create evidence. This is not proof of execution: callers
+/// must independently authenticate Create and verify its exact Created reply.
+pub(crate) fn clean_create_management_evidence(
+    input: &ReplayInput,
+) -> Option<super::journal::CleanManagementEvidence> {
+    let ReplayOperation::CleanManage {
+        request: request @ crate::agent_sdk::ManagementRequest::Create(descriptor),
+        authority,
+        observed_slot,
+    } = &input.operation
+    else {
+        return None;
+    };
+    Some(super::journal::CleanManagementEvidence {
+        input: input.id(),
+        ordered: OrderedBase::post_genesis(),
+        authority: authority.commitment(),
+        request: request.replay_commitment(),
+        epoch: authority.selector.epoch,
+        sequence: authority.selector.decision_sequence,
+        observed_slot: *observed_slot,
+        result: Ok(crate::agent_sdk::ManagementReply::Created(
+            descriptor.identity.clone(),
+        )),
+    })
+}
+
+/// Local admission retaining its physical initial roots and candidate blocks.
+/// Ordinary initialization has no external-block availability contract and
+/// rejects its genesis checkpoint. Only a dedicated
+/// initialization owner may consume this seal after staging its full closure.
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+pub(crate) struct ReplaySealedExternalLocalGenesis {
+    local: ReplaySealedLocalGenesis,
+    execution: super::state_block_pvm::ExternalCreateExecution,
+}
+
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+impl ReplaySealedExternalLocalGenesis {
+    pub(crate) fn from_prepared(
+        prepared: ReplayPreparedExternalGenesis,
+    ) -> Result<Self, ReplayValidationError> {
+        let ReplayPreparedExternalGenesis {
+            prepared,
+            execution,
+        } = prepared;
+        // The common Local admission includes the complete initial state,
+        // exact Create receipt, replica and artifact closure. The root wrapper
+        // must retain execution evidence rather than expose that opaque seal.
+        let sealed = Self {
+            local: ReplaySealedLocalGenesis::from_prepared_inner(prepared)?,
+            execution,
+        };
+        sealed.validate()?;
+        Ok(sealed)
+    }
+
+    pub(crate) fn genesis(&self) -> &AgentJournalGenesis {
+        self.local.genesis()
+    }
+
+    pub(crate) fn execution(&self) -> &super::state_block_pvm::ExternalCreateExecution {
+        &self.execution
+    }
+
+    /// Initial durable anchor for every lane and the artifact closure. A bare
+    /// genesis head does not reference the derived lane manifests; installing
+    /// it alone would leave these roots undiscoverable to recovery/collection.
+    /// Construction is not storage publication or an availability certificate.
+    pub(crate) fn initial_checkpoint(&self) -> Result<CheckpointManifest, ReplayValidationError> {
+        let heads = self.local.initial_heads();
+        let lanes = [
+            PersistedLane::Control,
+            PersistedLane::Linear,
+            PersistedLane::Merge,
+            PersistedLane::Local,
+        ]
+        .into_iter()
+        .map(|lane| CheckpointLane {
+            lane,
+            node: (lane == PersistedLane::Local).then_some(heads.node),
+            state: self.lane_manifest(lane).id(),
+            invocations: (lane == PersistedLane::Local).then_some(heads.local_invocations),
+        })
+        .collect();
+        derive_checkpoint(
+            heads.genesis,
+            heads.admission,
+            heads.runtime,
+            0,
+            OrderedBase::post_genesis(),
+            heads.merge_frontier,
+            heads.merge_fence,
+            heads.merge_seal,
+            heads.ordered_invocations,
+            heads.merge_invocations,
+            heads.transition_proofs,
+            lanes,
+            self.local.artifacts().id(),
+            clean_create_management_evidence(&self.genesis().create),
+        )
+    }
+
+    /// Canonical revision-zero predecessor retained as history, not exposed as
+    /// the usable external-state head. Initialization must persist it before
+    /// installing the checkpoint-bearing successor below.
+    pub(crate) fn initial_predecessor_heads(&self) -> JournalHeads {
+        self.local.initial_heads()
+    }
+
+    pub(crate) fn initial_heads(&self) -> Result<JournalHeads, ReplayValidationError> {
+        let predecessor = self.initial_predecessor_heads();
+        let mut heads = predecessor.clone();
+        heads.publication_revision = 1;
+        heads.previous = Some(predecessor.id());
+        heads.checkpoint = Some(self.initial_checkpoint()?.id());
+        predecessor
+            .validate_successor(&heads)
+            .map_err(|_| ReplayError::InvalidRecord)?;
+        Ok(heads)
+    }
+
+    pub(crate) fn post_create(&self) -> &RuntimeState {
+        self.local.post_create()
+    }
+    pub(crate) fn artifacts(&self) -> &ArtifactClosure {
+        self.local.artifacts()
+    }
+    pub(crate) fn empty_frontier(&self) -> &MergeFrontier {
+        self.local.empty_frontier()
+    }
+    pub(crate) fn ordered_invocations(&self) -> &InvocationIndexManifest {
+        self.local.ordered_invocations()
+    }
+    pub(crate) fn merge_invocations(&self) -> &InvocationIndexManifest {
+        self.local.merge_invocations()
+    }
+    pub(crate) fn local_invocations(&self) -> &InvocationIndexManifest {
+        self.local.local_invocations()
+    }
+
+    /// Verify/stage all initial roots under one exclusive store borrow and one
+    /// aggregate budget. Only the callback can consume availability, before GC
+    /// can intervene. It must still persist the exact closure and atomically
+    /// install the selected heads; dropping/failing leaves no publication right.
+    pub(crate) fn with_staged_roots<S: AgentJournalStore, T>(
+        &self,
+        store: &mut S,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+        initialize: impl FnOnce(
+            &mut S,
+            &ExternalCheckpointValidation<'_>,
+        ) -> Result<T, JournalStoreError>,
+    ) -> Result<T, JournalStoreError> {
+        use super::state_block_store::StateBlockStaging;
+        self.validate()
+            .map_err(|_| JournalStoreError::NonCanonical)?;
+        let heads = self
+            .initial_heads()
+            .map_err(|_| JournalStoreError::NonCanonical)?;
+        if store
+            .genesis()?
+            .as_ref()
+            .is_some_and(|genesis| genesis != self.genesis())
+            || store
+                .heads()?
+                .as_ref()
+                .is_some_and(|current| current != &heads)
+        {
+            return Err(JournalStoreError::Conflict);
+        }
+        let mut lanes = BTreeSet::new();
+        for work in self.execution.work().lanes() {
+            // Initial work is bound to empty roots, not caller-supplied bases.
+            let mut session = StateBlockStaging::audit_base(
+                store,
+                work.base,
+                work.base.context(),
+                work.base.commitment(),
+                budget,
+            )?;
+            let lane = match work.base.context().scope().lane() {
+                crate::agent_sdk::StateLane::Linear => PersistedLane::Linear,
+                crate::agent_sdk::StateLane::Merge => PersistedLane::Merge,
+                crate::agent_sdk::StateLane::Local => PersistedLane::Local,
+            };
+            if let Some(change) = self.execution.output().changes().iter().find(|change| {
+                change.next().context().scope().lane() == work.base.context().scope().lane()
+            }) {
+                session.stage_next(change, work.next, budget)?;
+            }
+            let manifest = self.lane_manifest(lane);
+            if manifest.external_root.as_ref().map(|root| root.descriptor)
+                != Some(session.available())
+            {
+                return Err(JournalStoreError::ScopeMismatch);
+            }
+            lanes.insert(manifest.id());
+        }
+        self.with_available_initial_roots(store, &lanes, initialize)
+    }
+
+    /// Read-only validation of the exact initial head, including staged heads.
+    /// Missing/corrupt blocks fail; guest candidates are never used to repair
+    /// persisted state during open. Advanced heads need general replay recovery.
+    pub(crate) fn validate_persisted_initial<S: AgentJournalStore>(
+        &self,
+        store: &mut S,
+        heads: &JournalHeads,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<(), JournalStoreError> {
+        self.validate()
+            .map_err(|_| JournalStoreError::NonCanonical)?;
+        if self
+            .initial_heads()
+            .map_err(|_| JournalStoreError::NonCanonical)?
+            != *heads
+            || store.genesis()?.as_ref() != Some(self.genesis())
+        {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        let mut lanes = BTreeSet::new();
+        for lane in [
+            PersistedLane::Linear,
+            PersistedLane::Merge,
+            PersistedLane::Local,
+        ] {
+            let manifest = self.lane_manifest(lane);
+            if manifest.external_root.is_some() {
+                let session = super::state_block_store::StateBlockStaging::audit_manifest(
+                    store, &manifest, budget,
+                )?;
+                drop(session);
+                lanes.insert(manifest.id());
+            }
+        }
+        self.with_available_initial_roots(store, &lanes, |store, availability| {
+            super::journal_store::validate_head_targets_with_availability(
+                store,
+                heads,
+                Some(availability),
+            )
+        })
+    }
+
+    /// Scope for the currently supported external Local journal: unchanged
+    /// runtime and Merge frontier, with checkpoints allowed after Linear/Local
+    /// mutations. This is not permission to execute Merge or upgrade a runtime.
+    pub(crate) fn validate_checkpoint_scope<S: AgentJournalStore>(
+        &self,
+        store: &S,
+        heads: &JournalHeads,
+    ) -> Result<(), JournalStoreError> {
+        self.validate()
+            .map_err(|_| JournalStoreError::NonCanonical)?;
+        if store.genesis()?.as_ref() != Some(self.genesis())
+            || heads.genesis != self.genesis().id()
+            || heads.admission != self.genesis().admission
+            || heads.node != self.local.replica().node
+            || heads.runtime != *self.genesis().runtime()
+            || heads.checkpoint.is_none()
+            || heads.merge_frontier != self.local.empty_frontier().id()
+        {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        match (heads.merge_fence.head, heads.merge_seal) {
+            (None, None) if heads.merge_fence == OrderedBase::post_genesis() => {}
+            (Some(id), Some(seal)) => {
+                // This is scope validation, not finality. Full suffix replay or
+                // checkpoint validation still authenticates the actual fence.
+                let entry: OrderedEntry = store.get(id)?.ok_or(JournalStoreError::MissingObject)?;
+                if entry.genesis != heads.genesis
+                    || entry.index != heads.merge_fence.index
+                    || entry.input.runtime != heads.runtime
+                    || entry.merge_seal != Some(seal)
+                    || entry.merge_frontier != heads.merge_frontier
+                    || !matches!(
+                        entry.input.operation,
+                        ReplayOperation::CleanManage {
+                            request: crate::agent_sdk::ManagementRequest::Install(_),
+                            ..
+                        }
+                    )
+                {
+                    return Err(JournalStoreError::ScopeMismatch);
+                }
+            }
+            _ => return Err(JournalStoreError::ScopeMismatch),
+        }
+        Ok(())
+    }
+
+    fn with_available_initial_roots<S: AgentJournalStore, T>(
+        &self,
+        store: &mut S,
+        lanes: &BTreeSet<LaneStateId>,
+        action: impl FnOnce(&mut S, &ExternalCheckpointValidation<'_>) -> Result<T, JournalStoreError>,
+    ) -> Result<T, JournalStoreError> {
+        let heads = self
+            .initial_heads()
+            .map_err(|_| JournalStoreError::NonCanonical)?;
+        let empty = BTreeSet::new();
+        let validation = ExternalCheckpointValidation {
+            mutation: None,
+            store: store.instance_id(),
+            predecessor: self.initial_predecessor_heads().id(),
+            successor: heads.id(),
+            predecessor_checkpoint: None,
+            successor_checkpoint: heads.checkpoint.ok_or(JournalStoreError::NonCanonical)?,
+            predecessor_lanes: &empty,
+            successor_lanes: lanes,
+        };
+        action(store, &validation)
+    }
+
+    pub(crate) fn lane_manifest(&self, lane: PersistedLane) -> LaneStateManifest {
+        let mut manifest = self.local.lane_manifest(lane);
+        let sdk_lane = match lane {
+            PersistedLane::Control => return manifest,
+            PersistedLane::Linear => crate::agent_sdk::StateLane::Linear,
+            PersistedLane::Merge => crate::agent_sdk::StateLane::Merge,
+            PersistedLane::Local => crate::agent_sdk::StateLane::Local,
+        };
+        if let Some(work) = self
+            .execution
+            .work()
+            .lanes()
+            .iter()
+            .find(|work| work.base.context().scope().lane() == sdk_lane)
+        {
+            let descriptor = self
+                .execution
+                .output()
+                .changes()
+                .iter()
+                .find(|change| change.next().context().scope().lane() == sdk_lane)
+                .map_or(work.base, |change| change.next());
+            manifest.external_root = Some(super::journal::ExternalStateRoot {
+                descriptor,
+                runtime: manifest.runtime.clone(),
+                cursor: manifest.cursor.clone(),
+            });
+        }
+        manifest
+    }
+
+    fn validate(&self) -> Result<(), ReplayValidationError> {
+        self.local.validate()?;
+        let crate::agent_sdk::RuntimeWork::Manage { request, .. } = self.execution.work().work()
+        else {
+            return Err(ReplayError::InvalidRecord);
+        };
+        let crate::agent_sdk::ManagementRequest::Create(descriptor) = request.as_ref() else {
+            return Err(ReplayError::InvalidRecord);
+        };
+        let [replica] = descriptor.replicas.as_slice() else {
+            return Err(ReplayError::ScopeMismatch);
+        };
+        if !self.execution.matches(&self.genesis().create, *replica)
+            || !sdk_replica_matches_host(replica, self.local.replica())
+            || !self.genesis().runtime().is_external_state()
+            || sdk_runtime_state(self.local.post_create())
+                != self.execution.output().transition().state
+        {
+            return Err(ReplayError::ScopeMismatch);
+        }
+        for lane in [
+            PersistedLane::Control,
+            PersistedLane::Linear,
+            PersistedLane::Merge,
+            PersistedLane::Local,
+        ] {
+            let manifest = self.lane_manifest(lane);
+            manifest
+                .validate()
+                .map_err(|_| ReplayError::InvalidRecord)?;
+            if let Some(root) = &manifest.external_root {
+                let expected = super::state_block_store::journal_root_context(
+                    self.genesis(),
+                    &manifest.runtime,
+                    lane,
+                    (lane == PersistedLane::Local).then_some(self.local.replica().node),
+                    &manifest.cursor,
+                )
+                .map_err(|_| ReplayError::ScopeMismatch)?;
+                if root.descriptor.context() != expected
+                    || root.descriptor.encode() != state_component(self.local.post_create(), lane)
+                {
+                    return Err(ReplayError::ScopeMismatch);
+                }
+            }
+        }
+        self.initial_heads()?;
+        Ok(())
     }
 }
 
@@ -2670,6 +3676,8 @@ impl ReplaySealedSharedGenesis {
             },
         };
         LaneStateManifest {
+            #[cfg(feature = "experimental-state-blocks")]
+            external_root: None,
             genesis: self.genesis.id(),
             runtime: self.genesis.runtime().clone(),
             lane,
@@ -2747,6 +3755,64 @@ pub(crate) trait ReplaySealedOrdinaryGenesis {
     fn validates_post_create_state(&self) -> bool;
     fn admission_record(&self) -> Option<&AgentGenesisAdmissionRecord>;
     fn validate_seal(&self) -> Result<(), ReplayValidationError>;
+    /// An external genesis needs a checkpoint-bearing first head. This metadata
+    /// is usable by admitted slot checks, never an ordinary initialization permit.
+    fn genesis_checkpoint(&self) -> Option<CheckpointManifest> {
+        None
+    }
+}
+
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+impl ReplaySealedOrdinaryGenesis for ReplaySealedExternalLocalGenesis {
+    fn genesis(&self) -> &AgentJournalGenesis {
+        self.genesis()
+    }
+    fn post_create(&self) -> &RuntimeState {
+        self.post_create()
+    }
+    fn empty_frontier(&self) -> &MergeFrontier {
+        self.empty_frontier()
+    }
+    fn ordered_invocations(&self) -> &InvocationIndexManifest {
+        self.ordered_invocations()
+    }
+    fn merge_invocations(&self) -> &InvocationIndexManifest {
+        self.merge_invocations()
+    }
+    fn local_invocations(&self) -> &InvocationIndexManifest {
+        self.local_invocations()
+    }
+    fn artifacts(&self) -> &ArtifactClosure {
+        self.artifacts()
+    }
+    fn replica(&self) -> AgentReplica {
+        self.local.replica()
+    }
+    fn admission_commitment(&self) -> Hash {
+        self.local.admission_commitment()
+    }
+    fn lane_manifest(&self, lane: PersistedLane) -> LaneStateManifest {
+        self.lane_manifest(lane)
+    }
+    fn initial_heads(&self) -> JournalHeads {
+        self.initial_heads()
+            .expect("validated immutable genesis seal")
+    }
+    fn validates_post_create_state(&self) -> bool {
+        self.local.validates_post_create_state()
+    }
+    fn admission_record(&self) -> Option<&AgentGenesisAdmissionRecord> {
+        None
+    }
+    fn validate_seal(&self) -> Result<(), ReplayValidationError> {
+        self.validate()
+    }
+    fn genesis_checkpoint(&self) -> Option<CheckpointManifest> {
+        Some(
+            self.initial_checkpoint()
+                .expect("validated immutable genesis seal"),
+        )
+    }
 }
 
 impl ReplaySealedOrdinaryGenesis for ReplaySealedLocalGenesis {
@@ -3157,6 +4223,8 @@ impl ReplaySealedGenesis {
             },
         };
         LaneStateManifest {
+            #[cfg(feature = "experimental-state-blocks")]
+            external_root: None,
             genesis: self.genesis.id(),
             runtime: self.genesis.runtime().clone(),
             lane,
@@ -3642,6 +4710,11 @@ impl CommittedSharedOrdered {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplaySealedPublication {
+    /// Exact candidate changes, not proof of durable availability. Ordinary
+    /// publishers refuse this plan until an exclusive availability owner stages
+    /// its closure. Boxed so opaque/Attested publication stacks do not grow.
+    #[cfg(feature = "experimental-state-blocks")]
+    external_execution: Option<Box<ReplayExternalExecution>>,
     expected: JournalHeadsId,
     next: JournalHeads,
     anchor: ReplayPublicationAnchor,
@@ -3972,9 +5045,41 @@ impl ReplaySealedOutcome {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MaterializedOrderedSnapshot {
+    #[cfg(feature = "experimental-state-blocks")]
+    linear_root: Option<super::journal::ExternalStateRoot>,
     runtime: RuntimeBinding,
     control: Vec<u8>,
     linear: Vec<u8>,
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+impl MaterializedOrderedSnapshot {
+    /// Cache consistency only. The source owner must authenticate the full
+    /// root context and origin before constructing this private snapshot.
+    fn validate(&self, base: OrderedBase) -> Result<(), ReplayValidationError> {
+        if let Some(root) = &self.linear_root {
+            base.validate()
+                .map_err(|_| ReplayError::InvalidOrderedBase)?;
+            let scope = root.descriptor.context().scope();
+            let LaneCursor::Ordered { base: origin } = root.cursor else {
+                return Err(ReplayError::InvalidOrderedBase);
+            };
+            if root.runtime.validate().is_err()
+                || root.runtime.space != self.runtime.space
+                || root.runtime.agent != self.runtime.agent
+                || scope.space().0 != self.runtime.space.0
+                || scope.agent().0 != self.runtime.agent.0
+                || scope.lane() != crate::agent_sdk::StateLane::Linear
+                || origin.validate().is_err()
+                || origin.index > base.index
+                || (origin.index == base.index && origin != base)
+                || root.descriptor.encode() != self.linear
+            {
+                return Err(ReplayError::InvalidOrderedBase);
+            }
+        }
+        Ok(())
+    }
 }
 
 const MAX_MATERIALIZED_ORDERED_SNAPSHOTS: usize = MAX_REPLAY_SUFFIX_ENTRIES + 1;
@@ -3983,6 +5088,8 @@ const MAX_MATERIALIZED_ORDERED_SNAPSHOT_BYTES: usize = MAX_REPLAY_SUFFIX_BYTES;
 /// Bounded authenticated cache of the Control/Linear images needed by the
 /// current replay suffix. Checkpoint compaction retains only the current
 /// ordered base; any older base must be supplied by the certified resolver.
+/// Variable image bytes have a separate aggregate budget; fixed runtime/root
+/// metadata is bounded by the maximum snapshot count and owns no block payloads.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct MaterializedOrderedSnapshots {
     values: BTreeMap<OrderedBase, MaterializedOrderedSnapshot>,
@@ -4017,6 +5124,8 @@ impl MaterializedOrderedSnapshots {
         base: OrderedBase,
         snapshot: MaterializedOrderedSnapshot,
     ) -> Result<(), ReplayValidationError> {
+        #[cfg(feature = "experimental-state-blocks")]
+        snapshot.validate(base)?;
         let snapshot_bytes = snapshot
             .control
             .len()
@@ -4058,6 +5167,10 @@ impl MaterializedOrderedSnapshots {
     }
 
     fn validate(&self) -> Result<(), ReplayValidationError> {
+        #[cfg(feature = "experimental-state-blocks")]
+        for (base, snapshot) in &self.values {
+            snapshot.validate(*base)?;
+        }
         let bytes = self.values.values().try_fold(0usize, |bytes, snapshot| {
             bytes
                 .checked_add(snapshot.control.len())
@@ -4176,6 +5289,10 @@ impl ReplaySuffixBudget {
 /// state bytes or cursors when preparing a publication.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplayMaterialization {
+    /// Explicit format/provenance, never inferred from component bytes. Entries
+    /// must come from authenticated lane manifests or captured replay steps.
+    #[cfg(feature = "experimental-state-blocks")]
+    external_roots: BTreeMap<PersistedLane, super::journal::ExternalStateRoot>,
     clean_management: Option<super::journal::CleanManagementEvidence>,
     heads_id: JournalHeadsId,
     heads: JournalHeads,
@@ -4480,6 +5597,142 @@ impl ReplayTransitionProofShadow {
 }
 
 impl ReplayMaterialization {
+    /// Advance only declared Ordered/Local roots using an accepted replay
+    /// step. An execution cannot invent a lane's format, and a no-op must keep
+    /// the old root-producing identity. Availability and publication are separate.
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    fn external_roots_after_step(
+        &self,
+        genesis: &AgentJournalGenesis,
+        step: &ReplayStep,
+    ) -> Result<BTreeMap<PersistedLane, super::journal::ExternalStateRoot>, ReplayValidationError>
+    {
+        if genesis.id() != self.heads.genesis
+            || self.external_roots.contains_key(&PersistedLane::Control)
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
+        if let Some(execution) = &step.external_execution {
+            if execution.owning_lane().is_none() {
+                if !execution.matches_roots(&self.external_roots)
+                    || !matches!(
+                        step.position,
+                        ReplayPosition::Ordered {
+                            merge_seal: Some(_),
+                            ..
+                        }
+                    )
+                    || self.external_roots.keys().any(|lane| {
+                        state_component(&self.state, *lane) != state_component(&step.state, *lane)
+                    })
+                {
+                    return Err(ReplayError::InvalidRecord);
+                }
+                return Ok(self.external_roots.clone());
+            }
+        }
+        let lane = match step.position {
+            ReplayPosition::Ordered {
+                merge_seal: None, ..
+            } => PersistedLane::Linear,
+            ReplayPosition::Local { .. } => PersistedLane::Local,
+            _ => return Err(ReplayError::InvalidPosition),
+        };
+        // An initial external genesis may declare Merge as well. Carry its
+        // authenticated root unchanged through an independent lane mutation;
+        // this does not admit Merge execution or an Ordered fence.
+        for other in self.external_roots.keys().filter(|other| **other != lane) {
+            if state_component(&self.state, *other) != state_component(&step.state, *other) {
+                return Err(ReplayError::InvalidRecord);
+            }
+        }
+        if let Some(execution) = &step.external_execution {
+            if !execution.matches_roots(&self.external_roots)
+                || execution
+                    .owning_lane()
+                    .ok_or(ReplayError::InvalidRecord)?
+                    .base
+                    .context()
+                    .scope()
+                    .lane() as u8
+                    != lane.state_lane().ok_or(ReplayError::InvalidRecord)? as u8
+                || !self.external_roots.contains_key(&lane)
+            {
+                return Err(ReplayError::InvalidRecord);
+            }
+        }
+        let mut roots = self.external_roots.clone();
+        if roots.contains_key(&lane) {
+            let previous =
+                self.checkpoint_lane(genesis, lane, state_component(&self.state, lane))?;
+            let successor = step.external_lane_successor(genesis, &previous)?;
+            roots.insert(
+                lane,
+                successor.external_root.ok_or(ReplayError::InvalidRecord)?,
+            );
+        }
+        Ok(roots)
+    }
+
+    /// Derive a checkpoint projection without erasing a retained external
+    /// root's producing runtime/revision. This constructs a record, not an
+    /// availability certificate or permission to publish it.
+    #[cfg(feature = "std")]
+    fn checkpoint_lane(
+        &self,
+        genesis: &AgentJournalGenesis,
+        lane: PersistedLane,
+        bytes: &[u8],
+    ) -> Result<LaneStateManifest, ReplayValidationError> {
+        if genesis.id() != self.heads.genesis {
+            return Err(ReplayError::ScopeMismatch);
+        }
+        let cursor = match lane {
+            PersistedLane::Control | PersistedLane::Linear => LaneCursor::Ordered {
+                base: self.ordered_base(),
+            },
+            PersistedLane::Merge => LaneCursor::Merge {
+                frontier: self.heads.merge_frontier,
+            },
+            PersistedLane::Local => LaneCursor::Local {
+                node: self.heads.node,
+                revision: self.heads.local_revision,
+                head: self.heads.local_head,
+            },
+        };
+        let manifest = derive_lane_state(
+            self.heads.genesis,
+            self.heads.runtime.clone(),
+            lane,
+            cursor,
+            bytes,
+        )?;
+        #[cfg(feature = "experimental-state-blocks")]
+        let manifest = if let Some(root) = self.external_roots.get(&lane) {
+            let mut manifest = manifest;
+            let node = (lane == PersistedLane::Local).then_some(self.heads.node);
+            let expected = super::state_block_store::journal_root_context(
+                genesis,
+                &root.runtime,
+                lane,
+                node,
+                &root.cursor,
+            )
+            .map_err(|_| ReplayError::InvalidRecord)?;
+            if expected != root.descriptor.context() || bytes != root.descriptor.encode() {
+                return Err(ReplayError::InvalidRecord);
+            }
+            manifest.external_root = Some(root.clone());
+            manifest
+                .validate()
+                .map_err(|_| ReplayError::InvalidRecord)?;
+            manifest
+        } else {
+            manifest
+        };
+        Ok(manifest)
+    }
+
     pub(crate) fn clean_management_evidence(
         &self,
     ) -> Option<&super::journal::CleanManagementEvidence> {
@@ -4610,6 +5863,366 @@ pub struct ReplayPreparedPublication<'store, S: AgentJournalStore> {
     executions: Vec<ReplayExecutionResult>,
 }
 
+/// Maintenance-only availability owner. Not Clone: the exact prepared seal
+/// and exclusive store borrow stay together until publication or abandonment.
+/// Only storage implementations with explicit availability validation may CAS.
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+pub(crate) struct AuditedExternalCheckpoint<'store, S: AgentJournalStore> {
+    prepared: ReplayPreparedPublication<'store, S>,
+    lanes: BTreeSet<LaneStateId>,
+    predecessor_lanes: BTreeSet<LaneStateId>,
+}
+
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+fn supported_external_checkpoint_lane(
+    manifest: &LaneStateManifest,
+    genesis: Option<&ReplaySealedExternalLocalGenesis>,
+) -> bool {
+    match manifest.lane {
+        PersistedLane::Linear | PersistedLane::Local => true,
+        PersistedLane::Merge => genesis.is_some_and(|seal| {
+            let initial = seal.lane_manifest(PersistedLane::Merge);
+            manifest.genesis == initial.genesis
+                && manifest.runtime == initial.runtime
+                && manifest.cursor == initial.cursor
+                && manifest.state == initial.state
+                && manifest.external_root == initial.external_root
+        }),
+        PersistedLane::Control => false,
+    }
+}
+
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+fn external_checkpoint_lanes<S: AgentJournalStore>(
+    store: &S,
+    heads: &JournalHeads,
+) -> Result<BTreeSet<LaneStateId>, JournalStoreError> {
+    let checkpoint: CheckpointManifest = store
+        .get(heads.checkpoint.ok_or(JournalStoreError::NonCanonical)?)?
+        .ok_or(JournalStoreError::MissingObject)?;
+    checkpoint
+        .lanes
+        .iter()
+        .filter_map(|lane| match store.get::<LaneStateManifest>(lane.state) {
+            Ok(Some(manifest)) if manifest.external_root.is_some() => Some(Ok(lane.state)),
+            Ok(Some(_)) => None,
+            Ok(None) => Some(Err(JournalStoreError::MissingObject)),
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
+}
+
+/// Borrowed validation context minted only by an audited checkpoint owner or
+/// an exclusively pinned replay session. Mutation authority additionally binds
+/// the exact seal and is enabled only after incremental staging succeeds.
+/// It is never persisted, cloned, or constructed from caller-supplied hashes.
+#[cfg(feature = "std")]
+pub(crate) struct ExternalCheckpointValidation<'a> {
+    /// Only a pinned replay session may bind a mutation to this exact borrowed
+    /// seal. A checkpoint/root audit alone must never authorize execution CAS.
+    #[cfg(feature = "experimental-state-blocks")]
+    mutation: Option<(&'a ReplaySealedPublication, bool)>,
+    store: JournalStoreInstanceId,
+    predecessor: JournalHeadsId,
+    successor: JournalHeadsId,
+    predecessor_checkpoint: Option<CheckpointId>,
+    successor_checkpoint: CheckpointId,
+    predecessor_lanes: &'a BTreeSet<LaneStateId>,
+    successor_lanes: &'a BTreeSet<LaneStateId>,
+}
+
+#[cfg(feature = "std")]
+impl ExternalCheckpointValidation<'_> {
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn permits_mutation(
+        &self,
+        store: JournalStoreInstanceId,
+        publication: &ReplaySealedPublication,
+    ) -> bool {
+        self.mutation.is_some_and(|(_, staged)| staged)
+            && self.permits_pinned_base(store, publication)
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn permits_pinned_base(
+        &self,
+        store: JournalStoreInstanceId,
+        publication: &ReplaySealedPublication,
+    ) -> bool {
+        self.store == store
+            && self
+                .mutation
+                .is_some_and(|(seal, _)| core::ptr::eq(seal, publication))
+            && self.predecessor == publication.expected
+            && self.successor == publication.next.id()
+            && self.predecessor_checkpoint == Some(self.successor_checkpoint)
+            && publication.next.checkpoint == Some(self.successor_checkpoint)
+            && publication.mode == ReplayPublicationMode::Canonical
+            && publication.shared_ordered_commit.is_none()
+            && publication.system_authority_write.is_none()
+            && match &publication.anchor {
+                ReplayPublicationAnchor::Local(_) => true,
+                ReplayPublicationAnchor::Ordered(entry) => {
+                    entry.merge_seal.is_none()
+                        || (matches!(
+                            &entry.input.operation,
+                            ReplayOperation::CleanManage {
+                                request: crate::agent_sdk::ManagementRequest::Install(_),
+                                ..
+                            }
+                        ) && publication
+                            .external_execution()
+                            .is_some_and(|execution| execution.owning_lane().is_none()))
+                }
+                _ => false,
+            }
+    }
+    pub(crate) fn matches_heads(
+        &self,
+        store: JournalStoreInstanceId,
+        heads: &JournalHeads,
+    ) -> bool {
+        store == self.store
+            && ((heads.id() == self.predecessor && heads.checkpoint == self.predecessor_checkpoint)
+                || (heads.id() == self.successor
+                    && heads.checkpoint == Some(self.successor_checkpoint)))
+    }
+
+    pub(crate) fn permits_lane(
+        &self,
+        store: JournalStoreInstanceId,
+        checkpoint: CheckpointId,
+        lane: LaneStateId,
+    ) -> bool {
+        store == self.store
+            && ((checkpoint == self.successor_checkpoint && self.successor_lanes.contains(&lane))
+                || (Some(checkpoint) == self.predecessor_checkpoint
+                    && self.predecessor_lanes.contains(&lane)))
+    }
+}
+
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+impl<'store, S: super::journal_store::AuditedCheckpointStore> AuditedExternalCheckpoint<'store, S> {
+    pub(crate) fn publish(
+        self,
+    ) -> Result<
+        (
+            JournalPublication,
+            ReplayMaterialization,
+            Vec<ReplayExecutionResult>,
+        ),
+        JournalStoreError,
+    > {
+        self.publish_using(|store, publication, availability| {
+            store.publish_audited_checkpoint(publication, availability)
+        })
+    }
+
+    fn publish_using(
+        self,
+        publish: impl FnOnce(
+            &mut S,
+            &ReplaySealedPublication,
+            &ExternalCheckpointValidation<'_>,
+        ) -> Result<JournalPublication, JournalStoreError>,
+    ) -> Result<
+        (
+            JournalPublication,
+            ReplayMaterialization,
+            Vec<ReplayExecutionResult>,
+        ),
+        JournalStoreError,
+    > {
+        let Self {
+            prepared,
+            lanes,
+            predecessor_lanes,
+        } = self;
+        let current = prepared
+            .store
+            .heads()?
+            .ok_or(JournalStoreError::NotInitialized)?;
+        if current.id() != prepared.sealed.expected {
+            return Err(JournalStoreError::Conflict);
+        }
+        let availability = ExternalCheckpointValidation {
+            mutation: None,
+            store: prepared.store.instance_id(),
+            predecessor: current.id(),
+            successor: prepared.sealed.next.id(),
+            predecessor_checkpoint: current.checkpoint,
+            successor_checkpoint: prepared
+                .sealed
+                .next
+                .checkpoint
+                .ok_or(JournalStoreError::NonCanonical)?,
+            predecessor_lanes: &predecessor_lanes,
+            successor_lanes: &lanes,
+        };
+        let result = publish(prepared.store, &prepared.sealed, &availability)?;
+        Ok((result, prepared.successor, prepared.executions))
+    }
+}
+
+/// Maintenance-only head closure validation for an independently admitted
+/// store. Availability is scoped to this call's exclusive borrow; no reusable
+/// ticket escapes. This is not replay, origin-ancestry or lifecycle authority.
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+pub(crate) fn validate_external_checkpoint_heads<S: AgentJournalStore>(
+    store: &mut S,
+    heads: &JournalHeads,
+    budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+) -> Result<(), JournalStoreError> {
+    with_external_checkpoint_heads(store, heads, budget, |_, _| Ok(()))
+}
+
+/// Keep the audited head's availability under one exclusive borrow through a
+/// maintenance action. The context cannot be retained past this call.
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+pub(crate) fn with_external_checkpoint_heads<S: AgentJournalStore, T>(
+    store: &mut S,
+    heads: &JournalHeads,
+    budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    action: impl FnOnce(
+        &mut S,
+        Option<&ExternalCheckpointValidation<'_>>,
+    ) -> Result<T, JournalStoreError>,
+) -> Result<T, JournalStoreError> {
+    with_external_checkpoint_heads_inner(store, heads, None, budget, action)
+}
+
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+pub(crate) fn with_external_genesis_checkpoint_heads<S: AgentJournalStore, T>(
+    store: &mut S,
+    heads: &JournalHeads,
+    genesis: &ReplaySealedExternalLocalGenesis,
+    budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    action: impl FnOnce(
+        &mut S,
+        Option<&ExternalCheckpointValidation<'_>>,
+    ) -> Result<T, JournalStoreError>,
+) -> Result<T, JournalStoreError> {
+    genesis.validate_checkpoint_scope(store, heads)?;
+    with_external_checkpoint_heads_inner(store, heads, Some(genesis), budget, action)
+}
+
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+fn with_external_checkpoint_heads_inner<S: AgentJournalStore, T>(
+    store: &mut S,
+    heads: &JournalHeads,
+    external_genesis: Option<&ReplaySealedExternalLocalGenesis>,
+    budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    action: impl FnOnce(
+        &mut S,
+        Option<&ExternalCheckpointValidation<'_>>,
+    ) -> Result<T, JournalStoreError>,
+) -> Result<T, JournalStoreError> {
+    use super::journal_store::validate_head_targets_with_availability;
+    use super::state_block_store::StateBlockStaging;
+    let Some(id) = heads.checkpoint else {
+        validate_head_targets_with_availability(store, heads, None)?;
+        return action(store, None);
+    };
+    let checkpoint: CheckpointManifest = store.get(id)?.ok_or(JournalStoreError::MissingObject)?;
+    checkpoint
+        .validate()
+        .map_err(|_| JournalStoreError::NonCanonical)?;
+    if checkpoint.id() != id || checkpoint.genesis != heads.genesis || checkpoint.lanes.len() != 4 {
+        return Err(JournalStoreError::NonCanonical);
+    }
+    let artifacts: ArtifactClosure = store
+        .get(checkpoint.artifacts)?
+        .ok_or(JournalStoreError::MissingObject)?;
+    if artifacts.id() != checkpoint.artifacts || artifacts.genesis != heads.genesis {
+        return Err(JournalStoreError::NonCanonical);
+    }
+    let mut lanes = BTreeSet::new();
+    for lane in &checkpoint.lanes {
+        let manifest: LaneStateManifest = store
+            .get(lane.state)?
+            .ok_or(JournalStoreError::MissingObject)?;
+        if manifest.id() != lane.state
+            || manifest.genesis != heads.genesis
+            || manifest.runtime != checkpoint.runtime
+            || manifest.lane != lane.lane
+        {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        let Some(root) = &manifest.external_root else {
+            continue;
+        };
+        if !checkpoint.runtime.is_external_state()
+            || !supported_external_checkpoint_lane(&manifest, external_genesis)
+            || (lane.lane == PersistedLane::Local && lane.node != Some(heads.node))
+            || !artifacts.artifacts.contains(&root.runtime.package)
+            || !lanes.insert(manifest.id())
+        {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        let session = StateBlockStaging::audit_manifest(store, &manifest, budget)?;
+        drop(session);
+    }
+    let validation = ExternalCheckpointValidation {
+        mutation: None,
+        store: store.instance_id(),
+        predecessor: heads.id(),
+        successor: heads.id(),
+        predecessor_checkpoint: Some(id),
+        successor_checkpoint: id,
+        predecessor_lanes: &lanes,
+        successor_lanes: &lanes,
+    };
+    validate_head_targets_with_availability(store, heads, Some(&validation))?;
+    action(store, Some(&validation))
+}
+
+/// Storage fault-injection harness. Audits both exact endpoints under one
+/// exclusive borrow; synthetic seals remain confined to tests.
+#[cfg(all(test, feature = "std", feature = "experimental-state-blocks"))]
+pub(crate) fn with_audited_checkpoint_for_test<S: AgentJournalStore, T>(
+    store: &mut S,
+    publication: &ReplaySealedPublication,
+    budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    action: impl FnOnce(&mut S, &ExternalCheckpointValidation<'_>) -> Result<T, JournalStoreError>,
+) -> Result<T, JournalStoreError> {
+    let current = store.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+    validate_external_checkpoint_heads(store, &current, budget)?;
+    validate_external_checkpoint_heads(store, publication.next(), budget)?;
+    let collect = |heads: &JournalHeads| -> Result<BTreeSet<LaneStateId>, JournalStoreError> {
+        let Some(id) = heads.checkpoint else {
+            return Ok(BTreeSet::new());
+        };
+        let checkpoint: CheckpointManifest =
+            store.get(id)?.ok_or(JournalStoreError::MissingObject)?;
+        checkpoint
+            .lanes
+            .iter()
+            .filter_map(|lane| match store.get::<LaneStateManifest>(lane.state) {
+                Ok(Some(manifest)) if manifest.external_root.is_some() => Some(Ok(lane.state)),
+                Ok(Some(_)) => None,
+                Ok(None) => Some(Err(JournalStoreError::MissingObject)),
+                Err(error) => Some(Err(error)),
+            })
+            .collect()
+    };
+    let predecessor_lanes = collect(&current)?;
+    let successor_lanes = collect(publication.next())?;
+    let context = ExternalCheckpointValidation {
+        mutation: None,
+        store: store.instance_id(),
+        predecessor: current.id(),
+        successor: publication.next().id(),
+        predecessor_checkpoint: current.checkpoint,
+        successor_checkpoint: publication
+            .next()
+            .checkpoint
+            .ok_or(JournalStoreError::NonCanonical)?,
+        predecessor_lanes: &predecessor_lanes,
+        successor_lanes: &successor_lanes,
+    };
+    action(store, &context)
+}
+
 /// Authenticated execution facts carried by a prepared journal publication.
 /// Durable invocation replies remain in the scoped invocation-result state
 /// of the returned successor materialization. Management replies are carried
@@ -4689,6 +6302,185 @@ impl ReplayCommittedRecovery {
 
 #[cfg(feature = "std")]
 impl<'store, S: AgentJournalStore> ReplayPreparedPublication<'store, S> {
+    /// Audit external roots only for checkpoint maintenance, never as a
+    /// substitute for incremental availability on ordinary request publication.
+    /// Consuming preparation prevents callers from changing its seal or running
+    /// GC between this audit and the eventual storage handoff.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn audit_external_checkpoint(
+        self,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<AuditedExternalCheckpoint<'store, S>, JournalStoreError> {
+        self.audit_external_checkpoint_inner(None, budget)
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn audit_external_checkpoint_from_genesis(
+        self,
+        genesis: &ReplaySealedExternalLocalGenesis,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<AuditedExternalCheckpoint<'store, S>, JournalStoreError> {
+        genesis.validate_checkpoint_scope(self.store, self.sealed.next())?;
+        self.audit_external_checkpoint_inner(Some(genesis), budget)
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    fn audit_external_checkpoint_inner(
+        self,
+        external_genesis: Option<&ReplaySealedExternalLocalGenesis>,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<AuditedExternalCheckpoint<'store, S>, JournalStoreError> {
+        use super::state_block_store::{StateBlockStaging, journal_root_context};
+        let checkpoint = self
+            .sealed
+            .checkpoint_validation()
+            .ok_or(JournalStoreError::NonCanonical)?;
+        if self.sealed.mode != ReplayPublicationMode::Canonical
+            || self.sealed.shared_ordered_commit.is_some()
+            || self.sealed.shared_merge_projection.is_some()
+            || self.sealed.next.checkpoint != Some(checkpoint.manifest().id())
+            || self.successor.heads != self.sealed.next
+            || self.successor.heads_id != self.sealed.next.id()
+            || !self.executions.is_empty()
+        {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        let current = self
+            .store
+            .heads()?
+            .ok_or(JournalStoreError::NotInitialized)?;
+        if current.id() != self.sealed.expected {
+            return Err(JournalStoreError::Conflict);
+        }
+        if !current.runtime.is_external_state()
+            || !matches!(self.sealed.anchor(), ReplayPublicationAnchor::Checkpoint(manifest)
+                if manifest == checkpoint.manifest())
+            || checkpoint.lanes().len() != checkpoint.manifest().lanes.len()
+            || !checkpoint
+                .lanes()
+                .iter()
+                .zip(&checkpoint.manifest().lanes)
+                .all(|((lane, _), expected)| lane == expected)
+        {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        let genesis = self
+            .store
+            .genesis()?
+            .ok_or(JournalStoreError::NotInitialized)?;
+        if genesis.id() != current.genesis || checkpoint.manifest().genesis != current.genesis {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        let mut lanes = BTreeSet::new();
+        for (lane, manifest) in checkpoint.lanes() {
+            let Some(root) = &manifest.external_root else {
+                continue;
+            };
+            manifest
+                .validate()
+                .map_err(|_| JournalStoreError::NonCanonical)?;
+            if lane.state != manifest.id()
+                || lane.lane != manifest.lane
+                || manifest.runtime != current.runtime
+                || manifest.genesis != current.genesis
+                || !supported_external_checkpoint_lane(manifest, external_genesis)
+                || !checkpoint
+                    .artifacts()
+                    .artifacts
+                    .contains(&root.runtime.package)
+                || !lanes.insert(manifest.id())
+            {
+                return Err(JournalStoreError::NonCanonical);
+            }
+            let node = (manifest.lane == PersistedLane::Local).then_some(current.node);
+            let context =
+                journal_root_context(&genesis, &root.runtime, manifest.lane, node, &root.cursor)
+                    .map_err(|_| JournalStoreError::ScopeMismatch)?;
+            let encoded = root.descriptor.encode();
+            let (stored, _, _) = self.store.load_blob_with_work_limit(
+                JournalBlobClass::LaneState,
+                &manifest.state,
+                encoded.len() as u64,
+                2,
+            )?;
+            if stored.ok_or(JournalStoreError::MissingObject)? != encoded {
+                return Err(JournalStoreError::Corrupt);
+            }
+            let session = StateBlockStaging::audit_base(
+                self.store,
+                root.descriptor,
+                context,
+                root.descriptor.commitment(),
+                budget,
+            )?;
+            drop(session);
+        }
+        if lanes.is_empty() {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        // Storage validates both the existing head's checkpoint and its
+        // successor. Auditing only the new root cannot establish availability
+        // of old branches no longer reachable from that successor.
+        let mut predecessor_lanes = BTreeSet::new();
+        if let Some(id) = current.checkpoint {
+            let previous: CheckpointManifest = self
+                .store
+                .get(id)?
+                .ok_or(JournalStoreError::MissingObject)?;
+            if previous.id() != id
+                || previous.genesis != current.genesis
+                || previous.lanes.len() != 4
+            {
+                return Err(JournalStoreError::NonCanonical);
+            }
+            previous
+                .validate()
+                .map_err(|_| JournalStoreError::NonCanonical)?;
+            let artifacts: ArtifactClosure = self
+                .store
+                .get(previous.artifacts)?
+                .ok_or(JournalStoreError::MissingObject)?;
+            if artifacts.id() != previous.artifacts || artifacts.genesis != current.genesis {
+                return Err(JournalStoreError::NonCanonical);
+            }
+            for lane in &previous.lanes {
+                let manifest: LaneStateManifest = self
+                    .store
+                    .get(lane.state)?
+                    .ok_or(JournalStoreError::MissingObject)?;
+                if manifest.id() != lane.state
+                    || manifest.lane != lane.lane
+                    || manifest.runtime != previous.runtime
+                    || manifest.genesis != current.genesis
+                {
+                    return Err(JournalStoreError::NonCanonical);
+                }
+                let Some(root) = &manifest.external_root else {
+                    continue;
+                };
+                if !supported_external_checkpoint_lane(&manifest, external_genesis)
+                    || (lane.lane == PersistedLane::Local && lane.node != Some(current.node))
+                    || !artifacts.artifacts.contains(&root.runtime.package)
+                    || !predecessor_lanes.insert(manifest.id())
+                {
+                    return Err(JournalStoreError::NonCanonical);
+                }
+                // An identical manifest was already audited under this same
+                // exclusive borrow. Otherwise charge the shared maintenance
+                // budget for the independently selected predecessor root.
+                if !lanes.contains(&manifest.id()) {
+                    let session = StateBlockStaging::audit_manifest(self.store, &manifest, budget)?;
+                    drop(session);
+                }
+            }
+        }
+        Ok(AuditedExternalCheckpoint {
+            prepared: self,
+            lanes,
+            predecessor_lanes,
+        })
+    }
+
     #[cfg(test)]
     fn with_staged_transition_proofs_for_test(
         self,
@@ -4766,6 +6558,10 @@ impl<'store, S: AgentJournalStore> ReplayPreparedPublication<'store, S> {
         ),
         JournalStoreError,
     > {
+        #[cfg(feature = "experimental-state-blocks")]
+        if self.sealed.external_execution().is_some() {
+            return Err(JournalStoreError::Unavailable);
+        }
         if self.sealed.mode != ReplayPublicationMode::Canonical
             || self.sealed.shared_ordered_commit.is_some()
             || self.sealed.system_authority_write.is_some()
@@ -7232,6 +9028,10 @@ pub(crate) enum SharedReplayPreparation<'store, S: AgentJournalStore> {
 }
 
 impl ReplaySealedPublication {
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn external_execution(&self) -> Option<&ReplayExternalExecution> {
+        self.external_execution.as_deref()
+    }
     #[cfg(all(test, feature = "std"))]
     fn transition_proof_test_action(
         action: ReplayTransitionProofTestAction,
@@ -7343,6 +9143,8 @@ impl ReplaySealedPublication {
             head: next.ordered_head,
         };
         let mut publication = Self {
+            #[cfg(feature = "experimental-state-blocks")]
+            external_execution: None,
             expected: current.id(),
             next: next.clone(),
             anchor: ReplayPublicationAnchor::Merge { event, frontier },
@@ -7470,6 +9272,8 @@ impl ReplaySealedPublication {
             .into_iter()
             .collect::<Result<Vec<_>, ReplayValidationError>>()?;
         let mut publication = Self {
+            #[cfg(feature = "experimental-state-blocks")]
+            external_execution: None,
             expected: current.id(),
             next: next.clone(),
             anchor: ReplayPublicationAnchor::Ordered(entry),
@@ -7611,6 +9415,8 @@ impl ReplaySealedPublication {
             expected: current.id(),
             next,
             anchor: ReplayPublicationAnchor::Checkpoint(manifest.clone()),
+            #[cfg(feature = "experimental-state-blocks")]
+            external_execution: None,
             outcomes: Vec::new(),
             history_plans: Vec::new(),
             proof_requirements: Vec::new(),
@@ -8581,6 +10387,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
             None,
             ReplayTransitionProofAccess::PublishedOnly,
             true,
+            None,
         )
     }
 
@@ -8605,9 +10412,11 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
             unseen_admission,
             ReplayTransitionProofAccess::PrepareAllowed,
             true,
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn apply_with_unseen_capacity_and_proof_access<E: ReplayExecutor, SourceError>(
         &mut self,
         executor: &mut E,
@@ -8617,6 +10426,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         unseen_admission: Option<UnseenInvocationAdmission>,
         transition_proof_access: ReplayTransitionProofAccess,
         finalize_transition_proof_ack: bool,
+        execute: Option<&mut dyn FnMut(&Ownership, &mut E) -> Result<ReplayTransition, E::Error>>,
     ) -> Result<ReplayStep, ReplayError<SourceError, E::Error>> {
         if input.validate().is_err() {
             return Err(ReplayError::InvalidRecord);
@@ -8893,6 +10703,11 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                         InvocationOwnershipError::Unauthenticated,
                     ))?,
             )?
+        } else if let Some(execute) = execute {
+            if system_authority_execution.is_some() {
+                return Err(ReplayError::InvalidRecord);
+            }
+            execute(&self.ownership, executor).map_err(ReplayError::Executor)?
         } else {
             executor
                 .execute_with_journal_context(
@@ -8945,6 +10760,34 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                 InvocationOwnershipError::Unauthenticated,
             ));
         }
+        #[cfg(feature = "experimental-state-blocks")]
+        let external_execution = {
+            // Cross-format upgrade needs an admitted state conversion and
+            // provenance closure. Neither an opaque r19 transition nor merely
+            // changing the runtime binding can install that conversion.
+            if execution_runtime.is_external_state() != transition.next_runtime.is_external_state()
+            {
+                return Err(ReplayError::InvalidRecord);
+            }
+            let execution = executor
+                .take_external_execution()
+                .map_err(ReplayError::Executor)?;
+            if execution_runtime.is_external_state()
+                && !retained_recovery
+                && !non_applied_ack
+                && execution.is_none()
+            {
+                return Err(ReplayError::InvalidRecord);
+            }
+            if execution.as_ref().is_some_and(|execution| {
+                retained_recovery
+                    || non_applied_ack
+                    || !execution.matches(input, before, position, &transition)
+            }) {
+                return Err(ReplayError::InvalidRecord);
+            }
+            execution
+        };
         let transition_proof =
             if !retained_recovery && attested_transition_invocation(input).is_some() {
                 let binding = executor
@@ -9138,6 +10981,8 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                 .insert(OrderedBase::post_genesis(), self.runtime.clone());
         }
         Ok(ReplayStep {
+            #[cfg(feature = "experimental-state-blocks")]
+            external_execution,
             state: transition.state,
             runtime: transition.next_runtime,
             outcome: if retained_recovery {
@@ -9215,6 +11060,8 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                     ordered_base: event.ordered_base,
                 };
                 return Ok(ReplayStep {
+                    #[cfg(feature = "experimental-state-blocks")]
+                    external_execution: None,
                     clean_management_result: None,
                     state: before.clone(),
                     runtime: self
@@ -9248,6 +11095,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
             unseen_admission,
             transition_proof_access,
             finalize_transition_proof_ack,
+            None,
         )?;
         step.merge_authenticated = true;
         Ok(step)
@@ -9558,7 +11406,11 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         materialization: &ReplayMaterialization,
     ) -> Result<ReplaySealedPublication, ReplayValidationError> {
         validate_publication_envelope(self.genesis, current, &next)?;
-        validate_system_authority_side_product(&entry.input, step)?;
+        #[cfg(feature = "experimental-state-blocks")]
+        let external_execution =
+            capture_publication_state_products(&entry.input, step, materialization)?;
+        #[cfg(not(feature = "experimental-state-blocks"))]
+        validate_step_side_products(&entry.input, step)?;
         let id = entry.id();
         let position_matches = matches!(
             step.position,
@@ -9669,6 +11521,8 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         }
         let fence_ancestry = successor_fence_ancestry(materialization, &next, false, Some(entry))?;
         let mut sealed = ReplaySealedPublication {
+            #[cfg(feature = "experimental-state-blocks")]
+            external_execution,
             expected: current.id(),
             next,
             anchor: ReplayPublicationAnchor::Ordered(entry.clone()),
@@ -9720,7 +11574,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         mode: ReplayPublicationMode,
     ) -> Result<ReplaySealedPublication, ReplayValidationError> {
         validate_publication_envelope(self.genesis, current, &next)?;
-        validate_system_authority_side_product(&entry.input, step)?;
+        validate_step_side_products(&entry.input, step)?;
         let id = entry.id();
         let installing_fence = mode == ReplayPublicationMode::SharedOrderedInstallFence;
         if !matches!(
@@ -9923,6 +11777,8 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         }
         let fence_ancestry = successor_fence_ancestry(materialization, &next, false, Some(entry))?;
         let mut sealed = ReplaySealedPublication {
+            #[cfg(feature = "experimental-state-blocks")]
+            external_execution: None,
             expected: current.id(),
             next,
             anchor: ReplayPublicationAnchor::Ordered(entry.clone()),
@@ -9967,7 +11823,11 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         materialization: &ReplayMaterialization,
     ) -> Result<ReplaySealedPublication, ReplayValidationError> {
         validate_publication_envelope(self.genesis, current, &next)?;
-        validate_system_authority_side_product(&entry.input, step)?;
+        #[cfg(feature = "experimental-state-blocks")]
+        let external_execution =
+            capture_publication_state_products(&entry.input, step, materialization)?;
+        #[cfg(not(feature = "experimental-state-blocks"))]
+        validate_step_side_products(&entry.input, step)?;
         let id = entry.id();
         let ordered_base = OrderedBase {
             index: current.ordered_index,
@@ -10026,6 +11886,8 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         }
         let fence_ancestry = successor_fence_ancestry(materialization, &next, false, None)?;
         let mut sealed = ReplaySealedPublication {
+            #[cfg(feature = "experimental-state-blocks")]
+            external_execution,
             expected: current.id(),
             next,
             anchor: ReplayPublicationAnchor::Local(entry.clone()),
@@ -10069,7 +11931,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         materialization: &ReplayMaterialization,
     ) -> Result<ReplaySealedPublication, ReplayValidationError> {
         validate_publication_envelope(self.genesis, current, &next)?;
-        validate_system_authority_side_product(&event.input, step)?;
+        validate_step_side_products(&event.input, step)?;
         let id = event.id();
         let position_matches = matches!(
             step.position,
@@ -10108,6 +11970,8 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         self.validate_publication_indexes(current, &next, step.ownership_delta)?;
         let fence_ancestry = successor_fence_ancestry(materialization, &next, false, None)?;
         let mut sealed = ReplaySealedPublication {
+            #[cfg(feature = "experimental-state-blocks")]
+            external_execution: None,
             expected: current.id(),
             next,
             anchor: ReplayPublicationAnchor::Merge {
@@ -10518,7 +12382,98 @@ fn validate_position<SourceError, ExecutorError>(
     }
 }
 
-fn validate_system_authority_side_product<SourceError, ExecutorError>(
+fn validate_step_side_products<SourceError, ExecutorError>(
+    input: &ReplayInput,
+    step: &ReplayStep,
+) -> Result<(), ReplayError<SourceError, ExecutorError>> {
+    // Capturing an execution is not sealing its data availability. Do not
+    // silently drop external candidates and publish only the descriptor bytes.
+    step.require_integrated_state_products()?;
+    validate_step_authority_products(input, step)
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+fn capture_publication_state_products(
+    input: &ReplayInput,
+    step: &ReplayStep,
+    before: &ReplayMaterialization,
+) -> Result<Option<Box<ReplayExternalExecution>>, ReplayValidationError> {
+    let Some(execution) = step.external_execution.as_ref() else {
+        if input.runtime.is_external_state()
+            && (step.state != *before.state() || step.runtime != before.heads().runtime)
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
+        validate_step_side_products(input, step)?;
+        return Ok(None);
+    };
+    if execution.owning_lane().is_none() {
+        if !input.runtime.is_external_state()
+            || !matches!(
+                &input.operation,
+                ReplayOperation::CleanManage {
+                    request: crate::agent_sdk::ManagementRequest::Install(_),
+                    ..
+                }
+            )
+            || !matches!(
+                step.position,
+                ReplayPosition::Ordered {
+                    merge_seal: Some(_),
+                    ..
+                }
+            )
+            || !execution.matches_roots(&before.external_roots)
+            || !execution.matches(input, before.state(), step.position, execution.transition())
+            || execution.transition().state != step.state
+            || execution.transition().next_runtime != step.runtime
+            || step.outcome != ReplayStepOutcome::Applied(execution.transition().disposition)
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
+        validate_step_authority_products(input, step)?;
+        return Ok(Some(Box::new(execution.clone())));
+    }
+    let lane = execution.owning_lane().ok_or(ReplayError::InvalidRecord)?;
+    if !execution.matches_roots(&before.external_roots)
+        || !input.runtime.is_external_state()
+        || !matches!(
+            &input.operation,
+            ReplayOperation::CleanInvoke {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                ..
+            } | ReplayOperation::CleanAcknowledge {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                ..
+            }
+        )
+        || !matches!(
+            step.position,
+            ReplayPosition::Local { .. }
+                | ReplayPosition::Ordered {
+                    merge_seal: None,
+                    ..
+                }
+        )
+        || !execution.matches(input, before.state(), step.position, execution.transition())
+        || execution.transition().state != step.state
+        || execution.transition().next_runtime != step.runtime
+        || step.outcome != ReplayStepOutcome::Applied(execution.transition().disposition)
+        || input.persisted_lane().state_lane().map(|value| value as u8)
+            != Some(lane.base.context().scope().lane() as u8)
+        || before
+            .external_roots
+            .get(&input.persisted_lane())
+            .map(|root| root.descriptor)
+            != Some(lane.base)
+    {
+        return Err(ReplayError::InvalidRecord);
+    }
+    validate_step_authority_products(input, step)?;
+    Ok(Some(Box::new(execution.clone())))
+}
+
+fn validate_step_authority_products<SourceError, ExecutorError>(
     input: &ReplayInput,
     step: &ReplayStep,
 ) -> Result<(), ReplayError<SourceError, ExecutorError>> {
@@ -11009,6 +12964,8 @@ fn noop_replay_step(
     outcome: ReplayStepOutcome,
 ) -> ReplayStep {
     ReplayStep {
+        #[cfg(feature = "experimental-state-blocks")]
+        external_execution: None,
         clean_management_result: None,
         state: before.clone(),
         runtime,
@@ -11634,6 +13591,8 @@ pub fn derive_lane_state<SourceError, ExecutorError>(
     state: &[u8],
 ) -> Result<LaneStateManifest, ReplayError<SourceError, ExecutorError>> {
     let manifest = LaneStateManifest {
+        #[cfg(feature = "experimental-state-blocks")]
+        external_root: None,
         genesis,
         runtime,
         lane,
@@ -11756,6 +13715,8 @@ mod aggregate {
     }
 
     struct ReplayBase {
+        #[cfg(feature = "experimental-state-blocks")]
+        external_roots: BTreeMap<PersistedLane, super::super::journal::ExternalStateRoot>,
         clean_management: Option<crate::agent::journal::CleanManagementEvidence>,
         state: RuntimeState,
         artifacts: Option<ArtifactClosure>,
@@ -11770,7 +13731,9 @@ mod aggregate {
         merge_invocations: InvocationIndexId,
         local_invocations: InvocationIndexId,
         transition_proof_boundary: TransitionProofIndexManifest,
-        genesis_input: Option<ReplayInput>,
+        // The Create envelope is large. Keep one owned allocation rather than
+        // copying it through each recovery frame before nested guest validation.
+        genesis_input: Option<Box<ReplayInput>>,
         fence_ancestry: FenceAncestryEvidence,
     }
 
@@ -11856,6 +13819,29 @@ mod aggregate {
             .ok_or_else(|| journal(JournalStoreError::MissingObject))
     }
 
+    /// Current replay projections carry opaque r19 components. Until they
+    /// retain authenticated external-root provenance and pinned availability,
+    /// reject explicitly declared external state rather than erase its format
+    /// while copying the descriptor blob into RuntimeState. Magic bytes alone
+    /// never select a format. Maintenance/codec readers remain separate.
+    fn require_opaque_lane_state<S, ResolverError, ExecutorError>(
+        store: &S,
+        id: LaneStateId,
+    ) -> Result<LaneStateManifest, MaterializeError<ResolverError, ExecutorError>>
+    where
+        S: AgentJournalStore,
+    {
+        let manifest: LaneStateManifest = require_record(store, id)?;
+        if manifest.id() != id || manifest.validate().is_err() {
+            return Err(ReplayError::InvalidRecord);
+        }
+        #[cfg(feature = "experimental-state-blocks")]
+        if manifest.external_root.is_some() {
+            return Err(ReplayError::InvalidRecord);
+        }
+        Ok(manifest)
+    }
+
     fn require_genesis<S, ResolverError, ExecutorError>(
         store: &S,
         id: AgentJournalGenesisId,
@@ -11915,6 +13901,10 @@ mod aggregate {
             return Err(ReplayError::InvalidFence);
         }
         let state: LaneStateManifest = require_record(store, seal.merge_state)?;
+        #[cfg(feature = "experimental-state-blocks")]
+        if state.external_root.is_some() && !state.runtime.is_external_state() {
+            return Err(ReplayError::InvalidFence);
+        }
         let bytes = require_blob(store, JournalBlobClass::LaneState, &state.state)?;
         if state.id() != seal.merge_state
             || state.genesis != seal.genesis
@@ -11986,10 +13976,16 @@ mod aggregate {
     }
 
     fn load_checkpoint_base<S, E, R>(
-        store: &S,
+        store: &mut S,
         executor: &mut E,
         heads: &JournalHeads,
         checkpoint_id: CheckpointId,
+        #[cfg(feature = "experimental-state-blocks")] mut external_budget: Option<
+            &mut crate::agent_sdk::state_blocks::ReadBudget,
+        >,
+        #[cfg(feature = "experimental-state-blocks")] external_genesis: Option<
+            &ReplaySealedExternalLocalGenesis,
+        >,
     ) -> Result<ReplayBase, MaterializeError<R::Error, E::Error>>
     where
         S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
@@ -11997,6 +13993,11 @@ mod aggregate {
         R: OrderedBaseResolver,
     {
         let checkpoint: CheckpointManifest = require_record(store, checkpoint_id)?;
+        #[cfg(feature = "experimental-state-blocks")]
+        if let Some(seal) = external_genesis {
+            seal.validate_checkpoint_scope(store, heads)
+                .map_err(journal)?;
+        }
         if checkpoint.validate().is_err()
             || checkpoint.id() != checkpoint_id
             || checkpoint.genesis != heads.genesis
@@ -12022,6 +14023,8 @@ mod aggregate {
         let mut state = RuntimeState::default();
         let mut local_cursor = None;
         let mut aggregate_state_bytes = 0usize;
+        #[cfg(feature = "experimental-state-blocks")]
+        let mut external_roots = BTreeMap::new();
         for lane in &checkpoint.lanes {
             let manifest: LaneStateManifest = require_record(store, lane.state)?;
             if manifest.validate().is_err()
@@ -12043,6 +14046,29 @@ mod aggregate {
             let bytes = require_blob(store, JournalBlobClass::LaneState, &manifest.state)?;
             if manifest.state != BlobRef::of_bytes(&bytes) {
                 return Err(ReplayError::InvalidRecord);
+            }
+            #[cfg(feature = "experimental-state-blocks")]
+            if let Some(root) = &manifest.external_root {
+                if !checkpoint.runtime.is_external_state()
+                    || !supported_external_checkpoint_lane(&manifest, external_genesis)
+                {
+                    return Err(ReplayError::InvalidRecord);
+                }
+                let budget = external_budget
+                    .as_deref_mut()
+                    .ok_or(ReplayError::InvalidRecord)?;
+                // The checkpoint selects the exact declaration. Availability is
+                // audited only on this opt-in recovery path, never on requests.
+                // The caller retains the exclusive store borrow for the whole
+                // materialization; the returned metadata is not a portable pin.
+                let session = super::super::state_block_store::StateBlockStaging::audit_manifest(
+                    store, &manifest, budget,
+                )
+                .map_err(journal)?;
+                drop(session);
+                if external_roots.insert(lane.lane, root.clone()).is_some() {
+                    return Err(ReplayError::InvalidRecord);
+                }
             }
             match (lane.lane, lane.node, lane.invocations, &manifest.cursor) {
                 (PersistedLane::Control, None, None, LaneCursor::Ordered { base })
@@ -12113,6 +14139,14 @@ mod aggregate {
         }
         authenticate_artifacts(store, &artifacts)?;
 
+        #[cfg(feature = "experimental-state-blocks")]
+        if external_roots
+            .values()
+            .any(|root| !artifacts.artifacts.contains(&root.runtime.package))
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
+
         let structural_merge =
             load_structural_merge_base(store, checkpoint.genesis, checkpoint.merge_frontier)
                 .map_err(lift_replay)?;
@@ -12135,6 +14169,8 @@ mod aggregate {
         let snapshots = MaterializedOrderedSnapshots::singleton(
             ordered,
             MaterializedOrderedSnapshot {
+                #[cfg(feature = "experimental-state-blocks")]
+                linear_root: external_roots.get(&PersistedLane::Linear).cloned(),
                 runtime: checkpoint.runtime.clone(),
                 control: state.control.clone(),
                 linear: state.linear.clone(),
@@ -12142,6 +14178,8 @@ mod aggregate {
         )
         .map_err(lift_validation)?;
         Ok(ReplayBase {
+            #[cfg(feature = "experimental-state-blocks")]
+            external_roots,
             state,
             clean_management: checkpoint.clean_management.clone(),
             artifacts: Some(artifacts),
@@ -12227,6 +14265,8 @@ mod aggregate {
             }
         }
         Ok(ReplayBase {
+            #[cfg(feature = "experimental-state-blocks")]
+            external_roots: BTreeMap::new(),
             state: RuntimeState::default(),
             clean_management: None,
             artifacts: None,
@@ -12259,7 +14299,7 @@ mod aggregate {
             )
             .id(),
             transition_proof_boundary: transition_proofs,
-            genesis_input: Some(genesis.create),
+            genesis_input: Some(Box::new(genesis.create)),
             fence_ancestry: FenceAncestryEvidence::post_genesis(heads.genesis)
                 .map_err(lift_validation)?,
         })
@@ -12530,11 +14570,16 @@ mod aggregate {
         {
             return Err(ReplayError::InvalidOrderedBase);
         }
-        Ok(MaterializedOrderedSnapshot {
+        let materialized = MaterializedOrderedSnapshot {
+            #[cfg(feature = "experimental-state-blocks")]
+            linear_root: snapshot.linear_root,
             runtime: snapshot.runtime,
             control: snapshot.control,
             linear: snapshot.linear,
-        })
+        };
+        #[cfg(feature = "experimental-state-blocks")]
+        materialized.validate(requested).map_err(lift_validation)?;
+        Ok(materialized)
     }
 
     fn resolve_snapshot<R, E>(
@@ -12572,6 +14617,10 @@ mod aggregate {
         frontier: MergeFrontierId,
         ancestry: &BTreeSet<MergeEventId>,
     ) -> Result<MergeFence, MaterializeError<ResolverError, ExecutorError>> {
+        #[cfg(feature = "experimental-state-blocks")]
+        if dependency.state.external_root.is_some() != entry.input.runtime.is_external_state() {
+            return Err(ReplayError::InvalidFence);
+        }
         let parent = OrderedBase {
             index: entry
                 .index
@@ -12604,6 +14653,204 @@ mod aggregate {
         })
     }
 
+    #[cfg(feature = "experimental-state-blocks")]
+    fn recover_external_step<S: AgentJournalStore>(
+        store: &S,
+        genesis: &AgentJournalGenesis,
+        roots: &mut BTreeMap<PersistedLane, super::super::journal::ExternalStateRoot>,
+        cursor: LaneCursor,
+        before: &RuntimeState,
+        step: &ReplayStep,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<(), ReplayError<JournalStoreError, core::convert::Infallible>> {
+        use super::super::state_block_store::{JournalBlockReader, verify_persisted_execution};
+        if let Some(execution) = &step.external_execution {
+            if execution.owning_lane().is_none() {
+                if !execution.matches_roots(roots)
+                    || !matches!(
+                        step.position,
+                        ReplayPosition::Ordered {
+                            merge_seal: Some(_),
+                            ..
+                        }
+                    )
+                    || roots.keys().any(|lane| {
+                        state_component(before, *lane) != state_component(&step.state, *lane)
+                    })
+                {
+                    return Err(ReplayError::InvalidRecord);
+                }
+                return Ok(());
+            }
+        }
+        let owning = match cursor {
+            LaneCursor::Ordered { .. } => PersistedLane::Linear,
+            LaneCursor::Local { .. } => PersistedLane::Local,
+            _ => return Err(ReplayError::InvalidPosition),
+        };
+        for lane in roots.keys() {
+            if *lane != owning
+                && state_component(before, *lane) != state_component(&step.state, *lane)
+            {
+                return Err(ReplayError::InvalidRecord);
+            }
+        }
+        let Some(root) = roots.get(&owning) else {
+            return step.require_integrated_state_products();
+        };
+        let previous = LaneStateManifest {
+            genesis: genesis.id(),
+            runtime: step.runtime.clone(),
+            lane: owning,
+            cursor,
+            state: BlobRef::of_bytes(state_component(before, owning)),
+            external_root: Some(root.clone()),
+        };
+        let successor = step
+            .external_lane_successor(genesis, &previous)
+            .map_err(|e| e.map_source(|never| match never {}))?;
+        let next = successor.external_root.ok_or(ReplayError::InvalidRecord)?;
+        if let Some(execution) = &step.external_execution {
+            let lane = execution.owning_lane().ok_or(ReplayError::InvalidRecord)?;
+            if lane.base != root.descriptor || !execution.matches_roots(roots) {
+                return Err(ReplayError::InvalidRecord);
+            }
+            let available = verify_persisted_execution(
+                root.descriptor,
+                execution,
+                &mut JournalBlockReader {
+                    store,
+                    scope: root.descriptor.context().scope(),
+                },
+                budget,
+            )
+            .map_err(ReplayError::Source)?;
+            if available != next.descriptor {
+                return Err(ReplayError::InvalidRecord);
+            }
+        }
+        roots.insert(owning, next);
+        Ok(())
+    }
+
+    /// Keep block reads inside the replay owner's exclusive store lifetime.
+    /// Authentication/ownership checks still precede the execution callback.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_recovery_step<S, E, ResolverError>(
+        machine: &mut ReplayMachine<InvocationIndexes<'_, S>>,
+        executor: &mut E,
+        input: &ReplayInput,
+        before: &RuntimeState,
+        position: ReplayPosition,
+        #[cfg(feature = "experimental-state-blocks")] external: Option<(
+            &AgentJournalGenesis,
+            &BTreeMap<PersistedLane, super::super::journal::ExternalStateRoot>,
+            LaneCursor,
+            &mut crate::agent_sdk::state_blocks::ReadBudget,
+        )>,
+    ) -> Result<ReplayStep, MaterializeError<ResolverError, E::Error>>
+    where
+        S: AgentJournalStore,
+        E: ReplayExecutor,
+    {
+        #[cfg(feature = "experimental-state-blocks")]
+        if let Some((genesis, roots, previous, budget)) = external {
+            if !matches!(
+                input.operation,
+                ReplayOperation::CleanInvoke { .. }
+                    | ReplayOperation::CleanAcknowledge { .. }
+                    | ReplayOperation::CleanManage {
+                        request: crate::agent_sdk::ManagementRequest::Install(_),
+                        ..
+                    }
+            ) {
+                return Err(ReplayError::InvalidRecord);
+            }
+            let lane = input.persisted_lane();
+            let next = match position {
+                ReplayPosition::Ordered {
+                    merge_seal: Some(_),
+                    ..
+                } if lane == PersistedLane::Control => previous.clone(),
+                ReplayPosition::Ordered {
+                    id,
+                    index,
+                    merge_seal: None,
+                    ..
+                } if lane == PersistedLane::Linear => LaneCursor::Ordered {
+                    base: OrderedBase {
+                        index,
+                        head: Some(id),
+                    },
+                },
+                ReplayPosition::Local {
+                    id, node, revision, ..
+                } if lane == PersistedLane::Local => LaneCursor::Local {
+                    node,
+                    revision,
+                    head: Some(id),
+                },
+                _ => return Err(ReplayError::InvalidRecord),
+            };
+            if lane != PersistedLane::Control && !roots.contains_key(&lane) {
+                return Err(ReplayError::InvalidRecord);
+            }
+            let mut lanes = Vec::with_capacity(roots.len());
+            for (read_lane, read_root) in roots {
+                if *read_lane == lane {
+                    let mut manifest = derive_lane_state(
+                        genesis.id(),
+                        input.runtime.clone(),
+                        lane,
+                        previous.clone(),
+                        state_component(before, lane),
+                    )?;
+                    manifest.external_root = Some(read_root.clone());
+                    manifest
+                        .validate()
+                        .map_err(|_| ReplayError::InvalidRecord)?;
+                    lanes.push((manifest, next.clone()));
+                } else {
+                    // Read-only declarations retain the root-producing cursor,
+                    // including when later no-op entries advanced journal heads.
+                    let mut read_manifest = derive_lane_state(
+                        genesis.id(),
+                        input.runtime.clone(),
+                        *read_lane,
+                        read_root.cursor.clone(),
+                        state_component(before, *read_lane),
+                    )?;
+                    read_manifest.external_root = Some(read_root.clone());
+                    read_manifest
+                        .validate()
+                        .map_err(|_| ReplayError::InvalidRecord)?;
+                    lanes.push((read_manifest, read_root.cursor.clone()));
+                }
+            }
+            return machine.apply_with_unseen_capacity_and_proof_access(
+                executor,
+                input,
+                before,
+                position,
+                None,
+                ReplayTransitionProofAccess::PublishedOnly,
+                true,
+                Some(&mut |ownership, executor| {
+                    executor.execute_with_external_state(
+                        input,
+                        before,
+                        position,
+                        genesis,
+                        &lanes,
+                        ownership.backing_store(),
+                        budget,
+                    )
+                }),
+            );
+        }
+        machine.apply(executor, input, before, position)
+    }
+
     fn execute_plan<S, E, R>(
         store: &mut S,
         executor: &mut E,
@@ -12612,12 +14859,50 @@ mod aggregate {
         mut base: ReplayBase,
         plan: MaterializationPlan,
         replayed_root: Option<ReplayedRootJournalIdentity>,
+        #[cfg(feature = "experimental-state-blocks")] mut external_budget: Option<
+            &mut crate::agent_sdk::state_blocks::ReadBudget,
+        >,
     ) -> Result<ReplayMaterialization, MaterializeError<R::Error, E::Error>>
     where
         S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
         E: ReplayExecutor,
         R: OrderedBaseResolver,
     {
+        #[cfg(feature = "experimental-state-blocks")]
+        if !base.external_roots.is_empty()
+            && plan.actions.iter().any(|action| match action {
+                MaterializationAction::Merge { .. } => true,
+                MaterializationAction::Ordered {
+                    entry,
+                    fence: Some(fence),
+                    ..
+                } => {
+                    !base.merge.roots().is_empty()
+                        || !matches!(
+                            &entry.input.operation,
+                            ReplayOperation::CleanManage {
+                                request: crate::agent_sdk::ManagementRequest::Install(_),
+                                ..
+                            }
+                        )
+                        || fence.state.external_root.as_ref()
+                            != base.external_roots.get(&PersistedLane::Merge)
+                }
+                _ => false,
+            })
+        {
+            // Only a metadata-only Install over the unchanged initial Merge
+            // projection is integrated; external Merge execution remains closed.
+            return Err(ReplayError::InvalidRecord);
+        }
+        #[cfg(feature = "experimental-state-blocks")]
+        let external_genesis = if base.external_roots.is_empty() {
+            None
+        } else {
+            Some(Box::new(require_genesis(store, heads.genesis)?))
+        };
+        #[cfg(feature = "experimental-state-blocks")]
+        let mut external_roots = core::mem::take(&mut base.external_roots);
         let canonical_head = OrderedBase {
             index: heads.ordered_index,
             head: heads.ordered_head,
@@ -12750,6 +15035,7 @@ mod aggregate {
                 )
                 .map_err(historical_replay_error)?;
             clean_management = step.management_evidence(&input, &state);
+            step.require_integrated_state_products()?;
             state = step.state;
             validate_runtime_state_bound(&state)?;
             if step.runtime != input.runtime {
@@ -12762,6 +15048,8 @@ mod aggregate {
                 .insert(
                     OrderedBase::post_genesis(),
                     MaterializedOrderedSnapshot {
+                        #[cfg(feature = "experimental-state-blocks")]
+                        linear_root: None,
                         runtime: step.runtime,
                         control: state.control.clone(),
                         linear: state.linear.clone(),
@@ -12884,6 +15172,7 @@ mod aggregate {
                                 ReplayMaterializationSourceError<R::Error>,
                             >(executor, &plan.ordered, *id, event, &before)
                             .map_err(historical_replay_error)?;
+                        step.require_integrated_state_products()?;
                         if merge_facts
                             .insert(
                                 *id,
@@ -12964,20 +15253,59 @@ mod aggregate {
                         merge: state.merge.clone(),
                         local: state.local.clone(),
                     };
-                    let step = machine
-                        .apply::<_, ReplayMaterializationSourceError<R::Error>>(
-                            executor,
-                            &entry.input,
-                            &before,
-                            ReplayPosition::Local {
-                                id,
-                                node: entry.node,
-                                revision: entry.revision,
-                                ordered_base: entry.ordered_base,
-                                merge_frontier: entry.merge_frontier,
+                    let step = apply_recovery_step::<_, _, R::Error>(
+                        &mut machine,
+                        executor,
+                        &entry.input,
+                        &before,
+                        ReplayPosition::Local {
+                            id,
+                            node: entry.node,
+                            revision: entry.revision,
+                            ordered_base: entry.ordered_base,
+                            merge_frontier: entry.merge_frontier,
+                        },
+                        #[cfg(feature = "experimental-state-blocks")]
+                        match external_genesis.as_deref() {
+                            Some(genesis) => Some((
+                                genesis,
+                                &external_roots,
+                                LaneCursor::Local {
+                                    node: entry.node,
+                                    revision: local_revision,
+                                    head: local_head,
+                                },
+                                external_budget
+                                    .as_deref_mut()
+                                    .ok_or(ReplayError::InvalidRecord)?,
+                            )),
+                            None => None,
+                        },
+                    )
+                    .map_err(historical_replay_error)?;
+                    #[cfg(feature = "experimental-state-blocks")]
+                    if let Some(genesis) = &external_genesis {
+                        recover_external_step(
+                            machine.ownership.backing_store(),
+                            genesis,
+                            &mut external_roots,
+                            LaneCursor::Local {
+                                node: heads.node,
+                                revision: local_revision,
+                                head: local_head,
                             },
+                            &before,
+                            &step,
+                            external_budget
+                                .as_deref_mut()
+                                .ok_or(ReplayError::InvalidRecord)?,
                         )
-                        .map_err(historical_replay_error)?;
+                        .map_err(lift_replay)?;
+                    } else {
+                        step.require_integrated_state_products()?;
+                    }
+                    #[cfg(not(feature = "experimental-state-blocks"))]
+                    step.require_integrated_state_products()?;
                     state.local = step.state.local;
                     current_transition_proof_shadow = machine
                         .transition_proof_projection
@@ -13034,19 +15362,54 @@ mod aggregate {
                             .finalize_merge_outcomes(id, seal, &merge_facts)
                             .map_err(lift_validation)?;
                     }
-                    let step = machine
-                        .apply::<_, ReplayMaterializationSourceError<R::Error>>(
-                            executor,
-                            &entry.input,
-                            &state,
-                            ReplayPosition::Ordered {
-                                id,
-                                index: entry.index,
-                                merge_frontier: entry.merge_frontier,
-                                merge_seal: entry.merge_seal,
+                    let step = apply_recovery_step::<_, _, R::Error>(
+                        &mut machine,
+                        executor,
+                        &entry.input,
+                        &state,
+                        ReplayPosition::Ordered {
+                            id,
+                            index: entry.index,
+                            merge_frontier: entry.merge_frontier,
+                            merge_seal: entry.merge_seal,
+                        },
+                        #[cfg(feature = "experimental-state-blocks")]
+                        match external_genesis.as_deref() {
+                            Some(genesis) => Some((
+                                genesis,
+                                &external_roots,
+                                LaneCursor::Ordered {
+                                    base: current_ordered,
+                                },
+                                external_budget
+                                    .as_deref_mut()
+                                    .ok_or(ReplayError::InvalidRecord)?,
+                            )),
+                            None => None,
+                        },
+                    )
+                    .map_err(historical_replay_error)?;
+                    #[cfg(feature = "experimental-state-blocks")]
+                    if let Some(genesis) = &external_genesis {
+                        recover_external_step(
+                            machine.ownership.backing_store(),
+                            genesis,
+                            &mut external_roots,
+                            LaneCursor::Ordered {
+                                base: current_ordered,
                             },
+                            &state,
+                            &step,
+                            external_budget
+                                .as_deref_mut()
+                                .ok_or(ReplayError::InvalidRecord)?,
                         )
-                        .map_err(historical_replay_error)?;
+                        .map_err(lift_replay)?;
+                    } else {
+                        step.require_integrated_state_products()?;
+                    }
+                    #[cfg(not(feature = "experimental-state-blocks"))]
+                    step.require_integrated_state_products()?;
                     let next_artifacts = derive_successor_artifact_closure(
                         artifacts.as_ref().ok_or(ReplayError::InvalidRecord)?,
                         &entry.input,
@@ -13103,6 +15466,8 @@ mod aggregate {
                         .insert(
                             current_ordered,
                             MaterializedOrderedSnapshot {
+                                #[cfg(feature = "experimental-state-blocks")]
+                                linear_root: external_roots.get(&PersistedLane::Linear).cloned(),
                                 runtime: step.runtime,
                                 control: state.control.clone(),
                                 linear: state.linear.clone(),
@@ -13206,6 +15571,8 @@ mod aggregate {
             return Err(ReplayError::InvalidFence);
         }
         Ok(ReplayMaterialization {
+            #[cfg(feature = "experimental-state-blocks")]
+            external_roots,
             clean_management,
             heads_id: heads.id(),
             heads,
@@ -13244,10 +15611,423 @@ mod aggregate {
         E: ReplayExecutor,
         R: OrderedBaseResolver,
     {
+        materialize_current_inner(
+            store,
+            executor,
+            resolver,
+            #[cfg(feature = "experimental-state-blocks")]
+            None,
+            #[cfg(feature = "experimental-state-blocks")]
+            None,
+        )
+    }
+
+    /// Opt-in checkpoint recovery with an aggregate external-block audit
+    /// budget shared by the checkpoint audit and Ordered/Local suffix checks.
+    /// Ordinary recovery remains opaque-only. Merge roots/fences are unsupported.
+    /// This does not open publication or mint a durable root pin.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn materialize_external_checkpoint<S, E, R>(
+        store: &mut S,
+        executor: &mut E,
+        resolver: &R,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<ReplayMaterialization, MaterializeError<R::Error, E::Error>>
+    where
+        S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
+        E: ReplayExecutor,
+        R: OrderedBaseResolver,
+    {
+        materialize_current_inner(store, executor, resolver, Some(budget), None)
+    }
+
+    /// Recover from an independently authenticated external Local genesis.
+    /// Checkpoints may retain its exact unchanged initial Merge declaration.
+    /// Ordered/Local suffixes use captured-execution checks; Merge/fence work and
+    /// runtime changes remain refused. No caller state replaces persisted bytes.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn materialize_external_genesis<S, E, R>(
+        store: &mut S,
+        seal: &ReplaySealedExternalLocalGenesis,
+        executor: &mut E,
+        resolver: &R,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<ReplayMaterialization, MaterializeError<R::Error, E::Error>>
+    where
+        S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
+        E: ReplayExecutor,
+        R: OrderedBaseResolver,
+    {
         let heads = store
             .heads()
             .map_err(journal)?
             .ok_or_else(|| journal(JournalStoreError::NotInitialized))?;
+        seal.validate_checkpoint_scope(store, &heads)
+            .map_err(|error| {
+                if error == JournalStoreError::ScopeMismatch {
+                    ReplayError::ScopeMismatch
+                } else {
+                    journal(error)
+                }
+            })?;
+        // The borrowed seal qualifies only its unchanged initial Merge root,
+        // including after checkpoint compaction. No caller state is admitted.
+        materialize_current_inner(store, executor, resolver, Some(budget), Some(seal))
+    }
+
+    /// Validate a head selected by the locked filesystem opener, including a
+    /// staged successor, without installing it or exporting a replay cursor.
+    /// The common replay validates suffix execution and persisted block
+    /// availability; guest output must never repair missing files here.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn validate_external_genesis_head<S, E, R>(
+        store: &mut S,
+        seal: &ReplaySealedExternalLocalGenesis,
+        heads: &JournalHeads,
+        executor: &mut E,
+        resolver: &R,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<(), JournalStoreError>
+    where
+        S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
+        E: ReplayExecutor,
+        R: OrderedBaseResolver,
+    {
+        seal.validate_checkpoint_scope(store, heads)?;
+        let recovered = materialize_heads_inner(
+            store,
+            executor,
+            resolver,
+            heads.clone(),
+            Some(budget),
+            Some(seal),
+        )
+        .map_err(|_| JournalStoreError::Unavailable)?;
+        if recovered.heads() != heads {
+            return Err(JournalStoreError::Corrupt);
+        }
+        let lanes = external_checkpoint_lanes(store, heads)?;
+        let availability = ExternalCheckpointValidation {
+            mutation: None,
+            store: store.instance_id(),
+            predecessor: heads.id(),
+            successor: heads.id(),
+            predecessor_checkpoint: heads.checkpoint,
+            successor_checkpoint: heads.checkpoint.ok_or(JournalStoreError::NonCanonical)?,
+            predecessor_lanes: &lanes,
+            successor_lanes: &lanes,
+        };
+        super::super::journal_store::validate_head_targets_with_availability(
+            store,
+            heads,
+            Some(&availability),
+        )
+    }
+
+    /// One independently ordered Local journal, pinned from recovery through
+    /// successive commits. No mutable store handle or transferable availability
+    /// token escapes. Opening audits once; mutations verify changed paths only.
+    /// A failed CAS poisons the owner because durable publication may have won
+    /// before the error; callers must recover, never execute on a stale cursor.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) struct PinnedExternalJournal<'store, S: AgentJournalStore> {
+        store: &'store mut S,
+        materialization: ReplayMaterialization,
+        checkpoint_lanes: BTreeSet<LaneStateId>,
+        poisoned: bool,
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) enum ExternalJournalEntry<'a> {
+        Ordered(&'a OrderedEntry),
+        Local(&'a LocalEntry),
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) enum ExternalJournalCommit {
+        AlreadyCommitted(ReplayCommittedRecovery),
+        Published(JournalPublication, Vec<ReplayExecutionResult>),
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    impl<'store, S> PinnedExternalJournal<'store, S>
+    where
+        S: super::super::journal_store::ExternalMutationStore
+            + ReplaySource<Error = JournalStoreError>,
+    {
+        pub(crate) fn open<E: ReplayExecutor, R: OrderedBaseResolver>(
+            store: &'store mut S,
+            seal: &ReplaySealedExternalLocalGenesis,
+            executor: &mut E,
+            resolver: &R,
+            budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+        ) -> Result<Self, MaterializeError<R::Error, E::Error>> {
+            let materialization =
+                materialize_external_genesis(store, seal, executor, resolver, budget)?;
+            let checkpoint_lanes =
+                external_checkpoint_lanes(store, materialization.heads()).map_err(journal)?;
+            Ok(Self {
+                store,
+                materialization,
+                checkpoint_lanes,
+                poisoned: false,
+            })
+        }
+
+        pub(crate) fn materialization(&self) -> Result<&ReplayMaterialization, JournalStoreError> {
+            if self.poisoned {
+                Err(JournalStoreError::Unavailable)
+            } else {
+                Ok(&self.materialization)
+            }
+        }
+
+        /// Explicit maintenance checkpoint. Full root audits are budgeted here,
+        /// never in the ordinary mutation path. Preserve the pinned store and
+        /// poison on uncertain publication exactly as for mutations.
+        pub(crate) fn checkpoint(
+            &mut self,
+            genesis: &ReplaySealedExternalLocalGenesis,
+            budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+        ) -> Result<JournalPublication, RecoveryError>
+        where
+            S: super::super::journal_store::AuditedCheckpointStore
+                + TransitionProofPublicationStore,
+        {
+            self.checkpoint_using(genesis, budget, |store, seal, availability| {
+                store.publish_audited_checkpoint(seal, availability)
+            })
+        }
+
+        fn checkpoint_using(
+            &mut self,
+            genesis: &ReplaySealedExternalLocalGenesis,
+            budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+            publish: impl FnOnce(
+                &mut S,
+                &ReplaySealedPublication,
+                &ExternalCheckpointValidation<'_>,
+            ) -> Result<JournalPublication, JournalStoreError>,
+        ) -> Result<JournalPublication, RecoveryError>
+        where
+            S: super::super::journal_store::AuditedCheckpointStore
+                + TransitionProofPublicationStore,
+        {
+            if self.poisoned {
+                return Err(journal(JournalStoreError::Unavailable));
+            }
+            let prepared = prepare_checkpoint(self.store, &self.materialization)?;
+            let audited = prepared
+                .audit_external_checkpoint_from_genesis(genesis, budget)
+                .map_err(journal)?;
+            let checkpoint_lanes = audited.lanes.clone();
+            self.poisoned = true;
+            let (publication, successor, _) = audited.publish_using(publish).map_err(journal)?;
+            self.materialization = successor;
+            self.checkpoint_lanes = checkpoint_lanes;
+            self.poisoned = false;
+            Ok(publication)
+        }
+
+        #[cfg(test)]
+        pub(super) fn checkpoint_with_fault_for_test(
+            &mut self,
+            genesis: &ReplaySealedExternalLocalGenesis,
+            budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+            publish: impl FnOnce(
+                &mut S,
+                &ReplaySealedPublication,
+                &ExternalCheckpointValidation<'_>,
+            ) -> Result<JournalPublication, JournalStoreError>,
+        ) -> Result<JournalPublication, RecoveryError>
+        where
+            S: super::super::journal_store::AuditedCheckpointStore
+                + TransitionProofPublicationStore,
+        {
+            self.checkpoint_using(genesis, budget, publish)
+        }
+
+        #[cfg(test)]
+        pub(super) fn store_for_test(&self) -> &S {
+            self.store
+        }
+
+        pub(crate) fn apply<E: ReplayExecutor>(
+            &mut self,
+            executor: &mut E,
+            entry: ExternalJournalEntry<'_>,
+            budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+        ) -> Result<ExternalJournalCommit, MaterializeError<core::convert::Infallible, E::Error>>
+        {
+            self.apply_using(executor, entry, budget, |store, seal, availability| {
+                store.publish_external_mutation(seal, availability)
+            })
+        }
+
+        #[cfg(test)]
+        pub(super) fn apply_with_fault_for_test<E: ReplayExecutor>(
+            &mut self,
+            executor: &mut E,
+            entry: ExternalJournalEntry<'_>,
+            budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+            publish: impl FnOnce(
+                &mut S,
+                &ReplaySealedPublication,
+                &ExternalCheckpointValidation<'_>,
+            ) -> Result<JournalPublication, JournalStoreError>,
+        ) -> Result<ExternalJournalCommit, MaterializeError<core::convert::Infallible, E::Error>>
+        {
+            self.apply_using(executor, entry, budget, publish)
+        }
+
+        fn apply_using<E: ReplayExecutor>(
+            &mut self,
+            executor: &mut E,
+            entry: ExternalJournalEntry<'_>,
+            budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+            publish: impl FnOnce(
+                &mut S,
+                &ReplaySealedPublication,
+                &ExternalCheckpointValidation<'_>,
+            ) -> Result<JournalPublication, JournalStoreError>,
+        ) -> Result<ExternalJournalCommit, MaterializeError<core::convert::Infallible, E::Error>>
+        {
+            if self.poisoned {
+                return Err(journal(JournalStoreError::Unavailable));
+            }
+            let prepared = match entry {
+                ExternalJournalEntry::Ordered(entry) => {
+                    prepare_ordered(self.store, executor, &self.materialization, entry)?
+                }
+                ExternalJournalEntry::Local(entry) => {
+                    prepare_local(self.store, executor, &self.materialization, entry)?
+                }
+            };
+            let ReplayPreparation::Ready(prepared) = prepared else {
+                let ReplayPreparation::AlreadyCommitted(recovery) = prepared else {
+                    unreachable!()
+                };
+                return Ok(ExternalJournalCommit::AlreadyCommitted(recovery));
+            };
+            let checkpoint = self
+                .materialization
+                .heads
+                .checkpoint
+                .ok_or_else(|| journal(JournalStoreError::NonCanonical))?;
+            let mut availability = ExternalCheckpointValidation {
+                mutation: Some((&prepared.sealed, false)),
+                store: prepared.store.instance_id(),
+                predecessor: self.materialization.heads.id(),
+                successor: prepared.sealed.next.id(),
+                predecessor_checkpoint: Some(checkpoint),
+                successor_checkpoint: checkpoint,
+                predecessor_lanes: &self.checkpoint_lanes,
+                successor_lanes: &self.checkpoint_lanes,
+            };
+            if !availability.permits_pinned_base(prepared.store.instance_id(), &prepared.sealed) {
+                return Err(journal(JournalStoreError::NonCanonical));
+            }
+            if let Some(execution) = prepared.sealed.external_execution() {
+                if execution.owning_lane().is_none() {
+                    if prepared.successor.external_roots != self.materialization.external_roots
+                        || !execution.matches_roots(&self.materialization.external_roots)
+                        || !execution.output().changes().is_empty()
+                    {
+                        return Err(journal(JournalStoreError::NonCanonical));
+                    }
+                } else {
+                    let mut staging =
+                    super::super::state_block_store::StateBlockStaging::from_pinned_publication(
+                        prepared.store,
+                        &prepared.sealed,
+                        &availability,
+                    )
+                    .map_err(journal)?;
+                    staging
+                        .stage_execution(execution, budget)
+                        .map_err(journal)?;
+                    let lane = match &prepared.sealed.anchor {
+                        ReplayPublicationAnchor::Ordered(entry) => entry.input.persisted_lane(),
+                        ReplayPublicationAnchor::Local(entry) => entry.input.persisted_lane(),
+                        _ => return Err(journal(JournalStoreError::NonCanonical)),
+                    };
+                    if prepared
+                        .successor
+                        .external_roots
+                        .get(&lane)
+                        .map(|root| root.descriptor)
+                        != Some(staging.available())
+                    {
+                        return Err(journal(JournalStoreError::NonCanonical));
+                    }
+                }
+            } else if prepared.successor.state != self.materialization.state
+                || prepared.successor.external_roots != self.materialization.external_roots
+            {
+                return Err(journal(JournalStoreError::NonCanonical));
+            }
+            availability.mutation = Some((&prepared.sealed, true));
+            self.poisoned = true;
+            let publication =
+                publish(prepared.store, &prepared.sealed, &availability).map_err(journal)?;
+            self.materialization = prepared.successor;
+            self.poisoned = false;
+            Ok(ExternalJournalCommit::Published(
+                publication,
+                prepared.executions,
+            ))
+        }
+    }
+
+    fn materialize_current_inner<S, E, R>(
+        store: &mut S,
+        executor: &mut E,
+        resolver: &R,
+        #[cfg(feature = "experimental-state-blocks")] external_budget: Option<
+            &mut crate::agent_sdk::state_blocks::ReadBudget,
+        >,
+        #[cfg(feature = "experimental-state-blocks")] external_genesis: Option<
+            &ReplaySealedExternalLocalGenesis,
+        >,
+    ) -> Result<ReplayMaterialization, MaterializeError<R::Error, E::Error>>
+    where
+        S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
+        E: ReplayExecutor,
+        R: OrderedBaseResolver,
+    {
+        let heads = store
+            .heads()
+            .map_err(journal)?
+            .ok_or_else(|| journal(JournalStoreError::NotInitialized))?;
+        materialize_heads_inner(
+            store,
+            executor,
+            resolver,
+            heads,
+            #[cfg(feature = "experimental-state-blocks")]
+            external_budget,
+            #[cfg(feature = "experimental-state-blocks")]
+            external_genesis,
+        )
+    }
+
+    fn materialize_heads_inner<S, E, R>(
+        store: &mut S,
+        executor: &mut E,
+        resolver: &R,
+        heads: JournalHeads,
+        #[cfg(feature = "experimental-state-blocks")] mut external_budget: Option<
+            &mut crate::agent_sdk::state_blocks::ReadBudget,
+        >,
+        #[cfg(feature = "experimental-state-blocks")] external_genesis: Option<
+            &ReplaySealedExternalLocalGenesis,
+        >,
+    ) -> Result<ReplayMaterialization, MaterializeError<R::Error, E::Error>>
+    where
+        S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
+        E: ReplayExecutor,
+        R: OrderedBaseResolver,
+    {
         if heads.validate().is_err() || heads.id() == JournalHeadsId::ZERO {
             return Err(ReplayError::InvalidRecord);
         }
@@ -13262,13 +16042,30 @@ mod aggregate {
             .seed_genesis(&genesis)
             .map_err(ReplayError::Executor)?;
         let base = match heads.checkpoint {
-            Some(checkpoint) => {
-                load_checkpoint_base::<S, E, R>(store, executor, &heads, checkpoint)?
-            }
+            Some(checkpoint) => load_checkpoint_base::<S, E, R>(
+                store,
+                executor,
+                &heads,
+                checkpoint,
+                #[cfg(feature = "experimental-state-blocks")]
+                external_budget.as_deref_mut(),
+                #[cfg(feature = "experimental-state-blocks")]
+                external_genesis,
+            )?,
             None => load_genesis_base::<S, E, R>(store, &heads)?,
         };
         let plan = build_plan::<S, R, E>(store, &heads, &base)?;
-        execute_plan(store, executor, resolver, heads, base, plan, None)
+        execute_plan(
+            store,
+            executor,
+            resolver,
+            heads,
+            base,
+            plan,
+            None,
+            #[cfg(feature = "experimental-state-blocks")]
+            external_budget,
+        )
     }
 
     /// Materialize a live root journal while retaining only the process-local
@@ -13310,9 +16107,16 @@ mod aggregate {
             .seed_genesis(&genesis)
             .map_err(ReplayError::Executor)?;
         let base = match heads.checkpoint {
-            Some(checkpoint) => {
-                load_checkpoint_base::<S, E, R>(store, executor, &heads, checkpoint)?
-            }
+            Some(checkpoint) => load_checkpoint_base::<S, E, R>(
+                store,
+                executor,
+                &heads,
+                checkpoint,
+                #[cfg(feature = "experimental-state-blocks")]
+                None,
+                #[cfg(feature = "experimental-state-blocks")]
+                None,
+            )?,
             None => load_genesis_base::<S, E, R>(store, &heads)?,
         };
         let plan = build_plan::<S, R, E>(store, &heads, &base)?;
@@ -13324,6 +16128,8 @@ mod aggregate {
             base,
             plan,
             Some(replayed_root),
+            #[cfg(feature = "experimental-state-blocks")]
+            None,
         )
     }
 
@@ -14018,6 +16824,15 @@ mod aggregate {
         if materialization.merge_boundary_state.len() > MAX_RUNTIME_STATE_BYTES {
             return Err(ReplayError::ReplayLimit);
         }
+        #[cfg(feature = "experimental-state-blocks")]
+        if materialization
+            .ordered_snapshots
+            .get(&materialization.ordered_base())
+            .and_then(|snapshot| snapshot.linear_root.as_ref())
+            != materialization.external_roots.get(&PersistedLane::Linear)
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
         if materialization.heads.validate().is_err()
             || materialization.heads.id() != materialization.heads_id
             || materialization.ordered_base().validate().is_err()
@@ -14072,6 +16887,29 @@ mod aggregate {
             return Err(journal(JournalStoreError::Conflict));
         }
         Ok(())
+    }
+
+    /// Keep the ordinary r19 path free of extra genesis reads. External roots
+    /// use the same authenticated materialization/predecessor as publication.
+    #[cfg(feature = "experimental-state-blocks")]
+    fn advance_external_roots<S, ResolverError, ExecutorError>(
+        store: &S,
+        materialization: &ReplayMaterialization,
+        step: &ReplayStep,
+    ) -> Result<
+        BTreeMap<PersistedLane, super::super::journal::ExternalStateRoot>,
+        MaterializeError<ResolverError, ExecutorError>,
+    >
+    where
+        S: AgentJournalStore,
+    {
+        if materialization.external_roots.is_empty() && step.external_execution.is_none() {
+            return Ok(BTreeMap::new());
+        }
+        let genesis = require_genesis(store, materialization.heads.genesis)?;
+        materialization
+            .external_roots_after_step(&genesis, step)
+            .map_err(lift_validation)
     }
 
     fn outcome_anchor_input<S>(
@@ -14665,6 +17503,24 @@ mod aggregate {
             .merge_seal
             .map(|seal| load_fence_dependency(store, seal))
             .transpose()?;
+        #[cfg(feature = "experimental-state-blocks")]
+        if !materialization.external_roots.is_empty() {
+            if let Some(fence) = &fence_dependency {
+                if !materialization.merge_ancestry.is_empty()
+                    || !matches!(
+                        &entry.input.operation,
+                        ReplayOperation::CleanManage {
+                            request: crate::agent_sdk::ManagementRequest::Install(_),
+                            ..
+                        }
+                    )
+                    || fence.state.external_root.as_ref()
+                        != materialization.external_roots.get(&PersistedLane::Merge)
+                {
+                    return Err(ReplayError::InvalidFence);
+                }
+            }
+        }
         let mut suffix_budget = materialization.suffix_budget.clone();
         suffix_budget.ordered(id, entry).map_err(lift_validation)?;
         if let Some(dependency) = fence_dependency.as_ref() {
@@ -14971,6 +17827,8 @@ mod aggregate {
         };
         drop(machine);
         let mut executions = vec![step.execution_result(true)];
+        #[cfg(feature = "experimental-state-blocks")]
+        let external_roots = advance_external_roots(store, materialization, &step)?;
         executions.extend(finalized_executions);
 
         snapshots
@@ -14980,6 +17838,8 @@ mod aggregate {
                     head: Some(id),
                 },
                 MaterializedOrderedSnapshot {
+                    #[cfg(feature = "experimental-state-blocks")]
+                    linear_root: external_roots.get(&PersistedLane::Linear).cloned(),
                     runtime: step.runtime.clone(),
                     control: step.state.control.clone(),
                     linear: step.state.linear.clone(),
@@ -15022,6 +17882,8 @@ mod aggregate {
             store,
             sealed,
             successor: ReplayMaterialization {
+                #[cfg(feature = "experimental-state-blocks")]
+                external_roots,
                 clean_management: step
                     .management_evidence(&entry.input, &materialization.state)
                     .or_else(|| materialization.clean_management.clone()),
@@ -15089,6 +17951,14 @@ mod aggregate {
         let entry = committed.authenticated_entry().map_err(lift_validation)?;
         let current = &materialization.heads;
         let id = entry.id();
+        // Load origin context before invocation indexes borrow the store. The
+        // released opaque path needs no additional read.
+        #[cfg(feature = "experimental-state-blocks")]
+        let external_genesis = if materialization.external_roots.is_empty() {
+            None
+        } else {
+            Some(require_genesis(store, current.genesis)?)
+        };
         let clean_descriptor = executor
             .trusted_clean_descriptor(&current.runtime)
             .map_err(ReplayError::Executor)?;
@@ -15140,8 +18010,20 @@ mod aggregate {
                     LaneCursor::Ordered { base: current_base },
                     &materialization.state.linear,
                 )?;
-            let claimed_merge_manifest: LaneStateManifest =
-                require_record(store, claim.merge().manifest())?;
+            #[cfg(feature = "experimental-state-blocks")]
+            let linear_manifest = if let Some(genesis) = &external_genesis {
+                materialization
+                    .checkpoint_lane(
+                        genesis,
+                        PersistedLane::Linear,
+                        &materialization.state.linear,
+                    )
+                    .map_err(lift_validation)?
+            } else {
+                linear_manifest
+            };
+            let claimed_merge_manifest =
+                require_opaque_lane_state(store, claim.merge().manifest())?;
             let claimed_merge_state =
                 require_blob(store, JournalBlobClass::LaneState, claim.merge().state())?;
             let merge_projection_matches = claimed_merge_manifest.genesis == current.genesis
@@ -15690,6 +18572,14 @@ mod aggregate {
             index: entry.index,
             head: Some(id),
         };
+        #[cfg(feature = "experimental-state-blocks")]
+        let external_roots = match &external_genesis {
+            Some(genesis) => materialization
+                .external_roots_after_step(genesis, &step)
+                .map_err(lift_validation)?,
+            None if step.external_execution.is_none() => BTreeMap::new(),
+            None => return Err(ReplayError::InvalidRecord),
+        };
         let control_manifest =
             derive_lane_state::<ReplayMaterializationSourceError<R::Error>, E::Error>(
                 current.genesis,
@@ -15706,6 +18596,15 @@ mod aggregate {
                 LaneCursor::Ordered { base: output_base },
                 &step.state.linear,
             )?;
+        #[cfg(feature = "experimental-state-blocks")]
+        let linear_manifest = {
+            let mut manifest = linear_manifest;
+            manifest.external_root = external_roots.get(&PersistedLane::Linear).cloned();
+            manifest
+                .validate()
+                .map_err(|_| ReplayError::InvalidRecord)?;
+            manifest
+        };
         let derived_fence_ancestry =
             successor_fence_ancestry(materialization, &next, false, Some(entry))
                 .map_err(lift_validation)?;
@@ -15802,6 +18701,8 @@ mod aggregate {
                     head: Some(id),
                 },
                 MaterializedOrderedSnapshot {
+                    #[cfg(feature = "experimental-state-blocks")]
+                    linear_root: external_roots.get(&PersistedLane::Linear).cloned(),
                     runtime: step.runtime.clone(),
                     control: step.state.control.clone(),
                     linear: step.state.linear.clone(),
@@ -15842,6 +18743,8 @@ mod aggregate {
                     store,
                     sealed,
                     successor: ReplayMaterialization {
+                        #[cfg(feature = "experimental-state-blocks")]
+                        external_roots,
                         clean_management: step
                             .management_evidence(&entry.input, &execution_before)
                             .or_else(|| materialization.clean_management.clone()),
@@ -16013,6 +18916,8 @@ mod aggregate {
             );
         drop(machine);
         let execution = step.execution_result(true);
+        #[cfg(feature = "experimental-state-blocks")]
+        let external_roots = advance_external_roots(store, materialization, &step)?;
         let mut state = materialization.state.clone();
         state.local = step.state.local;
         validate_runtime_state_bound(&state)?;
@@ -16028,6 +18933,8 @@ mod aggregate {
             store,
             sealed,
             successor: ReplayMaterialization {
+                #[cfg(feature = "experimental-state-blocks")]
+                external_roots,
                 clean_management: materialization.clean_management.clone(),
                 heads_id: next.id(),
                 heads: next,
@@ -16446,6 +19353,8 @@ mod aggregate {
             store,
             sealed,
             successor: ReplayMaterialization {
+                #[cfg(feature = "experimental-state-blocks")]
+                external_roots: materialization.external_roots.clone(),
                 clean_management: materialization.clean_management.clone(),
                 heads_id: next.id(),
                 heads: next,
@@ -16593,18 +19502,6 @@ mod aggregate {
         };
         authenticate_artifacts(store, &artifacts)?;
         let ordered = materialization.ordered_base();
-        let cursors = [
-            LaneCursor::Ordered { base: ordered },
-            LaneCursor::Ordered { base: ordered },
-            LaneCursor::Merge {
-                frontier: current.merge_frontier,
-            },
-            LaneCursor::Local {
-                node: current.node,
-                revision: current.local_revision,
-                head: current.local_head,
-            },
-        ];
         let persisted = [
             PersistedLane::Control,
             PersistedLane::Linear,
@@ -16614,18 +19511,13 @@ mod aggregate {
         let mut lanes = Vec::new();
         let mut sealed_lanes = Vec::new();
         let mut lane_blobs = Vec::new();
-        for (lane, cursor) in persisted.into_iter().zip(cursors) {
+        for lane in persisted {
             let bytes = state_component(&state, lane);
             let reference = BlobRef::of_bytes(bytes);
             lane_blobs.push((reference.clone(), bytes.to_vec()));
-            let manifest = derive_lane_state(
-                current.genesis,
-                current.runtime.clone(),
-                lane,
-                cursor,
-                bytes,
-            )
-            .map_err(lift_validation)?;
+            let manifest = materialization
+                .checkpoint_lane(&genesis, lane, bytes)
+                .map_err(lift_validation)?;
             let checkpoint_lane = CheckpointLane {
                 lane,
                 node: (lane == PersistedLane::Local).then_some(current.node),
@@ -16685,6 +19577,8 @@ mod aggregate {
             fence_ancestry: fence_ancestry.clone(),
         };
         let sealed = ReplaySealedPublication {
+            #[cfg(feature = "experimental-state-blocks")]
+            external_execution: None,
             expected: materialization.heads_id,
             next: next.clone(),
             anchor: ReplayPublicationAnchor::Checkpoint(manifest),
@@ -16708,6 +19602,11 @@ mod aggregate {
         let snapshots = MaterializedOrderedSnapshots::singleton(
             ordered,
             MaterializedOrderedSnapshot {
+                #[cfg(feature = "experimental-state-blocks")]
+                linear_root: materialization
+                    .external_roots
+                    .get(&PersistedLane::Linear)
+                    .cloned(),
                 runtime: current.runtime.clone(),
                 control: state.control.clone(),
                 linear: state.linear.clone(),
@@ -16732,6 +19631,8 @@ mod aggregate {
         PreparedSharedCheckpoint {
             sealed,
             successor: ReplayMaterialization {
+                #[cfg(feature = "experimental-state-blocks")]
+                external_roots: materialization.external_roots.clone(),
                 clean_management: materialization.clean_management.clone(),
                 heads_id: next.id(),
                 heads: next,
@@ -16797,7 +19698,7 @@ mod aggregate {
         let mut roots = [None; 4];
         let mut local_cursor = None;
         for lane in &checkpoint.lanes {
-            let manifest: LaneStateManifest = require_record(store, lane.state)?;
+            let manifest = require_opaque_lane_state(store, lane.state)?;
             let state = require_blob(store, JournalBlobClass::LaneState, &manifest.state)?;
             let expected = match lane.lane {
                 PersistedLane::Control
@@ -16999,18 +19900,6 @@ mod aggregate {
         };
         authenticate_artifacts(store, &artifacts)?;
         let ordered = materialization.ordered_base();
-        let cursors = [
-            LaneCursor::Ordered { base: ordered },
-            LaneCursor::Ordered { base: ordered },
-            LaneCursor::Merge {
-                frontier: current.merge_frontier,
-            },
-            LaneCursor::Local {
-                node: current.node,
-                revision: current.local_revision,
-                head: current.local_head,
-            },
-        ];
         let persisted = [
             PersistedLane::Control,
             PersistedLane::Linear,
@@ -17019,20 +19908,15 @@ mod aggregate {
         ];
         let mut lanes = Vec::new();
         let mut sealed_lanes = Vec::new();
-        for (lane, cursor) in persisted.into_iter().zip(cursors) {
+        for lane in persisted {
             let bytes = state_component(&state, lane);
             let reference = BlobRef::of_bytes(bytes);
             store
                 .put_blob(JournalBlobClass::LaneState, &reference, bytes)
                 .map_err(journal)?;
-            let manifest = derive_lane_state(
-                current.genesis,
-                current.runtime.clone(),
-                lane,
-                cursor,
-                bytes,
-            )
-            .map_err(lift_validation)?;
+            let manifest = materialization
+                .checkpoint_lane(&genesis, lane, bytes)
+                .map_err(lift_validation)?;
             let checkpoint_lane = CheckpointLane {
                 lane,
                 node: (lane == PersistedLane::Local).then_some(current.node),
@@ -17092,6 +19976,8 @@ mod aggregate {
             fence_ancestry: fence_ancestry.clone(),
         };
         let sealed = ReplaySealedPublication {
+            #[cfg(feature = "experimental-state-blocks")]
+            external_execution: None,
             expected: materialization.heads_id,
             next: next.clone(),
             anchor: ReplayPublicationAnchor::Checkpoint(manifest),
@@ -17115,6 +20001,11 @@ mod aggregate {
         let snapshots = MaterializedOrderedSnapshots::singleton(
             ordered,
             MaterializedOrderedSnapshot {
+                #[cfg(feature = "experimental-state-blocks")]
+                linear_root: materialization
+                    .external_roots
+                    .get(&PersistedLane::Linear)
+                    .cloned(),
                 runtime: current.runtime.clone(),
                 control: state.control.clone(),
                 linear: state.linear.clone(),
@@ -17140,6 +20031,8 @@ mod aggregate {
             store,
             sealed,
             successor: ReplayMaterialization {
+                #[cfg(feature = "experimental-state-blocks")]
+                external_roots: materialization.external_roots.clone(),
                 clean_management: materialization.clean_management.clone(),
                 heads_id: next.id(),
                 heads: next,
@@ -17183,6 +20076,14 @@ pub(crate) use aggregate::{
     prepare_ordered, prepare_shared_checkpoint, prepare_shared_ordered, recover_invocation,
     validate_published_shared_checkpoint,
 };
+
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+#[allow(unused_imports)]
+pub(crate) use aggregate::materialize_external_checkpoint;
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+pub(crate) use aggregate::materialize_external_genesis;
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+pub(crate) use aggregate::validate_external_genesis_head;
 
 #[cfg(all(feature = "std", feature = "storage"))]
 #[allow(unused_imports)]
@@ -18729,7 +21630,7 @@ pub(crate) mod tests {
     }
 
     #[cfg(feature = "std")]
-    fn signed_opaque_clean_receipt(
+    pub(crate) fn signed_opaque_clean_receipt(
         descriptor: &crate::agent_sdk::AgentDescriptor,
         request: &crate::agent_sdk::ManagementRequest,
         runtime_deployment: crate::agent_sdk::DeploymentId,
@@ -19003,6 +21904,3462 @@ pub(crate) mod tests {
             validated_clean_management_result::<_, ()>(&executor, &create, &transition),
             Err(ReplayError::InvalidManagementTransition),
         ));
+    }
+
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    #[test]
+    fn checkpoint_recovery_must_not_erase_external_root_declarations() {
+        external_checkpoint_suffix_recovery(PersistedLane::Linear, false);
+    }
+
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    pub(crate) fn external_create_fixture(
+        admitted: &super::super::package_admission::AdmittedStateRuntimePackage,
+    ) -> (ReplayInput, crate::agent_sdk::AgentReplica, AgentReplica) {
+        let (mut create, mut descriptor, signing, native_replica) = opaque_clean_fixture();
+        let binding = admitted
+            .binding(create.runtime.space, create.runtime.agent)
+            .unwrap();
+        descriptor.identity.runtime_deployment =
+            crate::agent_sdk::DeploymentId(binding.deployment.0);
+        descriptor.identity.runtime_program = crate::agent_sdk::ProgramId(binding.program.0);
+        descriptor.identity.runtime_producer = crate::agent_sdk::ProducerId(binding.producer.0);
+        descriptor.runtime_package = admitted.package_ref().clone();
+        descriptor.runtime_contract = admitted.manifest().contract.clone();
+        descriptor.capabilities = admitted.manifest().capabilities;
+        let replica = descriptor.replicas[0];
+        let request = crate::agent_sdk::ManagementRequest::Create(Box::new(descriptor.clone()));
+        let authority = signed_opaque_clean_receipt(
+            &descriptor,
+            &request,
+            descriptor.identity.runtime_deployment,
+            1,
+            &signing,
+        );
+        create.runtime = binding;
+        create.operation = ReplayOperation::CleanManage {
+            request,
+            authority,
+            observed_slot: 10,
+        };
+        (create, replica, native_replica)
+    }
+
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    #[test]
+    fn external_create_work_binds_package_placement_and_all_declared_initial_lanes() {
+        use super::super::state_block_store::{initial_root_context, journal_create_state_work};
+        let admitted = super::super::package_admission::tests::admitted_state_fixture(
+            vos_pvm_compiler::assembler::Assembler::new()
+                .trap()
+                .build_standard(),
+        );
+        let (create, replica, native_replica) = external_create_fixture(&admitted);
+        let framed = journal_create_state_work(&admitted, &create, replica).unwrap();
+        assert_eq!(framed.lanes().len(), 3);
+        for (lane, declaration) in [
+            PersistedLane::Linear,
+            PersistedLane::Merge,
+            PersistedLane::Local,
+        ]
+        .into_iter()
+        .zip(framed.lanes())
+        {
+            let context = initial_root_context(
+                &create,
+                lane,
+                (lane == PersistedLane::Local).then_some(NodeId(replica.node.0)),
+            )
+            .unwrap();
+            assert_eq!(
+                declaration.base,
+                crate::agent_sdk::state_root::StateRootDescriptor::new(context, None)
+            );
+            assert_eq!(declaration.next, context);
+        }
+        assert!(
+            matches!(framed.work(), crate::agent_sdk::RuntimeWork::Manage { state, .. } if state.is_empty())
+        );
+        let mut foreign = replica;
+        foreign.node.0[0] ^= 1;
+        assert!(matches!(
+            journal_create_state_work(&admitted, &create, foreign),
+            Err(JournalStoreError::ScopeMismatch)
+        ));
+        let mut wrong_package = create.clone();
+        wrong_package.runtime.program.0[0] ^= 1;
+        assert!(journal_create_state_work(&admitted, &wrong_package, replica).is_err());
+        assert!(
+            journal_create_state_work(
+                &admitted,
+                &clean_admitted_invocation(&create.runtime, MethodMode::Linear, 0x62),
+                replica
+            )
+            .is_err()
+        );
+        // Framing is not a lifecycle bypass: ordinary genesis preparation
+        // remains closed until root-bearing genesis seals are integrated.
+        assert!(
+            ReplayPreparedGenesis::prepare(
+                create,
+                native_replica,
+                &mut OpaqueCleanReplayExecutor::default()
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    #[derive(Default)]
+    pub(crate) struct CapturedExternalExecutor {
+        captures: Vec<ReplayExternalExecution>,
+        pending: Option<ReplayExternalExecution>,
+        executions: usize,
+        physical_runtime: Option<super::super::package_admission::AdmittedStateRuntimePackage>,
+        physical_replays: usize,
+        reject_authentication: bool,
+        management_descriptor: Option<crate::agent_sdk::AgentDescriptor>,
+    }
+
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    impl ReplayExecutor for CapturedExternalExecutor {
+        type Error = ();
+        fn clean_management_transition_result(
+            &self,
+            input: &ReplayInput,
+            transition: &ReplayTransition,
+        ) -> Option<Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError>>
+        {
+            self.pending
+                .as_ref()?
+                .management_result_for(input, transition)
+        }
+        fn verify_merge_event(&mut self, _: &MergeEvent) -> Result<bool, ()> {
+            Ok(false)
+        }
+        fn authenticate(
+            &mut self,
+            input: &ReplayInput,
+            before: &RuntimeState,
+            position: ReplayPosition,
+        ) -> Result<(), ()> {
+            self.pending = None;
+            if self.reject_authentication {
+                return Err(());
+            }
+            if matches!(input.operation, ReplayOperation::CleanManage { .. }) {
+                let mut auth = OpaqueCleanReplayExecutor {
+                    descriptor: self.management_descriptor.clone(),
+                    ..Default::default()
+                };
+                auth.authenticate(input, before, position)?;
+            }
+            if let Some(descriptor) = &self.management_descriptor {
+                let authorization = match &input.operation {
+                    ReplayOperation::CleanInvoke {
+                        work,
+                        authorization,
+                        observed_slot,
+                        ..
+                    } => {
+                        if !authorization.matches_invoke(work, *observed_slot) {
+                            return Err(());
+                        }
+                        Some(authorization)
+                    }
+                    ReplayOperation::CleanAcknowledge {
+                        work,
+                        authorization,
+                        ..
+                    } => {
+                        if !authorization.matches_retirement(work) {
+                            return Err(());
+                        }
+                        Some(authorization)
+                    }
+                    _ => None,
+                };
+                if let Some(authorization) = authorization {
+                    let crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(receipt) =
+                        authorization
+                    else {
+                        return Err(());
+                    };
+                    if !descriptor.authority.accepts(receipt)
+                        || !super::super::authority::verify_raw_ed25519(
+                            &receipt.public_key,
+                            &receipt.signing_bytes(),
+                            &receipt.signature,
+                        )
+                    {
+                        return Err(());
+                    }
+                }
+            }
+            Ok(())
+        }
+        fn execute_with_external_state(
+            &mut self,
+            input: &ReplayInput,
+            before: &RuntimeState,
+            position: ReplayPosition,
+            genesis: &AgentJournalGenesis,
+            lanes: &[(LaneStateManifest, LaneCursor)],
+            reader: &dyn ScopedBlockReader,
+            budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+        ) -> Result<ReplayTransition, ()> {
+            self.pending = None;
+            let runtime = self.physical_runtime.as_ref().ok_or(())?;
+            // No lookup in captures: restart executes the signed guest against
+            // the recovery store, and cannot stage its returned candidate bytes.
+            let execution = super::super::state_block_pvm::MultiLaneStateBlockHost {
+                store: reader,
+                budget,
+            }
+            .execute_admitted_journal(
+                runtime,
+                genesis,
+                input,
+                before,
+                position,
+                lanes,
+                1_000_000_000,
+            )
+            .map_err(|_| ())?;
+            let transition = execution.transition().clone();
+            self.pending = Some(execution);
+            self.executions += 1;
+            self.physical_replays += 1;
+            Ok(transition)
+        }
+        fn execute(
+            &mut self,
+            input: &ReplayInput,
+            before: &RuntimeState,
+            position: ReplayPosition,
+        ) -> Result<ReplayTransition, ()> {
+            let capture = self
+                .captures
+                .iter()
+                .find(|capture| capture.matches(input, before, position, capture.transition()))
+                .ok_or(())?;
+            if !capture.matches(input, before, position, capture.transition()) {
+                return Err(());
+            }
+            self.pending = Some(capture.clone());
+            self.executions += 1;
+            Ok(capture.transition().clone())
+        }
+        fn take_external_execution(&mut self) -> Result<Option<ReplayExternalExecution>, ()> {
+            Ok(self.pending.take())
+        }
+    }
+
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    fn capture_standard_invocation<S>(
+        store: &S,
+        sealed: &ReplaySealedExternalLocalGenesis,
+        admitted: &super::super::package_admission::AdmittedStateRuntimePackage,
+        before: &ReplayMaterialization,
+        entry: &OrderedEntry,
+    ) -> ReplayExternalExecution
+    where
+        S: super::super::journal_store::ExternalMutationStore
+            + ReplaySource<Error = JournalStoreError>,
+    {
+        use crate::agent_sdk::state_blocks::ReadBudget;
+        let position = ReplayPosition::Ordered {
+            id: entry.id(),
+            index: entry.index,
+            merge_frontier: entry.merge_frontier,
+            merge_seal: None,
+        };
+        let lanes = before
+            .external_roots
+            .iter()
+            .map(|(lane, root)| {
+                (
+                    before
+                        .checkpoint_lane(
+                            sealed.genesis(),
+                            *lane,
+                            state_component(before.state(), *lane),
+                        )
+                        .unwrap(),
+                    if *lane == PersistedLane::Linear {
+                        LaneCursor::Ordered {
+                            base: OrderedBase {
+                                index: entry.index,
+                                head: Some(entry.id()),
+                            },
+                        }
+                    } else {
+                        root.cursor.clone()
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        super::super::state_block_pvm::MultiLaneStateBlockHost {
+            store,
+            budget: &mut ReadBudget::new(10000, 10000000),
+        }
+        .execute_admitted_journal(
+            admitted,
+            sealed.genesis(),
+            &entry.input,
+            before.state(),
+            position,
+            &lanes,
+            10_000_000_000,
+        )
+        .unwrap()
+    }
+
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    fn publish_standard_invocation<S>(
+        store: &mut S,
+        sealed: &ReplaySealedExternalLocalGenesis,
+        admitted: &super::super::package_admission::AdmittedStateRuntimePackage,
+        executor: &mut CapturedExternalExecutor,
+        input: ReplayInput,
+    ) -> crate::agent_sdk::RuntimeOutcome
+    where
+        S: super::super::journal_store::ExternalMutationStore
+            + ReplaySource<Error = JournalStoreError>,
+    {
+        use crate::agent_sdk::state_blocks::ReadBudget;
+        use aggregate::{ExternalJournalCommit, ExternalJournalEntry, PinnedExternalJournal};
+        let mut pinned = PinnedExternalJournal::open(
+            store,
+            sealed,
+            executor,
+            &NoPrunedOrderedBases,
+            &mut ReadBudget::new(10000, 10000000),
+        )
+        .unwrap();
+        let before = pinned.materialization().unwrap().clone();
+        let entry = OrderedEntry {
+            genesis: sealed.genesis().id(),
+            index: before.heads.ordered_index + 1,
+            parent: before.heads.ordered_head,
+            merge_frontier: before.heads.merge_frontier,
+            merge_seal: None,
+            input,
+        };
+        let capture =
+            capture_standard_invocation(pinned.store_for_test(), sealed, admitted, &before, &entry);
+        let outcome = capture.output().transition().outcome.clone();
+        let expected = capture.transition().state.clone();
+        executor.captures.push(capture);
+        assert!(matches!(
+            pinned
+                .apply(
+                    executor,
+                    ExternalJournalEntry::Ordered(&entry),
+                    &mut ReadBudget::new(10000, 10000000)
+                )
+                .unwrap(),
+            ExternalJournalCommit::Published(_, _)
+        ));
+        assert_eq!(pinned.materialization().unwrap().state(), &expected);
+        let executions = executor.executions;
+        assert!(matches!(
+            pinned
+                .apply(
+                    executor,
+                    ExternalJournalEntry::Ordered(&entry),
+                    &mut ReadBudget::new(0, 0)
+                )
+                .unwrap(),
+            ExternalJournalCommit::AlreadyCommitted(_)
+        ));
+        assert_eq!(executor.executions, executions);
+        outcome
+    }
+
+    /// An interrupted publication cannot be retried through its poisoned owner.
+    /// Reopen the durable store, then retry the exact ordered entry only when its
+    /// head was not already published by the interrupted attempt.
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    fn publish_standard_invocation_with_fault<S>(
+        mut store: S,
+        sealed: &ReplaySealedExternalLocalGenesis,
+        admitted: &super::super::package_admission::AdmittedStateRuntimePackage,
+        executor: &mut CapturedExternalExecutor,
+        input: ReplayInput,
+        publish: impl FnOnce(
+            &mut S,
+            &ReplaySealedPublication,
+            &ExternalCheckpointValidation<'_>,
+        ) -> Result<JournalPublication, JournalStoreError>,
+        reopen: &mut impl FnMut(S, &mut CapturedExternalExecutor) -> S,
+    ) -> (S, crate::agent_sdk::RuntimeOutcome)
+    where
+        S: super::super::journal_store::ExternalMutationStore
+            + ReplaySource<Error = JournalStoreError>,
+    {
+        use crate::agent_sdk::state_blocks::ReadBudget;
+        use aggregate::{ExternalJournalCommit, ExternalJournalEntry, PinnedExternalJournal};
+        let mut pinned = PinnedExternalJournal::open(
+            &mut store,
+            sealed,
+            executor,
+            &NoPrunedOrderedBases,
+            &mut ReadBudget::new(10000, 10000000),
+        )
+        .unwrap();
+        let before = pinned.materialization().unwrap().clone();
+        let entry = OrderedEntry {
+            genesis: sealed.genesis().id(),
+            index: before.heads.ordered_index + 1,
+            parent: before.heads.ordered_head,
+            merge_frontier: before.heads.merge_frontier,
+            merge_seal: None,
+            input,
+        };
+        let capture =
+            capture_standard_invocation(pinned.store_for_test(), sealed, admitted, &before, &entry);
+        let outcome = capture.output().transition().outcome.clone();
+        let expected = capture.transition().state.clone();
+        executor.captures.push(capture);
+        assert!(matches!(
+            pinned.apply_with_fault_for_test(
+                executor,
+                ExternalJournalEntry::Ordered(&entry),
+                &mut ReadBudget::new(10000, 10000000),
+                publish,
+            ),
+            Err(ReplayError::Source(
+                ReplayMaterializationSourceError::Journal(JournalStoreError::Unavailable)
+            ))
+        ));
+        assert!(
+            pinned
+                .apply(
+                    executor,
+                    ExternalJournalEntry::Ordered(&entry),
+                    &mut ReadBudget::new(10000, 10000000),
+                )
+                .is_err(),
+            "uncertain publication must poison the owner"
+        );
+        drop(pinned);
+        executor.captures.clear();
+        executor.pending = None;
+        store = reopen(store, executor);
+        let mut pinned = PinnedExternalJournal::open(
+            &mut store,
+            sealed,
+            executor,
+            &NoPrunedOrderedBases,
+            &mut ReadBudget::new(10000, 10000000),
+        )
+        .unwrap();
+        let recovered = pinned.materialization().unwrap().clone();
+        let already_published = recovered.heads.ordered_head == Some(entry.id());
+        if !already_published {
+            assert_eq!(recovered.heads(), before.heads());
+            executor.captures.push(capture_standard_invocation(
+                pinned.store_for_test(),
+                sealed,
+                admitted,
+                &before,
+                &entry,
+            ));
+        }
+        let executions = executor.executions;
+        let committed = pinned
+            .apply(
+                executor,
+                ExternalJournalEntry::Ordered(&entry),
+                &mut ReadBudget::new(10000, 10000000),
+            )
+            .unwrap();
+        assert_eq!(
+            matches!(committed, ExternalJournalCommit::AlreadyCommitted(_)),
+            already_published
+        );
+        if already_published {
+            assert_eq!(executor.executions, executions);
+        }
+        assert_eq!(pinned.materialization().unwrap().state(), &expected);
+        let committed_heads = pinned.materialization().unwrap().heads().clone();
+        drop(pinned);
+        executor.captures.clear();
+        executor.pending = None;
+        store = reopen(store, executor);
+        let durable = materialize_external_genesis(
+            &mut store,
+            sealed,
+            executor,
+            &NoPrunedOrderedBases,
+            &mut ReadBudget::new(10000, 10000000),
+        )
+        .unwrap();
+        assert_eq!(durable.heads(), &committed_heads);
+        assert_eq!(durable.state(), &expected);
+        (store, outcome)
+    }
+
+    /// Real standard guest and macro-generated actor, with fixture Authority and
+    /// package admission. No synthesized private installed state or replay cache.
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    pub(crate) fn qualify_standard_durable_install<S>(
+        mut store: S,
+        sealed: &ReplaySealedExternalLocalGenesis,
+        admitted: &super::super::package_admission::AdmittedStateRuntimePackage,
+        expect_interruption: bool,
+        interrupt_actor_operations: bool,
+        publish: impl FnOnce(
+            &mut S,
+            &ReplaySealedPublication,
+            &ExternalCheckpointValidation<'_>,
+        ) -> Result<JournalPublication, JournalStoreError>,
+        mut publish_actor_fault: impl FnMut(
+            &mut S,
+            &ReplaySealedPublication,
+            &ExternalCheckpointValidation<'_>,
+        ) -> Result<JournalPublication, JournalStoreError>,
+        mut reopen: impl FnMut(S, &mut CapturedExternalExecutor) -> S,
+    ) where
+        S: super::super::journal_store::ExternalMutationStore
+            + super::super::journal_store::AuditedCheckpointStore
+            + TransitionProofPublicationStore
+            + ReplaySource<Error = JournalStoreError>,
+    {
+        use crate::agent_sdk::{self as sdk, state_blocks::ReadBudget};
+        use aggregate::{ExternalJournalCommit, ExternalJournalEntry, PinnedExternalJournal};
+        let ReplayOperation::CleanManage {
+            request: sdk::ManagementRequest::Create(descriptor),
+            ..
+        } = &sealed.genesis().create.operation
+        else {
+            unreachable!()
+        };
+        let (install, blobs, package) =
+            super::super::state_block_pvm::lifecycle_tests::compiled_install_fixture(descriptor);
+        let mut actor_availability = blobs
+            .iter()
+            .cloned()
+            .map(|bytes| sdk::RuntimeBlob {
+                reference: sdk::BlobRef::of_bytes(&bytes),
+                bytes,
+            })
+            .collect::<Vec<_>>();
+        actor_availability.sort_by(|a, b| a.reference.cmp(&b.reference));
+        for bytes in blobs.into_iter().chain([package]) {
+            store
+                .put_blob(
+                    JournalBlobClass::CatalogArtifact,
+                    &BlobRef::of_bytes(&bytes),
+                    &bytes,
+                )
+                .unwrap();
+        }
+        let request = sdk::ManagementRequest::Install(Box::new(install.clone()));
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x31; 32]);
+        let input = ReplayInput {
+            runtime: sealed.genesis().runtime().clone(),
+            operation: ReplayOperation::CleanManage {
+                authority: signed_opaque_clean_receipt(
+                    descriptor,
+                    &request,
+                    admitted.deployment(),
+                    2,
+                    &signing,
+                ),
+                request,
+                observed_slot: 11,
+            },
+        };
+        let mut executor = CapturedExternalExecutor {
+            physical_runtime: Some(admitted.clone()),
+            management_descriptor: Some(descriptor.as_ref().clone()),
+            ..Default::default()
+        };
+        let before = materialize_external_genesis(
+            &mut store,
+            sealed,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &mut ReadBudget::new(10000, 10000000),
+        )
+        .unwrap();
+        let merge = before
+            .checkpoint_lane(sealed.genesis(), PersistedLane::Merge, &before.state.merge)
+            .unwrap();
+        store.put(&merge).unwrap();
+        let fence = MergeSeal {
+            genesis: sealed.genesis().id(),
+            frontier: before.heads.merge_frontier,
+            ordered_base: before.ordered_base(),
+            merge_state: merge.id(),
+        };
+        store.put(&fence).unwrap();
+        let mut wrong_fence = fence.clone();
+        wrong_fence.ordered_base = OrderedBase {
+            index: 1,
+            head: Some(OrderedEntryId([0xfa; 32])),
+        };
+        store.put(&wrong_fence).unwrap();
+        let entry = OrderedEntry {
+            genesis: sealed.genesis().id(),
+            index: before.heads.ordered_index + 1,
+            parent: before.heads.ordered_head,
+            merge_frontier: before.heads.merge_frontier,
+            merge_seal: Some(fence.id()),
+            input,
+        };
+        let position = ReplayPosition::Ordered {
+            id: entry.id(),
+            index: entry.index,
+            merge_frontier: entry.merge_frontier,
+            merge_seal: entry.merge_seal,
+        };
+        let lanes = before
+            .external_roots
+            .iter()
+            .map(|(lane, root)| {
+                (
+                    before
+                        .checkpoint_lane(
+                            sealed.genesis(),
+                            *lane,
+                            state_component(before.state(), *lane),
+                        )
+                        .unwrap(),
+                    root.cursor.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let capture = |store: &S| {
+            super::super::state_block_pvm::MultiLaneStateBlockHost {
+                store,
+                budget: &mut ReadBudget::new(10000, 10000000),
+            }
+            .execute_admitted_journal(
+                admitted,
+                sealed.genesis(),
+                &entry.input,
+                before.state(),
+                position,
+                &lanes,
+                1_000_000_000,
+            )
+            .unwrap()
+        };
+        let captured = capture(&store);
+        assert_eq!(
+            captured.management_result_for(&entry.input, captured.transition()),
+            Some(Ok(sdk::ManagementReply::Installed(install.entry.clone())))
+        );
+        executor.captures.push(captured);
+        let mut pinned = PinnedExternalJournal::open(
+            &mut store,
+            sealed,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &mut ReadBudget::new(10000, 10000000),
+        )
+        .unwrap();
+        let mut wrong_entry = entry.clone();
+        wrong_entry.merge_seal = Some(wrong_fence.id());
+        let executions_before = executor.executions;
+        assert!(matches!(
+            pinned.apply(
+                &mut executor,
+                ExternalJournalEntry::Ordered(&wrong_entry),
+                &mut ReadBudget::new(10000, 10000000)
+            ),
+            Err(ReplayError::InvalidFence)
+        ));
+        assert_eq!(executor.executions, executions_before);
+        assert_eq!(pinned.materialization().unwrap().heads(), before.heads());
+        let attempted = pinned.apply_with_fault_for_test(
+            &mut executor,
+            ExternalJournalEntry::Ordered(&entry),
+            &mut ReadBudget::new(10000, 10000000),
+            publish,
+        );
+        let committed = match attempted {
+            Ok(committed) => {
+                assert!(
+                    !expect_interruption,
+                    "configured Install fault point must be reached"
+                );
+                committed
+            }
+            Err(ReplayError::Source(ReplayMaterializationSourceError::Journal(
+                JournalStoreError::Unavailable,
+            ))) => {
+                assert!(
+                    expect_interruption,
+                    "ordinary Install publication must not require recovery"
+                );
+                assert!(
+                    pinned
+                        .apply(
+                            &mut executor,
+                            ExternalJournalEntry::Ordered(&entry),
+                            &mut ReadBudget::new(10000, 10000000)
+                        )
+                        .is_err(),
+                    "uncertain publication must poison the owner"
+                );
+                drop(pinned);
+                executor.captures.clear();
+                executor.pending = None;
+                store = reopen(store, &mut executor);
+                pinned = PinnedExternalJournal::open(
+                    &mut store,
+                    sealed,
+                    &mut executor,
+                    &NoPrunedOrderedBases,
+                    &mut ReadBudget::new(10000, 10000000),
+                )
+                .unwrap();
+                let heads = pinned.materialization().unwrap().heads();
+                if heads.ordered_head != Some(entry.id()) {
+                    assert_eq!(heads, before.heads());
+                    executor.captures.push(capture(pinned.store_for_test()));
+                }
+                pinned
+                    .apply(
+                        &mut executor,
+                        ExternalJournalEntry::Ordered(&entry),
+                        &mut ReadBudget::new(10000, 10000000),
+                    )
+                    .unwrap()
+            }
+            Err(error) => panic!(
+                "Install apply failed after {} executions: {error:?}",
+                executor.executions
+            ),
+        };
+        if let ExternalJournalCommit::Published(_, results) = committed {
+            assert_eq!(
+                results.last().unwrap().clean_management_result(),
+                Some(&Ok(sdk::ManagementReply::Installed(install.entry.clone())))
+            );
+        }
+        let installed = pinned.materialization().unwrap().clone();
+        assert_eq!(installed.external_roots, before.external_roots);
+        assert_ne!(installed.state.control, before.state.control);
+        let executions = executor.executions;
+        assert!(matches!(
+            pinned
+                .apply(
+                    &mut executor,
+                    ExternalJournalEntry::Ordered(&entry),
+                    &mut ReadBudget::new(0, 0)
+                )
+                .unwrap(),
+            ExternalJournalCommit::AlreadyCommitted(_)
+        ));
+        assert_eq!(executor.executions, executions);
+        drop(pinned);
+        executor.captures.clear();
+        executor.pending = None;
+        store = reopen(store, &mut executor);
+        let replays = executor.physical_replays;
+        let recovered = materialize_external_genesis(
+            &mut store,
+            sealed,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &mut ReadBudget::new(10000, 10000000),
+        )
+        .unwrap();
+        assert!(executor.physical_replays > replays);
+        assert_eq!(recovered.state(), installed.state());
+        assert_eq!(recovered.heads(), installed.heads());
+        assert_eq!(
+            recovered.clean_management_evidence(),
+            installed.clean_management_evidence()
+        );
+        let inspect = sdk::state_execution::StateExecutionWork::new(
+            sdk::RuntimeWork::Manage {
+                context: sdk::RuntimeExecutionContext::Direct,
+                space: descriptor.identity.space,
+                agent: descriptor.identity.agent,
+                runtime_deployment: admitted.deployment(),
+                state: sdk_runtime_state(recovered.state()),
+                request: Box::new(sdk::ManagementRequest::InspectActors {
+                    after: None,
+                    limit: 16,
+                }),
+                authority: None,
+                observed_slot: 11,
+            },
+            recovered
+                .external_roots
+                .values()
+                .map(|root| sdk::state_execution::ExternalLaneWork {
+                    base: root.descriptor,
+                    next: root.descriptor.context(),
+                })
+                .collect(),
+            admitted.external_state_limits(),
+        )
+        .unwrap();
+        let output = super::super::state_block_pvm::MultiLaneStateBlockHost {
+            store: &store,
+            budget: &mut ReadBudget::new(10000, 10000000),
+        }
+        .execute_admitted_work(admitted, &inspect, 1_000_000_000)
+        .unwrap();
+        let sdk::RuntimeOutcome::Management(Ok(sdk::ManagementReply::Actors(page))) =
+            &output.transition().outcome
+        else {
+            panic!("recovered Install must be visible through public inspection");
+        };
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].entry, install.entry);
+        assert!(output.changes().is_empty());
+        assert_eq!(
+            output.transition().state,
+            sdk_runtime_state(recovered.state())
+        );
+        let mut pinned = PinnedExternalJournal::open(
+            &mut store,
+            sealed,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &mut ReadBudget::new(10000, 10000000),
+        )
+        .unwrap();
+        pinned
+            .checkpoint(sealed, &mut ReadBudget::new(10000, 10000000))
+            .unwrap();
+        drop(pinned);
+        store = reopen(store, &mut executor);
+        let compacted = materialize_external_genesis(
+            &mut store,
+            sealed,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &mut ReadBudget::new(10000, 10000000),
+        )
+        .unwrap();
+        assert_eq!(compacted.state(), installed.state());
+        assert_eq!(
+            compacted.clean_management_evidence(),
+            installed.clean_management_evidence()
+        );
+        use crate::actors::{
+            codec::{Decode, Encode},
+            value::{Msg, TAG_DYNAMIC, Value},
+        };
+        use ed25519_dalek::Signer;
+        let record = &page.entries[0];
+        for (index, expected) in [42_u64, 43].into_iter().enumerate() {
+            let mut message = vec![TAG_DYNAMIC];
+            message.extend(Msg::new("advance").encode());
+            let work = sdk::InvocationWork {
+                space: descriptor.identity.space,
+                agent: descriptor.identity.agent,
+                runtime_deployment: admitted.deployment(),
+                invocation: sdk::InvocationId([0x90 + index as u8; 32]),
+                actor: record.entry.actor,
+                incarnation: record.incarnation,
+                deployment: record.entry.deployment,
+                program: record.entry.program,
+                mode: sdk::MethodMode::Linear,
+                origin: sdk::InvocationOrigin::anonymous(),
+                roles: sdk::InvocationRoleClaims::none(),
+                message,
+                installation_data: record.entry.installation_data.clone(),
+                availability: actor_availability.clone(),
+                gas: 100_000_000,
+                recovery_only: false,
+            };
+            let ReplayOperation::CleanManage { authority, .. } = &entry.input.operation else {
+                unreachable!()
+            };
+            let mut receipt = authority.clone();
+            receipt.selector.operation = sdk::authority::AuthorityOperationKind::InvokeActor;
+            receipt.selector.request = work.commitment();
+            receipt.selector.decision_sequence = 0;
+            receipt.signature = signing.sign(&receipt.signing_bytes()).to_bytes();
+            let authorization = sdk::InvocationAuthorization::AuthorityReceipt(receipt);
+            let invoke = ReplayInput {
+                runtime: entry.input.runtime.clone(),
+                operation: ReplayOperation::CleanInvoke {
+                    context: sdk::RuntimeExecutionContext::Direct,
+                    work: work.clone(),
+                    authorization: authorization.clone(),
+                    observed_slot: 12 + index as u64,
+                },
+            };
+            let first = if interrupt_actor_operations && index == 0 {
+                let (reopened, outcome) = publish_standard_invocation_with_fault(
+                    store,
+                    sealed,
+                    admitted,
+                    &mut executor,
+                    invoke.clone(),
+                    &mut publish_actor_fault,
+                    &mut reopen,
+                );
+                store = reopened;
+                outcome
+            } else {
+                publish_standard_invocation(
+                    &mut store,
+                    sealed,
+                    admitted,
+                    &mut executor,
+                    invoke.clone(),
+                )
+            };
+            let sdk::RuntimeOutcome::Completed(Ok(reply)) = &first else {
+                panic!("actor advance failed: {first:?}");
+            };
+            assert_eq!(reply.status, sdk::InvocationStatus::Done);
+            assert_eq!(Value::decode(&reply.reply), Value::U64(expected));
+            executor.captures.clear();
+            executor.pending = None;
+            store = reopen(store, &mut executor);
+            let before_retry = materialize_external_genesis(
+                &mut store,
+                sealed,
+                &mut executor,
+                &NoPrunedOrderedBases,
+                &mut ReadBudget::new(10000, 10000000),
+            )
+            .unwrap();
+            assert_eq!(
+                publish_standard_invocation(
+                    &mut store,
+                    sealed,
+                    admitted,
+                    &mut executor,
+                    invoke.clone()
+                ),
+                first
+            );
+            let after_retry = materialize_external_genesis(
+                &mut store,
+                sealed,
+                &mut executor,
+                &NoPrunedOrderedBases,
+                &mut ReadBudget::new(10000, 10000000),
+            )
+            .unwrap();
+            assert_eq!(after_retry.state(), before_retry.state());
+            let ack = ReplayInput {
+                runtime: entry.input.runtime.clone(),
+                operation: ReplayOperation::CleanAcknowledge {
+                    context: sdk::RuntimeExecutionContext::Direct,
+                    expected_live: None,
+                    work: sdk::InvocationRetirement::from_work(&work),
+                    authorization,
+                },
+            };
+            let acknowledged = if interrupt_actor_operations && index == 0 {
+                let (reopened, outcome) = publish_standard_invocation_with_fault(
+                    store,
+                    sealed,
+                    admitted,
+                    &mut executor,
+                    ack.clone(),
+                    &mut publish_actor_fault,
+                    &mut reopen,
+                );
+                store = reopened;
+                outcome
+            } else {
+                publish_standard_invocation(
+                    &mut store,
+                    sealed,
+                    admitted,
+                    &mut executor,
+                    ack.clone(),
+                )
+            };
+            assert!(matches!(
+                acknowledged,
+                sdk::RuntimeOutcome::Acknowledged(Ok(_))
+            ));
+            executor.captures.clear();
+            executor.pending = None;
+            store = reopen(store, &mut executor);
+            assert_eq!(
+                publish_standard_invocation(&mut store, sealed, admitted, &mut executor, ack),
+                acknowledged
+            );
+            let retired = materialize_external_genesis(
+                &mut store,
+                sealed,
+                &mut executor,
+                &NoPrunedOrderedBases,
+                &mut ReadBudget::new(10000, 10000000),
+            )
+            .unwrap();
+            assert_eq!(
+                publish_standard_invocation(&mut store, sealed, admitted, &mut executor, invoke),
+                sdk::RuntimeOutcome::Completed(Err(sdk::InvocationError::DivergentInvocation))
+            );
+            let mut pinned = PinnedExternalJournal::open(
+                &mut store,
+                sealed,
+                &mut executor,
+                &NoPrunedOrderedBases,
+                &mut ReadBudget::new(10000, 10000000),
+            )
+            .unwrap();
+            assert_eq!(pinned.materialization().unwrap().state(), retired.state());
+            pinned
+                .checkpoint(sealed, &mut ReadBudget::new(10000, 10000000))
+                .unwrap();
+            drop(pinned);
+            executor.captures.clear();
+            executor.pending = None;
+            store = reopen(store, &mut executor);
+        }
+    }
+
+    /// Probe-specific mutation markers qualify storage/replay, not actor execution.
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    pub(crate) fn qualify_pinned_external_mutations<S>(
+        mut store: S,
+        seal: &ReplaySealedExternalLocalGenesis,
+        admitted: &super::super::package_admission::AdmittedStateRuntimePackage,
+        lane: PersistedLane,
+        mut interrupt: impl FnMut(
+            &mut S,
+            &ReplaySealedPublication,
+            &ExternalCheckpointValidation<'_>,
+        ) -> Result<JournalPublication, JournalStoreError>,
+        remove_block: impl FnOnce(&mut S, crate::agent_sdk::state_blocks::BlockRef),
+        mut reopen: impl FnMut(S, &mut CapturedExternalExecutor, bool) -> Option<S>,
+    ) where
+        S: super::super::journal_store::ExternalMutationStore
+            + super::super::journal_store::AuditedCheckpointStore
+            + TransitionProofPublicationStore
+            + ReplaySource<Error = JournalStoreError>,
+    {
+        use super::super::state_block_store::JournalBlockReader;
+        use crate::agent_sdk::state_blocks::ReadBudget;
+        use aggregate::{ExternalJournalCommit, ExternalJournalEntry, PinnedExternalJournal};
+        struct MissingReadLane<'a, S> {
+            store: &'a S,
+            lane: crate::agent_sdk::StateLane,
+            fetched: core::cell::Cell<bool>,
+        }
+        impl<S: AgentJournalStore> ScopedBlockReader for MissingReadLane<'_, S> {
+            fn read_scoped(
+                &self,
+                scope: crate::agent_sdk::state_blocks::BlockScope,
+                reference: crate::agent_sdk::state_blocks::BlockRef,
+                output: &mut [u8],
+            ) -> Result<bool, crate::agent_sdk::state_tree::TreeError> {
+                if scope.lane() == self.lane {
+                    self.fetched.set(true);
+                    return Ok(false);
+                }
+                self.store.read_scoped(scope, reference, output)
+            }
+        }
+        enum Entry {
+            Ordered(OrderedEntry),
+            Local(LocalEntry),
+        }
+        impl Entry {
+            fn new(before: &ReplayMaterialization, input: ReplayInput) -> Self {
+                match input.persisted_lane() {
+                    PersistedLane::Linear => Self::Ordered(OrderedEntry {
+                        genesis: before.heads.genesis,
+                        index: before.heads.ordered_index + 1,
+                        parent: before.heads.ordered_head,
+                        merge_frontier: before.heads.merge_frontier,
+                        merge_seal: None,
+                        input,
+                    }),
+                    PersistedLane::Local => Self::Local(LocalEntry {
+                        genesis: before.heads.genesis,
+                        node: before.heads.node,
+                        revision: before.heads.local_revision + 1,
+                        parent: before.heads.local_head,
+                        ordered_base: before.ordered_base(),
+                        merge_frontier: before.heads.merge_frontier,
+                        input,
+                    }),
+                    _ => panic!("unsupported fixture lane"),
+                }
+            }
+            fn borrowed(&self) -> ExternalJournalEntry<'_> {
+                match self {
+                    Self::Ordered(entry) => ExternalJournalEntry::Ordered(entry),
+                    Self::Local(entry) => ExternalJournalEntry::Local(entry),
+                }
+            }
+            fn input(&self) -> &ReplayInput {
+                match self {
+                    Self::Ordered(entry) => &entry.input,
+                    Self::Local(entry) => &entry.input,
+                }
+            }
+            fn committed(&self, heads: &JournalHeads) -> bool {
+                match self {
+                    Self::Ordered(entry) => heads.ordered_head == Some(entry.id()),
+                    Self::Local(entry) => heads.local_head == Some(entry.id()),
+                }
+            }
+            fn position(&self) -> ReplayPosition {
+                match self {
+                    Self::Ordered(entry) => ReplayPosition::Ordered {
+                        id: entry.id(),
+                        index: entry.index,
+                        merge_frontier: entry.merge_frontier,
+                        merge_seal: entry.merge_seal,
+                    },
+                    Self::Local(entry) => ReplayPosition::Local {
+                        id: entry.id(),
+                        node: entry.node,
+                        revision: entry.revision,
+                        ordered_base: entry.ordered_base,
+                        merge_frontier: entry.merge_frontier,
+                    },
+                }
+            }
+            fn cursor(&self) -> LaneCursor {
+                match self {
+                    Self::Ordered(entry) => LaneCursor::Ordered {
+                        base: OrderedBase {
+                            index: entry.index,
+                            head: Some(entry.id()),
+                        },
+                    },
+                    Self::Local(entry) => LaneCursor::Local {
+                        node: entry.node,
+                        revision: entry.revision,
+                        head: Some(entry.id()),
+                    },
+                }
+            }
+        }
+        let physical_capture = |pinned: &PinnedExternalJournal<'_, S>, entry: &Entry| {
+            let before = pinned.materialization().unwrap();
+            let lanes = before
+                .external_roots
+                .iter()
+                .map(|(selected, root)| {
+                    let manifest = before
+                        .checkpoint_lane(
+                            seal.genesis(),
+                            *selected,
+                            state_component(before.state(), *selected),
+                        )
+                        .unwrap();
+                    let next = if *selected == lane {
+                        entry.cursor()
+                    } else {
+                        root.cursor.clone()
+                    };
+                    (manifest, next)
+                })
+                .collect::<Vec<_>>();
+            let mut invalid_read_cursor = lanes.clone();
+            let secondary = invalid_read_cursor
+                .iter_mut()
+                .find(|(manifest, _)| manifest.lane != lane)
+                .unwrap();
+            secondary.1 = entry.cursor();
+            let missing = MissingReadLane {
+                store: pinned.store_for_test(),
+                lane: secondary
+                    .0
+                    .external_root
+                    .as_ref()
+                    .unwrap()
+                    .descriptor
+                    .context()
+                    .scope()
+                    .lane(),
+                fetched: core::cell::Cell::new(false),
+            };
+            assert!(matches!(
+                super::super::state_block_pvm::MultiLaneStateBlockHost {
+                    store: &missing,
+                    budget: &mut ReadBudget::new(100, 100000),
+                }
+                .execute_admitted_journal(
+                    admitted,
+                    seal.genesis(),
+                    entry.input(),
+                    before.state(),
+                    entry.position(),
+                    &lanes,
+                    1_000_000_000,
+                ),
+                Err(super::super::state_block_pvm::BlockPvmError::Block(_))
+            ));
+            assert!(
+                missing.fetched.get(),
+                "physical guest must actually read secondary roots"
+            );
+            assert!(
+                super::super::state_block_pvm::MultiLaneStateBlockHost {
+                    store: pinned.store_for_test(),
+                    budget: &mut ReadBudget::new(0, 0),
+                }
+                .execute_admitted_journal(
+                    admitted,
+                    seal.genesis(),
+                    entry.input(),
+                    before.state(),
+                    entry.position(),
+                    &invalid_read_cursor,
+                    1_000_000_000,
+                )
+                .is_err()
+            );
+            let captured = super::super::state_block_pvm::MultiLaneStateBlockHost {
+                store: pinned.store_for_test(),
+                budget: &mut ReadBudget::new(100, 100000),
+            }
+            .execute_admitted_journal(
+                admitted,
+                seal.genesis(),
+                entry.input(),
+                before.state(),
+                entry.position(),
+                &lanes,
+                1_000_000_000,
+            )
+            .unwrap();
+            assert_eq!(captured.lanes().len(), before.external_roots.len());
+            assert!(captured.matches_roots(&before.external_roots));
+            captured
+        };
+        let mut executor = CapturedExternalExecutor {
+            physical_runtime: Some(admitted.clone()),
+            ..Default::default()
+        };
+        let mut pinned = PinnedExternalJournal::open(
+            &mut store,
+            seal,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &mut ReadBudget::new(100, 100000),
+        )
+        .unwrap();
+        let mut last = None;
+        let mut expected = pinned.materialization().unwrap().clone();
+        for discriminator in [0xb1, 0xb2] {
+            let before = pinned.materialization().unwrap().clone();
+            let mode = if lane == PersistedLane::Local {
+                MethodMode::Local
+            } else {
+                MethodMode::Linear
+            };
+            let entry = Entry::new(
+                &before,
+                clean_admitted_invocation(&before.heads.runtime, mode, discriminator),
+            );
+            let root = before.external_roots[&lane].clone();
+            let scope = root.descriptor.context().scope();
+            let capture = physical_capture(&pinned, &entry);
+            let after = capture.transition().state.clone();
+            let next_root = capture.output().changes()[0].next();
+            let mut incremental_budget = ReadBudget::new(100, 100000);
+            capture.output().changes()[0]
+                .verify_reuse(
+                    root.descriptor,
+                    capture.owning_lane().unwrap().next,
+                    &mut JournalBlockReader {
+                        store: pinned.store_for_test(),
+                        scope,
+                    },
+                    &mut incremental_budget,
+                )
+                .unwrap();
+            let mut publication_budget = ReadBudget::new(100, 100000);
+            executor.captures.push(capture);
+            assert!(
+                pinned
+                    .apply(&mut executor, entry.borrowed(), &mut ReadBudget::new(0, 0))
+                    .is_err()
+            );
+            assert_eq!(pinned.materialization().unwrap().heads(), before.heads());
+            assert_eq!(
+                pinned.store_for_test().heads().unwrap().as_ref(),
+                Some(before.heads())
+            );
+            if discriminator == 0xb1 {
+                let committed = pinned
+                    .apply(&mut executor, entry.borrowed(), &mut publication_budget)
+                    .unwrap();
+                let ExternalJournalCommit::Published(publication, executions) = committed else {
+                    panic!("new mutation must publish");
+                };
+                assert!(publication.heads_advanced);
+                assert_eq!(executions.len(), 1);
+                assert_eq!(pinned.materialization().unwrap().state(), &after);
+                assert_eq!(
+                    pinned.materialization().unwrap().external_roots[&lane].descriptor,
+                    next_root
+                );
+                let executed = executor.executions;
+                assert!(matches!(
+                    pinned
+                        .apply(&mut executor, entry.borrowed(), &mut ReadBudget::new(0, 0))
+                        .unwrap(),
+                    ExternalJournalCommit::AlreadyCommitted(_)
+                ));
+                assert_eq!(executor.executions, executed);
+                expected = pinned.materialization().unwrap().clone();
+            } else {
+                // A publication error leaves durability uncertain. The old
+                // materialization must never remain executable through this owner.
+                assert!(
+                    pinned
+                        .apply_with_fault_for_test(
+                            &mut executor,
+                            entry.borrowed(),
+                            &mut publication_budget,
+                            |store, publication, availability| {
+                                let mut alien = publication.clone();
+                                assert!(
+                                    !availability.permits_mutation(store.instance_id(), &alien)
+                                );
+                                alien.external_execution = None;
+                                assert!(
+                                    !availability.permits_mutation(store.instance_id(), &alien)
+                                );
+                                interrupt(store, publication, availability)
+                            }
+                        )
+                        .is_err()
+                );
+                assert!(pinned.materialization().is_err());
+                let executed = executor.executions;
+                assert!(
+                    pinned
+                        .apply(
+                            &mut executor,
+                            entry.borrowed(),
+                            &mut ReadBudget::new(100, 100000)
+                        )
+                        .is_err()
+                );
+                assert_eq!(executor.executions, executed);
+                expected.heads = pinned.store_for_test().heads().unwrap().unwrap();
+                expected.state = if entry.committed(&expected.heads) {
+                    after
+                } else {
+                    before.state
+                };
+            }
+            // No recovery/full-base audit is charged again on an ordinary
+            // mutation: exactly the changed-link verifier's fetches are used.
+            assert_eq!(
+                publication_budget.remaining(),
+                incremental_budget.remaining()
+            );
+            last = Some(entry);
+        }
+        let physical_replays = executor.physical_replays;
+        // Recovery must work with no previously captured transitions available.
+        let live_captures = core::mem::take(&mut executor.captures);
+        drop(pinned);
+        store = reopen(store, &mut executor, false).unwrap();
+        let before_rejected_replay = executor.physical_replays;
+        executor.reject_authentication = true;
+        assert!(
+            PinnedExternalJournal::open(
+                &mut store,
+                seal,
+                &mut executor,
+                &NoPrunedOrderedBases,
+                &mut ReadBudget::new(1000, 1000000),
+            )
+            .is_err()
+        );
+        assert_eq!(executor.physical_replays, before_rejected_replay);
+        assert_eq!(store.heads().unwrap().as_ref(), Some(&expected.heads));
+        executor.reject_authentication = false;
+        // Recovery requires the persisted changed blocks. Guest candidates are
+        // not restaged or used to repair missing storage during this replay.
+        let mut recovered = PinnedExternalJournal::open(
+            &mut store,
+            seal,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &mut ReadBudget::new(1000, 1000000),
+        )
+        .unwrap();
+        assert!(executor.physical_replays > physical_replays);
+        executor.captures = live_captures;
+        assert_eq!(
+            recovered.materialization().unwrap().state(),
+            &expected.state
+        );
+        assert_eq!(
+            recovered.materialization().unwrap().heads(),
+            &expected.heads
+        );
+        let executed = executor.executions;
+        let was_committed = last.as_ref().unwrap().committed(&expected.heads);
+        let retry = recovered
+            .apply(
+                &mut executor,
+                last.as_ref().unwrap().borrowed(),
+                &mut ReadBudget::new(100, 100000),
+            )
+            .unwrap();
+        assert_eq!(
+            matches!(retry, ExternalJournalCommit::AlreadyCommitted(_)),
+            was_committed
+        );
+        assert_eq!(executor.executions, executed + usize::from(!was_committed));
+        assert_eq!(
+            recovered.materialization().unwrap().state(),
+            &executor.captures.last().unwrap().transition().state
+        );
+        let invocation = last.as_ref().unwrap();
+        let ReplayOperation::CleanInvoke {
+            work,
+            authorization,
+            ..
+        } = &invocation.input().operation
+        else {
+            unreachable!()
+        };
+        let ack = Entry::new(
+            recovered.materialization().unwrap(),
+            ReplayInput {
+                runtime: invocation.input().runtime.clone(),
+                operation: ReplayOperation::CleanAcknowledge {
+                    context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                    expected_live: None,
+                    work: crate::agent_sdk::InvocationRetirement::from_work(work),
+                    authorization: authorization.clone(),
+                },
+            },
+        );
+        let capture = physical_capture(&recovered, &ack);
+        let acknowledged_state = capture.transition().state.clone();
+        executor.captures.push(capture);
+        let published = recovered
+            .apply(
+                &mut executor,
+                ack.borrowed(),
+                &mut ReadBudget::new(100, 100000),
+            )
+            .unwrap();
+        assert!(
+            matches!(published, ExternalJournalCommit::Published(publication, _) if publication.heads_advanced)
+        );
+        assert_eq!(
+            recovered.materialization().unwrap().state(),
+            &acknowledged_state
+        );
+        let executed = executor.executions;
+        assert!(matches!(
+            recovered
+                .apply(&mut executor, ack.borrowed(), &mut ReadBudget::new(0, 0))
+                .unwrap(),
+            ExternalJournalCommit::AlreadyCommitted(_)
+        ));
+        assert_eq!(executor.executions, executed);
+        // Clean runtimes own result retention: a later-position ACK executes
+        // the runtime again. Only retrying the exact publication skips it.
+        // The probe returns a captured no-change transition, not a new root.
+        let repeated_ack = Entry::new(recovered.materialization().unwrap(), ack.input().clone());
+        let repeated_capture = physical_capture(&recovered, &repeated_ack);
+        assert!(repeated_capture.output().changes().is_empty());
+        assert_eq!(repeated_capture.transition().state, acknowledged_state);
+        executor.captures.push(repeated_capture);
+        let published = recovered
+            .apply(
+                &mut executor,
+                repeated_ack.borrowed(),
+                &mut ReadBudget::new(0, 0),
+            )
+            .unwrap();
+        assert!(
+            matches!(published, ExternalJournalCommit::Published(publication, _) if publication.heads_advanced)
+        );
+        assert_eq!(executor.executions, executed + 1);
+        assert_eq!(
+            recovered.materialization().unwrap().state(),
+            &acknowledged_state
+        );
+        let before_checkpoint = recovered.materialization().unwrap().heads().clone();
+        assert!(
+            recovered
+                .checkpoint(seal, &mut ReadBudget::new(0, 0))
+                .is_err()
+        );
+        assert_eq!(
+            recovered.materialization().unwrap().heads(),
+            &before_checkpoint
+        );
+        let mut candidate = None;
+        assert!(
+            recovered
+                .checkpoint_with_fault_for_test(
+                    seal,
+                    &mut ReadBudget::new(1000, 1000000),
+                    |store, publication, availability| {
+                        candidate = publication.next().checkpoint;
+                        interrupt(store, publication, availability)
+                    },
+                )
+                .is_err()
+        );
+        assert!(candidate.is_some());
+        assert_ne!(candidate, before_checkpoint.checkpoint);
+        assert!(recovered.materialization().is_err());
+        assert!(
+            recovered
+                .checkpoint(seal, &mut ReadBudget::new(1000, 1000000))
+                .is_err()
+        );
+        let durable = recovered.store_for_test().heads().unwrap().unwrap();
+        drop(recovered);
+        store = reopen(store, &mut executor, false).unwrap();
+        // Reopening must neither promote a staged checkpoint nor roll back a
+        // durable commit whose response was lost.
+        assert_eq!(store.heads().unwrap().as_ref(), Some(&durable));
+        let mut recovered = PinnedExternalJournal::open(
+            &mut store,
+            seal,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &mut ReadBudget::new(1000, 1000000),
+        )
+        .unwrap();
+        assert_eq!(
+            recovered.materialization().unwrap().state(),
+            &acknowledged_state
+        );
+        if durable.checkpoint == before_checkpoint.checkpoint {
+            assert!(
+                recovered
+                    .checkpoint(seal, &mut ReadBudget::new(1000, 1000000))
+                    .unwrap()
+                    .heads_advanced
+            );
+        }
+        assert_eq!(
+            recovered.materialization().unwrap().heads().checkpoint,
+            candidate
+        );
+        assert_ne!(
+            recovered.materialization().unwrap().heads().checkpoint,
+            before_checkpoint.checkpoint
+        );
+        assert_eq!(
+            recovered.materialization().unwrap().state(),
+            &acknowledged_state
+        );
+        // Continue under the newly selected checkpoint's availability set,
+        // then checkpoint again so collection can cover the entire suffix.
+        let after_checkpoint_ack =
+            Entry::new(recovered.materialization().unwrap(), ack.input().clone());
+        executor
+            .captures
+            .push(physical_capture(&recovered, &after_checkpoint_ack));
+        assert!(
+            matches!(recovered.apply(&mut executor, after_checkpoint_ack.borrowed(), &mut ReadBudget::new(0, 0)).unwrap(), ExternalJournalCommit::Published(publication, _) if publication.heads_advanced)
+        );
+        assert!(
+            recovered
+                .checkpoint(seal, &mut ReadBudget::new(1000, 1000000))
+                .unwrap()
+                .heads_advanced
+        );
+        drop(recovered);
+        store = reopen(store, &mut executor, false).unwrap();
+        let materialized = materialize_external_genesis(
+            &mut store,
+            seal,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &mut ReadBudget::new(1000, 1000000),
+        )
+        .unwrap();
+        assert_eq!(materialized.state(), &acknowledged_state);
+        // Read counters from durable roots after restart/checkpoint/GC, not
+        // from the captured output or a caller-maintained arithmetic total.
+        for (current_lane, root) in &materialized.external_roots {
+            let descriptor = root.descriptor;
+            let tree = descriptor
+                .bind(descriptor.context(), descriptor.commitment())
+                .unwrap();
+            let mut reader = JournalBlockReader {
+                store: &store,
+                scope: tree.scope(),
+            };
+            let usage = crate::agent_sdk::state_rows::lane_row_usage(
+                tree,
+                &mut reader,
+                &mut ReadBudget::new(100, 100000),
+            )
+            .unwrap();
+            let expected = if *current_lane == lane {
+                crate::agent_sdk::state_rows::RowUsage {
+                    rows: 4,
+                    bytes: (b"initial".len()
+                        + b"created".len()
+                        + b"key".len()
+                        + b"mirror".len()
+                        + 2 * work.message.len()
+                        + work.invocation.0.len()
+                        + b"acknowledged".len()) as u64,
+                }
+            } else {
+                crate::agent_sdk::state_rows::RowUsage { rows: 1, bytes: 14 }
+            };
+            assert_eq!(usage, expected);
+            if *current_lane == lane {
+                let rows = crate::agent_sdk::state_rows::ActorRows::new(
+                    tree,
+                    work.actor,
+                    work.incarnation,
+                )
+                .unwrap();
+                for key in [b"key".as_slice(), b"mirror".as_slice()] {
+                    assert_eq!(
+                        rows.get(key, &mut reader, &mut ReadBudget::new(100, 100000))
+                            .unwrap(),
+                        Some(work.message.clone())
+                    );
+                }
+            }
+        }
+        let committed_heads = store.heads().unwrap();
+        let missing = executor
+            .captures
+            .iter()
+            .rev()
+            .find(|capture| !capture.output().changes().is_empty())
+            .unwrap()
+            .output()
+            .changes()[0]
+            .blocks()[0]
+            .0;
+        remove_block(&mut store, missing);
+        assert!(
+            PinnedExternalJournal::open(
+                &mut store,
+                seal,
+                &mut executor,
+                &NoPrunedOrderedBases,
+                &mut ReadBudget::new(1000, 1000000)
+            )
+            .is_err()
+        );
+        assert_eq!(store.heads().unwrap(), committed_heads);
+        let reference = missing.storage_reference();
+        assert!(
+            store
+                .load_blob(
+                    super::super::journal_store::JournalBlobClass::StateBlock,
+                    &BlobRef {
+                        hash: Hash(reference.hash.0),
+                        len: reference.len
+                    }
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(reopen(store, &mut executor, true).is_none());
+    }
+
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    #[test]
+    #[ignore = "requires build-agent-state-probe"]
+    fn compiled_external_genesis_preparation_authenticates_and_retains_roots() {
+        qualify_compiled_external_genesis(
+            "agent-state-probe/riscv64em-vos/release/state_tree_probe.elf",
+            true,
+        );
+    }
+
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    #[test]
+    #[ignore = "requires build-agent-standard-state-guest and build-agent-state-actor"]
+    fn compiled_standard_external_genesis_publication_and_crash_recovery() {
+        // The standard guest executes real lifecycle validation and metadata
+        // initialization. Probe-specific mutation markers are not its API.
+        qualify_compiled_external_genesis(
+            "agent-state-standard/riscv64em-vos/release/agent_runtime.elf",
+            false,
+        );
+    }
+
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    fn qualify_compiled_external_genesis(artifact: &str, probe_mutations: bool) {
+        use super::super::{
+            journal_store::{AgentJournalStore, MemoryAgentJournalStore},
+            package_admission::AdmittedStateRuntimePackage,
+            state_block_pvm::{ExternalCreateExecution, MultiLaneStateBlockHost},
+            state_block_store::journal_create_state_work,
+        };
+        use crate::agent_sdk::state_blocks::ReadBudget;
+
+        struct Executor<'a> {
+            admitted: &'a AdmittedStateRuntimePackage,
+            store: &'a MemoryAgentJournalStore,
+            replica: crate::agent_sdk::AgentReplica,
+            authenticated: Option<ReplayInputId>,
+            executions: usize,
+            substitute: Option<ReplayInput>,
+            gas: u64,
+        }
+        impl ReplayExecutor for Executor<'_> {
+            type Error = ();
+
+            fn verify_merge_event(&mut self, _: &MergeEvent) -> Result<bool, ()> {
+                Err(())
+            }
+
+            fn authenticate(
+                &mut self,
+                input: &ReplayInput,
+                before: &RuntimeState,
+                position: ReplayPosition,
+            ) -> Result<(), ()> {
+                self.authenticated = None;
+                assert!(before.is_empty());
+                assert_eq!(position, ReplayPosition::Genesis);
+                // Real fixture receipt signature, request, binding and window
+                // checks, not an always-successful authentication stub.
+                OpaqueCleanReplayExecutor::default().authenticate(input, before, position)?;
+                self.authenticated = Some(input.id());
+                Ok(())
+            }
+
+            fn execute(
+                &mut self,
+                _: &ReplayInput,
+                _: &RuntimeState,
+                _: ReplayPosition,
+            ) -> Result<ReplayTransition, ()> {
+                panic!("external genesis must not use opaque execution");
+            }
+        }
+        impl ExternalGenesisExecutor for Executor<'_> {
+            fn execute_external_create(
+                &mut self,
+                create: &ReplayInput,
+                _: AgentReplica,
+            ) -> Result<ExternalCreateExecution, ()> {
+                assert_eq!(self.authenticated.take(), Some(create.id()));
+                self.executions += 1;
+                MultiLaneStateBlockHost {
+                    store: self.store,
+                    budget: &mut ReadBudget::new(0, 0),
+                }
+                .execute_admitted_create(
+                    self.admitted,
+                    self.substitute.as_ref().unwrap_or(create),
+                    self.replica,
+                    self.gas,
+                )
+                .map_err(|_| ())
+            }
+        }
+
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target"));
+        let elf = std::fs::read(target.join(artifact))
+            .unwrap_or_else(|error| panic!("build {artifact} first: {error}"));
+        let admitted = super::super::package_admission::tests::admitted_state_fixture(
+            vos_pvm_compiler::link_elf_spi(&elf).unwrap(),
+        );
+        let (create, replica, native_replica) = external_create_fixture(&admitted);
+        let store =
+            MemoryAgentJournalStore::new(create.runtime.agent, native_replica.node).unwrap();
+        let mut executor = Executor {
+            admitted: &admitted,
+            store: &store,
+            replica,
+            authenticated: None,
+            executions: 0,
+            substitute: None,
+            gas: 1_000_000_000,
+        };
+
+        for expired in [false, true] {
+            let mut invalid = create.clone();
+            let ReplayOperation::CleanManage {
+                authority,
+                observed_slot,
+                ..
+            } = &mut invalid.operation
+            else {
+                unreachable!()
+            };
+            if expired {
+                *observed_slot = u64::MAX;
+            } else {
+                authority.signature[0] ^= 1;
+            }
+            assert!(matches!(
+                ReplayPreparedExternalGenesis::prepare(invalid, native_replica, &mut executor),
+                Err(ReplayError::Executor(()))
+            ));
+            assert_eq!(executor.executions, 0);
+        }
+        let mut foreign_replica = native_replica;
+        foreign_replica.node.0[0] ^= 1;
+        assert!(matches!(
+            ReplayPreparedExternalGenesis::prepare(create.clone(), foreign_replica, &mut executor),
+            Err(ReplayError::ScopeMismatch)
+        ));
+        assert_eq!(executor.executions, 0);
+        executor.gas = 0;
+        assert!(matches!(
+            ReplayPreparedExternalGenesis::prepare(create.clone(), native_replica, &mut executor),
+            Err(ReplayError::Executor(()))
+        ));
+        executor.gas = 1_000_000_000;
+        let mut other = create.clone();
+        let ReplayOperation::CleanManage { observed_slot, .. } = &mut other.operation else {
+            unreachable!()
+        };
+        *observed_slot += 1;
+        executor.substitute = Some(other);
+        assert!(matches!(
+            ReplayPreparedExternalGenesis::prepare(create.clone(), native_replica, &mut executor),
+            Err(ReplayError::ScopeMismatch)
+        ));
+        executor.substitute = None;
+        let prepared =
+            ReplayPreparedExternalGenesis::prepare(create.clone(), native_replica, &mut executor)
+                .unwrap();
+        assert_eq!(executor.executions, 3);
+        assert!(prepared.execution().matches(&create, replica));
+        assert_eq!(
+            prepared.execution().work(),
+            &journal_create_state_work(&admitted, &create, replica).unwrap()
+        );
+        assert_eq!(prepared.execution().output().changes().len(), 3);
+        let proposal = prepared.ordinary_proposal().unwrap();
+        assert_eq!(proposal.create(), &create);
+        assert_eq!(proposal.catalog(), &[create.runtime.package.clone()]);
+        assert_eq!(
+            proposal.expectations().post_create_state(),
+            system_genesis_post_create_state_commitment(&prepared.prepared.post_create).unwrap()
+        );
+        let mut sealed = ReplaySealedExternalLocalGenesis::from_prepared(prepared).unwrap();
+        assert!(sealed.execution().matches(&create, replica));
+        assert_eq!(sealed.genesis().create, create);
+        let catalog = [super::super::execution::RuntimeBlob {
+            reference: create.runtime.package.clone(),
+            bytes: admitted.exact_bytes().to_vec(),
+        }];
+        let production_prepared = super::super::local_journal_driver::LocalJournalAgentDriver::<
+            MemoryAgentJournalStore,
+        >::prepare_external_local_genesis(
+            create.clone(),
+            native_replica,
+            &catalog,
+            native_replica.node,
+        )
+        .unwrap();
+        assert_eq!(production_prepared.genesis(), sealed.genesis());
+        assert_eq!(production_prepared.execution(), sealed.execution());
+        assert!(super::super::local_journal_driver::LocalJournalAgentDriver::<
+            MemoryAgentJournalStore,
+        >::prepare_external_local_genesis(
+            create.clone(), native_replica, &[], native_replica.node
+        )
+        .is_err());
+        let mut bad_receipt = create.clone();
+        let ReplayOperation::CleanManage { authority, .. } = &mut bad_receipt.operation else {
+            unreachable!()
+        };
+        authority.signature[0] ^= 1;
+        assert!(super::super::local_journal_driver::LocalJournalAgentDriver::<
+            MemoryAgentJournalStore,
+        >::prepare_external_local_genesis(
+            bad_receipt, native_replica, &catalog, native_replica.node
+        )
+        .is_err());
+        let mut foreign_node = native_replica.node;
+        foreign_node.0[0] ^= 1;
+        assert!(super::super::local_journal_driver::LocalJournalAgentDriver::<
+            MemoryAgentJournalStore,
+        >::prepare_external_local_genesis(
+            create.clone(), native_replica, &catalog, foreign_node
+        )
+        .is_err());
+        assert!(
+            sealed
+                .lane_manifest(PersistedLane::Control)
+                .external_root
+                .is_none()
+        );
+        for lane in [
+            PersistedLane::Linear,
+            PersistedLane::Merge,
+            PersistedLane::Local,
+        ] {
+            let manifest = sealed.lane_manifest(lane);
+            let root = manifest.external_root.as_ref().unwrap();
+            assert_eq!(root.runtime, create.runtime);
+            assert_eq!(root.cursor, manifest.cursor);
+            assert_eq!(
+                root.descriptor.encode(),
+                state_component(sealed.local.post_create(), lane)
+            );
+            assert_eq!(
+                LaneStateManifest::decode(&manifest.encode()).unwrap(),
+                manifest
+            );
+        }
+        sealed.local.replica.node.0[0] ^= 1;
+        assert!(matches!(sealed.validate(), Err(ReplayError::ScopeMismatch)));
+        sealed.local.replica.node.0[0] ^= 1;
+        sealed.validate().unwrap();
+        let initial_merge = sealed.lane_manifest(PersistedLane::Merge);
+        assert!(!supported_external_checkpoint_lane(&initial_merge, None));
+        assert!(supported_external_checkpoint_lane(
+            &initial_merge,
+            Some(&sealed)
+        ));
+        let mut changed_merge = initial_merge.clone();
+        let root = changed_merge.external_root.as_mut().unwrap();
+        root.descriptor =
+            crate::agent_sdk::state_root::StateRootDescriptor::new(root.descriptor.context(), None);
+        changed_merge.state = BlobRef::of_bytes(&root.descriptor.encode());
+        assert!(!supported_external_checkpoint_lane(
+            &changed_merge,
+            Some(&sealed)
+        ));
+        let mut changed_frontier = initial_merge.clone();
+        changed_frontier.cursor = LaneCursor::Merge {
+            frontier: MergeFrontierId([0x91; 32]),
+        };
+        assert!(!supported_external_checkpoint_lane(
+            &changed_frontier,
+            Some(&sealed)
+        ));
+        let initial_checkpoint = sealed.initial_checkpoint().unwrap();
+        let initial_heads = sealed.initial_heads().unwrap();
+        assert_eq!(initial_heads.checkpoint, Some(initial_checkpoint.id()));
+        assert_eq!(initial_heads.publication_revision, 1);
+        let predecessor = sealed.initial_predecessor_heads();
+        assert_eq!(predecessor.publication_revision, 0);
+        assert_eq!(predecessor.checkpoint, None);
+        assert_eq!(initial_heads.previous, Some(predecessor.id()));
+        predecessor.validate_successor(&initial_heads).unwrap();
+        assert_eq!(
+            initial_checkpoint.publication_revision,
+            predecessor.publication_revision
+        );
+        assert_eq!(initial_checkpoint.genesis, sealed.genesis().id());
+        assert_eq!(initial_checkpoint.artifacts, sealed.local.artifacts().id());
+        assert_eq!(initial_checkpoint.lanes.len(), 4);
+        for lane in &initial_checkpoint.lanes {
+            assert_eq!(lane.state, sealed.lane_manifest(lane.lane).id());
+            assert_eq!(
+                lane.node,
+                (lane.lane == PersistedLane::Local).then_some(native_replica.node)
+            );
+            assert_eq!(
+                lane.invocations,
+                (lane.lane == PersistedLane::Local).then_some(initial_heads.local_invocations)
+            );
+        }
+        assert_eq!(
+            CheckpointManifest::decode(&initial_checkpoint.encode()).unwrap(),
+            initial_checkpoint
+        );
+        assert_eq!(
+            JournalHeads::decode(&initial_heads.encode()).unwrap(),
+            initial_heads
+        );
+        let mut initialized =
+            MemoryAgentJournalStore::new(create.runtime.agent, native_replica.node).unwrap();
+        assert!(matches!(
+            initialized.initialize_external_local(&sealed, &mut ReadBudget::new(100, 100000)),
+            Err(JournalStoreError::MissingObject)
+        ));
+        initialized
+            .put_blob(
+                super::super::journal_store::JournalBlobClass::CatalogArtifact,
+                &create.runtime.package,
+                admitted.exact_bytes(),
+            )
+            .unwrap();
+        // A shared budget can fail after earlier lanes staged blocks. The
+        // memory candidate must not expose any of that partial initialization.
+        for (fetches, bytes) in [(0, 0), (2, 100000), (100, 1)] {
+            assert!(
+                initialized
+                    .initialize_external_local(&sealed, &mut ReadBudget::new(fetches, bytes))
+                    .is_err()
+            );
+            assert!(initialized.genesis().unwrap().is_none());
+            assert!(initialized.heads().unwrap().is_none());
+            for change in sealed.execution().output().changes() {
+                for (_, bytes) in change.blocks() {
+                    let (_, envelope) =
+                        change.next().context().scope().encode_block(bytes).unwrap();
+                    assert!(
+                        initialized
+                            .load_blob(
+                                super::super::journal_store::JournalBlobClass::StateBlock,
+                                &BlobRef::of_bytes(&envelope)
+                            )
+                            .unwrap()
+                            .is_none()
+                    );
+                }
+            }
+        }
+        let mut wrong_node =
+            MemoryAgentJournalStore::new(create.runtime.agent, NodeId([0xfe; 32])).unwrap();
+        assert!(matches!(
+            wrong_node.initialize_external_local(&sealed, &mut ReadBudget::new(100, 100000)),
+            Err(JournalStoreError::ScopeMismatch)
+        ));
+        assert!(
+            initialized
+                .initialize_external_local(&sealed, &mut ReadBudget::new(100, 100000))
+                .unwrap()
+        );
+        assert_eq!(
+            initialized.genesis().unwrap().as_ref(),
+            Some(sealed.genesis())
+        );
+        assert_eq!(initialized.heads().unwrap(), Some(initial_heads.clone()));
+        let mut unsupported_heads = initial_heads.clone();
+        unsupported_heads.merge_frontier = MergeFrontierId([0x91; 32]);
+        assert!(
+            sealed
+                .validate_checkpoint_scope(&initialized, &unsupported_heads)
+                .is_err()
+        );
+        unsupported_heads = initial_heads.clone();
+        unsupported_heads.runtime.deployment = DeploymentId([0x91; 32]);
+        assert!(
+            sealed
+                .validate_checkpoint_scope(&initialized, &unsupported_heads)
+                .is_err()
+        );
+        assert_eq!(
+            initialized.historical_heads(predecessor.id()).unwrap(),
+            Some(predecessor)
+        );
+        assert_eq!(
+            initialized
+                .get::<CheckpointManifest>(initial_checkpoint.id())
+                .unwrap(),
+            Some(initial_checkpoint.clone())
+        );
+        for lane in [
+            PersistedLane::Linear,
+            PersistedLane::Merge,
+            PersistedLane::Local,
+        ] {
+            let manifest = sealed.lane_manifest(lane);
+            let session = super::super::state_block_store::StateBlockStaging::audit_manifest(
+                &mut initialized,
+                &manifest,
+                &mut ReadBudget::new(100, 100000),
+            )
+            .unwrap();
+            assert_eq!(
+                Some(session.available()),
+                manifest.external_root.map(|root| root.descriptor)
+            );
+        }
+        assert!(
+            !initialized
+                .initialize_external_local(&sealed, &mut ReadBudget::new(100, 100000))
+                .unwrap()
+        );
+        assert_eq!(initialized.heads().unwrap(), Some(initial_heads.clone()));
+        assert!(
+            materialize_current(&mut initialized, &mut executor, &NoPrunedOrderedBases).is_err()
+        );
+        assert!(
+            materialize_external_checkpoint(
+                &mut initialized,
+                &mut executor,
+                &NoPrunedOrderedBases,
+                &mut ReadBudget::new(100, 100000)
+            )
+            .is_err()
+        );
+        assert!(
+            materialize_external_genesis(
+                &mut initialized,
+                &sealed,
+                &mut executor,
+                &NoPrunedOrderedBases,
+                &mut ReadBudget::new(0, 0)
+            )
+            .is_err()
+        );
+        let recovered = materialize_external_genesis(
+            &mut initialized,
+            &sealed,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &mut ReadBudget::new(100, 100000),
+        )
+        .unwrap();
+        assert_eq!(recovered.heads(), &initial_heads);
+        assert_eq!(recovered.state(), sealed.post_create());
+        assert_eq!(recovered.external_roots.len(), 3);
+        assert_eq!(
+            recovered.clean_management_evidence(),
+            initial_checkpoint.clean_management.as_ref()
+        );
+        assert!(recovered.clean_management_evidence().is_some());
+        for lane in [
+            PersistedLane::Linear,
+            PersistedLane::Merge,
+            PersistedLane::Local,
+        ] {
+            assert_eq!(
+                recovered.external_roots.get(&lane),
+                sealed.lane_manifest(lane).external_root.as_ref()
+            );
+        }
+        let mut other_create = create.clone();
+        let ReplayOperation::CleanManage { observed_slot, .. } = &mut other_create.operation else {
+            unreachable!()
+        };
+        *observed_slot += 1;
+        let other_seal = ReplaySealedExternalLocalGenesis::from_prepared(
+            ReplayPreparedExternalGenesis::prepare(other_create, native_replica, &mut executor)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(other_seal.genesis().id(), sealed.genesis().id());
+        assert!(matches!(
+            materialize_external_genesis(
+                &mut initialized,
+                &other_seal,
+                &mut executor,
+                &NoPrunedOrderedBases,
+                &mut ReadBudget::new(100, 100000),
+            ),
+            Err(ReplayError::ScopeMismatch)
+        ));
+        assert_eq!(initialized.heads().unwrap(), Some(initial_heads));
+        if !probe_mutations {
+            qualify_standard_durable_install(
+                initialized.clone(),
+                &sealed,
+                &admitted,
+                false,
+                false,
+                |store, publication, availability| {
+                    super::super::journal_store::ExternalMutationStore::publish_external_mutation(
+                        store,
+                        publication,
+                        availability,
+                    )
+                },
+                |_, _, _| unreachable!("memory fixture has no actor fault injection"),
+                |store, _| store,
+            );
+        }
+        if probe_mutations {
+            for lane in [PersistedLane::Linear, PersistedLane::Local] {
+                qualify_pinned_external_mutations(
+                    initialized.clone(),
+                    &sealed,
+                    &admitted,
+                    lane,
+                    |store, publication, availability| {
+                        if publication.checkpoint_validation().is_some() {
+                            super::super::journal_store::AuditedCheckpointStore::publish_audited_checkpoint(
+                            store, publication, availability,
+                        )?;
+                        } else {
+                            super::super::journal_store::ExternalMutationStore::publish_external_mutation(
+                            store, publication, availability,
+                        )?;
+                        }
+                        Err(JournalStoreError::Unavailable)
+                    },
+                    |store, block| {
+                        assert!(store.remove_state_block_for_test(block).is_some());
+                    },
+                    |store, _, missing| (!missing).then_some(store),
+                );
+            }
+        }
+        #[cfg(all(target_os = "linux", feature = "storage"))]
+        super::super::journal_store::ExternalFileFixture::qualify_external_genesis(
+            &sealed,
+            &admitted,
+            &mut executor,
+            probe_mutations,
+        );
+        // The same Shared Create has equal public roots but intentionally
+        // different Local roots on its replicas. Never promote these full
+        // per-replica states to a common quorum proposal.
+        let mut shared = create.clone();
+        let ReplayOperation::CleanManage {
+            request, authority, ..
+        } = &mut shared.operation
+        else {
+            unreachable!()
+        };
+        let crate::agent_sdk::ManagementRequest::Create(descriptor) = request else {
+            unreachable!()
+        };
+        descriptor.identity.profile = crate::agent_sdk::AgentProfile::Shared;
+        let mut second = replica;
+        second.node.0[0] += 1;
+        descriptor.replicas.push(second);
+        let shared_descriptor = (**descriptor).clone();
+        let (_, _, signing, _) = opaque_clean_fixture();
+        *authority = signed_opaque_clean_receipt(
+            &shared_descriptor,
+            request,
+            shared_descriptor.identity.runtime_deployment,
+            1,
+            &signing,
+        );
+        let mut shared_states = Vec::new();
+        for sdk_replica in [replica, second] {
+            let placed = AgentReplica {
+                node: NodeId(sdk_replica.node.0),
+                principal: PrincipalId(sdk_replica.principal.0),
+                role: ReplicaRole::Voter,
+            };
+            let replica_store =
+                MemoryAgentJournalStore::new(shared.runtime.agent, placed.node).unwrap();
+            let mut shared_executor = Executor {
+                admitted: &admitted,
+                store: &replica_store,
+                replica: sdk_replica,
+                authenticated: None,
+                executions: 0,
+                substitute: None,
+                gas: 1_000_000_000,
+            };
+            let candidate = ReplayPreparedExternalGenesis::prepare(
+                shared.clone(),
+                placed,
+                &mut shared_executor,
+            )
+            .unwrap();
+            assert!(matches!(
+                candidate.ordinary_proposal(),
+                Err(super::super::genesis::AgentGenesisError::InvalidProposal)
+            ));
+            shared_states.push(candidate.prepared.post_create);
+            assert!(replica_store.genesis().unwrap().is_none());
+            assert!(replica_store.heads().unwrap().is_none());
+        }
+        assert_eq!(shared_states[0].control, shared_states[1].control);
+        assert_eq!(shared_states[0].linear, shared_states[1].linear);
+        assert_eq!(shared_states[0].merge, shared_states[1].merge);
+        assert_ne!(shared_states[0].local, shared_states[1].local);
+        // Neither successful preparation nor any failure stores blocks, admits
+        // finality, publishes heads, or enables ordinary root-blind sealing.
+        assert!(store.genesis().unwrap().is_none());
+        assert!(store.heads().unwrap().is_none());
+        assert!(ReplayPreparedGenesis::prepare(create, native_replica, &mut executor).is_err());
+        assert_eq!(executor.executions, 4);
+    }
+
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    #[test]
+    fn local_checkpoint_suffix_preserves_root_origin_and_replica_scope() {
+        external_checkpoint_suffix_recovery(PersistedLane::Local, false);
+    }
+
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    #[test]
+    #[ignore = "requires build-agent-state-probe"]
+    fn compiled_external_checkpoint_publication_reopen_and_gc() {
+        external_checkpoint_suffix_recovery(PersistedLane::Linear, true);
+    }
+
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    fn external_checkpoint_suffix_recovery(selected_lane: PersistedLane, physical: bool) {
+        use super::super::state_block_store::{
+            JournalBlockReader, journal_root_context, stage_change_blocks,
+        };
+        use crate::agent_sdk::{
+            state_blocks::ReadBudget,
+            state_change::StateChange,
+            state_root::StateRootDescriptor,
+            state_tree::{StateTree, WriteBudget},
+        };
+        let admitted = physical.then(|| {
+            let target = std::env::var_os("CARGO_TARGET_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| {
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target")
+                });
+            let path = target.join("agent-state-probe/riscv64em-vos/release/state_tree_probe.elf");
+            let elf = std::fs::read(&path)
+                .unwrap_or_else(|error| panic!("build probe first: {}: {error}", path.display()));
+            let program = vos_pvm_compiler::link_elf_spi(&elf).unwrap();
+            super::super::package_admission::tests::admitted_state_fixture(program)
+        });
+        let (create, descriptor, _, replica) = opaque_clean_fixture();
+        let mut executor = OpaqueCleanReplayExecutor::default();
+        let prepared = ReplayPreparedGenesis::prepare(create, replica, &mut executor).unwrap();
+        let sealed = ReplaySealedLocalGenesis::from_prepared(prepared).unwrap();
+        let mut store =
+            MemoryAgentJournalStore::new(AgentId(descriptor.identity.agent.0), replica.node)
+                .unwrap();
+        store
+            .put_blob(
+                JournalBlobClass::CatalogArtifact,
+                &sealed.genesis().runtime().package,
+                b"opaque-clean-runtime-v1",
+            )
+            .unwrap();
+        store.initialize_raw_for_test(sealed.genesis()).unwrap();
+        let initial =
+            materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        let (_, checkpointed, _) = prepare_checkpoint(&mut store, &initial)
+            .unwrap()
+            .publish()
+            .unwrap();
+        let original_heads = checkpointed.heads().clone();
+        let checkpoint_id = original_heads.checkpoint.unwrap();
+        let mut checkpoint: CheckpointManifest = store.get(checkpoint_id).unwrap().unwrap();
+        let selected = checkpoint
+            .lanes
+            .iter()
+            .position(|lane| lane.lane == selected_lane)
+            .unwrap();
+        let mut lane: LaneStateManifest = store
+            .get(checkpoint.lanes[selected].state)
+            .unwrap()
+            .unwrap();
+        let context = journal_root_context(
+            sealed.genesis(),
+            &lane.runtime,
+            lane.lane,
+            (selected_lane == PersistedLane::Local).then_some(replica.node),
+            &lane.cursor,
+        )
+        .unwrap();
+        let root = StateRootDescriptor::new(context, None);
+        let bytes = root.encode();
+        lane.state = BlobRef::of_bytes(&bytes);
+        store
+            .put_blob(JournalBlobClass::LaneState, &lane.state, &bytes)
+            .unwrap();
+        // A test store supplies a hash-consistent checkpoint boundary. This is
+        // not a production publication bypass or permission to trust raw heads.
+        for declared in [false, true] {
+            lane.external_root = declared.then(|| super::super::journal::ExternalStateRoot {
+                descriptor: root,
+                runtime: lane.runtime.clone(),
+                cursor: lane.cursor.clone(),
+            });
+            store.put(&lane).unwrap();
+            checkpoint.lanes[selected].state = lane.id();
+            store.put(&checkpoint).unwrap();
+            let mut heads = original_heads.clone();
+            heads.checkpoint = Some(checkpoint.id());
+            let mut source = LinearReplayStore {
+                inner: store.clone(),
+                heads,
+                history_nodes: BTreeMap::new(),
+            };
+            let mut executor = OpaqueCleanReplayExecutor::default();
+            let result = materialize_current(&mut source, &mut executor, &NoPrunedOrderedBases);
+            if declared {
+                assert!(
+                    matches!(result, Err(ReplayError::InvalidRecord)),
+                    "external roots require explicit recovery/provenance support"
+                );
+            } else {
+                assert_eq!(
+                    state_component(result.unwrap().state(), selected_lane),
+                    bytes,
+                    "opaque bytes must not be classified using descriptor magic"
+                );
+            }
+        }
+        // Synthetic authenticated-checkpoint boundary, not evidence of a
+        // lifecycle upgrade or permission to publish fabricated heads. Opt-in
+        // recovery must preserve declarations under the matching contract.
+        let update = if physical {
+            crate::agent_sdk::state_rows::ActorRows::new(
+                StateTree::empty(context.scope()),
+                crate::agent_sdk::ActorId([0xa1; 32]),
+                crate::agent_sdk::Hash([0xa0; 32]),
+            )
+            .unwrap()
+            .update_accounted_batch(
+                &[(b"key".to_vec(), Some(b"retained".to_vec()))],
+                admitted.as_ref().unwrap().external_state_limits(),
+                &mut JournalBlockReader {
+                    store: &store,
+                    scope: context.scope(),
+                },
+                &mut ReadBudget::new(10, 10000),
+                &mut WriteBudget::new(10, 10000),
+            )
+            .unwrap()
+            .update
+        } else {
+            StateTree::empty(context.scope())
+                .update(
+                    [0x61; 32],
+                    Some(b"retained"),
+                    &mut JournalBlockReader {
+                        store: &store,
+                        scope: context.scope(),
+                    },
+                    &mut ReadBudget::new(10, 10000),
+                    &mut WriteBudget::new(10, 10000),
+                )
+                .unwrap()
+        };
+        let change = StateChange::from_update(root.commitment(), context, update).unwrap();
+        stage_change_blocks(&mut store, &change, root.commitment(), context).unwrap();
+        let descriptor = change.next();
+        let mut runtime = checkpoint.runtime.clone();
+        runtime.runtime_abi = Hash(crate::agent_sdk::state_execution::STATE_EXECUTION_ABI_ID.0);
+        runtime.execution_semantics =
+            Hash(crate::agent_sdk::state_execution::STATE_EXECUTION_SEMANTICS_ID.0);
+        if let Some(admitted) = &admitted {
+            runtime = admitted.binding(runtime.space, runtime.agent).unwrap();
+            store
+                .put_blob(
+                    JournalBlobClass::CatalogArtifact,
+                    &runtime.package,
+                    admitted.exact_bytes(),
+                )
+                .unwrap();
+            let mut artifacts: ArtifactClosure = store.get(checkpoint.artifacts).unwrap().unwrap();
+            artifacts.artifacts.push(runtime.package.clone());
+            artifacts
+                .artifacts
+                .sort_unstable_by_key(|reference| (reference.hash, reference.len));
+            artifacts.artifacts.dedup();
+            store.put(&artifacts).unwrap();
+            checkpoint.artifacts = artifacts.id();
+        }
+        checkpoint.runtime = runtime.clone();
+        for selected in &mut checkpoint.lanes {
+            let mut manifest: LaneStateManifest = store.get(selected.state).unwrap().unwrap();
+            manifest.runtime = runtime.clone();
+            if manifest.lane == selected_lane {
+                manifest.external_root.as_mut().unwrap().descriptor = descriptor;
+                manifest.state = BlobRef::of_bytes(&descriptor.encode());
+                store
+                    .put_blob(
+                        JournalBlobClass::LaneState,
+                        &manifest.state,
+                        &descriptor.encode(),
+                    )
+                    .unwrap();
+            }
+            store.put(&manifest).unwrap();
+            selected.state = manifest.id();
+        }
+        store.put(&checkpoint).unwrap();
+        let mut heads = original_heads.clone();
+        heads.runtime = runtime;
+        heads.checkpoint = Some(checkpoint.id());
+        let mut source = LinearReplayStore {
+            inner: store,
+            heads,
+            history_nodes: BTreeMap::new(),
+        };
+        assert!(materialize_current(&mut source, &mut executor, &NoPrunedOrderedBases).is_err());
+        assert!(
+            aggregate::materialize_external_checkpoint(
+                &mut source,
+                &mut executor,
+                &NoPrunedOrderedBases,
+                &mut ReadBudget::new(0, 0),
+            )
+            .is_err()
+        );
+        let recovered = aggregate::materialize_external_checkpoint(
+            &mut source,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &mut ReadBudget::new(100, 100000),
+        )
+        .unwrap();
+        assert_eq!(
+            state_component(&recovered.state, selected_lane),
+            descriptor.encode()
+        );
+        assert_eq!(
+            recovered.external_roots[&selected_lane].descriptor,
+            descriptor
+        );
+        assert_eq!(
+            recovered
+                .ordered_snapshots
+                .get(&recovered.ordered_base())
+                .unwrap()
+                .linear_root,
+            recovered
+                .external_roots
+                .get(&PersistedLane::Linear)
+                .cloned()
+        );
+        assert_eq!(recovered.heads(), &source.heads);
+        if selected_lane == PersistedLane::Local {
+            let mut foreign = LinearReplayStore {
+                inner: source.inner.clone(),
+                heads: source.heads.clone(),
+                history_nodes: BTreeMap::new(),
+            };
+            foreign.heads.node = NodeId([0x64; 32]);
+            assert!(
+                materialize_external_checkpoint(
+                    &mut foreign,
+                    &mut executor,
+                    &NoPrunedOrderedBases,
+                    &mut ReadBudget::new(100, 100000),
+                )
+                .is_err(),
+                "a checkpoint cannot transfer Local roots to another replica"
+            );
+        }
+        let checkpoint_heads = source.heads.clone();
+        let mode = if selected_lane == PersistedLane::Local {
+            MethodMode::Local
+        } else {
+            MethodMode::Linear
+        };
+        let input = clean_admitted_invocation(&source.heads.runtime, mode, 0x62);
+        let (position, next_cursor) = if selected_lane == PersistedLane::Local {
+            let entry = LocalEntry {
+                genesis: source.heads.genesis,
+                node: replica.node,
+                revision: source.heads.local_revision + 1,
+                parent: source.heads.local_head,
+                ordered_base: recovered.ordered_base(),
+                merge_frontier: source.heads.merge_frontier,
+                input: input.clone(),
+            };
+            source.put(&entry).unwrap();
+            source.heads.local_revision = entry.revision;
+            source.heads.local_head = Some(entry.id());
+            (
+                ReplayPosition::Local {
+                    id: entry.id(),
+                    node: replica.node,
+                    revision: entry.revision,
+                    ordered_base: entry.ordered_base,
+                    merge_frontier: entry.merge_frontier,
+                },
+                LaneCursor::Local {
+                    node: replica.node,
+                    revision: entry.revision,
+                    head: Some(entry.id()),
+                },
+            )
+        } else {
+            let entry = OrderedEntry {
+                genesis: source.heads.genesis,
+                index: source.heads.ordered_index + 1,
+                parent: source.heads.ordered_head,
+                merge_frontier: source.heads.merge_frontier,
+                merge_seal: None,
+                input: input.clone(),
+            };
+            source.put(&entry).unwrap();
+            source.heads.ordered_index = entry.index;
+            source.heads.ordered_head = Some(entry.id());
+            (
+                ReplayPosition::Ordered {
+                    id: entry.id(),
+                    index: entry.index,
+                    merge_frontier: entry.merge_frontier,
+                    merge_seal: None,
+                },
+                LaneCursor::Ordered {
+                    base: OrderedBase {
+                        index: entry.index,
+                        head: Some(entry.id()),
+                    },
+                },
+            )
+        };
+        source.heads.previous = Some(checkpoint_heads.id());
+        source.heads.publication_revision += 1;
+        assert!(
+            materialize_external_checkpoint(
+                &mut source,
+                &mut executor,
+                &NoPrunedOrderedBases,
+                &mut ReadBudget::new(100, 100000),
+            )
+            .is_err(),
+            "external suffix replay requires its captured execution"
+        );
+        // Ordinary cases use a simulated handoff; the explicit compiled case
+        // executes the signed test package through the physical journal adapter.
+        let previous: LaneStateManifest = source
+            .get(checkpoint.lanes[selected].state)
+            .unwrap()
+            .unwrap();
+        let work = super::super::state_block_store::journal_state_work(
+            sealed.genesis(),
+            &input,
+            &recovered.state,
+            &[(previous.clone(), next_cursor.clone())],
+        )
+        .unwrap();
+        let update = if physical {
+            crate::agent_sdk::state_rows::ActorRows::new(
+                descriptor.bind(context, descriptor.commitment()).unwrap(),
+                crate::agent_sdk::ActorId([0xa1; 32]),
+                crate::agent_sdk::Hash([0xa0; 32]),
+            )
+            .unwrap()
+            .update_accounted_batch(
+                &[
+                    (b"key".to_vec(), Some(vec![0x62])),
+                    (b"mirror".to_vec(), Some(vec![0x62])),
+                ],
+                admitted.as_ref().unwrap().external_state_limits(),
+                &mut JournalBlockReader {
+                    store: &source,
+                    scope: context.scope(),
+                },
+                &mut ReadBudget::new(100, 100000),
+                &mut WriteBudget::new(100, 100000),
+            )
+            .unwrap()
+            .update
+        } else {
+            descriptor
+                .bind(context, descriptor.commitment())
+                .unwrap()
+                .update(
+                    [0x61; 32],
+                    Some(b"changed"),
+                    &mut JournalBlockReader {
+                        store: &source,
+                        scope: context.scope(),
+                    },
+                    &mut ReadBudget::new(100, 100000),
+                    &mut WriteBudget::new(100, 100000),
+                )
+                .unwrap()
+        };
+        let change =
+            StateChange::from_update(descriptor.commitment(), work.lanes()[0].next, update)
+                .unwrap();
+        let crate::agent_sdk::RuntimeWork::Invoke { state: prior, .. } = work.work() else {
+            unreachable!()
+        };
+        let mut returned = prior.clone();
+        match selected_lane {
+            PersistedLane::Local => returned.local = change.next().encode(),
+            PersistedLane::Linear => returned.linear = change.next().encode(),
+            _ => unreachable!(),
+        }
+        let output = crate::agent_sdk::state_execution::StateExecutionOutput::new(
+            &work,
+            crate::agent_sdk::RuntimeTransition {
+                state: returned,
+                outcome: crate::agent_sdk::RuntimeOutcome::Completed(Err(
+                    crate::agent_sdk::InvocationError::NotFound,
+                )),
+            },
+            vec![change.clone()],
+        )
+        .unwrap();
+        let captured = if let Some(admitted) = &admitted {
+            super::super::state_block_pvm::StateBlockHost {
+                scope: context.scope(),
+                reader: &mut JournalBlockReader {
+                    store: &source,
+                    scope: context.scope(),
+                },
+                budget: &mut ReadBudget::new(100, 100000),
+            }
+            .execute_admitted_journal(
+                admitted,
+                sealed.genesis(),
+                &input,
+                &recovered.state,
+                position,
+                &[(previous, next_cursor.clone())],
+                1_000_000_000,
+            )
+            .unwrap()
+        } else {
+            ReplayExternalExecution::from_physical_response(
+                &input,
+                &recovered.state,
+                position,
+                &work,
+                output,
+            )
+            .unwrap()
+        };
+        assert_eq!(captured.output().changes(), &[change.clone()]);
+        #[derive(Clone)]
+        struct RecoveryExecutor(Option<ReplayExternalExecution>);
+        impl ReplayExecutor for RecoveryExecutor {
+            type Error = ();
+            fn verify_merge_event(&mut self, _: &MergeEvent) -> Result<bool, ()> {
+                Ok(false)
+            }
+            fn authenticate(
+                &mut self,
+                _: &ReplayInput,
+                _: &RuntimeState,
+                _: ReplayPosition,
+            ) -> Result<(), ()> {
+                Ok(())
+            }
+            fn execute(
+                &mut self,
+                _: &ReplayInput,
+                _: &RuntimeState,
+                _: ReplayPosition,
+            ) -> Result<ReplayTransition, ()> {
+                Ok(self.0.as_ref().ok_or(())?.transition().clone())
+            }
+            fn take_external_execution(&mut self) -> Result<Option<ReplayExternalExecution>, ()> {
+                Ok(self.0.take())
+            }
+        }
+        let run = RecoveryExecutor(Some(captured));
+        // Ordinary preparation must retain the exact physical candidate, not
+        // discard its blocks. Publication remains closed until the availability
+        // owner is integrated; abandoning this plan must not advance heads.
+        let mut preparation_store = LinearReplayStore {
+            inner: source.inner.clone(),
+            heads: checkpoint_heads.clone(),
+            history_nodes: BTreeMap::new(),
+        };
+        let preparation = match position {
+            ReplayPosition::Local { id, .. } => {
+                let entry: LocalEntry = source.get(id).unwrap().unwrap();
+                prepare_local(&mut preparation_store, &mut run.clone(), &recovered, &entry)
+            }
+            ReplayPosition::Ordered { id, .. } => {
+                let entry: OrderedEntry = source.get(id).unwrap().unwrap();
+                prepare_ordered(&mut preparation_store, &mut run.clone(), &recovered, &entry)
+            }
+            _ => unreachable!(),
+        }
+        .unwrap();
+        let ReplayPreparation::Ready(prepared) = preparation else {
+            panic!("expected prepared mutation");
+        };
+        assert_eq!(prepared.sealed.external_execution(), run.0.as_ref());
+        assert_eq!(
+            prepared.successor.external_roots[&selected_lane].descriptor,
+            change.next()
+        );
+        let mutation_seal = Box::new(prepared.sealed.clone());
+        assert!(matches!(
+            prepared.publish(),
+            Err(JournalStoreError::Unavailable)
+        ));
+        assert_eq!(preparation_store.heads, checkpoint_heads);
+        let old_memory_heads = preparation_store.inner.heads().unwrap();
+        assert!(matches!(
+            preparation_store.inner.publish(&mutation_seal),
+            Err(JournalStoreError::Unavailable)
+        ));
+        assert_eq!(preparation_store.inner.heads().unwrap(), old_memory_heads);
+        // Derive the exact expected invocation-index successor independently of
+        // the recovery loop, rather than accepting whatever head it returns.
+        let indexes = InvocationIndexes::open(
+            &mut source,
+            checkpoint_heads.ordered_invocations,
+            checkpoint_heads.merge_invocations,
+            checkpoint_heads.local_invocations,
+        )
+        .unwrap();
+        let mut machine = ReplayMachine::from_materialization(&recovered, indexes).unwrap();
+        let captured_step = machine
+            .apply::<_, ()>(&mut run.clone(), &input, &recovered.state, position)
+            .unwrap();
+        assert_eq!(
+            capture_publication_state_products(&input, &captured_step, &recovered)
+                .unwrap()
+                .as_deref(),
+            run.0.as_ref()
+        );
+        let mut missing_capture = captured_step.clone();
+        missing_capture.external_execution = None;
+        assert!(capture_publication_state_products(&input, &missing_capture, &recovered).is_err());
+        let mut wrong_state = captured_step.clone();
+        wrong_state.state.control.push(0);
+        assert!(capture_publication_state_products(&input, &wrong_state, &recovered).is_err());
+        let mut unbound = recovered.clone();
+        unbound.external_roots.clear();
+        assert!(capture_publication_state_products(&input, &captured_step, &unbound).is_err());
+        let mut wrong_runtime = captured_step.clone();
+        wrong_runtime.runtime.execution_semantics = Hash::ZERO;
+        assert!(capture_publication_state_products(&input, &wrong_runtime, &recovered).is_err());
+        let mut wrong_outcome = captured_step.clone();
+        wrong_outcome.outcome = ReplayStepOutcome::Applied(
+            if captured_step.outcome == ReplayStepOutcome::Applied(ReplayDisposition::Rejected) {
+                ReplayDisposition::Applied
+            } else {
+                ReplayDisposition::Rejected
+            },
+        );
+        assert!(capture_publication_state_products(&input, &wrong_outcome, &recovered).is_err());
+        // Non-executing retained-result/ACK paths carry no new state and must
+        // remain sealable without fabricating a physical capture. ReplayMachine
+        // independently decides whether skipping execution is legitimate.
+        let mut unchanged = missing_capture;
+        unchanged.state = recovered.state.clone();
+        unchanged.runtime = recovered.heads.runtime.clone();
+        assert!(
+            capture_publication_state_products(&input, &unchanged, &recovered)
+                .unwrap()
+                .is_none()
+        );
+        let ids = machine.ownership_ids(checkpoint_heads.node).unwrap();
+        drop(machine);
+        source.heads.ordered_invocations = ids.0;
+        source.heads.local_invocations = ids.2;
+        assert!(matches!(
+            materialize_external_checkpoint(
+                &mut source,
+                &mut run.clone(),
+                &NoPrunedOrderedBases,
+                &mut ReadBudget::new(100, 100000)
+            ),
+            Err(ReplayError::Source(
+                ReplayMaterializationSourceError::Journal(JournalStoreError::MissingObject)
+            ))
+        ));
+        stage_change_blocks(
+            &mut source,
+            &change,
+            descriptor.commitment(),
+            work.lanes()[0].next,
+        )
+        .unwrap();
+        let advanced = materialize_external_checkpoint(
+            &mut source,
+            &mut run.clone(),
+            &NoPrunedOrderedBases,
+            &mut ReadBudget::new(100, 100000),
+        )
+        .unwrap();
+        assert_eq!(
+            state_component(&advanced.state, selected_lane),
+            change.next().encode()
+        );
+        for other in [
+            PersistedLane::Control,
+            PersistedLane::Linear,
+            PersistedLane::Merge,
+            PersistedLane::Local,
+        ] {
+            if other != selected_lane {
+                assert_eq!(
+                    state_component(&advanced.state, other),
+                    state_component(&recovered.state, other)
+                );
+            }
+        }
+        assert_eq!(advanced.external_roots[&selected_lane].cursor, next_cursor);
+        assert_eq!(
+            advanced.external_roots[&selected_lane].descriptor,
+            change.next()
+        );
+        // Exercise actual checkpoint preparation, not only the projection
+        // helper. This harness is not a storage publication authority; do not
+        // invoke its lightweight test CAS to claim external publication support.
+        let before_prepare = source.heads.clone();
+        assert!(
+            prepare_checkpoint(&mut source, &recovered).is_err(),
+            "a pre-suffix materialization cannot prepare the current checkpoint"
+        );
+        let prepared = prepare_checkpoint(&mut source, &advanced).unwrap();
+        let sealed_checkpoint = prepared.sealed.checkpoint_validation().unwrap();
+        let (checkpoint_lane, projected) = sealed_checkpoint
+            .lanes()
+            .iter()
+            .find(|(lane, _)| lane.lane == selected_lane)
+            .unwrap();
+        assert_eq!(
+            projected.external_root.as_ref(),
+            advanced.external_roots.get(&selected_lane)
+        );
+        assert_eq!(projected.cursor, next_cursor);
+        assert_eq!(projected.state, BlobRef::of_bytes(&change.next().encode()));
+        assert_eq!(checkpoint_lane.state, projected.id());
+        assert_eq!(prepared.successor.external_roots, advanced.external_roots);
+        assert_eq!(prepared.successor.state, advanced.state);
+        let projected_blob = projected.state.clone();
+        assert!(
+            matches!(
+                prepared.audit_external_checkpoint(&mut ReadBudget::new(0, 0)),
+                Err(JournalStoreError::LimitExceeded)
+            ),
+            "maintenance audit must honor its budget"
+        );
+        assert_eq!(source.heads, before_prepare);
+        let prepared = prepare_checkpoint(&mut source, &advanced).unwrap();
+        assert!(
+            matches!(
+                prepared.audit_external_checkpoint(&mut ReadBudget::new(1, 100000)),
+                Err(JournalStoreError::LimitExceeded)
+            ),
+            "successor and predecessor share one audit budget"
+        );
+        let prepared = prepare_checkpoint(&mut source, &advanced).unwrap();
+        let audited = prepared
+            .audit_external_checkpoint(&mut ReadBudget::new(100, 100000))
+            .unwrap();
+        assert_eq!(audited.lanes.len(), 1);
+        assert_eq!(audited.predecessor_lanes.len(), 1);
+        assert!(
+            audited.lanes.is_disjoint(&audited.predecessor_lanes),
+            "the changed root must not substitute for its predecessor"
+        );
+        assert!(
+            audited
+                .predecessor_lanes
+                .contains(&checkpoint.lanes[selected].state)
+        );
+        assert_eq!(audited.prepared.sealed.expected(), before_prepare.id());
+        assert_eq!(
+            audited.prepared.successor.external_roots,
+            advanced.external_roots
+        );
+        drop(audited);
+        assert_eq!(
+            source.heads, before_prepare,
+            "preparation must not publish heads"
+        );
+        let old_block = descriptor
+            .bind(context, descriptor.commitment())
+            .unwrap()
+            .root()
+            .unwrap();
+        let prepared = prepare_checkpoint(&mut source, &advanced).unwrap();
+        let old_bytes = prepared
+            .store
+            .inner
+            .remove_state_block_for_test(old_block)
+            .unwrap();
+        assert!(
+            matches!(
+                prepared.audit_external_checkpoint(&mut ReadBudget::new(100, 100000)),
+                Err(JournalStoreError::MissingObject)
+            ),
+            "available successor blocks do not replace missing predecessor branches"
+        );
+        assert_eq!(source.heads, before_prepare);
+        let old_storage = old_block.storage_reference();
+        source
+            .put_blob(
+                JournalBlobClass::StateBlock,
+                &BlobRef {
+                    hash: Hash(old_storage.hash.0),
+                    len: old_storage.len,
+                },
+                &old_bytes,
+            )
+            .unwrap();
+        assert_eq!(
+            source
+                .load_blob(JournalBlobClass::LaneState, &projected_blob)
+                .unwrap(),
+            Some(change.next().encode())
+        );
+        // Use the actual memory-store publication engine, not the fixture's
+        // lightweight CAS. Only the starting checkpoint/runtime selection is
+        // synthetic; this does not qualify lifecycle admission or filesystem
+        // durability of an external-state generation.
+        let mut publication_store = source.inner.clone();
+        // The lightweight replay harness did not publish this synthetic
+        // boundary. Real storage validates the complete predecessor chain.
+        publication_store
+            .persist_historical_heads_for_test(&checkpoint_heads)
+            .unwrap();
+        publication_store.replace_heads_for_external_fixture(&before_prepare);
+        let ordinary = prepare_checkpoint(&mut publication_store, &advanced).unwrap();
+        let ordinary_error = ordinary
+            .publish()
+            .err()
+            .expect("ordinary publication must reject external roots");
+        assert_eq!(
+            publication_store.heads().unwrap().as_ref(),
+            Some(&before_prepare)
+        );
+        let audited = prepare_checkpoint(&mut publication_store, &advanced)
+            .unwrap()
+            .audit_external_checkpoint(&mut ReadBudget::new(100, 100000))
+            .unwrap();
+        let mut foreign_store = audited.prepared.store.clone();
+        let validation = ExternalCheckpointValidation {
+            mutation: None,
+            store: audited.prepared.store.instance_id(),
+            predecessor: audited.prepared.sealed.expected(),
+            successor: audited.prepared.sealed.next().id(),
+            predecessor_checkpoint: before_prepare.checkpoint,
+            successor_checkpoint: audited.prepared.sealed.next().checkpoint.unwrap(),
+            predecessor_lanes: &audited.predecessor_lanes,
+            successor_lanes: &audited.lanes,
+        };
+        assert!(matches!(
+            super::super::journal_store::AuditedCheckpointStore::publish_audited_checkpoint(
+                &mut foreign_store,
+                &audited.prepared.sealed,
+                &validation,
+            ),
+            Err(JournalStoreError::NonCanonical)
+        ));
+        assert_eq!(
+            foreign_store.heads().unwrap().as_ref(),
+            Some(&before_prepare)
+        );
+        // The private owner normally makes these substitutions impossible.
+        // Exercise storage's independent binding checks without minting a
+        // transferable availability ticket or relaxing the ordinary path.
+        let empty_lanes = BTreeSet::new();
+        for mismatch in 0..6 {
+            let mut invalid = ExternalCheckpointValidation {
+                mutation: None,
+                store: validation.store,
+                predecessor: validation.predecessor,
+                successor: validation.successor,
+                predecessor_checkpoint: validation.predecessor_checkpoint,
+                successor_checkpoint: validation.successor_checkpoint,
+                predecessor_lanes: validation.predecessor_lanes,
+                successor_lanes: validation.successor_lanes,
+            };
+            match mismatch {
+                0 => invalid.predecessor = invalid.successor,
+                1 => invalid.predecessor_checkpoint = Some(invalid.successor_checkpoint),
+                2 => invalid.successor_checkpoint = invalid.predecessor_checkpoint.unwrap(),
+                3 => invalid.predecessor_lanes = &empty_lanes,
+                4 => invalid.successor_lanes = &empty_lanes,
+                5 => {
+                    invalid.predecessor_lanes = validation.successor_lanes;
+                    invalid.successor_lanes = validation.predecessor_lanes;
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                super::super::journal_store::AuditedCheckpointStore::publish_audited_checkpoint(
+                    audited.prepared.store,
+                    &audited.prepared.sealed,
+                    &invalid,
+                )
+                .is_err(),
+                "availability mismatch {mismatch} must not publish"
+            );
+            assert_eq!(
+                audited.prepared.store.heads().unwrap().as_ref(),
+                Some(&before_prepare),
+                "availability mismatch {mismatch} must preserve heads"
+            );
+        }
+        let (publication, committed, executions) = audited.publish().unwrap_or_else(|error| {
+            panic!("audited publication: {error:?}; ordinary refusal: {ordinary_error:?}")
+        });
+        assert!(publication.heads_advanced);
+        assert!(executions.is_empty());
+        assert_eq!(
+            publication_store.heads().unwrap().as_ref(),
+            Some(committed.heads())
+        );
+        assert_eq!(committed.external_roots, advanced.external_roots);
+        assert!(
+            materialize_current(&mut publication_store, &mut executor, &NoPrunedOrderedBases)
+                .is_err()
+        );
+        let reopened = materialize_external_checkpoint(
+            &mut publication_store,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &mut ReadBudget::new(100, 100000),
+        )
+        .unwrap();
+        assert_eq!(reopened.state, committed.state);
+        assert_eq!(reopened.external_roots, committed.external_roots);
+        #[cfg(all(target_os = "linux", feature = "storage"))]
+        {
+            // Carry the changed-root replay result through the actual prepared
+            // owner and filesystem publisher, not the synthetic-seal fault
+            // harness. Initial runtime selection remains synthetic; only the
+            // explicit compiled variant supplies a physical execution handoff.
+            let mut seed = source.inner.clone();
+            seed.persist_historical_heads_for_test(&checkpoint_heads)
+                .unwrap();
+            let (fixture, mut file) = super::super::journal_store::ExternalFileFixture::new(
+                &seed,
+                &sealed,
+                &before_prepare,
+            );
+            let before_rejected_mutation =
+                super::super::journal_store::ExternalFileFixture::snapshot(&file);
+            assert!(matches!(
+                file.publish(&mutation_seal),
+                Err(JournalStoreError::Unavailable)
+            ));
+            assert_eq!(
+                super::super::journal_store::ExternalFileFixture::snapshot(&file),
+                before_rejected_mutation
+            );
+            let prepared = prepare_checkpoint(&mut file, &advanced).unwrap();
+            drop(
+                prepared
+                    .audit_external_checkpoint(&mut ReadBudget::new(100, 100000))
+                    .unwrap(),
+            );
+            assert_eq!(file.heads().unwrap(), Some(before_prepare.clone()));
+            let interrupted = prepare_checkpoint(&mut file, &advanced)
+                .unwrap().audit_external_checkpoint(&mut ReadBudget::new(100, 100000))
+                .unwrap().publish_using(
+                    super::super::journal_store::ExternalFileFixture::interrupt_checkpoint_after_head_stage);
+            assert!(matches!(interrupted, Err(JournalStoreError::Unavailable)));
+            assert_eq!(file.heads().unwrap(), Some(before_prepare.clone()));
+            let staged_heads = std::fs::read(file.root().join("heads.next")).unwrap();
+            let staged_snapshot = super::super::journal_store::ExternalFileFixture::snapshot(&file);
+            let gc_limits = super::super::journal_store::GcLimits {
+                max_index_nodes: 10000,
+                max_marked_objects: 10000,
+                max_marked_blobs: 10000,
+                max_scanned_files: 10000,
+                max_scanned_bytes: 64 * 1024 * 1024,
+                max_unlinks_per_run: 1,
+            };
+            assert!(matches!(
+                file.collect_external_checkpoint_garbage(
+                    before_prepare.id(),
+                    gc_limits,
+                    &mut ReadBudget::new(100, 100000)
+                ),
+                Err(JournalStoreError::Conflict)
+            ));
+            assert_eq!(
+                super::super::journal_store::ExternalFileFixture::snapshot(&file),
+                staged_snapshot
+            );
+            drop(file);
+            let mut file = fixture.reopen(&sealed).unwrap();
+            assert_eq!(file.heads().unwrap(), Some(before_prepare.clone()));
+            assert_eq!(
+                std::fs::read(file.root().join("heads.next")).unwrap(),
+                staged_heads
+            );
+            let (publication, durable, executions) = prepare_checkpoint(&mut file, &advanced)
+                .unwrap()
+                .audit_external_checkpoint(&mut ReadBudget::new(100, 100000))
+                .unwrap()
+                .publish()
+                .unwrap();
+            assert!(publication.heads_advanced);
+            assert!(executions.is_empty());
+            assert_eq!(durable.heads().encode(), staged_heads);
+            assert!(!file.root().join("heads.next").exists());
+            assert_eq!(durable.state, advanced.state);
+            assert_eq!(durable.external_roots, advanced.external_roots);
+            drop(file);
+            let mut reopened_file = fixture.reopen(&sealed).unwrap();
+            assert_eq!(
+                reopened_file.heads().unwrap().as_ref(),
+                Some(durable.heads())
+            );
+            let recovered = materialize_external_checkpoint(
+                &mut reopened_file,
+                &mut executor,
+                &NoPrunedOrderedBases,
+                &mut ReadBudget::new(100, 100000),
+            )
+            .unwrap();
+            assert_eq!(recovered.state, durable.state);
+            assert_eq!(recovered.external_roots, durable.external_roots);
+            let prior = super::super::journal_store::ExternalFileFixture::snapshot(&reopened_file);
+            assert!(
+                super::super::journal_store::AgentJournalGarbageCollection::collect_garbage(
+                    &mut reopened_file,
+                    durable.heads_id(),
+                    gc_limits
+                )
+                .is_err()
+            );
+            assert!(matches!(
+                reopened_file.collect_external_checkpoint_garbage(
+                    before_prepare.id(),
+                    gc_limits,
+                    &mut ReadBudget::new(100, 100000)
+                ),
+                Err(JournalStoreError::Conflict)
+            ));
+            assert!(matches!(
+                reopened_file.collect_external_checkpoint_garbage(
+                    durable.heads_id(),
+                    gc_limits,
+                    &mut ReadBudget::new(0, 0)
+                ),
+                Err(JournalStoreError::LimitExceeded)
+            ));
+            assert_eq!(
+                super::super::journal_store::ExternalFileFixture::snapshot(&reopened_file),
+                prior
+            );
+            // Abandoning a freshly audited preparation does not pin old,
+            // unreachable branches or produce a ticket reusable after GC.
+            drop(
+                prepare_checkpoint(&mut reopened_file, &recovered)
+                    .unwrap()
+                    .audit_external_checkpoint(&mut ReadBudget::new(100, 100000))
+                    .unwrap(),
+            );
+            let first = reopened_file
+                .collect_external_checkpoint_garbage(
+                    durable.heads_id(),
+                    gc_limits,
+                    &mut ReadBudget::new(100, 100000),
+                )
+                .unwrap();
+            assert!(!first.complete);
+            assert!(prepare_checkpoint(&mut reopened_file, &recovered).is_err());
+            drop(reopened_file);
+            let mut reopened_file = fixture.reopen(&sealed).unwrap();
+            let finished = reopened_file
+                .collect_external_checkpoint_garbage(
+                    durable.heads_id(),
+                    super::super::journal_store::GcLimits {
+                        max_unlinks_per_run: 10000,
+                        ..gc_limits
+                    },
+                    &mut ReadBudget::new(100, 100000),
+                )
+                .unwrap();
+            assert!(finished.resumed && finished.complete);
+            assert!(
+                reopened_file
+                    .load_blob(
+                        JournalBlobClass::StateBlock,
+                        &BlobRef {
+                            hash: Hash(old_storage.hash.0),
+                            len: old_storage.len
+                        }
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+            drop(reopened_file);
+            let mut reopened_file = fixture.reopen(&sealed).unwrap();
+            let after_gc = materialize_external_checkpoint(
+                &mut reopened_file,
+                &mut executor,
+                &NoPrunedOrderedBases,
+                &mut ReadBudget::new(100, 100000),
+            )
+            .unwrap();
+            assert_eq!(after_gc.state, durable.state);
+            assert_eq!(after_gc.external_roots, durable.external_roots);
+            let (_, next, _) = prepare_checkpoint(&mut reopened_file, &after_gc)
+                .unwrap()
+                .audit_external_checkpoint(&mut ReadBudget::new(100, 100000))
+                .unwrap()
+                .publish()
+                .unwrap();
+            assert_eq!(next.external_roots, durable.external_roots);
+        }
+        source.heads = checkpoint_heads;
+
+        let missing = StateRootDescriptor::new(
+            context,
+            Some(
+                crate::agent_sdk::state_blocks::BlockRef::new(
+                    crate::agent_sdk::Hash([0x63; 32]),
+                    100,
+                )
+                .unwrap(),
+            ),
+        );
+        let mut manifest: LaneStateManifest = source
+            .get(checkpoint.lanes[selected].state)
+            .unwrap()
+            .unwrap();
+        manifest.external_root.as_mut().unwrap().descriptor = missing;
+        manifest.state = BlobRef::of_bytes(&missing.encode());
+        source
+            .put_blob(
+                JournalBlobClass::LaneState,
+                &manifest.state,
+                &missing.encode(),
+            )
+            .unwrap();
+        source.put(&manifest).unwrap();
+        checkpoint.lanes[selected].state = manifest.id();
+        source.put(&checkpoint).unwrap();
+        source.heads.checkpoint = Some(checkpoint.id());
+        assert!(matches!(
+            materialize_external_checkpoint(
+                &mut source,
+                &mut executor,
+                &NoPrunedOrderedBases,
+                &mut ReadBudget::new(100, 100000),
+            ),
+            Err(ReplayError::Source(
+                ReplayMaterializationSourceError::Journal(JournalStoreError::MissingObject)
+            ))
+        ));
+    }
+
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    #[test]
+    fn checkpoint_projection_preserves_declared_root_origin_and_rejects_changed_bytes() {
+        use super::super::{journal::ExternalStateRoot, state_block_store::journal_root_context};
+        use crate::agent_sdk::state_root::StateRootDescriptor;
+        let (create, descriptor, _, replica) = opaque_clean_fixture();
+        let mut executor = OpaqueCleanReplayExecutor::default();
+        let prepared = ReplayPreparedGenesis::prepare(create, replica, &mut executor).unwrap();
+        let sealed = ReplaySealedLocalGenesis::from_prepared(prepared).unwrap();
+        let genesis = sealed.genesis();
+        let mut store =
+            MemoryAgentJournalStore::new(AgentId(descriptor.identity.agent.0), replica.node)
+                .unwrap();
+        store
+            .put_blob(
+                JournalBlobClass::CatalogArtifact,
+                &genesis.runtime().package,
+                b"opaque-clean-runtime-v1",
+            )
+            .unwrap();
+        store.initialize_raw_for_test(genesis).unwrap();
+        let initial =
+            materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        for lane in [PersistedLane::Linear, PersistedLane::Local] {
+            let original = initial
+                .checkpoint_lane(genesis, lane, state_component(initial.state(), lane))
+                .unwrap();
+            let context = journal_root_context(
+                genesis,
+                &original.runtime,
+                lane,
+                (lane == PersistedLane::Local).then_some(replica.node),
+                &original.cursor,
+            )
+            .unwrap();
+            let root = ExternalStateRoot {
+                descriptor: StateRootDescriptor::new(context, None),
+                runtime: original.runtime.clone(),
+                cursor: original.cursor.clone(),
+            };
+            let bytes = root.descriptor.encode();
+            // Private record-projection fixture, NOT an authenticated upgrade,
+            // recovery bypass, or permission to publish these fabricated heads.
+            let mut tracked = initial.clone();
+            tracked.external_roots.insert(lane, root.clone());
+            tracked.heads.ordered_index = 2;
+            tracked.heads.ordered_head = Some(OrderedEntryId([7; 32]));
+            tracked.heads.local_revision = 3;
+            tracked.heads.local_head = Some(LocalEntryId([8; 32]));
+            tracked.heads.runtime.program = ProgramId([9; 32]);
+            match lane {
+                PersistedLane::Linear => tracked.state.linear = bytes.clone(),
+                PersistedLane::Local => tracked.state.local = bytes.clone(),
+                _ => unreachable!(),
+            }
+            let position = match lane {
+                PersistedLane::Linear => ReplayPosition::Ordered {
+                    id: OrderedEntryId([10; 32]),
+                    index: 3,
+                    merge_frontier: tracked.heads.merge_frontier,
+                    merge_seal: None,
+                },
+                PersistedLane::Local => ReplayPosition::Local {
+                    id: LocalEntryId([11; 32]),
+                    node: replica.node,
+                    revision: 4,
+                    ordered_base: tracked.ordered_base(),
+                    merge_frontier: tracked.heads.merge_frontier,
+                },
+                _ => unreachable!(),
+            };
+            let mode = if lane == PersistedLane::Linear {
+                MethodMode::Linear
+            } else {
+                MethodMode::Local
+            };
+            let input = clean_admitted_invocation(&tracked.heads.runtime, mode, 0x51);
+            let noop = noop_replay_step(
+                &input,
+                &tracked.state,
+                tracked.heads.runtime.clone(),
+                position,
+                ReplayStepOutcome::ExactDuplicate,
+            );
+            assert_eq!(
+                tracked.external_roots_after_step(genesis, &noop).unwrap(),
+                tracked.external_roots
+            );
+            let mut changed_step = noop;
+            match lane {
+                PersistedLane::Linear => changed_step.state.linear.push(0),
+                PersistedLane::Local => changed_step.state.local.push(0),
+                _ => unreachable!(),
+            }
+            assert!(
+                tracked
+                    .external_roots_after_step(genesis, &changed_step)
+                    .is_err()
+            );
+            let manifest = tracked.checkpoint_lane(genesis, lane, &bytes).unwrap();
+            assert_eq!(manifest.external_root, Some(root.clone()));
+            assert_eq!(manifest.runtime, tracked.heads.runtime);
+            assert_ne!(manifest.cursor, root.cursor);
+            assert_eq!(manifest.state, BlobRef::of_bytes(&bytes));
+            let mut changed = bytes.clone();
+            changed[0] ^= 1;
+            assert!(tracked.checkpoint_lane(genesis, lane, &changed).is_err());
+            let mut foreign_origin = tracked.clone();
+            foreign_origin
+                .external_roots
+                .get_mut(&lane)
+                .unwrap()
+                .runtime
+                .program = ProgramId([0x42; 32]);
+            assert!(
+                foreign_origin
+                    .checkpoint_lane(genesis, lane, &bytes)
+                    .is_err()
+            );
+            if lane == PersistedLane::Local {
+                let mut foreign_replica = tracked.clone();
+                foreign_replica.heads.node = NodeId([0x43; 32]);
+                assert!(
+                    foreign_replica
+                        .checkpoint_lane(genesis, lane, &bytes)
+                        .is_err()
+                );
+            }
+            tracked.external_roots.clear();
+            let opaque = tracked.checkpoint_lane(genesis, lane, &bytes).unwrap();
+            assert!(
+                opaque.external_root.is_none(),
+                "descriptor magic must not select the format"
+            );
+            assert_ne!(opaque.id(), manifest.id());
+            if lane == PersistedLane::Linear {
+                let declared_projection =
+                    SharedLaneProjection::new(manifest.id(), manifest.state.clone()).unwrap();
+                let opaque_projection =
+                    SharedLaneProjection::new(opaque.id(), opaque.state.clone()).unwrap();
+                assert_eq!(declared_projection.state(), opaque_projection.state());
+                assert_ne!(declared_projection.manifest(), opaque_projection.manifest());
+                assert!(declared_projection.verify_state(&bytes).is_ok());
+            }
+        }
     }
 
     #[cfg(feature = "std")]
@@ -19593,6 +25950,16 @@ pub(crate) mod tests {
         admitted_genesis_for(config, create)
     }
 
+    /// Test authority/lifecycle fixture with an exact declared PVM identity.
+    /// The synthetic package is not signature-checked package admission.
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    pub(crate) fn admitted_state_probe_genesis(program: ProgramId) -> ReplaySealedGenesis {
+        let mut config = admitted_config();
+        config.identity.runtime_program = program;
+        let create = admitted_clean_create_input_for(&config, 0xb1);
+        admitted_genesis_for(config, create)
+    }
+
     #[cfg(feature = "std")]
     struct AcceptTestGenesisFinality;
 
@@ -19783,6 +26150,781 @@ pub(crate) mod tests {
 
     #[cfg(feature = "std")]
     #[test]
+    fn canonical_clean_work_preserves_direct_and_attested_request_bytes() {
+        let runtime = runtime();
+        let mut input = clean_admitted_invocation(&runtime, MethodMode::Linear, 0xd6);
+        let before = RuntimeState {
+            control: vec![1],
+            linear: vec![2],
+            merge: vec![3],
+            local: vec![4],
+        };
+        assert!(canonical_attested_runtime_work(&input, &before).is_none());
+        for attested in [false, true] {
+            let ReplayOperation::CleanInvoke {
+                context,
+                work,
+                authorization,
+                observed_slot,
+            } = &mut input.operation
+            else {
+                unreachable!()
+            };
+            if attested {
+                *context = crate::agent_sdk::RuntimeExecutionContext::Attested {
+                    proof_system: crate::agent_sdk::Hash([7; 32]),
+                };
+            }
+            let expected = crate::agent_sdk::RuntimeWork::Invoke {
+                context: *context,
+                state: sdk_runtime_state(&before),
+                invocation: alloc::boxed::Box::new(work.clone()),
+                authorization: alloc::boxed::Box::new(authorization.clone()),
+                observed_slot: *observed_slot,
+            };
+            let actual = canonical_clean_runtime_work(&input, &before).unwrap();
+            assert_eq!(actual.encode().unwrap(), expected.encode().unwrap());
+            assert_eq!(
+                canonical_attested_runtime_work(&input, &before),
+                attested.then_some(actual)
+            );
+        }
+        assert!(canonical_clean_runtime_work(&self::input(MethodMode::Linear), &before).is_none());
+    }
+
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    #[test]
+    fn external_capture_pins_all_read_lanes_and_forbids_secondary_writes() {
+        use crate::agent_sdk::{
+            RuntimeOutcome, RuntimeTransition, StateLane,
+            state_blocks::BlockScope,
+            state_execution::{ExternalLaneWork, StateExecutionOutput, StateExecutionWork},
+            state_root::{RootContext, StateRootDescriptor},
+        };
+        let runtime = runtime();
+        let input = clean_admitted_invocation(&runtime, MethodMode::Linear, 0xd6);
+        let position = ReplayPosition::Ordered {
+            id: OrderedEntryId([9; 32]),
+            index: 1,
+            merge_frontier: MergeFrontierId([8; 32]),
+            merge_seal: None,
+        };
+        let descriptor = |lane| {
+            StateRootDescriptor::new(
+                RootContext::new(
+                    BlockScope::new(
+                        crate::agent_sdk::SpaceId(runtime.space.0),
+                        crate::agent_sdk::AgentId(runtime.agent.0),
+                        crate::agent_sdk::Hash([3; 32]),
+                        lane,
+                    )
+                    .unwrap(),
+                    crate::agent_sdk::Hash(runtime.commitment().0),
+                    crate::agent_sdk::Hash([4; 32]),
+                )
+                .unwrap(),
+                None,
+            )
+        };
+        let linear = descriptor(StateLane::Linear);
+        let local = descriptor(StateLane::Local);
+        let before = RuntimeState {
+            linear: linear.encode(),
+            local: local.encode(),
+            ..Default::default()
+        };
+        let lanes = vec![linear, local]
+            .into_iter()
+            .map(|base| ExternalLaneWork {
+                base,
+                next: base.context(),
+            })
+            .collect::<Vec<_>>();
+        let make_work = |lanes| {
+            StateExecutionWork::new(
+                canonical_clean_runtime_work(&input, &before).unwrap(),
+                lanes,
+                super::super::package_admission::tests::STATE_FIXTURE_LIMITS,
+            )
+            .unwrap()
+        };
+        let capture = |work: &StateExecutionWork| {
+            let output = StateExecutionOutput::new(
+                work,
+                RuntimeTransition {
+                    state: sdk_runtime_state(&before),
+                    outcome: RuntimeOutcome::Completed(Err(
+                        crate::agent_sdk::InvocationError::NotFound,
+                    )),
+                },
+                vec![],
+            )
+            .unwrap();
+            ReplayExternalExecution::from_physical_response(&input, &before, position, work, output)
+        };
+        let roots = BTreeMap::from([
+            (
+                PersistedLane::Linear,
+                super::super::journal::ExternalStateRoot {
+                    descriptor: linear,
+                    runtime: runtime.clone(),
+                    cursor: LaneCursor::Ordered {
+                        base: OrderedBase::post_genesis(),
+                    },
+                },
+            ),
+            (
+                PersistedLane::Local,
+                super::super::journal::ExternalStateRoot {
+                    descriptor: local,
+                    runtime: runtime.clone(),
+                    cursor: LaneCursor::Local {
+                        node: NodeId([7; 32]),
+                        revision: 0,
+                        head: None,
+                    },
+                },
+            ),
+        ]);
+        let accepted = capture(&make_work(lanes.clone())).unwrap();
+        assert!(accepted.matches_roots(&roots));
+        assert_eq!(accepted.owning_lane().unwrap().base, linear);
+        let omitted = capture(&make_work(vec![lanes[0]])).unwrap();
+        assert!(!omitted.matches_roots(&roots));
+        let mut substituted = roots.clone();
+        substituted
+            .get_mut(&PersistedLane::Local)
+            .unwrap()
+            .descriptor = StateRootDescriptor::new(
+            RootContext::new(
+                local.context().scope(),
+                crate::agent_sdk::Hash(runtime.commitment().0),
+                crate::agent_sdk::Hash([5; 32]),
+            )
+            .unwrap(),
+            None,
+        );
+        assert!(!accepted.matches_roots(&substituted));
+        let mut advanced = lanes;
+        advanced[1].next = substituted[&PersistedLane::Local].descriptor.context();
+        // Even a no-op response cannot capture permission to advance a read lane.
+        assert!(capture(&make_work(advanced)).is_err());
+    }
+
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    #[test]
+    fn journal_state_work_requires_explicit_matching_manifests_and_cursors() {
+        use super::super::state_block_store::{journal_root_context, journal_state_work};
+        use crate::agent_sdk::state_root::StateRootDescriptor;
+        let sealed = admitted_genesis(0xb1);
+        let genesis = sealed.genesis();
+        let runtime = genesis.runtime();
+        let mut store =
+            MemoryAgentJournalStore::new(runtime.agent, admitted_config().replicas[0].node)
+                .unwrap();
+        store
+            .put_blob(
+                JournalBlobClass::CatalogArtifact,
+                &runtime.package,
+                b"replay-runtime-package",
+            )
+            .unwrap();
+        store.initialize(&sealed).unwrap();
+        let materialized = materialize_current(
+            &mut store,
+            &mut ExactCreateRejectInvocations::default(),
+            &NoPrunedOrderedBases,
+        )
+        .unwrap();
+        let input = clean_admitted_invocation(runtime, MethodMode::Linear, 0xd6);
+        let initial = LaneCursor::Ordered {
+            base: OrderedBase::post_genesis(),
+        };
+        let next = LaneCursor::Ordered {
+            base: OrderedBase {
+                index: 1,
+                head: Some(OrderedEntryId([9; 32])),
+            },
+        };
+        let context =
+            journal_root_context(genesis, runtime, PersistedLane::Linear, None, &initial).unwrap();
+        let base = StateRootDescriptor::new(context, None);
+        let before = RuntimeState {
+            linear: base.encode(),
+            ..Default::default()
+        };
+        let manifest = LaneStateManifest {
+            genesis: genesis.id(),
+            runtime: runtime.clone(),
+            lane: PersistedLane::Linear,
+            cursor: initial,
+            state: BlobRef::of_bytes(&before.linear),
+            external_root: Some(super::super::journal::ExternalStateRoot {
+                descriptor: base,
+                runtime: runtime.clone(),
+                cursor: LaneCursor::Ordered {
+                    base: OrderedBase::post_genesis(),
+                },
+            }),
+        };
+        let lanes = vec![(manifest.clone(), next.clone())];
+        let work = journal_state_work(genesis, &input, &before, &lanes).unwrap();
+        assert_eq!(
+            work.work(),
+            &canonical_clean_runtime_work(&input, &before).unwrap()
+        );
+        assert_eq!(work.lanes()[0].base, base);
+        {
+            use crate::agent::state_block_pvm::{BlockPvmError, StateBlockHost};
+            use crate::agent_sdk::{
+                state_change::StateChange,
+                state_execution::StateExecutionOutput,
+                state_tree::{StateTree, TreeUpdate},
+            };
+            use vos_pvm_compiler::assembler::{Assembler, Reg};
+            struct NoReads;
+            impl crate::agent_sdk::state_tree::BlockReader for NoReads {
+                fn read(
+                    &mut self,
+                    _: crate::agent_sdk::state_blocks::BlockRef,
+                    _: &mut [u8],
+                ) -> Result<bool, crate::agent_sdk::state_tree::TreeError> {
+                    panic!("no reads expected")
+                }
+            }
+            let change = StateChange::from_update(
+                base.commitment(),
+                work.lanes()[0].next,
+                TreeUpdate {
+                    tree: StateTree::empty(context.scope()),
+                    blocks: Vec::new(),
+                },
+            )
+            .unwrap();
+            let returned = crate::agent_sdk::RuntimeTransition {
+                state: crate::agent_sdk::RuntimeState {
+                    linear: change.next().encode(),
+                    ..Default::default()
+                },
+                outcome: crate::agent_sdk::RuntimeOutcome::Completed(Err(
+                    crate::agent_sdk::InvocationError::NotFound,
+                )),
+            };
+            let output =
+                StateExecutionOutput::new(&work, returned.clone(), vec![change.clone()]).unwrap();
+            let position = ReplayPosition::Ordered {
+                id: OrderedEntryId([9; 32]),
+                index: 1,
+                merge_frontier: MergeFrontierId([8; 32]),
+                merge_seal: None,
+            };
+            let bytes = output.encode().unwrap();
+            let mut asm = Assembler::new();
+            asm.set_rw_data(bytes.clone());
+            asm.load_imm_64(Reg::A0, 2 * vos_pvm::PVM_ZONE_SIZE as u64)
+                .load_imm_64(Reg::A1, bytes.len() as u64)
+                .jump_ind(Reg::RA, 0);
+            let program = asm.build_standard();
+            let mut reads = crate::agent_sdk::state_blocks::ReadBudget::new(0, 0);
+            let mut reader = NoReads;
+            let mut host = StateBlockHost {
+                scope: context.scope(),
+                reader: &mut reader,
+                budget: &mut reads,
+            };
+            assert!(matches!(
+                host.execute_journal(
+                    &program, genesis, &input, &before, position, &lanes, 1_000_000,
+                ),
+                Err(BlockPvmError::ProgramMismatch)
+            ));
+            // This assembler fixture embeds its response, whose commitment
+            // includes the requested runtime identity. It cannot provide a
+            // self-referential matching program hash. Test semantic handoff
+            // below at the raw boundary; the compiled journal fixture covers
+            // the fully program-bound path.
+            let response = host.execute_state(&program, &work, 1_000_000).unwrap();
+            let execution = ReplayExternalExecution::from_physical_response(
+                &input, &before, position, &work, response,
+            )
+            .unwrap();
+            let transition = execution.transition();
+            assert_eq!(execution.output(), &output);
+            assert_eq!(transition.disposition, ReplayDisposition::Rejected);
+            assert_eq!(transition.state.linear, returned.state.linear);
+            struct CapturedExecutor {
+                transition: ReplayTransition,
+                pending: Option<ReplayExternalExecution>,
+            }
+            impl ReplayExecutor for CapturedExecutor {
+                type Error = ();
+                fn verify_merge_event(&mut self, _: &MergeEvent) -> Result<bool, ()> {
+                    Ok(false)
+                }
+                fn authenticate(
+                    &mut self,
+                    _: &ReplayInput,
+                    _: &RuntimeState,
+                    _: ReplayPosition,
+                ) -> Result<(), ()> {
+                    Ok(())
+                }
+                fn execute(
+                    &mut self,
+                    _: &ReplayInput,
+                    _: &RuntimeState,
+                    _: ReplayPosition,
+                ) -> Result<ReplayTransition, ()> {
+                    Ok(self.transition.clone())
+                }
+                fn take_external_execution(
+                    &mut self,
+                ) -> Result<Option<ReplayExternalExecution>, ()> {
+                    Ok(self.pending.take())
+                }
+            }
+            let mut executor = CapturedExecutor {
+                transition: transition.clone(),
+                pending: Some(execution.clone()),
+            };
+            let mut machine = ReplayMachine::from_genesis(genesis.id(), runtime.clone()).unwrap();
+            let step = machine
+                .apply::<_, ()>(&mut executor, &input, &before, position)
+                .unwrap();
+            assert_eq!(step.external_execution.as_ref(), Some(&execution));
+            assert!(executor.pending.is_none());
+            // An executor's ordinary transition is insufficient when the
+            // admitted journal contract requires physical external-state evidence.
+            let mut external_input = input.clone();
+            external_input.runtime.runtime_abi =
+                Hash(crate::agent_sdk::state_execution::STATE_EXECUTION_ABI_ID.0);
+            external_input.runtime.execution_semantics =
+                Hash(crate::agent_sdk::state_execution::STATE_EXECUTION_SEMANTICS_ID.0);
+            external_input.validate().unwrap();
+            let mut missing = CapturedExecutor {
+                transition: transition.clone(),
+                pending: None,
+            };
+            missing.transition.next_runtime = external_input.runtime.clone();
+            let mut external_machine =
+                ReplayMachine::from_genesis(genesis.id(), external_input.runtime.clone()).unwrap();
+            assert!(matches!(
+                external_machine.apply::<_, ()>(&mut missing, &external_input, &before, position),
+                Err(ReplayError::InvalidRecord)
+            ));
+            let successor = step.external_lane_successor(genesis, &manifest).unwrap();
+            assert_eq!(successor.cursor, next);
+            let provenance = successor.external_root.as_ref().unwrap();
+            assert_eq!(provenance.cursor, next);
+            assert_eq!(provenance.runtime, *runtime);
+            assert_eq!(provenance.descriptor, output.changes()[0].next());
+            assert_eq!(successor.state, BlobRef::of_bytes(&returned.state.linear));
+            // Exercise the same map advancement used by Ordered/Local
+            // preparation. The root declaration is a private fixture seed;
+            // this does not open recovery or publication of external state.
+            let mut projection = materialized.clone();
+            projection.state = before.clone();
+            projection.external_roots.insert(
+                PersistedLane::Linear,
+                manifest.external_root.clone().unwrap(),
+            );
+            let advanced = projection
+                .external_roots_after_step(genesis, &step)
+                .unwrap();
+            assert_eq!(advanced.get(&PersistedLane::Linear), Some(provenance));
+            let mut undeclared = projection.clone();
+            undeclared.external_roots.clear();
+            assert!(
+                undeclared
+                    .external_roots_after_step(genesis, &step)
+                    .is_err()
+            );
+            let mut wrong_base = projection.clone();
+            wrong_base.state.linear.push(0);
+            assert!(
+                wrong_base
+                    .external_roots_after_step(genesis, &step)
+                    .is_err()
+            );
+            let mut stripped = step.clone();
+            stripped.external_execution = None;
+            assert!(
+                projection
+                    .external_roots_after_step(genesis, &stripped)
+                    .is_err()
+            );
+            assert!(
+                stripped
+                    .external_lane_successor(genesis, &manifest)
+                    .is_err(),
+                "changed descriptor must not acquire provenance without its capture"
+            );
+            let retained = noop_replay_step(
+                &input,
+                &before,
+                runtime.clone(),
+                position,
+                ReplayStepOutcome::ExactDuplicate,
+            );
+            let retained_manifest = retained
+                .external_lane_successor(genesis, &manifest)
+                .unwrap();
+            assert_eq!(retained_manifest.cursor, next);
+            assert_eq!(retained_manifest.external_root, manifest.external_root);
+            assert_eq!(retained_manifest.state, manifest.state);
+            assert_eq!(
+                projection
+                    .external_roots_after_step(genesis, &retained)
+                    .unwrap(),
+                projection.external_roots
+            );
+            let mut foreign = manifest.clone();
+            foreign.genesis = AgentJournalGenesisId([0xee; 32]);
+            assert!(step.external_lane_successor(genesis, &foreign).is_err());
+            let mut replayed = step.clone();
+            replayed.position = ReplayPosition::Ordered {
+                id: OrderedEntryId([0xee; 32]),
+                index: 1,
+                merge_frontier: MergeFrontierId([8; 32]),
+                merge_seal: None,
+            };
+            assert!(
+                replayed
+                    .external_lane_successor(genesis, &manifest)
+                    .is_err()
+            );
+            assert!(
+                step.external_lane_successor(genesis, &successor).is_err(),
+                "projection cannot advance from an equal or newer predecessor"
+            );
+            assert!(
+                matches!(
+                    validate_step_side_products::<(), ()>(&input, &step),
+                    Err(ReplayError::InvalidRecord)
+                ),
+                "captured blocks cannot disappear at the publication boundary"
+            );
+            let mut wrong_input = execution.clone();
+            wrong_input.input = ReplayInputId([0xee; 32]);
+            let mut wrong_before = execution.clone();
+            wrong_before.before = Hash([0xee; 32]);
+            let mut wrong_transition = execution.clone();
+            wrong_transition.transition.disposition = ReplayDisposition::Applied;
+            let mut wrong_place = execution.clone();
+            wrong_place.position = ReplayPosition::Genesis;
+            for capture in [wrong_input, wrong_before, wrong_transition, wrong_place] {
+                let mut executor = CapturedExecutor {
+                    transition: transition.clone(),
+                    pending: Some(capture),
+                };
+                let mut machine =
+                    ReplayMachine::from_genesis(genesis.id(), runtime.clone()).unwrap();
+                assert!(matches!(
+                    machine.apply::<_, ()>(&mut executor, &input, &before, position),
+                    Err(ReplayError::InvalidRecord)
+                ));
+                assert!(executor.pending.is_none());
+            }
+            let wrong_position = ReplayPosition::Ordered {
+                id: OrderedEntryId([7; 32]),
+                index: 1,
+                merge_frontier: MergeFrontierId([8; 32]),
+                merge_seal: None,
+            };
+            assert!(matches!(
+                host.execute_journal(&[], genesis, &input, &before, wrong_position, &lanes, 0),
+                Err(BlockPvmError::InvalidRequest)
+            ));
+            // Framing permits opaque Control changes; ordinary replay must not
+            // permit one on a Linear invocation.
+            let mut cross_lane = returned.clone();
+            cross_lane.state.control.push(1);
+            let cross_lane = StateExecutionOutput::new(&work, cross_lane, vec![change]).unwrap();
+            assert!(matches!(
+                external_state_replay_transition(&input, &before, position, &work, &cross_lane),
+                Err(ReplayError::CrossLaneMutation)
+            ));
+        }
+        assert_eq!(
+            work.lanes()[0].next,
+            journal_root_context(genesis, runtime, PersistedLane::Linear, None, &next).unwrap()
+        );
+        let mut opaque = manifest.clone();
+        opaque.external_root = None;
+        assert!(journal_state_work(genesis, &input, &before, &[(opaque, next.clone())]).is_err());
+        let mut stale = manifest.clone();
+        stale.cursor = next.clone();
+        // An unchanged root can be projected at a later journal position.
+        assert!(
+            journal_state_work(genesis, &input, &before, &[(stale.clone(), next.clone())]).is_ok()
+        );
+        stale.external_root.as_mut().unwrap().cursor = next.clone();
+        assert!(journal_state_work(genesis, &input, &before, &[(stale, next.clone())]).is_err());
+        let mut wrong_genesis = manifest.clone();
+        wrong_genesis.genesis = AgentJournalGenesisId([8; 32]);
+        assert!(
+            journal_state_work(genesis, &input, &before, &[(wrong_genesis, next.clone())]).is_err()
+        );
+        let mut wrong_state = before.clone();
+        wrong_state.linear.push(0);
+        assert!(journal_state_work(genesis, &input, &wrong_state, &lanes).is_err());
+        let wrong_lane = LaneCursor::Local {
+            node: NodeId([1; 32]),
+            revision: 1,
+            head: Some(LocalEntryId([2; 32])),
+        };
+        assert!(journal_state_work(genesis, &input, &before, &[(manifest, wrong_lane)]).is_err());
+        assert!(
+            journal_state_work(
+                genesis,
+                &input,
+                &before,
+                &[lanes[0].clone(), lanes[0].clone()]
+            )
+            .is_err()
+        );
+        let mut attested = input.clone();
+        let ReplayOperation::CleanInvoke { context, .. } = &mut attested.operation else {
+            unreachable!()
+        };
+        *context = crate::agent_sdk::RuntimeExecutionContext::Attested {
+            proof_system: crate::agent_sdk::Hash([7; 32]),
+        };
+        assert!(journal_state_work(genesis, &attested, &before, &lanes).is_err());
+        assert!(journal_state_work(genesis, &genesis.create, &before, &lanes).is_err());
+    }
+
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    #[test]
+    fn external_root_local_projection_retains_origin_and_replica_scope() {
+        use super::super::state_block_store::journal_root_context;
+        use crate::agent_sdk::state_root::StateRootDescriptor;
+        let sealed = admitted_genesis(0xb1);
+        let genesis = sealed.genesis();
+        let runtime = genesis.runtime();
+        let node = NodeId([1; 32]);
+        let cursor = LaneCursor::Local {
+            node,
+            revision: 0,
+            head: None,
+        };
+        let context =
+            journal_root_context(genesis, runtime, PersistedLane::Local, Some(node), &cursor)
+                .unwrap();
+        let root = StateRootDescriptor::new(context, None);
+        let before = RuntimeState {
+            local: root.encode(),
+            ..Default::default()
+        };
+        let manifest = LaneStateManifest {
+            genesis: genesis.id(),
+            runtime: runtime.clone(),
+            lane: PersistedLane::Local,
+            cursor: cursor.clone(),
+            state: BlobRef::of_bytes(&before.local),
+            external_root: Some(super::super::journal::ExternalStateRoot {
+                descriptor: root,
+                runtime: runtime.clone(),
+                cursor,
+            }),
+        };
+        let input = clean_admitted_invocation(runtime, MethodMode::Local, 0x41);
+        let position = ReplayPosition::Local {
+            id: LocalEntryId([2; 32]),
+            node,
+            revision: 1,
+            ordered_base: OrderedBase::post_genesis(),
+            merge_frontier: MergeFrontierId([3; 32]),
+        };
+        let step = noop_replay_step(
+            &input,
+            &before,
+            runtime.clone(),
+            position,
+            ReplayStepOutcome::ExactDuplicate,
+        );
+        let next = step.external_lane_successor(genesis, &manifest).unwrap();
+        assert_eq!(next.external_root, manifest.external_root);
+        assert_eq!(next.state, manifest.state);
+        assert_eq!(
+            next.cursor,
+            LaneCursor::Local {
+                node,
+                revision: 1,
+                head: Some(LocalEntryId([2; 32]))
+            }
+        );
+        assert!(step.external_lane_successor(genesis, &next).is_err());
+        let mut foreign = step.clone();
+        let ReplayPosition::Local { node, .. } = &mut foreign.position else {
+            unreachable!()
+        };
+        *node = NodeId([9; 32]);
+        assert!(foreign.external_lane_successor(genesis, &manifest).is_err());
+        let mut unbound = step;
+        unbound.state.local.push(0);
+        assert!(unbound.external_lane_successor(genesis, &manifest).is_err());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn canonical_clean_resume_and_ack_keep_retained_identity_and_authorization() {
+        use crate::agent_sdk::{
+            RuntimeExecutionContext, RuntimeWork, YieldReason, YieldedInvocation,
+        };
+        let runtime = runtime();
+        let invocation = clean_admitted_invocation(&runtime, MethodMode::Linear, 0xd6);
+        let ReplayOperation::CleanInvoke {
+            work,
+            authorization,
+            observed_slot,
+            ..
+        } = invocation.operation
+        else {
+            unreachable!()
+        };
+        let before = RuntimeState {
+            control: vec![1],
+            linear: vec![2],
+            merge: vec![3],
+            local: vec![4],
+        };
+        let yielded = YieldedInvocation {
+            invocation: work.invocation,
+            actor: work.actor,
+            incarnation: work.incarnation,
+            deployment: work.deployment,
+            program: work.program,
+            mode: work.mode,
+            continuation: crate::agent_sdk::BlobRef::of_bytes(b"retained continuation"),
+            ready_sequence: 7,
+            installation_data: work.installation_data.clone(),
+            required: work
+                .availability
+                .iter()
+                .map(|blob| blob.reference.clone())
+                .collect(),
+            reason: YieldReason::Cooperative,
+        };
+        let resume = ReplayInput {
+            runtime: runtime.clone(),
+            operation: ReplayOperation::CleanResume {
+                context: RuntimeExecutionContext::Direct,
+                expected_live: None,
+                work: work.clone(),
+                authorization: authorization.clone(),
+                yielded: yielded.clone(),
+                observed_slot,
+            },
+        };
+        let expected = RuntimeWork::Resume {
+            context: RuntimeExecutionContext::Direct,
+            state: sdk_runtime_state(&before),
+            resume: alloc::boxed::Box::new(crate::agent_sdk::ResumeWork {
+                invocation: yielded.invocation,
+                actor: yielded.actor,
+                incarnation: yielded.incarnation,
+                deployment: yielded.deployment,
+                program: yielded.program,
+                mode: yielded.mode,
+                continuation: yielded.continuation,
+                ready_sequence: yielded.ready_sequence,
+                installation_data: yielded.installation_data,
+                availability: work.availability.clone(),
+                input: None,
+            }),
+        };
+        assert_eq!(
+            canonical_clean_runtime_work(&resume, &before)
+                .unwrap()
+                .encode()
+                .unwrap(),
+            expected.encode().unwrap()
+        );
+        let retirement = crate::agent_sdk::InvocationRetirement::from_work(&work);
+        let ack = ReplayInput {
+            runtime,
+            operation: ReplayOperation::CleanAcknowledge {
+                context: RuntimeExecutionContext::Direct,
+                expected_live: None,
+                work: retirement.clone(),
+                authorization: authorization.clone(),
+            },
+        };
+        let expected = RuntimeWork::Acknowledge {
+            context: RuntimeExecutionContext::Direct,
+            state: sdk_runtime_state(&before),
+            invocation: alloc::boxed::Box::new(retirement),
+            authorization: alloc::boxed::Box::new(authorization),
+        };
+        assert_eq!(
+            canonical_clean_runtime_work(&ack, &before)
+                .unwrap()
+                .encode()
+                .unwrap(),
+            expected.encode().unwrap()
+        );
+        assert!(canonical_attested_runtime_work(&resume, &before).is_none());
+        assert!(canonical_attested_runtime_work(&ack, &before).is_none());
+        use crate::agent_sdk::{InvocationAcknowledgement, RuntimeOutcome};
+        let ReplayOperation::CleanResume { yielded, .. } = &resume.operation else {
+            unreachable!()
+        };
+        let mut next_yield = yielded.clone();
+        assert!(!clean_invocation_outcome_matches(
+            &resume,
+            &RuntimeOutcome::Yielded(next_yield.clone())
+        ));
+        next_yield.ready_sequence += 1;
+        assert!(clean_invocation_outcome_matches(
+            &resume,
+            &RuntimeOutcome::Yielded(next_yield.clone())
+        ));
+        next_yield.program = crate::agent_sdk::ProgramId([0xee; 32]);
+        assert!(!clean_invocation_outcome_matches(
+            &resume,
+            &RuntimeOutcome::Yielded(next_yield)
+        ));
+        let ReplayOperation::CleanAcknowledge {
+            work,
+            authorization,
+            ..
+        } = &ack.operation
+        else {
+            unreachable!()
+        };
+        let acknowledged = InvocationAcknowledgement {
+            invocation: work.invocation,
+            actor: work.actor,
+            incarnation: work.incarnation,
+            deployment: work.deployment,
+            mode: work.mode,
+            work: work.commitment(),
+            authorization: authorization.commitment(),
+        };
+        assert!(clean_invocation_outcome_matches(
+            &ack,
+            &RuntimeOutcome::Acknowledged(Ok(acknowledged))
+        ));
+        for bad in [
+            InvocationAcknowledgement {
+                work: crate::agent_sdk::Hash([0xee; 32]),
+                ..acknowledged
+            },
+            InvocationAcknowledgement {
+                authorization: crate::agent_sdk::Hash([0xee; 32]),
+                ..acknowledged
+            },
+        ] {
+            assert!(!clean_invocation_outcome_matches(
+                &ack,
+                &RuntimeOutcome::Acknowledged(Ok(bad))
+            ));
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
     fn genesis_materialization_requires_the_exact_empty_transition_proof_index() {
         let mut store = initialized_replay_store();
         let proof_root = store.heads().unwrap().unwrap().transition_proofs;
@@ -19899,6 +27041,8 @@ pub(crate) mod tests {
         .expect("the exact returned transition binds");
         assert_eq!(binding.transition(), transition_b_commitment);
         let prepared_step = ReplayStep {
+            #[cfg(feature = "experimental-state-blocks")]
+            external_execution: None,
             clean_management_result: None,
             state: replay.state.clone(),
             runtime: replay.next_runtime.clone(),
@@ -19981,6 +27125,8 @@ pub(crate) mod tests {
         )
         .expect("the authoritative retained tuple binds exact execution");
         let published_step = ReplayStep {
+            #[cfg(feature = "experimental-state-blocks")]
+            external_execution: None,
             clean_management_result: None,
             state: replay.state.clone(),
             runtime: replay.next_runtime.clone(),
@@ -21835,6 +28981,8 @@ pub(crate) mod tests {
                         head: Some(OrderedEntryId(id)),
                     },
                     MaterializedOrderedSnapshot {
+                        #[cfg(feature = "experimental-state-blocks")]
+                        linear_root: None,
                         runtime: runtime(),
                         control: vec![0x11; MAX_RUNTIME_STATE_BYTES],
                         linear: Vec::new(),
@@ -21851,6 +28999,8 @@ pub(crate) mod tests {
                     head: Some(OrderedEntryId([0x89; 32])),
                 },
                 MaterializedOrderedSnapshot {
+                    #[cfg(feature = "experimental-state-blocks")]
+                    linear_root: None,
                     runtime: runtime(),
                     control: vec![0x22; MAX_RUNTIME_STATE_BYTES],
                     linear: Vec::new(),
@@ -21859,6 +29009,81 @@ pub(crate) mod tests {
             Err(ReplayError::ReplayLimit)
         ));
         assert_eq!(snapshots.len(), 16);
+    }
+
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    #[test]
+    fn ordered_snapshot_cache_preserves_external_declaration_and_origin() {
+        use super::super::{journal::ExternalStateRoot, state_block_store::journal_root_context};
+        use crate::agent_sdk::state_root::StateRootDescriptor;
+        let sealed = admitted_genesis(0xb1);
+        let genesis = sealed.genesis();
+        let origin = LaneCursor::Ordered {
+            base: OrderedBase::post_genesis(),
+        };
+        let context = journal_root_context(
+            genesis,
+            genesis.runtime(),
+            PersistedLane::Linear,
+            None,
+            &origin,
+        )
+        .unwrap();
+        let root = ExternalStateRoot {
+            descriptor: StateRootDescriptor::new(context, None),
+            runtime: genesis.runtime().clone(),
+            cursor: origin,
+        };
+        let base = OrderedBase {
+            index: 2,
+            head: Some(OrderedEntryId([8; 32])),
+        };
+        let snapshot = MaterializedOrderedSnapshot {
+            runtime: genesis.runtime().clone(),
+            control: vec![1],
+            linear: root.descriptor.encode(),
+            linear_root: Some(root),
+        };
+        let mut cache = MaterializedOrderedSnapshots::singleton(base, snapshot.clone()).unwrap();
+        cache.insert(base, snapshot.clone()).unwrap();
+        assert_eq!(cache.get(&base).unwrap().linear_root, snapshot.linear_root);
+        let original = cache.clone();
+        let mut erased = snapshot.clone();
+        erased.linear_root = None;
+        assert!(matches!(
+            cache.insert(base, erased.clone()),
+            Err(ReplayError::InvalidOrderedBase)
+        ));
+        assert_eq!(
+            cache, original,
+            "failed replacement must not erase the declaration"
+        );
+        assert!(
+            MaterializedOrderedSnapshots::singleton(base, erased).is_ok(),
+            "an independently opaque snapshot is not classified by payload magic"
+        );
+        let mut wrong_bytes = snapshot.clone();
+        wrong_bytes.linear.push(0);
+        assert!(MaterializedOrderedSnapshots::singleton(base, wrong_bytes).is_err());
+        let mut future = snapshot.clone();
+        future.linear_root.as_mut().unwrap().cursor = LaneCursor::Ordered {
+            base: OrderedBase {
+                index: 3,
+                head: Some(OrderedEntryId([9; 32])),
+            },
+        };
+        assert!(MaterializedOrderedSnapshots::singleton(base, future).is_err());
+        let mut foreign = snapshot.clone();
+        foreign.runtime.agent = AgentId([9; 32]);
+        assert!(MaterializedOrderedSnapshots::singleton(base, foreign).is_err());
+        let mut local_origin = snapshot;
+        local_origin.linear_root.as_mut().unwrap().cursor = LaneCursor::Local {
+            node: NodeId([1; 32]),
+            revision: 0,
+            head: None,
+        };
+        assert!(MaterializedOrderedSnapshots::singleton(base, local_origin).is_err());
+        cache.validate().unwrap();
     }
 
     #[test]

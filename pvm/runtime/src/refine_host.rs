@@ -103,7 +103,23 @@ impl RefineContext {
 
     /// Run the outer program, transparently servicing host calls 9 through
     /// 14. Other host calls are returned to the embedder unchanged.
-    pub fn run(mut self) -> Invocation {
+    pub fn run(self) -> Invocation {
+        self.run_with_host(|id, _| Err(ExitReason::HostCall(id)))
+    }
+
+    /// Service embedder-owned outer calls without restarting this execution or
+    /// discarding its inner-machine dictionary. Built-in calls 9 through 14
+    /// remain exclusively owned by Refine. Returning Ok advances past exactly
+    /// the pending host call; an error stops at that call's counter.
+    ///
+    /// The embedder must admit the call, validate memory ranges and charge gas
+    /// and its own I/O budgets before doing work. This is not a storage ABI or
+    /// an authorization grant. The observed/proof runner does not yet support
+    /// external handlers and must not silently substitute for this path.
+    pub fn run_with_host(
+        mut self,
+        mut host: impl FnMut(u64, &mut Machine) -> Result<(), ExitReason>,
+    ) -> Invocation {
         loop {
             let exit = self.outer.resume();
             let ExitReason::HostCall(id) = exit else {
@@ -111,6 +127,11 @@ impl RefineContext {
             };
             match self.dispatch(id) {
                 Dispatch::Continue => {}
+                Dispatch::Exit(ExitReason::HostCall(call)) => {
+                    if let Err(exit) = host(call, &mut self.outer) {
+                        return self.outer.finish(exit);
+                    }
+                }
                 Dispatch::Exit(exit) => return self.outer.finish(exit),
             }
         }
@@ -684,6 +705,85 @@ mod tests {
         assert_eq!(invocation.exit, ExitReason::HostCall(77));
         assert_eq!(invocation.pc, 3, "unknown host call stays on its cause");
         assert_eq!(invocation.registers[2], 9);
+    }
+
+    #[test]
+    fn embedder_calls_resume_without_reexecuting_prior_instructions() {
+        // r2 <- 9; external(77); external(77); halt.
+        let outer = standard_program(&[51, 2, 9, 10, 77, 10, 77, 50, 0], &[0, 3, 5, 7]);
+        let mut calls = 0;
+        let invocation = RefineContext::load(&outer, &[], 1_000_000)
+            .unwrap()
+            .run_with_host(|id, machine| {
+                assert_eq!(id, 77);
+                calls += 1;
+                if !machine.charge(50) {
+                    return Err(ExitReason::OutOfGas);
+                }
+                machine.registers_mut()[2] += 1;
+                Ok(())
+            });
+        assert_eq!(calls, 2);
+        assert_eq!(invocation.exit, ExitReason::Halt);
+        assert_eq!(invocation.registers[2], 11);
+        assert!(invocation.gas_used >= 100);
+    }
+
+    #[test]
+    fn embedder_refusal_keeps_exact_call_counter_and_stops_execution() {
+        let outer = standard_program(&[51, 2, 9, 10, 77, 10, 77, 50, 0], &[0, 3, 5, 7]);
+        let mut calls = 0;
+        let invocation = RefineContext::load(&outer, &[], 1_000_000)
+            .unwrap()
+            .run_with_host(|id, _| {
+                calls += 1;
+                Err(ExitReason::HostCall(id))
+            });
+        assert_eq!(calls, 1);
+        assert_eq!(invocation.exit, ExitReason::HostCall(77));
+        assert_eq!(invocation.pc, 3);
+        assert_eq!(invocation.registers[2], 9);
+    }
+
+    #[test]
+    fn embedder_calls_preserve_inner_machines_and_cannot_intercept_builtins() {
+        const RW_BASE: u32 = 2 * crate::PVM_ZONE_SIZE;
+        let mut frame = [0u8; 112];
+        frame[..8].copy_from_slice(&100_000u64.to_le_bytes());
+        let [b0, b1, b2, _] = RW_BASE.to_le_bytes();
+        let baseline = standard_program_with_rw(
+            &[10, 9, 51, 8, b0, b1, b2, 10, 13, 50, 0],
+            &[0, 2, 7, 9],
+            &frame,
+        );
+        let expected = RefineContext::load(&baseline, &inner_program(), 1_000_000)
+            .unwrap()
+            .run();
+        let outer = standard_program_with_rw(
+            &[10, 9, 10, 77, 51, 8, b0, b1, b2, 10, 13, 10, 77, 50, 0],
+            &[0, 2, 4, 9, 11, 13],
+            &frame,
+        );
+        let mut calls = 0;
+        let invocation = RefineContext::load(&outer, &inner_program(), 1_000_000)
+            .unwrap()
+            .run_with_host(|id, _| {
+                assert_eq!(id, 77);
+                calls += 1;
+                Ok(())
+            });
+        assert_eq!(calls, 2);
+        assert_eq!(expected.exit, ExitReason::Halt);
+        assert_eq!(invocation.exit, expected.exit);
+        let mut expected_frame = [0; 112];
+        let mut actual_frame = [0; 112];
+        expected.memory().read_bytes(RW_BASE, &mut expected_frame);
+        invocation.memory().read_bytes(RW_BASE, &mut actual_frame);
+        assert_eq!(actual_frame, expected_frame);
+        assert_ne!(
+            actual_frame, frame,
+            "the retained inner machine must actually execute"
+        );
     }
 
     #[test]

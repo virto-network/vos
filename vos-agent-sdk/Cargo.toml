@@ -9,5 +9,9 @@ homepage.workspace = true
 authors.workspace = true
 readme.workspace = true
 
+[features]
+# Candidate contract only; not admitted by the released runtime ABI.
+experimental-state-blocks = []
+
 [dependencies]
 vos-protocol.workspace = true

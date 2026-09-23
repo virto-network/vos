@@ -2356,6 +2356,8 @@ where
         self.store
             .put_blob(JournalBlobClass::LaneState, &state, &merge_state)?;
         let manifest = super::journal::LaneStateManifest {
+            #[cfg(feature = "experimental-state-blocks")]
+            external_root: None,
             genesis: heads.genesis,
             runtime: heads.runtime.clone(),
             lane: PersistedLane::Merge,
@@ -3071,6 +3073,8 @@ where
         self.store
             .put_blob(JournalBlobClass::LaneState, &state, &merge_state)?;
         let manifest = super::journal::LaneStateManifest {
+            #[cfg(feature = "experimental-state-blocks")]
+            external_root: None,
             genesis: heads.genesis,
             runtime: heads.runtime.clone(),
             lane: super::journal::PersistedLane::Merge,

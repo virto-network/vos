@@ -8622,6 +8622,7 @@ mod tests {
                 manifest: PackageManifest::AgentRuntime(
                     crate::agent::sdk::package::AgentRuntimePackageManifest {
                         name: "shape-only-r7".into(),
+                        external_state_limits: None,
                         outer_program: crate::agent::sdk::BlobRef::of_bytes(&program),
                         contract: crate::agent::sdk::contract::RuntimePackageContract::canonical(),
                         capabilities: crate::agent::sdk::RuntimeCapabilities::standard(),

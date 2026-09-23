@@ -9,10 +9,10 @@ on `saga/agents`; later implementation-only work is identified in current status
 Keep checkpoint hashes, next steps and qualification results there rather than
 duplicating a potentially stale batch description here.
 
-Preserve freshness, ordering, runtime independence and recovery. Continue all
-full-saga gates without narrowing scope. Do not disable tests, decode custom
-runtime private state in the host, or treat a scoped checkpoint as full-saga
-completion.
+Preserve freshness, ordering, runtime independence and recovery. Follow the
+customer-release scope in current status; deferred full-saga capabilities are
+not first-release gates. Do not disable tests, decode custom runtime private
+state in the host, or treat a scoped checkpoint as production qualification.
 
 The superseded 206-line working log is recoverable with
 `git show a1ebce16:docs/agent-next-checkpoint.md`.

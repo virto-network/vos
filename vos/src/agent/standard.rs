@@ -3418,6 +3418,74 @@ impl StandardAgentRuntime {
         .map_err(|_| super::execution::ActorExecutionError::InvalidAvailability)
     }
 
+    /// External metadata must never silently retain image-backed row data,
+    /// including historical incarnations that are no longer active.
+    #[cfg(all(feature = "pvm", feature = "experimental-state-blocks"))]
+    pub(crate) fn has_image_rows(&self) -> bool {
+        self.lane_state
+            .linear
+            .iter()
+            .chain(&self.lane_state.merge)
+            .chain(&self.lane_state.local)
+            .any(|entry| !entry.rows.is_empty())
+    }
+
+    /// Resolve external rows using the same installed schema and incarnation
+    /// checks as the image backend. The enclosing runtime must obtain trees
+    /// from its authenticated lane roots and admit caller policy before IO.
+    /// This neither imports image rows nor grants authority to supplied roots.
+    /// The returned reader borrows this runtime so its installation cannot be
+    /// changed while the resolved access scope is in use.
+    #[cfg(all(feature = "pvm", feature = "experimental-state-blocks"))]
+    pub(crate) fn resolve_clean_external_storage_reader<
+        'a,
+        R: crate::agent_sdk::state_tree::BlockReader,
+    >(
+        &'a self,
+        work: &crate::agent_sdk::InvocationWork,
+        schema: &crate::agent_sdk::RuntimeBlob,
+        lanes: [Option<(crate::agent_sdk::state_tree::StateTree, R)>; 3],
+        budget: &'a mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<
+        super::actor_storage::ExternalActorStorageReader<'a, R>,
+        super::execution::ActorExecutionError,
+    > {
+        use super::execution::ActorExecutionError;
+        let descriptor = self
+            .clean_descriptor
+            .as_ref()
+            .ok_or(ActorExecutionError::NotCreated)?;
+        if work.space != descriptor.identity.space
+            || work.agent != descriptor.identity.agent
+            || work.runtime_deployment != descriptor.identity.runtime_deployment
+            || lanes.iter().flatten().any(|(tree, _)| {
+                tree.scope().space() != work.space || tree.scope().agent() != work.agent
+            })
+        {
+            return Err(ActorExecutionError::InvalidAvailability);
+        }
+        let access = self.resolve_clean_storage_access(work, schema)?;
+        for lane in [StateLane::Linear, StateLane::Merge, StateLane::Local] {
+            if self
+                .lane_state
+                .lookup(lane, ActorId(work.actor.0), Hash(work.incarnation.0))
+                .is_some_and(|entry| !entry.rows.is_empty())
+            {
+                // No mixed-backend migration: selecting an external tree must
+                // not silently hide the installed actor's existing image rows.
+                return Err(ActorExecutionError::InvalidAvailability);
+            }
+        }
+        super::actor_storage::ExternalActorStorageReader::new(
+            access,
+            work.actor,
+            work.incarnation,
+            lanes,
+            budget,
+        )
+        .map_err(|_| ActorExecutionError::InvalidAvailability)
+    }
+
     #[cfg(feature = "pvm")]
     pub(crate) fn validate_clean_execution_installation_data(
         &self,
@@ -4150,6 +4218,78 @@ impl StandardAgentRuntime {
             })?;
         *self = candidate;
         Ok(result)
+    }
+
+    /// Prepare one external lane's rows and existing runtime result/inline
+    /// semantics as one candidate. Neither this runtime nor the provider is
+    /// mutated. The caller must publish the returned root and enclosing runtime
+    /// transition together; it must not install the returned runtime separately.
+    /// `commit` retains the existing authorization/result/continuation checks.
+    #[cfg(all(feature = "pvm", feature = "experimental-state-blocks"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_clean_external_row_batch<
+        R: crate::agent_sdk::state_tree::BlockReader,
+        T,
+    >(
+        &self,
+        work: &crate::agent_sdk::InvocationWork,
+        schema: &crate::agent_sdk::RuntimeBlob,
+        changes: &[(Vec<u8>, Option<Vec<u8>>)],
+        limits: crate::agent_sdk::contract::ExternalStateResourceLimits,
+        lanes: [Option<(crate::agent_sdk::state_tree::StateTree, R)>; 3],
+        (reads, writes): (
+            &mut crate::agent_sdk::state_blocks::ReadBudget,
+            &mut crate::agent_sdk::state_tree::WriteBudget,
+        ),
+        commit: impl FnOnce(&mut Self) -> Result<T, super::execution::ActorExecutionError>,
+    ) -> Result<
+        (Self, crate::agent_sdk::state_tree::TreeUpdate, T),
+        super::execution::ActorExecutionError,
+    > {
+        use super::{actor_storage::ActorRowStorage, execution::ActorExecutionError};
+        let lane = clean_method_mode(work.mode)
+            .write_lane()
+            .ok_or(ActorExecutionError::UnsupportedMethod)?;
+        let reader = self.resolve_clean_external_storage_reader(work, schema, lanes, reads)?;
+        reader
+            .validate_delta(changes)
+            .map_err(|_| ActorExecutionError::InvalidActorOutput)?;
+        let before = super::wire::encode_standard_runtime_state(&self.snapshot());
+        let metadata = reader
+            .read_write_lane_metadata(super::execution::MAX_RUNTIME_STATE_BYTES)
+            .map_err(|_| ActorExecutionError::InvalidAvailability)?
+            .ok_or(ActorExecutionError::InvalidAvailability)?;
+        if metadata != before.component(lane) {
+            return Err(ActorExecutionError::InvalidAvailability);
+        }
+        let mut candidate = self.clone();
+        let result = commit(&mut candidate)?;
+        candidate
+            .validate_restored_lane_state()
+            .map_err(|_| ActorExecutionError::InvalidActorOutput)?;
+        candidate
+            .validate_signed_state_resource()
+            .map_err(|error| match error {
+                LifecycleError::ResourceLimit => ActorExecutionError::ResultCapacity,
+                _ => ActorExecutionError::InvalidActorOutput,
+            })?;
+        let after = super::wire::encode_standard_runtime_state(&candidate.snapshot());
+        if before.control != after.control
+            || [StateLane::Linear, StateLane::Merge, StateLane::Local]
+                .into_iter()
+                .any(|other| other != lane && before.component(other) != after.component(other))
+        {
+            return Err(ActorExecutionError::InvalidActorOutput);
+        }
+        let metadata = crate::agent_sdk::state_metadata::RuntimeMetadataUpdate::new(
+            after.component(lane),
+            super::execution::MAX_RUNTIME_STATE_BYTES,
+        )
+        .map_err(|_| ActorExecutionError::ResultCapacity)?;
+        let (update, _) = reader
+            .prepare_delta_with_metadata(changes, limits, metadata, writes)
+            .map_err(|_| ActorExecutionError::InvalidAvailability)?;
+        Ok((candidate, update, result))
     }
 
     /// Retain an authenticated terminal actor failure without committing any

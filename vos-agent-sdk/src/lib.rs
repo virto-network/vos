@@ -23,6 +23,22 @@ pub mod recovery;
 mod runtime;
 pub mod scheduling;
 pub mod schema;
+#[cfg(any(test, feature = "experimental-state-blocks"))]
+pub mod state_blocks;
+#[cfg(any(test, feature = "experimental-state-blocks"))]
+pub mod state_change;
+#[cfg(any(test, feature = "experimental-state-blocks"))]
+pub mod state_execution;
+#[cfg(any(test, feature = "experimental-state-blocks"))]
+pub mod state_guest;
+#[cfg(any(test, feature = "experimental-state-blocks"))]
+pub mod state_metadata;
+#[cfg(any(test, feature = "experimental-state-blocks"))]
+pub mod state_root;
+#[cfg(any(test, feature = "experimental-state-blocks"))]
+pub mod state_rows;
+#[cfg(any(test, feature = "experimental-state-blocks"))]
+pub mod state_tree;
 pub mod task;
 pub mod wire;
 

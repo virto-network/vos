@@ -2268,6 +2268,454 @@ pub fn apply_standard_runtime_input(
     }
 }
 
+/// Experimental standard-runtime lifecycle, non-yielding invocation and inspection
+/// with metadata in accounted external roots. Other operations fail closed until their
+/// external-state dispatch is implemented. This never publishes storage.
+#[cfg(all(feature = "pvm", feature = "experimental-state-blocks"))]
+pub fn apply_standard_external_runtime_input(input: &[u8]) -> Result<Vec<u8>, DecodeError> {
+    #[cfg(target_arch = "riscv64")]
+    return apply_standard_external_runtime_input_with_reader(input, |scope| {
+        crate::agent_sdk::state_guest::PvmBlockReader::new(scope.lane())
+    });
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        struct NoBase;
+        impl crate::agent_sdk::state_tree::BlockReader for NoBase {
+            fn read(
+                &mut self,
+                _: crate::agent_sdk::state_blocks::BlockRef,
+                _: &mut [u8],
+            ) -> Result<bool, crate::agent_sdk::state_tree::TreeError> {
+                Err(crate::agent_sdk::state_tree::TreeError::Storage)
+            }
+        }
+        // Native callers get no implicit provider or interpretation of missing
+        // blocks as empty state. Tests supply an explicit authenticated reader.
+        apply_standard_external_runtime_input_with_reader(input, |_| NoBase)
+    }
+}
+
+#[cfg(all(feature = "pvm", feature = "experimental-state-blocks"))]
+fn apply_standard_external_runtime_input_with_reader<
+    R: crate::agent_sdk::state_tree::BlockReader,
+>(
+    input: &[u8],
+    mut reader: impl FnMut(crate::agent_sdk::state_blocks::BlockScope) -> R,
+) -> Result<Vec<u8>, DecodeError> {
+    use crate::agent_sdk::{
+        ManagementReply, ManagementRequest, RuntimeOutcome, RuntimeWork,
+        state_blocks::ReadBudget,
+        state_change::StateChange,
+        state_execution::{StateExecutionOutput, StateExecutionWork},
+        state_metadata::RuntimeMetadataUpdate,
+        state_rows::initialize_accounted_metadata,
+        state_tree::WriteBudget,
+    };
+    let work = StateExecutionWork::decode(input).map_err(|_| DecodeError::NonCanonical)?;
+    let (space, agent, deployment, state, supported) = match work.work() {
+        RuntimeWork::Manage {
+            space,
+            agent,
+            runtime_deployment,
+            state,
+            request,
+            ..
+        } => (
+            *space,
+            *agent,
+            *runtime_deployment,
+            state,
+            matches!(
+                request.as_ref(),
+                ManagementRequest::InspectActors { .. }
+                    | ManagementRequest::InspectResources
+                    | ManagementRequest::InspectManagementHistory
+                    | ManagementRequest::Install(_)
+            ),
+        ),
+        RuntimeWork::Acknowledge {
+            state, invocation, ..
+        } => (
+            invocation.space,
+            invocation.agent,
+            invocation.runtime_deployment,
+            state,
+            true,
+        ),
+        RuntimeWork::Invoke {
+            state, invocation, ..
+        } => (
+            invocation.space,
+            invocation.agent,
+            invocation.runtime_deployment,
+            state,
+            true,
+        ),
+        _ => return Err(DecodeError::InvalidPlatform),
+    };
+    if supported {
+        let mut decoded = encode_standard_runtime_state(&StandardRuntimeState::default());
+        decoded.control = state.control.clone();
+        let mut remaining = crate::agent_sdk::MAX_RUNTIME_STATE_BYTES
+            .checked_sub(decoded.control.len())
+            .ok_or(DecodeError::LimitExceeded)?;
+        let mut reads =
+            ReadBudget::new(4096, (crate::agent_sdk::MAX_RUNTIME_STATE_BYTES * 2) as u64);
+        for lane in [
+            crate::agent_sdk::StateLane::Linear,
+            crate::agent_sdk::StateLane::Merge,
+            crate::agent_sdk::StateLane::Local,
+        ] {
+            let bytes = if let Some(selected) = work
+                .lanes()
+                .iter()
+                .find(|selected| selected.base.context().scope().lane() == lane)
+            {
+                let tree = selected
+                    .base
+                    .bind(selected.base.context(), selected.base.commitment())
+                    .map_err(|_| DecodeError::NonCanonical)?;
+                let mut provider = reader(tree.scope());
+                let usage =
+                    crate::agent_sdk::state_rows::lane_row_usage(tree, &mut provider, &mut reads)
+                        .map_err(|_| DecodeError::NonCanonical)?;
+                if usage.rows > work.limits().max_rows_per_lane
+                    || usage.bytes > work.limits().max_row_bytes_per_lane
+                {
+                    return Err(DecodeError::LimitExceeded);
+                }
+                crate::agent_sdk::state_metadata::read_runtime_metadata(
+                    tree,
+                    remaining,
+                    &mut provider,
+                    &mut reads,
+                )
+                .map_err(|_| DecodeError::NonCanonical)?
+                .ok_or(DecodeError::NonCanonical)?
+            } else {
+                if !state.component(lane).is_empty() {
+                    return Err(DecodeError::NonCanonical);
+                }
+                match lane {
+                    crate::agent_sdk::StateLane::Linear => decoded.linear.clone(),
+                    crate::agent_sdk::StateLane::Merge => decoded.merge.clone(),
+                    crate::agent_sdk::StateLane::Local => decoded.local.clone(),
+                }
+            };
+            remaining = remaining
+                .checked_sub(bytes.len())
+                .ok_or(DecodeError::LimitExceeded)?;
+            match lane {
+                crate::agent_sdk::StateLane::Linear => decoded.linear = bytes,
+                crate::agent_sdk::StateLane::Merge => decoded.merge = bytes,
+                crate::agent_sdk::StateLane::Local => decoded.local = bytes,
+            }
+        }
+        let (mut runtime, _) = restore_standard_runtime_state(&decoded)?;
+        if runtime.has_image_rows() {
+            return Err(DecodeError::NonCanonical);
+        }
+        let descriptor = runtime
+            .clean_descriptor()
+            .ok_or(DecodeError::NonCanonical)?;
+        let declared = work.lanes().iter().fold(0u8, |bits, lane| {
+            bits | crate::agent_sdk::LaneSet::of(lane.base.context().scope().lane()).bits()
+        });
+        if descriptor.identity.space != space
+            || descriptor.identity.agent != agent
+            || descriptor.identity.runtime_deployment != deployment
+            || descriptor.runtime_contract.lifecycle_abi
+                != crate::agent_sdk::state_execution::STATE_EXECUTION_ABI_ID
+            || descriptor.capabilities.lanes.bits() != declared
+            || decoded.encoded_len().is_none_or(|bytes| {
+                bytes
+                    > descriptor
+                        .runtime_contract
+                        .resources
+                        .max_runtime_state_bytes as usize
+            })
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        let limit = descriptor
+            .runtime_contract
+            .resources
+            .max_runtime_state_bytes as usize;
+        let mut writes = WriteBudget::new(
+            4096,
+            crate::agent_sdk::state_change::MAX_STATE_CHANGE_BYTES as u64,
+        );
+        let mut row_candidate = None;
+        let (successor, outcome) = match work.work() {
+            RuntimeWork::Manage {
+                request,
+                authority,
+                observed_slot,
+                ..
+            } => {
+                let outcome = runtime.apply_clean_management(
+                    space,
+                    agent,
+                    deployment,
+                    request.as_ref().clone(),
+                    authority.as_deref().cloned(),
+                    *observed_slot,
+                    false,
+                );
+                let successor = if matches!(request.as_ref(), ManagementRequest::Install(_)) {
+                    encode_standard_runtime_state(&runtime.snapshot())
+                } else {
+                    decoded.clone()
+                };
+                // Install updates only bounded control/directory metadata.
+                if runtime.has_image_rows()
+                    || successor.linear != decoded.linear
+                    || successor.merge != decoded.merge
+                    || successor.local != decoded.local
+                {
+                    return Err(DecodeError::NonCanonical);
+                }
+                (successor, RuntimeOutcome::Management(outcome))
+            }
+            RuntimeWork::Acknowledge {
+                invocation,
+                authorization,
+                ..
+            } => {
+                // Use the same retirement/retry/capacity implementation as r19,
+                // consuming the already restored runtime, without a second restore.
+                let result = apply_clean_acknowledge_restored(
+                    decoded.clone(),
+                    runtime,
+                    limit,
+                    invocation.as_ref().clone(),
+                    authorization.as_ref().clone(),
+                )?;
+                (clean_state_to_legacy(&result.state), result.outcome)
+            }
+            RuntimeWork::Invoke {
+                invocation,
+                authorization,
+                observed_slot,
+                ..
+            } => {
+                // The image runtime's Merge observation hashes embedded rows.
+                // External Merge frontiers need their own committed semantics;
+                // never report that image-derived frontier for external rows.
+                if runtime
+                    .clean_actor_record(invocation.actor)
+                    .is_some_and(|record| {
+                        record
+                            .entry
+                            .lanes
+                            .contains(crate::agent_sdk::StateLane::Merge)
+                    })
+                {
+                    return Err(DecodeError::InvalidPlatform);
+                }
+                let mut storage = ExternalInvocationStorage {
+                    reader: &mut reader,
+                    lanes: work.lanes(),
+                    limits: work.limits(),
+                    reads: &mut reads,
+                    writes: &mut writes,
+                    candidate: None,
+                };
+                let result = apply_clean_invoke_restored(
+                    decoded.clone(),
+                    runtime,
+                    limit,
+                    invocation.as_ref().clone(),
+                    authorization.as_ref().clone(),
+                    *observed_slot,
+                    CleanExecutionAdmission::direct(),
+                    false,
+                    &mut storage,
+                )?;
+                let successor = clean_state_to_legacy(&result.state);
+                if let Some((expected, update)) = storage.candidate {
+                    if expected != successor {
+                        return Err(DecodeError::NonCanonical);
+                    }
+                    row_candidate = Some(update);
+                }
+                (successor, result.outcome)
+            }
+            _ => unreachable!(),
+        };
+        if successor.encoded_len().is_none_or(|bytes| bytes > limit) {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let mut transition = crate::agent_sdk::RuntimeTransition {
+            state: state.clone(),
+            outcome,
+        };
+        transition.state.control = successor.control;
+        let mut changes = Vec::new();
+        for (lane, before, after) in [
+            (
+                crate::agent_sdk::StateLane::Linear,
+                &decoded.linear,
+                &successor.linear,
+            ),
+            (
+                crate::agent_sdk::StateLane::Merge,
+                &decoded.merge,
+                &successor.merge,
+            ),
+            (
+                crate::agent_sdk::StateLane::Local,
+                &decoded.local,
+                &successor.local,
+            ),
+        ] {
+            let owns_rows = row_candidate
+                .as_ref()
+                .is_some_and(|update| update.tree.scope().lane() == lane);
+            if before == after && !owns_rows {
+                continue;
+            }
+            let selected = work
+                .lanes()
+                .iter()
+                .find(|selected| selected.base.context().scope().lane() == lane)
+                .ok_or(DecodeError::NonCanonical)?;
+            if selected.next == selected.base.context() {
+                return Err(DecodeError::NonCanonical);
+            }
+            let tree = selected
+                .base
+                .bind(selected.base.context(), selected.base.commitment())
+                .map_err(|_| DecodeError::NonCanonical)?;
+            let update = if owns_rows {
+                row_candidate.take().ok_or(DecodeError::NonCanonical)?
+            } else {
+                crate::agent_sdk::state_rows::update_accounted_metadata(
+                    tree,
+                    RuntimeMetadataUpdate::new(after, limit)
+                        .map_err(|_| DecodeError::LimitExceeded)?,
+                    work.limits(),
+                    &mut reader(tree.scope()),
+                    &mut reads,
+                    &mut writes,
+                )
+                .map_err(|_| DecodeError::NonCanonical)?
+                .update
+            };
+            let change =
+                StateChange::from_update(selected.base.commitment(), selected.next, update)
+                    .map_err(|_| DecodeError::LimitExceeded)?;
+            match lane {
+                crate::agent_sdk::StateLane::Linear => {
+                    transition.state.linear = change.next().encode()
+                }
+                crate::agent_sdk::StateLane::Merge => {
+                    transition.state.merge = change.next().encode()
+                }
+                crate::agent_sdk::StateLane::Local => {
+                    transition.state.local = change.next().encode()
+                }
+            }
+            changes.push(change);
+        }
+        return StateExecutionOutput::new(&work, transition, changes)
+            .and_then(|output| output.encode())
+            .map_err(|_| DecodeError::NonCanonical);
+    }
+    let RuntimeWork::Manage { request, .. } = work.work() else {
+        return Err(DecodeError::InvalidPlatform);
+    };
+    let ManagementRequest::Create(descriptor) = request.as_ref() else {
+        return Err(DecodeError::InvalidPlatform);
+    };
+    if !state.is_empty()
+        || descriptor.runtime_contract.lifecycle_abi
+            != crate::agent_sdk::state_execution::STATE_EXECUTION_ABI_ID
+    {
+        return Err(DecodeError::InvalidPlatform);
+    }
+    let declared = work.lanes().iter().fold(0u8, |bits, lane| {
+        bits | crate::agent_sdk::LaneSet::of(lane.base.context().scope().lane()).bits()
+    });
+    if declared != descriptor.capabilities.lanes.bits() {
+        return Err(DecodeError::NonCanonical);
+    }
+    // The existing standard runtime performs Create authority, descriptor,
+    // identity and lifecycle checks. No native substitute executes in the host.
+    let mut transition = apply_standard_runtime_work(work.work().clone())?;
+    if !matches!(&transition.outcome, RuntimeOutcome::Management(Ok(ManagementReply::Created(identity))) if identity == &descriptor.identity)
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    let limit = descriptor
+        .runtime_contract
+        .resources
+        .max_runtime_state_bytes as usize;
+    if transition.state.encoded_len().is_none_or(|len| len > limit) {
+        return Err(DecodeError::LimitExceeded);
+    }
+    let empty = encode_standard_runtime_state(&StandardRuntimeState::default());
+    let mut changes = Vec::new();
+    let mut reads = ReadBudget::new(4096, crate::agent_sdk::MAX_RUNTIME_STATE_BYTES as u64);
+    let mut writes = WriteBudget::new(
+        4096,
+        crate::agent_sdk::state_change::MAX_STATE_CHANGE_BYTES as u64,
+    );
+    for lane in [
+        crate::agent_sdk::StateLane::Linear,
+        crate::agent_sdk::StateLane::Merge,
+        crate::agent_sdk::StateLane::Local,
+    ] {
+        let bytes = transition.state.component(lane);
+        let successor = if let Some(selected) = work
+            .lanes()
+            .iter()
+            .find(|selected| selected.base.context().scope().lane() == lane)
+        {
+            let tree = selected
+                .base
+                .bind(selected.base.context(), selected.base.commitment())
+                .map_err(|_| DecodeError::NonCanonical)?;
+            let metadata =
+                RuntimeMetadataUpdate::new(bytes, limit).map_err(|_| DecodeError::LimitExceeded)?;
+            let batch = initialize_accounted_metadata(
+                tree,
+                metadata,
+                &mut reader(tree.scope()),
+                &mut reads,
+                &mut writes,
+            )
+            .map_err(|_| DecodeError::NonCanonical)?;
+            let change =
+                StateChange::from_update(selected.base.commitment(), selected.next, batch.update)
+                    .map_err(|_| DecodeError::LimitExceeded)?;
+            let root = change.next().encode();
+            changes.push(change);
+            root
+        } else {
+            // Unsupported lanes may only discard the canonical empty metadata,
+            // which a later standard loader can reconstruct without data loss.
+            let native_lane = match lane {
+                crate::agent_sdk::StateLane::Linear => StateLane::Linear,
+                crate::agent_sdk::StateLane::Merge => StateLane::Merge,
+                crate::agent_sdk::StateLane::Local => StateLane::Local,
+            };
+            if bytes != empty.component(native_lane) {
+                return Err(DecodeError::NonCanonical);
+            }
+            Vec::new()
+        };
+        match lane {
+            crate::agent_sdk::StateLane::Linear => transition.state.linear = successor,
+            crate::agent_sdk::StateLane::Merge => transition.state.merge = successor,
+            crate::agent_sdk::StateLane::Local => transition.state.local = successor,
+        }
+    }
+    StateExecutionOutput::new(&work, transition, changes)
+        .and_then(|output| output.encode())
+        .map_err(|_| DecodeError::NonCanonical)
+}
+
 /// Execute constructed Direct work, validating its invocation preimages.
 #[cfg(feature = "pvm")]
 pub fn apply_standard_runtime_work(
@@ -2496,6 +2944,165 @@ fn apply_clean_invoke(
 }
 
 #[cfg(feature = "pvm")]
+trait CleanInvocationStorage {
+    fn execute(
+        &mut self,
+        runtime: &StandardAgentRuntime,
+        work: &crate::agent_sdk::InvocationWork,
+        schema: &crate::agent_sdk::RuntimeBlob,
+        run: impl FnOnce(
+            &dyn super::actor_storage::ActorRowStorage,
+        ) -> Result<super::execution::ActorRunOutcome, ActorExecutionError>,
+    ) -> Result<super::execution::ActorRunOutcome, ActorExecutionError>;
+
+    fn commit<T>(
+        &mut self,
+        runtime: &mut StandardAgentRuntime,
+        work: &crate::agent_sdk::InvocationWork,
+        schema: &crate::agent_sdk::RuntimeBlob,
+        inline: Vec<u8>,
+        rows: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        commit: impl FnOnce(&mut StandardAgentRuntime) -> Result<T, ActorExecutionError>,
+    ) -> Result<T, ActorExecutionError>;
+}
+
+#[cfg(feature = "pvm")]
+struct ImageInvocationStorage;
+
+/// Per-execution external IO and an unpublished row/metadata candidate. It
+/// cannot publish storage or replace authorization/retry/failure semantics.
+#[cfg(all(feature = "pvm", feature = "experimental-state-blocks"))]
+struct ExternalInvocationStorage<'a, F> {
+    reader: F,
+    lanes: &'a [crate::agent_sdk::state_execution::ExternalLaneWork],
+    limits: crate::agent_sdk::contract::ExternalStateResourceLimits,
+    reads: &'a mut crate::agent_sdk::state_blocks::ReadBudget,
+    writes: &'a mut crate::agent_sdk::state_tree::WriteBudget,
+    candidate: Option<(RuntimeState, crate::agent_sdk::state_tree::TreeUpdate)>,
+}
+
+#[cfg(all(feature = "pvm", feature = "experimental-state-blocks"))]
+impl<
+    R: crate::agent_sdk::state_tree::BlockReader,
+    F: FnMut(crate::agent_sdk::state_blocks::BlockScope) -> R,
+> ExternalInvocationStorage<'_, F>
+{
+    fn readers(
+        &mut self,
+    ) -> Result<[Option<(crate::agent_sdk::state_tree::StateTree, R)>; 3], ActorExecutionError>
+    {
+        let mut select = |lane| {
+            self.lanes
+                .iter()
+                .find(|selected| selected.base.context().scope().lane() == lane)
+                .map(|selected| {
+                    let tree = selected
+                        .base
+                        .bind(selected.base.context(), selected.base.commitment())
+                        .map_err(|_| ActorExecutionError::InvalidAvailability)?;
+                    Ok((tree, (self.reader)(tree.scope())))
+                })
+                .transpose()
+        };
+        Ok([
+            select(crate::agent_sdk::StateLane::Linear)?,
+            select(crate::agent_sdk::StateLane::Merge)?,
+            select(crate::agent_sdk::StateLane::Local)?,
+        ])
+    }
+}
+
+#[cfg(all(feature = "pvm", feature = "experimental-state-blocks"))]
+impl<
+    R: crate::agent_sdk::state_tree::BlockReader,
+    F: FnMut(crate::agent_sdk::state_blocks::BlockScope) -> R,
+> CleanInvocationStorage for ExternalInvocationStorage<'_, F>
+{
+    fn execute(
+        &mut self,
+        runtime: &StandardAgentRuntime,
+        work: &crate::agent_sdk::InvocationWork,
+        schema: &crate::agent_sdk::RuntimeBlob,
+        run: impl FnOnce(
+            &dyn super::actor_storage::ActorRowStorage,
+        ) -> Result<super::execution::ActorRunOutcome, ActorExecutionError>,
+    ) -> Result<super::execution::ActorRunOutcome, ActorExecutionError> {
+        let lanes = self.readers()?;
+        let reader =
+            runtime.resolve_clean_external_storage_reader(work, schema, lanes, self.reads)?;
+        let outcome = run(&reader)?;
+        // Do not persist a continuation until aggregate external work budgets
+        // are carried by that continuation. No yielded writes may escape.
+        if matches!(outcome, super::execution::ActorRunOutcome::Yielded { .. }) {
+            return Err(ActorExecutionError::InvalidAvailability);
+        }
+        Ok(outcome)
+    }
+
+    fn commit<T>(
+        &mut self,
+        runtime: &mut StandardAgentRuntime,
+        work: &crate::agent_sdk::InvocationWork,
+        schema: &crate::agent_sdk::RuntimeBlob,
+        _inline: Vec<u8>,
+        rows: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        commit: impl FnOnce(&mut StandardAgentRuntime) -> Result<T, ActorExecutionError>,
+    ) -> Result<T, ActorExecutionError> {
+        if rows.is_empty() {
+            return commit(runtime);
+        }
+        if self.candidate.is_some() {
+            return Err(ActorExecutionError::InvalidActorOutput);
+        }
+        let lanes = self.readers()?;
+        let (candidate, update, result) = runtime.prepare_clean_external_row_batch(
+            work,
+            schema,
+            &rows,
+            self.limits,
+            lanes,
+            (self.reads, self.writes),
+            commit,
+        )?;
+        self.candidate = Some((encode_standard_runtime_state(&candidate.snapshot()), update));
+        *runtime = candidate;
+        Ok(result)
+    }
+}
+
+#[cfg(feature = "pvm")]
+impl CleanInvocationStorage for ImageInvocationStorage {
+    fn execute(
+        &mut self,
+        runtime: &StandardAgentRuntime,
+        work: &crate::agent_sdk::InvocationWork,
+        schema: &crate::agent_sdk::RuntimeBlob,
+        run: impl FnOnce(
+            &dyn super::actor_storage::ActorRowStorage,
+        ) -> Result<super::execution::ActorRunOutcome, ActorExecutionError>,
+    ) -> Result<super::execution::ActorRunOutcome, ActorExecutionError> {
+        let reader = runtime.resolve_clean_storage_reader(work, schema)?;
+        run(&reader)
+    }
+
+    fn commit<T>(
+        &mut self,
+        runtime: &mut StandardAgentRuntime,
+        work: &crate::agent_sdk::InvocationWork,
+        schema: &crate::agent_sdk::RuntimeBlob,
+        inline: Vec<u8>,
+        rows: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        commit: impl FnOnce(&mut StandardAgentRuntime) -> Result<T, ActorExecutionError>,
+    ) -> Result<T, ActorExecutionError> {
+        if rows.is_empty() {
+            commit(runtime)
+        } else {
+            runtime.commit_clean_row_batch(work, schema, inline, rows, commit)
+        }
+    }
+}
+
+#[cfg(feature = "pvm")]
 fn apply_clean_invoke_inner(
     state: crate::agent_sdk::RuntimeState,
     work: crate::agent_sdk::InvocationWork,
@@ -2504,8 +3111,6 @@ fn apply_clean_invoke_inner(
     admission: CleanExecutionAdmission<'_>,
     decoded_work: bool,
 ) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
-    use crate::agent_sdk::{InvocationError, RuntimeOutcome, RuntimeTransition};
-
     // Keep one owned encoded rollback image, not both SDK and legacy copies.
     // The fields have identical bytes; only the enclosing wire types differ.
     let original_state = RuntimeState {
@@ -2514,7 +3119,33 @@ fn apply_clean_invoke_inner(
         merge: state.merge,
         local: state.local,
     };
-    let (mut runtime, state_limit) = restore_standard_runtime_state(&original_state)?;
+    let (runtime, state_limit) = restore_standard_runtime_state(&original_state)?;
+    apply_clean_invoke_restored(
+        original_state,
+        runtime,
+        state_limit,
+        work,
+        authorization,
+        observed_slot,
+        admission,
+        decoded_work,
+        &mut ImageInvocationStorage,
+    )
+}
+
+#[cfg(feature = "pvm")]
+fn apply_clean_invoke_restored(
+    original_state: RuntimeState,
+    mut runtime: StandardAgentRuntime,
+    state_limit: usize,
+    work: crate::agent_sdk::InvocationWork,
+    authorization: crate::agent_sdk::InvocationAuthorization,
+    observed_slot: u64,
+    admission: CleanExecutionAdmission<'_>,
+    decoded_work: bool,
+    storage_backend: &mut impl CleanInvocationStorage,
+) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
+    use crate::agent_sdk::{InvocationError, RuntimeOutcome, RuntimeTransition};
     // Retained authenticated errors can name a missing or stale actor.
     // Recovery begins with full work/authorization verification before any
     // mutation, so do not repeat that verification (including blob hashes and
@@ -2763,12 +3394,12 @@ fn apply_clean_invoke_inner(
                                 Ok(true) => runtime.prepare_execution_state(&invocation).and_then(
                                     |before| {
                                         let visible = before.visible_for(invocation.mode);
-                                        let outcome = {
-                                            let storage = runtime.resolve_clean_storage_reader(
-                                                &work,
-                                                &actor_schema,
-                                            )?;
-                                            super::execution::run_inner_actor_with_storage(
+                                        let outcome = storage_backend.execute(
+                                            &runtime,
+                                            &work,
+                                            &actor_schema,
+                                            |storage| {
+                                                super::execution::run_inner_actor_with_storage(
                                                 &invocation,
                                                 Some(
                                                     crate::agent_sdk::InvocationContext::from_work(
@@ -2782,9 +3413,10 @@ fn apply_clean_invoke_inner(
                                                     .map(|data| data.bytes.as_slice()),
                                                 &visible,
                                                 None,
-                                                Some(&storage),
+                                                Some(storage),
                                             )
-                                        };
+                                            },
+                                        );
                                         outcome.and_then(|outcome| match outcome {
                                             super::execution::ActorRunOutcome::Completed {
                                                 mut reply,
@@ -2814,17 +3446,14 @@ fn apply_clean_invoke_inner(
                                                                 None,
                                                             )
                                                         };
-                                                    if rows.is_empty() {
-                                                        commit(&mut runtime)?;
-                                                    } else {
-                                                        runtime.commit_clean_row_batch(
-                                                            &work,
-                                                            &actor_schema,
-                                                            inline,
-                                                            rows,
-                                                            commit,
-                                                        )?;
-                                                    }
+                                                    storage_backend.commit(
+                                                        &mut runtime,
+                                                        &work,
+                                                        &actor_schema,
+                                                        inline,
+                                                        rows,
+                                                        commit,
+                                                    )?;
                                                 }
                                                 Ok(reply)
                                             }
@@ -2862,17 +3491,14 @@ fn apply_clean_invoke_inner(
                                         )),
                                     )
                                                     };
-                                                if rows.is_empty() {
-                                                    commit(&mut runtime)?;
-                                                } else {
-                                                    runtime.commit_clean_row_batch(
-                                                        &work,
-                                                        &actor_schema,
-                                                        inline,
-                                                        rows,
-                                                        commit,
-                                                    )?;
-                                                }
+                                                storage_backend.commit(
+                                                    &mut runtime,
+                                                    &work,
+                                                    &actor_schema,
+                                                    inline,
+                                                    rows,
+                                                    commit,
+                                                )?;
                                                 Ok(reply)
                                             }
                                         })
@@ -3175,8 +3801,6 @@ fn apply_clean_acknowledge(
     work: crate::agent_sdk::InvocationRetirement,
     authorization: crate::agent_sdk::InvocationAuthorization,
 ) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
-    use crate::agent_sdk::{InvocationError, RuntimeOutcome, RuntimeTransition};
-
     // Retain one owned rollback image across admission and retirement. Keeping
     // an additional SDK copy can exhaust the guest heap near the state limit.
     let original_state = RuntimeState {
@@ -3185,7 +3809,19 @@ fn apply_clean_acknowledge(
         merge: state.merge,
         local: state.local,
     };
-    let (mut runtime, state_limit) = restore_standard_runtime_state(&original_state)?;
+    let (runtime, state_limit) = restore_standard_runtime_state(&original_state)?;
+    apply_clean_acknowledge_restored(original_state, runtime, state_limit, work, authorization)
+}
+
+#[cfg(feature = "pvm")]
+fn apply_clean_acknowledge_restored(
+    original_state: RuntimeState,
+    mut runtime: StandardAgentRuntime,
+    state_limit: usize,
+    work: crate::agent_sdk::InvocationRetirement,
+    authorization: crate::agent_sdk::InvocationAuthorization,
+) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
+    use crate::agent_sdk::{InvocationError, RuntimeOutcome, RuntimeTransition};
     // Acknowledge retires an already retained exact result; it does not
     // execute the actor method again. Re-running the current AMP2 method
     // policy here would make a Required-attestation result impossible to
@@ -5963,7 +6599,7 @@ pub(crate) mod tests {
     }
 
     #[cfg(feature = "pvm")]
-    fn clean_install_request(
+    pub(crate) fn clean_install_request(
         descriptor: &crate::agent_sdk::AgentDescriptor,
         name: &str,
         parent: Option<crate::agent_sdk::ActorId>,
@@ -10176,6 +10812,181 @@ pub(crate) mod tests {
         clean_terminal_fixture_with_program_size(0)
     }
 
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    fn rebind_external_test_runtime(
+        seed: &mut StandardRuntimeState,
+        admitted: &super::super::package_admission::AdmittedStateRuntimePackage,
+    ) {
+        for descriptor in [
+            &mut seed.clean_descriptor,
+            &mut seed.clean_creation_descriptor,
+        ] {
+            let descriptor = descriptor.as_mut().unwrap();
+            descriptor.identity.runtime_deployment = admitted.deployment();
+            descriptor.identity.runtime_producer = admitted.manifest().signing.producer;
+            descriptor.identity.runtime_program =
+                crate::agent_sdk::ProgramId::of_pvm(admitted.program_bytes());
+            descriptor.runtime_contract = admitted.manifest().contract.clone();
+            descriptor.capabilities = admitted.manifest().capabilities;
+            descriptor.runtime_package = admitted.package_ref().clone();
+        }
+        let descriptor = seed.clean_descriptor.as_ref().unwrap();
+        seed.config =
+            Some(super::super::standard::clean_descriptor_to_legacy_config(descriptor).unwrap());
+        seed.active_resource_policy = Some(descriptor.initial_resource_policy());
+    }
+
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    pub(crate) fn external_invocation_fixture(
+        admitted: &super::super::package_admission::AdmittedStateRuntimePackage,
+        yielded: bool,
+    ) -> crate::agent_sdk::RuntimeWork {
+        use vos_pvm_compiler::assembler::{Assembler, Reg};
+        let (runtime, mut work) = clean_policy_fixture_with_storage(
+            crate::agent_sdk::method_policy::AuthorizationPolicySelector::Public,
+            crate::agent_sdk::method_policy::AttestationRequirement::None,
+            true,
+        );
+        let key = b"s/rows/value";
+        let delta =
+            super::super::actor_storage::encode_row_delta(&[(key.to_vec(), Some(vec![7; 8]))])
+                .unwrap();
+        let base = 2 * vos_pvm::PVM_ZONE_SIZE;
+        let mut output = vec![0; 30];
+        output[0] = if yielded {
+            crate::actors::STATUS_YIELDED
+        } else {
+            crate::actors::STATUS_DONE
+        };
+        output[1..5].copy_from_slice(&1u32.to_le_bytes());
+        output[13] = 0xee;
+        output.extend_from_slice(&delta);
+        let key_at = base + output.len() as u32;
+        output.extend_from_slice(key);
+        let buffer = base + output.len() as u32;
+        output.extend_from_slice(&[0; 8]);
+        let mut program = Assembler::new();
+        program.set_rw_data(output);
+        if yielded {
+            program.ecalli(crate::abi::hostcall::SUSPEND);
+        }
+        program
+            .load_imm_64(Reg::A0, key_at as u64)
+            .load_imm_64(Reg::A1, key.len() as u64)
+            .load_imm_64(Reg::A2, buffer as u64)
+            .load_imm_64(Reg::A3, 8)
+            .ecalli(crate::abi::hostcall::STORAGE_R)
+            .store_u64(Reg::A0, base + 14)
+            .load_imm_64(Reg::A0, buffer as u64)
+            .load_ind_u64(Reg::A1, Reg::A0, 0)
+            .store_u64(Reg::A1, base + 22)
+            .load_imm_64(Reg::A0, (base + 30) as u64)
+            .load_imm_64(Reg::A1, delta.len() as u64)
+            .ecalli(crate::abi::hostcall::ACTOR_EFFECT_EXPORT)
+            .load_imm_64(Reg::A0, base as u64)
+            .load_imm_64(Reg::A1, if yielded { 14 } else { 30 })
+            .jump_ind(Reg::RA, 0);
+        let bytes = program.build_standard();
+        let blob = work
+            .availability
+            .iter_mut()
+            .find(|blob| crate::agent_sdk::ProgramId::of_pvm(&blob.bytes) == work.program)
+            .unwrap();
+        work.program = crate::agent_sdk::ProgramId::of_pvm(&bytes);
+        *blob = crate::agent_sdk::RuntimeBlob {
+            reference: crate::agent_sdk::BlobRef::of_bytes(&bytes),
+            bytes,
+        };
+        work.availability
+            .sort_by(|a, b| a.reference.cmp(&b.reference));
+        work.gas = 100_000;
+        work.runtime_deployment = admitted.deployment();
+        let mut seed = runtime.snapshot();
+        rebind_external_test_runtime(&mut seed, admitted);
+        seed.actors[0].record.entry.program = crate::service::ProgramId(work.program.0);
+        let installation = &mut seed.clean_actor_installations.as_mut().unwrap()[0];
+        installation.original.entry.program = work.program;
+        installation.commitment = installation.original.lineage_commitment();
+        for entry in &mut seed.lane_state.linear {
+            entry.rows.clear();
+        }
+        seed.lane_state.linear[0]
+            .rows
+            .insert(key.to_vec(), vec![9; 8]);
+        let runtime = StandardAgentRuntime::restore(seed).unwrap();
+        let authorization = crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
+            clean_authority_receipt(runtime.config().unwrap(), &work),
+        );
+        crate::agent_sdk::RuntimeWork::Invoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+            state: legacy_state_to_clean(encode_standard_runtime_state(&runtime.snapshot())),
+            invocation: Box::new(work),
+            authorization: Box::new(authorization),
+            observed_slot: 1,
+        }
+    }
+
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    pub(crate) fn external_test_metadata_only(
+        state: &crate::agent_sdk::RuntimeState,
+    ) -> crate::agent_sdk::RuntimeState {
+        let mut decoded = decode_standard_runtime_state(&clean_state_to_legacy(state)).unwrap();
+        for entries in [
+            &mut decoded.lane_state.linear,
+            &mut decoded.lane_state.merge,
+            &mut decoded.lane_state.local,
+        ] {
+            for entry in entries {
+                entry.rows.clear();
+            }
+        }
+        legacy_state_to_clean(encode_standard_runtime_state(&decoded))
+    }
+
+    /// Native retained-result seed for physical ACK conformance, not evidence
+    /// of an external guest Invoke or authenticated journal genesis.
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    pub(crate) fn external_retirement_fixture(
+        admitted: &super::super::package_admission::AdmittedStateRuntimePackage,
+    ) -> (
+        crate::agent_sdk::RuntimeState,
+        crate::agent_sdk::InvocationRetirement,
+        crate::agent_sdk::InvocationAuthorization,
+    ) {
+        let (runtime, mut work) = clean_policy_fixture(
+            crate::agent_sdk::method_policy::AuthorizationPolicySelector::Public,
+        );
+        let mut seed = runtime.snapshot();
+        rebind_external_test_runtime(&mut seed, admitted);
+        let mut runtime = StandardAgentRuntime::restore(seed).unwrap();
+        work.runtime_deployment = admitted.deployment();
+        let authorization = crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
+            clean_authority_receipt(runtime.config().unwrap(), &work),
+        );
+        let (invocation, ..) = runtime.resolve_clean_invocation(&work).unwrap();
+        let before = runtime.prepare_execution_state(&invocation).unwrap();
+        let mut after = before.clone();
+        after.linear = Some(vec![0xa1]);
+        let mut reply = exact_reply(&invocation, ActorExecutionStatus::Done);
+        runtime
+            .commit_clean_execution(
+                &work,
+                &authorization,
+                &invocation,
+                &mut reply,
+                &before,
+                after,
+                1,
+                None,
+            )
+            .unwrap();
+        (
+            legacy_state_to_clean(encode_standard_runtime_state(&runtime.snapshot())),
+            crate::agent_sdk::InvocationRetirement::from_work(&work),
+            authorization,
+        )
+    }
+
     #[cfg(feature = "pvm")]
     fn clean_terminal_fixture_with_program_size(
         program_size: usize,
@@ -12170,6 +12981,391 @@ pub(crate) mod tests {
             )),
             observed_slot: 1,
         }
+    }
+
+    #[cfg(all(feature = "pvm", feature = "experimental-state-blocks"))]
+    #[test]
+    fn clean_external_storage_uses_installed_identity_schema_and_scope() {
+        use super::super::actor_storage::{ActorRowStorage, tests::TestBlocks};
+        use crate::agent_sdk::{
+            method_policy::{AttestationRequirement, AuthorizationPolicySelector},
+            state_blocks::{BlockRef, BlockScope, ReadBudget},
+            state_rows::ActorRows,
+            state_tree::{BlockReader, StateTree, TreeError, WriteBudget},
+        };
+        struct Observed {
+            reads: alloc::rc::Rc<core::cell::Cell<usize>>,
+            blocks: TestBlocks,
+        }
+        impl BlockReader for Observed {
+            fn read(&mut self, reference: BlockRef, bytes: &mut [u8]) -> Result<bool, TreeError> {
+                self.reads.set(self.reads.get() + 1);
+                self.blocks.read(reference, bytes)
+            }
+        }
+        let (mut runtime, work) = clean_policy_fixture_with_storage(
+            AuthorizationPolicySelector::Public,
+            AttestationRequirement::None,
+            true,
+        );
+        let (_, _, schema, _, _) = runtime.resolve_clean_invocation(&work).unwrap();
+        let scope = BlockScope::new(
+            work.space,
+            work.agent,
+            crate::agent_sdk::Hash([7; 32]),
+            crate::agent_sdk::StateLane::Linear,
+        )
+        .unwrap();
+        let mut blocks = TestBlocks::default();
+        let batch = ActorRows::new(StateTree::empty(scope), work.actor, work.incarnation)
+            .unwrap()
+            .update_accounted_batch(
+                &[(b"s/rows/value".to_vec(), Some(vec![9]))],
+                crate::agent_sdk::contract::ExternalStateResourceLimits {
+                    max_rows_per_lane: 100,
+                    max_row_bytes_per_lane: 100000,
+                },
+                &mut blocks,
+                &mut ReadBudget::new(100, 100000),
+                &mut WriteBudget::new(100, 100000),
+            )
+            .unwrap();
+        let tree = batch.update.tree;
+        for (reference, bytes) in batch.update.blocks {
+            blocks.blocks.insert(reference.hash().0, bytes);
+        }
+        let reads = alloc::rc::Rc::new(core::cell::Cell::new(0));
+        let lanes = |tree| {
+            [
+                Some((
+                    tree,
+                    Observed {
+                        reads: reads.clone(),
+                        blocks: blocks.clone(),
+                    },
+                )),
+                None,
+                None,
+            ]
+        };
+        for field in 0..8 {
+            let mut bad = work.clone();
+            match field {
+                0 => bad.space.0[0] ^= 1,
+                1 => bad.agent.0[0] ^= 1,
+                2 => bad.runtime_deployment.0[0] ^= 1,
+                3 => bad.actor.0[0] ^= 1,
+                4 => bad.incarnation.0[0] ^= 1,
+                5 => bad.deployment.0[0] ^= 1,
+                6 => bad.program.0[0] ^= 1,
+                _ => bad.mode = crate::agent_sdk::MethodMode::Query,
+            }
+            assert!(
+                runtime
+                    .resolve_clean_external_storage_reader(
+                        &bad,
+                        &schema,
+                        lanes(tree),
+                        &mut ReadBudget::new(100, 100000)
+                    )
+                    .is_err()
+            );
+        }
+        let mut bad_schema = schema.clone();
+        bad_schema.bytes.push(0);
+        assert!(
+            runtime
+                .resolve_clean_external_storage_reader(
+                    &work,
+                    &bad_schema,
+                    lanes(tree),
+                    &mut ReadBudget::new(100, 100000)
+                )
+                .is_err()
+        );
+        let alien = StateTree::empty(
+            BlockScope::new(
+                crate::agent_sdk::SpaceId([0xf1; 32]),
+                work.agent,
+                crate::agent_sdk::Hash([7; 32]),
+                crate::agent_sdk::StateLane::Linear,
+            )
+            .unwrap(),
+        );
+        assert!(
+            runtime
+                .resolve_clean_external_storage_reader(
+                    &work,
+                    &schema,
+                    lanes(alien),
+                    &mut ReadBudget::new(100, 100000)
+                )
+                .is_err()
+        );
+        assert_eq!(reads.get(), 0);
+        let mut budget = ReadBudget::new(100, 100000);
+        let reader = runtime
+            .resolve_clean_external_storage_reader(&work, &schema, lanes(tree), &mut budget)
+            .unwrap();
+        assert!(reader.read(b"undeclared/value").is_err());
+        assert_eq!(reads.get(), 0);
+        assert_eq!(
+            reader.read(b"s/rows/value").unwrap().as_deref(),
+            Some(&[9][..])
+        );
+        assert!(reads.get() > 0);
+        drop(reader);
+        assert!(!runtime.has_image_rows());
+        runtime
+            .commit_clean_row_batch(
+                &work,
+                &schema,
+                vec![],
+                vec![(b"s/rows/legacy".to_vec(), Some(vec![1]))],
+                |_| Ok(()),
+            )
+            .unwrap();
+        let before = reads.get();
+        assert!(runtime.has_image_rows());
+        assert!(
+            runtime
+                .resolve_clean_external_storage_reader(&work, &schema, lanes(tree), &mut budget)
+                .is_err()
+        );
+        assert_eq!(reads.get(), before);
+    }
+
+    #[cfg(all(feature = "pvm", feature = "experimental-state-blocks"))]
+    #[test]
+    fn clean_external_rows_metadata_and_exact_result_form_one_candidate() {
+        use super::super::actor_storage::tests::TestBlocks;
+        use crate::agent_sdk::MAX_RUNTIME_STATE_BYTES;
+        use crate::agent_sdk::{
+            method_policy::{AttestationRequirement, AuthorizationPolicySelector},
+            state_blocks::{BlockScope, ReadBudget},
+            state_metadata::{RuntimeMetadataUpdate, read_runtime_metadata},
+            state_rows::{ActorRows, RowUsage, lane_row_usage},
+            state_tree::{StateTree, WriteBudget},
+        };
+        let (pristine, work) = clean_policy_fixture_with_storage(
+            AuthorizationPolicySelector::Public,
+            AttestationRequirement::None,
+            true,
+        );
+        let (invocation, _, schema, _, _) = pristine.resolve_clean_invocation(&work).unwrap();
+        let authorization = crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
+            clean_authority_receipt(pristine.config().unwrap(), &work),
+        );
+        let before = pristine.prepare_execution_state(&invocation).unwrap();
+        let mut after = before.clone();
+        after.linear = Some(vec![0xa1]);
+        let encoded = encode_standard_runtime_state(&pristine.snapshot());
+        let scope = BlockScope::new(
+            work.space,
+            work.agent,
+            crate::agent_sdk::Hash([7; 32]),
+            crate::agent_sdk::StateLane::Linear,
+        )
+        .unwrap();
+        let limits = crate::agent_sdk::contract::ExternalStateResourceLimits {
+            max_rows_per_lane: 10,
+            max_row_bytes_per_lane: 100,
+        };
+        let mut blocks = TestBlocks::default();
+        let seed = ActorRows::new(StateTree::empty(scope), work.actor, work.incarnation)
+            .unwrap()
+            .update_accounted_with_metadata(
+                &[],
+                limits,
+                RuntimeMetadataUpdate::new(&encoded.linear, MAX_RUNTIME_STATE_BYTES).unwrap(),
+                &mut blocks,
+                (
+                    &mut ReadBudget::new(1000, 1000000),
+                    &mut WriteBudget::new(1000, 1000000),
+                ),
+            )
+            .unwrap();
+        let base = seed.update.tree;
+        for (reference, bytes) in seed.update.blocks {
+            blocks.blocks.insert(reference.hash().0, bytes);
+        }
+        let snapshot = blocks.blocks.clone();
+        let changes = vec![(b"s/rows/value".to_vec(), Some(vec![9]))];
+        let commit = |candidate: &mut StandardAgentRuntime| {
+            let mut reply = exact_reply(&invocation, ActorExecutionStatus::Done);
+            candidate.commit_clean_execution(
+                &work,
+                &authorization,
+                &invocation,
+                &mut reply,
+                &before,
+                after.clone(),
+                1,
+                None,
+            )?;
+            Ok(reply)
+        };
+        let (candidate, update, _) = pristine
+            .prepare_clean_external_row_batch(
+                &work,
+                &schema,
+                &changes,
+                limits,
+                [Some((base, blocks.clone())), None, None],
+                (
+                    &mut ReadBudget::new(1000, 1000000),
+                    &mut WriteBudget::new(1000, 1000000),
+                ),
+                &commit,
+            )
+            .unwrap();
+        assert_eq!(blocks.blocks, snapshot);
+        assert_eq!(encode_standard_runtime_state(&pristine.snapshot()), encoded);
+        let context = crate::agent_sdk::state_root::RootContext::new(
+            scope,
+            crate::agent_sdk::Hash([8; 32]),
+            crate::agent_sdk::Hash([9; 32]),
+        )
+        .unwrap();
+        let descriptor =
+            crate::agent_sdk::state_root::StateRootDescriptor::new(context, base.root());
+        let tree = update.tree;
+        let change = crate::agent_sdk::state_change::StateChange::from_update(
+            descriptor.commitment(),
+            context,
+            update,
+        )
+        .unwrap();
+        change
+            .verify_reuse(
+                descriptor,
+                context,
+                &mut blocks,
+                &mut ReadBudget::new(1000, 1000000),
+            )
+            .unwrap();
+        for (reference, bytes) in change.blocks() {
+            blocks.blocks.insert(reference.hash().0, bytes.clone());
+        }
+        let metadata = read_runtime_metadata(
+            tree,
+            MAX_RUNTIME_STATE_BYTES,
+            &mut blocks,
+            &mut ReadBudget::new(1000, 1000000),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            metadata,
+            encode_standard_runtime_state(&candidate.snapshot()).linear
+        );
+        let mut restored = encoded.clone();
+        restored.linear = metadata;
+        let mut reopened =
+            StandardAgentRuntime::restore(decode_standard_runtime_state(&restored).unwrap())
+                .unwrap();
+        assert_eq!(reopened.snapshot(), candidate.snapshot());
+        assert!(
+            reopened
+                .recover_clean_execution(&work, &authorization, 1)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            lane_row_usage(tree, &mut blocks, &mut ReadBudget::new(1000, 1000000)).unwrap(),
+            RowUsage { rows: 1, bytes: 13 }
+        );
+        assert_eq!(
+            ActorRows::new(tree, work.actor, work.incarnation)
+                .unwrap()
+                .get(
+                    b"s/rows/value",
+                    &mut blocks,
+                    &mut ReadBudget::new(1000, 1000000)
+                )
+                .unwrap(),
+            Some(vec![9])
+        );
+        for late in [false, true] {
+            assert!(
+                pristine
+                    .prepare_clean_external_row_batch(
+                        &work,
+                        &schema,
+                        &changes,
+                        limits,
+                        [Some((base, blocks.clone())), None, None],
+                        (
+                            &mut ReadBudget::new(1000, 1000000),
+                            &mut WriteBudget::new(0, 0)
+                        ),
+                        |candidate| {
+                            let reply = commit(candidate)?;
+                            if late {
+                                Err(ActorExecutionError::ResultCapacity)
+                            } else {
+                                Ok(reply)
+                            }
+                        },
+                    )
+                    .is_err()
+            );
+            assert_eq!(encode_standard_runtime_state(&pristine.snapshot()), encoded);
+        }
+        let wrong = ActorRows::new(StateTree::empty(scope), work.actor, work.incarnation)
+            .unwrap()
+            .update_accounted_with_metadata(
+                &[],
+                limits,
+                RuntimeMetadataUpdate::new(b"other runtime metadata", MAX_RUNTIME_STATE_BYTES)
+                    .unwrap(),
+                &mut blocks,
+                (
+                    &mut ReadBudget::new(1000, 1000000),
+                    &mut WriteBudget::new(1000, 1000000),
+                ),
+            )
+            .unwrap();
+        let wrong_tree = wrong.update.tree;
+        for (reference, bytes) in wrong.update.blocks {
+            blocks.blocks.insert(reference.hash().0, bytes);
+        }
+        assert!(
+            pristine
+                .prepare_clean_external_row_batch(
+                    &work,
+                    &schema,
+                    &changes,
+                    limits,
+                    [Some((wrong_tree, blocks.clone())), None, None],
+                    (
+                        &mut ReadBudget::new(1000, 1000000),
+                        &mut WriteBudget::new(1000, 1000000)
+                    ),
+                    |_| -> Result<(), ActorExecutionError> {
+                        panic!("mismatched metadata reached commit")
+                    },
+                )
+                .is_err()
+        );
+        assert!(
+            pristine
+                .prepare_clean_external_row_batch(
+                    &work,
+                    &schema,
+                    &[(b"undeclared/row".to_vec(), None)],
+                    limits,
+                    [Some((base, blocks)), None, None],
+                    (
+                        &mut ReadBudget::new(1000, 1000000),
+                        &mut WriteBudget::new(1000, 1000000)
+                    ),
+                    |_| -> Result<(), ActorExecutionError> {
+                        panic!("unauthorized namespace reached commit")
+                    },
+                )
+                .is_err()
+        );
     }
 
     #[cfg(feature = "pvm")]

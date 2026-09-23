@@ -123,6 +123,7 @@ pub(crate) fn root_signed_agent_runtime_package(
     let mut envelope = PackageEnvelope {
         manifest: PackageManifest::AgentRuntime(AgentRuntimePackageManifest {
             name: BUNDLED_AGENT_RUNTIME_PACKAGE_NAME.into(),
+            external_state_limits: None,
             outer_program: outer_program.clone(),
             contract: RuntimePackageContract::canonical(),
             capabilities: RuntimeCapabilities::standard(),

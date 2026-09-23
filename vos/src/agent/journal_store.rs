@@ -69,9 +69,9 @@ use super::journal::{
 #[cfg(test)]
 use super::replay::ReplayTransitionProofTestAction;
 use super::replay::{
-    ReplayPosition, ReplayPublicationAnchor, ReplayPublicationMode, ReplaySealedGenesis,
-    ReplaySealedLocalGenesis, ReplaySealedOrdinaryGenesis, ReplaySealedPublication,
-    ReplaySealedSharedMergeProjection, ReplaySystemAuthorityStoragePlan,
+    ExternalCheckpointValidation, ReplayPosition, ReplayPublicationAnchor, ReplayPublicationMode,
+    ReplaySealedGenesis, ReplaySealedLocalGenesis, ReplaySealedOrdinaryGenesis,
+    ReplaySealedPublication, ReplaySealedSharedMergeProjection, ReplaySystemAuthorityStoragePlan,
     ReplayTransitionProofAction, ReplayTransitionProofIntent, ReplayTransitionProofLifecycle,
     ReplayTransitionProofProjection, ReplayTransitionProofProjectionAction,
     ReplayedRootJournalIdentity,
@@ -781,6 +781,10 @@ pub enum JournalBlobClass {
     /// Canonical RuntimeWork/RuntimeTransition, APR4/APM1, and bounded public
     /// proof chunks reachable only through a heads-authenticated proof index.
     TransitionProof,
+    /// Experimental scoped state-block envelopes. Staging alone is not
+    /// publication; audited checkpoint roots admit their GC reachability.
+    #[cfg(feature = "experimental-state-blocks")]
+    StateBlock,
 }
 
 fn blob_maximum(class: JournalBlobClass) -> usize {
@@ -788,6 +792,10 @@ fn blob_maximum(class: JournalBlobClass) -> usize {
         JournalBlobClass::LaneState => MAX_RUNTIME_STATE_BYTES,
         JournalBlobClass::CatalogArtifact => MAX_ARTIFACT_CLOSURE_BYTES,
         JournalBlobClass::TransitionProof => super::MAX_CATALOG_ARTIFACT_BYTES as usize,
+        #[cfg(feature = "experimental-state-blocks")]
+        JournalBlobClass::StateBlock => {
+            crate::agent_sdk::state_blocks::MAX_STATE_BLOCK_ENVELOPE_BYTES
+        }
     }
 }
 
@@ -998,6 +1006,24 @@ pub(crate) struct UnpublishedCatalogBlob {
     store: JournalStoreInstanceId,
     predecessor: JournalHeadsId,
     reference: BlobRef,
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+pub(crate) trait AuditedCheckpointStore: AgentJournalStore {
+    fn publish_audited_checkpoint(
+        &mut self,
+        publication: &ReplaySealedPublication,
+        availability: &ExternalCheckpointValidation<'_>,
+    ) -> Result<JournalPublication, JournalStoreError>;
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+pub(crate) trait ExternalMutationStore: AgentJournalStore {
+    fn publish_external_mutation(
+        &mut self,
+        publication: &ReplaySealedPublication,
+        availability: &ExternalCheckpointValidation<'_>,
+    ) -> Result<JournalPublication, JournalStoreError>;
 }
 
 /// Crate-private staging transaction used by the Local lifecycle driver.
@@ -1871,6 +1897,8 @@ fn decode_journal_blob_class(tag: u8) -> Result<JournalBlobClass, DecodeError> {
         0 => Ok(JournalBlobClass::LaneState),
         1 => Ok(JournalBlobClass::CatalogArtifact),
         2 => Ok(JournalBlobClass::TransitionProof),
+        #[cfg(feature = "experimental-state-blocks")]
+        3 => Ok(JournalBlobClass::StateBlock),
         _ => Err(DecodeError::InvalidTag),
     }
 }
@@ -2684,14 +2712,51 @@ fn validate_sealed_ordinary_genesis_shape<T: ReplaySealedOrdinaryGenesis>(
 
     let initial = sealed.initial_heads();
     encode_object(&initial)?;
-    if initial
-        != JournalHeads::initial(
+    let mut expected_initial = JournalHeads::initial(
+        genesis.id(),
+        genesis.admission,
+        node,
+        sealed.empty_frontier().id(),
+        genesis.runtime().clone(),
+    );
+    if let Some(checkpoint) = sealed.genesis_checkpoint() {
+        let expected_checkpoint = super::replay::derive_checkpoint::<
+            core::convert::Infallible,
+            core::convert::Infallible,
+        >(
             genesis.id(),
             genesis.admission,
-            node,
-            sealed.empty_frontier().id(),
             genesis.runtime().clone(),
+            0,
+            OrderedBase::post_genesis(),
+            expected_initial.merge_frontier,
+            expected_initial.merge_fence,
+            None,
+            expected_initial.ordered_invocations,
+            expected_initial.merge_invocations,
+            expected_initial.transition_proofs,
+            lanes
+                .iter()
+                .map(|lane| super::journal::CheckpointLane {
+                    lane: lane.lane,
+                    node: (lane.lane == PersistedLane::Local).then_some(node),
+                    state: lane.id(),
+                    invocations: (lane.lane == PersistedLane::Local)
+                        .then_some(local_invocations.id()),
+                })
+                .collect(),
+            artifacts.id(),
+            super::replay::clean_create_management_evidence(&genesis.create),
         )
+        .map_err(|_| JournalStoreError::NonCanonical)?;
+        if checkpoint != expected_checkpoint {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        expected_initial.previous = Some(expected_initial.id());
+        expected_initial.publication_revision = 1;
+        expected_initial.checkpoint = Some(checkpoint.id());
+    }
+    if initial != expected_initial
         || initial.ordered_invocations != sealed.ordered_invocations().id()
         || initial.merge_invocations != sealed.merge_invocations().id()
         || initial.local_invocations != local_invocations.id()
@@ -2748,6 +2813,21 @@ fn require_blob<S: AgentJournalStore>(
 }
 
 fn validate_lane_state<S: AgentJournalStore>(
+    store: &S,
+    id: super::journal::LaneStateId,
+) -> Result<LaneStateManifest, JournalStoreError> {
+    let manifest = validate_lane_state_record(store, id)?;
+    // Do not substitute a whole-tree audit on the publication fast path.
+    // External roots need incremental replay-sealed availability before they
+    // can be admitted here. GC's explicit maintenance traversal is separate.
+    #[cfg(feature = "experimental-state-blocks")]
+    if manifest.external_root.is_some() {
+        return Err(JournalStoreError::Unavailable);
+    }
+    Ok(manifest)
+}
+
+fn validate_lane_state_record<S: AgentJournalStore>(
     store: &S,
     id: super::journal::LaneStateId,
 ) -> Result<LaneStateManifest, JournalStoreError> {
@@ -5176,6 +5256,15 @@ fn validate_checkpoint_closure<S: AgentJournalStore>(
     store: &S,
     checkpoint: &CheckpointManifest,
 ) -> Result<(), JournalStoreError> {
+    validate_checkpoint_closure_with_availability(store, checkpoint, None)
+}
+
+fn validate_checkpoint_closure_with_availability<S: AgentJournalStore>(
+    store: &S,
+    checkpoint: &CheckpointManifest,
+    availability: Option<&ExternalCheckpointValidation<'_>>,
+) -> Result<(), JournalStoreError> {
+    let _ = availability;
     let genesis = store.genesis()?.ok_or(JournalStoreError::NotInitialized)?;
     if genesis.id() != checkpoint.genesis
         || genesis.admission != checkpoint.admission
@@ -5207,6 +5296,8 @@ fn validate_checkpoint_closure<S: AgentJournalStore>(
         checkpoint.genesis,
         checkpoint.merge_fence,
         checkpoint.merge_seal,
+        Some(checkpoint.id()),
+        availability,
     )?;
     let closure = require_record::<S, ArtifactClosure>(store, checkpoint.artifacts)?;
     if closure.genesis != checkpoint.genesis
@@ -5238,7 +5329,18 @@ fn validate_checkpoint_closure<S: AgentJournalStore>(
         return Err(JournalStoreError::Corrupt);
     }
     for lane in &checkpoint.lanes {
-        let manifest = validate_lane_state(store, lane.state)?;
+        let manifest = {
+            #[cfg(feature = "experimental-state-blocks")]
+            if availability.is_some_and(|proof| {
+                proof.permits_lane(store.instance_id(), checkpoint.id(), lane.state)
+            }) {
+                validate_lane_state_record(store, lane.state)?
+            } else {
+                validate_lane_state(store, lane.state)?
+            }
+            #[cfg(not(feature = "experimental-state-blocks"))]
+            validate_lane_state(store, lane.state)?
+        };
         if manifest.genesis != checkpoint.genesis
             || manifest.runtime != checkpoint.runtime
             || manifest.lane != lane.lane
@@ -5270,11 +5372,28 @@ fn validate_checkpoint_closure<S: AgentJournalStore>(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_checkpoint_publication<S: AgentJournalStore>(
     store: &S,
     current: &JournalHeads,
     next_transition_proofs: TransitionProofIndexId,
     checkpoint: &CheckpointManifest,
+) -> Result<(), JournalStoreError> {
+    validate_checkpoint_publication_with_availability(
+        store,
+        current,
+        next_transition_proofs,
+        checkpoint,
+        None,
+    )
+}
+
+fn validate_checkpoint_publication_with_availability<S: AgentJournalStore>(
+    store: &S,
+    current: &JournalHeads,
+    next_transition_proofs: TransitionProofIndexId,
+    checkpoint: &CheckpointManifest,
+    availability: Option<&ExternalCheckpointValidation<'_>>,
 ) -> Result<(), JournalStoreError> {
     if checkpoint.runtime != current.runtime
         || checkpoint.ordered_invocations != current.ordered_invocations
@@ -5304,7 +5423,7 @@ fn validate_checkpoint_publication<S: AgentJournalStore>(
     {
         return Err(JournalStoreError::NonCanonical);
     }
-    validate_checkpoint_closure(store, checkpoint)?;
+    validate_checkpoint_closure_with_availability(store, checkpoint, availability)?;
     Ok(())
 }
 
@@ -5323,6 +5442,14 @@ pub(crate) fn validate_gc_limits(limits: GcLimits) -> Result<(), JournalStoreErr
 fn fresh_gc_checkpoint<S: AgentJournalStore>(
     store: &S,
     expected_heads: JournalHeadsId,
+) -> Result<(JournalHeads, CheckpointManifest), JournalStoreError> {
+    fresh_gc_checkpoint_with_availability(store, expected_heads, None)
+}
+
+fn fresh_gc_checkpoint_with_availability<S: AgentJournalStore>(
+    store: &S,
+    expected_heads: JournalHeadsId,
+    availability: Option<&ExternalCheckpointValidation<'_>>,
 ) -> Result<(JournalHeads, CheckpointManifest), JournalStoreError> {
     let heads = store.heads()?.ok_or(JournalStoreError::NotInitialized)?;
     if heads.id() != expected_heads {
@@ -5395,8 +5522,8 @@ fn fresh_gc_checkpoint<S: AgentJournalStore>(
             return Err(JournalStoreError::Conflict);
         }
     }
-    validate_checkpoint_closure(store, &checkpoint)?;
-    validate_head_targets(store, &heads)?;
+    validate_checkpoint_closure_with_availability(store, &checkpoint, availability)?;
+    validate_head_targets_with_availability(store, &heads, availability)?;
     Ok((heads, checkpoint))
 }
 
@@ -5464,11 +5591,102 @@ fn mark_lane_state<S: AgentJournalStore>(
     mark: &mut GcMark,
     id: LaneStateId,
 ) -> Result<LaneStateManifest, JournalStoreError> {
-    let state = validate_lane_state(store, id)?;
+    let state = validate_lane_state_record(store, id)?;
+    #[cfg(feature = "experimental-state-blocks")]
+    if let Some(root) = &state.external_root {
+        mark_external_state_root(store, mark, &state, root)?;
+        mark_catalog_blob(store, mark, &root.runtime.package)?;
+    }
     mark.object::<LaneStateManifest>(id)?;
     mark.blob(JournalBlobClass::LaneState, &state.state)?;
     mark_catalog_blob(store, mark, &state.runtime.package)?;
     Ok(state)
+}
+
+/// Maintenance-only closure traversal. Normal publication must establish
+/// incremental availability, not pay for this audit on every request.
+#[cfg(feature = "experimental-state-blocks")]
+fn mark_external_state_root<S: AgentJournalStore>(
+    store: &S,
+    mark: &mut GcMark,
+    manifest: &LaneStateManifest,
+    provenance: &super::journal::ExternalStateRoot,
+) -> Result<(), JournalStoreError> {
+    use super::state_block_store::{JournalBlockReader, journal_root_context};
+    use crate::agent_sdk::{
+        state_blocks::{BlockError, BlockRef, MAX_STATE_BLOCK_BYTES, ReadBudget},
+        state_tree::{BlockReader, TreeError},
+    };
+    let genesis = store.genesis()?.ok_or(JournalStoreError::NotInitialized)?;
+    if manifest.genesis != genesis.id() {
+        return Err(JournalStoreError::ScopeMismatch);
+    }
+    let node = match manifest.cursor {
+        LaneCursor::Local { node, .. } => Some(node),
+        _ => None,
+    };
+    let context = journal_root_context(
+        &genesis,
+        &provenance.runtime,
+        manifest.lane,
+        node,
+        &provenance.cursor,
+    )
+    .map_err(|_| JournalStoreError::ScopeMismatch)?;
+    let root = provenance.descriptor;
+    if root.context() != context {
+        return Err(JournalStoreError::ScopeMismatch);
+    }
+    // The descriptor commitment is selected by this content-identified lane
+    // manifest, not by bytes encountered during traversal.
+    let tree = root
+        .bind(context, root.commitment())
+        .map_err(|_| JournalStoreError::Corrupt)?;
+    // One node can reference at most 16 value chunks. Count repeated chunk
+    // visits too, while marking unique blobs only once. The graph traversal's
+    // own bounded frontier and these work limits prevent unbounded auditing.
+    let visits = mark
+        .max_blobs
+        .checked_mul(17)
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or(JournalStoreError::LimitExceeded)?;
+    let mut budget = ReadBudget::new(visits, u64::from(visits) * MAX_STATE_BLOCK_BYTES as u64);
+    struct MarkingReader<'a, S> {
+        inner: JournalBlockReader<'a, S>,
+        mark: &'a mut GcMark,
+        failure: Option<JournalStoreError>,
+    }
+    impl<S: AgentJournalStore> BlockReader for MarkingReader<'_, S> {
+        fn read(&mut self, reference: BlockRef, output: &mut [u8]) -> Result<bool, TreeError> {
+            let sdk = reference.storage_reference();
+            let blob = BlobRef {
+                hash: Hash(sdk.hash.0),
+                len: sdk.len,
+            };
+            if let Err(error) = self.mark.blob(JournalBlobClass::StateBlock, &blob) {
+                self.failure = Some(error);
+                return Err(TreeError::Storage);
+            }
+            self.inner.read(reference, output)
+        }
+    }
+    let mut reader = MarkingReader {
+        inner: JournalBlockReader {
+            store,
+            scope: context.scope(),
+        },
+        mark,
+        failure: None,
+    };
+    tree.audit(&mut reader, &mut budget).map_err(|error| {
+        reader.failure.unwrap_or(match error {
+            TreeError::Block(BlockError::BudgetExceeded) => JournalStoreError::LimitExceeded,
+            TreeError::Block(BlockError::Unavailable) => JournalStoreError::MissingObject,
+            TreeError::Storage => JournalStoreError::Unavailable,
+            _ => JournalStoreError::Corrupt,
+        })
+    })?;
+    Ok(())
 }
 
 fn mark_merge_frontier_tips<S: AgentJournalStore>(
@@ -5594,8 +5812,18 @@ fn build_gc_mark<S: AgentJournalStore>(
     expected_heads: JournalHeadsId,
     limits: GcLimits,
 ) -> Result<(GcIntent, GcMark), JournalStoreError> {
+    build_gc_mark_with_availability(store, expected_heads, limits, None)
+}
+
+fn build_gc_mark_with_availability<S: AgentJournalStore>(
+    store: &S,
+    expected_heads: JournalHeadsId,
+    limits: GcLimits,
+    availability: Option<&ExternalCheckpointValidation<'_>>,
+) -> Result<(GcIntent, GcMark), JournalStoreError> {
     validate_gc_limits(limits)?;
-    let (heads, checkpoint) = fresh_gc_checkpoint(store, expected_heads)?;
+    let (heads, checkpoint) =
+        fresh_gc_checkpoint_with_availability(store, expected_heads, availability)?;
     let mut mark = GcMark::new(limits);
     mark.object::<CheckpointManifest>(checkpoint.id())?;
 
@@ -6389,6 +6617,8 @@ fn validate_merge_fence_structure<S: AgentJournalStore>(
     genesis: super::journal::AgentJournalGenesisId,
     fence: OrderedBase,
     seal_id: Option<super::journal::MergeSealId>,
+    checkpoint: Option<CheckpointId>,
+    availability: Option<&ExternalCheckpointValidation<'_>>,
 ) -> Result<(), JournalStoreError> {
     if fence == OrderedBase::post_genesis() {
         return if seal_id.is_none() {
@@ -6420,7 +6650,28 @@ fn validate_merge_fence_structure<S: AgentJournalStore>(
     }
     let sealed_tips = frontier.events.iter().copied().collect::<BTreeSet<_>>();
     validate_frontier(store, &frontier, &sealed_tips)?;
-    let state = validate_lane_state(store, seal.merge_state)?;
+    let state = if availability
+        .zip(checkpoint)
+        .is_some_and(|(proof, checkpoint)| {
+            proof.permits_lane(store.instance_id(), checkpoint, seal.merge_state)
+        }) {
+        validate_lane_state_record(store, seal.merge_state)?
+    } else {
+        validate_lane_state(store, seal.merge_state)?
+    };
+    #[cfg(feature = "experimental-state-blocks")]
+    if state.external_root.is_some()
+        && (!frontier.events.is_empty()
+            || !matches!(
+                fence_entry.input.operation,
+                ReplayOperation::CleanManage {
+                    request: crate::agent_sdk::ManagementRequest::Install(_),
+                    ..
+                }
+            ))
+    {
+        return Err(JournalStoreError::Unavailable);
+    }
     if state.genesis != genesis
         || state.lane != PersistedLane::Merge
         || !matches!(
@@ -6437,6 +6688,17 @@ fn validate_head_targets<S: AgentJournalStore>(
     store: &S,
     heads: &JournalHeads,
 ) -> Result<(), JournalStoreError> {
+    validate_head_targets_with_availability(store, heads, None)
+}
+
+pub(crate) fn validate_head_targets_with_availability<S: AgentJournalStore>(
+    store: &S,
+    heads: &JournalHeads,
+    availability: Option<&ExternalCheckpointValidation<'_>>,
+) -> Result<(), JournalStoreError> {
+    if availability.is_some_and(|proof| !proof.matches_heads(store.instance_id(), heads)) {
+        return Err(JournalStoreError::Conflict);
+    }
     let genesis = store.genesis()?.ok_or(JournalStoreError::NotInitialized)?;
     if genesis.id() != heads.genesis
         || genesis.admission != heads.admission
@@ -6485,7 +6747,14 @@ fn validate_head_targets<S: AgentJournalStore>(
         }
     }
 
-    validate_merge_fence_structure(store, heads.genesis, heads.merge_fence, heads.merge_seal)?;
+    validate_merge_fence_structure(
+        store,
+        heads.genesis,
+        heads.merge_fence,
+        heads.merge_seal,
+        heads.checkpoint,
+        availability,
+    )?;
     if let Some(id) = heads.ordered_head {
         let entry = require_record::<S, OrderedEntry>(store, id)?;
         if entry.genesis != heads.genesis || entry.index != heads.ordered_index {
@@ -6509,7 +6778,7 @@ fn validate_head_targets<S: AgentJournalStore>(
             {
                 return Err(JournalStoreError::Corrupt);
             }
-            validate_checkpoint_closure(store, &checkpoint)?;
+            validate_checkpoint_closure_with_availability(store, &checkpoint, availability)?;
             let local = checkpoint
                 .lanes
                 .iter()
@@ -6587,16 +6856,23 @@ fn validate_head_targets<S: AgentJournalStore>(
     Ok(())
 }
 
-fn validate_anchor_dependencies<S, R>(
+fn validate_anchor_dependencies_with_availability<S, R>(
     store: &S,
     current: &JournalHeads,
     anchor: &R,
     next: &JournalHeads,
+    availability: Option<&ExternalCheckpointValidation<'_>>,
 ) -> Result<(), JournalStoreError>
 where
     S: AgentJournalStore,
     R: CanonicalJournalRecord,
 {
+    if availability.is_some_and(|proof| {
+        !proof.matches_heads(store.instance_id(), current)
+            || !proof.matches_heads(store.instance_id(), next)
+    }) {
+        return Err(JournalStoreError::Conflict);
+    }
     if R::STORAGE_CLASS == JournalStorageClass::MergeEvent {
         let event = decode_anchor::<MergeEvent, _>(anchor)?;
         if event.ordered_base.index < current.merge_fence.index
@@ -6633,7 +6909,13 @@ where
         }
     } else if R::STORAGE_CLASS == JournalStorageClass::Checkpoint {
         let checkpoint = decode_anchor::<CheckpointManifest, _>(anchor)?;
-        validate_checkpoint_publication(store, current, next.transition_proofs, &checkpoint)?;
+        validate_checkpoint_publication_with_availability(
+            store,
+            current,
+            next.transition_proofs,
+            &checkpoint,
+            availability,
+        )?;
     }
     Ok(())
 }
@@ -7709,6 +7991,84 @@ impl MemoryAgentJournalStore {
         self.initialize_ordinary(sealed)
     }
 
+    /// Experimental Local bootstrap. Build and validate the entire candidate
+    /// before exposing any genesis/head; ordinary initialization stays closed.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn initialize_external_local(
+        &mut self,
+        sealed: &super::replay::ReplaySealedExternalLocalGenesis,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<bool, JournalStoreError> {
+        self.ensure_no_gc_pending()?;
+        let genesis = sealed.genesis();
+        let heads = sealed
+            .initial_heads()
+            .map_err(|_| JournalStoreError::NonCanonical)?;
+        if genesis.runtime().agent != self.agent
+            || heads.node != self.node
+            || self.replayed_root.is_some()
+        {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        let encoded = encode_object(genesis)?;
+        let encoded_heads = encode_object(&heads)?;
+        for artifact in &sealed.artifacts().artifacts {
+            require_blob(self, JournalBlobClass::CatalogArtifact, artifact)?;
+        }
+        if self
+            .genesis_admission
+            .is_some_and(|id| id != genesis.admission.as_hash())
+            || self
+                .genesis
+                .as_ref()
+                .is_some_and(|bytes| bytes != &encoded.bytes)
+            || self
+                .heads
+                .as_ref()
+                .is_some_and(|bytes| bytes != &encoded_heads.bytes)
+        {
+            return Err(JournalStoreError::Conflict);
+        }
+        let created = self.genesis.is_none() || self.heads.is_none();
+        let mut candidate = self.candidate_clone();
+        sealed.with_staged_roots(&mut candidate, budget, |candidate, availability| {
+            candidate.put(sealed.empty_frontier())?;
+            candidate.put(sealed.ordered_invocations())?;
+            candidate.put(sealed.merge_invocations())?;
+            candidate.put(sealed.local_invocations())?;
+            candidate.put(sealed.artifacts())?;
+            for lane in [
+                PersistedLane::Control,
+                PersistedLane::Linear,
+                PersistedLane::Merge,
+                PersistedLane::Local,
+            ] {
+                let manifest = sealed.lane_manifest(lane);
+                candidate.put_blob(
+                    JournalBlobClass::LaneState,
+                    &manifest.state,
+                    genesis_state_component(sealed.post_create(), lane),
+                )?;
+                candidate.put(&manifest)?;
+            }
+            candidate.put(
+                &sealed
+                    .initial_checkpoint()
+                    .map_err(|_| JournalStoreError::NonCanonical)?,
+            )?;
+            candidate.genesis_admission = Some(genesis.admission.as_hash());
+            candidate.genesis = Some(encoded.bytes);
+            persist_initial_transition_proof_index(candidate, &heads)?;
+            candidate.persist_historical_heads(&sealed.initial_predecessor_heads())?;
+            candidate.heads = Some(encoded_heads.bytes);
+            candidate.history_retirements =
+                Some(HistoryRetirementQueue::empty(genesis.id(), self.node));
+            validate_head_targets_with_availability(candidate, &heads, Some(availability))
+        })?;
+        *self = candidate;
+        Ok(created)
+    }
+
     pub(crate) fn install_portable_checkpoint(
         &mut self,
         image: &PortableJournalCheckpoint,
@@ -7770,6 +8130,25 @@ impl MemoryAgentJournalStore {
         self.objects
             .remove(&(JournalStorageClass::TransitionProofIndex, *id.as_bytes()))
             .is_some()
+    }
+
+    #[cfg(all(test, feature = "experimental-state-blocks"))]
+    pub(crate) fn replace_heads_for_external_fixture(&mut self, heads: &JournalHeads) {
+        heads.validate().unwrap();
+        assert_eq!(heads.runtime.agent, self.agent);
+        assert_eq!(heads.node, self.node);
+        self.heads = Some(heads.encode());
+    }
+
+    #[cfg(all(test, feature = "experimental-state-blocks"))]
+    pub(crate) fn remove_state_block_for_test(
+        &mut self,
+        reference: crate::agent_sdk::state_blocks::BlockRef,
+    ) -> Option<Vec<u8>> {
+        Arc::make_mut(&mut self.blobs).remove(&(
+            JournalBlobClass::StateBlock,
+            Hash(reference.storage_reference().hash.0),
+        ))
     }
 
     fn copy_with_instance(&self, instance_id: JournalStoreInstanceId) -> Self {
@@ -7989,6 +8368,25 @@ impl MemoryAgentJournalStore {
         mode: ReplayPublicationMode,
         transition_proof_change: bool,
     ) -> Result<JournalPublication, JournalStoreError> {
+        self.publish_anchor_with_availability(
+            expected,
+            anchor,
+            next,
+            mode,
+            transition_proof_change,
+            None,
+        )
+    }
+
+    fn publish_anchor_with_availability<R: CanonicalJournalRecord>(
+        &mut self,
+        expected: JournalHeadsId,
+        anchor: &R,
+        next: &JournalHeads,
+        mode: ReplayPublicationMode,
+        transition_proof_change: bool,
+        availability: Option<&ExternalCheckpointValidation<'_>>,
+    ) -> Result<JournalPublication, JournalStoreError> {
         self.ensure_no_gc_pending()?;
         ensure_publication_class(R::STORAGE_CLASS)?;
         let encoded_anchor = encode_object(anchor)?;
@@ -8003,7 +8401,7 @@ impl MemoryAgentJournalStore {
             if existing != &encoded_anchor.bytes {
                 return Err(JournalStoreError::Corrupt);
             }
-            validate_head_targets(self, &current)?;
+            validate_head_targets_with_availability(self, &current, availability)?;
             validate_idempotent_anchor(self, &current, anchor)?;
             let predecessor = next.previous.ok_or(JournalStoreError::Corrupt)?;
             if predecessor != expected
@@ -8023,7 +8421,7 @@ impl MemoryAgentJournalStore {
         if current.id() != expected {
             return Err(JournalStoreError::Conflict);
         }
-        validate_head_targets(self, &current)?;
+        validate_head_targets_with_availability(self, &current, availability)?;
         current
             .validate_successor(next)
             .map_err(supplied_decode_error)?;
@@ -8040,8 +8438,14 @@ impl MemoryAgentJournalStore {
         let mut candidate = self.candidate_clone();
         let snapshot_created = candidate.persist_historical_heads(&current)?;
         let object_created = candidate.put(anchor)? || snapshot_created;
-        validate_anchor_dependencies(&candidate, &current, anchor, next)?;
-        validate_head_targets(&candidate, next)?;
+        validate_anchor_dependencies_with_availability(
+            &candidate,
+            &current,
+            anchor,
+            next,
+            availability,
+        )?;
+        validate_head_targets_with_availability(&candidate, next, availability)?;
         candidate.heads = Some(encoded_next.bytes);
         *self = candidate;
         Ok(JournalPublication {
@@ -8070,6 +8474,22 @@ impl MemoryAgentJournalStore {
         publication: &ReplaySealedPublication,
         authority: Option<&ReplaySystemAuthorityStoragePlan>,
     ) -> Result<JournalPublication, JournalStoreError> {
+        self.publish_sealed_with_availability(publication, authority, None)
+    }
+
+    fn publish_sealed_with_availability(
+        &mut self,
+        publication: &ReplaySealedPublication,
+        authority: Option<&ReplaySystemAuthorityStoragePlan>,
+        availability: Option<&ExternalCheckpointValidation<'_>>,
+    ) -> Result<JournalPublication, JournalStoreError> {
+        #[cfg(feature = "experimental-state-blocks")]
+        if publication.external_execution().is_some()
+            && !availability
+                .is_some_and(|proof| proof.permits_mutation(self.instance_id(), publication))
+        {
+            return Err(JournalStoreError::Unavailable);
+        }
         match (publication.system_authority_write(), authority) {
             (None, None) | (Some(_), Some(_)) => {}
             _ => return Err(JournalStoreError::NonCanonical),
@@ -8121,19 +8541,21 @@ impl MemoryAgentJournalStore {
         let dependency_created = stage_sealed_dependencies(&mut candidate, publication)?;
         let transition_proof_change = publication.transition_proof_batch().is_some();
         let mut result = match publication.anchor() {
-            ReplayPublicationAnchor::Ordered(entry) => candidate.publish_anchor_with_mode(
+            ReplayPublicationAnchor::Ordered(entry) => candidate.publish_anchor_with_availability(
                 expected,
                 entry,
                 next,
                 publication.mode(),
                 transition_proof_change,
+                availability,
             )?,
-            ReplayPublicationAnchor::Local(entry) => candidate.publish_anchor_with_mode(
+            ReplayPublicationAnchor::Local(entry) => candidate.publish_anchor_with_availability(
                 expected,
                 entry,
                 next,
                 publication.mode(),
                 transition_proof_change,
+                availability,
             )?,
             ReplayPublicationAnchor::Merge { event, .. } => candidate.publish_anchor_with_mode(
                 expected,
@@ -8142,13 +8564,15 @@ impl MemoryAgentJournalStore {
                 publication.mode(),
                 transition_proof_change,
             )?,
-            ReplayPublicationAnchor::Checkpoint(checkpoint) => candidate.publish_anchor_with_mode(
-                expected,
-                checkpoint,
-                next,
-                publication.mode(),
-                transition_proof_change,
-            )?,
+            ReplayPublicationAnchor::Checkpoint(checkpoint) => candidate
+                .publish_anchor_with_availability(
+                    expected,
+                    checkpoint,
+                    next,
+                    publication.mode(),
+                    transition_proof_change,
+                    availability,
+                )?,
         };
         if result.heads_advanced
             && let Some(overlay) = &overlay
@@ -8238,6 +8662,9 @@ impl MemoryAgentJournalStore {
         &mut self,
         sealed: &T,
     ) -> Result<bool, JournalStoreError> {
+        if sealed.genesis_checkpoint().is_some() {
+            return Err(JournalStoreError::Unavailable);
+        }
         self.ensure_no_gc_pending()?;
         let shape = validate_sealed_ordinary_genesis_shape(sealed, self.agent, self.node)?;
         if self.replayed_root.is_some() {
@@ -8472,6 +8899,36 @@ impl AgentJournalStore for MemoryAgentJournalStore {
         publication: &ReplaySealedPublication,
     ) -> Result<JournalPublication, JournalStoreError> {
         self.publish_sealed_internal(publication, None)
+    }
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+impl AuditedCheckpointStore for MemoryAgentJournalStore {
+    fn publish_audited_checkpoint(
+        &mut self,
+        publication: &ReplaySealedPublication,
+        availability: &ExternalCheckpointValidation<'_>,
+    ) -> Result<JournalPublication, JournalStoreError> {
+        if !matches!(publication.anchor(), ReplayPublicationAnchor::Checkpoint(_))
+            || !availability.matches_heads(self.instance_id(), publication.next())
+        {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        self.publish_sealed_with_availability(publication, None, Some(availability))
+    }
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+impl ExternalMutationStore for MemoryAgentJournalStore {
+    fn publish_external_mutation(
+        &mut self,
+        publication: &ReplaySealedPublication,
+        availability: &ExternalCheckpointValidation<'_>,
+    ) -> Result<JournalPublication, JournalStoreError> {
+        if !availability.permits_mutation(self.instance_id(), publication) {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        self.publish_sealed_with_availability(publication, None, Some(availability))
     }
 }
 
@@ -8925,6 +9382,16 @@ const GC_BLOB_NAMESPACES: &[(JournalBlobClass, &str)] = &[
     (JournalBlobClass::LaneState, "lane-state/blobs"),
     (JournalBlobClass::CatalogArtifact, "catalog/blobs"),
     (JournalBlobClass::TransitionProof, "transition-proofs/blobs"),
+    #[cfg(feature = "experimental-state-blocks")]
+    (JournalBlobClass::StateBlock, "lane-state/blocks"),
+];
+
+#[cfg(target_os = "linux")]
+const LANE_STATE_DIRECTORIES: &[&str] = &[
+    "manifests",
+    "blobs",
+    #[cfg(feature = "experimental-state-blocks")]
+    "blocks",
 ];
 
 #[cfg(target_os = "linux")]
@@ -10561,6 +11028,81 @@ impl FileLocalAgentJournalSlot {
         sealed: &T,
         externally_exposed: bool,
     ) -> Result<FileAgentJournalStore, JournalStoreError> {
+        if sealed.genesis_checkpoint().is_some() {
+            return Err(JournalStoreError::Unavailable);
+        }
+        self.open_with_head_validation(sealed, externally_exposed, |store, heads| {
+            validate_head_targets(store, heads)
+        })
+    }
+
+    /// Experimental maintenance reopen. Admission and stable-slot ownership
+    /// are identical to ordinary open; only explicit external checkpoint
+    /// availability is additionally audited. This does not authenticate replay
+    /// provenance or expose a route. Both durable and staged heads share the
+    /// caller's budget, and a staged head is never promoted here.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn open_with_external_checkpoint_budget<T: ReplaySealedOrdinaryGenesis>(
+        self,
+        sealed: &T,
+        externally_exposed: bool,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<FileAgentJournalStore, JournalStoreError> {
+        if sealed.genesis_checkpoint().is_some() {
+            return Err(JournalStoreError::Unavailable);
+        }
+        self.open_with_head_validation(sealed, externally_exposed, |store, heads| {
+            super::replay::validate_external_checkpoint_heads(store, heads, budget)
+        })
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn open_external_genesis(
+        self,
+        sealed: &super::replay::ReplaySealedExternalLocalGenesis,
+        externally_exposed: bool,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<FileAgentJournalStore, JournalStoreError> {
+        self.open_with_head_validation(sealed, externally_exposed, |store, heads| {
+            sealed.validate_persisted_initial(store, heads, budget)
+        })
+    }
+
+    /// Read-only recovery of an exposed external generation and its optional
+    /// staged mutation. Both heads are replayed under one aggregate budget;
+    /// neither private stages nor heads.next are cleaned or promoted on open.
+    /// This returns a locked store, not an executable materialization or route.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn open_external_journal<
+        E: super::replay::ReplayExecutor,
+        R: super::replay::OrderedBaseResolver,
+    >(
+        self,
+        sealed: &super::replay::ReplaySealedExternalLocalGenesis,
+        externally_exposed: bool,
+        executor: &mut E,
+        resolver: &R,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<FileAgentJournalStore, JournalStoreError> {
+        if !externally_exposed && !self.exposure_committed {
+            return Err(JournalStoreError::Unavailable);
+        }
+        self.open_with_head_validation(sealed, externally_exposed, |store, heads| {
+            super::replay::validate_external_genesis_head(
+                store, sealed, heads, executor, resolver, budget,
+            )
+        })
+    }
+
+    fn open_with_head_validation<T: ReplaySealedOrdinaryGenesis>(
+        self,
+        sealed: &T,
+        externally_exposed: bool,
+        mut validate_heads: impl FnMut(
+            &mut FileAgentJournalStore,
+            &JournalHeads,
+        ) -> Result<(), JournalStoreError>,
+    ) -> Result<FileAgentJournalStore, JournalStoreError> {
         self.verify_lock()?;
         if externally_exposed && !self.exposure_committed {
             return Err(JournalStoreError::Corrupt);
@@ -10640,7 +11182,8 @@ impl FileLocalAgentJournalSlot {
             local_exposure: Some(self.intent),
             _stable_lock: self.stable_lock,
         };
-        store.validate_recovery_state()?;
+        let external_initial = sealed.genesis_checkpoint().map(|_| sealed.initial_heads());
+        store.validate_recovery_state_for_initial(external_initial.as_ref())?;
         if read_only_open {
             store.open_existing_layout()?;
             store.load_history_candidate_for_read_only_open()?;
@@ -10650,10 +11193,10 @@ impl FileLocalAgentJournalSlot {
         }
         store.validate_local_authority_recovery(sealed)?;
         if let Some(heads) = store.heads()? {
-            validate_head_targets(&store, &heads)?;
+            validate_heads(&mut store, &heads)?;
         }
         if let Some(staged) = store.read_fixed::<JournalHeads>("", "heads.next")? {
-            validate_head_targets(&store, &staged)?;
+            validate_heads(&mut store, &staged)?;
         }
         store.verify_lock()?;
         Ok(store)
@@ -11315,6 +11858,102 @@ impl FileAgentJournalStore {
         self.initialize_ordinary(sealed)
     }
 
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn initialize_external_local(
+        &mut self,
+        sealed: &super::replay::ReplaySealedExternalLocalGenesis,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<bool, JournalStoreError> {
+        self.initialize_external_local_with_hook(sealed, budget, |_| Ok(()))
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    fn initialize_external_local_with_hook(
+        &mut self,
+        sealed: &super::replay::ReplaySealedExternalLocalGenesis,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+        mut publication_point: impl FnMut(PublicationPoint) -> Result<(), JournalStoreError>,
+    ) -> Result<bool, JournalStoreError> {
+        self.ensure_no_gc_pending()?;
+        let shape = validate_sealed_ordinary_genesis_shape(sealed, self.agent, self.node)?;
+        if self.replayed_root.is_some() || self.local_exposure.is_none() {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        let genesis = sealed.genesis();
+        let encoded = encode_object(genesis)?;
+        for reference in &sealed.artifacts().artifacts {
+            require_blob(self, JournalBlobClass::CatalogArtifact, reference)?;
+        }
+        for existing in [
+            self.read_admission("genesis-admission")?,
+            self.read_admission("genesis-admission.next")?,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if existing != genesis.admission.as_hash() {
+                return Err(JournalStoreError::Conflict);
+            }
+        }
+        for existing in [
+            self.read_fixed::<AgentJournalGenesis>("", "genesis")?,
+            self.read_fixed::<AgentJournalGenesis>("", "genesis.next")?,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if existing != *genesis {
+                return Err(JournalStoreError::Conflict);
+            }
+        }
+        for existing in [
+            self.read_fixed::<JournalHeads>("", "heads")?,
+            self.read_fixed::<JournalHeads>("", "heads.next")?,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if existing != shape.initial {
+                return Err(JournalStoreError::Conflict);
+            }
+        }
+        sealed.with_staged_roots(self, budget, |store, availability| {
+            store.persist_admission(genesis.admission.as_hash())?;
+            store.persist_object(sealed.empty_frontier())?;
+            store.persist_object(sealed.ordered_invocations())?;
+            store.persist_object(sealed.merge_invocations())?;
+            store.persist_object(sealed.local_invocations())?;
+            store.persist_object(sealed.artifacts())?;
+            for lane in &shape.lanes {
+                store.persist_blob(
+                    JournalBlobClass::LaneState,
+                    &lane.state,
+                    genesis_state_component(sealed.post_create(), lane.lane),
+                )?;
+                store.persist_object(lane)?;
+            }
+            store.persist_object(
+                &sealed
+                    .initial_checkpoint()
+                    .map_err(|_| JournalStoreError::NonCanonical)?,
+            )?;
+            let created = persist_immutable_at(
+                store.directory("")?,
+                "genesis",
+                &encoded.bytes,
+                class_maximum(JournalStorageClass::Genesis),
+                |bytes| decode_object::<AgentJournalGenesis>(bytes, genesis.id()).map(|_| ()),
+            )?;
+            persist_initial_transition_proof_index(store, &shape.initial)?;
+            store.persist_historical_heads(&sealed.initial_predecessor_heads())?;
+            validate_head_targets_with_availability(store, &shape.initial, Some(availability))?;
+            publication_point(PublicationPoint::ObjectDurable)?;
+            let heads_created =
+                store.install_initial_heads_with_hook(&shape.initial, &mut publication_point)?;
+            Ok(created || heads_created)
+        })
+    }
+
     /// Install one system-finality-verified Shared genesis using the same
     /// descriptor-pinned crash protocol as Local genesis while additionally
     /// retaining its typed SystemAuthorized admission record.
@@ -11484,6 +12123,9 @@ impl FileAgentJournalStore {
         &mut self,
         sealed: &T,
     ) -> Result<bool, JournalStoreError> {
+        if sealed.genesis_checkpoint().is_some() {
+            return Err(JournalStoreError::Unavailable);
+        }
         self.ensure_no_gc_pending()?;
         let shape = validate_sealed_ordinary_genesis_shape(sealed, self.agent, self.node)?;
         if self.replayed_root.is_some() {
@@ -11592,6 +12234,33 @@ impl FileAgentJournalStore {
         sealed: &T,
         intent: Hash,
     ) -> Result<(), JournalStoreError> {
+        if sealed.genesis_checkpoint().is_some() {
+            return Err(JournalStoreError::Unavailable);
+        }
+        self.commit_exposure_with_head_validation(sealed, intent, |store, heads| {
+            validate_head_targets(store, heads)
+        })
+    }
+
+    #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+    pub(crate) fn commit_external_genesis_exposure(
+        &mut self,
+        sealed: &super::replay::ReplaySealedExternalLocalGenesis,
+        intent: Hash,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<(), JournalStoreError> {
+        self.commit_exposure_with_head_validation(sealed, intent, |store, heads| {
+            sealed.validate_persisted_initial(store, heads, budget)
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn commit_exposure_with_head_validation<T: ReplaySealedOrdinaryGenesis>(
+        &mut self,
+        sealed: &T,
+        intent: Hash,
+        validate_heads: impl FnOnce(&mut Self, &JournalHeads) -> Result<(), JournalStoreError>,
+    ) -> Result<(), JournalStoreError> {
         if intent == Hash::ZERO
             || self.local_exposure != Some(intent)
             || self.replayed_root.is_some()
@@ -11600,9 +12269,6 @@ impl FileAgentJournalStore {
         }
         validate_sealed_ordinary_genesis_shape(sealed, self.agent, self.node)?;
 
-        // Cleanup for a read-only reopen is permitted only after the driver
-        // has authenticated and replayed its current head closure.
-        self.finish_deferred_startup_recovery()?;
         if self.read_admission("genesis-admission")? != Some(sealed.admission_commitment())
             || self.read_admission("genesis-admission.next")?.is_some()
             || self.read_fixed::<AgentJournalGenesis>("", "genesis")?
@@ -11618,12 +12284,14 @@ impl FileAgentJournalStore {
         if heads.genesis != sealed.genesis().id() || heads.node != self.node {
             return Err(JournalStoreError::ScopeMismatch);
         }
-        validate_head_targets(self, &heads)?;
+        validate_heads(self, &heads)?;
         // Re-read the typed authority record at the last irreversible
         // boundary. In particular, a Shared SystemAuthorized admission may
         // not be deleted or replaced between slot open/initialization and
         // stable-lock exposure.
         self.validate_local_authority_recovery(sealed)?;
+        // No private-stage cleanup before the exact head closure is checked.
+        self.finish_deferred_startup_recovery()?;
         self.sync_unexposed_generation()?;
         commit_local_stable_lock_exposure(
             &self._stable_lock,
@@ -11913,6 +12581,8 @@ impl FileAgentJournalStore {
             "checkpoints",
             "lane-state/manifests",
             "lane-state/blobs",
+            #[cfg(feature = "experimental-state-blocks")]
+            "lane-state/blocks",
             "artifact-closures",
             "invocation-index/manifests",
             "invocation-index/nodes",
@@ -11982,7 +12652,7 @@ impl FileAgentJournalStore {
                     "merge-seals",
                 ],
             )?;
-            validate_directory_names(self.directories.get("lane-state")?, &["manifests", "blobs"])?;
+            validate_directory_names(self.directories.get("lane-state")?, LANE_STATE_DIRECTORIES)?;
             validate_directory_names(
                 self.directories.get("invocation-index")?,
                 &["manifests", "nodes"],
@@ -12025,6 +12695,8 @@ impl FileAgentJournalStore {
                 ("records/merge-seals", "records", "merge-seals"),
                 ("lane-state/manifests", "lane-state", "manifests"),
                 ("lane-state/blobs", "lane-state", "blobs"),
+                #[cfg(feature = "experimental-state-blocks")]
+                ("lane-state/blocks", "lane-state", "blocks"),
                 (
                     "invocation-index/manifests",
                     "invocation-index",
@@ -12121,6 +12793,8 @@ impl FileAgentJournalStore {
                 "checkpoints",
                 "lane-state/manifests",
                 "lane-state/blobs",
+                #[cfg(feature = "experimental-state-blocks")]
+                "lane-state/blocks",
                 "artifact-closures",
                 "invocation-index/manifests",
                 "invocation-index/nodes",
@@ -12787,6 +13461,8 @@ impl FileAgentJournalStore {
             JournalBlobClass::LaneState => "lane-state/blobs",
             JournalBlobClass::CatalogArtifact => "catalog/blobs",
             JournalBlobClass::TransitionProof => "transition-proofs/blobs",
+            #[cfg(feature = "experimental-state-blocks")]
+            JournalBlobClass::StateBlock => "lane-state/blocks",
         }
     }
 
@@ -13526,6 +14202,13 @@ impl FileAgentJournalStore {
     }
 
     fn validate_recovery_state(&self) -> Result<(), JournalStoreError> {
+        self.validate_recovery_state_for_initial(None)
+    }
+
+    fn validate_recovery_state_for_initial(
+        &self,
+        admitted_initial: Option<&JournalHeads>,
+    ) -> Result<(), JournalStoreError> {
         self.gc_intent()?;
         let admission = self.read_admission("genesis-admission")?;
         let staged_admission = self.read_admission("genesis-admission.next")?;
@@ -13571,6 +14254,7 @@ impl FileAgentJournalStore {
                 .validate_successor(staged)
                 .map_err(|_| JournalStoreError::Corrupt)?,
             (None, Some(staged)) if staged.publication_revision == 0 => {}
+            (None, Some(staged)) if admitted_initial == Some(staged) => {}
             (None, Some(_)) => return Err(JournalStoreError::Corrupt),
             _ => {}
         }
@@ -13578,6 +14262,14 @@ impl FileAgentJournalStore {
     }
 
     fn install_initial_heads(&self, initial: &JournalHeads) -> Result<bool, JournalStoreError> {
+        self.install_initial_heads_with_hook(initial, |_| Ok(()))
+    }
+
+    fn install_initial_heads_with_hook(
+        &self,
+        initial: &JournalHeads,
+        mut publication_point: impl FnMut(PublicationPoint) -> Result<(), JournalStoreError>,
+    ) -> Result<bool, JournalStoreError> {
         self.ensure_no_gc_pending()?;
         let encoded = encode_object(initial)?;
         let directory = self.directory("")?;
@@ -13601,12 +14293,14 @@ impl FileAgentJournalStore {
             Some(_) => return Err(JournalStoreError::Corrupt),
             None => create_synced_stage_at(directory, "heads.next", &encoded.bytes)?,
         }
-        // Initialization is resumed only by an exact admission-sealed genesis
-        // and empty head. `open` itself never promotes this stage.
+        publication_point(PublicationPoint::HeadsStaged)?;
+        // Only exact admission-sealed initialization promotes this stage.
+        // `open` itself never does; external heads also pin a verified checkpoint.
         rename_file_at(directory, "heads.next", "heads")?;
         directory
             .sync_all()
             .map_err(|_| JournalStoreError::Unavailable)?;
+        publication_point(PublicationPoint::HeadsDurable)?;
         Ok(true)
     }
 
@@ -13617,6 +14311,31 @@ impl FileAgentJournalStore {
         next: &JournalHeads,
         mode: ReplayPublicationMode,
         transition_proof_change: bool,
+        publication_point: F,
+    ) -> Result<JournalPublication, JournalStoreError>
+    where
+        R: CanonicalJournalRecord,
+        F: FnMut(PublicationPoint) -> Result<(), JournalStoreError>,
+    {
+        self.publish_inner_with_availability(
+            expected,
+            anchor,
+            next,
+            mode,
+            transition_proof_change,
+            None,
+            publication_point,
+        )
+    }
+
+    fn publish_inner_with_availability<R, F>(
+        &mut self,
+        expected: JournalHeadsId,
+        anchor: &R,
+        next: &JournalHeads,
+        mode: ReplayPublicationMode,
+        transition_proof_change: bool,
+        availability: Option<&ExternalCheckpointValidation<'_>>,
         mut publication_point: F,
     ) -> Result<JournalPublication, JournalStoreError>
     where
@@ -13635,7 +14354,7 @@ impl FileAgentJournalStore {
             if existing.encode() != encoded_anchor.bytes {
                 return Err(JournalStoreError::Corrupt);
             }
-            validate_head_targets(self, &current)?;
+            validate_head_targets_with_availability(self, &current, availability)?;
             validate_idempotent_anchor(self, &current, anchor)?;
             let predecessor = next.previous.ok_or(JournalStoreError::Corrupt)?;
             if predecessor != expected
@@ -13655,7 +14374,7 @@ impl FileAgentJournalStore {
         if current.id() != expected {
             return Err(JournalStoreError::Conflict);
         }
-        validate_head_targets(self, &current)?;
+        validate_head_targets_with_availability(self, &current, availability)?;
         current
             .validate_successor(next)
             .map_err(supplied_decode_error)?;
@@ -13670,8 +14389,8 @@ impl FileAgentJournalStore {
         let snapshot_created = self.persist_historical_heads(&current)?;
         let object_created = self.persist_object(anchor)? || snapshot_created;
         publication_point(PublicationPoint::ObjectDurable)?;
-        validate_anchor_dependencies(self, &current, anchor, next)?;
-        validate_head_targets(self, next)?;
+        validate_anchor_dependencies_with_availability(self, &current, anchor, next, availability)?;
+        validate_head_targets_with_availability(self, next, availability)?;
 
         let directory = self.directory("")?;
         match self.read_fixed::<JournalHeads>("", "heads.next")? {
@@ -13772,8 +14491,26 @@ impl FileAgentJournalStore {
         &mut self,
         publication: &ReplaySealedPublication,
         authority: Option<&ReplaySystemAuthorityStoragePlan>,
+        publication_point: impl FnMut(PublicationPoint) -> Result<(), JournalStoreError>,
+    ) -> Result<JournalPublication, JournalStoreError> {
+        self.publish_sealed_with_availability(publication, authority, None, publication_point)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn publish_sealed_with_availability(
+        &mut self,
+        publication: &ReplaySealedPublication,
+        authority: Option<&ReplaySystemAuthorityStoragePlan>,
+        availability: Option<&ExternalCheckpointValidation<'_>>,
         mut publication_point: impl FnMut(PublicationPoint) -> Result<(), JournalStoreError>,
     ) -> Result<JournalPublication, JournalStoreError> {
+        #[cfg(feature = "experimental-state-blocks")]
+        if publication.external_execution().is_some()
+            && !availability
+                .is_some_and(|proof| proof.permits_mutation(self.instance_id(), publication))
+        {
+            return Err(JournalStoreError::Unavailable);
+        }
         match (publication.system_authority_write(), authority) {
             (None, None) | (Some(_), Some(_)) => {}
             _ => return Err(JournalStoreError::NonCanonical),
@@ -13801,20 +14538,22 @@ impl FileAgentJournalStore {
             let dependency_created = stage_sealed_dependencies(self, publication)?;
             let transition_proof_change = publication.transition_proof_batch().is_some();
             let mut result = match publication.anchor() {
-                ReplayPublicationAnchor::Ordered(entry) => self.publish_inner_with_mode(
+                ReplayPublicationAnchor::Ordered(entry) => self.publish_inner_with_availability(
                     expected,
                     entry,
                     next,
                     publication.mode(),
                     transition_proof_change,
+                    availability,
                     &mut publication_point,
                 )?,
-                ReplayPublicationAnchor::Local(entry) => self.publish_inner_with_mode(
+                ReplayPublicationAnchor::Local(entry) => self.publish_inner_with_availability(
                     expected,
                     entry,
                     next,
                     publication.mode(),
                     transition_proof_change,
+                    availability,
                     &mut publication_point,
                 )?,
                 ReplayPublicationAnchor::Merge { event, .. } => self.publish_inner_with_mode(
@@ -13825,14 +14564,16 @@ impl FileAgentJournalStore {
                     transition_proof_change,
                     &mut publication_point,
                 )?,
-                ReplayPublicationAnchor::Checkpoint(checkpoint) => self.publish_inner_with_mode(
-                    expected,
-                    checkpoint,
-                    next,
-                    publication.mode(),
-                    transition_proof_change,
-                    &mut publication_point,
-                )?,
+                ReplayPublicationAnchor::Checkpoint(checkpoint) => self
+                    .publish_inner_with_availability(
+                        expected,
+                        checkpoint,
+                        next,
+                        publication.mode(),
+                        transition_proof_change,
+                        availability,
+                        &mut publication_point,
+                    )?,
             };
             if let Some(plan) = authority {
                 stage_system_authority_dependencies(self, publication, plan)?;
@@ -13852,20 +14593,22 @@ impl FileAgentJournalStore {
             let dependency_created = stage_sealed_dependencies(self, publication)?;
             let transition_proof_change = publication.transition_proof_batch().is_some();
             let mut result = match publication.anchor() {
-                ReplayPublicationAnchor::Ordered(entry) => self.publish_inner_with_mode(
+                ReplayPublicationAnchor::Ordered(entry) => self.publish_inner_with_availability(
                     expected,
                     entry,
                     next,
                     publication.mode(),
                     transition_proof_change,
+                    availability,
                     &mut publication_point,
                 )?,
-                ReplayPublicationAnchor::Local(entry) => self.publish_inner_with_mode(
+                ReplayPublicationAnchor::Local(entry) => self.publish_inner_with_availability(
                     expected,
                     entry,
                     next,
                     publication.mode(),
                     transition_proof_change,
+                    availability,
                     &mut publication_point,
                 )?,
                 ReplayPublicationAnchor::Merge { event, .. } => self.publish_inner_with_mode(
@@ -13876,14 +14619,16 @@ impl FileAgentJournalStore {
                     transition_proof_change,
                     &mut publication_point,
                 )?,
-                ReplayPublicationAnchor::Checkpoint(checkpoint) => self.publish_inner_with_mode(
-                    expected,
-                    checkpoint,
-                    next,
-                    publication.mode(),
-                    transition_proof_change,
-                    &mut publication_point,
-                )?,
+                ReplayPublicationAnchor::Checkpoint(checkpoint) => self
+                    .publish_inner_with_availability(
+                        expected,
+                        checkpoint,
+                        next,
+                        publication.mode(),
+                        transition_proof_change,
+                        availability,
+                        &mut publication_point,
+                    )?,
             };
             if result.heads_advanced && overlay.is_some() {
                 result.object_created |= self.finish_history_candidate(&mut publication_point)?;
@@ -14193,6 +14938,79 @@ impl FileAgentJournalStore {
         &mut self,
         expected_heads: JournalHeadsId,
         limits: GcLimits,
+        publication_point: impl FnMut(GcPoint) -> Result<(), JournalStoreError>,
+    ) -> Result<JournalGc, JournalStoreError> {
+        self.collect_garbage_with_availability(expected_heads, limits, None, publication_point)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+    /// Explicit maintenance path; ordinary collection remains closed for
+    /// external roots. `budget` bounds the preliminary availability audit;
+    /// `limits` separately bound marking, namespace scans and each unlink batch.
+    /// No audited context escapes the exclusive store borrow across a sweep.
+    pub(crate) fn collect_external_checkpoint_garbage(
+        &mut self,
+        expected_heads: JournalHeadsId,
+        limits: GcLimits,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<JournalGc, JournalStoreError> {
+        self.collect_external_checkpoint_garbage_inner(expected_heads, limits, budget, None)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+    pub(crate) fn collect_external_genesis_checkpoint_garbage(
+        &mut self,
+        genesis: &super::replay::ReplaySealedExternalLocalGenesis,
+        expected_heads: JournalHeadsId,
+        limits: GcLimits,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<JournalGc, JournalStoreError> {
+        self.collect_external_checkpoint_garbage_inner(
+            expected_heads,
+            limits,
+            budget,
+            Some(genesis),
+        )
+    }
+
+    #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+    fn collect_external_checkpoint_garbage_inner(
+        &mut self,
+        expected_heads: JournalHeadsId,
+        limits: GcLimits,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+        genesis: Option<&super::replay::ReplaySealedExternalLocalGenesis>,
+    ) -> Result<JournalGc, JournalStoreError> {
+        validate_gc_limits(limits)?;
+        let heads = self.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+        if heads.id() != expected_heads
+            || self.read_fixed::<JournalHeads>("", "heads.next")?.is_some()
+        {
+            return Err(JournalStoreError::Conflict);
+        }
+        let collect =
+            |store: &mut Self, availability: Option<&ExternalCheckpointValidation<'_>>| {
+                store.collect_garbage_with_availability(
+                    expected_heads,
+                    limits,
+                    availability,
+                    |_| Ok(()),
+                )
+            };
+        match genesis {
+            Some(genesis) => super::replay::with_external_genesis_checkpoint_heads(
+                self, &heads, genesis, budget, collect,
+            ),
+            None => super::replay::with_external_checkpoint_heads(self, &heads, budget, collect),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn collect_garbage_with_availability(
+        &mut self,
+        expected_heads: JournalHeadsId,
+        limits: GcLimits,
+        availability: Option<&ExternalCheckpointValidation<'_>>,
         mut publication_point: impl FnMut(GcPoint) -> Result<(), JournalStoreError>,
     ) -> Result<JournalGc, JournalStoreError> {
         validate_gc_limits(limits)?;
@@ -14200,7 +15018,8 @@ impl FileAgentJournalStore {
         if self.read_fixed::<JournalHeads>("", "heads.next")?.is_some() {
             return Err(JournalStoreError::Conflict);
         }
-        let (intent, mark) = build_gc_mark(self, expected_heads, limits)?;
+        let (intent, mark) =
+            build_gc_mark_with_availability(self, expected_heads, limits, availability)?;
         let heads = self.heads()?.ok_or(JournalStoreError::NotInitialized)?;
         let (history_queue, staged_history) = self.history_queue_and_stage(heads.genesis)?;
         validate_history_retirement_coverage(self, expected_heads, &history_queue)?;
@@ -14579,6 +15398,36 @@ impl AgentJournalStore for FileAgentJournalStore {
     }
 }
 
+#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+impl AuditedCheckpointStore for FileAgentJournalStore {
+    fn publish_audited_checkpoint(
+        &mut self,
+        publication: &ReplaySealedPublication,
+        availability: &ExternalCheckpointValidation<'_>,
+    ) -> Result<JournalPublication, JournalStoreError> {
+        if !matches!(publication.anchor(), ReplayPublicationAnchor::Checkpoint(_))
+            || !availability.matches_heads(self.instance_id(), publication.next())
+        {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        self.publish_sealed_with_availability(publication, None, Some(availability), |_| Ok(()))
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+impl ExternalMutationStore for FileAgentJournalStore {
+    fn publish_external_mutation(
+        &mut self,
+        publication: &ReplaySealedPublication,
+        availability: &ExternalCheckpointValidation<'_>,
+    ) -> Result<JournalPublication, JournalStoreError> {
+        if !availability.permits_mutation(self.instance_id(), publication) {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        self.publish_sealed_with_availability(publication, None, Some(availability), |_| Ok(()))
+    }
+}
+
 impl TransitionProofPublicationStore for FileAgentJournalStore {
     fn stage_proof_predecessor(&mut self, heads: &JournalHeads) -> Result<bool, JournalStoreError> {
         let current = self.heads()?.ok_or(JournalStoreError::NotInitialized)?;
@@ -14953,6 +15802,14 @@ macro_rules! impl_replay_source {
 
 impl_replay_source!(MemoryAgentJournalStore);
 impl_replay_source!(FileAgentJournalStore);
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    feature = "storage",
+    feature = "experimental-state-blocks"
+))]
+pub(crate) use tests::ExternalFileFixture;
 
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
@@ -15410,6 +16267,8 @@ mod tests {
         ]
         .map(|(lane, cursor)| {
             let manifest = LaneStateManifest {
+                #[cfg(feature = "experimental-state-blocks")]
+                external_root: None,
                 genesis: genesis.id(),
                 runtime: heads.runtime.clone(),
                 lane,
@@ -15493,6 +16352,941 @@ mod tests {
             lanes: sealed_lanes,
             artifacts,
             invocation_indexes,
+        }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    #[test]
+    fn external_checkpoint_reopen_audits_durable_and_staged_heads_without_mutation() {
+        use super::super::state_block_store::{
+            JournalBlockReader, journal_root_context, stage_change_blocks,
+        };
+        use crate::agent_sdk::{
+            state_blocks::ReadBudget,
+            state_change::StateChange,
+            state_root::StateRootDescriptor,
+            state_tree::{StateTree, WriteBudget},
+        };
+
+        for (selected_lane, staged) in [
+            (PersistedLane::Linear, false),
+            (PersistedLane::Linear, true),
+            (PersistedLane::Local, false),
+            (PersistedLane::Local, true),
+        ] {
+            let directory = TestDirectory::new("external-checkpoint-budgeted-reopen");
+            let sealed = crate::agent::replay::tests::admitted_local_genesis(0xe3);
+            let genesis = sealed.genesis();
+            let mut store = initialize_production_local_file_store(&directory, &sealed);
+            let original = store.heads().unwrap().unwrap();
+            let mut closure = stage_test_checkpoint_closure(&mut store, genesis);
+            let root_cursor = closure
+                .lanes
+                .iter()
+                .find(|(_, manifest)| manifest.lane == selected_lane)
+                .unwrap()
+                .1
+                .cursor
+                .clone();
+            let context = journal_root_context(
+                genesis,
+                genesis.runtime(),
+                selected_lane,
+                (selected_lane == PersistedLane::Local).then_some(original.node),
+                &root_cursor,
+            )
+            .unwrap();
+            let empty = StateRootDescriptor::new(context, None);
+            let update = StateTree::empty(context.scope())
+                .update(
+                    [0x61; 32],
+                    Some(b"durable row"),
+                    &mut JournalBlockReader {
+                        store: &store,
+                        scope: context.scope(),
+                    },
+                    &mut ReadBudget::new(10, 10000),
+                    &mut WriteBudget::new(10, 10000),
+                )
+                .unwrap();
+            let change = StateChange::from_update(empty.commitment(), context, update).unwrap();
+            stage_change_blocks(&mut store, &change, empty.commitment(), context).unwrap();
+            let mut runtime = original.runtime.clone();
+            runtime.runtime_abi = Hash(crate::agent_sdk::state_execution::STATE_EXECUTION_ABI_ID.0);
+            runtime.execution_semantics =
+                Hash(crate::agent_sdk::state_execution::STATE_EXECUTION_SEMANTICS_ID.0);
+            closure.manifest.runtime = runtime.clone();
+            for (index, (_, manifest)) in closure.lanes.iter_mut().enumerate() {
+                manifest.runtime = runtime.clone();
+                if manifest.lane == selected_lane {
+                    manifest.external_root = Some(super::super::journal::ExternalStateRoot {
+                        descriptor: change.next(),
+                        runtime: genesis.runtime().clone(),
+                        cursor: root_cursor.clone(),
+                    });
+                    let bytes = change.next().encode();
+                    manifest.state = BlobRef::of_bytes(&bytes);
+                    store
+                        .put_blob(JournalBlobClass::LaneState, &manifest.state, &bytes)
+                        .unwrap();
+                }
+                store.put(manifest).unwrap();
+                closure.manifest.lanes[index].state = manifest.id();
+            }
+            store.put(&closure.manifest).unwrap();
+            closure.next.runtime = runtime;
+            closure.next.checkpoint = Some(closure.manifest.id());
+            store.persist_historical_heads(&original).unwrap();
+            // Synthetic post-upgrade boundary: qualifies the real admitted
+            // filesystem opener, not runtime upgrade or checkpoint publication.
+            let target = if staged { "heads.next" } else { "heads" };
+            std::fs::write(store.root().join(target), closure.next.encode()).unwrap();
+            let root = store.root().to_path_buf();
+            drop(store);
+            let before = file_tree_snapshot(&root);
+            assert!(reopen_production_local_file_store(&directory, &sealed).is_err());
+            assert_eq!(file_tree_snapshot(&root), before);
+            assert!(matches!(
+                acquire_production_local_slot(&directory, &sealed)
+                    .open_with_external_checkpoint_budget(
+                        &sealed,
+                        true,
+                        &mut ReadBudget::new(0, 0)
+                    ),
+                Err(JournalStoreError::LimitExceeded)
+            ));
+            assert_eq!(file_tree_snapshot(&root), before);
+            let reopened = acquire_production_local_slot(&directory, &sealed)
+                .open_with_external_checkpoint_budget(
+                    &sealed,
+                    true,
+                    &mut ReadBudget::new(100, 100000),
+                )
+                .unwrap();
+            assert_eq!(
+                reopened.heads().unwrap(),
+                Some(if staged {
+                    original
+                } else {
+                    closure.next.clone()
+                })
+            );
+            assert_eq!(
+                reopened
+                    .read_fixed::<JournalHeads>("", "heads.next")
+                    .unwrap(),
+                staged.then_some(closure.next.clone())
+            );
+            assert_eq!(file_tree_snapshot(&root), before);
+            drop(reopened);
+            let blocks = before
+                .iter()
+                .filter(|(path, bytes)| path.starts_with("lane-state/blocks") && bytes.is_some())
+                .collect::<Vec<_>>();
+            assert_eq!(blocks.len(), 1);
+            let (block_path, block_bytes) = blocks[0];
+            let block_path = root.join(block_path);
+            for missing in [false, true] {
+                if missing {
+                    std::fs::remove_file(&block_path).unwrap();
+                } else {
+                    let mut corrupt = block_bytes.as_ref().unwrap().clone();
+                    *corrupt.last_mut().unwrap() ^= 1;
+                    std::fs::write(&block_path, corrupt).unwrap();
+                }
+                let damaged = file_tree_snapshot(&root);
+                let failure = acquire_production_local_slot(&directory, &sealed)
+                    .open_with_external_checkpoint_budget(
+                        &sealed,
+                        true,
+                        &mut ReadBudget::new(100, 100000),
+                    )
+                    .unwrap_err();
+                assert_eq!(
+                    failure,
+                    if missing {
+                        JournalStoreError::MissingObject
+                    } else {
+                        // BlockReader maps backend integrity errors through
+                        // TreeError::Storage; availability fails closed without
+                        // exposing the backend-specific corruption code.
+                        JournalStoreError::Unavailable
+                    }
+                );
+                assert_eq!(
+                    file_tree_snapshot(&root),
+                    damaged,
+                    "failed reopen must not repair or promote damaged external heads"
+                );
+                std::fs::write(&block_path, block_bytes.as_ref().unwrap()).unwrap();
+            }
+            if !staged {
+                for crash_at in [
+                    PublicationPoint::ObjectDurable,
+                    PublicationPoint::HeadsStaged,
+                    PublicationPoint::HeadsDurable,
+                ] {
+                    let mut store = acquire_production_local_slot(&directory, &sealed)
+                        .open_with_external_checkpoint_budget(
+                            &sealed,
+                            true,
+                            &mut ReadBudget::new(100, 100000),
+                        )
+                        .unwrap();
+                    let current = store.heads().unwrap().unwrap();
+                    let mut manifest = closure.manifest.clone();
+                    manifest.publication_revision = current.publication_revision;
+                    let next = JournalHeads {
+                        publication_revision: current.publication_revision + 1,
+                        previous: Some(current.id()),
+                        checkpoint: Some(manifest.id()),
+                        ..current.clone()
+                    };
+                    let lanes = manifest
+                        .lanes
+                        .iter()
+                        .map(|lane| {
+                            (
+                                lane.clone(),
+                                store.get::<LaneStateManifest>(lane.state).unwrap().unwrap(),
+                            )
+                        })
+                        .collect();
+                    let publication =
+                        ReplaySealedPublication::checkpoint_transition_proof_test_publication(
+                            &current,
+                            manifest.clone(),
+                            next.clone(),
+                            lanes,
+                            closure.artifacts.clone(),
+                            closure.invocation_indexes.clone(),
+                        )
+                        .unwrap();
+                    // Immutable fixture staging permits auditing the candidate
+                    // before entering the real sealed publication engine.
+                    store.persist_historical_heads(&current).unwrap();
+                    store.put(&manifest).unwrap();
+                    assert!(store.publish(&publication).is_err());
+                    assert_eq!(store.heads().unwrap(), Some(current.clone()));
+                    let failure = super::super::replay::with_audited_checkpoint_for_test(
+                        &mut store,
+                        &publication,
+                        &mut ReadBudget::new(100, 100000),
+                        |store, availability| {
+                            store.publish_sealed_with_availability(
+                                &publication,
+                                None,
+                                Some(availability),
+                                |point| {
+                                    if point == crash_at {
+                                        Err(JournalStoreError::Unavailable)
+                                    } else {
+                                        Ok(())
+                                    }
+                                },
+                            )
+                        },
+                    );
+                    assert_eq!(failure, Err(JournalStoreError::Unavailable));
+                    drop(store);
+                    let crashed = file_tree_snapshot(&root);
+                    let mut reopened = acquire_production_local_slot(&directory, &sealed)
+                        .open_with_external_checkpoint_budget(
+                            &sealed,
+                            true,
+                            &mut ReadBudget::new(100, 100000),
+                        )
+                        .unwrap();
+                    assert_eq!(file_tree_snapshot(&root), crashed);
+                    assert_eq!(
+                        reopened.heads().unwrap(),
+                        Some(if crash_at == PublicationPoint::HeadsDurable {
+                            next.clone()
+                        } else {
+                            current
+                        })
+                    );
+                    let result = super::super::replay::with_audited_checkpoint_for_test(
+                        &mut reopened,
+                        &publication,
+                        &mut ReadBudget::new(100, 100000),
+                        |store, availability| {
+                            store.publish_audited_checkpoint(&publication, availability)
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        result.heads_advanced,
+                        crash_at != PublicationPoint::HeadsDurable
+                    );
+                    assert_eq!(reopened.heads().unwrap(), Some(next));
+                    assert!(!root.join("heads.next").exists());
+                }
+            }
+        }
+    }
+
+    /// Test-only bridge for replay integration. Genesis is admitted through the
+    /// real Local slot; the starting external checkpoint/suffix is synthetic.
+    /// This is deliberately not a portable restore or production import API.
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    pub(crate) struct ExternalFileFixture {
+        directory: TestDirectory,
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    impl ExternalFileFixture {
+        pub(crate) fn qualify_external_genesis<E: super::super::replay::ReplayExecutor>(
+            sealed: &super::super::replay::ReplaySealedExternalLocalGenesis,
+            admitted: &super::super::package_admission::AdmittedStateRuntimePackage,
+            executor: &mut E,
+            probe_mutations: bool,
+        ) where
+            E::Error: core::fmt::Debug,
+        {
+            use crate::agent_sdk::state_blocks::ReadBudget;
+            let package = admitted.exact_bytes();
+            for failure in [
+                PublicationPoint::ObjectDurable,
+                PublicationPoint::HeadsStaged,
+                PublicationPoint::HeadsDurable,
+            ] {
+                let directory = TestDirectory::new("external-genesis-crash");
+                assert!(matches!(
+                    acquire_production_local_slot(&directory, sealed).open(sealed, false),
+                    Err(JournalStoreError::Unavailable)
+                ));
+                let mut store = acquire_production_local_slot(&directory, sealed)
+                    .open_external_genesis(sealed, false, &mut ReadBudget::new(100, 100000))
+                    .unwrap();
+                store
+                    .put_blob(
+                        JournalBlobClass::CatalogArtifact,
+                        &sealed.genesis().runtime().package,
+                        package,
+                    )
+                    .unwrap();
+                let before = file_tree_snapshot(store.root());
+                assert!(matches!(
+                    store.initialize_shared(sealed),
+                    Err(JournalStoreError::Unavailable)
+                ));
+                assert_eq!(file_tree_snapshot(store.root()), before);
+                assert!(
+                    store
+                        .initialize_external_local(sealed, &mut ReadBudget::new(2, 100000))
+                        .is_err()
+                );
+                assert!(store.heads().unwrap().is_none());
+                assert!(store.genesis().unwrap().is_none());
+                assert!(matches!(
+                    store.initialize_external_local_with_hook(
+                        sealed,
+                        &mut ReadBudget::new(100, 100000),
+                        |point| if point == failure {
+                            Err(JournalStoreError::Unavailable)
+                        } else {
+                            Ok(())
+                        }
+                    ),
+                    Err(JournalStoreError::Unavailable)
+                ));
+                let expected = sealed.initial_heads().unwrap();
+                assert_eq!(
+                    store.heads().unwrap(),
+                    (failure == PublicationPoint::HeadsDurable).then_some(expected.clone())
+                );
+                let root = store.root().to_owned();
+                let snapshot = file_tree_snapshot(&root);
+                drop(store);
+                if failure != PublicationPoint::ObjectDurable {
+                    assert!(
+                        acquire_production_local_slot(&directory, sealed)
+                            .open_external_genesis(sealed, false, &mut ReadBudget::new(0, 0))
+                            .is_err()
+                    );
+                    assert_eq!(file_tree_snapshot(&root), snapshot);
+                }
+                let mut store = acquire_production_local_slot(&directory, sealed)
+                    .open_external_genesis(sealed, false, &mut ReadBudget::new(100, 100000))
+                    .unwrap();
+                assert_eq!(
+                    file_tree_snapshot(&root),
+                    snapshot,
+                    "open must not promote or repair staged state"
+                );
+                assert_eq!(
+                    store.heads().unwrap(),
+                    (failure == PublicationPoint::HeadsDurable).then_some(expected.clone())
+                );
+                store
+                    .initialize_external_local(sealed, &mut ReadBudget::new(100, 100000))
+                    .unwrap();
+                assert_eq!(store.heads().unwrap(), Some(expected.clone()));
+                assert!(!root.join("heads.next").exists());
+                assert!(
+                    !store
+                        .initialize_external_local(sealed, &mut ReadBudget::new(100, 100000))
+                        .unwrap()
+                );
+                let snapshot = file_tree_snapshot(&root);
+                drop(store);
+                let mut store = acquire_production_local_slot(&directory, sealed)
+                    .open_external_genesis(sealed, false, &mut ReadBudget::new(100, 100000))
+                    .unwrap();
+                sealed
+                    .validate_persisted_initial(
+                        &mut store,
+                        &expected,
+                        &mut ReadBudget::new(100, 100000),
+                    )
+                    .unwrap();
+                assert_eq!(file_tree_snapshot(&root), snapshot);
+                assert!(matches!(
+                    store.commit_shared_exposure(sealed, PRODUCTION_LOCAL_INTENT),
+                    Err(JournalStoreError::Unavailable)
+                ));
+                assert!(
+                    store
+                        .commit_external_genesis_exposure(
+                            sealed,
+                            PRODUCTION_LOCAL_INTENT,
+                            &mut ReadBudget::new(0, 0)
+                        )
+                        .is_err()
+                );
+                assert_eq!(file_tree_snapshot(&root), snapshot);
+                store
+                    .commit_external_genesis_exposure(
+                        sealed,
+                        PRODUCTION_LOCAL_INTENT,
+                        &mut ReadBudget::new(100, 100000),
+                    )
+                    .unwrap();
+                drop(store);
+                let mut store = acquire_production_local_slot(&directory, sealed)
+                    .open_external_genesis(sealed, true, &mut ReadBudget::new(100, 100000))
+                    .unwrap();
+                assert_eq!(store.heads().unwrap(), Some(expected.clone()));
+                let before_replay = file_tree_snapshot(&root);
+                let recovered = super::super::replay::materialize_external_genesis(
+                    &mut store,
+                    sealed,
+                    executor,
+                    &super::super::replay::NoPrunedOrderedBases,
+                    &mut ReadBudget::new(100, 100000),
+                )
+                .unwrap();
+                assert_eq!(recovered.heads(), &expected);
+                assert_eq!(recovered.state(), sealed.post_create());
+                assert_eq!(
+                    recovered.clean_management_evidence(),
+                    sealed
+                        .initial_checkpoint()
+                        .unwrap()
+                        .clean_management
+                        .as_ref()
+                );
+                assert_eq!(file_tree_snapshot(&root), before_replay);
+                if !probe_mutations {
+                    use crate::agent_sdk::{
+                        self as sdk,
+                        state_execution::{ExternalLaneWork, StateExecutionWork},
+                    };
+                    // Fresh guest execution reads only the reopened store; it
+                    // has no access to the retained Create candidate blocks.
+                    let state = sdk::RuntimeState {
+                        control: recovered.state().control.clone(),
+                        linear: recovered.state().linear.clone(),
+                        merge: recovered.state().merge.clone(),
+                        local: recovered.state().local.clone(),
+                    };
+                    let lanes = [
+                        PersistedLane::Linear,
+                        PersistedLane::Merge,
+                        PersistedLane::Local,
+                    ]
+                    .into_iter()
+                    .map(|lane| {
+                        let base = sealed.lane_manifest(lane).external_root.unwrap().descriptor;
+                        ExternalLaneWork {
+                            base,
+                            next: base.context(),
+                        }
+                    })
+                    .collect();
+                    let work = StateExecutionWork::new(
+                        sdk::RuntimeWork::Manage {
+                            context: sdk::RuntimeExecutionContext::Direct,
+                            space: sdk::SpaceId(expected.runtime.space.0),
+                            agent: sdk::AgentId(expected.runtime.agent.0),
+                            runtime_deployment: admitted.deployment(),
+                            state: state.clone(),
+                            request: Box::new(sdk::ManagementRequest::InspectActors {
+                                after: None,
+                                limit: 1,
+                            }),
+                            authority: None,
+                            observed_slot: 10,
+                        },
+                        lanes,
+                        admitted.external_state_limits(),
+                    )
+                    .unwrap();
+                    let output = super::super::state_block_pvm::MultiLaneStateBlockHost {
+                        store: &store,
+                        budget: &mut ReadBudget::new(100, 100000),
+                    }
+                    .execute_admitted_work(admitted, &work, 1_000_000_000)
+                    .unwrap();
+                    let sdk::RuntimeOutcome::Management(Ok(sdk::ManagementReply::Actors(page))) =
+                        &output.transition().outcome
+                    else {
+                        panic!("reopened standard runtime must answer directory inspection");
+                    };
+                    assert!(page.entries.is_empty());
+                    assert!(output.changes().is_empty());
+                    assert_eq!(output.transition().state, state);
+                    assert_eq!(file_tree_snapshot(&root), before_replay);
+                    assert_eq!(store.heads().unwrap(), Some(expected.clone()));
+                }
+                // An exposed store must refuse missing blocks without filling
+                // them from the retained physical Create output.
+                let reference = sealed.execution().output().changes()[0].blocks()[0].0;
+                let block_path = root
+                    .join("lane-state/blocks")
+                    .join(encode_hex(reference.hash().as_bytes()));
+                drop(store);
+                std::fs::remove_file(&block_path).unwrap();
+                let damaged = file_tree_snapshot(&root);
+                assert!(
+                    acquire_production_local_slot(&directory, sealed)
+                        .open_external_genesis(sealed, true, &mut ReadBudget::new(100, 100000))
+                        .is_err()
+                );
+                assert_eq!(file_tree_snapshot(&root), damaged);
+            }
+            // Standard-runtime lifecycle mutations need their own Install and
+            // receipt/fence setup; never feed it the probe's synthetic markers.
+            if !probe_mutations {
+                for failure in [
+                    PublicationPoint::ObjectDurable,
+                    PublicationPoint::HeadsStaged,
+                    PublicationPoint::HeadsDurable,
+                ] {
+                    let directory = TestDirectory::new("standard-install-crash");
+                    let interrupted = core::cell::Cell::new(false);
+                    let interrupted_actor_operations = core::cell::Cell::new(0_u8);
+                    let mut store = acquire_production_local_slot(&directory, sealed)
+                        .open_external_genesis(sealed, false, &mut ReadBudget::new(10000, 10000000))
+                        .unwrap();
+                    store
+                        .put_blob(
+                            JournalBlobClass::CatalogArtifact,
+                            &sealed.genesis().runtime().package,
+                            package,
+                        )
+                        .unwrap();
+                    store
+                        .initialize_external_local(sealed, &mut ReadBudget::new(10000, 10000000))
+                        .unwrap();
+                    store
+                        .commit_external_genesis_exposure(
+                            sealed,
+                            PRODUCTION_LOCAL_INTENT,
+                            &mut ReadBudget::new(10000, 10000000),
+                        )
+                        .unwrap();
+                    super::super::replay::tests::qualify_standard_durable_install(
+                        store,
+                        sealed,
+                        admitted,
+                        true,
+                        true,
+                        |store, publication, availability| {
+                            store.publish_sealed_with_availability(
+                                publication,
+                                None,
+                                Some(availability),
+                                |point| {
+                                    if point == failure {
+                                        interrupted.set(true);
+                                        Err(JournalStoreError::Unavailable)
+                                    } else {
+                                        Ok(())
+                                    }
+                                },
+                            )
+                        },
+                        |store, publication, availability| {
+                            store.publish_sealed_with_availability(
+                                publication,
+                                None,
+                                Some(availability),
+                                |point| {
+                                    if point == failure {
+                                        interrupted_actor_operations
+                                            .set(interrupted_actor_operations.get() + 1);
+                                        Err(JournalStoreError::Unavailable)
+                                    } else {
+                                        Ok(())
+                                    }
+                                },
+                            )
+                        },
+                        |store, executor| {
+                            let root = store.root().to_owned();
+                            let heads = store.heads().unwrap();
+                            let snapshot = file_tree_snapshot(&root);
+                            drop(store);
+                            assert!(
+                                acquire_production_local_slot(&directory, sealed)
+                                    .open_external_journal(
+                                        sealed,
+                                        true,
+                                        executor,
+                                        &super::super::replay::NoPrunedOrderedBases,
+                                        &mut ReadBudget::new(0, 0),
+                                    )
+                                    .is_err()
+                            );
+                            assert_eq!(file_tree_snapshot(&root), snapshot);
+                            let reopened = acquire_production_local_slot(&directory, sealed)
+                                .open_external_journal(
+                                    sealed,
+                                    true,
+                                    executor,
+                                    &super::super::replay::NoPrunedOrderedBases,
+                                    &mut ReadBudget::new(10000, 10000000),
+                                )
+                                .unwrap();
+                            assert_eq!(reopened.heads().unwrap(), heads);
+                            assert_eq!(
+                                file_tree_snapshot(&root),
+                                snapshot,
+                                "reopen must not promote or repair interrupted publication"
+                            );
+                            reopened
+                        },
+                    );
+                    assert!(
+                        interrupted.get(),
+                        "configured Install interruption must be exercised"
+                    );
+                    assert_eq!(
+                        interrupted_actor_operations.get(),
+                        2,
+                        "configured Invoke and ACK interruptions must be exercised"
+                    );
+                }
+                return;
+            }
+            for failure in [
+                PublicationPoint::ObjectDurable,
+                PublicationPoint::HeadsStaged,
+                PublicationPoint::HeadsDurable,
+            ] {
+                for lane in [PersistedLane::Linear, PersistedLane::Local] {
+                    let directory = TestDirectory::new(if lane == PersistedLane::Local {
+                        "pinned-local-mutation"
+                    } else {
+                        "pinned-linear-mutation"
+                    });
+                    let mut store = acquire_production_local_slot(&directory, sealed)
+                        .open_external_genesis(sealed, false, &mut ReadBudget::new(100, 100000))
+                        .unwrap();
+                    store
+                        .put_blob(
+                            JournalBlobClass::CatalogArtifact,
+                            &sealed.genesis().runtime().package,
+                            package,
+                        )
+                        .unwrap();
+                    store
+                        .initialize_external_local(sealed, &mut ReadBudget::new(100, 100000))
+                        .unwrap();
+                    store
+                        .commit_external_genesis_exposure(
+                            sealed,
+                            PRODUCTION_LOCAL_INTENT,
+                            &mut ReadBudget::new(100, 100000),
+                        )
+                        .unwrap();
+                    super::super::replay::tests::qualify_pinned_external_mutations(
+                        store,
+                        sealed,
+                        admitted,
+                        lane,
+                        |store, publication, availability| {
+                            store.publish_sealed_with_availability(
+                                publication,
+                                None,
+                                Some(availability),
+                                |point| {
+                                    if point == failure {
+                                        Err(JournalStoreError::Unavailable)
+                                    } else {
+                                        Ok(())
+                                    }
+                                },
+                            )
+                        },
+                        |store, block| {
+                            let path = store
+                                .root()
+                                .join("lane-state/blocks")
+                                .join(encode_hex(block.hash().as_bytes()));
+                            std::fs::remove_file(path).unwrap();
+                        },
+                        |store, executor, missing| {
+                            let root = store.root().to_owned();
+                            let heads = store.heads().unwrap();
+                            let snapshot = file_tree_snapshot(&root);
+                            drop(store);
+                            assert!(
+                                acquire_production_local_slot(&directory, sealed)
+                                    .open_external_genesis(
+                                        sealed,
+                                        true,
+                                        &mut ReadBudget::new(1000, 1000000)
+                                    )
+                                    .is_err()
+                            );
+                            assert!(
+                                acquire_production_local_slot(&directory, sealed)
+                                    .open_external_journal(
+                                        sealed,
+                                        true,
+                                        executor,
+                                        &super::super::replay::NoPrunedOrderedBases,
+                                        &mut ReadBudget::new(0, 0)
+                                    )
+                                    .is_err()
+                            );
+                            assert_eq!(file_tree_snapshot(&root), snapshot);
+                            let mut complete_budget = ReadBudget::new(1000, 1000000);
+                            let reopened = acquire_production_local_slot(&directory, sealed)
+                                .open_external_journal(
+                                    sealed,
+                                    true,
+                                    executor,
+                                    &super::super::replay::NoPrunedOrderedBases,
+                                    &mut complete_budget,
+                                );
+                            assert_eq!(file_tree_snapshot(&root), snapshot);
+                            if missing {
+                                assert!(reopened.is_err());
+                                None
+                            } else {
+                                let reopened = reopened.unwrap();
+                                assert_eq!(reopened.heads().unwrap(), heads);
+                                let used = 1000 - complete_budget.remaining().0;
+                                assert!(used > 0);
+                                drop(reopened);
+                                assert!(
+                                    acquire_production_local_slot(&directory, sealed)
+                                        .open_external_journal(
+                                            sealed,
+                                            true,
+                                            executor,
+                                            &super::super::replay::NoPrunedOrderedBases,
+                                            &mut ReadBudget::new(used - 1, 1000000)
+                                        )
+                                        .is_err()
+                                );
+                                assert_eq!(file_tree_snapshot(&root), snapshot);
+                                let mut reopened =
+                                    acquire_production_local_slot(&directory, sealed)
+                                        .open_external_journal(
+                                            sealed,
+                                            true,
+                                            executor,
+                                            &super::super::replay::NoPrunedOrderedBases,
+                                            &mut ReadBudget::new(used, 1000000),
+                                        )
+                                        .unwrap();
+                                assert_eq!(file_tree_snapshot(&root), snapshot);
+                                let current = reopened.heads().unwrap().unwrap();
+                                if current.checkpoint
+                                    == Some(sealed.initial_checkpoint().unwrap().id())
+                                    || root.join("heads.next").exists()
+                                {
+                                    assert!(
+                                        reopened
+                                            .collect_external_genesis_checkpoint_garbage(
+                                                sealed,
+                                                current.id(),
+                                                gc_limits(),
+                                                &mut ReadBudget::new(1000, 1000000)
+                                            )
+                                            .is_err()
+                                    );
+                                    assert_eq!(file_tree_snapshot(&root), snapshot);
+                                } else {
+                                    // Maintenance cannot use a stale head or an exhausted
+                                    // root audit to begin unlinking candidate garbage.
+                                    assert!(
+                                        reopened
+                                            .collect_external_genesis_checkpoint_garbage(
+                                                sealed,
+                                                JournalHeadsId::ZERO,
+                                                gc_limits(),
+                                                &mut ReadBudget::new(1000, 1000000)
+                                            )
+                                            .is_err()
+                                    );
+                                    assert!(
+                                        reopened
+                                            .collect_external_genesis_checkpoint_garbage(
+                                                sealed,
+                                                current.id(),
+                                                gc_limits(),
+                                                &mut ReadBudget::new(0, 0)
+                                            )
+                                            .is_err()
+                                    );
+                                    assert_eq!(file_tree_snapshot(&root), snapshot);
+                                    let scope = sealed.execution().output().changes()[0]
+                                        .next()
+                                        .context()
+                                        .scope();
+                                    let (_, bytes) =
+                                        scope.encode_block(b"unreachable test block").unwrap();
+                                    let orphan = BlobRef::of_bytes(&bytes);
+                                    reopened
+                                        .put_blob(JournalBlobClass::StateBlock, &orphan, &bytes)
+                                        .unwrap();
+                                    let mut limits = gc_limits();
+                                    limits.max_unlinks_per_run = 1;
+                                    let mut complete = false;
+                                    for round in 0..512 {
+                                        let result = reopened
+                                            .collect_external_genesis_checkpoint_garbage(
+                                                sealed,
+                                                current.id(),
+                                                limits,
+                                                &mut ReadBudget::new(1000, 1000000),
+                                            )
+                                            .unwrap();
+                                        if round > 0 {
+                                            assert!(result.resumed);
+                                        }
+                                        if result.complete {
+                                            complete = true;
+                                            break;
+                                        }
+                                    }
+                                    assert!(complete);
+                                    assert!(
+                                        reopened
+                                            .load_blob(JournalBlobClass::StateBlock, &orphan)
+                                            .unwrap()
+                                            .is_none()
+                                    );
+                                    assert_eq!(reopened.heads().unwrap(), Some(current));
+                                    let after_gc = file_tree_snapshot(&root);
+                                    drop(reopened);
+                                    reopened = acquire_production_local_slot(&directory, sealed)
+                                        .open_external_journal(
+                                            sealed,
+                                            true,
+                                            executor,
+                                            &super::super::replay::NoPrunedOrderedBases,
+                                            &mut ReadBudget::new(1000, 1000000),
+                                        )
+                                        .unwrap();
+                                    assert_eq!(file_tree_snapshot(&root), after_gc);
+                                }
+                                Some(reopened)
+                            }
+                        },
+                    );
+                }
+            }
+        }
+
+        pub(crate) fn snapshot(
+            store: &FileAgentJournalStore,
+        ) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+            file_tree_snapshot(store.root())
+        }
+
+        pub(crate) fn interrupt_checkpoint_after_head_stage(
+            store: &mut FileAgentJournalStore,
+            publication: &ReplaySealedPublication,
+            availability: &ExternalCheckpointValidation<'_>,
+        ) -> Result<JournalPublication, JournalStoreError> {
+            store.publish_sealed_with_availability(publication, None, Some(availability), |point| {
+                if point == PublicationPoint::HeadsStaged {
+                    Err(JournalStoreError::Unavailable)
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        pub(crate) fn new(
+            source: &MemoryAgentJournalStore,
+            sealed: &ReplaySealedLocalGenesis,
+            heads: &JournalHeads,
+        ) -> (Self, FileAgentJournalStore) {
+            let directory = TestDirectory::new("replay-external-file-owner");
+            let mut store = acquire_production_local_slot(&directory, sealed)
+                .open(sealed, false)
+                .unwrap();
+            for ((class, hash), bytes) in source.blobs.iter() {
+                let reference = BlobRef::of_bytes(bytes);
+                assert_eq!(reference.hash, *hash);
+                store.put_blob(*class, &reference, bytes).unwrap();
+            }
+            store.initialize_local(sealed).unwrap();
+            store
+                .commit_local_exposure(sealed, PRODUCTION_LOCAL_INTENT)
+                .unwrap();
+            for ((class, id), bytes) in &source.objects {
+                store
+                    .persist_portable_object(&PortableJournalObject {
+                        class: *class,
+                        id: *id,
+                        bytes: bytes.clone(),
+                    })
+                    .unwrap();
+            }
+            for (id, bytes) in &source.history_nodes {
+                store.persist_history_node(*id, bytes).unwrap();
+            }
+            assert!(
+                source
+                    .history_retirements
+                    .as_ref()
+                    .is_none_or(|queue| queue.records.is_empty())
+            );
+            std::fs::write(store.root().join("heads"), heads.encode()).unwrap();
+            (Self { directory }, store)
+        }
+
+        pub(crate) fn reopen(
+            &self,
+            sealed: &ReplaySealedLocalGenesis,
+        ) -> Result<FileAgentJournalStore, JournalStoreError> {
+            acquire_production_local_slot(&self.directory, sealed)
+                .open_with_external_checkpoint_budget(
+                    sealed,
+                    true,
+                    &mut crate::agent_sdk::state_blocks::ReadBudget::new(100, 100000),
+                )
         }
     }
 
@@ -17829,9 +19623,9 @@ mod tests {
     const PRODUCTION_LOCAL_INTENT: Hash = Hash([0xa7; 32]);
 
     #[cfg(all(target_os = "linux", feature = "storage"))]
-    fn acquire_production_local_slot(
+    fn acquire_production_local_slot<T: ReplaySealedOrdinaryGenesis>(
         directory: &TestDirectory,
-        sealed: &ReplaySealedLocalGenesis,
+        sealed: &T,
     ) -> FileLocalAgentJournalSlot {
         let parent = File::open(&directory.0).unwrap();
         FileLocalAgentJournalSlot::acquire_with_pinned_parents(
@@ -20216,6 +22010,8 @@ mod tests {
         let state_bytes = b"canonical-control-lane";
         let state_reference = BlobRef::of_bytes(state_bytes);
         let control_lane = LaneStateManifest {
+            #[cfg(feature = "experimental-state-blocks")]
+            external_root: None,
             genesis: genesis.id(),
             runtime: runtime_binding(),
             lane: PersistedLane::Control,
@@ -20228,6 +22024,8 @@ mod tests {
         let linear_state_bytes = b"canonical-linear-lane";
         let linear_state_reference = BlobRef::of_bytes(linear_state_bytes);
         let linear_lane = LaneStateManifest {
+            #[cfg(feature = "experimental-state-blocks")]
+            external_root: None,
             genesis: genesis.id(),
             runtime: runtime_binding(),
             lane: PersistedLane::Linear,
@@ -20247,6 +22045,8 @@ mod tests {
         let merge_state_bytes = b"canonical-merge-lane";
         let merge_state_reference = BlobRef::of_bytes(merge_state_bytes);
         let merge_lane = LaneStateManifest {
+            #[cfg(feature = "experimental-state-blocks")]
+            external_root: None,
             genesis: genesis.id(),
             runtime: runtime_binding(),
             lane: PersistedLane::Merge,
@@ -20266,6 +22066,8 @@ mod tests {
         let local_state_bytes = b"canonical-local-lane";
         let local_state_reference = BlobRef::of_bytes(local_state_bytes);
         let local_lane = LaneStateManifest {
+            #[cfg(feature = "experimental-state-blocks")]
+            external_root: None,
             genesis: genesis.id(),
             runtime: runtime_binding(),
             lane: PersistedLane::Local,
@@ -20705,6 +22507,8 @@ mod tests {
         let state_bytes = b"checkpoint-control";
         let state = BlobRef::of_bytes(state_bytes);
         let control = LaneStateManifest {
+            #[cfg(feature = "experimental-state-blocks")]
+            external_root: None,
             genesis: genesis.id(),
             runtime: boundary_heads.runtime.clone(),
             lane: PersistedLane::Control,
@@ -22105,6 +23909,1235 @@ mod tests {
         assert_eq!(fs::read(lock).unwrap(), nonce);
     }
 
+    #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+    #[test]
+    fn experimental_state_blocks_stage_reopen_without_publishing_heads() {
+        use crate::agent::state_block_store::{JournalBlockReader, stage_change_blocks};
+        use crate::agent_sdk::{
+            AgentId as SdkAgentId, Hash as SdkHash, SpaceId as SdkSpaceId, StateLane,
+            state_blocks::{BlockScope, ReadBudget},
+            state_change::StateChange,
+            state_root::RootContext,
+            state_tree::{BlockReader, StateTree, TreeError, WriteBudget},
+        };
+
+        let directory = TestDirectory::new("state-block-stage");
+        let mut store = open_file_store(&directory);
+        let scope = BlockScope::new(
+            SdkSpaceId([1; 32]),
+            SdkAgentId([2; 32]),
+            SdkHash([3; 32]),
+            StateLane::Linear,
+        )
+        .unwrap();
+        let next = RootContext::new(scope, SdkHash([4; 32]), SdkHash([5; 32])).unwrap();
+        let base = SdkHash([6; 32]);
+        let value = vec![7; 65536];
+        let tree = StateTree::empty(scope);
+        let update = tree
+            .update(
+                [8; 32],
+                Some(&value),
+                &mut JournalBlockReader {
+                    store: &store,
+                    scope,
+                },
+                &mut ReadBudget::new(0, 0),
+                &mut WriteBudget::new(10, 100000),
+            )
+            .unwrap();
+        let expected = update.tree;
+        let candidate = StateChange::from_update(base, next, update).unwrap();
+        let before = file_tree_snapshot(&directory.0);
+        assert_eq!(
+            stage_change_blocks(&mut store, &candidate, SdkHash([9; 32]), next),
+            Err(JournalStoreError::ScopeMismatch)
+        );
+        assert_eq!(file_tree_snapshot(&directory.0), before);
+        assert_eq!(
+            stage_change_blocks(&mut store, &candidate, base, next).unwrap(),
+            candidate.blocks().len()
+        );
+        assert_eq!(
+            stage_change_blocks(&mut store, &candidate, base, next).unwrap(),
+            0
+        );
+        assert!(store.heads().unwrap().is_none());
+        drop(store);
+        let store = open_file_store(&directory);
+        assert!(store.heads().unwrap().is_none());
+        let mut reader = JournalBlockReader {
+            store: &store,
+            scope,
+        };
+        assert_eq!(
+            expected
+                .get(&[8; 32], &mut reader, &mut ReadBudget::new(10, 100000))
+                .unwrap(),
+            Some(value)
+        );
+        assert_eq!(
+            expected
+                .audit(&mut reader, &mut ReadBudget::new(10, 100000))
+                .unwrap()
+                .rows,
+            1
+        );
+        assert!(matches!(
+            reader.read(expected.root().unwrap(), &mut []),
+            Err(TreeError::Block(_))
+        ));
+        let foreign = BlockScope::new(
+            SdkSpaceId([1; 32]),
+            SdkAgentId([9; 32]),
+            SdkHash([3; 32]),
+            StateLane::Linear,
+        )
+        .unwrap();
+        let mut reader = JournalBlockReader {
+            store: &store,
+            scope: foreign,
+        };
+        assert!(
+            expected
+                .get(&[8; 32], &mut reader, &mut ReadBudget::new(10, 100000))
+                .is_err()
+        );
+        drop(store);
+        let mut store = open_file_store(&directory);
+        let reference = candidate.blocks()[0].0;
+        let path = directory
+            .agent_root(config().identity.agent)
+            .join("lane-state/blocks")
+            .join(encode_hex(reference.hash().as_bytes()));
+        let mut bytes = fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            stage_change_blocks(&mut store, &candidate, base, next),
+            Err(JournalStoreError::Corrupt)
+        );
+        let mut reader = JournalBlockReader {
+            store: &store,
+            scope,
+        };
+        assert_eq!(
+            expected.audit(&mut reader, &mut ReadBudget::new(10, 100000)),
+            Err(TreeError::Storage)
+        );
+        assert!(store.heads().unwrap().is_none());
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn experimental_state_root_context_is_cycle_free_and_cursor_bound() {
+        use crate::agent::state_block_store::{initial_root_context, journal_root_context};
+        let genesis = genesis();
+        let runtime = genesis.runtime();
+        let linear = initial_root_context(&genesis.create, PersistedLane::Linear, None).unwrap();
+        let initial = LaneCursor::Ordered {
+            base: OrderedBase::post_genesis(),
+        };
+        assert_eq!(
+            journal_root_context(&genesis, runtime, PersistedLane::Linear, None, &initial).unwrap(),
+            linear
+        );
+        let mut admitted_again = genesis.clone();
+        admitted_again.admission = AgentGenesisAdmissionId::from_bytes([0x72; 32]);
+        assert_ne!(admitted_again.id(), genesis.id());
+        assert_eq!(
+            journal_root_context(
+                &admitted_again,
+                runtime,
+                PersistedLane::Linear,
+                None,
+                &initial
+            )
+            .unwrap(),
+            linear,
+            "post-state-dependent admission must not change initial state identity"
+        );
+
+        let cursor = LaneCursor::Ordered {
+            base: OrderedBase {
+                index: 1,
+                head: Some(OrderedEntryId([0x73; 32])),
+            },
+        };
+        let next =
+            journal_root_context(&genesis, runtime, PersistedLane::Linear, None, &cursor).unwrap();
+        assert_eq!(next.scope(), linear.scope());
+        assert_ne!(next, linear);
+        assert_ne!(
+            journal_root_context(
+                &admitted_again,
+                runtime,
+                PersistedLane::Linear,
+                None,
+                &cursor
+            )
+            .unwrap(),
+            next
+        );
+        let mut upgraded = runtime.clone();
+        upgraded.program = ProgramId([0x74; 32]);
+        let upgraded_context =
+            journal_root_context(&genesis, &upgraded, PersistedLane::Linear, None, &cursor)
+                .unwrap();
+        assert_eq!(
+            upgraded_context.scope(),
+            next.scope(),
+            "runtime upgrades preserve storage identity"
+        );
+        assert_ne!(upgraded_context, next);
+        assert!(
+            journal_root_context(&genesis, &upgraded, PersistedLane::Linear, None, &initial)
+                .is_err()
+        );
+        upgraded.agent = AgentId([0x75; 32]);
+        assert!(
+            journal_root_context(&genesis, &upgraded, PersistedLane::Linear, None, &cursor)
+                .is_err()
+        );
+
+        let invalid = LaneCursor::Ordered {
+            base: OrderedBase {
+                index: 1,
+                head: None,
+            },
+        };
+        assert!(
+            journal_root_context(&genesis, runtime, PersistedLane::Linear, None, &invalid).is_err()
+        );
+        assert!(initial_root_context(&genesis.create, PersistedLane::Control, None).is_err());
+        let mut new_generation = genesis.create.clone();
+        let ReplayOperation::Management {
+            request: LifecycleRequest::Authorized { admission, .. },
+        } = &mut new_generation.operation
+        else {
+            panic!("fixture Create")
+        };
+        admission.receipt.claim.sequence += 1;
+        assert_ne!(
+            initial_root_context(&new_generation, PersistedLane::Linear, None)
+                .unwrap()
+                .scope(),
+            linear.scope()
+        );
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn experimental_manifest_marks_exact_block_closure_without_admitting_publication() {
+        use crate::agent::state_block_store::{
+            JournalBlockReader, StateBlockStaging, initial_root_context, stage_change_blocks,
+        };
+        use crate::agent_sdk::{
+            Hash as SdkHash,
+            state_blocks::ReadBudget,
+            state_change::StateChange,
+            state_root::StateRootDescriptor,
+            state_tree::{StateTree, WriteBudget},
+        };
+        let genesis = genesis();
+        let config = config();
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        initialize(&mut store, &genesis);
+        let heads = store.heads().unwrap();
+        let context = initial_root_context(&genesis.create, PersistedLane::Linear, None).unwrap();
+        let mut tree = StateTree::empty(context.scope());
+        let mut previous = StateRootDescriptor::new(context, tree.root());
+        let mut changes = Vec::new();
+        for value in [b"obsolete".to_vec(), vec![7; 65536]] {
+            let update = tree
+                .update(
+                    [8; 32],
+                    Some(&value),
+                    &mut JournalBlockReader {
+                        store: &store,
+                        scope: context.scope(),
+                    },
+                    &mut ReadBudget::new(10, 100000),
+                    &mut WriteBudget::new(10, 100000),
+                )
+                .unwrap();
+            tree = update.tree;
+            let change = StateChange::from_update(previous.commitment(), context, update).unwrap();
+            stage_change_blocks(&mut store, &change, previous.commitment(), context).unwrap();
+            previous = change.next();
+            changes.push(change);
+        }
+        let bytes = previous.encode();
+        let manifest = LaneStateManifest {
+            genesis: genesis.id(),
+            runtime: genesis.runtime().clone(),
+            lane: PersistedLane::Linear,
+            cursor: LaneCursor::Ordered {
+                base: OrderedBase::post_genesis(),
+            },
+            state: BlobRef::of_bytes(&bytes),
+            external_root: Some(super::super::journal::ExternalStateRoot {
+                descriptor: previous,
+                runtime: genesis.runtime().clone(),
+                cursor: LaneCursor::Ordered {
+                    base: OrderedBase::post_genesis(),
+                },
+            }),
+        };
+        store
+            .put_blob(JournalBlobClass::LaneState, &manifest.state, &bytes)
+            .unwrap();
+        store.put(&manifest).unwrap();
+        let original_heads = store.heads().unwrap();
+        assert!(matches!(
+            StateBlockStaging::audit_manifest(&mut store, &manifest, &mut ReadBudget::new(0, 0)),
+            Err(JournalStoreError::LimitExceeded)
+        ));
+        let audited = StateBlockStaging::audit_manifest(
+            &mut store,
+            &manifest,
+            &mut ReadBudget::new(100, 1000000),
+        )
+        .unwrap();
+        assert_eq!(audited.available(), previous);
+        drop(audited);
+        assert_eq!(store.heads().unwrap(), original_heads);
+        let mut missing_descriptor = store.clone();
+        Arc::make_mut(&mut missing_descriptor.blobs)
+            .remove(&(JournalBlobClass::LaneState, manifest.state.hash));
+        assert!(matches!(
+            StateBlockStaging::audit_manifest(
+                &mut missing_descriptor,
+                &manifest,
+                &mut ReadBudget::new(100, 1000000),
+            ),
+            Err(JournalStoreError::MissingObject)
+        ));
+        let mut foreign_generation = manifest.clone();
+        foreign_generation.genesis = AgentJournalGenesisId([0x76; 32]);
+        assert!(matches!(
+            StateBlockStaging::audit_manifest(
+                &mut store,
+                &foreign_generation,
+                &mut ReadBudget::new(100, 1000000),
+            ),
+            Err(JournalStoreError::ScopeMismatch)
+        ));
+        let mut opaque = manifest.clone();
+        opaque.external_root = None;
+        store.put(&opaque).unwrap();
+        assert!(matches!(
+            StateBlockStaging::audit_manifest(
+                &mut store,
+                &opaque,
+                &mut ReadBudget::new(100, 1000000)
+            ),
+            Err(JournalStoreError::NonCanonical)
+        ));
+        assert_eq!(
+            LaneStateManifest::decode(&manifest.encode()).unwrap(),
+            manifest
+        );
+        let mut mark = GcMark::new(gc_limits());
+        assert_eq!(
+            mark_lane_state(&store, &mut mark, manifest.id()).unwrap(),
+            manifest
+        );
+        let reachable: BTreeSet<_> = changes[1]
+            .blocks()
+            .iter()
+            .map(|(reference, _)| Hash(reference.hash().0))
+            .collect();
+        let marked: BTreeSet<_> = mark
+            .blobs
+            .keys()
+            .filter_map(|(class, hash)| (*class == JournalBlobClass::StateBlock).then_some(*hash))
+            .collect();
+        assert_eq!(marked, reachable);
+        let obsolete = Hash(changes[0].blocks()[0].0.hash().0);
+        assert!(
+            store
+                .blobs
+                .contains_key(&(JournalBlobClass::StateBlock, obsolete))
+        );
+        assert!(
+            !marked.contains(&obsolete),
+            "old unpinned blocks are not retained by the new root"
+        );
+        assert_eq!(
+            validate_lane_state(&store, manifest.id()),
+            Err(JournalStoreError::Unavailable),
+            "full closure marking must not silently enable ordinary publication"
+        );
+        let mut limits = gc_limits();
+        limits.max_marked_blobs = 1;
+        assert_eq!(
+            mark_lane_state(&store, &mut GcMark::new(limits), manifest.id()),
+            Err(JournalStoreError::LimitExceeded)
+        );
+
+        let mut wrong_cursor = manifest.clone();
+        wrong_cursor.cursor = LaneCursor::Ordered {
+            base: OrderedBase {
+                index: 1,
+                head: Some(OrderedEntryId([0x72; 32])),
+            },
+        };
+        // Projection advancement does not alter the root's provenance or bytes.
+        store.put(&wrong_cursor).unwrap();
+        mark_lane_state(&store, &mut GcMark::new(gc_limits()), wrong_cursor.id()).unwrap();
+        assert_eq!(
+            StateBlockStaging::audit_manifest(
+                &mut store,
+                &wrong_cursor,
+                &mut ReadBudget::new(100, 1000000),
+            )
+            .unwrap()
+            .available(),
+            previous
+        );
+        wrong_cursor.external_root.as_mut().unwrap().cursor = wrong_cursor.cursor.clone();
+        store.put(&wrong_cursor).unwrap();
+        assert!(matches!(
+            StateBlockStaging::audit_manifest(
+                &mut store,
+                &wrong_cursor,
+                &mut ReadBudget::new(100, 1000000),
+            ),
+            Err(JournalStoreError::ScopeMismatch)
+        ));
+        assert_eq!(
+            mark_lane_state(&store, &mut GcMark::new(gc_limits()), wrong_cursor.id()),
+            Err(JournalStoreError::ScopeMismatch)
+        );
+        let missing = changes[1]
+            .blocks()
+            .iter()
+            .find(|(reference, _)| Some(*reference) != tree.root())
+            .unwrap()
+            .0;
+        Arc::make_mut(&mut store.blobs)
+            .remove(&(JournalBlobClass::StateBlock, Hash(missing.hash().0)));
+        assert!(matches!(
+            StateBlockStaging::audit_manifest(
+                &mut store,
+                &manifest,
+                &mut ReadBudget::new(100, 1000000),
+            ),
+            Err(JournalStoreError::MissingObject)
+        ));
+        assert_eq!(
+            mark_lane_state(&store, &mut GcMark::new(gc_limits()), manifest.id()),
+            Err(JournalStoreError::MissingObject)
+        );
+        assert_eq!(
+            store.heads().unwrap(),
+            heads,
+            "closure checks must not publish or collect"
+        );
+        // Opaque bytes with descriptor magic are not a public graph declaration.
+        let mut opaque = manifest.clone();
+        opaque.external_root = None;
+        store.put(&opaque).unwrap();
+        let mut mark = GcMark::new(gc_limits());
+        mark_lane_state(&store, &mut mark, opaque.id()).unwrap();
+        assert!(
+            mark.blobs
+                .keys()
+                .all(|(class, _)| *class != JournalBlobClass::StateBlock)
+        );
+        assert_ne!(opaque.id(), manifest.id());
+        assert!(manifest.encode().len() > opaque.encode().len() + 1 + 4 + bytes.len());
+        let mut invalid = manifest.clone();
+        invalid.state.hash = Hash(SdkHash([1; 32]).0);
+        assert!(invalid.validate().is_err());
+        let mut invalid = manifest.clone();
+        invalid.lane = PersistedLane::Control;
+        assert!(invalid.validate().is_err());
+        let mut invalid_wire = manifest.encode();
+        invalid_wire.push(0);
+        assert!(LaneStateManifest::decode(&invalid_wire).is_err());
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn experimental_state_root_provenance_retains_bytes_across_projection_positions() {
+        use crate::agent::journal::ExternalStateRoot;
+        use crate::agent::state_block_store::initial_root_context;
+        use crate::agent_sdk::state_root::StateRootDescriptor;
+        let genesis = genesis();
+        let node = config().replicas[0].node;
+        for lane in [PersistedLane::Linear, PersistedLane::Local] {
+            let context = initial_root_context(
+                &genesis.create,
+                lane,
+                (lane == PersistedLane::Local).then_some(node),
+            )
+            .unwrap();
+            let descriptor = StateRootDescriptor::new(context, None);
+            let (origin, current, future) = if lane == PersistedLane::Linear {
+                (
+                    LaneCursor::Ordered {
+                        base: OrderedBase::post_genesis(),
+                    },
+                    LaneCursor::Ordered {
+                        base: OrderedBase {
+                            index: 2,
+                            head: Some(OrderedEntryId([2; 32])),
+                        },
+                    },
+                    LaneCursor::Ordered {
+                        base: OrderedBase {
+                            index: 3,
+                            head: Some(OrderedEntryId([3; 32])),
+                        },
+                    },
+                )
+            } else {
+                (
+                    LaneCursor::Local {
+                        node,
+                        revision: 0,
+                        head: None,
+                    },
+                    LaneCursor::Local {
+                        node,
+                        revision: 2,
+                        head: Some(LocalEntryId([2; 32])),
+                    },
+                    LaneCursor::Local {
+                        node,
+                        revision: 3,
+                        head: Some(LocalEntryId([3; 32])),
+                    },
+                )
+            };
+            let mut manifest = LaneStateManifest {
+                genesis: genesis.id(),
+                runtime: genesis.runtime().clone(),
+                lane,
+                cursor: current,
+                state: BlobRef::of_bytes(&descriptor.encode()),
+                external_root: Some(ExternalStateRoot {
+                    descriptor,
+                    runtime: genesis.runtime().clone(),
+                    cursor: origin,
+                }),
+            };
+            manifest.validate().unwrap();
+            assert_eq!(
+                LaneStateManifest::decode(&manifest.encode()).unwrap(),
+                manifest
+            );
+            // A changed current runtime does not rewrite old root provenance.
+            manifest.runtime.program = ProgramId([9; 32]);
+            manifest.validate().unwrap();
+            assert_eq!(
+                manifest.external_root.as_ref().unwrap().descriptor.encode(),
+                descriptor.encode()
+            );
+            assert_eq!(
+                LaneStateManifest::decode(&manifest.encode()).unwrap(),
+                manifest
+            );
+            let mut invalid = manifest.clone();
+            invalid.external_root.as_mut().unwrap().cursor = future;
+            assert!(invalid.validate().is_err());
+            assert!(LaneStateManifest::decode(&invalid.encode()).is_err());
+            let mut invalid = manifest.clone();
+            invalid.external_root.as_mut().unwrap().runtime.agent = AgentId([8; 32]);
+            assert!(invalid.validate().is_err());
+            let mut invalid = manifest.clone();
+            let mut origin = manifest.cursor.clone();
+            match &mut origin {
+                LaneCursor::Ordered { base } => base.head = Some(OrderedEntryId([8; 32])),
+                LaneCursor::Local { head, .. } => *head = Some(LocalEntryId([8; 32])),
+                _ => unreachable!(),
+            }
+            invalid.external_root.as_mut().unwrap().cursor = origin;
+            assert!(invalid.validate().is_err());
+        }
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn experimental_staging_audits_once_then_advances_availability_without_publishing() {
+        use crate::agent::state_block_store::{
+            StateBlockStaging, initial_root_context, journal_root_context,
+        };
+        use crate::agent_sdk::{
+            state_blocks::ReadBudget,
+            state_change::StateChange,
+            state_root::StateRootDescriptor,
+            state_tree::{StateTree, WriteBudget},
+        };
+        let genesis = genesis();
+        let config = config();
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        let context = initial_root_context(&genesis.create, PersistedLane::Linear, None).unwrap();
+        let empty = StateRootDescriptor::new(context, None);
+        let mut session = StateBlockStaging::audit_base(
+            &mut store,
+            empty,
+            context,
+            empty.commitment(),
+            &mut ReadBudget::new(0, 0),
+        )
+        .unwrap();
+        let mut tree = StateTree::empty(context.scope());
+        let mut first = None;
+        for index in 1..=32u8 {
+            let cursor = LaneCursor::Ordered {
+                base: OrderedBase {
+                    index: u64::from(index),
+                    head: Some(OrderedEntryId([index; 32])),
+                },
+            };
+            let next = journal_root_context(
+                &genesis,
+                genesis.runtime(),
+                PersistedLane::Linear,
+                None,
+                &cursor,
+            )
+            .unwrap();
+            let update = tree
+                .update(
+                    [index; 32],
+                    Some(&[index]),
+                    &mut session,
+                    &mut ReadBudget::new(300, 1000000),
+                    &mut WriteBudget::new(300, 1000000),
+                )
+                .unwrap();
+            tree = update.tree;
+            let change =
+                StateChange::from_update(session.available().commitment(), next, update).unwrap();
+            assert!(
+                session
+                    .stage_next(&change, next, &mut ReadBudget::new(1024, 1000000))
+                    .unwrap()
+                    > 0
+            );
+            assert_eq!(session.available(), change.next());
+            first.get_or_insert(change);
+        }
+        let first = first.unwrap();
+        let current = session.available();
+        assert_eq!(
+            session.stage_next(&first, first.next().context(), &mut ReadBudget::new(0, 0)),
+            Err(JournalStoreError::Conflict)
+        );
+        assert_eq!(session.available(), current);
+        assert_eq!(
+            tree.get(&[32; 32], &mut session, &mut ReadBudget::new(300, 1000000))
+                .unwrap(),
+            Some(vec![32])
+        );
+        drop(session);
+        assert!(store.heads().unwrap().is_none());
+        // Re-entering after relinquishing the exclusive borrow must re-audit;
+        // an arbitrary descriptor or mere blob existence is not a durable pin.
+        assert!(matches!(
+            StateBlockStaging::audit_base(
+                &mut store,
+                current,
+                current.context(),
+                current.commitment(),
+                &mut ReadBudget::new(0, 0)
+            ),
+            Err(JournalStoreError::LimitExceeded)
+        ));
+        let session = StateBlockStaging::audit_base(
+            &mut store,
+            current,
+            current.context(),
+            current.commitment(),
+            &mut ReadBudget::new(300, 1000000),
+        )
+        .unwrap();
+        assert_eq!(session.available(), current);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+    #[test]
+    #[ignore = "requires just build-agent-state-probe; physical guest with journal files"]
+    fn compiled_state_change_stages_to_journal_and_survives_reopen() {
+        use crate::agent::{
+            state_block_pvm::StateBlockHost,
+            state_block_store::{
+                JournalBlockReader, StateBlockStaging, journal_root_context, journal_state_work,
+            },
+        };
+        use crate::agent_sdk::{
+            ActorId as SdkActorId, Hash as SdkHash, RuntimeExecutionContext, RuntimeWork,
+            state_blocks::ReadBudget,
+            state_change::StateChange,
+            state_execution::{
+                MAX_STATE_EXECUTION_OUTPUT_BYTES, StateExecutionOutput, StateExecutionWork,
+            },
+            state_root::StateRootDescriptor,
+            state_rows::ActorRows,
+            state_tree::{StateTree, WriteBudget},
+        };
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../target"));
+        let path = target.join("agent-state-probe/riscv64em-vos/release/state_tree_probe.elf");
+        let elf = fs::read(&path)
+            .unwrap_or_else(|e| panic!("build probe first: {}: {e}", path.display()));
+        let program = vos_pvm_compiler::link_elf_spi(&elf).unwrap();
+        let sealed =
+            crate::agent::replay::tests::admitted_state_probe_genesis(ProgramId::of_pvm(&program));
+        let genesis = sealed.genesis();
+        let admitted =
+            crate::agent::package_admission::tests::admitted_state_fixture(program.clone());
+        let runtime = admitted
+            .binding(genesis.runtime().space, genesis.runtime().agent)
+            .unwrap();
+        // Synthetic post-upgrade projection: this test authenticates package
+        // execution/staging, NOT the lifecycle transition selecting a runtime.
+        // The retained base still has its original root-producing identity.
+        let projection = LaneCursor::Ordered {
+            base: OrderedBase {
+                index: 1,
+                head: Some(OrderedEntryId([7; 32])),
+            },
+        };
+        let initial = LaneCursor::Ordered {
+            base: OrderedBase::post_genesis(),
+        };
+        let next = LaneCursor::Ordered {
+            base: OrderedBase {
+                index: 2,
+                head: Some(OrderedEntryId([9; 32])),
+            },
+        };
+        let before_context = journal_root_context(
+            genesis,
+            genesis.runtime(),
+            PersistedLane::Linear,
+            None,
+            &initial,
+        )
+        .unwrap();
+        let after_context =
+            journal_root_context(genesis, &runtime, PersistedLane::Linear, None, &next).unwrap();
+        let scope = before_context.scope();
+        let directory = TestDirectory::new("compiled-state-change");
+        // This storage fixture has no installed Authority foundation; use the
+        // test-only opener with the exact admitted Agent/replica identities.
+        let open_probe_store = || {
+            FileAgentJournalStore::open_unverified_for_test(
+                directory.agent_root(genesis.runtime().agent),
+                directory.lock(genesis.runtime().agent),
+                sealed.replica().node,
+            )
+            .unwrap()
+        };
+        let mut store = open_probe_store();
+        let empty = StateRootDescriptor::new(before_context, None);
+        let mut session = StateBlockStaging::audit_base(
+            &mut store,
+            empty,
+            before_context,
+            empty.commitment(),
+            &mut ReadBudget::new(0, 0),
+        )
+        .unwrap();
+        let mut tree = StateTree::empty(scope);
+        let old_value = vec![0x5a; 65536];
+        // Contexts come from a test-admitted genesis. Seeding is not lifecycle
+        // execution or production program admission; no heads are installed.
+        for (key, value) in [
+            (b"key".as_slice(), old_value.as_slice()),
+            (b"untouched".as_slice(), b"retained".as_slice()),
+        ] {
+            let update = ActorRows::new(tree, SdkActorId([1; 32]), SdkHash([1; 32]))
+                .unwrap()
+                .update_accounted_batch(
+                    &[(key.to_vec(), Some(value.to_vec()))],
+                    admitted.external_state_limits(),
+                    &mut session,
+                    &mut ReadBudget::new(300, 1024 * 1024),
+                    &mut WriteBudget::new(300, 1024 * 1024),
+                )
+                .unwrap()
+                .update;
+            tree = update.tree;
+            let change =
+                StateChange::from_update(session.available().commitment(), before_context, update)
+                    .unwrap();
+            session
+                .stage_next(
+                    &change,
+                    before_context,
+                    &mut ReadBudget::new(1024, 1024 * 1024),
+                )
+                .unwrap();
+        }
+        let base = session.available();
+        drop(session);
+        drop(store);
+        let mut store = open_probe_store();
+        let files_before = file_tree_snapshot(&directory.0);
+        let mut session = StateBlockStaging::audit_base(
+            &mut store,
+            base,
+            before_context,
+            base.commitment(),
+            &mut ReadBudget::new(300, 1024 * 1024),
+        )
+        .unwrap();
+        let value = b"compiled journal mutation";
+        let native = ActorRows::new(tree, SdkActorId([1; 32]), SdkHash([1; 32]))
+            .unwrap()
+            .update_accounted_batch(
+                &[
+                    (b"key".to_vec(), Some(value.to_vec())),
+                    (b"mirror".to_vec(), Some(value.to_vec())),
+                ],
+                admitted.external_state_limits(),
+                &mut session,
+                &mut ReadBudget::new(300, 1024 * 1024),
+                &mut WriteBudget::new(300, 1024 * 1024),
+            )
+            .unwrap()
+            .update;
+        let expected = StateChange::from_update(base.commitment(), after_context, native).unwrap();
+        let invocation = crate::agent_sdk::InvocationWork {
+            space: crate::agent_sdk::SpaceId(genesis.runtime().space.0),
+            agent: crate::agent_sdk::AgentId(genesis.runtime().agent.0),
+            runtime_deployment: crate::agent_sdk::DeploymentId(runtime.deployment.0),
+            invocation: crate::agent_sdk::InvocationId([1; 32]),
+            actor: SdkActorId([1; 32]),
+            incarnation: SdkHash([1; 32]),
+            deployment: crate::agent_sdk::DeploymentId([1; 32]),
+            program: crate::agent_sdk::ProgramId([1; 32]),
+            mode: crate::agent_sdk::MethodMode::Linear,
+            origin: crate::agent_sdk::InvocationOrigin::anonymous(),
+            roles: crate::agent_sdk::InvocationRoleClaims::none(),
+            message: value.to_vec(),
+            installation_data: None,
+            availability: Vec::new(),
+            gas: 1_000_000,
+            recovery_only: false,
+        };
+        let authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+            crate::agent_sdk::PublicPreflight::for_work(&invocation, 1),
+        );
+        let input = ReplayInput {
+            runtime: runtime.clone(),
+            operation: ReplayOperation::CleanInvoke {
+                context: RuntimeExecutionContext::Direct,
+                work: invocation,
+                authorization,
+                observed_slot: 1,
+            },
+        };
+        let before = crate::agent::wire::RuntimeState {
+            linear: base.encode(),
+            ..Default::default()
+        };
+        let manifest = LaneStateManifest {
+            genesis: genesis.id(),
+            runtime: runtime.clone(),
+            lane: PersistedLane::Linear,
+            cursor: projection,
+            state: BlobRef::of_bytes(&before.linear),
+            external_root: Some(crate::agent::journal::ExternalStateRoot {
+                descriptor: base,
+                runtime: genesis.runtime().clone(),
+                cursor: initial,
+            }),
+        };
+        let lanes = vec![(manifest, next)];
+        let work = journal_state_work(genesis, &input, &before, &lanes).unwrap();
+        let position = crate::agent::replay::ReplayPosition::Ordered {
+            id: OrderedEntryId([9; 32]),
+            index: 2,
+            merge_frontier: MergeFrontierId([8; 32]),
+            merge_seal: None,
+        };
+        let request = work.encode().unwrap();
+        for field in 0..6 {
+            let mut substituted = input.clone();
+            match field {
+                0 => substituted.runtime.program.0[0] ^= 1,
+                1 => substituted.runtime.deployment.0[0] ^= 1,
+                2 => substituted.runtime.producer.0[0] ^= 1,
+                3 => substituted.runtime.package.hash.0[0] ^= 1,
+                4 => substituted.runtime.runtime_abi.0[0] ^= 1,
+                _ => substituted.runtime.execution_semantics.0[0] ^= 1,
+            }
+            assert!(matches!(
+                StateBlockHost {
+                    scope,
+                    reader: &mut session,
+                    budget: &mut ReadBudget::new(0, 0),
+                }
+                .execute_admitted_journal(
+                    &admitted,
+                    genesis,
+                    &substituted,
+                    &before,
+                    position,
+                    &lanes,
+                    1_000_000_000
+                ),
+                Err(crate::agent::state_block_pvm::BlockPvmError::ProgramMismatch)
+            ));
+        }
+        assert_eq!(session.available(), base);
+        assert_eq!(file_tree_snapshot(&directory.0), files_before);
+        for (gas, maximum) in [(0, MAX_STATE_EXECUTION_OUTPUT_BYTES), (1_000_000_000, 1)] {
+            assert!(
+                StateBlockHost {
+                    scope,
+                    reader: &mut session,
+                    budget: &mut ReadBudget::new(300, 1024 * 1024)
+                }
+                .execute(&program, &request, gas, maximum)
+                .is_err()
+            );
+            assert_eq!(session.available(), base);
+            assert_eq!(file_tree_snapshot(&directory.0), files_before);
+        }
+        let execution = StateBlockHost {
+            scope,
+            reader: &mut session,
+            budget: &mut ReadBudget::new(300, 1024 * 1024),
+        }
+        .execute_admitted_journal(
+            &admitted,
+            genesis,
+            &input,
+            &before,
+            position,
+            &lanes,
+            1_000_000_000,
+        )
+        .unwrap();
+        let output = execution.output();
+        let transition = execution.transition();
+        assert_eq!(
+            transition.disposition,
+            crate::agent::replay::ReplayDisposition::Applied
+        );
+        assert_eq!(transition.state.linear, expected.next().encode());
+        assert_eq!(output.changes().len(), 1);
+        let candidate = output.changes()[0].clone();
+        assert_eq!(output.transition().state.linear, expected.next().encode());
+        let mut other = work.work().clone();
+        let RuntimeWork::Invoke { observed_slot, .. } = &mut other else {
+            unreachable!()
+        };
+        *observed_slot += 1;
+        let other = StateExecutionWork::new(other, work.lanes().to_vec(), work.limits()).unwrap();
+        assert!(
+            StateExecutionOutput::decode_for(&output.encode().unwrap(), &other).is_err(),
+            "a physical response cannot be attached to different runtime work"
+        );
+        assert_eq!(
+            candidate, expected,
+            "compiled and native roots/blocks must agree exactly"
+        );
+        assert_eq!(file_tree_snapshot(&directory.0), files_before);
+        assert_eq!(
+            session.stage_execution(&execution, &mut ReadBudget::new(0, 0)),
+            Err(JournalStoreError::LimitExceeded)
+        );
+        assert_eq!(session.available(), base);
+        assert_eq!(file_tree_snapshot(&directory.0), files_before);
+        assert_eq!(
+            session.verify_persisted_execution(&execution, &mut ReadBudget::new(1024, 1024 * 1024)),
+            Err(JournalStoreError::MissingObject),
+            "recovery must not replace missing durable blocks with guest output"
+        );
+        assert_eq!(session.available(), base);
+        assert_eq!(file_tree_snapshot(&directory.0), files_before);
+        assert!(
+            session
+                .stage_execution(&execution, &mut ReadBudget::new(1024, 1024 * 1024))
+                .unwrap()
+                > 0
+        );
+        assert_eq!(session.available(), expected.next());
+        drop(session);
+        let persisted_files = file_tree_snapshot(&directory.0);
+        let mut session = StateBlockStaging::audit_base(
+            &mut store,
+            base,
+            before_context,
+            base.commitment(),
+            &mut ReadBudget::new(300, 1024 * 1024),
+        )
+        .unwrap();
+        assert_eq!(
+            session.verify_persisted_execution(&execution, &mut ReadBudget::new(0, 0)),
+            Err(JournalStoreError::LimitExceeded)
+        );
+        assert_eq!(session.available(), base);
+        session
+            .verify_persisted_execution(&execution, &mut ReadBudget::new(1024, 1024 * 1024))
+            .unwrap();
+        assert_eq!(session.available(), expected.next());
+        assert_eq!(file_tree_snapshot(&directory.0), persisted_files);
+        assert_eq!(
+            session.stage_execution(&execution, &mut ReadBudget::new(0, 0)),
+            Err(JournalStoreError::Conflict),
+            "stale execution must not overwrite its successor"
+        );
+        // An identical value at a later execution position is a data no-op.
+        // This does not simulate retained-result/idempotency handling: the
+        // fixture still executes, and no authoritative heads are published.
+        let retained = candidate.next();
+        let after = transition.state.clone();
+        let retained_files = file_tree_snapshot(&directory.0);
+        let later_cursor = LaneCursor::Ordered {
+            base: OrderedBase {
+                index: 3,
+                head: Some(OrderedEntryId([10; 32])),
+            },
+        };
+        let later_position = crate::agent::replay::ReplayPosition::Ordered {
+            id: OrderedEntryId([10; 32]),
+            index: 3,
+            merge_frontier: MergeFrontierId([8; 32]),
+            merge_seal: None,
+        };
+        let mut retained_manifest = lanes[0].0.clone();
+        retained_manifest.cursor = lanes[0].1.clone();
+        retained_manifest.state = BlobRef::of_bytes(&after.linear);
+        retained_manifest.external_root = Some(crate::agent::journal::ExternalStateRoot {
+            descriptor: retained,
+            runtime: runtime.clone(),
+            cursor: lanes[0].1.clone(),
+        });
+        let no_op = StateBlockHost {
+            scope,
+            reader: &mut session,
+            budget: &mut ReadBudget::new(300, 1024 * 1024),
+        }
+        .execute_admitted_journal(
+            &admitted,
+            genesis,
+            &input,
+            &after,
+            later_position,
+            &[(retained_manifest.clone(), later_cursor)],
+            1_000_000_000,
+        )
+        .unwrap();
+        assert!(no_op.output().changes().is_empty());
+        assert_eq!(no_op.transition().state, after);
+        assert_eq!(
+            session.stage_execution(&no_op, &mut ReadBudget::new(0, 0)),
+            Ok(0)
+        );
+        assert_eq!(session.available(), retained);
+        assert_eq!(
+            session.verify_persisted_execution(&no_op, &mut ReadBudget::new(0, 0)),
+            Ok(())
+        );
+        assert_eq!(file_tree_snapshot(&directory.0), retained_files);
+        drop(session);
+        assert!(store.heads().unwrap().is_none());
+        drop(store);
+        let mut store = open_probe_store();
+        assert!(store.heads().unwrap().is_none());
+        let mut session = StateBlockStaging::audit_base(
+            &mut store,
+            candidate.next(),
+            after_context,
+            expected.next().commitment(),
+            &mut ReadBudget::new(300, 1024 * 1024),
+        )
+        .unwrap();
+        let current = expected
+            .next()
+            .bind(after_context, expected.next().commitment())
+            .unwrap();
+        let rows = ActorRows::new(current, SdkActorId([1; 32]), SdkHash([1; 32])).unwrap();
+        assert_eq!(
+            crate::agent_sdk::state_rows::lane_row_usage(
+                current,
+                &mut session,
+                &mut ReadBudget::new(300, 1024 * 1024),
+            )
+            .unwrap(),
+            crate::agent_sdk::state_rows::RowUsage {
+                rows: 3,
+                bytes: (b"key".len()
+                    + b"mirror".len()
+                    + 2 * value.len()
+                    + b"untouched".len()
+                    + b"retained".len()) as u64,
+            }
+        );
+        assert_eq!(
+            rows.get(
+                b"mirror",
+                &mut session,
+                &mut ReadBudget::new(300, 1024 * 1024)
+            )
+            .unwrap(),
+            Some(value.to_vec())
+        );
+        assert_eq!(
+            rows.get(b"key", &mut session, &mut ReadBudget::new(300, 1024 * 1024))
+                .unwrap(),
+            Some(value.to_vec())
+        );
+        assert_eq!(
+            rows.get(
+                b"untouched",
+                &mut session,
+                &mut ReadBudget::new(300, 1024 * 1024)
+            )
+            .unwrap(),
+            Some(b"retained".to_vec())
+        );
+        drop(session);
+        let mut reader = JournalBlockReader {
+            store: &store,
+            scope,
+        };
+        assert_eq!(
+            ActorRows::new(tree, SdkActorId([1; 32]), SdkHash([1; 32]))
+                .unwrap()
+                .get(b"key", &mut reader, &mut ReadBudget::new(300, 1024 * 1024))
+                .unwrap(),
+            Some(old_value)
+        );
+        // Install only the independently sealed opaque genesis. The external
+        // manifest below is an unpublished availability fixture, not a claim
+        // that replay or runtime upgrade selected this descriptor as a head.
+        initialize_sealed_file_store(&mut store, &sealed);
+        store
+            .put_blob(
+                JournalBlobClass::LaneState,
+                &retained_manifest.state,
+                &after.linear,
+            )
+            .unwrap();
+        store.put(&retained_manifest).unwrap();
+        let initialized_heads = store.heads().unwrap();
+        drop(store);
+        let mut store = open_probe_store();
+        let files = file_tree_snapshot(&directory.0);
+        let mut session = StateBlockStaging::audit_manifest(
+            &mut store,
+            &retained_manifest,
+            &mut ReadBudget::new(300, 1024 * 1024),
+        )
+        .unwrap();
+        assert_eq!(session.available(), retained);
+        assert_eq!(
+            session.stage_execution(&no_op, &mut ReadBudget::new(0, 0)),
+            Ok(0)
+        );
+        drop(session);
+        assert_eq!(store.heads().unwrap(), initialized_heads);
+        assert_eq!(file_tree_snapshot(&directory.0), files);
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn experimental_state_root_context_isolates_local_replicas_and_normalizes_empty_merge() {
+        use crate::agent::state_block_store::{initial_root_context, journal_root_context};
+        let genesis = genesis();
+        let node = NodeId([0x71; 32]);
+        let other = NodeId([0x72; 32]);
+        let local =
+            initial_root_context(&genesis.create, PersistedLane::Local, Some(node)).unwrap();
+        assert_ne!(
+            local.scope(),
+            initial_root_context(&genesis.create, PersistedLane::Local, Some(other))
+                .unwrap()
+                .scope()
+        );
+        assert!(initial_root_context(&genesis.create, PersistedLane::Local, None).is_err());
+        assert!(
+            initial_root_context(&genesis.create, PersistedLane::Local, Some(NodeId::ZERO))
+                .is_err()
+        );
+        assert!(initial_root_context(&genesis.create, PersistedLane::Linear, Some(node)).is_err());
+        let cursor = LaneCursor::Local {
+            node,
+            revision: 0,
+            head: None,
+        };
+        assert_eq!(
+            journal_root_context(
+                &genesis,
+                genesis.runtime(),
+                PersistedLane::Local,
+                Some(node),
+                &cursor
+            )
+            .unwrap(),
+            local
+        );
+        assert!(
+            journal_root_context(
+                &genesis,
+                genesis.runtime(),
+                PersistedLane::Local,
+                Some(other),
+                &cursor
+            )
+            .is_err()
+        );
+        let invalid = LaneCursor::Local {
+            node,
+            revision: 0,
+            head: Some(LocalEntryId([0x73; 32])),
+        };
+        assert!(
+            journal_root_context(
+                &genesis,
+                genesis.runtime(),
+                PersistedLane::Local,
+                Some(node),
+                &invalid
+            )
+            .is_err()
+        );
+        let empty = MergeFrontier {
+            genesis: genesis.id(),
+            events: Vec::new(),
+        };
+        let merge = initial_root_context(&genesis.create, PersistedLane::Merge, None).unwrap();
+        assert_eq!(
+            journal_root_context(
+                &genesis,
+                genesis.runtime(),
+                PersistedLane::Merge,
+                None,
+                &LaneCursor::Merge {
+                    frontier: empty.id()
+                }
+            )
+            .unwrap(),
+            merge
+        );
+        assert!(
+            journal_root_context(
+                &genesis,
+                genesis.runtime(),
+                PersistedLane::Merge,
+                None,
+                &LaneCursor::Merge {
+                    frontier: MergeFrontierId::ZERO
+                }
+            )
+            .is_err()
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn file_store_instance_id_binds_lock_nonce_and_canonical_path() {
@@ -23339,9 +26372,8 @@ fn validate_unexposed_initialization_namespace(root: &File) -> Result<(), Journa
         }
     }
     if let Some(lane_state) = open_optional_owned_directory_at(root, "lane-state")? {
-        let children = ["manifests", "blobs"];
-        validate_directory_names(&lane_state, &children)?;
-        for name in children {
+        validate_directory_names(&lane_state, LANE_STATE_DIRECTORIES)?;
+        for name in LANE_STATE_DIRECTORIES {
             let _ = open_optional_owned_directory_at(&lane_state, name)?;
         }
     }

@@ -85,6 +85,7 @@ fn runtime_package_bytes_for(runtime_pvm: &[u8], proof_system: Option<Hash>) -> 
     sign_package(PackageEnvelope {
         manifest: PackageManifest::AgentRuntime(AgentRuntimePackageManifest {
             name: "standard-local-runtime".into(),
+            external_state_limits: None,
             outer_program: BlobRef::of_bytes(runtime_pvm),
             contract: RuntimePackageContract::canonical(),
             capabilities,

@@ -4,6 +4,11 @@
 //! one canonical [`RuntimeWork`](vos::agent_sdk::RuntimeWork) and receives a
 //! canonical [`RuntimeTransition`](vos::agent_sdk::RuntimeTransition). The
 //! host persists the returned lane components without interpreting them.
+//!
+//! The opt-in `experimental-state-blocks` build instead accepts XSW2 external
+//! work. Create, Install, ACK, non-yielding Invoke for non-Merge actors, and
+//! read-only management inspection are implemented;
+//! unsupported operations trap. It is built separately and is not bundled.
 
 #[cfg(target_arch = "riscv64")]
 mod guest {
@@ -11,6 +16,7 @@ mod guest {
 
     use core::arch::global_asm;
 
+    #[cfg(not(feature = "experimental-state-blocks"))]
     use vos::agent_sdk::wire::CanonicalWire as _;
 
     const PVM_HALT_ADDR: u64 = 0xffff_0000;
@@ -27,9 +33,13 @@ mod guest {
         // SAFETY: the standard PVM loader maps the complete argument window
         // read-only and supplies its base/length in a0/a1.
         let input = unsafe { core::slice::from_raw_parts(arguments, arguments_len) };
+        #[cfg(not(feature = "experimental-state-blocks"))]
         let output = vos::agent::wire::apply_standard_runtime_input(input)
             .unwrap_or_else(|_| fail_closed())
             .encode()
+            .unwrap_or_else(|_| fail_closed());
+        #[cfg(feature = "experimental-state-blocks")]
+        let output = vos::agent::wire::apply_standard_external_runtime_input(input)
             .unwrap_or_else(|_| fail_closed());
         let public_io = vos::agent_sdk::runtime_transition_public_io(input, &output);
         halt_with_output_bound(&output, public_io.as_bytes())

@@ -1,0 +1,22 @@
+[workspace]
+
+[package]
+name = "state-tree-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "AGPL-3.0-or-later"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+vos-agent-sdk = { path = "../../../vos-agent-sdk", features = ["experimental-state-blocks"] }
+# Reuse the existing portable guest allocator/panic boundary, not its r19
+# dispatcher. This probe has a deliberately test-only input/output format.
+vos-agent-runtime-guest = { path = "../../../services/agent-runtime-guest" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

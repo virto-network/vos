@@ -29,6 +29,7 @@ pub enum PackageAdmissionError {
     InvalidActorProgram,
     InvalidTaskProgram(TaskId),
     InvalidRuntimeProgram,
+    UnsupportedRuntimeContract,
     UnsupportedProfile,
     IncompatibleRuntime,
 }
@@ -53,6 +54,9 @@ impl fmt::Display for PackageAdmissionError {
             }
             Self::InvalidRuntimeProgram => {
                 formatter.write_str("VOS3 AgentRuntime artifact is not a canonical standard PVM")
+            }
+            Self::UnsupportedRuntimeContract => {
+                formatter.write_str("VOS3 AgentRuntime requires a different execution contract")
             }
             Self::UnsupportedProfile => {
                 formatter.write_str("VOS3 actor requirements are unsupported by the Agent profile")
@@ -256,12 +260,128 @@ pub fn admit_actor_package(bytes: &[u8]) -> Result<AdmittedActorPackage, Package
 pub fn admit_runtime_package(
     bytes: &[u8],
 ) -> Result<AdmittedRuntimePackage, PackageAdmissionError> {
+    admit_runtime_with_contract(
+        bytes,
+        vos_agent_sdk::RUNTIME_ABI_ID,
+        &vos_pvm::spi::REFINE_HOST_CALL_ALLOWLIST,
+    )
+}
+
+/// Distinct type: experimental admission cannot be passed to ordinary r19
+/// lifecycle/installation APIs. No conversion to AdmittedRuntimePackage is
+/// exposed, even when both contracts are compiled into the same host.
+#[cfg(feature = "experimental-state-blocks")]
+#[derive(Clone, Debug)]
+pub(crate) struct AdmittedStateRuntimePackage(AdmittedRuntimePackage);
+
+#[cfg(feature = "experimental-state-blocks")]
+impl AdmittedStateRuntimePackage {
+    pub(crate) fn exact_bytes(&self) -> &[u8] {
+        self.0.exact_bytes()
+    }
+
+    /// Exact journal identity derived from verified package bytes. This is not
+    /// genesis/upgrade authority; the lifecycle owner must admit its selection.
+    pub(crate) fn binding(
+        &self,
+        space: crate::service::SpaceId,
+        agent: crate::service::AgentId,
+    ) -> Result<super::journal::RuntimeBinding, PackageAdmissionError> {
+        use crate::service::{BlobRef, DeploymentId, Hash, ProducerId, ProgramId};
+        let binding = super::journal::RuntimeBinding {
+            space,
+            agent,
+            deployment: DeploymentId(self.deployment().0),
+            program: ProgramId(self.program().0),
+            producer: ProducerId(self.manifest().signing.producer.0),
+            package: BlobRef {
+                hash: Hash(self.package_ref().hash.0),
+                len: self.package_ref().len,
+            },
+            runtime_abi: Hash(vos_agent_sdk::state_execution::STATE_EXECUTION_ABI_ID.0),
+            execution_semantics: Hash(
+                vos_agent_sdk::state_execution::STATE_EXECUTION_SEMANTICS_ID.0,
+            ),
+        };
+        binding
+            .validate()
+            .map_err(|_| PackageAdmissionError::UnsupportedRuntimeContract)?;
+        Ok(binding)
+    }
+
+    pub(crate) fn manifest(&self) -> &AgentRuntimePackageManifest {
+        self.0.manifest()
+    }
+
+    pub(crate) fn external_state_limits(
+        &self,
+    ) -> vos_agent_sdk::contract::ExternalStateResourceLimits {
+        self.manifest()
+            .external_state_limits
+            .expect("admitted external runtime carries signed limits")
+    }
+
+    pub(crate) fn program_bytes(&self) -> &[u8] {
+        self.0.program_bytes()
+    }
+
+    pub(crate) fn program(&self) -> ProgramId {
+        self.0.program()
+    }
+
+    pub(crate) fn package_ref(&self) -> &BlobRef {
+        self.0.package_ref()
+    }
+
+    pub(crate) fn deployment(&self) -> DeploymentId {
+        self.0.deployment()
+    }
+}
+
+/// Signature, exact closure and standard PVM admission for the explicit
+/// experimental contract. This grants no journal/finality authority and does
+/// not open publication, bootstrap or production runtime selection.
+#[cfg(feature = "experimental-state-blocks")]
+pub(crate) fn admit_state_runtime_package(
+    bytes: &[u8],
+) -> Result<AdmittedStateRuntimePackage, PackageAdmissionError> {
+    let mut allowed = vos_pvm::spi::REFINE_HOST_CALL_ALLOWLIST.to_vec();
+    allowed.push(u64::from(
+        vos_agent_sdk::state_blocks::STATE_BLOCK_FETCH_CALL,
+    ));
+    let admitted = admit_runtime_with_contract(
+        bytes,
+        vos_agent_sdk::state_execution::STATE_EXECUTION_ABI_ID,
+        &allowed,
+    )?;
+    if admitted
+        .manifest()
+        .contract
+        .resources
+        .max_runtime_state_bytes as usize
+        > vos_agent_sdk::state_execution::MAX_ADMITTED_EXTERNAL_RUNTIME_STATE_BYTES
+    {
+        return Err(PackageAdmissionError::UnsupportedRuntimeContract);
+    }
+    Ok(AdmittedStateRuntimePackage(admitted))
+}
+
+fn admit_runtime_with_contract(
+    bytes: &[u8],
+    expected_abi: vos_agent_sdk::Hash,
+    allowed_host_calls: &[u64],
+) -> Result<AdmittedRuntimePackage, PackageAdmissionError> {
     let envelope = decode_and_verify(bytes)?;
     let PackageManifest::AgentRuntime(manifest) = &envelope.manifest else {
         return Err(PackageAdmissionError::WrongKind);
     };
+    if manifest.contract.lifecycle_abi != expected_abi {
+        return Err(PackageAdmissionError::UnsupportedRuntimeContract);
+    }
     let program_bytes = artifact_bytes(&envelope, &manifest.outer_program)?;
-    if vos_pvm::spi::validate_refine_host_calls(program_bytes).is_err() {
+    if vos_pvm::spi::validate_standard_program_host_calls(program_bytes, allowed_host_calls)
+        .is_err()
+    {
         return Err(PackageAdmissionError::InvalidRuntimeProgram);
     }
     let program = ProgramId::of_pvm(program_bytes);
@@ -504,6 +624,7 @@ pub(crate) fn admitted_runtime_program_for_test(
         manifest: PackageManifest::AgentRuntime(AgentRuntimePackageManifest {
             name: name.into(),
             outer_program: BlobRef::of_bytes(program),
+            external_state_limits: None,
             contract: RuntimePackageContract::canonical(),
             capabilities: RuntimeCapabilities::standard(),
             signing: PackageSigning {
@@ -743,6 +864,7 @@ fn admitted_scripted_runtime_impl(
         manifest: PackageManifest::AgentRuntime(AgentRuntimePackageManifest {
             name: name.into(),
             outer_program: BlobRef::of_bytes(&program),
+            external_state_limits: None,
             contract: RuntimePackageContract::canonical(),
             capabilities: RuntimeCapabilities::standard(),
             signing: PackageSigning {
@@ -762,7 +884,7 @@ fn admitted_scripted_runtime_impl(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use ed25519_dalek::{Signer as _, SigningKey};
     use vos_agent_sdk::contract::{ActorPackageContract, RuntimePackageContract};
     use vos_agent_sdk::introspection::ActorIntrospectionArtifact;
@@ -947,6 +1069,7 @@ mod tests {
         sign(PackageEnvelope {
             manifest: PackageManifest::AgentRuntime(AgentRuntimePackageManifest {
                 name: "fixture-runtime".into(),
+                external_state_limits: None,
                 outer_program: BlobRef::of_bytes(&program),
                 contract: RuntimePackageContract::canonical(),
                 capabilities,
@@ -964,6 +1087,171 @@ mod tests {
     fn admit_runtime(capabilities: RuntimeCapabilities) -> AdmittedRuntimePackage {
         let bytes = runtime_package(capabilities, true).encode().unwrap();
         admit_runtime_package(&bytes).unwrap()
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) const STATE_FIXTURE_LIMITS: vos_agent_sdk::contract::ExternalStateResourceLimits =
+        vos_agent_sdk::contract::ExternalStateResourceLimits {
+            max_rows_per_lane: 1_000_000,
+            max_row_bytes_per_lane: 1 << 30,
+        };
+
+    #[cfg(feature = "experimental-state-blocks")]
+    fn state_runtime_envelope(program: Vec<u8>) -> PackageEnvelope {
+        let mut envelope = runtime_package_with_program(RuntimeCapabilities::standard(), program);
+        let PackageManifest::AgentRuntime(manifest) = &mut envelope.manifest else {
+            unreachable!()
+        };
+        manifest.contract = RuntimePackageContract::experimental_state_blocks();
+        // Explicit fixture policy, not a production deployment default.
+        manifest.external_state_limits = Some(STATE_FIXTURE_LIMITS);
+        sign(envelope)
+    }
+
+    /// Test issuer only; callers still must not treat this as installed journal
+    /// authority. Exercise the same admission boundary with compiled fixtures.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn admitted_state_fixture(program: Vec<u8>) -> AdmittedStateRuntimePackage {
+        let bytes = state_runtime_envelope(program).encode().unwrap();
+        admit_state_runtime_package(&bytes).unwrap()
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn admitted_state_fixture_row_limits(
+        program: Vec<u8>,
+        limits: vos_agent_sdk::contract::ExternalStateResourceLimits,
+    ) -> AdmittedStateRuntimePackage {
+        let mut envelope = state_runtime_envelope(program);
+        let PackageManifest::AgentRuntime(manifest) = &mut envelope.manifest else {
+            unreachable!()
+        };
+        manifest.external_state_limits = Some(limits);
+        admit_state_runtime_package(&sign(envelope).encode().unwrap()).unwrap()
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn admitted_state_fixture_limits(
+        program: Vec<u8>,
+        lanes: LaneSet,
+        state_bytes: u32,
+    ) -> AdmittedStateRuntimePackage {
+        let mut envelope = state_runtime_envelope(program);
+        let PackageManifest::AgentRuntime(manifest) = &mut envelope.manifest else {
+            unreachable!()
+        };
+        manifest.capabilities.lanes = lanes;
+        manifest.contract.resources.max_runtime_state_bytes = state_bytes;
+        let bytes = sign(envelope).encode().unwrap();
+        admit_state_runtime_package(&bytes).unwrap()
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn state_runtime_admission_is_explicit_signed_and_disjoint_from_r19() {
+        use vos_agent_sdk::state_blocks::STATE_BLOCK_FETCH_CALL;
+        let program = Assembler::new()
+            .ecalli(STATE_BLOCK_FETCH_CALL)
+            .trap()
+            .build_standard();
+        let envelope = state_runtime_envelope(program.clone());
+        let bytes = envelope.encode().unwrap();
+        let admitted = admit_state_runtime_package(&bytes).unwrap();
+        assert_eq!(admitted.program_bytes(), program);
+        assert_eq!(admitted.program(), ProgramId::of_pvm(&program));
+        assert_eq!(*admitted.package_ref(), BlobRef::of_bytes(&bytes));
+        assert_eq!(admitted.deployment(), envelope.deployment_id().unwrap());
+        assert_eq!(
+            admitted.external_state_limits().max_rows_per_lane,
+            1_000_000
+        );
+        for change_bytes in [false, true] {
+            let mut tampered = envelope.clone();
+            let PackageManifest::AgentRuntime(manifest) = &mut tampered.manifest else {
+                unreachable!()
+            };
+            let limits = manifest.external_state_limits.as_mut().unwrap();
+            if change_bytes {
+                limits.max_row_bytes_per_lane -= 1;
+            } else {
+                limits.max_rows_per_lane -= 1;
+            }
+            assert_eq!(
+                admit_state_runtime_package(&tampered.encode().unwrap()).unwrap_err(),
+                PackageAdmissionError::Package(PackageError::InvalidSignature)
+            );
+            let resigned = sign(tampered);
+            let changed = admit_state_runtime_package(&resigned.encode().unwrap()).unwrap();
+            assert_ne!(changed.deployment(), admitted.deployment());
+            assert_ne!(changed.package_ref(), admitted.package_ref());
+            assert_ne!(
+                changed.external_state_limits(),
+                admitted.external_state_limits()
+            );
+        }
+        assert_eq!(
+            admitted.manifest().contract,
+            RuntimePackageContract::experimental_state_blocks()
+        );
+        let mut over_budget = envelope.clone();
+        let PackageManifest::AgentRuntime(manifest) = &mut over_budget.manifest else {
+            unreachable!()
+        };
+        manifest.contract.resources.max_runtime_state_bytes =
+            vos_agent_sdk::MAX_RUNTIME_STATE_BYTES as u32;
+        let over_budget = sign(over_budget);
+        assert_eq!(
+            admit_state_runtime_package(&over_budget.encode().unwrap()).unwrap_err(),
+            PackageAdmissionError::UnsupportedRuntimeContract,
+            "a valid signature cannot bypass the experimental publication ceiling"
+        );
+        assert_eq!(
+            admit_runtime_package(&bytes).unwrap_err(),
+            PackageAdmissionError::UnsupportedRuntimeContract
+        );
+
+        let released = runtime_package(RuntimeCapabilities::standard(), true);
+        assert_eq!(
+            admit_state_runtime_package(&released.encode().unwrap()).unwrap_err(),
+            PackageAdmissionError::UnsupportedRuntimeContract
+        );
+        assert!(admit_runtime_package(&released.encode().unwrap()).is_ok());
+
+        // Changing only the signed declaration cannot silently downgrade the
+        // same executable or transfer a signature between execution contracts.
+        let mut downgraded = envelope;
+        let PackageManifest::AgentRuntime(manifest) = &mut downgraded.manifest else {
+            unreachable!()
+        };
+        manifest.contract = RuntimePackageContract::canonical();
+        manifest.external_state_limits = None;
+        assert_eq!(
+            admit_runtime_package(&downgraded.encode().unwrap()).unwrap_err(),
+            PackageAdmissionError::Package(PackageError::InvalidSignature)
+        );
+        let signed_downgrade = sign(downgraded);
+        assert_eq!(
+            admit_runtime_package(&signed_downgrade.encode().unwrap()).unwrap_err(),
+            PackageAdmissionError::InvalidRuntimeProgram
+        );
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn state_runtime_admission_does_not_expand_other_host_surfaces() {
+        for program in [
+            b"not a PVM".to_vec(),
+            Assembler::new()
+                .trap()
+                .ecalli(crate::abi::hostcall::DEBUG_WRITE)
+                .build_standard(),
+            Assembler::new().trap().ecalli(0x181).build_standard(),
+        ] {
+            let envelope = state_runtime_envelope(program);
+            assert_eq!(
+                admit_state_runtime_package(&envelope.encode().unwrap()).unwrap_err(),
+                PackageAdmissionError::InvalidRuntimeProgram
+            );
+        }
     }
 
     #[test]

@@ -8,7 +8,19 @@
 use crate::agent_sdk::RUNTIME_ABI_ID;
 use crate::agent_sdk::{MethodMode, StateLane, schema::ParsedSchema};
 use crate::service::wire::{DecodeError, Decoder, Encoder};
-use alloc::{collections::BTreeMap, vec::Vec};
+use alloc::{borrow::Cow, collections::BTreeMap, vec::Vec};
+
+/// Runtime-selected row access. Inner actors provide keys, never storage roots,
+/// actor identities, incarnations or lane selectors. Both backends retain the
+/// existing STORAGE_R and row-delta ABI.
+pub(crate) trait ActorRowStorage {
+    fn mode(&self) -> MethodMode;
+    fn read(&self, key: &[u8]) -> Result<Option<Cow<'_, [u8]>>, StorageAccessError>;
+    fn validate_delta(
+        &self,
+        changes: &[(Vec<u8>, Option<Vec<u8>>)],
+    ) -> Result<(), StorageAccessError>;
+}
 
 const MAGIC: &[u8; 4] = b"ALI1";
 const HEADER_BYTES: usize = 4 + 32 + 4 + 4;
@@ -154,12 +166,7 @@ impl<'a> ActorStorageReader<'a> {
         &self,
         changes: &[(Vec<u8>, Option<Vec<u8>>)],
     ) -> Result<(), StorageAccessError> {
-        for (key, _) in changes {
-            if !self.access.mode.can_write(self.access.owner_lane(key)?) {
-                return Err(StorageAccessError::Forbidden);
-            }
-        }
-        Ok(())
+        self.access.validate_delta(changes)
     }
 
     pub(crate) fn read(&self, key: &[u8]) -> Result<Option<&'a [u8]>, StorageAccessError> {
@@ -181,6 +188,224 @@ impl<'a> ActorStorageReader<'a> {
     }
 }
 
+impl ActorRowStorage for ActorStorageReader<'_> {
+    fn mode(&self) -> MethodMode {
+        self.mode()
+    }
+    fn read(&self, key: &[u8]) -> Result<Option<Cow<'_, [u8]>>, StorageAccessError> {
+        ActorStorageReader::read(self, key).map(|row| row.map(Cow::Borrowed))
+    }
+    fn validate_delta(
+        &self,
+        changes: &[(Vec<u8>, Option<Vec<u8>>)],
+    ) -> Result<(), StorageAccessError> {
+        ActorStorageReader::validate_delta(self, changes)
+    }
+}
+
+/// Bounded external row view for the same inner actor runner. Construction is
+/// not root/package/caller admission: the enclosing runtime must select these
+/// roots and the exact actor incarnation from its authenticated state first.
+/// A missing lane is unavailable, not an empty tree. Reads only visit one path;
+/// there is no retained-row enumeration or per-read full-tree audit.
+#[cfg(feature = "experimental-state-blocks")]
+pub(crate) struct ExternalActorStorageReader<'a, R> {
+    access: ActorStorageAccess,
+    io: core::cell::RefCell<(
+        [Option<(crate::agent_sdk::state_rows::ActorRows, R)>; 3],
+        &'a mut crate::agent_sdk::state_blocks::ReadBudget,
+    )>,
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+impl<'a, R: crate::agent_sdk::state_tree::BlockReader> ExternalActorStorageReader<'a, R> {
+    /// Prepare the row part of a runtime transition, never a separate commit.
+    /// `limits` must come from the admitted runtime package and any stricter
+    /// authenticated policy. Prior usage is read from the selected lane root.
+    /// Publish the candidate root, counters, inline state and
+    /// outcome together; this reader deliberately continues to expose its base.
+    pub(crate) fn prepare_delta(
+        &self,
+        changes: &[(Vec<u8>, Option<Vec<u8>>)],
+        limits: crate::agent_sdk::contract::ExternalStateResourceLimits,
+        writes: &mut crate::agent_sdk::state_tree::WriteBudget,
+    ) -> Result<
+        (
+            crate::agent_sdk::state_tree::TreeUpdate,
+            crate::agent_sdk::state_rows::RowUsage,
+        ),
+        StorageAccessError,
+    > {
+        self.prepare_delta_inner(changes, limits, None, writes)
+    }
+
+    pub(crate) fn prepare_delta_with_metadata(
+        &self,
+        changes: &[(Vec<u8>, Option<Vec<u8>>)],
+        limits: crate::agent_sdk::contract::ExternalStateResourceLimits,
+        metadata: crate::agent_sdk::state_metadata::RuntimeMetadataUpdate<'_>,
+        writes: &mut crate::agent_sdk::state_tree::WriteBudget,
+    ) -> Result<
+        (
+            crate::agent_sdk::state_tree::TreeUpdate,
+            crate::agent_sdk::state_rows::RowUsage,
+        ),
+        StorageAccessError,
+    > {
+        self.prepare_delta_inner(changes, limits, Some(metadata), writes)
+    }
+
+    pub(crate) fn read_write_lane_metadata(
+        &self,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, StorageAccessError> {
+        let lane = self
+            .access
+            .mode
+            .write_lane()
+            .ok_or(StorageAccessError::Forbidden)?;
+        let index = match lane {
+            StateLane::Linear => 0,
+            StateLane::Merge => 1,
+            StateLane::Local => 2,
+        };
+        let mut io = self.io.try_borrow_mut().map_err(|_| {
+            StorageAccessError::External(crate::agent_sdk::state_tree::TreeError::Storage)
+        })?;
+        let (lanes, reads) = &mut *io;
+        let (rows, reader) = lanes[index].as_mut().ok_or(StorageAccessError::External(
+            crate::agent_sdk::state_blocks::BlockError::Unavailable.into(),
+        ))?;
+        crate::agent_sdk::state_metadata::read_runtime_metadata(rows.tree(), limit, reader, reads)
+            .map_err(StorageAccessError::External)
+    }
+
+    fn prepare_delta_inner(
+        &self,
+        changes: &[(Vec<u8>, Option<Vec<u8>>)],
+        limits: crate::agent_sdk::contract::ExternalStateResourceLimits,
+        metadata: Option<crate::agent_sdk::state_metadata::RuntimeMetadataUpdate<'_>>,
+        writes: &mut crate::agent_sdk::state_tree::WriteBudget,
+    ) -> Result<
+        (
+            crate::agent_sdk::state_tree::TreeUpdate,
+            crate::agent_sdk::state_rows::RowUsage,
+        ),
+        StorageAccessError,
+    > {
+        self.access.validate_delta(changes)?;
+        let lane = self
+            .access
+            .mode
+            .write_lane()
+            .ok_or(StorageAccessError::Forbidden)?;
+        let index = match lane {
+            StateLane::Linear => 0,
+            StateLane::Merge => 1,
+            StateLane::Local => 2,
+        };
+        let mut io = self.io.try_borrow_mut().map_err(|_| {
+            StorageAccessError::External(crate::agent_sdk::state_tree::TreeError::Storage)
+        })?;
+        let (lanes, reads) = &mut *io;
+        let (rows, reader) = lanes[index].as_mut().ok_or(StorageAccessError::External(
+            crate::agent_sdk::state_blocks::BlockError::Unavailable.into(),
+        ))?;
+        let candidate = match metadata {
+            Some(metadata) => rows.update_accounted_with_metadata(
+                changes,
+                limits,
+                metadata,
+                reader,
+                (reads, writes),
+            ),
+            None => rows.update_accounted_batch(changes, limits, reader, reads, writes),
+        }
+        .map_err(StorageAccessError::External)?;
+        Ok((candidate.update, candidate.usage))
+    }
+
+    pub(crate) fn new(
+        access: ActorStorageAccess,
+        actor: crate::agent_sdk::ActorId,
+        incarnation: crate::agent_sdk::Hash,
+        lanes: [Option<(crate::agent_sdk::state_tree::StateTree, R)>; 3],
+        budget: &'a mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<Self, StorageAccessError> {
+        let mut identity = None;
+        let mut rows = [None, None, None];
+        for (index, (lane, entry)) in [StateLane::Linear, StateLane::Merge, StateLane::Local]
+            .into_iter()
+            .zip(lanes)
+            .enumerate()
+        {
+            if let Some((tree, reader)) = entry {
+                let scope = tree.scope();
+                if scope.lane() != lane {
+                    return Err(StorageAccessError::WrongLane);
+                }
+                let current = (scope.space(), scope.agent());
+                if identity.is_some_and(|previous| previous != current) {
+                    return Err(StorageAccessError::External(
+                        crate::agent_sdk::state_blocks::BlockError::InvalidScope.into(),
+                    ));
+                }
+                identity = Some(current);
+                rows[index] = Some((
+                    crate::agent_sdk::state_rows::ActorRows::new(tree, actor, incarnation)
+                        .map_err(StorageAccessError::External)?,
+                    reader,
+                ));
+            }
+        }
+        if actor == crate::agent_sdk::ActorId::ZERO || incarnation == crate::agent_sdk::Hash::ZERO {
+            return Err(StorageAccessError::External(
+                crate::agent_sdk::state_blocks::BlockError::InvalidScope.into(),
+            ));
+        }
+        Ok(Self {
+            access,
+            io: core::cell::RefCell::new((rows, budget)),
+        })
+    }
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+impl<R: crate::agent_sdk::state_tree::BlockReader> ActorRowStorage
+    for ExternalActorStorageReader<'_, R>
+{
+    fn mode(&self) -> MethodMode {
+        self.access.mode
+    }
+    fn read(&self, key: &[u8]) -> Result<Option<Cow<'_, [u8]>>, StorageAccessError> {
+        let lane = self.access.owner_lane(key)?;
+        if !self.access.mode.can_read(lane) {
+            return Err(StorageAccessError::Forbidden);
+        }
+        let index = match lane {
+            StateLane::Linear => 0,
+            StateLane::Merge => 1,
+            StateLane::Local => 2,
+        };
+        let mut io = self.io.try_borrow_mut().map_err(|_| {
+            StorageAccessError::External(crate::agent_sdk::state_tree::TreeError::Storage)
+        })?;
+        let (lanes, budget) = &mut *io;
+        let (rows, reader) = lanes[index].as_mut().ok_or(StorageAccessError::External(
+            crate::agent_sdk::state_blocks::BlockError::Unavailable.into(),
+        ))?;
+        rows.get(key, reader, budget)
+            .map(|row| row.map(Cow::Owned))
+            .map_err(StorageAccessError::External)
+    }
+    fn validate_delta(
+        &self,
+        changes: &[(Vec<u8>, Option<Vec<u8>>)],
+    ) -> Result<(), StorageAccessError> {
+        self.access.validate_delta(changes)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StorageAccessError {
     InvalidSchema,
@@ -190,6 +415,8 @@ pub(crate) enum StorageAccessError {
     WrongLane,
     Forbidden,
     Image(DecodeError),
+    #[cfg(feature = "experimental-state-blocks")]
+    External(crate::agent_sdk::state_tree::TreeError),
 }
 
 /// Invocation-local access derived from the installed, authenticated schema.
@@ -203,6 +430,18 @@ pub(crate) struct ActorStorageAccess {
 }
 
 impl ActorStorageAccess {
+    fn validate_delta(
+        &self,
+        changes: &[(Vec<u8>, Option<Vec<u8>>)],
+    ) -> Result<(), StorageAccessError> {
+        for (key, _) in changes {
+            if !self.mode.can_write(self.owner_lane(key)?) {
+                return Err(StorageAccessError::Forbidden);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn new(
         schema: &ParsedSchema,
         method: &str,
@@ -567,11 +806,11 @@ impl ActorLaneImage {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use alloc::vec;
 
-    fn schema() -> ParsedSchema {
+    pub(crate) fn schema() -> ParsedSchema {
         use crate::agent_sdk::schema::{
             ConstructorContract, ParsedField, ParsedMethod, ParsedStorageField,
         };
@@ -613,6 +852,276 @@ mod tests {
             fields,
             methods,
         }
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[derive(Clone, Default)]
+    pub(crate) struct TestBlocks {
+        pub(crate) blocks: BTreeMap<[u8; 32], Vec<u8>>,
+        reads: usize,
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    impl crate::agent_sdk::state_tree::BlockReader for TestBlocks {
+        fn read(
+            &mut self,
+            reference: crate::agent_sdk::state_blocks::BlockRef,
+            output: &mut [u8],
+        ) -> Result<bool, crate::agent_sdk::state_tree::TreeError> {
+            self.reads += 1;
+            let Some(bytes) = self.blocks.get(&reference.hash().0) else {
+                return Ok(false);
+            };
+            if bytes.len() != output.len() {
+                return Err(crate::agent_sdk::state_tree::TreeError::Storage);
+            }
+            output.copy_from_slice(bytes);
+            Ok(true)
+        }
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn external_rows_fixture(
+        actor: crate::agent_sdk::ActorId,
+        incarnation: crate::agent_sdk::Hash,
+        count: u64,
+    ) -> (crate::agent_sdk::state_tree::StateTree, TestBlocks) {
+        use crate::agent_sdk::{
+            AgentId, Hash, SpaceId,
+            state_blocks::{BlockScope, ReadBudget},
+            state_rows::ActorRows,
+            state_tree::{StateTree, WriteBudget},
+        };
+        let scope = BlockScope::new(
+            SpaceId([1; 32]),
+            AgentId([2; 32]),
+            Hash([3; 32]),
+            StateLane::Linear,
+        )
+        .unwrap();
+        let mut tree = StateTree::empty(scope);
+        let mut blocks = TestBlocks::default();
+        for value in 0..count {
+            let update = ActorRows::new(tree, actor, incarnation)
+                .unwrap()
+                .update(
+                    alloc::format!("s/0/{value}").as_bytes(),
+                    Some(&value.to_le_bytes()),
+                    &mut blocks,
+                    &mut ReadBudget::new(1000, 1000000),
+                    &mut WriteBudget::new(1000, 1000000),
+                )
+                .unwrap();
+            tree = update.tree;
+            for (reference, bytes) in update.blocks {
+                blocks.blocks.insert(reference.hash().0, bytes);
+            }
+        }
+        blocks.reads = 0;
+        (tree, blocks)
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn external_row_candidates_keep_base_and_counters_atomic() {
+        use crate::agent_sdk::{
+            ActorId, Hash,
+            contract::ExternalStateResourceLimits,
+            state_blocks::ReadBudget,
+            state_change::StateChange,
+            state_root::{RootContext, StateRootDescriptor},
+            state_rows::{ActorRows, RowUsage},
+            state_tree::WriteBudget,
+        };
+        let actor = ActorId([4; 32]);
+        let incarnation = Hash([5; 32]);
+        let limits = ExternalStateResourceLimits {
+            max_rows_per_lane: 2,
+            max_row_bytes_per_lane: 26,
+        };
+        let (tree, mut blocks) = external_rows_fixture(actor, incarnation, 0);
+        let initial = ActorRows::new(tree, actor, incarnation)
+            .unwrap()
+            .update_accounted_batch(
+                &[
+                    (b"s/0/0".to_vec(), Some(0u64.to_le_bytes().to_vec())),
+                    (b"s/0/1".to_vec(), Some(1u64.to_le_bytes().to_vec())),
+                ],
+                limits,
+                &mut blocks,
+                &mut ReadBudget::new(1000, 1000000),
+                &mut WriteBudget::new(1000, 1000000),
+            )
+            .unwrap();
+        let tree = initial.update.tree;
+        for (reference, bytes) in initial.update.blocks {
+            blocks.blocks.insert(reference.hash().0, bytes);
+        }
+        blocks.reads = 0;
+        let original = blocks.blocks.clone();
+        let access = ActorStorageAccess::new(&schema(), "method_3", MethodMode::Linear).unwrap();
+        let mut budget = ReadBudget::new(1000, 1000000);
+        let reader = ExternalActorStorageReader::new(
+            access,
+            actor,
+            incarnation,
+            [Some((tree, blocks.clone())), None, None],
+            &mut budget,
+        )
+        .unwrap();
+        let usage = RowUsage { rows: 2, bytes: 26 };
+        let changes = vec![
+            (b"s/0/-".to_vec(), Some(7u64.to_le_bytes().to_vec())),
+            (b"s/0/0".to_vec(), None),
+        ];
+        assert_eq!(
+            reader
+                .prepare_delta(
+                    &[(b"s/2/0".to_vec(), None)],
+                    limits,
+                    &mut WriteBudget::new(100, 100000)
+                )
+                .unwrap_err(),
+            StorageAccessError::Forbidden
+        );
+        assert_eq!(reader.io.borrow().0[0].as_ref().unwrap().1.reads, 0);
+        let mut writes = WriteBudget::new(100, 100000);
+        assert!(
+            reader
+                .prepare_delta(
+                    &[(b"s/0/2".to_vec(), Some(2u64.to_le_bytes().to_vec()))],
+                    limits,
+                    &mut writes
+                )
+                .is_err()
+        );
+        assert!(writes.remaining().0 < 100);
+        assert_eq!(reader.io.borrow().0[0].as_ref().unwrap().1.blocks, original);
+        assert_eq!(
+            reader.read(b"s/0/0").unwrap().as_deref(),
+            Some(&0u64.to_le_bytes()[..])
+        );
+        assert!(reader.read(b"s/0/-").unwrap().is_none());
+        let (update, next_usage) = reader
+            .prepare_delta(&changes, limits, &mut WriteBudget::new(100, 100000))
+            .unwrap();
+        assert_eq!(next_usage, usage);
+        assert_eq!(reader.io.borrow().0[0].as_ref().unwrap().1.blocks, original);
+        assert!(reader.read(b"s/0/-").unwrap().is_none());
+        let context = RootContext::new(tree.scope(), Hash([6; 32]), Hash([7; 32])).unwrap();
+        let base = StateRootDescriptor::new(context, tree.root());
+        let next = RootContext::new(tree.scope(), Hash([6; 32]), Hash([8; 32])).unwrap();
+        let change = StateChange::from_update(base.commitment(), next, update).unwrap();
+        change
+            .verify_reuse(base, next, &mut blocks, &mut ReadBudget::new(100, 100000))
+            .unwrap();
+        assert_eq!(blocks.blocks, original);
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn external_rows_are_path_bounded_and_check_access_before_io() {
+        use crate::agent_sdk::{
+            ActorId, Hash,
+            state_blocks::{BlockError, ReadBudget},
+        };
+        let actor = ActorId([4; 32]);
+        let incarnation = Hash([5; 32]);
+        let (tree, blocks) = external_rows_fixture(actor, incarnation, 1024);
+        let access = ActorStorageAccess::new(&schema(), "method_3", MethodMode::Linear).unwrap();
+        let mut budget = ReadBudget::new(1000, 1000000);
+        let reader = ExternalActorStorageReader::new(
+            access.clone(),
+            actor,
+            incarnation,
+            [Some((tree, blocks.clone())), None, None],
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(reader.read(b"s/2/42"), Err(StorageAccessError::Forbidden));
+        assert_eq!(
+            reader.read(b"unknown/42"),
+            Err(StorageAccessError::UndeclaredNamespace)
+        );
+        assert_eq!(reader.io.borrow().0[0].as_ref().unwrap().1.reads, 0);
+        assert_eq!(
+            reader.read(b"s/0/42").unwrap().as_deref(),
+            Some(&42u64.to_le_bytes()[..])
+        );
+        assert!(reader.read(b"s/0/absent").unwrap().is_none());
+        let reads = reader.io.borrow().0[0].as_ref().unwrap().1.reads;
+        assert!(reads > 0 && reads < 64, "two row paths read {reads} blocks");
+        assert_eq!(
+            reader.validate_delta(&[(b"s/2/42".to_vec(), None)]),
+            Err(StorageAccessError::Forbidden)
+        );
+        assert!(reader.validate_delta(&[(b"s/0/42".to_vec(), None)]).is_ok());
+        drop(reader);
+        assert!(budget.remaining().0 < 1000);
+        for identity in [(ActorId([6; 32]), incarnation), (actor, Hash([6; 32]))] {
+            let mut budget = ReadBudget::new(1000, 1000000);
+            let reader = ExternalActorStorageReader::new(
+                access.clone(),
+                identity.0,
+                identity.1,
+                [Some((tree, blocks.clone())), None, None],
+                &mut budget,
+            )
+            .unwrap();
+            assert!(reader.read(b"s/0/42").unwrap().is_none());
+        }
+        let mut budget = ReadBudget::new(0, 0);
+        let reader = ExternalActorStorageReader::new(
+            access.clone(),
+            actor,
+            incarnation,
+            [Some((tree, blocks.clone())), None, None],
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(
+            reader.read(b"s/0/42"),
+            Err(StorageAccessError::External(
+                BlockError::BudgetExceeded.into()
+            ))
+        );
+        let mut budget = ReadBudget::new(1000, 1000000);
+        let reader = ExternalActorStorageReader::<TestBlocks>::new(
+            access.clone(),
+            actor,
+            incarnation,
+            [None, None, None],
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(
+            reader.read(b"s/0/42"),
+            Err(StorageAccessError::External(BlockError::Unavailable.into()))
+        );
+        let mut budget = ReadBudget::new(1000, 1000000);
+        let reader = ExternalActorStorageReader::new(
+            access.clone(),
+            actor,
+            incarnation,
+            [Some((tree, TestBlocks::default())), None, None],
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(
+            reader.read(b"s/0/42"),
+            Err(StorageAccessError::External(BlockError::Unavailable.into()))
+        );
+        let mut budget = ReadBudget::new(1000, 1000000);
+        assert!(matches!(
+            ExternalActorStorageReader::new(
+                access,
+                actor,
+                incarnation,
+                [None, Some((tree, blocks)), None],
+                &mut budget
+            ),
+            Err(StorageAccessError::WrongLane)
+        ));
     }
 
     #[test]
@@ -950,6 +1459,36 @@ mod tests {
         assert_eq!(image, before);
         image.write_row(vec![1], None).unwrap();
         assert_eq!(image.row(&[1]), None);
+    }
+
+    #[test]
+    fn row_count_limit_rejects_growth_atomically_even_below_byte_budget() {
+        // Model the cheapest possible retained records: tiny values, no indexes
+        // or committed-map branch rows. Real ledger storage costs more. This
+        // boundary is independent of the runtime's aggregate byte budget.
+        let rows = (0..MAX_ROWS as u32)
+            .map(|ordinal| (ordinal.to_be_bytes().to_vec(), vec![0]))
+            .collect();
+        let mut image = ActorLaneImage::from_parts(Vec::new(), rows);
+        let encoded = image.encode().unwrap();
+        assert!(encoded.len() < MAX_IMAGE_BYTES);
+        assert_eq!(ActorLaneImage::decode(&encoded).unwrap(), image);
+
+        let extra_key = (MAX_ROWS as u32).to_be_bytes().to_vec();
+        assert_eq!(
+            image.write_row(extra_key.clone(), Some(vec![0])),
+            Err(DecodeError::LimitExceeded)
+        );
+        assert_eq!(image.encode().unwrap(), encoded);
+
+        // An at-capacity image may still update existing data; rejecting growth
+        // must not make its existing records inaccessible.
+        image
+            .write_row(0u32.to_be_bytes().to_vec(), Some(vec![1]))
+            .unwrap();
+        assert_eq!(image.row(&0u32.to_be_bytes()), Some(&[1][..]));
+        image.rows.insert(extra_key, vec![0]);
+        assert_eq!(image.encode(), Err(DecodeError::LimitExceeded));
     }
 
     #[test]

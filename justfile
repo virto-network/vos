@@ -159,6 +159,75 @@ test-custom-agent-runtime:
     cd examples/agent-runtimes/custom-linear; cargo test
     cd examples/agent-runtimes/custom-linear; cargo test --lib tests::compiled_runtime_executes_scheduling_and_rejects_attested_context -- --ignored --exact --test-threads=1
 
+# Build the opt-in experimental state-tree guest (not a released runtime).
+build-agent-state-probe:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    repository_root="{{justfile_directory()}}"
+    probe_target="${CARGO_TARGET_DIR:-$repository_root/target}"
+    mkdir -p "$probe_target"
+    probe_target=$(cd "$probe_target" && pwd)
+    export TMPDIR="$probe_target/task-tmp"
+    mkdir -p "$TMPDIR"
+    cd "$repository_root/examples/agent-runtimes/state-tree-probe"
+    CARGO_TARGET_DIR="$probe_target/agent-state-probe" cargo +nightly-2026-03-20 actor --offline --locked
+
+# Build the standard runtime's opt-in external-state candidate separately.
+build-agent-standard-state-guest:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    repository_root="{{justfile_directory()}}"
+    state_target="${CARGO_TARGET_DIR:-$repository_root/target}"
+    mkdir -p "$state_target"
+    state_target=$(cd "$state_target" && pwd)
+    export TMPDIR="$state_target/task-tmp"
+    mkdir -p "$TMPDIR"
+    cd "$repository_root/services/agent-runtime"
+    CARGO_TARGET_DIR="$state_target/agent-state-standard" cargo +nightly-2026-03-20 actor --offline --locked --features experimental-state-blocks
+
+build-agent-state-actor:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    repository_root="{{justfile_directory()}}"
+    state_target="${CARGO_TARGET_DIR:-$repository_root/target}"
+    mkdir -p "$state_target"
+    state_target=$(cd "$state_target" && pwd)
+    export TMPDIR="$state_target/task-tmp"
+    mkdir -p "$TMPDIR"
+    cd "$repository_root/examples/actors"
+    CARGO_TARGET_DIR="$state_target/agent-state-actor" cargo +nightly-2026-03-20 actor --offline --locked --manifest-path ../../vos/tests/fixtures/agent-state-actor/Cargo.toml
+
+# Qualify the experimental SDK, physical guests, and journal staging.
+# This does not replace the released Local/Shared publication/recovery gates.
+test-agent-state-prototype: build-agent-state-probe build-agent-standard-state-guest build-agent-state-actor
+    #!/usr/bin/env bash
+    set -euo pipefail
+    repository_root="{{justfile_directory()}}"
+    state_test_target="${CARGO_TARGET_DIR:-$repository_root/target}"
+    mkdir -p "$state_test_target"
+    state_test_target=$(cd "$state_test_target" && pwd)
+    export CARGO_TARGET_DIR="$state_test_target"
+    export TMPDIR="$state_test_target/task-tmp"
+    export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+    mkdir -p "$TMPDIR"
+    cd "$repository_root"
+    cargo +nightly-2025-05-09 test --offline --locked -p vos-agent-sdk --features experimental-state-blocks
+    cargo +nightly-2025-05-09 test --offline --locked -p vos-agent-sdk contract::tests
+    cargo +nightly-2025-05-09 test --offline --locked -p vos-agent-sdk package::tests
+    cargo +nightly-2025-05-09 check --offline --locked -p vos --lib --no-default-features --features 'agent-runtime experimental-state-blocks'
+    cargo +nightly-2025-05-09 test --offline --locked -p vos --lib --features 'agent-runtime storage network http-ingress experimental-state-blocks' agent::package_admission::tests -- --test-threads=2
+    cargo +nightly-2025-05-09 test --offline --locked -p vos --lib --features 'agent-runtime storage network http-ingress experimental-state-blocks' agent::actor_storage::tests -- --test-threads=2
+    cargo +nightly-2025-05-09 test --offline --locked -p vos --lib --features 'agent-runtime storage network http-ingress experimental-state-blocks' agent::wire::tests -- --test-threads=2
+    cargo +nightly-2025-05-09 test --offline --locked -p vos --lib --features 'agent-runtime storage network http-ingress experimental-state-blocks' agent::execution::tests -- --test-threads=2
+    cargo +nightly-2025-05-09 test --offline --locked -p vos --lib --features 'agent-runtime storage network http-ingress experimental-state-blocks' agent::replay::tests -- --include-ignored --test-threads=2
+    cargo +nightly-2025-05-09 test --offline --locked -p vos --lib --features 'agent-runtime storage network http-ingress experimental-state-blocks' agent::journal::tests::runtime_binding_requires_a_matching_execution_contract_pair
+    cargo +nightly-2025-05-09 test --offline --locked -p vos --lib --features 'agent-runtime storage network http-ingress experimental-state-blocks' agent::state_block_pvm:: -- --include-ignored --test-threads=2 --nocapture
+    cargo +nightly-2025-05-09 test --offline --locked -p vos --lib --features 'agent-runtime storage network http-ingress experimental-state-blocks' agent::journal_store::tests -- --include-ignored --test-threads=2
+    cargo +nightly-2025-05-09 test --offline --locked -p vos --lib --features 'agent-runtime storage network http-ingress' agent::journal::tests::runtime_binding_requires_a_matching_execution_contract_pair
+    cargo +nightly-2025-05-09 test --offline --locked -p vos --lib --features 'agent-runtime storage network http-ingress' agent::actor_storage::tests -- --test-threads=2
+    cargo +nightly-2025-05-09 test --offline --locked -p vos --lib --features 'agent-runtime storage network http-ingress' agent::wire::tests -- --test-threads=2
+    cargo +nightly-2025-05-09 test --offline --locked -p vos --lib --features 'agent-runtime storage network http-ingress' agent::execution::tests -- --test-threads=2
+
 # Build the opaque history-aware guest required by host recovery tests.
 build-agent-recovery-fixture:
     #!/usr/bin/env bash

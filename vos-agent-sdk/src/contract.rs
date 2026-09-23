@@ -71,6 +71,24 @@ pub struct RuntimeResourceLimits {
     pub max_proof_material_bytes: u64,
 }
 
+/// Explicit signed ceilings for logical external actor rows, separate from the
+/// state-image limit. Each data lane has its own allowance across actors and
+/// incarnations: replica-local usage cannot affect a common Linear/Merge write.
+/// Key/value bytes count; inline/runtime metadata, history and physical block
+/// overhead need separate bounds. No default silently grants storage authority.
+/// Deployment admission may impose stricter ceilings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExternalStateResourceLimits {
+    pub max_rows_per_lane: u64,
+    pub max_row_bytes_per_lane: u64,
+}
+
+impl ExternalStateResourceLimits {
+    pub const fn is_valid(self) -> bool {
+        self.max_rows_per_lane != 0 && self.max_row_bytes_per_lane != 0
+    }
+}
+
 impl RuntimeResourceLimits {
     pub const fn standard() -> Self {
         Self {
@@ -197,11 +215,31 @@ impl RuntimePackageContract {
     }
 
     pub fn is_valid(self) -> bool {
-        self.lifecycle_abi.0 == RUNTIME_ABI_ID.0
+        let supported_abi = self.lifecycle_abi == RUNTIME_ABI_ID;
+        #[cfg(feature = "experimental-state-blocks")]
+        let supported_abi =
+            supported_abi || self.lifecycle_abi == crate::state_execution::STATE_EXECUTION_ABI_ID;
+        supported_abi
             && self.actor_abis.is_valid()
             && self.control_schema.0 == CONTROL_SCHEMA_ID.0
             && self.resources.is_valid()
             && matches!(self.migration, RuntimeMigrationPolicy::None)
+    }
+
+    /// Explicit signed opt-in for experimental root/block execution. Host
+    /// admission must select a matching executor; merely decoding this
+    /// contract does not authorize execution through the released dispatcher.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub const fn experimental_state_blocks() -> Self {
+        Self {
+            lifecycle_abi: crate::state_execution::STATE_EXECUTION_ABI_ID,
+            resources: RuntimeResourceLimits {
+                max_runtime_state_bytes:
+                    crate::state_execution::MAX_ADMITTED_EXTERNAL_RUNTIME_STATE_BYTES as u32,
+                ..RuntimeResourceLimits::standard()
+            },
+            ..Self::canonical()
+        }
     }
 
     pub fn supports(self, actor: ActorPackageContract) -> bool {
@@ -212,6 +250,40 @@ impl RuntimePackageContract {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_state_contract_requires_explicit_feature_and_identity() {
+        let canonical = RuntimePackageContract::canonical();
+        assert_eq!(canonical.lifecycle_abi, RUNTIME_ABI_ID);
+        let mut external = canonical;
+        external.lifecycle_abi = crate::state_execution::STATE_EXECUTION_ABI_ID;
+        assert_ne!(external.lifecycle_abi, RUNTIME_ABI_ID);
+        assert_eq!(
+            external.is_valid(),
+            cfg!(feature = "experimental-state-blocks")
+        );
+        #[cfg(feature = "experimental-state-blocks")]
+        {
+            let admitted = RuntimePackageContract::experimental_state_blocks();
+            assert_eq!(admitted.lifecycle_abi, external.lifecycle_abi);
+            assert_eq!(
+                admitted.resources.max_runtime_state_bytes,
+                crate::state_execution::MAX_ADMITTED_EXTERNAL_RUNTIME_STATE_BYTES as u32
+            );
+            assert!(
+                admitted.resources.max_runtime_state_bytes
+                    < canonical.resources.max_runtime_state_bytes
+            );
+        }
+        external.resources.max_runtime_state_bytes = 0;
+        assert!(
+            !external.is_valid(),
+            "experimental framing must retain resource validation"
+        );
+        external = canonical;
+        external.lifecycle_abi = Hash([0x77; 32]);
+        assert!(!external.is_valid());
+    }
 
     #[test]
     fn actor_abi_interval_is_inclusive_and_fail_closed() {

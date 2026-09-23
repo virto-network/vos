@@ -2083,6 +2083,7 @@ mod tests {
         let package = sign_package(PackageEnvelope {
             manifest: PackageManifest::AgentRuntime(AgentRuntimePackageManifest {
                 name: "standard-local-runtime".into(),
+                external_state_limits: None,
                 outer_program: BlobRef::of_bytes(runtime),
                 contract: RuntimePackageContract::canonical(),
                 capabilities: RuntimeCapabilities::standard(),

@@ -27,11 +27,13 @@
 //!
 //! ## State
 //!
-//! Every collection lives in `#[storage(committed)]` maps — per-key
-//! rows bound by incrementally-maintained SMT roots — so the ledger's
-//! size is bounded by a dispatch's *touched set*, not the account
-//! count, and the composite state root reads in O(1) from the six
-//! per-field root rows instead of an O(N log N) rebuild:
+//! The core ledger collections use `#[storage(committed)]` maps —
+//! per-key rows bound by incrementally-maintained SMT roots. Kernel
+//! point operations touch individual rows, and the composite state root
+//! reads in O(1) from six per-field root rows instead of an O(N log N)
+//! rebuild. This does not bound host/runtime work by the touched set:
+//! the Agent lane image materializes the rows and enforces aggregate
+//! row and byte limits. The auxiliary collections below use plain storage:
 //!
 //! - `journal`: one-entry committed map (the journal sub-SMT);
 //!   `journal_id` in the blob is the O(1) handle to it.

@@ -1045,6 +1045,14 @@ pub struct InvocationIndexes<'a, S: InvocationOutcomeStore> {
 }
 
 impl<'a, S: InvocationOutcomeStore> InvocationIndexes<'a, S> {
+    /// Read-only access while retaining the index owner's exclusive borrow.
+    /// Recovery uses this to verify immutable state blocks without releasing
+    /// the store to publication or garbage collection between replay steps.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn backing_store(&self) -> &S {
+        self.store
+    }
+
     pub fn open(
         store: &'a mut S,
         ordered: InvocationIndexId,

@@ -240,18 +240,28 @@ pub struct RuntimeBinding {
 
 impl RuntimeBinding {
     pub fn validate(&self) -> Result<(), DecodeError> {
+        let supported = self.runtime_abi == super::RUNTIME_ABI_ID
+            && self.execution_semantics == super::EXECUTION_SEMANTICS_ID;
+        #[cfg(feature = "experimental-state-blocks")]
+        let supported = supported || self.is_external_state();
         if self.space == SpaceId::ZERO
             || self.agent == AgentId::ZERO
             || self.deployment == DeploymentId::ZERO
             || self.program == ProgramId::ZERO
             || self.producer == ProducerId::ZERO
             || !valid_blob_ref(&self.package, false, MAX_ARTIFACT_CLOSURE_BYTES as u64)
-            || self.runtime_abi != super::RUNTIME_ABI_ID
-            || self.execution_semantics != super::EXECUTION_SEMANTICS_ID
+            || !supported
         {
             return Err(DecodeError::NonCanonical);
         }
         Ok(())
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn is_external_state(&self) -> bool {
+        self.runtime_abi.0 == crate::agent_sdk::state_execution::STATE_EXECUTION_ABI_ID.0
+            && self.execution_semantics.0
+                == crate::agent_sdk::state_execution::STATE_EXECUTION_SEMANTICS_ID.0
     }
 
     /// Canonical authority-facing commitment to this exact replay runtime.
@@ -1814,7 +1824,13 @@ impl AgentJournalGenesis {
 
     /// Recompute the cycle-free intent certified by the system authority.
     pub fn genesis_intent(&self) -> Result<GenesisIntentId, DecodeError> {
-        let request = match &self.create.operation {
+        Self::create_intent(&self.create)
+    }
+
+    /// Cycle-free Create intent, available before the post-state-dependent
+    /// genesis admission record exists. Caller still authenticates the input.
+    pub(crate) fn create_intent(create: &ReplayInput) -> Result<GenesisIntentId, DecodeError> {
+        let request = match &create.operation {
             ReplayOperation::Management { request } => {
                 let LifecycleRequest::Authorized { request, .. } = request else {
                     return Err(DecodeError::NonCanonical);
@@ -1840,13 +1856,17 @@ impl AgentJournalGenesis {
             | ReplayOperation::Acknowledge { .. }
             | ReplayOperation::SealMerge => return Err(DecodeError::NonCanonical),
         };
-        GenesisIntentId::from_commitments(self.create.runtime.commitment(), request)
+        GenesisIntentId::from_commitments(create.runtime.commitment(), request)
             .map_err(|_| DecodeError::NonCanonical)
     }
 
     /// Authority sequence of the exact receipt which admits the inner Create.
     pub fn genesis_authority_sequence(&self) -> Result<u64, DecodeError> {
-        let sequence = match &self.create.operation {
+        Self::create_authority_sequence(&self.create)
+    }
+
+    pub(crate) fn create_authority_sequence(create: &ReplayInput) -> Result<u64, DecodeError> {
+        let sequence = match &create.operation {
             ReplayOperation::Management { request } => {
                 let LifecycleRequest::Authorized { admission, request } = request else {
                     return Err(DecodeError::NonCanonical);
@@ -2422,6 +2442,17 @@ pub enum LaneCursor {
     },
 }
 
+/// Provenance of the descriptor's last change, independent of the newest
+/// materialized journal position. Retaining a root does not rewrite guest state.
+/// These are untrusted record fields until replay authenticates their lineage.
+#[cfg(feature = "experimental-state-blocks")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternalStateRoot {
+    pub descriptor: crate::agent_sdk::state_root::StateRootDescriptor,
+    pub runtime: RuntimeBinding,
+    pub cursor: LaneCursor,
+}
+
 /// Content reference for one derived runtime-state lane.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaneStateManifest {
@@ -2432,11 +2463,55 @@ pub struct LaneStateManifest {
     /// Canonical opaque bytes for this runtime-state component. Empty lane
     /// bytes use `BlobRef::of_bytes(&[])`, never the zero reference.
     pub state: BlobRef,
+    /// Explicit public graph root, never inferred by inspecting opaque state
+    /// bytes. Experimental roots are not yet admitted by production replay.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub external_root: Option<ExternalStateRoot>,
 }
 
 impl LaneStateManifest {
     fn validate_inner(&self) -> Result<(), DecodeError> {
         self.runtime.validate()?;
+        #[cfg(feature = "experimental-state-blocks")]
+        if let Some(root) = &self.external_root {
+            root.runtime.validate()?;
+            let scope = root.descriptor.context().scope();
+            if scope.space().0 != self.runtime.space.0
+                || scope.agent().0 != self.runtime.agent.0
+                || root.runtime.space != self.runtime.space
+                || root.runtime.agent != self.runtime.agent
+                || self.lane.state_lane().map(|lane| lane as u8) != Some(scope.lane() as u8)
+                || self.state != BlobRef::of_bytes(&root.descriptor.encode())
+            {
+                return Err(DecodeError::NonCanonical);
+            }
+            // Cheap canonical bounds only, NOT proof of ancestor membership.
+            match (&root.cursor, &self.cursor) {
+                (LaneCursor::Ordered { base: origin }, LaneCursor::Ordered { base })
+                    if origin.validate().is_ok()
+                        && origin.index <= base.index
+                        && (origin.index != base.index || origin == base) => {}
+                (LaneCursor::Merge { frontier }, LaneCursor::Merge { .. })
+                    if *frontier != MergeFrontierId::ZERO => {}
+                (
+                    LaneCursor::Local {
+                        node: owner,
+                        revision: old,
+                        head: prior,
+                    },
+                    LaneCursor::Local {
+                        node,
+                        revision,
+                        head,
+                    },
+                ) if owner == node
+                    && old <= revision
+                    && ((*old == 0 && prior.is_none())
+                        || (*old != 0 && prior.is_some_and(|id| id != LocalEntryId::ZERO)))
+                    && (old != revision || prior == head) => {}
+                _ => return Err(DecodeError::NonCanonical),
+            }
+        }
         if self.genesis == AgentJournalGenesisId::ZERO
             || !valid_blob_ref(&self.state, true, MAX_RUNTIME_STATE_BYTES as u64)
         {
@@ -2474,6 +2549,14 @@ impl ServiceWire for LaneStateManifest {
         encoder.u8(self.lane as u8);
         encode_lane_cursor(&mut encoder, &self.cursor);
         encode_blob_ref(&mut encoder, &self.state);
+        #[cfg(feature = "experimental-state-blocks")]
+        if let Some(root) = &self.external_root {
+            // No extension for opaque r19 state: its bytes and IDs stay exact.
+            encoder.u8(2);
+            encoder.bytes(&root.descriptor.encode());
+            encode_runtime_binding(&mut encoder, &root.runtime);
+            encode_lane_cursor(&mut encoder, &root.cursor);
+        }
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -2484,6 +2567,25 @@ impl ServiceWire for LaneStateManifest {
             lane: decode_persisted_lane(decoder.u8()?)?,
             cursor: decode_lane_cursor(decoder)?,
             state: decode_blob_ref(decoder)?,
+            #[cfg(feature = "experimental-state-blocks")]
+            external_root: if decoder.remaining() == 0 {
+                None
+            } else {
+                if decoder.u8()? != 2 {
+                    return Err(DecodeError::InvalidTag);
+                }
+                Some(ExternalStateRoot {
+                    descriptor: crate::agent_sdk::state_root::StateRootDescriptor::decode(
+                        bounded_bytes_ref(
+                            decoder,
+                            crate::agent_sdk::state_root::MAX_STATE_ROOT_BYTES,
+                        )?,
+                    )
+                    .map_err(|_| DecodeError::NonCanonical)?,
+                    runtime: decode_runtime_binding(decoder)?,
+                    cursor: decode_lane_cursor(decoder)?,
+                })
+            },
         };
         manifest.validate_inner()?;
         Ok(manifest)
@@ -3889,7 +3991,7 @@ fn decode_method_mode(value: u8) -> Result<MethodMode, DecodeError> {
     }
 }
 
-fn encode_lane_cursor(encoder: &mut Encoder<'_>, cursor: &LaneCursor) {
+pub(crate) fn encode_lane_cursor(encoder: &mut Encoder<'_>, cursor: &LaneCursor) {
     match cursor {
         LaneCursor::Ordered { base } => {
             encoder.u8(0);
@@ -4364,6 +4466,35 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn runtime_binding_requires_a_matching_execution_contract_pair() {
+        let released = runtime_binding();
+        assert!(released.validate().is_ok());
+        let mut external = released.clone();
+        external.runtime_abi = Hash(*b"vos-agent-state-experimental-001");
+        assert!(
+            external.validate().is_err(),
+            "mixed ABI/semantics must fail"
+        );
+        external.execution_semantics = Hash(*b"vos-agent-state-experimental-s01");
+        assert!(
+            external.validate().is_err(),
+            "pre-selector experimental ABI is not compatible"
+        );
+        external.runtime_abi = Hash(*b"vos-agent-state-experimental-003");
+        assert!(
+            external.validate().is_err(),
+            "mixed experimental revisions must fail"
+        );
+        external.execution_semantics = Hash(*b"vos-agent-state-experimental-s03");
+        assert_eq!(
+            external.validate().is_ok(),
+            cfg!(feature = "experimental-state-blocks")
+        );
+        external.runtime_abi = released.runtime_abi;
+        assert!(external.validate().is_err());
     }
 
     fn genesis_admission() -> AgentGenesisAdmissionId {
@@ -6515,6 +6646,8 @@ mod tests {
         .id();
         let ordered_head = OrderedEntryId([1; 32]);
         let lane_state = LaneStateManifest {
+            #[cfg(feature = "experimental-state-blocks")]
+            external_root: None,
             genesis,
             runtime: runtime_binding(),
             lane: PersistedLane::Control,
@@ -6625,6 +6758,8 @@ mod tests {
         .id();
         let node = NodeId([0x71; 32]);
         let control = LaneStateManifest {
+            #[cfg(feature = "experimental-state-blocks")]
+            external_root: None,
             genesis,
             runtime: runtime_binding(),
             lane: PersistedLane::Control,
@@ -6637,6 +6772,8 @@ mod tests {
         roundtrip(&control);
 
         let local = LaneStateManifest {
+            #[cfg(feature = "experimental-state-blocks")]
+            external_root: None,
             genesis,
             runtime: runtime_binding(),
             lane: PersistedLane::Local,

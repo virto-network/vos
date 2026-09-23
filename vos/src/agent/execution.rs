@@ -747,7 +747,7 @@ pub(crate) fn run_inner_actor_with_storage(
     installation_data: Option<&[u8]>,
     actor_state: &ActorStateLanes,
     continuation: Option<ActorMachineContinuation>,
-    storage: Option<&super::actor_storage::ActorStorageReader<'_>>,
+    storage: Option<&dyn super::actor_storage::ActorRowStorage>,
 ) -> Result<ActorRunOutcome, ActorExecutionError> {
     use super::machine::{ActorMachine, InnerExit};
     use crate::abi::{error, hostcall};
@@ -1022,9 +1022,15 @@ pub(crate) fn run_inner_actor_with_storage(
                         machine
                             .read(key_address, &mut key)
                             .map_err(|_| ActorExecutionError::InvalidInput)?;
-                        let row = storage
-                            .read(&key)
-                            .map_err(|_| ActorExecutionError::InvalidInput)?;
+                        let row = storage.read(&key).map_err(|error| match error {
+                            // Missing/corrupt blocks and exhausted provider
+                            // budgets are not durable actor rejections.
+                            #[cfg(feature = "experimental-state-blocks")]
+                            super::actor_storage::StorageAccessError::External(_) => {
+                                ActorExecutionError::InvalidAvailability
+                            }
+                            _ => ActorExecutionError::InvalidInput,
+                        })?;
                         match row {
                             None => (error::HOST_NONE, 0),
                             Some(row) => {
@@ -2358,6 +2364,125 @@ mod tests {
         // Loading is not execution or package/release qualification. The full
         // authenticated publication campaign must supply real configuration,
         // pending state, availability and context before it can prove that.
+    }
+
+    #[cfg(feature = "pvm")]
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn inner_actor_reads_external_rows_without_changing_its_abi() {
+        use super::super::actor_storage::{
+            ActorStorageAccess, ExternalActorStorageReader,
+            tests::{external_rows_fixture, schema},
+        };
+        use crate::agent_sdk::{
+            ActorId as SdkActorId, Hash as SdkHash, MethodMode as CleanMode,
+            state_blocks::ReadBudget,
+        };
+        use vos_pvm_compiler::assembler::{Assembler, Reg};
+        let mut call = invocation();
+        call.gas = 100_000;
+        let actor = SdkActorId(call.actor.0);
+        let incarnation = SdkHash([5; 32]);
+        let (tree, blocks) = external_rows_fixture(actor, incarnation, 1024);
+        let access = ActorStorageAccess::new(&schema(), "method_3", CleanMode::Linear).unwrap();
+        let context = crate::agent_sdk::InvocationContext {
+            invocation: crate::agent_sdk::InvocationId(call.invocation.0),
+            actor,
+            mode: CleanMode::Linear,
+            origin: crate::agent_sdk::InvocationOrigin::anonymous(),
+            roles: crate::agent_sdk::InvocationRoleClaims::none(),
+            observed_slot: 1,
+        };
+        let state = ActorStateLanes {
+            linear: Some(Vec::new()),
+            merge: Some(Vec::new()),
+            local: Some(Vec::new()),
+        };
+        let base = 2 * vos_pvm::PVM_ZONE_SIZE;
+        let mut data = actor_output([0, 0, 0], 8);
+        let key_address = base + data.len() as u32;
+        data.extend_from_slice(b"s/0/42");
+        let mut program = Assembler::new();
+        program
+            .set_rw_data(data)
+            .load_imm_64(Reg::A0, key_address as u64)
+            .load_imm_64(Reg::A1, 6)
+            .load_imm_64(Reg::A2, (base + 13) as u64)
+            .load_imm_64(Reg::A3, 8)
+            .ecalli(crate::abi::hostcall::STORAGE_R)
+            .load_imm_64(Reg::A0, base as u64)
+            .load_imm_64(Reg::A1, 21)
+            .jump_ind(Reg::RA, 0);
+        let program = program.build_standard();
+        for fault in 0..3 {
+            let mut source = blocks.clone();
+            if fault == 1 {
+                source.blocks.clear();
+            } else if fault == 2 {
+                source
+                    .blocks
+                    .get_mut(&tree.root().unwrap().hash().0)
+                    .unwrap()[0] ^= 0xff;
+            }
+            let mut budget = ReadBudget::new(100, 100000);
+            let reader = ExternalActorStorageReader::new(
+                access.clone(),
+                actor,
+                incarnation,
+                [Some((tree, source)), None, None],
+                &mut budget,
+            )
+            .unwrap();
+            let outcome = run_inner_actor_with_storage(
+                &call,
+                Some(context),
+                &program,
+                None,
+                &state,
+                None,
+                Some(&reader),
+            );
+            if fault != 0 {
+                assert_eq!(outcome, Err(ActorExecutionError::InvalidAvailability));
+                assert!(!ActorExecutionError::InvalidAvailability.is_durable_exact_outcome());
+            } else {
+                let ActorRunOutcome::Completed {
+                    reply,
+                    state: next,
+                    rows,
+                } = outcome.unwrap()
+                else {
+                    panic!("read yielded")
+                };
+                assert_eq!(reply.status, ActorExecutionStatus::Done);
+                assert_eq!(reply.reply, 42u64.to_le_bytes());
+                assert_eq!(next, state);
+                assert!(rows.is_empty());
+            }
+            drop(reader);
+            assert!(budget.remaining().0 < 100);
+        }
+        let mut budget = ReadBudget::new(0, 0);
+        let reader = ExternalActorStorageReader::new(
+            access,
+            actor,
+            incarnation,
+            [Some((tree, blocks)), None, None],
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(
+            run_inner_actor_with_storage(
+                &call,
+                Some(context),
+                &program,
+                None,
+                &state,
+                None,
+                Some(&reader)
+            ),
+            Err(ActorExecutionError::InvalidAvailability)
+        );
     }
 
     #[cfg(feature = "pvm")]

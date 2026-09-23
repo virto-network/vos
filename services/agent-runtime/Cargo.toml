@@ -11,6 +11,9 @@ repository = "https://github.com/virto-network/vos"
 [lib]
 crate-type = ["rlib", "cdylib"]
 
+[features]
+experimental-state-blocks = ["vos/experimental-state-blocks"]
+
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 vos = { path = "../../vos", version = "0.1.0", default-features = false, features = ["agent-runtime"] }
 

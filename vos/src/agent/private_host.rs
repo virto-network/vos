@@ -8052,6 +8052,7 @@ mod tests {
         let public_key = signing_key.verifying_key().to_bytes();
         let mut envelope = PackageEnvelope {
             manifest: PackageManifest::AgentRuntime(AgentRuntimePackageManifest {
+                external_state_limits: None,
                 name: name.into(),
                 outer_program: BlobRef::of_bytes(&program),
                 contract: RuntimePackageContract::canonical(),
