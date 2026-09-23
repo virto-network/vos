@@ -191,6 +191,15 @@ against the independent fixture fence and uses it for an artifact-free
 candidate Install. Install coordinator TODO: use this locked-owner path under
 the retained issuer/lifecycle leases, handle a guest rejection without
 stranding an approved intent, and qualify crash/retry through route refresh.
+The publisher now physically preflights Install against that same pinned
+predecessor. A conflicting installation identity returns a guest rejection
+without advancing heads or retaining newly staged catalog bytes; an exact
+repeat remains idempotently successful. A successful preflight is re-executed
+for publication and its result must match. This avoids a durable failed
+Install but does not terminalize an already Authority-approved intent: the
+issuer has no cancellation transition for that case. Keep external Install
+ingress disabled until lifecycle handling of permanent guest rejection and
+response-loss recovery is qualified.
 Focused r04/s04 evidence: SDK feature-on/off suites passed (248 passed/1
 ignored and 247 passed/1 ignored); the compiled Standard physical
 Create/Install/Invoke/ACK/checkpoint/reopen test passed, including retained

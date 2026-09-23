@@ -1727,6 +1727,9 @@ impl ExternalLocalJournalOwner {
                 Ok(ExternalJournalCommit::Published(_, _, None)) => {
                     return Err(JournalStoreError::Corrupt);
                 }
+                Ok(ExternalJournalCommit::Rejected(_)) => {
+                    return Err(JournalStoreError::Corrupt);
+                }
                 Err(ReplayError::ReplayLimit) if attempt == 0 => {
                     self.checkpoint(budget)
                         .map_err(|_| JournalStoreError::Unavailable)?;

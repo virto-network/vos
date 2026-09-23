@@ -15809,6 +15809,9 @@ mod aggregate {
     #[cfg(feature = "experimental-state-blocks")]
     pub(crate) enum ExternalJournalCommit {
         AlreadyCommitted(ReplayCommittedRecovery),
+        /// A fresh Install was physically rejected before any head or state
+        /// publication. This variant is emitted only by the Install helper.
+        Rejected(crate::agent_sdk::ManagementError),
         Published(
             JournalPublication,
             Vec<ReplayExecutionResult>,
@@ -16101,6 +16104,52 @@ mod aggregate {
             )
         }
 
+        /// Physically preflight one prepared Install without publishing its
+        /// head or external blocks. The caller must already have made its
+        /// exact catalog available to the executor. An ordinary guest
+        /// rejection is returned separately from replay/storage failure so
+        /// lifecycle admission can avoid publishing a non-acknowledgeable
+        /// failed Install. The later publication must re-execute against the
+        /// same pinned predecessor and compare its exact result.
+        pub(crate) fn preview_install_entry<E: ReplayExecutor>(
+            &mut self,
+            executor: &mut E,
+            entry: &OrderedEntry,
+            budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+        ) -> Result<
+            Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError>,
+            MaterializeError<core::convert::Infallible, E::Error>,
+        > {
+            if self.poisoned {
+                return Err(journal(JournalStoreError::Unavailable));
+            }
+            if !matches!(
+                &entry.input.operation,
+                ReplayOperation::CleanManage {
+                    request: crate::agent_sdk::ManagementRequest::Install(_),
+                    ..
+                }
+            ) {
+                return Err(journal(JournalStoreError::NonCanonical));
+            }
+            let prepared = prepare_external_ordered(
+                &mut *self.store,
+                executor,
+                &self.materialization,
+                entry,
+                budget,
+            )?;
+            let ReplayPreparation::Ready(prepared) = prepared else {
+                return Err(journal(JournalStoreError::Conflict));
+            };
+            prepared
+                .executions
+                .iter()
+                .find(|execution| execution.input() == entry.input.id())
+                .and_then(|execution| execution.clean_management_result().cloned())
+                .ok_or_else(|| journal(JournalStoreError::Corrupt))
+        }
+
         #[cfg(test)]
         pub(super) fn apply_install_with_catalog_with_fault_for_test<E: ReplayExecutor>(
             &mut self,
@@ -16165,12 +16214,37 @@ mod aggregate {
                 self.rollback_catalog(staged).map_err(journal)?;
                 return Err(journal(error));
             }
+            let expected = match self.preview_install_entry(executor, entry, budget) {
+                Ok(Ok(reply)) => reply,
+                Ok(Err(rejection)) => {
+                    self.rollback_catalog(staged).map_err(journal)?;
+                    refresh(&*self.store, executor).map_err(journal)?;
+                    return Ok(ExternalJournalCommit::Rejected(rejection));
+                }
+                Err(error) => {
+                    self.rollback_catalog(staged).map_err(journal)?;
+                    refresh(&*self.store, executor).map_err(journal)?;
+                    return Err(error);
+                }
+            };
             let committed = self.apply_using(
                 executor,
                 ExternalJournalEntry::Ordered(entry),
                 budget,
                 publish,
             );
+            if let Ok(ExternalJournalCommit::Published(_, executions, _)) = &committed
+                && executions
+                    .iter()
+                    .find(|execution| execution.input() == entry.input.id())
+                    .and_then(|execution| execution.clean_management_result())
+                    != Some(&Ok(expected))
+            {
+                // The guest disagreed with its own preflight after durable
+                // publication. Do not reuse this cursor or issue an ACK.
+                self.poisoned = true;
+                return Err(journal(JournalStoreError::Corrupt));
+            }
             if !matches!(committed, Ok(ExternalJournalCommit::Published(..))) {
                 self.rollback_catalog(staged).map_err(journal)?;
                 refresh(&*self.store, executor).map_err(journal)?;
@@ -23307,6 +23381,62 @@ pub(crate) mod tests {
         let installed = pinned.materialization().unwrap().clone();
         assert_eq!(installed.external_roots, before.external_roots);
         assert_ne!(installed.state.control, before.state.control);
+        let mut duplicate_entry = entry.clone();
+        duplicate_entry.index = installed.heads().ordered_index + 1;
+        duplicate_entry.parent = installed.heads().ordered_head;
+        duplicate_entry.merge_seal = Some(pinned.persist_current_merge_seal(sealed).unwrap());
+        let mut conflicting_install = install.clone();
+        conflicting_install.installation_id.0[0] ^= 1;
+        let duplicate_request = sdk::ManagementRequest::Install(Box::new(conflicting_install));
+        duplicate_entry.input.operation = ReplayOperation::CleanManage {
+            request: duplicate_request.clone(),
+            authority: signed_opaque_clean_receipt(
+                descriptor,
+                &duplicate_request,
+                admitted.deployment(),
+                3,
+                &signing,
+            ),
+            observed_slot: 12,
+        };
+        assert!(
+            pinned
+                .preview_install_entry(
+                    &mut executor,
+                    &duplicate_entry,
+                    &mut ReadBudget::new(10000, 10000000),
+                )
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(pinned.materialization().unwrap().heads(), installed.heads());
+        let rejection_bytes = b"rejected-install-catalog-rollback".to_vec();
+        let rejection_reference = BlobRef::of_bytes(&rejection_bytes);
+        let mut rejection_catalog = install_catalog.clone();
+        rejection_catalog.push(super::super::execution::RuntimeBlob {
+            reference: rejection_reference.clone(),
+            bytes: rejection_bytes,
+        });
+        assert!(matches!(
+            pinned
+                .apply_install_with_catalog(
+                    &mut executor,
+                    &duplicate_entry,
+                    &rejection_catalog,
+                    &mut ReadBudget::new(10000, 10000000),
+                    |_, _| Ok(()),
+                )
+                .unwrap(),
+            ExternalJournalCommit::Rejected(_)
+        ));
+        assert_eq!(pinned.materialization().unwrap().heads(), installed.heads());
+        assert!(
+            pinned
+                .store_for_test()
+                .load_blob(JournalBlobClass::CatalogArtifact, &rejection_reference)
+                .unwrap()
+                .is_none()
+        );
         let ReplayOperation::CleanManage {
             request: install_request,
             authority: install_authority,
