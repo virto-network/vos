@@ -15956,6 +15956,42 @@ mod aggregate {
             Ok(())
         }
 
+        /// Persist the exact current Merge fence needed by a Control-lane
+        /// Install. The checkpoint projection preserves the authenticated
+        /// external Merge root; no caller-supplied manifest or frontier is
+        /// accepted. These immutable objects are not a head publication.
+        pub(crate) fn persist_current_merge_seal(
+            &mut self,
+            genesis: &ReplaySealedExternalLocalGenesis,
+        ) -> Result<MergeSealId, JournalStoreError> {
+            if self.poisoned {
+                return Err(JournalStoreError::Unavailable);
+            }
+            let recovered = &self.materialization;
+            let heads = recovered.heads();
+            if genesis.genesis().id() != heads.genesis
+                || self.store.heads()?.as_ref() != Some(heads)
+            {
+                return Err(JournalStoreError::Conflict);
+            }
+            let state = &recovered.state().merge;
+            let reference = BlobRef::of_bytes(state);
+            self.store
+                .put_blob(JournalBlobClass::LaneState, &reference, state)?;
+            let manifest = recovered
+                .checkpoint_lane(genesis.genesis(), PersistedLane::Merge, state)
+                .map_err(|_| JournalStoreError::Corrupt)?;
+            self.store.put(&manifest)?;
+            let seal = MergeSeal {
+                genesis: heads.genesis,
+                frontier: heads.merge_frontier,
+                ordered_base: recovered.ordered_base(),
+                merge_state: manifest.id(),
+            };
+            self.store.put(&seal)?;
+            Ok(seal.id())
+        }
+
         /// Explicit maintenance checkpoint. Full root audits are budgeted here,
         /// never in the ordinary mutation path. Preserve the pinned store and
         /// poison on uncertain publication exactly as for mutations.
@@ -23063,8 +23099,6 @@ pub(crate) mod tests {
         if let Some(mut candidate) = duplicate {
             // Fresh execution through the same adapter used by the file
             // owner, not only recovery of the fixture's captured response.
-            candidate.put(&merge).unwrap();
-            candidate.put(&fence).unwrap();
             let resolver =
                 super::super::journal_store::CatalogBlobResolverFactory::catalog_blob_resolver(
                     &candidate,
@@ -23085,6 +23119,10 @@ pub(crate) mod tests {
                 &mut ReadBudget::new(10000, 10000000),
             )
             .unwrap();
+            assert_eq!(
+                owner.persist_current_merge_seal(sealed).unwrap(),
+                fence.id()
+            );
             let committed = owner
                 .apply_install_with_catalog(
                     &mut production,
@@ -23113,6 +23151,10 @@ pub(crate) mod tests {
             &mut ReadBudget::new(10000, 10000000),
         )
         .unwrap();
+        assert_eq!(
+            pinned.persist_current_merge_seal(sealed).unwrap(),
+            fence.id()
+        );
         let staged_bytes = b"external-install-stage-rollback".to_vec();
         let staged_reference = BlobRef::of_bytes(&staged_bytes);
         let invalid = super::super::execution::RuntimeBlob {

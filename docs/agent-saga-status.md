@@ -185,6 +185,12 @@ it while rejecting substituted receipt, Agent identity and application hash.
 The existing issuer must still authorize, finalize and retire each Install
 before the next management operation; neither this evidence helper nor the
 publication helper is released ingress or a complete Install coordinator.
+The pinned journal can now persist Install's Merge fence from its own
+authenticated current Merge projection; the physical test compares this
+against the independent fixture fence and uses it for an artifact-free
+candidate Install. Install coordinator TODO: use this locked-owner path under
+the retained issuer/lifecycle leases, handle a guest rejection without
+stranding an approved intent, and qualify crash/retry through route refresh.
 Focused r04/s04 evidence: SDK feature-on/off suites passed (248 passed/1
 ignored and 247 passed/1 ignored); the compiled Standard physical
 Create/Install/Invoke/ACK/checkpoint/reopen test passed, including retained
