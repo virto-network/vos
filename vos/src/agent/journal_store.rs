@@ -16178,6 +16178,51 @@ mod tests {
     #[cfg(all(
         target_os = "linux",
         feature = "storage",
+        feature = "network",
+        feature = "experimental-state-blocks"
+    ))]
+    #[inline(never)]
+    fn qualify_external_local_owner_route(
+        owner: super::super::external_local_executor::ExternalLocalJournalOwner,
+        mut input: ReplayInput,
+    ) {
+        use crate::agent_sdk as sdk;
+
+        let ReplayOperation::CleanInvoke {
+            work,
+            authorization: sdk::InvocationAuthorization::AuthorityReceipt(receipt),
+            observed_slot,
+            ..
+        } = &mut input.operation
+        else {
+            unreachable!()
+        };
+        work.invocation = sdk::InvocationId([0xb1; 32]);
+        receipt.selector.request = work.commitment();
+        receipt.selector.expires_at = 200;
+        receipt.signature = SigningKey::from_bytes(&[0x31; 32])
+            .sign(&receipt.signing_bytes())
+            .to_bytes();
+        *observed_slot = 102;
+        let routed = Arc::new(std::sync::Mutex::new(owner));
+        let route_thread = std::thread::Builder::new()
+            .name("external-local-route-test".to_owned())
+            .stack_size(2 * 1024 * 1024)
+            .spawn({
+                let routed = routed.clone();
+                move || {
+                    super::super::supervisor_adapters::qualify_external_local_route_for_test(
+                        routed, input,
+                    );
+                }
+            })
+            .unwrap();
+        route_thread.join().unwrap();
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
         feature = "experimental-state-blocks"
     ))]
     #[test]
@@ -17837,12 +17882,14 @@ mod tests {
                             assert_eq!(reopened.materialization().unwrap().heads(), &retired);
                             assert_eq!(
                                 reopened.submit_direct_clean(
-                                    delayed,
+                                    delayed.clone(),
                                     101,
                                     &mut ReadBudget::new(10000, 10000000),
                                 ),
                                 Err(JournalStoreError::Conflict),
                             );
+                            #[cfg(feature = "network")]
+                            qualify_external_local_owner_route(reopened, delayed);
                         },
                     );
                     assert!(

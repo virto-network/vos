@@ -1185,6 +1185,10 @@ impl ExternalLocalJournalOwner {
         self.cursor.materialization()
     }
 
+    pub(crate) fn descriptor(&self) -> &crate::agent_sdk::AgentDescriptor {
+        &self.executor.descriptor
+    }
+
     /// Return an exact-head response-loss result only while the locked store
     /// still names the same committed input/position. The executor may have
     /// seen an uncommitted staged head during open or a failed preparation;

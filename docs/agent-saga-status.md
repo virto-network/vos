@@ -80,10 +80,14 @@ The external owner can build route identities from its authenticated read-only
 directory, reusing the same bounded paging and identity checks as image Local.
 It can also reconstruct an installed Actor's exact signed package, program,
 schema, policy and constructor layout from pinned catalog blobs; missing or
-altered artifacts fail closed. No external route worker or public attachment
-exists yet. A successful external journal publication now returns its exact
-guest SDK invocation outcome only after the head commit succeeds. The external
-adapter and Standard guest now physically admit Resume with the retained
+altered artifacts fail closed. An internal per-Agent inline route worker now
+connects this locked owner to Direct Invoke/ACK envelopes and compares its
+physical actor closure with the supplied Authority projection. The physical
+fixture supplies a synthetic projection; released startup does not yet attach
+this worker or prove independent route finality. A successful external journal
+publication now returns its exact guest SDK invocation outcome only after the
+head commit succeeds. The external adapter and Standard guest now physically
+admit Resume with the retained
 invocation's authorization and gas bound; an absent continuation returns a
 no-change guest error. A successful retained external Resume has not been
 physically qualified, and yielded external writes still fail closed until
@@ -108,9 +112,10 @@ checkpoint, and recovers exact Invoke and ACK outcomes without changing its
 file tree. An exact Invoke retry also recovers after the receipt validity
 window while a wrong runtime and a validly signed unseen invocation are
 rejected; ACK retirement hides the earlier Invoke result. This proves the owner
-handoff, not public response-loss retry: route admission and startup recovery
-are still disconnected. A plain no-change Invoke retry alone is still not
-evidence of the original response. Read-only owner inspection now distinguishes
+handoff, not public response-loss retry: released startup still cannot attach
+the internal route after recovery. A plain no-change Invoke retry alone is
+still not evidence of the original response. Read-only owner inspection now
+distinguishes
 positive guest-reported absence, retained completion and retained ACK; a failed
 inspection is never permission to execute. ACK inspection needs a trusted
 current logical slot to recognize a live pre-ACK result. The host invocation-
@@ -121,19 +126,21 @@ decides whether to recover, execute or refuse before any journal mutation.
 A physical file-backed query advanced its head once, returned the same result
 without another write on retry, and recovered it after owner restart and
 receipt expiry. Its ACK then published once, exact ACK retry made no new write,
-and the retired Invoke was refused. This is still an internal primitive, not a
-supervisor route; it inspects the guest on every new call, so measure that
-overhead before optimizing without moving result authority into the host.
+and the retired Invoke was refused. The internal supervisor worker uses the
+same primitive after physical material and signed-work checks. It still makes
+multiple guest reads per request, so measure that cost before optimizing
+without moving result authority into the host.
 Focused r04/s04 evidence: SDK feature-on/off suites passed (248 passed/1
 ignored and 247 passed/1 ignored); the compiled Standard physical
 Create/Install/Invoke/ACK/checkpoint/reopen test passed, including retained
 result, ACK, unseen-input refusal and retired-Invoke refusal; the file-backed
-locked-owner handoff passed through the same physical lifecycle; the candidate
-signed external Local Create/finality/retry test passed with rebuilt Standard
-and Authority guests. This is not full prototype, released-binary, publicly
+locked-owner handoff and internal Direct route worker passed through the same
+physical lifecycle; the candidate signed external Local Create/finality/retry
+test passed with rebuilt Standard and Authority guests. This is not full
+prototype, released-binary, publicly
 routed retry, performance or outer-PVM qualification.
 
-No released startup, lifecycle queue or route adapter selects this owner yet;
+No released startup or lifecycle queue selects this owner yet;
 the caller must choose Space/Node storage roots independently and attach a
 route only after authenticated finalization. Unretired Create now checks its
 saved authorization anchor against the pinned system journal before physical
@@ -153,9 +160,10 @@ the large ACK's 5-billion-gas success is not a release-latency guarantee.
 External Local cutover TODOs, in order: (1) pass the Space/Node-pinned external
 directory into the lifecycle controller and select format per Agent,
 then recover mixed image/external intents under one startup admission before
-publishing either kind of route; (2) attach an external per-Agent route owner
-with Install, Invoke, Resume and ACK using the existing signed journal
-semantics, not an image-host fallback; (3) qualify file-backed restart,
+publishing either kind of route; (2) attach the internal external per-Agent
+Direct Invoke/ACK worker after finality, and add Install/Resume using the
+existing signed journal semantics, not an image-host fallback; (3) qualify
+publicly routed response-loss retry after file-backed restart,
 near-ceiling ACK, candidate artifact identities and released-binary behavior.
 `LocalLifecycleController::with_recovery` currently assumes every discovered
 Agent is present in `LocalAgentHost`; merely accepting an external Create

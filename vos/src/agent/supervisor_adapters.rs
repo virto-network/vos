@@ -3618,6 +3618,403 @@ pub(crate) fn local_agent_supervisor_attachment_for_agent(
     })
 }
 
+/// One experimental external-state Local Agent. The locked journal owner is
+/// already generation-pinned and must have completed signed Create finality
+/// before this backend can be attached. Each request obtains trusted logical
+/// time and rechecks the physical actor closure before guest admission.
+#[cfg(all(
+    target_os = "linux",
+    feature = "storage",
+    feature = "experimental-state-blocks"
+))]
+struct ExternalLocalAgentRouteBackend {
+    owner: Arc<std::sync::Mutex<super::external_local_executor::ExternalLocalJournalOwner>>,
+    clock: Arc<dyn super::driver::AgentTrustProvider>,
+    agent: AgentId,
+}
+
+#[cfg(all(
+    target_os = "linux",
+    feature = "storage",
+    feature = "experimental-state-blocks"
+))]
+impl ExternalLocalAgentRouteBackend {
+    fn slot(&self) -> Result<u64, AgentRouteError> {
+        self.clock
+            .current_logical_slot()
+            .ok_or(AgentRouteError::Unavailable)
+    }
+
+    fn budget() -> super::sdk::state_blocks::ReadBudget {
+        // Provisional bounded owner-side IO, pending the measured release
+        // gate. This is a limit, not a throughput or dataset qualification.
+        super::sdk::state_blocks::ReadBudget::new(10_000, 10_000_000)
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    feature = "storage",
+    feature = "experimental-state-blocks"
+))]
+fn map_external_local_error(error: super::journal_store::JournalStoreError) -> AgentRouteError {
+    use super::journal_store::JournalStoreError;
+    match error {
+        JournalStoreError::Conflict
+        | JournalStoreError::ScopeMismatch
+        | JournalStoreError::NonCanonical => AgentRouteError::Rejected,
+        JournalStoreError::Backpressure | JournalStoreError::GcPending => AgentRouteError::NotReady,
+        _ => AgentRouteError::Unavailable,
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    feature = "storage",
+    feature = "experimental-state-blocks"
+))]
+impl CleanAgentRouteBackend for ExternalLocalAgentRouteBackend {
+    fn identities(&mut self) -> Result<Vec<AgentRouteIdentity>, AgentRouteError> {
+        let slot = self.slot()?;
+        let owner = self
+            .owner
+            .lock()
+            .map_err(|_| AgentRouteError::Unavailable)?;
+        if owner.descriptor().identity.agent != self.agent {
+            return Err(AgentRouteError::Unavailable);
+        }
+        owner.route_identities(slot, &mut Self::budget())
+    }
+
+    fn ready(&mut self) -> Result<(), AgentRouteError> {
+        self.slot()?;
+        let owner = self
+            .owner
+            .lock()
+            .map_err(|_| AgentRouteError::Unavailable)?;
+        if owner.descriptor().identity.agent != self.agent {
+            return Err(AgentRouteError::Unavailable);
+        }
+        owner.materialization().map_err(map_external_local_error)?;
+        Ok(())
+    }
+
+    fn invoke(
+        &mut self,
+        identity: AgentRouteIdentity,
+        request: AgentInvocationRequest,
+    ) -> Result<AgentInvocationResponse, AgentRouteError> {
+        if !request.execution().is_direct() || identity.key().agent() != self.agent {
+            return Err(AgentRouteError::Rejected);
+        }
+        let slot = self.slot()?;
+        let mut owner = self
+            .owner
+            .lock()
+            .map_err(|_| AgentRouteError::Unavailable)?;
+        let mut budget = Self::budget();
+        let material = owner
+            .physical_invocation_material(identity.key().actor(), slot, &mut budget)
+            .map_err(map_external_local_error)?;
+        if !physical_material_matches_identity(&material, identity) {
+            return Err(AgentRouteError::NotReady);
+        }
+        if !physical_material_authorizes_work(
+            &material,
+            identity,
+            request.execution(),
+            request.work(),
+            request.authorization(),
+        ) {
+            return Err(AgentRouteError::Rejected);
+        }
+        let input = super::journal::ReplayInput {
+            runtime: owner
+                .materialization()
+                .map_err(map_external_local_error)?
+                .runtime()
+                .clone(),
+            operation: super::journal::ReplayOperation::CleanInvoke {
+                context: RuntimeExecutionContext::Direct,
+                work: request.work().clone(),
+                authorization: request.authorization().clone(),
+                observed_slot: slot,
+            },
+        };
+        let outcome = owner
+            .submit_direct_clean(input, slot, &mut budget)
+            .map_err(map_external_local_error)?;
+        Ok(AgentInvocationResponse::direct(&request, outcome))
+    }
+
+    fn acknowledge(
+        &mut self,
+        identity: AgentRouteIdentity,
+        request: AgentAcknowledgementRequest,
+    ) -> Result<AgentAcknowledgementResponse, AgentRouteError> {
+        if !request.execution().is_direct()
+            || request.expected_live().is_some()
+            || identity.key().agent() != self.agent
+        {
+            return Err(AgentRouteError::Rejected);
+        }
+        let slot = self.slot()?;
+        let mut owner = self
+            .owner
+            .lock()
+            .map_err(|_| AgentRouteError::Unavailable)?;
+        let mut budget = Self::budget();
+        let material = owner
+            .physical_invocation_material(identity.key().actor(), slot, &mut budget)
+            .map_err(map_external_local_error)?;
+        if !physical_material_matches_identity(&material, identity) {
+            return Err(AgentRouteError::NotReady);
+        }
+        if !physical_material_authorizes_work(
+            &material,
+            identity,
+            request.execution(),
+            request.work(),
+            request.authorization(),
+        ) {
+            return Err(AgentRouteError::Rejected);
+        }
+        let input = super::journal::ReplayInput {
+            runtime: owner
+                .materialization()
+                .map_err(map_external_local_error)?
+                .runtime()
+                .clone(),
+            operation: super::journal::ReplayOperation::CleanAcknowledge {
+                context: RuntimeExecutionContext::Direct,
+                expected_live: None,
+                work: super::sdk::InvocationRetirement::from_work(request.work()),
+                authorization: request.authorization().clone(),
+            },
+        };
+        let outcome = owner
+            .submit_direct_clean(input, slot, &mut budget)
+            .map_err(map_external_local_error)?;
+        Ok(AgentAcknowledgementResponse::new(&request, outcome))
+    }
+
+    fn prepare(
+        &mut self,
+        identity: AgentRouteIdentity,
+    ) -> Result<super::invocation_preparation::PhysicalInvocationMaterial, AgentRouteError> {
+        if identity.key().agent() != self.agent {
+            return Err(AgentRouteError::Rejected);
+        }
+        let slot = self.slot()?;
+        let owner = self
+            .owner
+            .lock()
+            .map_err(|_| AgentRouteError::Unavailable)?;
+        let material = owner
+            .physical_invocation_material(identity.key().actor(), slot, &mut Self::budget())
+            .map_err(map_external_local_error)?;
+        physical_material_matches_identity(&material, identity)
+            .then_some(material)
+            .ok_or(AgentRouteError::NotReady)
+    }
+
+    #[cfg(feature = "network")]
+    fn authorize_projection(
+        &mut self,
+        _head: AuthorityProjectionHead,
+        projection: &[AgentAuthorityRouteProjection],
+    ) -> Result<Vec<AgentRouteIdentity>, AgentRouteError> {
+        let [expected] = projection else {
+            return Err(AgentRouteError::NotReady);
+        };
+        let slot = self.slot()?;
+        let owner = self
+            .owner
+            .lock()
+            .map_err(|_| AgentRouteError::Unavailable)?;
+        if owner.descriptor() != expected.descriptor()
+            || owner.descriptor().identity.agent != self.agent
+        {
+            return Err(AgentRouteError::NotReady);
+        }
+        let descriptor = owner.descriptor();
+        let mut budget = Self::budget();
+        let records = collect_actor_directory(
+            descriptor.capabilities.max_actors as usize,
+            |after, limit| {
+                owner
+                    .inspect_actors(after, limit, slot, &mut budget)
+                    .map_err(map_external_local_error)
+            },
+        )?;
+        if records.len() != expected.actors().len() {
+            return Err(AgentRouteError::NotReady);
+        }
+        let mut identities = Vec::new();
+        for (record, actor) in records.iter().zip(expected.actors()) {
+            if record.entry.actor != actor.entry.actor {
+                return Err(AgentRouteError::NotReady);
+            }
+            let material = owner
+                .physical_invocation_material(record.entry.actor, slot, &mut budget)
+                .map_err(map_external_local_error)?;
+            if !physical_material_matches_authority(&material, descriptor, actor) {
+                return Err(AgentRouteError::NotReady);
+            }
+            if !record.entry.suspended {
+                identities.push(physical_material_identity(&material)?);
+            }
+        }
+        Ok(identities)
+    }
+}
+
+/// Attach an already-finalized experimental external Local generation to one
+/// inline supervisor worker. Startup/lifecycle owns the Arc and its locked
+/// slot; dropping or retiring this attachment cannot release that lease.
+#[cfg(all(
+    target_os = "linux",
+    feature = "storage",
+    feature = "experimental-state-blocks"
+))]
+pub(crate) fn external_local_agent_supervisor_attachment_for_agent(
+    owner: Arc<std::sync::Mutex<super::external_local_executor::ExternalLocalJournalOwner>>,
+    clock: Arc<dyn super::driver::AgentTrustProvider>,
+) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError> {
+    let agent = owner
+        .lock()
+        .map_err(|_| AgentRouteAdapterError::Route(AgentRouteError::Unavailable))?
+        .descriptor()
+        .identity
+        .agent;
+    inline_backend(ExternalLocalAgentRouteBackend {
+        owner,
+        clock,
+        agent,
+    })
+}
+
+/// File-owner fixture bridge: exercise the actual inline worker, projection
+/// authorization, Direct route envelopes, retry and retirement. The fixture
+/// supplies a physically finalized owner and a newly signed query; this does
+/// not stand in for startup lifecycle selection or Authority finality.
+#[cfg(all(
+    test,
+    target_os = "linux",
+    feature = "storage",
+    feature = "network",
+    feature = "experimental-state-blocks"
+))]
+pub(crate) fn qualify_external_local_route_for_test(
+    owner: Arc<std::sync::Mutex<super::external_local_executor::ExternalLocalJournalOwner>>,
+    input: super::journal::ReplayInput,
+) {
+    use core::num::NonZeroU64;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct FixedClock(AtomicU64);
+    impl super::driver::AgentTrustProvider for FixedClock {
+        fn current_logical_slot(&self) -> Option<u64> {
+            Some(self.0.load(Ordering::Acquire))
+        }
+
+        fn authority_for_space(
+            &self,
+            _space: crate::service::SpaceId,
+        ) -> Option<super::authority::AgentAuthorityBinding> {
+            None
+        }
+
+        fn verify_package(
+            &self,
+            _agent: &super::AgentConfig,
+            _package: &super::package::Package,
+        ) -> bool {
+            false
+        }
+    }
+
+    let slot = match &input.operation {
+        super::journal::ReplayOperation::CleanInvoke { observed_slot, .. } => *observed_slot,
+        _ => panic!("route fixture requires a clean Invoke"),
+    };
+    let clock = Arc::new(FixedClock(AtomicU64::new(slot)));
+    let attachment =
+        external_local_agent_supervisor_attachment_for_agent(owner.clone(), clock.clone()).unwrap();
+    let handle = attachment.handle();
+    let identities = handle.identities().unwrap();
+    let [identity] = identities.as_slice() else {
+        panic!("route fixture requires exactly one installed Actor")
+    };
+    let material = handle.prepare(*identity).unwrap();
+    let actor = AuthorityActorProjection {
+        agent: material.descriptor.identity.agent,
+        entry: material.actor.entry.clone(),
+        producer: material.producer,
+        contract: material.contract,
+        requirements: material.requirements,
+        root_provenance: material.root_provenance,
+        installation_id: material.actor.installation_id,
+        registry_reservation: material.actor.registry_reservation,
+        install_request: material.install_request,
+    };
+    let projection = AgentAuthorityRouteProjection::new(
+        material.descriptor.replica_generation(),
+        material.descriptor.clone(),
+        vec![actor],
+    )
+    .unwrap();
+    let one = NonZeroU64::new(1).unwrap();
+    let head = AuthorityProjectionHead {
+        state_revision: one,
+        epoch: one,
+        authorization_sequence: one,
+        administration_generation: one,
+        state_commitment: Hash([0x33; 32]),
+    };
+    assert_eq!(
+        handle.authorize_projection(head, vec![projection]).unwrap(),
+        identities
+    );
+    let super::journal::ReplayOperation::CleanInvoke {
+        work,
+        authorization,
+        ..
+    } = input.operation
+    else {
+        unreachable!()
+    };
+    let request = AgentInvocationRequest::new(
+        RuntimeExecutionContext::Direct,
+        work.clone(),
+        authorization.clone(),
+    )
+    .unwrap();
+    let first = handle.invoke(*identity, request.clone()).unwrap();
+    assert!(matches!(first.outcome(), RuntimeOutcome::Completed(Ok(_))));
+    assert_eq!(handle.invoke(*identity, request.clone()).unwrap(), first);
+    let acknowledge = AgentAcknowledgementRequest::new(
+        RuntimeExecutionContext::Direct,
+        None,
+        work,
+        authorization,
+    )
+    .unwrap();
+    let acknowledged = handle.acknowledge(*identity, acknowledge.clone()).unwrap();
+    assert!(acknowledged.matches_request(&acknowledge));
+    assert_eq!(
+        handle.acknowledge(*identity, acknowledge).unwrap(),
+        acknowledged
+    );
+    clock.0.store(slot + 99, Ordering::Release);
+    assert_eq!(
+        handle.invoke(*identity, request),
+        Err(AgentRouteError::Rejected),
+    );
+    drop(handle);
+    attachment.retire().unwrap();
+}
+
 #[cfg(feature = "private-agent-store")]
 struct PrivateAgentRouteBackend {
     host: super::private_host::PrivateAgentHost,

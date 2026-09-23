@@ -24342,10 +24342,20 @@ pub(crate) mod tests {
     fn compiled_standard_external_genesis_publication_and_crash_recovery() {
         // The standard guest executes real lifecycle validation and metadata
         // initialization. Probe-specific mutation markers are not its API.
-        qualify_compiled_external_genesis(
-            "agent-state-standard/riscv64em-vos/release/agent_runtime.elf",
-            false,
-        );
+        // This fixture nests several independent crash/recovery scenarios;
+        // give the fixture, not the production route worker, a larger stack.
+        std::thread::Builder::new()
+            .name("standard-external-fixture".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                qualify_compiled_external_genesis(
+                    "agent-state-standard/riscv64em-vos/release/agent_runtime.elf",
+                    false,
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
