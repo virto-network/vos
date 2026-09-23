@@ -74,6 +74,13 @@ generation even after later work advances the head; it cannot sign a fresh ACK
 or substitute for issuer-side actor finality. Production lifecycle wiring must
 use the fresh initial-head observation before finalization and this exact
 generation check only for finalized recovery. That wiring remains open.
+The experimental Create preparer can now reconstruct its physical seal from
+the existing signed lifecycle's reopened intent, immutable retained package,
+saved authorization slot, and issuer-recovered receipt. Its exact-intent file
+slot can publish and reopen the initial checkpoint without producing a route.
+The caller must still prove the saved authorization anchor against the pinned
+system journal before using this seam; production startup/dispatch and the
+format-specific route owner are not wired yet.
 `LocalJournalAgentDriver::prepare_local_genesis` still builds an r19 binding
 and `StandardLocalReplayExecutor`. A separate external Local preparer now
 authenticates the signed package, exact catalog closure, Create receipt and

@@ -10946,6 +10946,13 @@ impl FileLocalAgentJournalSlot {
         self.generation_exists
     }
 
+    /// Immutable signed-Create selection pinned into the stable lock. A
+    /// producer must compare this before initializing an external generation;
+    /// matching Agent IDs alone do not identify the selected lifecycle.
+    pub(crate) fn intent(&self) -> Hash {
+        self.intent
+    }
+
     /// Resolve only the `heads.next` state created by a host-retained,
     /// quorum-authenticated portable restore marker. The caller has already
     /// verified the complete bundle and supplies both exact endpoints; this

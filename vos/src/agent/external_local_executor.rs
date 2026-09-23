@@ -22,6 +22,170 @@ use crate::agent_sdk::{
 };
 use crate::service::{AgentId, BlobRef, SpaceId};
 
+/// Reconstructed only from the existing signed Local lifecycle's durable
+/// intent/runtime sidecar and the exact receipt recovered from its issuer.
+/// Preparing this value executes physical Create but does not stage a journal,
+/// sign an application ACK, or expose a route. The lifecycle caller must first
+/// authenticate the retained authorization anchor against its independently
+/// selected system journal; the intent image alone cannot prove that anchor.
+#[cfg(all(target_os = "linux", feature = "storage"))]
+pub(crate) struct RetainedExternalLocalCreate {
+    seal: super::replay::ReplaySealedExternalLocalGenesis,
+    runtime_package: Vec<u8>,
+    intent: crate::service::Hash,
+}
+
+#[cfg(all(target_os = "linux", feature = "storage"))]
+impl RetainedExternalLocalCreate {
+    pub(crate) fn prepare<B: super::clean_authority_issuer::CleanManagementRuntimeStore>(
+        slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
+        selected_authority: crate::agent_sdk::authority::AuthorityActorTarget,
+        issued_receipt: &crate::agent_sdk::authority::AuthorityReceipt,
+        selected_node: crate::agent_sdk::NodeId,
+    ) -> Result<Self, super::shared_host::SharedAgentHostError> {
+        use super::shared_host::SharedAgentHostError;
+        use crate::agent_sdk::{self as sdk, AgentProfile, ManagementRequest, RuntimeWork};
+
+        if selected_node == sdk::NodeId::ZERO
+            || slot
+                .denial_complete()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let ManagementRequest::Create(descriptor) = intent.request() else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        let descriptor = descriptor.as_ref().clone();
+        if descriptor.identity.profile != AgentProfile::Local
+            || descriptor.identity.space != selected_authority.space
+            || descriptor.authority != selected_authority.binding
+            || descriptor.replicas.len() != 1
+            || descriptor.replicas[0].node != selected_node
+            || descriptor.replicas[0].role != sdk::ReplicaRole::Voter
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        intent
+            .verify(
+                selected_authority,
+                intent.call().managed,
+                &super::clean_bootstrap::RawCredentialVerifier,
+            )
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let request = intent.request().clone();
+        let intent_hash = crate::service::Hash::digest(
+            b"vos/agent/local/external-create-intent/v1",
+            &[&request.commitment().0, &intent.call().commitment().0],
+        );
+        let Some(RuntimeWork::Invoke { observed_slot, .. }) = slot
+            .authorization_work()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        let observed_slot = *observed_slot;
+        super::driver::verify_clean_management_receipt(
+            &descriptor,
+            &request,
+            issued_receipt,
+            observed_slot,
+            true,
+        )
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let runtime_package = slot
+            .load_runtime()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .ok_or(SharedAgentHostError::Unavailable)?;
+        let runtime = super::package_admission::admit_state_runtime_package(&runtime_package)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if descriptor.runtime_package != *runtime.package_ref()
+            || descriptor.identity.runtime_deployment != runtime.deployment()
+            || descriptor.identity.runtime_program != runtime.program()
+            || descriptor.identity.runtime_producer != runtime.manifest().signing.producer
+            || descriptor.runtime_contract != runtime.manifest().contract
+            || descriptor.capabilities != runtime.manifest().capabilities
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let binding = runtime
+            .binding(
+                SpaceId(descriptor.identity.space.0),
+                AgentId(descriptor.identity.agent.0),
+            )
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let replica = descriptor.replicas[0];
+        let seal = super::local_journal_driver::LocalJournalAgentDriver::<
+            super::journal_store::MemoryAgentJournalStore,
+        >::prepare_external_local_genesis(
+            ReplayInput {
+                runtime: binding,
+                operation: ReplayOperation::CleanManage {
+                    request,
+                    authority: issued_receipt.clone(),
+                    observed_slot,
+                },
+            },
+            super::AgentReplica {
+                node: crate::service::NodeId(replica.node.0),
+                principal: crate::service::PrincipalId(replica.principal.0),
+                role: super::ReplicaRole::Voter,
+            },
+            &[super::execution::RuntimeBlob {
+                reference: BlobRef {
+                    hash: crate::service::Hash(runtime.package_ref().hash.0),
+                    len: runtime.package_ref().len,
+                },
+                bytes: runtime_package.clone(),
+            }],
+            crate::service::NodeId(selected_node.0),
+        )
+        .map_err(|_| SharedAgentHostError::Unavailable)?;
+        Ok(Self {
+            seal,
+            runtime_package,
+            intent: intent_hash,
+        })
+    }
+
+    pub(crate) fn intent(&self) -> crate::service::Hash {
+        self.intent
+    }
+
+    /// Stage exact catalog bytes and the complete checkpoint-bearing Create
+    /// closure under this signed intent's locked slot. Exposure is a durable
+    /// storage marker, not route publication or Authority finalization. A
+    /// crash can repeat this method only while the generation is still at its
+    /// initial head; finalized retries with later work reopen the owner and
+    /// verify the old ACK instead.
+    pub(crate) fn publish_initial(
+        self,
+        slot: super::journal_store::FileLocalAgentJournalSlot,
+        budget: &mut ReadBudget,
+    ) -> Result<ExternalLocalJournalOwner, super::journal_store::JournalStoreError> {
+        use super::journal_store::{AgentJournalStore, JournalBlobClass, JournalStoreError};
+        if slot.intent() != self.intent {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        let mut store = slot.open_external_genesis(&self.seal, false, budget)?;
+        store.put_blob(
+            JournalBlobClass::CatalogArtifact,
+            &self.seal.genesis().runtime().package,
+            &self.runtime_package,
+        )?;
+        store.initialize_external_local(&self.seal, budget)?;
+        store.commit_external_genesis_exposure(&self.seal, self.intent, budget)?;
+        let owner = ExternalLocalJournalOwner::adopt_initial_store(store, self.seal, budget)?;
+        owner.observe_create_application()?;
+        Ok(owner)
+    }
+
+    pub(crate) fn into_parts(self) -> (super::replay::ReplaySealedExternalLocalGenesis, Vec<u8>) {
+        (self.seal, self.runtime_package)
+    }
+}
+
 struct AuthenticatedExternalInput {
     input: ReplayInputId,
     before: RuntimeState,
@@ -431,32 +595,70 @@ pub(crate) struct ExternalLocalJournalOwner {
 
 #[cfg(all(target_os = "linux", feature = "storage"))]
 impl ExternalLocalJournalOwner {
+    fn executor_from_store(
+        store: &super::journal_store::FileAgentJournalStore,
+        seal: &super::replay::ReplaySealedExternalLocalGenesis,
+    ) -> Result<
+        ExternalLocalReplayExecutor<super::journal_store::FileCatalogBlobResolver>,
+        super::journal_store::JournalStoreError,
+    > {
+        use super::journal_store::{CatalogBlobResolverFactory, JournalStoreError};
+        let resolver = store.catalog_blob_resolver()?;
+        let package = &seal.genesis().runtime().package;
+        let bytes = resolver
+            .load_catalog(package)?
+            .ok_or(JournalStoreError::MissingObject)?;
+        let runtime = super::package_admission::admit_state_runtime_package(&bytes)
+            .map_err(|_| JournalStoreError::Corrupt)?;
+        let ReplayOperation::CleanManage {
+            request: ManagementRequest::Create(descriptor),
+            ..
+        } = &seal.genesis().create.operation
+        else {
+            return Err(JournalStoreError::Corrupt);
+        };
+        ExternalLocalReplayExecutor::new(runtime, descriptor.as_ref().clone(), resolver)
+            .map_err(|_| JournalStoreError::Corrupt)
+    }
+
     pub(crate) fn open(
         slot: super::journal_store::FileLocalAgentJournalSlot,
         seal: super::replay::ReplaySealedExternalLocalGenesis,
         budget: &mut ReadBudget,
     ) -> Result<Self, super::journal_store::JournalStoreError> {
-        use super::journal_store::{CatalogBlobResolverFactory, JournalStoreError};
         let (store, executor, validated) = slot.open_external_journal_with_executor(
             &seal,
-            |store| {
-                let resolver = store.catalog_blob_resolver()?;
-                let package = &seal.genesis().runtime().package;
-                let bytes = resolver
-                    .load_catalog(package)?
-                    .ok_or(JournalStoreError::MissingObject)?;
-                let runtime = super::package_admission::admit_state_runtime_package(&bytes)
-                    .map_err(|_| JournalStoreError::Corrupt)?;
-                let ReplayOperation::CleanManage {
-                    request: ManagementRequest::Create(descriptor),
-                    ..
-                } = &seal.genesis().create.operation
-                else {
-                    return Err(JournalStoreError::Corrupt);
-                };
-                ExternalLocalReplayExecutor::new(runtime, descriptor.as_ref().clone(), resolver)
-                    .map_err(|_| JournalStoreError::Corrupt)
-            },
+            |store| Self::executor_from_store(store, &seal),
+            &super::replay::NoPrunedOrderedBases,
+            budget,
+        )?;
+        let cursor =
+            super::replay::PinnedExternalJournal::open_validated(Box::new(store), validated)?;
+        Ok(Self {
+            seal,
+            cursor,
+            executor,
+        })
+    }
+
+    fn adopt_initial_store(
+        mut store: super::journal_store::FileAgentJournalStore,
+        seal: super::replay::ReplaySealedExternalLocalGenesis,
+        budget: &mut ReadBudget,
+    ) -> Result<Self, super::journal_store::JournalStoreError> {
+        use super::journal_store::{AgentJournalStore, JournalStoreError};
+        let initial = seal
+            .initial_heads()
+            .map_err(|_| JournalStoreError::NonCanonical)?;
+        if store.heads()?.as_ref() != Some(&initial) {
+            return Err(JournalStoreError::Conflict);
+        }
+        let mut executor = Self::executor_from_store(&store, &seal)?;
+        let validated = super::replay::validate_external_genesis_head(
+            &mut store,
+            &seal,
+            &initial,
+            &mut executor,
             &super::replay::NoPrunedOrderedBases,
             budget,
         )?;
@@ -726,5 +928,262 @@ mod tests {
         expected[31] = u8::MAX;
         assert_eq!(actor_cursor_before(ActorId(first)), Some(ActorId(expected)));
         assert!(ActorId(expected) < ActorId(first));
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    #[test]
+    #[ignore = "requires just build-agent-standard-state-guest"]
+    fn retained_signed_external_create_reconstructs_physical_seal() {
+        use super::RetainedExternalLocalCreate;
+        use crate::agent::{
+            clean_authority_issuer::{CleanManagementIssuerStore, CleanManagementRuntimeStore},
+            clean_management_intent::{
+                CleanManagementIntent, CleanManagementIntentSlot, ManagementJournalAnchor,
+            },
+            genesis::AgentGenesisAdmissionId,
+            journal::{AgentJournalGenesisId, OrderedBase, ReplayOperation},
+            journal_store::FileLocalAgentJournalSlot,
+        };
+        use crate::agent_sdk::{
+            self as sdk,
+            authority::{AuthorityActorTarget, AuthorityCredentialCall, ManagedAgentTarget},
+        };
+        use ed25519_dalek::{Signer as _, SigningKey};
+        use std::num::NonZeroU64;
+
+        #[derive(Default)]
+        struct Store {
+            intent: Option<Vec<u8>>,
+            runtime: Option<Vec<u8>>,
+        }
+        impl CleanManagementIssuerStore for Store {
+            type Error = ();
+            fn load(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+                Ok(self.intent.clone())
+            }
+            fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
+                self.intent = Some(image.to_vec());
+                Ok(())
+            }
+        }
+        impl CleanManagementRuntimeStore for Store {
+            fn load_runtime(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+                Ok(self.runtime.clone())
+            }
+            fn commit_runtime(&mut self, package: &[u8]) -> Result<(), Self::Error> {
+                self.runtime = Some(package.to_vec());
+                Ok(())
+            }
+        }
+
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target"));
+        let program = vos_pvm_compiler::link_elf_spi(
+            &std::fs::read(
+                target.join("agent-state-standard/riscv64em-vos/release/agent_runtime.elf"),
+            )
+            .expect("build experimental standard guest first"),
+        )
+        .unwrap();
+        let admitted = crate::agent::package_admission::tests::admitted_state_fixture(program);
+        let (create, replica, _) = crate::agent::replay::tests::external_create_fixture(&admitted);
+        let ReplayOperation::CleanManage {
+            request: request @ sdk::ManagementRequest::Create(descriptor),
+            authority: receipt,
+            observed_slot,
+        } = &create.operation
+        else {
+            unreachable!()
+        };
+        let identity = &descriptor.identity;
+        let authority = AuthorityActorTarget {
+            space: identity.space,
+            system_agent: sdk::AgentId([0x91; 32]),
+            system_runtime_deployment: sdk::DeploymentId([0x92; 32]),
+            binding: descriptor.authority,
+        };
+        let managed = ManagedAgentTarget {
+            space: identity.space,
+            agent: identity.agent,
+            owner: identity.owner,
+            profile: identity.profile,
+            runtime_deployment: identity.runtime_deployment,
+            transition_producer: identity.transition_producer,
+        };
+        let credential_key = SigningKey::from_bytes(&[0x93; 32]);
+        let credential_public_key = credential_key.verifying_key().to_bytes();
+        let mut call = AuthorityCredentialCall {
+            invocation: sdk::InvocationId::ZERO,
+            authority,
+            managed,
+            principal: identity.owner,
+            credential: sdk::CredentialId::of_public_key(&credential_public_key),
+            request_sequence: NonZeroU64::new(1).unwrap(),
+            credential_public_key,
+            authenticated_node: Some(replica.node),
+            requested_valid_from: *observed_slot,
+            requested_expires_at: observed_slot + 20,
+            plan: request.authorization_plan().unwrap(),
+            signature: [0; 64],
+        };
+        call.invocation = call.expected_invocation();
+        call.signature = credential_key.sign(&call.signing_bytes()).to_bytes();
+        let intent = CleanManagementIntent::new(
+            authority,
+            managed,
+            request.clone(),
+            call.clone(),
+            &crate::agent::clean_bootstrap::RawCredentialVerifier,
+        )
+        .unwrap();
+        let work = sdk::InvocationWork {
+            space: authority.space,
+            agent: authority.system_agent,
+            runtime_deployment: authority.system_runtime_deployment,
+            invocation: call.invocation,
+            actor: authority.binding.issuer.actor,
+            incarnation: sdk::Hash([0x94; 32]),
+            deployment: authority.binding.issuer.deployment,
+            program: authority.binding.issuer.program,
+            mode: sdk::MethodMode::Linear,
+            origin: intent.authorization_origin(),
+            roles: sdk::InvocationRoleClaims::none(),
+            message: intent.authorization_message(),
+            installation_data: None,
+            availability: Vec::new(),
+            gas: 1_000_000,
+            recovery_only: false,
+        };
+        let authorization = sdk::InvocationAuthorization::PublicPreflight(
+            sdk::PublicPreflight::for_work(&work, *observed_slot),
+        );
+        let mut slot = CleanManagementIntentSlot::open(Store::default()).unwrap();
+        slot.pledge(intent).unwrap();
+        slot.retain_runtime(admitted.exact_bytes()).unwrap();
+        slot.pledge_authorization_work(
+            sdk::RuntimeWork::Invoke {
+                context: sdk::RuntimeExecutionContext::Direct,
+                state: sdk::RuntimeState::default(),
+                invocation: Box::new(work),
+                authorization: Box::new(authorization),
+                observed_slot: *observed_slot,
+            },
+            ManagementJournalAnchor {
+                genesis: AgentJournalGenesisId([0x95; 32]),
+                admission: AgentGenesisAdmissionId::from_bytes([0x96; 32]),
+                runtime: crate::service::Hash([0x97; 32]),
+                ordered: OrderedBase::post_genesis(),
+            },
+        )
+        .unwrap();
+        let mut slot = CleanManagementIntentSlot::open(slot.into_store()).unwrap();
+        let (seal, runtime) =
+            RetainedExternalLocalCreate::prepare(&mut slot, authority, receipt, replica.node)
+                .unwrap()
+                .into_parts();
+        assert_eq!(seal.genesis().create, create);
+        assert_eq!(runtime, admitted.exact_bytes());
+        let mut altered_receipt = receipt.clone();
+        altered_receipt.signature[0] ^= 1;
+        assert!(
+            RetainedExternalLocalCreate::prepare(
+                &mut slot,
+                authority,
+                &altered_receipt,
+                replica.node,
+            )
+            .is_err()
+        );
+        assert!(
+            RetainedExternalLocalCreate::prepare(
+                &mut slot,
+                authority,
+                receipt,
+                sdk::NodeId([0x98; 32]),
+            )
+            .is_err()
+        );
+        struct TestDirectory(std::path::PathBuf);
+        impl Drop for TestDirectory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory = TestDirectory(target.join("task-tmp").join(format!(
+            "retained-external-create-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )));
+        std::fs::create_dir_all(&directory.0).unwrap();
+        let agent_hex = identity
+            .agent
+            .0
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let agent_root = directory.0.join(format!("{agent_hex}.agent"));
+        let agent_lock = directory.0.join(format!("{agent_hex}.agent-lock"));
+        let parent = std::fs::File::open(&directory.0).unwrap();
+        let prepared =
+            RetainedExternalLocalCreate::prepare(&mut slot, authority, receipt, replica.node)
+                .unwrap();
+        let intent_hash = prepared.intent();
+        let file_slot = FileLocalAgentJournalSlot::acquire_with_pinned_parents(
+            agent_root.clone(),
+            agent_lock.clone(),
+            crate::service::NodeId(replica.node.0),
+            intent_hash,
+            &parent,
+            &parent,
+        )
+        .unwrap();
+        let owner = prepared
+            .publish_initial(
+                file_slot,
+                &mut sdk::state_blocks::ReadBudget::new(10000, 10000000),
+            )
+            .unwrap();
+        assert_eq!(
+            owner.observe_create_application().unwrap().receipt(),
+            receipt
+        );
+        let first_head = owner.materialization().unwrap().heads().clone();
+        drop(owner);
+        let prepared =
+            RetainedExternalLocalCreate::prepare(&mut slot, authority, receipt, replica.node)
+                .unwrap();
+        assert_eq!(prepared.intent(), intent_hash);
+        let file_slot = FileLocalAgentJournalSlot::acquire_with_pinned_parents(
+            agent_root,
+            agent_lock,
+            crate::service::NodeId(replica.node.0),
+            intent_hash,
+            &parent,
+            &parent,
+        )
+        .unwrap();
+        let owner = prepared
+            .publish_initial(
+                file_slot,
+                &mut sdk::state_blocks::ReadBudget::new(10000, 10000000),
+            )
+            .unwrap();
+        assert_eq!(owner.materialization().unwrap().heads(), &first_head);
+        drop(owner);
+        let mut store = slot.into_store();
+        store.runtime.as_mut().unwrap()[0] ^= 1;
+        let mut corrupt = CleanManagementIntentSlot::open(store).unwrap();
+        assert!(
+            RetainedExternalLocalCreate::prepare(&mut corrupt, authority, receipt, replica.node,)
+                .is_err()
+        );
     }
 }
