@@ -79,12 +79,13 @@ the experimental ABI; its artifact is not replaced or implicitly upgraded.
 An opt-in `LCQ2` Create envelope now preserves the exact signed external-state
 package and keeps it type-disjoint from image `LCQ1`; its physical Create
 fixture checks round-trip and corruption rejection. No released ingress accepts
-`LCQ2` until startup recovery and route publication qualify.
+`LCQ2` by default; the opt-in experimental HTTP path is described below.
 The external Create coordinator now also accepts already-open intent and issuer
 slots; a crash-point retry test keeps both slots alive across ambiguous errors.
 This lets a startup controller retain those leases instead of reopening them
 per attempt. The later startup driver and opt-in root selection below now
-perform recovery; `LCQ2` ingress remains disabled.
+perform recovery; the experimental queue/HTTP path below carries the distinct
+envelope, while the default binary does not.
 Physical Create-seal preparation is separate from the mutable lifecycle
 slot so recovery can consume immutable retained Create facts. This is needed
 before Install handoff: CMI4 may replace the Create intent with Install, while
@@ -268,7 +269,14 @@ valid unpledged candidate from startup admission. Its lifecycle stores are
 memory-backed, not the `vosx` file leases. A signed wrong-node Create is
 rejected before the store factory can create a lifecycle directory. The new
 Create wrapper also passed on a dedicated 2-MiB thread stack; the all-in-one
-fixture still uses 4 MiB. No LCQ2 production queue or HTTP path is enabled.
+fixture still uses 4 MiB. The opt-in production queue now retains LCQ2 as a
+distinct variant, and HTTP accepts it at the existing Local Create endpoint
+only with `experimental-state-blocks`. The production owner uses the same
+route reconciliation as image Create after external physical finality. No
+external Create CLI or full file-backed/public retry qualification is claimed.
+The physical fixture exercises the typed queue, shutdown rejection and
+type-erased Create on a 2-MiB thread, then exact retry/restart. Feature-on and
+default HTTP validation tests pass; neither is an end-to-end ingress test.
 The file-store regression independently confirms that a runtime-only candidate
 is discoverable after lease release/reopen with no intent or issuer image. It
 does not replace the pending end-to-end file-backed lifecycle test.
@@ -315,7 +323,7 @@ The current released-binary path is `vosx` clean startup -> image-based
 `LocalAgentHost` -> image-backed `LocalLifecycleController` -> Local route backend. The
 older `host::LocalGenesisIntent` file opener accepts r19 only. Next, qualify
 real file-backed restart through the opt-in external selection, then enable
-its correctly typed lifecycle dispatch and route refresh only after
+its correctly typed CLI/client request and qualify route refresh after
 authenticated Create publication. Shared common finality and Clerk follow
 within batch 1. Candidate signed packages are not live admission;
 the large ACK's 5-billion-gas success is not a release-latency guarantee.
@@ -324,16 +332,16 @@ External Local cutover TODOs, in order: (1) qualify the opt-in `vosx` fresh-root
 startup with an Agent under real file-backed lifecycle leases, a response-loss
 restart and the Install actor-sidecar crash window; existing image roots stay on their
 current path, and mixed-format migration is deferred;
-(2) connect the internal typed LCQ2 Create and external Install to production lifecycle
-dispatch and route refresh, resolving approved-but-guest-rejected Install
+(2) qualify the opt-in typed LCQ2 production dispatch and connect external
+Install to it, resolving approved-but-guest-rejected Install
 without stranding its intent; add Resume using the existing signed journal
 semantics, not an image-host fallback; (3) qualify
 publicly routed response-loss retry after file-backed restart,
 near-ceiling ACK, candidate artifact identities and released-binary behavior.
-`LocalLifecycleController::with_recovery` currently assumes every discovered
-Agent is present in `LocalAgentHost`; merely accepting an external Create
-submission would strand it on restart. Keep that ingress disabled until these
-gates pass.
+The image `with_recovery` still assumes an image host; the separate external
+startup path retains locked journal owners. Do not enable external mode in the
+default binary or present this experimental ingress as a supported customer
+workflow until the file-backed and artifact gates pass.
 
 Provisional acceptance envelope (customer confirmation required before sign-off):
 

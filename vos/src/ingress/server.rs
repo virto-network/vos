@@ -431,8 +431,8 @@ fn handle_clean_inventory(
     }
 }
 
-/// Signed-body authentication: LCQ1 verifies ACC3 locally and the node's live
-/// Authority actor independently authorizes the exact request before issuance.
+/// Signed-body authentication: LCQ1 (or opt-in LCQ2) verifies ACC3 locally;
+/// the live Authority independently authorizes the exact request before issue.
 #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
 fn handle_local_create(
     request: &super::types::Request,
@@ -456,22 +456,46 @@ fn handle_local_create(
         .and_then(|value| value.to_str().ok())
         != Some("application/octet-stream")
     {
-        return text(415, "Local Create requires application/octet-stream LCQ1");
+        return text(415, "Local Create requires application/octet-stream");
     }
-    let submission = match LocalCreateSubmission::decode(request.body()) {
-        Ok(value) => value,
-        Err(_) => return text(400, "invalid signed Local Create submission"),
+    let pending = if request.body().starts_with(b"LCQ2") {
+        #[cfg(feature = "experimental-state-blocks")]
+        {
+            let submission = match crate::agent::local_lifecycle::LocalStateCreateSubmission::decode(
+                request.body(),
+            ) {
+                Ok(value) => value,
+                Err(_) => return text(400, "invalid signed external Local Create submission"),
+            };
+            if submission.call().authenticated_node.is_some() {
+                return text(
+                    403,
+                    "HTTP Local Create does not accept transport-node claims",
+                );
+            }
+            handle.create_clean_external_local_agent(submission)
+        }
+        #[cfg(not(feature = "experimental-state-blocks"))]
+        {
+            return text(400, "external Local Create is not available in this build");
+        }
+    } else {
+        let submission = match LocalCreateSubmission::decode(request.body()) {
+            Ok(value) => value,
+            Err(_) => return text(400, "invalid signed Local Create submission"),
+        };
+        let (descriptor, call, runtime) = submission.into_parts();
+        // HTTP cannot attest a transport/node binding. The signed credential
+        // call still needs independent authorization by the Authority actor.
+        if call.authenticated_node.is_some() {
+            return text(
+                403,
+                "HTTP Local Create does not accept transport-node claims",
+            );
+        }
+        handle.create_clean_local_agent(descriptor, call, runtime)
     };
-    let (descriptor, call, runtime) = submission.into_parts();
-    // HTTP cannot attest a transport/node binding. The signed credential call
-    // still requires independent authorization by the Authority actor.
-    if call.authenticated_node.is_some() {
-        return text(
-            403,
-            "HTTP Local Create does not accept transport-node claims",
-        );
-    }
-    let reply = match handle.create_clean_local_agent(descriptor, call, runtime) {
+    let reply = match pending {
         Ok(reply) => reply,
         Err(LocalLifecycleIngressError::Invalid) => return text(400, "invalid Local Create"),
         Err(LocalLifecycleIngressError::Busy) => return text(503, "Local lifecycle queue is full"),
@@ -1062,6 +1086,13 @@ mod tests {
                 "/__agents/local",
                 "application/octet-stream",
                 b"LCQ1".to_vec(),
+                400,
+            ),
+            (
+                "POST",
+                "/__agents/local",
+                "application/octet-stream",
+                b"LCQ2".to_vec(),
                 400,
             ),
             (

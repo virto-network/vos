@@ -40,13 +40,14 @@ pub struct LocalCreateSubmission {
 /// Distinct LCQ2 request for the experimental external-state Local runtime.
 /// It has the same signed Create claim as LCQ1, but its runtime package is
 /// admitted against the state-execution ABI. This envelope alone grants no
-/// lifecycle, journal or route authority; released ingress remains disabled
-/// until external startup recovery is wired.
+/// lifecycle, journal or route authority. The opt-in HTTP path may queue it,
+/// but only the selected external controller can execute it.
 #[cfg(all(
     target_os = "linux",
     feature = "storage",
     feature = "experimental-state-blocks"
 ))]
+#[derive(Clone)]
 pub struct LocalStateCreateSubmission {
     descriptor: AgentDescriptor,
     call: AuthorityCredentialCall,
@@ -448,6 +449,15 @@ pub(crate) enum PendingLocalLifecycle {
         reply: mpsc::SyncSender<AuthorityOperationResult>,
     },
     Create(PendingLocalCreate),
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    CreateExternal {
+        submission: LocalStateCreateSubmission,
+        reply: mpsc::SyncSender<LocalCreateResult>,
+    },
     Install {
         submission: LocalInstallSubmission,
         reply: mpsc::SyncSender<LocalInstallResult>,
@@ -472,6 +482,14 @@ impl PendingLocalLifecycle {
             }
             Self::Create(request) => {
                 let _ = request.reply.try_send(Err(error));
+            }
+            #[cfg(all(
+                target_os = "linux",
+                feature = "storage",
+                feature = "experimental-state-blocks"
+            ))]
+            Self::CreateExternal { reply, .. } => {
+                let _ = reply.try_send(Err(error));
             }
             Self::Install { reply, .. } => {
                 let _ = reply.try_send(Err(error));
@@ -624,6 +642,32 @@ impl LocalLifecycleQueue {
                 runtime,
                 reply,
             }))
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => LocalLifecycleIngressError::Busy,
+                mpsc::TrySendError::Disconnected(_) => LocalLifecycleIngressError::Unavailable,
+            })?;
+        Ok(receiver)
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    pub(crate) fn submit_external(
+        &self,
+        submission: LocalStateCreateSubmission,
+    ) -> Result<mpsc::Receiver<LocalCreateResult>, LocalLifecycleIngressError> {
+        let channel = self
+            .channel
+            .lock()
+            .map_err(|_| LocalLifecycleIngressError::Unavailable)?;
+        let (sender, _) = channel
+            .as_ref()
+            .ok_or(LocalLifecycleIngressError::Unavailable)?;
+        let (reply, receiver) = mpsc::sync_channel(1);
+        sender
+            .try_send(PendingLocalLifecycle::CreateExternal { submission, reply })
             .map_err(|error| match error {
                 mpsc::TrySendError::Full(_) => LocalLifecycleIngressError::Busy,
                 mpsc::TrySendError::Disconnected(_) => LocalLifecycleIngressError::Unavailable,
@@ -1820,6 +1864,17 @@ pub(crate) trait NativeLocalLifecycle: Send {
     ) -> Result<Option<LocalCreateDenial>, SharedAgentHostError> {
         Ok(None)
     }
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    fn retained_state_denial(
+        &mut self,
+        _submission: &LocalStateCreateSubmission,
+    ) -> Result<Option<LocalCreateDenial>, SharedAgentHostError> {
+        Ok(None)
+    }
     fn node(&self) -> Result<super::sdk::NodeId, SharedAgentHostError>;
     fn system_attachment(
         &self,
@@ -1852,6 +1907,17 @@ pub(crate) trait NativeLocalLifecycle: Send {
         call: AuthorityCredentialCall,
         runtime: AdmittedRuntimePackage,
     ) -> Result<(AgentId, ManagementApplicationAck), SharedAgentHostError>;
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    fn create_external(
+        &mut self,
+        _submission: LocalStateCreateSubmission,
+    ) -> Result<(AgentId, ManagementApplicationAck), SharedAgentHostError> {
+        Err(SharedAgentHostError::Unavailable)
+    }
     fn install(
         &mut self,
         _install: super::sdk::InstallActor,
@@ -1862,13 +1928,47 @@ pub(crate) trait NativeLocalLifecycle: Send {
     }
 }
 
+// Image-only builds do not inherit a storage-format requirement from the
+// opt-in external method. Feature-on lifecycle factories must retain the
+// immutable Create archive if their controller is type-erased for production.
+#[cfg(all(
+    target_os = "linux",
+    feature = "storage",
+    feature = "experimental-state-blocks"
+))]
+pub trait NativeExternalIntentStore:
+    super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore
+{
+}
+#[cfg(all(
+    target_os = "linux",
+    feature = "storage",
+    feature = "experimental-state-blocks"
+))]
+impl<T: super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore>
+    NativeExternalIntentStore for T
+{
+}
+#[cfg(not(all(
+    target_os = "linux",
+    feature = "storage",
+    feature = "experimental-state-blocks"
+)))]
+pub trait NativeExternalIntentStore {}
+#[cfg(not(all(
+    target_os = "linux",
+    feature = "storage",
+    feature = "experimental-state-blocks"
+)))]
+impl<T> NativeExternalIntentStore for T {}
+
 impl<P, R, I, F, S> NativeLocalLifecycle for LocalLifecycleController<P, R, I, F, S>
 where
     P: CleanSystemAgentBootstrapStore + Send + 'static,
     R: CleanSystemAgentBootstrapStore + Send + 'static,
     I: CleanManagementIssuerStore + Send + 'static,
     F: LocalLifecycleStoreFactory + Send,
-    F::Intent: Send,
+    F::Intent: Send + NativeExternalIntentStore,
     F::Issuer: Send,
     S: CleanManagementReceiptSigner + Send,
 {
@@ -2015,6 +2115,22 @@ where
         LocalLifecycleController::create(self, descriptor, call, runtime)
     }
 
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    fn create_external(
+        &mut self,
+        submission: LocalStateCreateSubmission,
+    ) -> Result<(AgentId, ManagementApplicationAck), SharedAgentHostError> {
+        LocalLifecycleController::create_external(
+            self,
+            submission,
+            &mut super::sdk::state_blocks::ReadBudget::new(1_000_000, 1_000_000_000),
+        )
+    }
+
     fn install(
         &mut self,
         install: super::sdk::InstallActor,
@@ -2038,6 +2154,43 @@ where
         let Some((intent, _)) = self
             .retained_stores
             .get_mut(&submission.descriptor.identity.agent)
+        else {
+            return Ok(None);
+        };
+        let Some(bytes) = intent
+            .load()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        else {
+            return Ok(None);
+        };
+        if !bytes.starts_with(b"CND1") {
+            return Ok(None);
+        }
+        submission
+            .verify_denial(&bytes)
+            .map(Some)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    fn retained_state_denial(
+        &mut self,
+        submission: &LocalStateCreateSubmission,
+    ) -> Result<Option<LocalCreateDenial>, SharedAgentHostError> {
+        let system = self
+            .system
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if submission.call().authority != system.authority_target() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let Some((intent, _)) = self
+            .retained_stores
+            .get_mut(&submission.descriptor().identity.agent)
         else {
             return Ok(None);
         };
@@ -2273,8 +2426,8 @@ where
 
     /// Explicit fresh-root external selection. Complete signed lifecycle
     /// recovery and physical finality before constructing any route worker.
-    /// This does not enable LCQ2 admission; the released ingress remains
-    /// closed until external Create/Install and bundled guests are qualified.
+    /// This selects an external owner before any opt-in LCQ2 admission; the
+    /// default binary and image-backed path remain unchanged.
     #[cfg(all(
         target_os = "linux",
         feature = "storage",
@@ -2339,8 +2492,8 @@ where
     /// Drive an opt-in external Create under retained lifecycle leases. An
     /// exact retry of an already-serving generation verifies its immutable
     /// Create archive against the same locked owner; it must not reacquire
-    /// the stable lock or publish a second physical head. Public LCQ2 ingress
-    /// remains closed until the production queue and client retain this type.
+    /// the stable lock or publish a second physical head. The opt-in queue
+    /// retains this type separately from image LCQ1.
     #[cfg(all(
         target_os = "linux",
         feature = "storage",

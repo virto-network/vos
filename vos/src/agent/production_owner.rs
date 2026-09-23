@@ -879,6 +879,91 @@ impl AgentProductionOwner {
             &mut self.local,
             &mut self.local_by_agent,
         )?;
+        self.finish_local_create_publication(result, previous, had_local_attachment, started)
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    pub(crate) fn create_external_local_disposition(
+        &mut self,
+        submission: super::local_lifecycle::LocalStateCreateSubmission,
+    ) -> super::local_lifecycle::LocalCreateResult {
+        use super::local_lifecycle::LocalCreateDisposition;
+        let retained = submission.clone();
+        match self.create_external_local_agent(submission) {
+            Ok((agent, ack)) => Ok(LocalCreateDisposition::Created(agent, ack)),
+            Err(
+                error @ AgentProductionOwnerError::Lifecycle(
+                    super::shared_host::SharedAgentHostError::ScopeMismatch,
+                ),
+            ) => {
+                let (lifecycle, _) = self
+                    .lifecycle
+                    .as_mut()
+                    .ok_or(AgentProductionOwnerError::InvalidConfiguration)?;
+                match lifecycle
+                    .retained_state_denial(&retained)
+                    .map_err(AgentProductionOwnerError::Lifecycle)?
+                {
+                    Some(denial) => Ok(LocalCreateDisposition::Denied(denial)),
+                    None => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    fn create_external_local_agent(
+        &mut self,
+        submission: super::local_lifecycle::LocalStateCreateSubmission,
+    ) -> Result<(AgentId, super::sdk::authority::ManagementApplicationAck), AgentProductionOwnerError>
+    {
+        if !self.is_ready() {
+            return Err(AgentProductionOwnerError::InvalidConfiguration);
+        }
+        let agent = submission.descriptor().identity.agent;
+        let previous = self.completed_local_publication.take();
+        self.completed_local_install = None;
+        let started = Instant::now();
+        tracing::debug!(agent = ?agent, "external Local Create lifecycle started");
+        let had_local_attachment = self
+            .local_by_agent
+            .as_ref()
+            .map_or(!self.local.is_empty(), |slots| {
+                slots.get(&agent).is_some_and(|slot| !slot.is_empty())
+            });
+        let (lifecycle, capacity) = self
+            .lifecycle
+            .as_mut()
+            .ok_or(AgentProductionOwnerError::InvalidConfiguration)?;
+        let result = lifecycle
+            .create_external(submission)
+            .map_err(AgentProductionOwnerError::Lifecycle)?;
+        ensure_local_slots(
+            lifecycle.as_ref(),
+            *capacity,
+            &mut self.local,
+            &mut self.local_by_agent,
+        )?;
+        self.finish_local_create_publication(result, previous, had_local_attachment, started)
+    }
+
+    fn finish_local_create_publication(
+        &mut self,
+        result: (AgentId, super::sdk::authority::ManagementApplicationAck),
+        previous: Option<(super::sdk::Hash, AuthorityProjectionHead)>,
+        had_local_attachment: bool,
+        started: Instant,
+    ) -> Result<(AgentId, super::sdk::authority::ManagementApplicationAck), AgentProductionOwnerError>
+    {
         let acknowledgement = result.1.commitment();
         if completed_local_publication_matches(
             previous,

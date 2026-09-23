@@ -16228,6 +16228,36 @@ mod tests {
                 crate::agent::local_lifecycle::LocalStateCreateSubmission::decode(&corrupt_request)
                     .is_err()
             );
+            let queue = crate::agent::local_lifecycle::LocalLifecycleQueue::default();
+            queue.open().unwrap();
+            let queued = queue.submit_external(state_submission.clone()).unwrap();
+            let crate::agent::local_lifecycle::PendingLocalLifecycle::CreateExternal {
+                submission,
+                reply,
+            } = queue.pop().unwrap().unwrap()
+            else {
+                panic!("LCQ2 must retain its distinct lifecycle queue variant");
+            };
+            assert_eq!(submission.encode(), state_request);
+            reply
+                .try_send(Err(
+                    crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration,
+                ))
+                .unwrap();
+            assert_eq!(
+                queued.recv().unwrap(),
+                Err(
+                    crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration
+                )
+            );
+            let shutdown_reply = queue.submit_external(state_submission).unwrap();
+            queue.close();
+            assert_eq!(
+                shutdown_reply.recv().unwrap(),
+                Err(
+                    crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration
+                )
+            );
 
             let root = harness._directory.0.join("external-local");
             std::fs::create_dir(&root).unwrap();
@@ -17005,8 +17035,10 @@ mod tests {
                     .name("external-local-controller-create-stack".into())
                     .stack_size(2 * 1024 * 1024)
                     .spawn_scoped(scope, || {
-                        controller
-                            .create_external(fresh_input, &mut ReadBudget::new(10_000, 10_000_000))
+                        crate::agent::local_lifecycle::NativeLocalLifecycle::create_external(
+                            &mut controller,
+                            fresh_input,
+                        )
                     })
                     .unwrap()
                     .join()
@@ -17264,6 +17296,20 @@ mod tests {
                     }
                     fn commit_runtime(&mut self, bytes: &[u8]) -> Result<(), MemoryError> {
                         crate::agent::clean_authority_issuer::CleanManagementRuntimeStore::commit_runtime(&mut self.inner, bytes)
+                    }
+                }
+                #[cfg(feature = "experimental-state-blocks")]
+                impl crate::agent::clean_authority_issuer::CleanExternalLocalCreateArchiveStore for LeasedStore {
+                    fn load_external_create_archive(
+                        &mut self,
+                    ) -> Result<Option<Vec<u8>>, MemoryError> {
+                        crate::agent::clean_authority_issuer::CleanExternalLocalCreateArchiveStore::load_external_create_archive(&mut self.inner)
+                    }
+                    fn commit_external_create_archive(
+                        &mut self,
+                        bytes: &[u8],
+                    ) -> Result<(), MemoryError> {
+                        crate::agent::clean_authority_issuer::CleanExternalLocalCreateArchiveStore::commit_external_create_archive(&mut self.inner, bytes)
                     }
                 }
                 impl crate::agent::clean_authority_issuer::CleanManagementActorStore for LeasedStore {

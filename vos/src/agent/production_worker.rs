@@ -315,6 +315,14 @@ fn dispatch(owner: &mut AgentProductionOwner, request: PendingLocalLifecycle) {
                 request.runtime,
             ));
         }
+        #[cfg(all(
+            target_os = "linux",
+            feature = "storage",
+            feature = "experimental-state-blocks"
+        ))]
+        PendingLocalLifecycle::CreateExternal { submission, reply } => {
+            let _ = reply.try_send(owner.create_external_local_disposition(submission));
+        }
         PendingLocalLifecycle::Install { submission, reply } => {
             let (install, call, package) = submission.into_parts();
             let _ = reply.try_send(owner.install_local_actor(install, call, package));

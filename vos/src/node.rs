@@ -2400,6 +2400,25 @@ impl IngressHandle {
             .submit(descriptor, call, runtime)
     }
 
+    #[cfg(all(
+        feature = "network",
+        feature = "storage",
+        feature = "experimental-state-blocks",
+        target_os = "linux"
+    ))]
+    pub fn create_clean_external_local_agent(
+        &self,
+        submission: crate::agent::local_lifecycle::LocalStateCreateSubmission,
+    ) -> Result<
+        mpsc::Receiver<crate::agent::local_lifecycle::LocalCreateResult>,
+        crate::agent::local_lifecycle::LocalLifecycleIngressError,
+    > {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(crate::agent::local_lifecycle::LocalLifecycleIngressError::Unavailable);
+        }
+        self.clean_local_lifecycle_queue.submit_external(submission)
+    }
+
     /// Queue an authenticated Install frame. Acceptance is not application
     /// success; disconnection does not cancel accepted durable work.
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
@@ -5874,7 +5893,7 @@ impl VosNode {
         R: crate::agent::clean_bootstrap::CleanSystemAgentBootstrapStore + Send + 'static,
         I: crate::agent::clean_authority_issuer::CleanManagementIssuerStore + Send + 'static,
         F: crate::agent::local_lifecycle::LocalLifecycleStoreFactory + Send + 'static,
-        F::Intent: Send + 'static,
+        F::Intent: crate::agent::local_lifecycle::NativeExternalIntentStore + Send + 'static,
         F::Issuer: Send + 'static,
         S: crate::agent::clean_authority_issuer::CleanManagementReceiptSigner + Send + 'static,
     {
@@ -5921,6 +5940,30 @@ impl VosNode {
             .call(move |owner| {
                 owner.ok_or(crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration)?
                     .create_local_disposition(descriptor, call, runtime)
+            })?
+    }
+
+    #[cfg(all(
+        feature = "network",
+        feature = "storage",
+        feature = "experimental-state-blocks",
+        target_os = "linux"
+    ))]
+    pub fn create_clean_external_local_agent(
+        &mut self,
+        submission: crate::agent::local_lifecycle::LocalStateCreateSubmission,
+    ) -> crate::agent::local_lifecycle::LocalCreateResult {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(
+                crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration,
+            );
+        }
+        self.clean_agent_owner
+            .as_ref()
+            .ok_or(crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration)?
+            .call(move |owner| {
+                owner.ok_or(crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration)?
+                    .create_external_local_disposition(submission)
             })?
     }
 
