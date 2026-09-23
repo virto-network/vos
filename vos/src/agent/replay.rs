@@ -22697,6 +22697,7 @@ pub(crate) mod tests {
             &ExternalCheckpointValidation<'_>,
         ) -> Result<JournalPublication, JournalStoreError>,
         mut reopen: impl FnMut(S, &mut CapturedExternalExecutor) -> S,
+        verify_final_head: impl FnOnce(S),
     ) where
         S: super::super::journal_store::ExternalMutationStore
             + super::super::journal_store::AuditedCheckpointStore
@@ -23293,6 +23294,10 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(actual, expected);
+        // The production resolver carries the same stable file lock. Release
+        // it before the callback reopens the final head under a new owner.
+        drop(production);
+        verify_final_head(store);
     }
 
     /// Probe-specific mutation markers qualify storage/replay, not actor execution.
@@ -24506,6 +24511,7 @@ pub(crate) mod tests {
                 },
                 |_, _, _| unreachable!("memory fixture has no actor fault injection"),
                 |store, _| store,
+                |_| {},
             );
         }
         if probe_mutations {

@@ -517,6 +517,74 @@ impl ExternalLocalJournalOwner {
         })
     }
 
+    /// A finalized exact retry may find later Install/Invoke work at the
+    /// durable head. It must verify the original signed Create ACK against the
+    /// authenticated generation, not re-observe the latest management result
+    /// or issue another ACK. Only the issuer's finalized-record recovery may
+    /// supply this acknowledgement; this check does not establish Authority
+    /// actor finality on its own.
+    pub(crate) fn verify_finalized_create_ack(
+        &self,
+        acknowledgement: &crate::agent_sdk::authority::ManagementApplicationAck,
+    ) -> Result<(), super::journal_store::JournalStoreError> {
+        use super::journal_store::JournalStoreError;
+        use crate::agent_sdk::{Hash, ManagementReply, ManagementRequest};
+
+        let ReplayOperation::CleanManage {
+            request: ManagementRequest::Create(descriptor),
+            authority,
+            observed_slot,
+        } = &self.seal.genesis().create.operation
+        else {
+            return Err(JournalStoreError::NonCanonical);
+        };
+        let initial = self
+            .seal
+            .initial_heads()
+            .map_err(|_| JournalStoreError::NonCanonical)?;
+        let expected_state = Hash::digest(
+            b"vos/agent/local/reopened-external-head/v1",
+            &[&initial.id().0],
+        );
+        if acknowledgement.validate_shape().is_err()
+            || acknowledgement.receipt != *authority
+            || acknowledgement.request
+                != ManagementRequest::Create(descriptor.clone()).replay_commitment()
+            || acknowledgement.application != ManagementReply::Created(descriptor.identity.clone())
+            || acknowledgement.reopened_state != expected_state
+            || acknowledgement.applied_at != *observed_slot
+            || acknowledgement.authorization_sequence.get() != authority.selector.decision_sequence
+            || acknowledgement.managed.space != descriptor.identity.space
+            || acknowledgement.managed.agent != descriptor.identity.agent
+            || acknowledgement.managed.owner != descriptor.identity.owner
+            || acknowledgement.managed.profile != descriptor.identity.profile
+            || acknowledgement.managed.runtime_deployment != descriptor.identity.runtime_deployment
+            || acknowledgement.managed.transition_producer
+                != descriptor.identity.transition_producer
+            || acknowledgement.authority.binding != descriptor.authority
+            || !super::authority::verify_raw_ed25519(
+                &descriptor.authority.public_key,
+                &acknowledgement.signing_bytes(),
+                &acknowledgement.signature,
+            )
+        {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        self.cursor.inspect(|store, recovered| {
+            self.seal
+                .validate_checkpoint_scope(store, recovered.heads())?;
+            if recovered.heads() == &initial
+                && (recovered.clean_management_evidence()
+                    != super::replay::clean_create_management_evidence(&self.seal.genesis().create)
+                        .as_ref()
+                    || recovered.state() != self.seal.post_create())
+            {
+                return Err(JournalStoreError::Conflict);
+            }
+            Ok(())
+        })
+    }
+
     /// Inspect the installed directory against this owner's exact pinned
     /// roots and locked store. Read-only guest output cannot publish changes
     /// or replace the authenticated cursor. This is an internal route-building

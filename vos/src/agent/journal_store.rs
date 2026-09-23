@@ -16727,6 +16727,63 @@ mod tests {
         feature = "storage",
         feature = "experimental-state-blocks"
     ))]
+    fn signed_external_create_ack(
+        sealed: &super::super::replay::ReplaySealedExternalLocalGenesis,
+    ) -> crate::agent_sdk::authority::ManagementApplicationAck {
+        use crate::agent_sdk::{self as sdk, authority};
+        let ReplayOperation::CleanManage {
+            request: sdk::ManagementRequest::Create(descriptor),
+            authority: receipt,
+            observed_slot,
+        } = &sealed.genesis().create.operation
+        else {
+            unreachable!()
+        };
+        let identity = &descriptor.identity;
+        let initial = sealed.initial_heads().unwrap();
+        let mut ack = authority::ManagementApplicationAck {
+            authorization_invocation: sdk::InvocationId([0x81; 32]),
+            acknowledgement_invocation: sdk::InvocationId([0x82; 32]),
+            authority: authority::AuthorityActorTarget {
+                space: identity.space,
+                system_agent: sdk::AgentId([0x83; 32]),
+                system_runtime_deployment: sdk::DeploymentId([0x84; 32]),
+                binding: descriptor.authority,
+            },
+            managed: authority::ManagedAgentTarget {
+                space: identity.space,
+                agent: identity.agent,
+                owner: identity.owner,
+                profile: identity.profile,
+                runtime_deployment: identity.runtime_deployment,
+                transition_producer: identity.transition_producer,
+            },
+            credential_call: sdk::Hash([0x85; 32]),
+            approval: sdk::Hash([0x86; 32]),
+            authorization_sequence: std::num::NonZeroU64::new(receipt.selector.decision_sequence)
+                .unwrap(),
+            request: sdk::ManagementRequest::Create(descriptor.clone()).replay_commitment(),
+            receipt: receipt.clone(),
+            application: sdk::ManagementReply::Created(identity.clone()),
+            reopened_state: sdk::Hash::digest(
+                b"vos/agent/local/reopened-external-head/v1",
+                &[&initial.id().0],
+            ),
+            applied_at: *observed_slot,
+            signature: [0; 64],
+        };
+        ack.signature = SigningKey::from_bytes(&[0x31; 32])
+            .sign(&ack.signing_bytes())
+            .to_bytes();
+        ack.validate_shape().unwrap();
+        ack
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
     impl ExternalFileFixture {
         pub(crate) fn qualify_external_genesis<E: super::super::replay::ReplayExecutor>(
             sealed: &super::super::replay::ReplaySealedExternalLocalGenesis,
@@ -16931,6 +16988,23 @@ mod tests {
                     &crate::agent_sdk::ManagementReply::Created(descriptor.identity.clone(),)
                 );
                 assert_ne!(observation.reopened_state(), crate::agent_sdk::Hash::ZERO);
+                let create_ack = signed_external_create_ack(sealed);
+                owned.verify_finalized_create_ack(&create_ack).unwrap();
+                let mut substituted = create_ack.clone();
+                substituted.reopened_state.0[0] ^= 1;
+                substituted.signature = SigningKey::from_bytes(&[0x31; 32])
+                    .sign(&substituted.signing_bytes())
+                    .to_bytes();
+                assert!(owned.verify_finalized_create_ack(&substituted).is_err());
+                let mut substituted = create_ack.clone();
+                substituted.authorization_sequence = std::num::NonZeroU64::new(2).unwrap();
+                substituted.signature = SigningKey::from_bytes(&[0x31; 32])
+                    .sign(&substituted.signing_bytes())
+                    .to_bytes();
+                assert!(owned.verify_finalized_create_ack(&substituted).is_err());
+                let mut substituted = create_ack.clone();
+                substituted.signature[0] ^= 1;
+                assert!(owned.verify_finalized_create_ack(&substituted).is_err());
                 if !probe_mutations {
                     let page = owned
                         .inspect_actors(None, 1, 10, &mut ReadBudget::new(100, 100000))
@@ -17146,6 +17220,36 @@ mod tests {
                                 "reopen must not promote or repair interrupted publication"
                             );
                             reopened
+                        },
+                        |store| {
+                            let advanced = store.heads().unwrap().unwrap();
+                            assert_ne!(advanced, sealed.initial_heads().unwrap());
+                            drop(store);
+                            let catalog = [super::super::execution::RuntimeBlob {
+                                reference: sealed.genesis().runtime().package.clone(),
+                                bytes: admitted.exact_bytes().to_vec(),
+                            }];
+                            let recreated =
+                                super::super::local_journal_driver::LocalJournalAgentDriver::<
+                                    MemoryAgentJournalStore,
+                                >::prepare_external_local_genesis(
+                                    sealed.genesis().create.clone(),
+                                    sealed.replica(),
+                                    &catalog,
+                                    sealed.replica().node,
+                                )
+                                .unwrap();
+                            let owned = super::super::external_local_executor::ExternalLocalJournalOwner::open(
+                                acquire_production_local_slot(&directory, sealed),
+                                recreated,
+                                &mut ReadBudget::new(10000, 10000000),
+                            )
+                            .unwrap();
+                            assert_eq!(owned.materialization().unwrap().heads(), &advanced);
+                            assert!(owned.observe_create_application().is_err());
+                            owned
+                                .verify_finalized_create_ack(&signed_external_create_ack(sealed))
+                                .unwrap();
                         },
                     );
                     assert!(

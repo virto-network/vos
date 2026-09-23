@@ -68,9 +68,12 @@ runtime's full metadata through the guest; measure it during release
 qualification.
 The locked owner can also re-observe physical Create from the exact initial
 external head; the existing management issuer now accepts that evidence through
-its shared acknowledgement logic. Production lifecycle wiring and finalized
-Create retry after later Agent work remain open—an initial-head-only observation
-must not be used as the post-finalization generation check.
+its shared acknowledgement logic. A separate read-only check now verifies a
+previously finalized signed Create ACK against the authenticated external
+generation even after later work advances the head; it cannot sign a fresh ACK
+or substitute for issuer-side actor finality. Production lifecycle wiring must
+use the fresh initial-head observation before finalization and this exact
+generation check only for finalized recovery. That wiring remains open.
 `LocalJournalAgentDriver::prepare_local_genesis` still builds an r19 binding
 and `StandardLocalReplayExecutor`. A separate external Local preparer now
 authenticates the signed package, exact catalog closure, Create receipt and
