@@ -15913,6 +15913,30 @@ mod tests {
             call.invocation = call.expected_invocation();
             call.signature = credential_key.sign(&call.signing_bytes()).to_bytes();
 
+            let state_submission = crate::agent::local_lifecycle::LocalStateCreateSubmission::new(
+                descriptor.clone(),
+                call.clone(),
+                runtime.exact_bytes(),
+            )
+            .unwrap();
+            let state_request = state_submission.encode();
+            assert_eq!(
+                crate::agent::local_lifecycle::LocalStateCreateSubmission::decode(&state_request)
+                    .unwrap()
+                    .encode(),
+                state_request
+            );
+            assert!(
+                crate::agent::local_lifecycle::LocalCreateSubmission::decode(&state_request)
+                    .is_err()
+            );
+            let mut corrupt_request = state_request.clone();
+            *corrupt_request.last_mut().unwrap() ^= 1;
+            assert!(
+                crate::agent::local_lifecycle::LocalStateCreateSubmission::decode(&corrupt_request)
+                    .is_err()
+            );
+
             let root = harness._directory.0.join("external-local");
             std::fs::create_dir(&root).unwrap();
             let directory = ExternalLocalJournalDirectory::open_existing(

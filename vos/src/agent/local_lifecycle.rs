@@ -37,6 +37,22 @@ pub struct LocalCreateSubmission {
     runtime: AdmittedRuntimePackage,
 }
 
+/// Distinct LCQ2 request for the experimental external-state Local runtime.
+/// It has the same signed Create claim as LCQ1, but its runtime package is
+/// admitted against the state-execution ABI. This envelope alone grants no
+/// lifecycle, journal or route authority; released ingress remains disabled
+/// until external startup recovery is wired.
+#[cfg(all(
+    target_os = "linux",
+    feature = "storage",
+    feature = "experimental-state-blocks"
+))]
+pub struct LocalStateCreateSubmission {
+    descriptor: AgentDescriptor,
+    call: AuthorityCredentialCall,
+    runtime: super::package_admission::AdmittedStateRuntimePackage,
+}
+
 /// LIQ1 carries an exact signed Install and admitted actor package. Admission
 /// authenticates request bytes, not Authority approval or target availability.
 pub struct LocalInstallSubmission {
@@ -260,6 +276,120 @@ impl LocalCreateSubmission {
         AgentDescriptor,
         AuthorityCredentialCall,
         AdmittedRuntimePackage,
+    ) {
+        (self.descriptor, self.call, self.runtime)
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    feature = "storage",
+    feature = "experimental-state-blocks"
+))]
+impl LocalStateCreateSubmission {
+    pub const MAX_BYTES: usize = LocalCreateSubmission::MAX_BYTES;
+
+    /// Verify a terminal signed denial against this exact retained request.
+    pub fn verify_denial(
+        &self,
+        bytes: &[u8],
+    ) -> Result<LocalCreateDenial, crate::service::wire::DecodeError> {
+        super::clean_management_intent::verify_denial_record(
+            bytes,
+            &ManagementRequest::Create(Box::new(self.descriptor.clone())),
+            &self.call,
+        )?;
+        Ok(LocalCreateDenial {
+            bytes: bytes.to_vec(),
+        })
+    }
+
+    pub fn new(
+        descriptor: AgentDescriptor,
+        call: AuthorityCredentialCall,
+        runtime_package: &[u8],
+    ) -> Result<Self, crate::service::wire::DecodeError> {
+        use crate::service::wire::DecodeError;
+        let runtime = super::package_admission::admit_state_runtime_package(runtime_package)
+            .map_err(|_| DecodeError::NonCanonical)?;
+        if !super::external_local_executor::state_runtime_matches_descriptor(&descriptor, &runtime)
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        super::clean_management_intent::CleanManagementIntent::new(
+            call.authority,
+            call.managed,
+            ManagementRequest::Create(Box::new(descriptor.clone())),
+            call.clone(),
+            &super::clean_bootstrap::RawCredentialVerifier,
+        )
+        .map_err(|_| DecodeError::NonCanonical)?;
+        Ok(Self {
+            descriptor,
+            call,
+            runtime,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        use super::sdk::wire::CanonicalWire as _;
+        let mut bytes = b"LCQ2".to_vec();
+        let mut encoder = crate::service::wire::Encoder(&mut bytes);
+        encoder.bytes(
+            &ManagementRequest::Create(Box::new(self.descriptor.clone()))
+                .encode()
+                .expect("validated external Create"),
+        );
+        encoder.bytes(&self.call.encode().expect("validated credential call"));
+        encoder.bytes(self.runtime.exact_bytes());
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, crate::service::wire::DecodeError> {
+        use super::sdk::wire::CanonicalWire as _;
+        use crate::service::wire::{DecodeError, Decoder};
+        if bytes.len() > Self::MAX_BYTES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        if bytes.get(..4) != Some(b"LCQ2") {
+            return Err(DecodeError::InvalidTag);
+        }
+        let mut decoder = Decoder::new(&bytes[4..]);
+        let request = decoder.bytes_ref()?;
+        let call = decoder.bytes_ref()?;
+        let package = decoder.bytes_ref()?;
+        if !decoder.exhausted() {
+            return Err(DecodeError::TrailingBytes);
+        }
+        if request.len() > super::sdk::wire::MAX_MANAGEMENT_REQUEST_WIRE_BYTES
+            || call.len() > super::sdk::wire::MAX_AUTHORITY_CREDENTIAL_CALL_WIRE_BYTES
+            || package.len() > super::sdk::package::MAX_PACKAGE_ENCODED_BYTES
+        {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let ManagementRequest::Create(descriptor) =
+            ManagementRequest::decode(request).map_err(|_| DecodeError::NonCanonical)?
+        else {
+            return Err(DecodeError::NonCanonical);
+        };
+        let call = AuthorityCredentialCall::decode(call).map_err(|_| DecodeError::NonCanonical)?;
+        Self::new(*descriptor, call, package)
+    }
+
+    pub fn descriptor(&self) -> &AgentDescriptor {
+        &self.descriptor
+    }
+
+    pub fn call(&self) -> &AuthorityCredentialCall {
+        &self.call
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        AgentDescriptor,
+        AuthorityCredentialCall,
+        super::package_admission::AdmittedStateRuntimePackage,
     ) {
         (self.descriptor, self.call, self.runtime)
     }

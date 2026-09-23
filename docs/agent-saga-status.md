@@ -17,6 +17,13 @@ self-custodial clients. Both Local and Shared require durable recovery and
 backup. Human-friendly create/install/invoke commands must preserve exact
 protocol requests and resumability.
 
+First-release Local storage selection is explicit: a new external-state Local
+deployment uses a fresh dedicated root; existing image-based Local deployments
+keep their current path. Do not migrate an image root in place or silently
+interpret mixed formats. Mixed-format migration is deferred, not a release
+gate. An external root still must recover every pending lifecycle generation
+before its first route is published.
+
 Three release-work batches remain. The bounded-state vertical slice is a
 separate intermediate review checkpoint on `saga/agents`, not completion of
 batch 1; subsequent integration stays on `wip/ch08-runtime-directory`:
@@ -66,6 +73,10 @@ builds opt-in Authority and standard-runtime guests and exercises the complete
 internal Create/retry flow, including a failure after actor finality but before
 local retirement. The released bundled Authority correctly rejects
 the experimental ABI; its artifact is not replaced or implicitly upgraded.
+An opt-in `LCQ2` Create envelope now preserves the exact signed external-state
+package and keeps it type-disjoint from image `LCQ1`; its physical Create
+fixture checks round-trip and corruption rejection. No released ingress accepts
+`LCQ2` until startup recovery and route publication qualify.
 The coordinator now accepts an operator-selected, filesystem-descriptor-pinned
 external directory owner rather than a request-controlled slot-opening
 callback; replacing that directory pathname cannot redirect a retained owner.
@@ -158,10 +169,12 @@ Clerk follow within batch 1. Candidate signed packages are not live admission;
 the large ACK's 5-billion-gas success is not a release-latency guarantee.
 
 External Local cutover TODOs, in order: (1) pass the Space/Node-pinned external
-directory into the lifecycle controller and select format per Agent,
-then recover mixed image/external intents under one startup admission before
-publishing either kind of route; (2) attach the internal external per-Agent
-Direct Invoke/ACK worker after finality, and add Install/Resume using the
+directory into startup and explicitly select the fresh external format for
+that root, then recover its complete external lifecycle set under startup
+admission before publishing any route; existing image roots stay on their
+current path, and mixed-format migration is deferred; (2) attach the internal
+external per-Agent Direct Invoke/ACK worker after finality, and add
+Install/Resume using the
 existing signed journal semantics, not an image-host fallback; (3) qualify
 publicly routed response-loss retry after file-backed restart,
 near-ceiling ACK, candidate artifact identities and released-binary behavior.
@@ -1319,9 +1332,10 @@ backup or long-running retention tests.
   previous bounded-state checkpoint was `6bcff6fe`. Neither is production
   release evidence.
 - Implementation continues on `wip/ch08-runtime-directory` after this
-  checkpoint. Next: qualify locked file-owner retry, connect mixed image/
-  external startup selection and route attachment, then remaining batch 1.
-  This signed Create/Invoke seam is internal, not deployed.
+  checkpoint. Locked file-owner retry and an internal Direct route worker have
+  qualified. Next: explicit fresh-root external startup recovery and route
+  attachment, then remaining batch 1. This signed Create/Invoke seam is
+  internal, not deployed.
 - Current focused checks are recorded above: candidate signed Local Create,
   physical Standard Invoke/ACK checkpoint recovery, SDK feature-on/off and
   feature-disabled `vos` pass. Full prototype, released-binary and workspace
