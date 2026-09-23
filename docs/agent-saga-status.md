@@ -252,6 +252,12 @@ second Agent on a 2-MiB worker stack, then verifies exact retry and recovery
 after controller restart. This remains internal candidate behavior: the full
 file-backed lifecycle/route retry and multi-Agent credential ordering need
 qualification.
+A follow-up fixture now performs two sequential physical Installs on the second
+Agent with one credential's advancing request sequence. It verifies the later
+signed pending package replaces the retired Install's sidecar and that restart
+recovers the later ACK. The real `vosx` file adapter separately exercises the
+pre-handoff and post-handoff file order, including a staged `.next` recovery,
+but this is not yet a full file-backed daemon lifecycle run.
 A permanently guest-rejected approved Install has no terminal failure
 transition, so public Install ingress remains disabled.
 The internal lifecycle controller now has an explicit external backing that

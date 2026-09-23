@@ -17186,6 +17186,47 @@ mod tests {
                 fresh_install_ack,
                 "a live exact Install retry must reuse the published generation",
             );
+            harness
+                .fixture
+                .logical_slot
+                .as_ref()
+                .unwrap()
+                .store(LOGICAL_SLOT + 22, Ordering::Release);
+            let second_package = crate::agent::package_admission::admitted_standard_actor_for_test(
+                "external-local-second",
+                StateLane::Local,
+                0x6b,
+            );
+            let second_request = self::install_request(fresh_agent, &second_package, 0x6c, None);
+            let (mut second_call, _) =
+                credential_call_and_approval(&fresh_descriptor, &second_request, &credential_key);
+            second_call.authority = fresh_call.authority;
+            second_call.request_sequence = core::num::NonZeroU64::new(5).unwrap();
+            second_call.requested_valid_from = LOGICAL_SLOT + 22;
+            second_call.requested_expires_at = LOGICAL_SLOT + 60;
+            second_call.invocation = second_call.expected_invocation();
+            second_call.signature = credential_key.sign(&second_call.signing_bytes()).to_bytes();
+            let ManagementRequest::Install(second_install) = second_request else {
+                unreachable!();
+            };
+            let second_install_bytes = crate::agent::local_lifecycle::LocalInstallSubmission::new(
+                *second_install,
+                second_call,
+                second_package,
+            )
+            .unwrap()
+            .encode();
+            let second_install_ack = controller
+                .install_external(
+                    crate::agent::local_lifecycle::LocalInstallSubmission::decode(
+                        &second_install_bytes,
+                    )
+                    .unwrap(),
+                    &mut ReadBudget::new(10_000, 10_000_000),
+                )
+                .unwrap();
+            assert_eq!(second_install_ack.managed.agent, fresh_agent);
+            assert_ne!(second_install_ack, fresh_install_ack);
             use crate::agent::local_lifecycle::NativeLocalLifecycle as _;
             let mut expected = vec![descriptor.identity.agent, fresh_agent];
             expected.sort_unstable();
@@ -17220,14 +17261,14 @@ mod tests {
                 restarted
                     .install_external(
                         crate::agent::local_lifecycle::LocalInstallSubmission::decode(
-                            &fresh_install_bytes,
+                            &second_install_bytes,
                         )
                         .unwrap(),
                         &mut ReadBudget::new(10_000, 10_000_000),
                     )
                     .unwrap(),
-                fresh_install_ack,
-                "recovered Install must keep its exact ACK and original file generation",
+                second_install_ack,
+                "the successor Install must replace the prior staged package and recover exactly",
             );
             assert_eq!(
                 restarted

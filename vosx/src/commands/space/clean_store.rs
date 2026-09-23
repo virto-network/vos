@@ -4184,16 +4184,52 @@ pub(crate) mod tests {
             CleanManagementLifecycleStoreFactory::open_or_create_external(&fixture.root, space)
                 .unwrap();
         let (mut intent, issuer) = external.open(space, agent).unwrap();
-        intent
-            .commit_pending_install(b"exact-pending-install")
-            .unwrap();
-        assert_eq!(intent.load().unwrap(), None);
+        intent.commit(b"retired-create").unwrap();
+        intent.commit_actor(b"previous-actor").unwrap();
+        stage(&intent.4, None, b"exact-pending-install");
+        assert_eq!(intent.load().unwrap(), Some(b"retired-create".to_vec()));
+        assert_eq!(
+            intent.load_actor().unwrap(),
+            Some(b"previous-actor".to_vec())
+        );
         drop((intent, issuer));
         assert_eq!(external.discover(space, 1).unwrap(), vec![agent]);
         let (mut intent, issuer) = external.open_existing(space, agent).unwrap();
         assert_eq!(
             intent.load_pending_install().unwrap(),
             Some(b"exact-pending-install".to_vec())
+        );
+        assert!(
+            !fixture
+                .root
+                .join(hex::encode(agent.0))
+                .join(LIFECYCLE_PENDING_INSTALL_STAGE_FILE)
+                .exists()
+        );
+        assert_eq!(intent.load().unwrap(), Some(b"retired-create".to_vec()));
+        assert_eq!(
+            intent.load_actor().unwrap(),
+            Some(b"previous-actor".to_vec())
+        );
+        intent.commit(b"pending-install-intent").unwrap();
+        drop((intent, issuer));
+        let (mut intent, issuer) = external.open_existing(space, agent).unwrap();
+        assert_eq!(
+            intent.load().unwrap(),
+            Some(b"pending-install-intent".to_vec())
+        );
+        assert_eq!(
+            intent.load_actor().unwrap(),
+            Some(b"previous-actor".to_vec())
+        );
+        assert_eq!(
+            intent.load_pending_install().unwrap(),
+            Some(b"exact-pending-install".to_vec())
+        );
+        intent.commit_actor(b"installed-actor").unwrap();
+        assert_eq!(
+            intent.load_actor().unwrap(),
+            Some(b"installed-actor".to_vec())
         );
         drop((intent, issuer, external));
         let mut image =
