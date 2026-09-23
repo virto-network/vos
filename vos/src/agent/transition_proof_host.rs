@@ -161,6 +161,8 @@ impl AttestedTransitionRoute {
                 context
             }
             RuntimeWork::Manage { .. } | RuntimeWork::Acknowledge { .. } => return false,
+            #[cfg(feature = "experimental-state-blocks")]
+            RuntimeWork::InspectInvocation { .. } => return false,
         };
         self.is_valid()
             && matches!(context, RuntimeExecutionContext::Attested { proof_system } if *proof_system == self.proof_system)
@@ -338,6 +340,8 @@ impl AuthenticatedAttestedTransition {
         let state = match work {
             RuntimeWork::Invoke { state, .. } | RuntimeWork::Resume { state, .. } => state,
             RuntimeWork::Manage { .. } | RuntimeWork::Acknowledge { .. } => return None,
+            #[cfg(feature = "experimental-state-blocks")]
+            RuntimeWork::InspectInvocation { .. } => return None,
         };
         let root =
             |tag: &[u8], bytes: &[u8]| Hash::digest(b"vos/test/agent-proof-root", &[tag, bytes]);
@@ -2224,6 +2228,8 @@ fn invocation_id(work: &RuntimeWork) -> Option<InvocationId> {
         RuntimeWork::Invoke { invocation, .. } => Some(invocation.invocation),
         RuntimeWork::Resume { resume, .. } => Some(resume.invocation),
         RuntimeWork::Manage { .. } | RuntimeWork::Acknowledge { .. } => None,
+        #[cfg(feature = "experimental-state-blocks")]
+        RuntimeWork::InspectInvocation { .. } => None,
     }
 }
 
@@ -2273,6 +2279,8 @@ fn authenticate_admission(
             (resume.actor, resume.deployment, resume.program, resume.mode)
         }
         RuntimeWork::Manage { .. } | RuntimeWork::Acknowledge { .. } => return None,
+        #[cfg(feature = "experimental-state-blocks")]
+        RuntimeWork::InspectInvocation { .. } => return None,
     };
     if admission.space != route.space
         || admission.agent != route.agent
@@ -2352,6 +2360,8 @@ fn subject_for(
             resume.mode,
         ),
         RuntimeWork::Manage { .. } | RuntimeWork::Acknowledge { .. } => return None,
+        #[cfg(feature = "experimental-state-blocks")]
+        RuntimeWork::InspectInvocation { .. } => return None,
     };
     let subject = TransitionProofSubject {
         space: route.space,
@@ -2394,6 +2404,10 @@ fn validate_transition_for_work(
             None,
         ),
         RuntimeWork::Manage { .. } | RuntimeWork::Acknowledge { .. } => {
+            return Err(TransitionProofHostRejection::InvalidWork);
+        }
+        #[cfg(feature = "experimental-state-blocks")]
+        RuntimeWork::InspectInvocation { .. } => {
             return Err(TransitionProofHostRejection::InvalidWork);
         }
     };
@@ -3103,6 +3117,12 @@ mod tests {
                         AdapterError::Rejected,
                     ));
                 }
+                #[cfg(feature = "experimental-state-blocks")]
+                RuntimeWork::InspectInvocation { .. } => {
+                    return Err(TransitionProofAdapterError::Terminal(
+                        AdapterError::Rejected,
+                    ));
+                }
             };
             let (actor, deployment, program) = match work {
                 RuntimeWork::Invoke { invocation, .. } => {
@@ -3112,6 +3132,8 @@ mod tests {
                     (resume.actor, resume.deployment, resume.program)
                 }
                 RuntimeWork::Manage { .. } | RuntimeWork::Acknowledge { .. } => unreachable!(),
+                #[cfg(feature = "experimental-state-blocks")]
+                RuntimeWork::InspectInvocation { .. } => unreachable!(),
             };
             let proof_systems =
                 crate::agent::sdk::ProofSystemSet::from_sorted(&[route.proof_system]).unwrap();
@@ -3188,6 +3210,12 @@ mod tests {
                         AdapterError::Rejected,
                     ));
                 }
+                #[cfg(feature = "experimental-state-blocks")]
+                RuntimeWork::InspectInvocation { .. } => {
+                    return Err(TransitionProofAdapterError::Terminal(
+                        AdapterError::Rejected,
+                    ));
+                }
             };
             if transition.state.control != before.control
                 || transition.state.merge != before.merge
@@ -3230,6 +3258,10 @@ mod tests {
             let state = match work {
                 RuntimeWork::Invoke { state, .. } | RuntimeWork::Resume { state, .. } => state,
                 RuntimeWork::Manage { .. } | RuntimeWork::Acknowledge { .. } => {
+                    return Err(TransitionProofAdapterError::Terminal(()));
+                }
+                #[cfg(feature = "experimental-state-blocks")]
+                RuntimeWork::InspectInvocation { .. } => {
                     return Err(TransitionProofAdapterError::Terminal(()));
                 }
             };
@@ -3348,6 +3380,8 @@ mod tests {
                         0,
                     ),
                     RuntimeWork::Manage { .. } | RuntimeWork::Acknowledge { .. } => unreachable!(),
+                    #[cfg(feature = "experimental-state-blocks")]
+                    RuntimeWork::InspectInvocation { .. } => unreachable!(),
                 };
             if self.fail_terminal {
                 return Err(TransitionProofAdapterError::Terminal(

@@ -23335,6 +23335,80 @@ pub(crate) mod tests {
                         .unwrap(),
                     first,
                 );
+                drop(reopened);
+                drop(production);
+                // Compact away both journal inputs while the first mutation's
+                // terminal result remains in guest-owned state. Its signed
+                // reference-only binding must still recover physically.
+                let mut pinned = PinnedExternalJournal::open(
+                    &mut store,
+                    sealed,
+                    &mut executor,
+                    &NoPrunedOrderedBases,
+                    &mut ReadBudget::new(10000, 10000000),
+                )
+                .unwrap();
+                pinned
+                    .checkpoint(sealed, &mut ReadBudget::new(10000, 10000000))
+                    .unwrap();
+                drop(pinned);
+                executor.captures.clear();
+                executor.pending = None;
+                store = reopen(store, &mut executor);
+                let compacted = materialize_external_genesis(
+                    &mut store,
+                    sealed,
+                    &mut executor,
+                    &NoPrunedOrderedBases,
+                    &mut ReadBudget::new(10000, 10000000),
+                )
+                .unwrap();
+                let resolver =
+                    super::super::journal_store::CatalogBlobResolverFactory::catalog_blob_resolver(
+                        &store,
+                    )
+                    .unwrap();
+                let production =
+                    super::super::external_local_executor::ExternalLocalReplayExecutor::new(
+                        admitted.clone(),
+                        descriptor.as_ref().clone(),
+                        resolver,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    super::super::external_local_executor::inspect_retained_external_outcome(
+                        &store,
+                        &compacted,
+                        &production,
+                        &invoke,
+                        &mut ReadBudget::new(10000, 10000000),
+                    )
+                    .unwrap(),
+                    first,
+                );
+                let mut unseen = invoke.clone();
+                let ReplayOperation::CleanInvoke {
+                    work: unseen_work,
+                    authorization: sdk::InvocationAuthorization::AuthorityReceipt(unseen_receipt),
+                    ..
+                } = &mut unseen.operation
+                else {
+                    unreachable!()
+                };
+                unseen_work.invocation = sdk::InvocationId([0xa1; 32]);
+                unseen_receipt.selector.request = unseen_work.commitment();
+                unseen_receipt.signature = signing.sign(&unseen_receipt.signing_bytes()).to_bytes();
+                assert_eq!(
+                    super::super::external_local_executor::inspect_retained_external_outcome(
+                        &store,
+                        &compacted,
+                        &production,
+                        &unseen,
+                        &mut ReadBudget::new(10000, 10000000),
+                    ),
+                    Err(JournalStoreError::Unavailable),
+                    "a valid unseen authorization cannot create a recovered response",
+                );
             }
             let ack = ReplayInput {
                 runtime: entry.input.runtime.clone(),
@@ -23374,7 +23448,13 @@ pub(crate) mod tests {
             executor.pending = None;
             store = reopen(store, &mut executor);
             assert_eq!(
-                publish_standard_invocation(&mut store, sealed, admitted, &mut executor, ack),
+                publish_standard_invocation(
+                    &mut store,
+                    sealed,
+                    admitted,
+                    &mut executor,
+                    ack.clone()
+                ),
                 acknowledged
             );
             let retired = materialize_external_genesis(
@@ -23386,7 +23466,13 @@ pub(crate) mod tests {
             )
             .unwrap();
             assert_eq!(
-                publish_standard_invocation(&mut store, sealed, admitted, &mut executor, invoke),
+                publish_standard_invocation(
+                    &mut store,
+                    sealed,
+                    admitted,
+                    &mut executor,
+                    invoke.clone()
+                ),
                 sdk::RuntimeOutcome::Completed(Err(sdk::InvocationError::DivergentInvocation))
             );
             let mut pinned = PinnedExternalJournal::open(
@@ -23461,6 +23547,28 @@ pub(crate) mod tests {
                         )
                     }),
                     Err(JournalStoreError::Unavailable),
+                );
+                assert_eq!(
+                    super::super::external_local_executor::inspect_retained_external_outcome(
+                        reopened.store_for_test(),
+                        reopened.materialization().unwrap(),
+                        &production,
+                        &ack,
+                        &mut ReadBudget::new(10000, 10000000),
+                    )
+                    .unwrap(),
+                    acknowledged,
+                );
+                assert_eq!(
+                    super::super::external_local_executor::inspect_retained_external_outcome(
+                        reopened.store_for_test(),
+                        reopened.materialization().unwrap(),
+                        &production,
+                        &invoke,
+                        &mut ReadBudget::new(10000, 10000000),
+                    ),
+                    Err(JournalStoreError::Unavailable),
+                    "an ACK marker cannot resurrect the retired Invoke response",
                 );
             }
         }

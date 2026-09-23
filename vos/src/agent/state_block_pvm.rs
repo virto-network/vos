@@ -91,6 +91,9 @@ impl<R: BlockReader + ?Sized> StateBlockHost<'_, R> {
             RuntimeWork::Manage { .. } | RuntimeWork::Resume { .. } => {
                 return Err(BlockPvmError::InvalidRequest);
             }
+            RuntimeWork::InspectInvocation { .. } => {
+                return Err(BlockPvmError::InvalidRequest);
+            }
         };
         let manifest = runtime.manifest();
         let limit = manifest.contract.resources.max_runtime_state_bytes as usize;
@@ -522,6 +525,9 @@ impl<S: super::replay::ScopedBlockReader + ?Sized> MultiLaneStateBlockHost<'_, S
             RuntimeWork::Invoke {
                 invocation, state, ..
             } => (None, invocation.runtime_deployment, state),
+            RuntimeWork::InspectInvocation {
+                invocation, state, ..
+            } => (None, invocation.runtime_deployment, state),
             // Resume carries only the retained continuation tuple. The
             // admitted package supplies its deployment; journal replay must
             // separately authenticate the original invocation and yield.
@@ -585,6 +591,9 @@ impl<S: super::replay::ScopedBlockReader + ?Sized> MultiLaneStateBlockHost<'_, S
             ) | (
                 RuntimeWork::Acknowledge { .. },
                 RuntimeOutcome::Acknowledged(_)
+            ) | (
+                RuntimeWork::InspectInvocation { .. },
+                RuntimeOutcome::Completed(_) | RuntimeOutcome::Acknowledged(_)
             ) | (RuntimeWork::Manage { .. }, RuntimeOutcome::Management(_))
         ) {
             return Err(BlockPvmError::Output);
@@ -597,6 +606,40 @@ impl<S: super::replay::ScopedBlockReader + ?Sized> MultiLaneStateBlockHost<'_, S
                 || reply.incarnation != invocation.incarnation
                 || reply.deployment != invocation.deployment
                 || reply.mode != invocation.mode
+            {
+                return Err(BlockPvmError::Output);
+            }
+        }
+        if let (
+            RuntimeWork::InspectInvocation { invocation, .. },
+            RuntimeOutcome::Completed(Ok(reply)),
+        ) = (work.work(), &output.transition().outcome)
+        {
+            if reply.invocation != invocation.invocation
+                || reply.actor != invocation.actor
+                || reply.incarnation != invocation.incarnation
+                || reply.deployment != invocation.deployment
+                || reply.mode != invocation.mode
+            {
+                return Err(BlockPvmError::Output);
+            }
+        }
+        if let (
+            RuntimeWork::InspectInvocation {
+                invocation,
+                authorization,
+                ..
+            },
+            RuntimeOutcome::Acknowledged(Ok(reply)),
+        ) = (work.work(), &output.transition().outcome)
+        {
+            if reply.invocation != invocation.invocation
+                || reply.actor != invocation.actor
+                || reply.incarnation != invocation.incarnation
+                || reply.deployment != invocation.deployment
+                || reply.mode != invocation.mode
+                || reply.work != invocation.commitment()
+                || reply.authorization != authorization.commitment()
             {
                 return Err(BlockPvmError::Output);
             }

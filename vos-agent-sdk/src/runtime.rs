@@ -809,6 +809,18 @@ pub enum RuntimeWork {
         invocation: Box<InvocationRetirement>,
         authorization: Box<InvocationAuthorization>,
     },
+    /// Experimental read-only lookup of a retained exact clean result.
+    /// Unlike Invoke, absence can never execute unseen actor work. The guest
+    /// returns `NotReady` for absence, `Completed` for a retained result,
+    /// and `Acknowledged` for a retained retirement marker.
+    #[cfg(feature = "experimental-state-blocks")]
+    InspectInvocation {
+        context: RuntimeExecutionContext,
+        state: RuntimeState,
+        invocation: Box<InvocationRetirement>,
+        authorization: Box<InvocationAuthorization>,
+        observed_slot: u64,
+    },
 }
 
 impl RuntimeWork {
@@ -818,6 +830,8 @@ impl RuntimeWork {
             | Self::Invoke { context, .. }
             | Self::Resume { context, .. }
             | Self::Acknowledge { context, .. } => *context,
+            #[cfg(feature = "experimental-state-blocks")]
+            Self::InspectInvocation { context, .. } => *context,
         }
     }
 }

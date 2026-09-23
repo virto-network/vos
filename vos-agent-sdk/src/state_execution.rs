@@ -20,10 +20,10 @@ use alloc::vec::Vec;
 /// Signed opt-in identity for this experimental framing and block-fetch
 /// contract. Not the released ABI, nor a promise of compatibility with a
 /// future production revision (resource pricing is still provisional).
-pub const STATE_EXECUTION_ABI_ID: Hash = Hash(*b"vos-agent-state-experimental-003");
+pub const STATE_EXECUTION_ABI_ID: Hash = Hash(*b"vos-agent-state-experimental-004");
 /// Experimental execution semantics, including the provisional fetch tariff.
 /// Never pair this with the released ABI or reuse released replay semantics.
-pub const STATE_EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-agent-state-experimental-s03");
+pub const STATE_EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-agent-state-experimental-s04");
 
 /// Admission headroom for a metadata rewrite under the 4-MiB single-change
 /// envelope. The released image runtime retains its separate 4-MiB ceiling.
@@ -53,6 +53,8 @@ fn state(work: &RuntimeWork) -> &RuntimeState {
         | RuntimeWork::Invoke { state, .. }
         | RuntimeWork::Resume { state, .. }
         | RuntimeWork::Acknowledge { state, .. } => state,
+        #[cfg(feature = "experimental-state-blocks")]
+        RuntimeWork::InspectInvocation { state, .. } => state,
     }
 }
 
@@ -62,6 +64,10 @@ fn bootstrap(work: &RuntimeWork) -> bool {
 }
 
 fn inspection(work: &RuntimeWork) -> bool {
+    #[cfg(feature = "experimental-state-blocks")]
+    if matches!(work, RuntimeWork::InspectInvocation { .. }) {
+        return true;
+    }
     matches!(work, RuntimeWork::Manage { request, .. } if matches!(request.as_ref(),
         ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources
         | ManagementRequest::InspectManagementHistory))
@@ -97,6 +103,10 @@ impl StateExecutionWork {
             RuntimeWork::Manage { space, agent, .. } => Some((*space, *agent)),
             RuntimeWork::Invoke { invocation, .. } => Some((invocation.space, invocation.agent)),
             RuntimeWork::Acknowledge { invocation, .. } => {
+                Some((invocation.space, invocation.agent))
+            }
+            #[cfg(feature = "experimental-state-blocks")]
+            RuntimeWork::InspectInvocation { invocation, .. } => {
                 Some((invocation.space, invocation.agent))
             }
             // Resume identity comes from the independently authenticated retained
@@ -252,19 +262,31 @@ impl StateExecutionOutput {
             return Err(DecodeError::NonCanonical);
         }
         use crate::RuntimeOutcome;
-        if !matches!(
+        #[cfg(feature = "experimental-state-blocks")]
+        let retained_inspection_shape = matches!(
             (&work.work, &self.transition.outcome),
-            (RuntimeWork::Manage { .. }, RuntimeOutcome::Management(_))
-                | (
-                    RuntimeWork::Invoke { .. } | RuntimeWork::Resume { .. },
-                    RuntimeOutcome::Completed(_) | RuntimeOutcome::Yielded(_)
-                )
-                | (
-                    RuntimeWork::Acknowledge { .. },
-                    RuntimeOutcome::Acknowledged(_)
-                )
-        ) || (inspection(&work.work)
-            && (self.transition.state != *state(&work.work) || !self.changes.is_empty()))
+            (
+                RuntimeWork::InspectInvocation { .. },
+                RuntimeOutcome::Completed(_) | RuntimeOutcome::Acknowledged(_)
+            )
+        );
+        #[cfg(not(feature = "experimental-state-blocks"))]
+        let retained_inspection_shape = false;
+        if !(retained_inspection_shape
+            || matches!(
+                (&work.work, &self.transition.outcome),
+                (RuntimeWork::Manage { .. }, RuntimeOutcome::Management(_))
+                    | (
+                        RuntimeWork::Invoke { .. } | RuntimeWork::Resume { .. },
+                        RuntimeOutcome::Completed(_) | RuntimeOutcome::Yielded(_)
+                    )
+                    | (
+                        RuntimeWork::Acknowledge { .. },
+                        RuntimeOutcome::Acknowledged(_)
+                    )
+            ))
+            || (inspection(&work.work)
+                && (self.transition.state != *state(&work.work) || !self.changes.is_empty()))
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -646,6 +668,73 @@ mod tests {
         bad.transition.state.control.push(1);
         assert!(bad.validate_for(&work).is_err());
         assert!(StateExecutionOutput::decode_for(&output.encode().unwrap(), &work).is_ok());
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn retained_invocation_inspection_is_distinct_and_read_only() {
+        use crate::{
+            InvocationAuthorization, InvocationOrigin, InvocationRetirement, InvocationRoleClaims,
+            PublicPreflight,
+        };
+        let (original, _) = fixture();
+        let base = original.lanes[0].base;
+        let invocation = InvocationRetirement {
+            space: SpaceId([1; 32]),
+            agent: AgentId([2; 32]),
+            runtime_deployment: DeploymentId([1; 32]),
+            invocation: InvocationId([3; 32]),
+            actor: ActorId([4; 32]),
+            incarnation: Hash([5; 32]),
+            deployment: DeploymentId([6; 32]),
+            program: ProgramId([7; 32]),
+            mode: MethodMode::Linear,
+            origin: InvocationOrigin::anonymous(),
+            roles: InvocationRoleClaims::none(),
+            gas: 100,
+            recovery_only: false,
+            message: vec![],
+            installation_data: None,
+            required: vec![],
+        };
+        let authorization = InvocationAuthorization::PublicPreflight(PublicPreflight {
+            work: invocation.commitment(),
+            origin: invocation.origin,
+            observed_slot: 1,
+        });
+        let work = RuntimeWork::InspectInvocation {
+            context: RuntimeExecutionContext::Direct,
+            state: state(&original.work).clone(),
+            invocation: Box::new(invocation),
+            authorization: Box::new(authorization),
+            observed_slot: 2,
+        };
+        assert_eq!(RuntimeWork::decode(&work.encode().unwrap()).unwrap(), work);
+        assert!(fixture_work(work.clone(), original.lanes.clone()).is_err());
+        let framed = fixture_work(
+            work,
+            vec![ExternalLaneWork {
+                base,
+                next: base.context(),
+            }],
+        )
+        .unwrap();
+        let output = StateExecutionOutput::new(
+            &framed,
+            RuntimeTransition {
+                state: state(framed.work()).clone(),
+                outcome: RuntimeOutcome::Completed(Err(InvocationError::NotReady)),
+            },
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(
+            StateExecutionOutput::decode_for(&output.encode().unwrap(), &framed).unwrap(),
+            output,
+        );
+        let mut mutated = output;
+        mutated.transition.state.control.push(1);
+        assert!(mutated.validate_for(&framed).is_err());
     }
 
     #[test]

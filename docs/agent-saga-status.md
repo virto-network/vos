@@ -93,20 +93,26 @@ after restart, but only while the locked journal still names that input and
 position. A bounded older-head lookup also requires the exact clean operation
 to remain in the authenticated suffix, with no newer lifecycle step for that
 invocation, before using physically replayed outcome bytes. The cache retains
-at most 32 outcomes per Ordered/Local domain; eviction fails closed. A
-checkpoint-pruned result after reopen remains unavailable, even if the guest
-retains its runtime result. Do not attach a route until that retry case has an
-authenticated response policy. A fresh no-change
-guest retry alone is not evidence of the original response; bind recovery to
-the committed input and retained result/lifecycle state.
-The narrow follow-up is a read-only SDK inspection of an exact retained
-invocation disposition, authenticated by the original work/authorization and
-current committed runtime root. It must explicitly report absence (not execute
-unseen work), return no state or external block changes, and be physically
-qualified after checkpoint/reopen. ACK recovery must likewise prove the exact
-retained retirement marker. Keep this in the experimental ABI; do not decode
-the Standard runtime's private result layout in the host or relax the signed
-work commitment's `recovery_only` binding.
+at most 32 outcomes per Ordered/Local domain; eviction fails closed. The
+experimental r04/s04 ABI adds read-only exact-disposition inspection against
+the current authenticated runtime root. It carries the original reference-only
+work and authorization, never runs unseen actor work, reports absence
+separately from a retained `NotFound`, and returns no state/block changes. The
+owner exposes this guest query for checkpoint-pruned Invoke and ACK responses;
+the Standard PVM physically recovered both after checkpoint/reopen. An ACK
+marker cannot resurrect the original Invoke response. The host does not decode
+the Standard runtime's private result layout or relax the signed work
+commitment's `recovery_only` binding. Before route attachment, qualify this
+handoff through the locked file owner (including unseen/mismatched inputs),
+then connect it to response-loss retry admission and startup recovery. A plain
+no-change Invoke retry alone is still not evidence of the original response.
+Focused r04/s04 evidence: SDK feature-on/off suites passed (248 passed/1
+ignored and 247 passed/1 ignored); the compiled Standard physical
+Create/Install/Invoke/ACK/checkpoint/reopen test passed, including retained
+result, ACK, unseen-input refusal and retired-Invoke refusal; the candidate
+signed external Local Create/finality/retry test passed with rebuilt Standard
+and Authority guests. This is not full prototype, released-binary, file-owner
+retry, performance or outer-PVM qualification.
 
 No released startup, lifecycle queue or route adapter selects this owner yet;
 the caller must choose Space/Node storage roots independently and attach a
@@ -778,7 +784,7 @@ correct pinned root. Missing blocks mean unavailable state, never absent keys.
   bootstrap currently traps; structured bootstrap error transport also needs
   definition before activation. This external-state candidate is reviewable as
   a scoped architecture checkpoint, not a deployable runtime.
-  Package-policy transport follow-up: experimental ABI 003/s03 uses `XSW2`,
+  Package-policy transport follow-up: experimental ABI 003/s03 introduced `XSW2`,
   requiring positive per-lane row/byte limits in each work envelope and its
   response commitment. Create derives these from its admitted package; typed
   Invoke/ACK checks exact equality before execution or provider access. Journal
@@ -974,8 +980,9 @@ correct pinned root. Missing blocks mean unavailable state, never absent keys.
   Framing does not verify receipt authority or relax the external-genesis refusal.
   Bounded multi-lane physical dispatch now selects declared scopes using fetch
   register r11 (guest a4), with one aggregate fetch/byte budget and the existing
-  scoped-hash validation. Experimental ABI/semantics are now 003/s03, including
-  quota-policy framing; 001/002 artifacts are rejected, while r19 is unchanged.
+  scoped-hash validation. At this checkpoint ABI/semantics were 003/s03,
+  including quota-policy framing; 001/002 artifacts were rejected, while r19
+  remained unchanged. The current experimental candidate is 004/s04.
   A distinct admitted Create executor runs that initial frame and enforces signed
   input/output state limits. Its output remains an uncommitted candidate until
   the dedicated genesis seal and initializer stage and validate all declared
@@ -1470,9 +1477,10 @@ base, while journal heads and genesis remain absent. The physical group passed
 Empty Create input consumes zero state bytes; small positive state limits reject
 the produced state, not input framing overhead. The initial stricter test had
 that expectation reversed; enforcement was not changed to make it pass.
-The current experimental contract is ABI 003/semantics s03 (quota framing).
-001/002 experimental packages/guests must be regenerated; no production migration or
-change to released r19 artifacts is implied.
+At this earlier checkpoint the experimental contract was ABI 003/semantics s03
+(quota framing). The current 004/s04 candidate also binds read-only retained
+disposition inspection; older experimental packages/guests must be regenerated.
+No production migration or change to released r19 artifacts is implied.
 Create now returns a private-construction `ExternalCreateExecution` handoff,
 retaining the exact input ID, replica, initial lane work and physical output.
 It rejects a structurally valid `Created` reply for a different Agent identity;

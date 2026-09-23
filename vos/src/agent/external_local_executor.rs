@@ -970,6 +970,92 @@ pub(crate) fn replayed_committed_suffix_outcome<
         .ok_or(JournalStoreError::Unavailable)
 }
 
+/// Physically inspect an exact terminal disposition against one independently
+/// authenticated runtime head. The caller must keep the store/head pinned;
+/// neither this read nor the guest may publish or mutate external blocks.
+#[cfg(feature = "experimental-state-blocks")]
+pub(crate) fn inspect_retained_external_outcome<
+    S: super::journal_store::AgentJournalStore,
+    R: CatalogBlobResolver,
+>(
+    store: &S,
+    recovered: &super::replay::ReplayMaterialization,
+    executor: &ExternalLocalReplayExecutor<R>,
+    input: &ReplayInput,
+    budget: &mut ReadBudget,
+) -> Result<RuntimeOutcome, super::journal_store::JournalStoreError> {
+    use super::journal_store::JournalStoreError;
+    use crate::agent_sdk::{RuntimeExecutionContext, RuntimeWork};
+    if input.runtime != executor.binding().map_err(|_| JournalStoreError::Corrupt)? {
+        return Err(JournalStoreError::Conflict);
+    }
+    let (invocation, authorization, observed_slot, acknowledge) = match &input.operation {
+        ReplayOperation::CleanInvoke {
+            context: RuntimeExecutionContext::Direct,
+            work,
+            authorization,
+            observed_slot,
+        } => (
+            InvocationRetirement::from_work(work),
+            authorization.clone(),
+            *observed_slot,
+            false,
+        ),
+        ReplayOperation::CleanAcknowledge {
+            context: RuntimeExecutionContext::Direct,
+            work,
+            authorization,
+            ..
+        } => (work.clone(), authorization.clone(), 0, true),
+        _ => return Err(JournalStoreError::NonCanonical),
+    };
+    let work = crate::agent_sdk::state_execution::StateExecutionWork::new(
+        RuntimeWork::InspectInvocation {
+            context: RuntimeExecutionContext::Direct,
+            state: crate::agent_sdk::RuntimeState {
+                control: recovered.state().control.clone(),
+                linear: recovered.state().linear.clone(),
+                merge: recovered.state().merge.clone(),
+                local: recovered.state().local.clone(),
+            },
+            invocation: Box::new(invocation.clone()),
+            authorization: Box::new(authorization.clone()),
+            observed_slot,
+        },
+        recovered
+            .external_inspection_lanes()
+            .map_err(|_| JournalStoreError::Corrupt)?,
+        executor.runtime.external_state_limits(),
+    )
+    .map_err(|_| JournalStoreError::Corrupt)?;
+    let output = MultiLaneStateBlockHost { store, budget }
+        .execute_admitted_work(&executor.runtime, &work, DEFAULT_MANAGEMENT_GAS)
+        .map_err(|_| JournalStoreError::Unavailable)?;
+    let outcome = output.transition().outcome.clone();
+    match (&outcome, acknowledge) {
+        (RuntimeOutcome::Completed(Ok(reply)), false)
+            if reply.invocation == invocation.invocation
+                && reply.actor == invocation.actor
+                && reply.incarnation == invocation.incarnation
+                && reply.deployment == invocation.deployment
+                && reply.mode == invocation.mode =>
+        {
+            Ok(outcome)
+        }
+        (RuntimeOutcome::Completed(Err(error)), false) if error.is_durable_exact_outcome() => {
+            Ok(outcome)
+        }
+        (RuntimeOutcome::Acknowledged(Ok(reply)), true)
+            if reply.invocation == invocation.invocation
+                && reply.work == invocation.commitment()
+                && reply.authorization == authorization.commitment() =>
+        {
+            Ok(outcome)
+        }
+        _ => Err(JournalStoreError::Unavailable),
+    }
+}
+
 #[cfg(all(target_os = "linux", feature = "storage"))]
 impl ExternalLocalJournalOwner {
     fn executor_from_store(
@@ -1084,6 +1170,22 @@ impl ExternalLocalJournalOwner {
     ) -> Result<RuntimeOutcome, super::journal_store::JournalStoreError> {
         self.cursor.inspect(|store, recovered| {
             replayed_committed_suffix_outcome(store, recovered, &self.executor, input)
+        })
+    }
+
+    /// Read a checkpoint-retained exact terminal disposition through the
+    /// admitted guest, without executing unseen work or publishing a head.
+    /// The guest's authenticated runtime state distinguishes a retained
+    /// rejection from absence; the physical frame enforces no state or block
+    /// changes. External Resume remains unsupported until yielded execution
+    /// and its checkpoint identity are qualified.
+    pub(crate) fn inspect_retained_outcome(
+        &self,
+        input: &ReplayInput,
+        budget: &mut ReadBudget,
+    ) -> Result<RuntimeOutcome, super::journal_store::JournalStoreError> {
+        self.cursor.inspect(|store, recovered| {
+            inspect_retained_external_outcome(store, recovered, &self.executor, input, budget)
         })
     }
 

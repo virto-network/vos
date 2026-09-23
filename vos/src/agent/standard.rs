@@ -418,6 +418,16 @@ pub(crate) struct StandardCleanInvocationResult {
     pub observed_slot: u64,
 }
 
+/// Read-only evidence for an exact accepted clean invocation. `None` from
+/// inspection is distinct from a retained application `NotFound` rejection;
+/// callers must never turn absence into a successful retry response.
+#[cfg(feature = "experimental-state-blocks")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RetainedCleanTerminal {
+    Completed(Result<super::execution::ActorExecutionReply, crate::agent_sdk::InvocationError>),
+    Acknowledged(crate::agent_sdk::InvocationAcknowledgement),
+}
+
 impl StandardCleanInvocationResult {
     fn from_work(
         work: &crate::agent_sdk::InvocationWork,
@@ -2563,6 +2573,76 @@ impl StandardAgentRuntime {
         let storage = result.storage;
         self.advance_result_authority_slot(storage, observed_slot);
         Ok(Some(reply))
+    }
+
+    /// Inspect committed terminal disposition without actor execution,
+    /// publication, clock advancement or availability preimages. The exact
+    /// reference-only work and authorization must match guest-owned retained
+    /// acceptance. This is intentionally separate from Invoke recovery, which
+    /// can execute unseen work and advance a result authority clock.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn inspect_clean_retained_terminal(
+        &self,
+        work: &crate::agent_sdk::InvocationRetirement,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        observed_slot: u64,
+    ) -> Result<Option<RetainedCleanTerminal>, crate::agent_sdk::InvocationError> {
+        use crate::agent_sdk::InvocationError;
+
+        if !work.validate() || !authorization.matches_retirement(work) {
+            return Err(InvocationError::InvalidAuthorization);
+        }
+        let descriptor = self
+            .clean_descriptor
+            .as_ref()
+            .ok_or(InvocationError::NotCreated)?;
+        if work.space != descriptor.identity.space
+            || work.agent != descriptor.identity.agent
+            || work.runtime_deployment != descriptor.identity.runtime_deployment
+        {
+            return Err(InvocationError::InvalidAuthorization);
+        }
+        if let Some(acknowledgement) = self.recover_clean_retirement(work, authorization)? {
+            return Ok(Some(RetainedCleanTerminal::Acknowledged(acknowledgement)));
+        }
+        let scope = clean_method_mode(work.mode).invocation_scope();
+        let key = (scope, InvocationId(work.invocation.0));
+        if let Some(record) = self.clean_invocation_errors.get(&key) {
+            if !self.clean_invocation_error_is_valid(record)
+                || !record.binding.matches_retirement(work, authorization)
+                || observed_slot < record.binding.observed_slot
+            {
+                return Err(InvocationError::DivergentInvocation);
+            }
+            return Ok(Some(RetainedCleanTerminal::Completed(Err(record.error))));
+        }
+        let Some(result) = self.invocation_results.get(&key) else {
+            return Ok(None);
+        };
+        let binding = result
+            .clean
+            .as_ref()
+            .ok_or(InvocationError::DivergentInvocation)?;
+        if !binding.matches_retirement(work, authorization)
+            || !clean_authorization_is_live_at(&binding.authorization, binding.observed_slot)
+            || observed_slot < binding.observed_slot
+            || self
+                .result_authority_slot(result.storage)
+                .is_none_or(|slot| slot < binding.observed_slot)
+            || result.storage != clean_method_mode(work.mode).result_storage()
+            || result.request.0 != binding.work.0
+            || result.scope != scope
+            || result.invocation.0 != work.invocation.0
+            || result.incarnation.0 != work.incarnation.0
+            || result.reply.actor.0 != work.actor.0
+            || result.reply.deployment.0 != work.deployment.0
+            || result.reply.mode != clean_method_mode(work.mode)
+        {
+            return Err(InvocationError::DivergentInvocation);
+        }
+        Ok(Some(RetainedCleanTerminal::Completed(Ok(result
+            .reply
+            .clone()))))
     }
 
     #[cfg(feature = "pvm")]

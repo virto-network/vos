@@ -4483,12 +4483,12 @@ mod tests {
             external.validate().is_err(),
             "pre-selector experimental ABI is not compatible"
         );
-        external.runtime_abi = Hash(*b"vos-agent-state-experimental-003");
+        external.runtime_abi = Hash(*b"vos-agent-state-experimental-004");
         assert!(
             external.validate().is_err(),
             "mixed experimental revisions must fail"
         );
-        external.execution_semantics = Hash(*b"vos-agent-state-experimental-s03");
+        external.execution_semantics = Hash(*b"vos-agent-state-experimental-s04");
         assert_eq!(
             external.validate().is_ok(),
             cfg!(feature = "experimental-state-blocks")

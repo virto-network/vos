@@ -2343,6 +2343,15 @@ fn apply_standard_external_runtime_input_with_reader<
             state,
             true,
         ),
+        RuntimeWork::InspectInvocation {
+            state, invocation, ..
+        } => (
+            invocation.space,
+            invocation.agent,
+            Some(invocation.runtime_deployment),
+            state,
+            true,
+        ),
         RuntimeWork::Invoke {
             state, invocation, ..
         } => (
@@ -2498,6 +2507,19 @@ fn apply_standard_external_runtime_input_with_reader<
                 )?;
                 (clean_state_to_legacy(&result.state), result.outcome)
             }
+            RuntimeWork::InspectInvocation {
+                invocation,
+                authorization,
+                observed_slot,
+                ..
+            } => (
+                decoded.clone(),
+                clean_retained_inspection_outcome(runtime.inspect_clean_retained_terminal(
+                    invocation,
+                    authorization,
+                    *observed_slot,
+                )),
+            ),
             RuntimeWork::Invoke {
                 invocation,
                 authorization,
@@ -2759,6 +2781,29 @@ fn apply_standard_external_runtime_input_with_reader<
         .map_err(|_| DecodeError::NonCanonical)
 }
 
+/// Return a retained result only; absence and ACK are distinct fail-closed
+/// outcomes, never a reason to execute unseen work.
+#[cfg(all(feature = "pvm", feature = "experimental-state-blocks"))]
+fn clean_retained_inspection_outcome(
+    inspected: Result<
+        Option<super::standard::RetainedCleanTerminal>,
+        crate::agent_sdk::InvocationError,
+    >,
+) -> crate::agent_sdk::RuntimeOutcome {
+    use super::standard::RetainedCleanTerminal;
+    use crate::agent_sdk::{InvocationError, RuntimeOutcome};
+    match inspected {
+        Ok(Some(RetainedCleanTerminal::Completed(result))) => {
+            RuntimeOutcome::Completed(result.map(clean_reply))
+        }
+        Ok(Some(RetainedCleanTerminal::Acknowledged(acknowledgement))) => {
+            RuntimeOutcome::Acknowledged(Ok(acknowledgement))
+        }
+        Ok(None) => RuntimeOutcome::Completed(Err(InvocationError::NotReady)),
+        Err(error) => RuntimeOutcome::Completed(Err(error)),
+    }
+}
+
 /// Execute constructed Direct work, validating its invocation preimages.
 #[cfg(feature = "pvm")]
 pub fn apply_standard_runtime_work(
@@ -2790,6 +2835,27 @@ pub fn apply_standard_runtime_work(
             authorization,
             ..
         } => apply_clean_acknowledge(state, *invocation, *authorization),
+        #[cfg(feature = "experimental-state-blocks")]
+        crate::agent_sdk::RuntimeWork::InspectInvocation {
+            state,
+            invocation,
+            authorization,
+            observed_slot,
+            ..
+        } => {
+            let original_state = state.clone();
+            let (runtime, _) = restore_standard_runtime_state(&clean_state_to_legacy(&state))?;
+            Ok(crate::agent_sdk::RuntimeTransition {
+                state: original_state,
+                outcome: clean_retained_inspection_outcome(
+                    runtime.inspect_clean_retained_terminal(
+                        &invocation,
+                        &authorization,
+                        observed_slot,
+                    ),
+                ),
+            })
+        }
         crate::agent_sdk::RuntimeWork::Manage {
             space,
             agent,
@@ -2855,6 +2921,8 @@ pub fn apply_proof_host_attested_standard_runtime_work(
         | crate::agent_sdk::RuntimeWork::Acknowledge { .. }
         | crate::agent_sdk::RuntimeWork::Invoke { .. }
         | crate::agent_sdk::RuntimeWork::Resume { .. } => Err(DecodeError::NonCanonical),
+        #[cfg(feature = "experimental-state-blocks")]
+        crate::agent_sdk::RuntimeWork::InspectInvocation { .. } => Err(DecodeError::NonCanonical),
     }
 }
 
@@ -2918,6 +2986,8 @@ pub(crate) fn apply_authenticated_attested_standard_runtime_work(
         | crate::agent_sdk::RuntimeWork::Acknowledge { .. }
         | crate::agent_sdk::RuntimeWork::Invoke { .. }
         | crate::agent_sdk::RuntimeWork::Resume { .. } => Err(DecodeError::NonCanonical),
+        #[cfg(feature = "experimental-state-blocks")]
+        crate::agent_sdk::RuntimeWork::InspectInvocation { .. } => Err(DecodeError::NonCanonical),
     }
 }
 
@@ -9825,6 +9895,8 @@ pub(crate) mod tests {
             crate::agent_sdk::RuntimeWork::Resume { state, resume, .. } => (state, resume.actor),
             crate::agent_sdk::RuntimeWork::Manage { .. }
             | crate::agent_sdk::RuntimeWork::Acknowledge { .. } => unreachable!(),
+            #[cfg(feature = "experimental-state-blocks")]
+            crate::agent_sdk::RuntimeWork::InspectInvocation { .. } => unreachable!(),
         };
         let decoded = decode_standard_runtime_state(&clean_state_to_legacy(state)).unwrap();
         let package = decoded
@@ -10537,6 +10609,45 @@ pub(crate) mod tests {
             legacy_state_to_clean(encode_standard_runtime_state(&reopened.snapshot())),
             committed,
         );
+        #[cfg(feature = "experimental-state-blocks")]
+        {
+            use super::super::standard::RetainedCleanTerminal;
+            let retirement = crate::agent_sdk::InvocationRetirement::from_work(&work);
+            assert_eq!(
+                reopened.inspect_clean_retained_terminal(&retirement, &authorization, 2),
+                Ok(Some(RetainedCleanTerminal::Completed(Ok(reply.clone())))),
+            );
+            let mut unseen = work.clone();
+            unseen.invocation = crate::agent_sdk::InvocationId([0xb8; 32]);
+            let unseen_authorization =
+                InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&unseen, 1));
+            assert_eq!(
+                reopened.inspect_clean_retained_terminal(
+                    &crate::agent_sdk::InvocationRetirement::from_work(&unseen),
+                    &unseen_authorization,
+                    2,
+                ),
+                Ok(None),
+            );
+            assert_eq!(
+                reopened.snapshot(),
+                decode_standard_runtime_state(&clean_state_to_legacy(&committed)).unwrap(),
+                "inspection must not advance the retained result clock",
+            );
+            let inspected = apply_standard_runtime_work(RuntimeWork::InspectInvocation {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                state: committed.clone(),
+                invocation: Box::new(retirement),
+                authorization: Box::new(authorization.clone()),
+                observed_slot: 2,
+            })
+            .unwrap();
+            assert_eq!(inspected.state, committed);
+            assert_eq!(
+                inspected.outcome,
+                RuntimeOutcome::Completed(Ok(clean_reply(reply.clone())))
+            );
+        }
 
         let retried = apply_standard_runtime_work(RuntimeWork::Invoke {
             context: crate::agent_sdk::RuntimeExecutionContext::Direct,
@@ -10593,6 +10704,35 @@ pub(crate) mod tests {
         };
         assert_eq!(acknowledgement.work, work.commitment());
         assert_eq!(acknowledgement.authorization, authorization.commitment());
+        #[cfg(feature = "experimental-state-blocks")]
+        {
+            use super::super::standard::RetainedCleanTerminal;
+            let retired = StandardAgentRuntime::restore(
+                decode_standard_runtime_state(&clean_state_to_legacy(&acknowledged.state)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                retired.inspect_clean_retained_terminal(
+                    &crate::agent_sdk::InvocationRetirement::from_work(&work),
+                    &authorization,
+                    2,
+                ),
+                Ok(Some(RetainedCleanTerminal::Acknowledged(acknowledgement))),
+            );
+            let inspected = apply_standard_runtime_work(RuntimeWork::InspectInvocation {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                state: acknowledged.state.clone(),
+                invocation: Box::new(crate::agent_sdk::InvocationRetirement::from_work(&work)),
+                authorization: Box::new(authorization.clone()),
+                observed_slot: 2,
+            })
+            .unwrap();
+            assert_eq!(inspected.state, acknowledged.state);
+            assert_eq!(
+                inspected.outcome,
+                RuntimeOutcome::Acknowledged(Ok(acknowledgement)),
+            );
+        }
 
         let mut tampered =
             decode_standard_runtime_state(&clean_state_to_legacy(&committed)).unwrap();
@@ -12694,6 +12834,18 @@ pub(crate) mod tests {
             let decoded = decode_standard_runtime_state(&encoded).unwrap();
             assert_eq!(decoded, retained);
             let mut reopened = StandardAgentRuntime::restore(decoded).unwrap();
+            #[cfg(feature = "experimental-state-blocks")]
+            assert_eq!(
+                reopened.inspect_clean_retained_terminal(
+                    &crate::agent_sdk::InvocationRetirement::from_work(&invocation),
+                    &authorization,
+                    99,
+                ),
+                Ok(Some(
+                    super::super::standard::RetainedCleanTerminal::Completed(Err(error),)
+                )),
+                "a durable guest rejection is distinct from an unseen input",
+            );
             assert_eq!(
                 reopened.recover_clean_invocation_error(&invocation, &authorization, 99),
                 Ok(Some(error))

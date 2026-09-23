@@ -4181,6 +4181,19 @@ fn runtime_work_valid_with_nested(value: &RuntimeWork, nested_already_validated:
                 && (nested_already_validated || invocation.validate())
                 && authorization.matches_retirement(invocation)
         }
+        #[cfg(feature = "experimental-state-blocks")]
+        RuntimeWork::InspectInvocation {
+            context,
+            state,
+            invocation,
+            authorization,
+            ..
+        } => {
+            context.is_direct()
+                && state.validate()
+                && (nested_already_validated || invocation.validate())
+                && authorization.matches_retirement(invocation)
+        }
     }
 }
 
@@ -4258,6 +4271,21 @@ impl CanonicalWire for RuntimeWork {
                 invocation.encode_body(encoder);
                 encode_invocation_authorization(encoder, authorization);
             }
+            #[cfg(feature = "experimental-state-blocks")]
+            RuntimeWork::InspectInvocation {
+                context,
+                state,
+                invocation,
+                authorization,
+                observed_slot,
+            } => {
+                encoder.u8(4);
+                encode_runtime_execution_context(encoder, *context);
+                encode_runtime_state(encoder, state);
+                invocation.encode_body(encoder);
+                encode_invocation_authorization(encoder, authorization);
+                encoder.u64(*observed_slot);
+            }
         }
     }
 
@@ -4292,6 +4320,14 @@ impl CanonicalWire for RuntimeWork {
                 state: decode_runtime_state(decoder)?,
                 invocation: alloc::boxed::Box::new(InvocationRetirement::decode_body(decoder)?),
                 authorization: alloc::boxed::Box::new(decode_invocation_authorization(decoder)?),
+            },
+            #[cfg(feature = "experimental-state-blocks")]
+            4 => RuntimeWork::InspectInvocation {
+                context: decode_runtime_execution_context(decoder)?,
+                state: decode_runtime_state(decoder)?,
+                invocation: alloc::boxed::Box::new(InvocationRetirement::decode_body(decoder)?),
+                authorization: alloc::boxed::Box::new(decode_invocation_authorization(decoder)?),
+                observed_slot: decoder.u64()?,
             },
             _ => return Err(DecodeError::InvalidTag),
         };
@@ -7655,8 +7691,17 @@ mod tests {
             Err(WireError::Decode(DecodeError::InvalidPlatform))
         );
 
+        #[cfg(not(feature = "experimental-state-blocks"))]
+        {
+            let mut experimental_tag = encoded.clone();
+            experimental_tag[HEADER_BYTES] = 4;
+            assert_eq!(
+                RuntimeWork::decode(&experimental_tag),
+                Err(WireError::Decode(DecodeError::InvalidTag))
+            );
+        }
         let mut unknown_tag = encoded;
-        unknown_tag[HEADER_BYTES] = 4;
+        unknown_tag[HEADER_BYTES] = 5;
         assert_eq!(
             RuntimeWork::decode(&unknown_tag),
             Err(WireError::Decode(DecodeError::InvalidTag))
