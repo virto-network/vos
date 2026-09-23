@@ -237,6 +237,14 @@ so do multi-Agent credential ordering and real file-backed lifecycle leases.
 This is not a released controller/route path. A permanently guest-rejected
 approved Install has no terminal failure transition; ingress remains disabled
 until that case and startup cutover are resolved.
+The internal lifecycle controller now has an explicit external backing that
+consumes the complete signed startup recovery, retains each locked file owner
+and its selected directory, and creates per-Agent Direct route attachments
+only from finalized owners. The existing image backing is unchanged. The
+physical Create/Install/reopen fixture exercises this handoff without opening
+an image host. This is still not selected by `vosx space up`, and the external
+backing rejects the image-shaped Create/Install lifecycle methods; no public
+external admission or route publication is claimed.
 Focused r04/s04 evidence: SDK feature-on/off suites passed (248 passed/1
 ignored and 247 passed/1 ignored); the compiled Standard physical
 Create/Install/Invoke/ACK/checkpoint/reopen test passed, including retained
@@ -263,24 +271,23 @@ external journal/lifecycle root. The released binary currently returns a clear
 unsupported-mode error for `external-state` before opening the image path;
 this is a format guard, not external startup enablement.
 The current released-binary path is `vosx` clean startup -> image-based
-`LocalAgentHost` -> `LocalLifecycleController` -> Local route backend. The
+`LocalAgentHost` -> image-backed `LocalLifecycleController` -> Local route backend. The
 older `host::LocalGenesisIntent` file opener accepts r19 only. Next, select and
-recover the external owner through the existing lifecycle controller, then
-route only after authenticated Create publication. Shared common finality and
-Clerk follow within batch 1. Candidate signed packages are not live admission;
+recover the external-backed controller from the fresh roots in `vosx`, then
+enable its correctly typed lifecycle dispatch and route refresh only after
+authenticated Create publication. Shared common finality and Clerk follow
+within batch 1. Candidate signed packages are not live admission;
 the large ACK's 5-billion-gas success is not a release-latency guarantee.
 
-External Local cutover TODOs, in order: (1) pass the Space/Node-pinned external
-directory into startup and explicitly select the fresh external format for
-that root, then recover its complete external lifecycle set under startup
-admission before publishing any route; existing image roots stay on their
-current path, and mixed-format migration is deferred; verify the retained
-Create archive against physical journal and selected Authority even after
-Install replaces the current-operation slot;
-(2) attach the internal
-external per-Agent Direct Invoke/ACK worker after finality, and add
-Install/Resume using the
-existing signed journal semantics, not an image-host fallback; (3) qualify
+External Local cutover TODOs, in order: (1) have `vosx` explicitly open the
+fresh Space/Node-pinned external roots and invoke the internal controller's
+complete recovery before any route is published; existing image roots stay on
+their current path, and mixed-format migration is deferred; qualify
+file-backed lifecycle leases and the pre-sidecar crash window;
+(2) connect typed LCQ2 Create and external Install to production lifecycle
+dispatch and route refresh, resolving approved-but-guest-rejected Install
+without stranding its intent; add Resume using the existing signed journal
+semantics, not an image-host fallback; (3) qualify
 publicly routed response-loss retry after file-backed restart,
 near-ceiling ACK, candidate artifact identities and released-binary behavior.
 `LocalLifecycleController::with_recovery` currently assumes every discovered

@@ -1889,9 +1889,10 @@ where
     }
     fn node(&self) -> Result<super::sdk::NodeId, SharedAgentHostError> {
         Ok(self
-            .local
+            .system
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?
+            .pins()
             .node())
     }
     fn system_attachment(
@@ -1907,25 +1908,51 @@ where
         LocalLifecycleController::local_attachment(self, capacity)
     }
     fn local_agents(&self) -> Result<Option<Vec<AgentId>>, AgentRouteAdapterError> {
-        self.local
-            .lock()
-            .map_err(|_| {
-                AgentRouteAdapterError::Route(super::supervisor::AgentRouteError::Unavailable)
-            })?
-            .list()
-            .map(Some)
-            .map_err(|_| {
-                AgentRouteAdapterError::Route(super::supervisor::AgentRouteError::Unavailable)
-            })
+        match &self.local {
+            LocalBacking::Image(local) => local
+                .lock()
+                .map_err(|_| {
+                    AgentRouteAdapterError::Route(super::supervisor::AgentRouteError::Unavailable)
+                })?
+                .list()
+                .map(Some)
+                .map_err(|_| {
+                    AgentRouteAdapterError::Route(super::supervisor::AgentRouteError::Unavailable)
+                }),
+            #[cfg(all(
+                target_os = "linux",
+                feature = "storage",
+                feature = "experimental-state-blocks"
+            ))]
+            LocalBacking::External { owners, .. } => Ok(Some(owners.keys().copied().collect())),
+        }
     }
     fn local_attachment_for_agent(
         &self,
         agent: AgentId,
     ) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError> {
-        super::supervisor_adapters::local_agent_supervisor_attachment_for_agent(
-            self.local.clone(),
-            agent,
-        )
+        match &self.local {
+            LocalBacking::Image(local) => {
+                super::supervisor_adapters::local_agent_supervisor_attachment_for_agent(
+                    local.clone(),
+                    agent,
+                )
+            }
+            #[cfg(all(
+                target_os = "linux",
+                feature = "storage",
+                feature = "experimental-state-blocks"
+            ))]
+            LocalBacking::External { owners, clock, .. } => {
+                super::supervisor_adapters::external_local_agent_supervisor_attachment_for_agent(
+                    owners
+                        .get(&agent)
+                        .ok_or(AgentRouteAdapterError::NoReadyRoutes)?
+                        .clone(),
+                    clock.clone(),
+                )
+            }
+        }
     }
 
     fn shared_generations(
@@ -2133,11 +2160,29 @@ where
     }
 }
 
-/// Retains one system owner and one physical Local host across route-worker
+/// Retains one system owner and one selected physical Local backing across route-worker
 /// retirement. Lifecycle calls lock system then Local; route workers lock only
 /// their own host. Never call route-worker methods while either guard is held.
 /// Native shutdown must stop lifecycle callers and retire/join route workers
 /// before dropping this controller's final owner references and operation leases.
+enum LocalBacking {
+    Image(Arc<Mutex<LocalAgentHost>>),
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    External {
+        // The pinned directory and every locked owner outlive route workers.
+        _directory: super::journal_store::ExternalLocalJournalDirectory,
+        owners: BTreeMap<
+            AgentId,
+            Arc<Mutex<super::external_local_executor::ExternalLocalJournalOwner>>,
+        >,
+        clock: Arc<dyn super::driver::AgentTrustProvider>,
+    },
+}
+
 pub struct LocalLifecycleController<P, R, I, F, S>
 where
     P: CleanSystemAgentBootstrapStore,
@@ -2146,7 +2191,7 @@ where
     F: LocalLifecycleStoreFactory,
 {
     system: Arc<Mutex<CleanSystemAgentBootstrapOwner<P, R, I>>>,
-    local: Arc<Mutex<LocalAgentHost>>,
+    local: LocalBacking,
     stores: F,
     // Retain exclusive handles across retries, including ambiguous commits.
     // Parsed protocol state is reopened from these handles for every call.
@@ -2176,7 +2221,7 @@ where
         }
         Ok(Self {
             system: Arc::new(Mutex::new(system)),
-            local: Arc::new(Mutex::new(local)),
+            local: LocalBacking::Image(Arc::new(Mutex::new(local))),
             stores,
             retained_stores: BTreeMap::new(),
             signer,
@@ -2184,6 +2229,70 @@ where
             admins: None,
             shared_genesis: None,
         })
+    }
+
+    /// Explicit fresh-root external selection. Complete signed lifecycle
+    /// recovery and physical finality before constructing any route worker.
+    /// This does not enable LCQ2 admission; the released ingress remains
+    /// closed until external Create/Install and bundled guests are qualified.
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_external_recovery(
+        mut system: CleanSystemAgentBootstrapOwner<P, R, I>,
+        directory: super::journal_store::ExternalLocalJournalDirectory,
+        stores: F,
+        mut signer: S,
+        mut recovery: LocalLifecycleRecovery<F::Intent, F::Issuer>,
+        clock: Arc<dyn super::driver::AgentTrustProvider>,
+        maximum: usize,
+        budget: &mut super::sdk::state_blocks::ReadBudget,
+    ) -> Result<Self, SharedAgentHostError>
+    where
+        F::Intent: super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore,
+    {
+        let node = system.pins().node();
+        if directory.space() != crate::service::SpaceId(system.pins().space().0)
+            || directory.node() != crate::service::NodeId(node.0)
+            || recovery.authority != system.authority_target()
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let owners = recovery
+            .recover_external_pending(&mut system, &directory, node, maximum, budget, &mut signer)?
+            .into_iter()
+            .map(|(agent, owner)| (agent, Arc::new(Mutex::new(owner))))
+            .collect();
+        let mut controller = Self {
+            system: Arc::new(Mutex::new(system)),
+            local: LocalBacking::External {
+                _directory: directory,
+                owners,
+                clock,
+            },
+            stores,
+            retained_stores: BTreeMap::new(),
+            signer,
+            operations: None,
+            admins: None,
+            shared_genesis: None,
+        };
+        for entry in recovery.entries {
+            if controller
+                .retained_stores
+                .insert(
+                    entry.agent,
+                    (entry.intent.into_store(), entry.issuer.into_store()),
+                )
+                .is_some()
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+        }
+        Ok(controller)
     }
 
     /// Recover the complete Shared set before this controller can be handed to
@@ -2789,10 +2898,20 @@ where
         &self,
         capacity: usize,
     ) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError> {
-        super::supervisor_adapters::local_agent_supervisor_attachment_shared(
-            self.local.clone(),
-            capacity,
-        )
+        match &self.local {
+            LocalBacking::Image(local) => {
+                super::supervisor_adapters::local_agent_supervisor_attachment_shared(
+                    local.clone(),
+                    capacity,
+                )
+            }
+            #[cfg(all(
+                target_os = "linux",
+                feature = "storage",
+                feature = "experimental-state-blocks"
+            ))]
+            LocalBacking::External { .. } => Err(AgentRouteAdapterError::NoReadyRoutes),
+        }
     }
 
     #[cfg(test)]
@@ -2855,6 +2974,17 @@ where
             .expect("retire system route workers first")
             .into_inner()
             .unwrap();
+        let local = match local {
+            LocalBacking::Image(local) => local,
+            #[cfg(all(
+                target_os = "linux",
+                feature = "storage",
+                feature = "experimental-state-blocks"
+            ))]
+            LocalBacking::External { .. } => {
+                panic!("image test extraction requires an image Local backing")
+            }
+        };
         let local = Arc::try_unwrap(local)
             .ok()
             .expect("retire local route workers first")
@@ -2872,12 +3002,20 @@ where
         call: AuthorityCredentialCall,
         package: super::package_admission::AdmittedActorPackage,
     ) -> Result<ManagementApplicationAck, SharedAgentHostError> {
+        let local = match &self.local {
+            LocalBacking::Image(local) => local,
+            #[cfg(all(
+                target_os = "linux",
+                feature = "storage",
+                feature = "experimental-state-blocks"
+            ))]
+            LocalBacking::External { .. } => return Err(SharedAgentHostError::Unavailable),
+        };
         let mut system = self
             .system
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
-        let mut local = self
-            .local
+        let mut local = local
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
         let request = ManagementRequest::Install(Box::new(install));
@@ -2911,12 +3049,20 @@ where
         call: AuthorityCredentialCall,
         runtime: AdmittedRuntimePackage,
     ) -> Result<(AgentId, ManagementApplicationAck), SharedAgentHostError> {
+        let local = match &self.local {
+            LocalBacking::Image(local) => local,
+            #[cfg(all(
+                target_os = "linux",
+                feature = "storage",
+                feature = "experimental-state-blocks"
+            ))]
+            LocalBacking::External { .. } => return Err(SharedAgentHostError::Unavailable),
+        };
         let mut system = self
             .system
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
-        let mut local = self
-            .local
+        let mut local = local
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
         if descriptor.identity.profile != AgentProfile::Local

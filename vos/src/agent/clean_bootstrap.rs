@@ -16811,6 +16811,7 @@ mod tests {
                 Err(SharedAgentHostError::ScopeMismatch)
             ));
             drop(orphan_slot);
+            std::fs::remove_file(root.join(format!("{}.agent-lock", "77".repeat(32)))).unwrap();
 
             // A pathname replacement cannot redirect the pinned owner into
             // a new empty directory or mint a fresh stable lock there.
@@ -16825,6 +16826,47 @@ mod tests {
                     .is_err()
             );
             assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+            std::fs::remove_dir(&root).unwrap();
+            std::fs::rename(root.with_extension("moved"), &root).unwrap();
+
+            // The production controller must adopt the recovered locked
+            // generation without constructing an image host. The attachment
+            // is created only after signed startup finality has passed.
+            let mut controller_stores = ExternalStores {
+                space: descriptor.identity.space,
+                agent: descriptor.identity.agent,
+                intent: intent_store.clone(),
+                issuer: issuer_store.clone(),
+            };
+            let controller_recovery = discover_local_lifecycle_recovery(
+                &mut controller_stores,
+                owner.authority_target(),
+                1,
+            )
+            .unwrap();
+            let controller =
+                crate::agent::local_lifecycle::LocalLifecycleController::with_external_recovery(
+                    harness.owner.take().unwrap(),
+                    directory,
+                    controller_stores,
+                    signer,
+                    controller_recovery,
+                    Arc::clone(&harness.fixture.trust),
+                    1,
+                    &mut ReadBudget::new(10_000, 10_000_000),
+                )
+                .unwrap();
+            use crate::agent::local_lifecycle::NativeLocalLifecycle as _;
+            assert_eq!(
+                controller.local_agents().unwrap(),
+                Some(vec![descriptor.identity.agent])
+            );
+            controller
+                .local_attachment_for_agent(descriptor.identity.agent)
+                .unwrap()
+                .retire()
+                .unwrap();
+            drop(controller);
             harness.stop();
         }
 
