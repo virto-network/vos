@@ -15681,6 +15681,16 @@ mod aggregate {
         materialize_current_inner(store, executor, resolver, Some(budget), Some(seal))
     }
 
+    /// A materialization obtained while validating one head of a locked store.
+    /// The private store and per-open identities prevent a different opener
+    /// from borrowing this replay result as its serving cursor.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) struct ValidatedExternalHead {
+        store: JournalStoreInstanceId,
+        validation_epoch: u64,
+        materialization: ReplayMaterialization,
+    }
+
     /// Validate a head selected by the locked filesystem opener, including a
     /// staged successor, without installing it or exporting a replay cursor.
     /// The common replay validates suffix execution and persisted block
@@ -15693,7 +15703,7 @@ mod aggregate {
         executor: &mut E,
         resolver: &R,
         budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
-    ) -> Result<(), JournalStoreError>
+    ) -> Result<ValidatedExternalHead, JournalStoreError>
     where
         S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
         E: ReplayExecutor,
@@ -15727,7 +15737,12 @@ mod aggregate {
             store,
             heads,
             Some(&availability),
-        )
+        )?;
+        Ok(ValidatedExternalHead {
+            store: store.instance_id(),
+            validation_epoch: store.validation_epoch(),
+            materialization: recovered,
+        })
     }
 
     /// One independently ordered Local journal, pinned from recovery through
@@ -15782,6 +15797,29 @@ mod aggregate {
             Ok(Self {
                 store,
                 materialization,
+                checkpoint_lanes,
+                poisoned: false,
+            })
+        }
+
+        /// Reuse the durable replay already performed by the locked file
+        /// opener. Its staged head was validated separately and is never
+        /// selected as the serving cursor.
+        pub(crate) fn open_validated(
+            store: H,
+            validated: ValidatedExternalHead,
+        ) -> Result<Self, JournalStoreError> {
+            if store.instance_id() != validated.store
+                || store.validation_epoch() != validated.validation_epoch
+                || store.heads()?.as_ref() != Some(validated.materialization.heads())
+            {
+                return Err(JournalStoreError::Conflict);
+            }
+            let checkpoint_lanes =
+                external_checkpoint_lanes(&*store, validated.materialization.heads())?;
+            Ok(Self {
+                store,
+                materialization: validated.materialization,
                 checkpoint_lanes,
                 poisoned: false,
             })
@@ -20272,12 +20310,12 @@ pub(crate) use aggregate::PinnedExternalJournal;
 #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
 #[allow(unused_imports)]
 pub(crate) use aggregate::materialize_external_checkpoint;
-#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+#[cfg(all(test, feature = "std", feature = "experimental-state-blocks"))]
 pub(crate) use aggregate::materialize_external_genesis;
 #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
-pub(crate) use aggregate::validate_external_genesis_head;
-#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
 pub(crate) use aggregate::{ExternalJournalCommit, ExternalJournalEntry, RecoveryError};
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+pub(crate) use aggregate::{ValidatedExternalHead, validate_external_genesis_head};
 
 #[cfg(all(feature = "std", feature = "storage"))]
 #[allow(unused_imports)]
@@ -24350,14 +24388,19 @@ pub(crate) mod tests {
         // A serving owner may move the locked store into the pinned cursor;
         // it must retain the same authenticated materialization and be able
         // to publish without borrowing a second, detached store handle.
-        let mut owned = aggregate::PinnedExternalJournal::open(
-            Box::new(initialized.clone()),
+        let mut serving_store = initialized.clone();
+        let validated = aggregate::validate_external_genesis_head(
+            &mut serving_store,
             &sealed,
+            &initial_heads,
             &mut executor,
             &NoPrunedOrderedBases,
             &mut ReadBudget::new(100, 100000),
         )
         .unwrap();
+        let mut owned =
+            aggregate::PinnedExternalJournal::open_validated(Box::new(serving_store), validated)
+                .unwrap();
         assert_eq!(owned.materialization().unwrap(), &recovered);
         assert!(
             owned
@@ -24370,6 +24413,22 @@ pub(crate) mod tests {
             Some(owned.materialization().unwrap().heads())
         );
         drop(owned);
+        let validated = aggregate::validate_external_genesis_head(
+            &mut initialized,
+            &sealed,
+            &initial_heads,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &mut ReadBudget::new(100, 100000),
+        )
+        .unwrap();
+        assert!(matches!(
+            aggregate::PinnedExternalJournal::open_validated(
+                Box::new(initialized.clone()),
+                validated,
+            ),
+            Err(JournalStoreError::Conflict)
+        ));
         let mut other_create = create.clone();
         let ReplayOperation::CleanManage { observed_slot, .. } = &mut other_create.operation else {
             unreachable!()

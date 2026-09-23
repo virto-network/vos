@@ -373,7 +373,7 @@ impl ExternalLocalJournalOwner {
         budget: &mut ReadBudget,
     ) -> Result<Self, super::journal_store::JournalStoreError> {
         use super::journal_store::{CatalogBlobResolverFactory, JournalStoreError};
-        let (store, mut executor) = slot.open_external_journal_with_executor(
+        let (store, executor, validated) = slot.open_external_journal_with_executor(
             &seal,
             |store| {
                 let resolver = store.catalog_blob_resolver()?;
@@ -396,14 +396,8 @@ impl ExternalLocalJournalOwner {
             &super::replay::NoPrunedOrderedBases,
             budget,
         )?;
-        let cursor = super::replay::PinnedExternalJournal::open(
-            Box::new(store),
-            &seal,
-            &mut executor,
-            &super::replay::NoPrunedOrderedBases,
-            budget,
-        )
-        .map_err(|_| JournalStoreError::Unavailable)?;
+        let cursor =
+            super::replay::PinnedExternalJournal::open_validated(Box::new(store), validated)?;
         Ok(Self {
             seal,
             cursor,

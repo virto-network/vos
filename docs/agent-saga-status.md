@@ -56,7 +56,10 @@ Install, Invoke and ACK, resolves exact Install artifacts and replays the
 physical guest without decoding its private state. A file-backed owner now
 holds the locked slot, catalog-bound executor and pinned materialization
 together; the active Local lifecycle still does not select it from durable
-intent or expose a route.
+intent or expose a route. The owner reuses the durable head's validated
+materialization from the locked file opener, bound to that opener's ephemeral
+identity, while a staged successor remains separately validated and never
+becomes the serving cursor. Startup cost is still unmeasured.
 `LocalJournalAgentDriver::prepare_local_genesis` still builds an r19 binding
 and `StandardLocalReplayExecutor`. A separate external Local preparer now
 authenticates the signed package, exact catalog closure, Create receipt and
@@ -622,11 +625,12 @@ correct pinned root. Missing blocks mean unavailable state, never absent keys.
   then reopens the same unchanged generation. The owned in-memory cursor also
   publishes a checkpoint. These are internal lifecycle contracts, not a
   production Local route or evidence that the live issuer selects this ABI.
-  The current file opener validates the durable/staged external head and
-  `PinnedExternalJournal::open` materializes the durable head again. Preserve
-  staged-head validation, but eliminate this duplicate replay when wiring the
-  production owner; measure its startup cost before accepting it. The focused
-  owned-file regression passed at `task-tmp/state-owned-file-cursor-focused.log`;
+  The file opener previously validated the durable/staged external head and
+  `PinnedExternalJournal::open` materialized the durable head again. The owned
+  cursor path now reuses that authenticated durable materialization while
+  preserving staged-head validation. Measure startup cost before accepting it.
+  The focused owned-file regression passed at
+  `task-tmp/state-owned-file-cursor-focused.log`;
   the complete prototype gate passed at `task-tmp/state-owned-cursor-prototype.log`
   (SDK 247/1 ignored, replay 69, physical PVM 17, journal-store 105 and
   feature-disabled groups).
@@ -651,7 +655,8 @@ correct pinned root. Missing blocks mean unavailable state, never absent keys.
   `vosx` lifecycle has not selected this owner, and its retained Create seal
   still carries candidate output; reconstruct/compact that evidence from exact
   durable intent and measure startup memory/latency before release. The file
-  opener still validates then replays the durable head again, as noted above.
+  owner now takes the opener's store-bound validated durable materialization;
+  this removes the additional durable replay without selecting a staged head.
   The full prototype gate passed on this owner/live-execution tree at
   `task-tmp/external-live-prototype-final.log` (SDK 247/1 ignored, replay 69,
   physical PVM 17, journal-store 105 and feature-disabled groups). The focused
@@ -661,6 +666,16 @@ correct pinned root. Missing blocks mean unavailable state, never absent keys.
   and changed-link verification to one live budget and refuses later-position
   ACK with zero fetch allowance; exact committed retry still costs no guest
   execution.
+  Locked-open replay follow-up: the file opener now passes its authenticated
+  durable materialization directly into the retained cursor. The cursor checks
+  both the stable store ID and a per-open epoch, so a token from a prior lock
+  lifetime cannot bypass replay on a later reopen. A staged head is still
+  validated but never selected for serving. The final physical standard-runtime
+  crash/reopen test passed at `task-tmp/validated-cursor-final.log`; the
+  feature-off check passed at `task-tmp/validated-cursor-feature-off.log`.
+  The complete prototype gate passed at
+  `task-tmp/validated-cursor-prototype.log` (SDK 247/1 ignored, replay 69,
+  physical PVM 17, journal-store 105 and feature-disabled groups).
   Production actor-package issuance and authoritative heads remain separate.
   Local Create-preparation follow-up: the new external preparer consumes a
   bounded immutable supplied catalog, rejects a missing package, verifies the

@@ -863,6 +863,13 @@ pub trait AgentJournalStore:
     /// independently constructed or copied store.
     fn instance_id(&self) -> JournalStoreInstanceId;
 
+    /// Ephemeral identity of this opener, not the durable journal slot. File
+    /// stores override it so a validated replay cannot survive lock release
+    /// and be borrowed by a later opener of the same stable slot.
+    fn validation_epoch(&self) -> u64 {
+        0
+    }
+
     /// Install immutable genesis and its empty head envelope. Exact retries
     /// are idempotent. Implementations may durably retain a validated partial
     /// initialization after an I/O failure; retrying this method completes it.
@@ -9340,6 +9347,14 @@ fn file_journal_store_instance_id(
     .ok_or(JournalStoreError::Corrupt)
 }
 
+fn next_file_validation_epoch() -> Result<u64, JournalStoreError> {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        current.checked_add(1)
+    })
+    .map_err(|_| JournalStoreError::LimitExceeded)
+}
+
 #[cfg(target_os = "linux")]
 const GC_OBJECT_NAMESPACES: &[(JournalStorageClass, &str)] = &[
     (JournalStorageClass::ReplayInput, "records/replay-inputs"),
@@ -9827,6 +9842,7 @@ struct DirectoryCapabilities;
 pub struct FileAgentJournalStore {
     root: PathBuf,
     instance_id: JournalStoreInstanceId,
+    validation_epoch: u64,
     agent: AgentId,
     node: NodeId,
     directories: DirectoryCapabilities,
@@ -10535,6 +10551,7 @@ impl FileAgentJournalSlot {
         let mut store = FileAgentJournalStore {
             root: self.root,
             instance_id: self.instance_id,
+            validation_epoch: next_file_validation_epoch()?,
             agent: self.agent,
             node: self.node,
             directories,
@@ -11091,6 +11108,7 @@ impl FileLocalAgentJournalSlot {
             super::replay::validate_external_genesis_head(
                 store, sealed, heads, executor, resolver, budget,
             )
+            .map(|_| ())
         })
     }
 
@@ -11109,23 +11127,45 @@ impl FileLocalAgentJournalSlot {
         executor_from_store: impl FnOnce(&FileAgentJournalStore) -> Result<E, JournalStoreError>,
         resolver: &R,
         budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
-    ) -> Result<(FileAgentJournalStore, E), JournalStoreError> {
+    ) -> Result<
+        (
+            FileAgentJournalStore,
+            E,
+            super::replay::ValidatedExternalHead,
+        ),
+        JournalStoreError,
+    > {
         let mut make = Some(executor_from_store);
         let mut executor = None;
+        let mut durable = None;
         let store = self.open_with_head_validation(sealed, true, |store, heads| {
             if executor.is_none() {
                 executor = Some(make.take().ok_or(JournalStoreError::Corrupt)?(store)?);
             }
-            super::replay::validate_external_genesis_head(
+            let validated = super::replay::validate_external_genesis_head(
                 store,
                 sealed,
                 heads,
                 executor.as_mut().ok_or(JournalStoreError::Corrupt)?,
                 resolver,
                 budget,
-            )
+            )?;
+            // open_with_head_validation visits the durable head before an
+            // optional staged head. Retain only durable replay; a staged
+            // successor is validated but must not become a serving cursor.
+            if durable.is_none() {
+                durable = Some(validated);
+            }
+            Ok(())
         })?;
-        Ok((store, executor.ok_or(JournalStoreError::NotInitialized)?))
+        if store.heads()?.is_none() {
+            return Err(JournalStoreError::NotInitialized);
+        }
+        Ok((
+            store,
+            executor.ok_or(JournalStoreError::NotInitialized)?,
+            durable.ok_or(JournalStoreError::NotInitialized)?,
+        ))
     }
 
     fn open_with_head_validation<T: ReplaySealedOrdinaryGenesis>(
@@ -11200,6 +11240,7 @@ impl FileLocalAgentJournalSlot {
         let mut store = FileAgentJournalStore {
             root: self.root,
             instance_id: self.instance_id,
+            validation_epoch: next_file_validation_epoch()?,
             agent: self.agent,
             node: self.node,
             directories,
@@ -12491,6 +12532,7 @@ impl FileAgentJournalStore {
                 node,
                 &stable_lock_nonce,
             )?,
+            validation_epoch: next_file_validation_epoch()?,
             root: canonical_root,
             agent,
             node,
@@ -15205,6 +15247,10 @@ impl AgentJournalStore for FileAgentJournalStore {
         self.instance_id
     }
 
+    fn validation_epoch(&self) -> u64 {
+        self.validation_epoch
+    }
+
     fn finish_reverified_open(&mut self) -> Result<(), JournalStoreError> {
         self.finish_deferred_startup_recovery()
     }
@@ -16838,7 +16884,15 @@ mod tests {
                 // not only a borrowed replay view. A competing opener cannot
                 // take the lock until that cursor is dropped; dropping it
                 // releases the backend even without a separate host handle.
+                let stable_instance = store.instance_id();
+                let previous_open = store.validation_epoch();
                 drop(store);
+                let reopened = acquire_production_local_slot(&directory, sealed)
+                    .open_external_genesis(sealed, true, &mut ReadBudget::new(100, 100000))
+                    .unwrap();
+                assert_eq!(reopened.instance_id(), stable_instance);
+                assert_ne!(reopened.validation_epoch(), previous_open);
+                drop(reopened);
                 let catalog = [super::super::execution::RuntimeBlob {
                     reference: sealed.genesis().runtime().package.clone(),
                     bytes: admitted.exact_bytes().to_vec(),
