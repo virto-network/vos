@@ -61,6 +61,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let _space_data_lock = super::space_lock::SpaceDataLock::exclusive(&space_id)?;
     verify_local_genesis(&data_dir, &space_id)?;
     let local = local_config::load(&data_dir)?;
+    local_config::validate_local_storage_roots(&data_dir, local.local_agent_storage)?;
+    anyhow::ensure!(
+        local.local_agent_storage == local_config::LocalAgentStorage::Image,
+        "external-state Local startup is not yet available in this binary; image roots were not opened",
+    );
     let daemon_keypair = load_daemon_keypair(&data_dir)?;
     let network = build_network_for_daemon(
         entry,

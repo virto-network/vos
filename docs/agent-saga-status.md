@@ -256,6 +256,12 @@ the image Local path active until external selection, file-backed restart and
 near-3-MiB ACK recovery qualify. The external replay adapter covers signed
 Create, Install, Invoke, Resume and ACK without decoding private runtime state,
 subject to the Resume/yield gates above.
+`local.toml` now has an explicit `local_agent_storage` choice. Missing fields
+remain `image`; selecting `external-state` checks that neither image host nor
+image lifecycle root exists. Conversely, image selection refuses an existing
+external journal/lifecycle root. The released binary currently returns a clear
+unsupported-mode error for `external-state` before opening the image path;
+this is a format guard, not external startup enablement.
 The current released-binary path is `vosx` clean startup -> image-based
 `LocalAgentHost` -> `LocalLifecycleController` -> Local route backend. The
 older `host::LocalGenesisIntent` file opener accepts r19 only. Next, select and

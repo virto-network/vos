@@ -10,6 +10,27 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 const LOCAL_FILE: &str = "local.toml";
+pub(crate) const IMAGE_LOCAL_HOST_DIRECTORY: &str = "local-agent-host";
+pub(crate) const IMAGE_LOCAL_LIFECYCLE_DIRECTORY: &str = "local-agent-lifecycle";
+pub(crate) const EXTERNAL_LOCAL_JOURNAL_DIRECTORY: &str = "local-agent-external";
+pub(crate) const EXTERNAL_LOCAL_LIFECYCLE_DIRECTORY: &str = "local-agent-external-lifecycle";
+
+/// Immutable-at-deployment Local persistence choice. Missing fields on older
+/// nodes keep the existing image path; external-state never means an in-place
+/// reinterpretation of either image root.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum LocalAgentStorage {
+    #[default]
+    Image,
+    ExternalState,
+}
+
+impl LocalAgentStorage {
+    fn is_image(&self) -> bool {
+        *self == Self::Image
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -17,6 +38,9 @@ pub struct LocalConfig {
     /// Persistent libp2p listen addresses. `space up --listen` overrides these.
     #[serde(default)]
     pub listen: Vec<String>,
+    /// Explicit Local storage format. Existing configs default to `image`.
+    #[serde(default, skip_serializing_if = "LocalAgentStorage::is_image")]
+    pub local_agent_storage: LocalAgentStorage,
     /// Built-in node-local ingress listeners.
     #[serde(default, skip_serializing_if = "IngressLocal::is_empty")]
     pub ingress: IngressLocal,
@@ -30,6 +54,7 @@ impl LocalConfig {
     pub fn for_new_space() -> Self {
         Self {
             listen: vec!["/ip4/127.0.0.1/tcp/0".into()],
+            local_agent_storage: LocalAgentStorage::Image,
             ingress: IngressLocal {
                 http: vec![HttpIngressLocal {
                     name: "http".into(),
@@ -48,6 +73,38 @@ impl LocalConfig {
             extensions: Vec::new(),
         }
     }
+}
+
+/// Reject a configuration change that would silently mix two Local formats
+/// in one Space/Node deployment. This reads path metadata only: startup owns
+/// creation of its selected fresh roots after the full lifecycle is ready.
+pub(crate) fn validate_local_storage_roots(
+    data_dir: &Path,
+    selected: LocalAgentStorage,
+) -> anyhow::Result<()> {
+    let forbidden = match selected {
+        LocalAgentStorage::Image => [
+            EXTERNAL_LOCAL_JOURNAL_DIRECTORY,
+            EXTERNAL_LOCAL_LIFECYCLE_DIRECTORY,
+        ],
+        LocalAgentStorage::ExternalState => {
+            [IMAGE_LOCAL_HOST_DIRECTORY, IMAGE_LOCAL_LIFECYCLE_DIRECTORY]
+        }
+    };
+    for name in forbidden {
+        let path = data_dir.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => anyhow::bail!(
+                "Local storage selection {selected:?} conflicts with existing root {}; use a fresh deployment root, not an in-place migration",
+                path.display(),
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(anyhow::anyhow!("inspect {}: {error}", path.display()));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
@@ -158,6 +215,11 @@ mod tests {
         assert_eq!(config.ingress.http[0].listen, "127.0.0.1:8080");
         assert_eq!(config.ingress.ssh[0].listen, "127.0.0.1:2222");
         assert!(LocalConfig::default().ingress.is_empty());
+        assert_eq!(
+            LocalConfig::default().local_agent_storage,
+            LocalAgentStorage::Image
+        );
+        assert!(!encoded.contains("local_agent_storage"));
     }
 
     #[test]
@@ -180,5 +242,45 @@ mod tests {
         .expect("local platform configuration");
         assert_eq!(config.extensions[0].name, "prover");
         assert_eq!(config.ingress.http[0].name, "api");
+    }
+
+    #[test]
+    fn explicit_external_selection_never_reuses_image_roots() {
+        let config: LocalConfig = toml::from_str("local_agent_storage = 'external-state'").unwrap();
+        assert_eq!(config.local_agent_storage, LocalAgentStorage::ExternalState);
+        assert!(
+            toml::to_string(&config)
+                .unwrap()
+                .contains("local_agent_storage = \"external-state\"")
+        );
+
+        struct TestRoot(std::path::PathBuf);
+        impl Drop for TestRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = TestRoot(std::env::temp_dir().join(format!(
+            "vosx-local-storage-{}-{suffix}",
+            std::process::id()
+        )));
+        std::fs::create_dir(&root.0).unwrap();
+        validate_local_storage_roots(&root.0, LocalAgentStorage::Image).unwrap();
+        validate_local_storage_roots(&root.0, LocalAgentStorage::ExternalState).unwrap();
+
+        let image = root.0.join(IMAGE_LOCAL_LIFECYCLE_DIRECTORY);
+        std::fs::create_dir(&image).unwrap();
+        assert!(validate_local_storage_roots(&root.0, LocalAgentStorage::ExternalState).is_err());
+        validate_local_storage_roots(&root.0, LocalAgentStorage::Image).unwrap();
+        std::fs::remove_dir(&image).unwrap();
+
+        let external = root.0.join(EXTERNAL_LOCAL_JOURNAL_DIRECTORY);
+        std::fs::create_dir(&external).unwrap();
+        assert!(validate_local_storage_roots(&root.0, LocalAgentStorage::Image).is_err());
+        validate_local_storage_roots(&root.0, LocalAgentStorage::ExternalState).unwrap();
     }
 }
