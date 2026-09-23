@@ -331,6 +331,13 @@ not embedded, selected by startup, or a release pin. The next artifact step is
 a compatible bounded state-runtime candidate and an explicit fresh-root bundle
 selection tested through actual `vosx` startup, while image deployments keep
 their existing bundle.
+`just build-agent-state-runtime-pvm` now compiles that candidate and physically
+probes an external-state Create through the PVM before writing a separate PVM;
+two conversions of the same guest ELF were byte-identical. The probe checks
+the XSW2 response and bounded state changes, but does not authorize a package,
+publish a journal head, or make the candidate a startup-selected release
+artifact. A source/revision-pinned candidate bundle and real daemon recovery
+remain required.
 Image-format Local Create/Install CLI commands now reject an external-state
 Space before reserving a credential or retaining a request; the opt-in daemon
 cannot accidentally strand an LCQ1 request while typed LCQ2 ingress is absent.

@@ -77,6 +77,9 @@ enum Command {
         /// Output path; defaults to the input path with a `.pvm` extension.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Probe the opt-in external-state ABI; requires a candidate ELF.
+        #[arg(long)]
+        experimental_state_blocks: bool,
     },
     /// Package or verify the protocol-pinned production runtime artifacts.
     Release {
@@ -257,8 +260,14 @@ fn main() {
                 }
             }
         },
-        Some(Command::AgentRuntimePvm { elf, out }) => {
-            if let Err(error) = commands::agent_runtime_pvm::run(elf.as_deref(), out) {
+        Some(Command::AgentRuntimePvm {
+            elf,
+            out,
+            experimental_state_blocks,
+        }) => {
+            if let Err(error) =
+                commands::agent_runtime_pvm::run(elf.as_deref(), out, experimental_state_blocks)
+            {
                 report_error(error);
             }
         }

@@ -540,10 +540,12 @@ mod tests {
     fn default_binary_refuses_experimental_template_build() {
         let source = TestDir::new("templates-experimental-disabled");
         let out = source.0.join("output");
-        assert!(build_system_templates(&source.0, &out, true)
-            .unwrap_err()
-            .to_string()
-            .contains("experimental-state-blocks vosx build"));
+        assert!(
+            build_system_templates(&source.0, &out, true)
+                .unwrap_err()
+                .to_string()
+                .contains("experimental-state-blocks vosx build")
+        );
         assert!(!out.exists());
     }
 

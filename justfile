@@ -185,6 +185,22 @@ build-agent-standard-state-guest:
     cd "$repository_root/services/agent-runtime"
     CARGO_TARGET_DIR="$state_target/agent-state-standard" cargo +nightly-2026-03-20 actor --offline --locked --features experimental-state-blocks
 
+# Compile and physically probe the opt-in framed ABI without overwriting the
+# pinned released runtime PVM. Each output is a separate candidate.
+build-agent-state-runtime-pvm: build-agent-standard-state-guest
+    #!/usr/bin/env bash
+    set -euo pipefail
+    repository_root="{{justfile_directory()}}"
+    state_target="${CARGO_TARGET_DIR:-$repository_root/target}"
+    mkdir -p "$state_target"
+    state_target=$(cd "$state_target" && pwd)
+    export TMPDIR="$state_target/task-tmp"
+    mkdir -p "$TMPDIR"
+    candidate_root=$(mktemp -d "$state_target/agent-state-runtime-pvm.XXXXXX")
+    cd "$repository_root"
+    CARGO_TARGET_DIR="$state_target" cargo +nightly-2025-05-09 run --offline --locked -p vosx --features experimental-state-blocks -- agent-runtime-pvm "$state_target/agent-state-standard/riscv64em-vos/release/agent_runtime.elf" --out "$candidate_root/agent_runtime.pvm" --experimental-state-blocks
+    echo "candidate runtime: $candidate_root/agent_runtime.pvm"
+
 # Candidate Authority only. Do not overwrite the released bundled actor.
 build-agent-state-authority-guest:
     #!/usr/bin/env bash
