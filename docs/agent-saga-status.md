@@ -82,9 +82,16 @@ It can also reconstruct an installed Actor's exact signed package, program,
 schema, policy and constructor layout from pinned catalog blobs; missing or
 altered artifacts fail closed. No external route worker or public attachment
 exists yet. A successful external journal publication now returns its exact
-guest SDK invocation outcome only after the head commit succeeds. An
-`AlreadyCommitted` retry still lacks an authenticated response handoff,
-including after restart; do not attach a route that can execute without it.
+guest SDK invocation outcome only after the head commit succeeds. The external
+adapter and Standard guest now physically admit Resume with the retained
+invocation's authorization and gas bound; an absent continuation returns a
+no-change guest error. A successful retained external Resume has not been
+physically qualified, and yielded external writes still fail closed until
+continuation budgets are retained. An `AlreadyCommitted` retry still lacks an
+authenticated response handoff, including after restart; do not attach a
+route that can execute without it. A fresh no-change guest retry is not by
+itself evidence of the original response; bind any recovery path to the
+authenticated committed input and retained result/lifecycle state.
 
 No released startup, lifecycle queue or route adapter selects this owner yet;
 the caller must choose Space/Node storage roots independently and attach a
@@ -93,7 +100,8 @@ saved authorization anchor against the pinned system journal before physical
 recovery; startup must restore its pending/retirement admission first. Keep
 the image Local path active until external selection, file-backed restart and
 near-3-MiB ACK recovery qualify. The external replay adapter covers signed
-Create, Install, Invoke and ACK without decoding private runtime state.
+Create, Install, Invoke, Resume and ACK without decoding private runtime state,
+subject to the Resume/yield gates above.
 The current released-binary path is `vosx` clean startup -> image-based
 `LocalAgentHost` -> `LocalLifecycleController` -> Local route backend. The
 older `host::LocalGenesisIntent` file opener accepts r19 only. Next, select and

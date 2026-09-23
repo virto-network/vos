@@ -21674,7 +21674,7 @@ pub(crate) mod tests {
     }
 
     #[cfg(feature = "std")]
-    fn clean_admitted_invocation(
+    pub(crate) fn clean_admitted_invocation(
         runtime: &RuntimeBinding,
         mode: MethodMode,
         discriminator: u8,

@@ -521,7 +521,8 @@ impl<R: CatalogBlobResolver> ExternalLocalReplayExecutor<R> {
 
     fn gas(&self, operation: &ReplayOperation) -> Result<u64, LocalReplayExecutorError> {
         let actor = match operation {
-            ReplayOperation::CleanInvoke { work, .. } => {
+            ReplayOperation::CleanInvoke { work, .. }
+            | ReplayOperation::CleanResume { work, .. } => {
                 if work.gas > MAX_EXECUTION_GAS {
                     return Err(LocalReplayExecutorError::InvalidRequest);
                 }
@@ -608,6 +609,12 @@ impl<R: CatalogBlobResolver> ReplayExecutor for ExternalLocalReplayExecutor<R> {
                 .map_err(|_| LocalReplayExecutorError::InvalidAuthority)?;
             }
             ReplayOperation::CleanInvoke {
+                work,
+                authorization,
+                observed_slot,
+                ..
+            }
+            | ReplayOperation::CleanResume {
                 work,
                 authorization,
                 observed_slot,
@@ -1099,6 +1106,139 @@ impl ExternalLocalJournalOwner {
 mod tests {
     use super::actor_cursor_before;
     use crate::agent_sdk::ActorId;
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn external_resume_reuses_exact_invoke_authorization_and_gas() {
+        use super::{DEFAULT_MANAGEMENT_GAS, ExternalLocalReplayExecutor};
+        use crate::agent::{
+            MethodMode,
+            genesis::AgentGenesisAdmissionId,
+            journal::{
+                AgentJournalGenesis, CanonicalJournalRecord, MergeFrontierId, OrderedEntryId,
+                ReplayOperation,
+            },
+            journal_store::{CatalogBlobResolver, JournalStoreError},
+            package_admission::tests::admitted_state_fixture,
+            replay::{ReplayExecutor, ReplayPosition, tests::clean_admitted_invocation},
+            wire::RuntimeState,
+        };
+        use crate::agent_sdk::{
+            self as sdk, RuntimeExecutionContext, YieldReason, YieldedInvocation,
+        };
+
+        #[derive(Clone)]
+        struct EmptyCatalog;
+        impl CatalogBlobResolver for EmptyCatalog {
+            fn load_catalog(
+                &self,
+                _: &crate::service::BlobRef,
+            ) -> Result<Option<Vec<u8>>, JournalStoreError> {
+                Ok(None)
+            }
+        }
+
+        let runtime = admitted_state_fixture(
+            vos_pvm_compiler::assembler::Assembler::new()
+                .trap()
+                .build_standard(),
+        );
+        let (create, _, _) = crate::agent::replay::tests::external_create_fixture(&runtime);
+        let ReplayOperation::CleanManage {
+            request: sdk::ManagementRequest::Create(descriptor),
+            ..
+        } = &create.operation
+        else {
+            unreachable!()
+        };
+        let mut executor =
+            ExternalLocalReplayExecutor::new(runtime, descriptor.as_ref().clone(), EmptyCatalog)
+                .unwrap();
+        executor
+            .seed_genesis(&AgentJournalGenesis {
+                admission: AgentGenesisAdmissionId::from_bytes([0x71; 32]),
+                create: create.clone(),
+            })
+            .unwrap();
+        let invoke = clean_admitted_invocation(&create.runtime, MethodMode::Linear, 0x72);
+        let ReplayOperation::CleanInvoke {
+            work,
+            authorization,
+            observed_slot,
+            ..
+        } = invoke.operation
+        else {
+            unreachable!()
+        };
+        let yielded = YieldedInvocation {
+            invocation: work.invocation,
+            actor: work.actor,
+            incarnation: work.incarnation,
+            deployment: work.deployment,
+            program: work.program,
+            mode: work.mode,
+            continuation: sdk::BlobRef::of_bytes(b"retained continuation"),
+            ready_sequence: 1,
+            installation_data: work.installation_data.clone(),
+            required: work
+                .availability
+                .iter()
+                .map(|blob| blob.reference.clone())
+                .collect(),
+            reason: YieldReason::Cooperative,
+        };
+        let resume = crate::agent::journal::ReplayInput {
+            runtime: create.runtime,
+            operation: ReplayOperation::CleanResume {
+                context: RuntimeExecutionContext::Direct,
+                expected_live: None,
+                work,
+                authorization,
+                yielded,
+                observed_slot,
+            },
+        };
+        resume.validate().unwrap();
+        assert_eq!(
+            executor.gas(&resume.operation).unwrap(),
+            DEFAULT_MANAGEMENT_GAS + 1_000
+        );
+        let mut excessive = resume.clone();
+        let ReplayOperation::CleanResume { work, .. } = &mut excessive.operation else {
+            unreachable!()
+        };
+        work.gas = super::MAX_EXECUTION_GAS + 1;
+        assert!(executor.gas(&excessive.operation).is_err());
+        let position = ReplayPosition::Ordered {
+            id: OrderedEntryId([0x73; 32]),
+            index: 1,
+            merge_frontier: MergeFrontierId([0x74; 32]),
+            merge_seal: None,
+        };
+        executor
+            .authenticate(&resume, &RuntimeState::default(), position)
+            .unwrap();
+        let mut stale = resume.clone();
+        let ReplayOperation::CleanResume { observed_slot, .. } = &mut stale.operation else {
+            unreachable!()
+        };
+        *observed_slot -= 1;
+        assert!(
+            executor
+                .authenticate(&stale, &RuntimeState::default(), position)
+                .is_err()
+        );
+        let mut changed = resume;
+        let ReplayOperation::CleanResume { work, .. } = &mut changed.operation else {
+            unreachable!()
+        };
+        work.message.push(0xff);
+        assert!(
+            executor
+                .authenticate(&changed, &RuntimeState::default(), position)
+                .is_err()
+        );
+    }
 
     #[test]
     fn targeted_actor_cursor_handles_first_id_and_borrow() {

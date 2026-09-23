@@ -495,7 +495,7 @@ impl<S: super::replay::ScopedBlockReader + ?Sized> MultiLaneStateBlockHost<'_, S
         .map_err(|_| BlockPvmError::Output)
     }
 
-    /// Management, invocation and retirement under an admitted package.
+    /// Management, invocation, resume and retirement under an admitted package.
     /// The caller must select
     /// authoritative, revision-consistent roots; this does not mint freshness
     /// evidence, publish state, or infer any private runtime representation.
@@ -522,7 +522,10 @@ impl<S: super::replay::ScopedBlockReader + ?Sized> MultiLaneStateBlockHost<'_, S
             RuntimeWork::Invoke {
                 invocation, state, ..
             } => (None, invocation.runtime_deployment, state),
-            _ => return Err(BlockPvmError::InvalidRequest),
+            // Resume carries only the retained continuation tuple. The
+            // admitted package supplies its deployment; journal replay must
+            // separately authenticate the original invocation and yield.
+            RuntimeWork::Resume { state, .. } => (None, runtime.deployment(), state),
         };
         if !matches!(
             request,
@@ -574,9 +577,16 @@ impl<S: super::replay::ScopedBlockReader + ?Sized> MultiLaneStateBlockHost<'_, S
                 return Err(BlockPvmError::Output);
             }
         }
-        if matches!(work.work(), RuntimeWork::Invoke { .. })
-            != matches!(&output.transition().outcome, RuntimeOutcome::Completed(_))
-        {
+        if !matches!(
+            (work.work(), &output.transition().outcome),
+            (
+                RuntimeWork::Invoke { .. } | RuntimeWork::Resume { .. },
+                RuntimeOutcome::Completed(_) | RuntimeOutcome::Yielded(_)
+            ) | (
+                RuntimeWork::Acknowledge { .. },
+                RuntimeOutcome::Acknowledged(_)
+            ) | (RuntimeWork::Manage { .. }, RuntimeOutcome::Management(_))
+        ) {
             return Err(BlockPvmError::Output);
         }
         if let (RuntimeWork::Invoke { invocation, .. }, RuntimeOutcome::Completed(Ok(reply))) =
@@ -621,6 +631,7 @@ impl<S: super::replay::ScopedBlockReader + ?Sized> MultiLaneStateBlockHost<'_, S
                 (Some(_), RuntimeOutcome::Management(Err(_)))
                     | (None, RuntimeOutcome::Acknowledged(_))
                     | (None, RuntimeOutcome::Completed(_))
+                    | (None, RuntimeOutcome::Yielded(_))
                     | (
                         Some(ManagementRequest::InspectActors { .. }),
                         RuntimeOutcome::Management(Ok(ManagementReply::Actors(_)))
@@ -1212,7 +1223,59 @@ mod tests {
             );
         }
         if yielded {
-            assert!(matches!(native.outcome, RuntimeOutcome::Yielded(_)));
+            let RuntimeOutcome::Yielded(prior) = &native.outcome else {
+                panic!("native fixture did not yield");
+            };
+            // A Resume without the retained guest continuation must fail
+            // without publication, but it must reach the physical guest. This
+            // guards the host's Resume admission separately from the journal's
+            // stronger retained-yield and authorization checks.
+            let RuntimeWork::Invoke { invocation, .. } = work.work() else {
+                unreachable!()
+            };
+            let resume = crate::agent_sdk::ResumeWork {
+                invocation: prior.invocation,
+                actor: prior.actor,
+                incarnation: prior.incarnation,
+                deployment: prior.deployment,
+                program: prior.program,
+                mode: prior.mode,
+                continuation: prior.continuation.clone(),
+                ready_sequence: prior.ready_sequence,
+                installation_data: prior.installation_data.clone(),
+                availability: invocation.availability.clone(),
+                input: None,
+            };
+            let read_only_lanes = work
+                .lanes()
+                .iter()
+                .map(|lane| ExternalLaneWork {
+                    base: lane.base,
+                    next: lane.base.context(),
+                })
+                .collect();
+            let resume = StateExecutionWork::new(
+                RuntimeWork::Resume {
+                    context: RuntimeExecutionContext::Direct,
+                    state: state.clone(),
+                    resume: Box::new(resume),
+                },
+                read_only_lanes,
+                admitted.external_state_limits(),
+            )
+            .unwrap();
+            let missing = MultiLaneStateBlockHost {
+                store: &store,
+                budget: &mut ReadBudget::new(10000, 10000000),
+            }
+            .execute_admitted_work(&admitted, &resume, gas)
+            .unwrap();
+            assert!(matches!(
+                missing.transition().outcome,
+                RuntimeOutcome::Completed(Err(_))
+            ));
+            assert_eq!(missing.transition().state, state);
+            assert!(missing.changes().is_empty());
             assert_eq!(
                 acknowledged.transition().outcome,
                 RuntimeOutcome::Completed(Err(

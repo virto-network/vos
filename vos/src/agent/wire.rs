@@ -2268,9 +2268,10 @@ pub fn apply_standard_runtime_input(
     }
 }
 
-/// Experimental standard-runtime lifecycle, non-yielding invocation and inspection
-/// with metadata in accounted external roots. Other operations fail closed until their
-/// external-state dispatch is implemented. This never publishes storage.
+/// Experimental standard-runtime lifecycle, invocation, resume, retirement and
+/// inspection with metadata in accounted external roots. External yielded
+/// writes remain unavailable until continuation budgets are retained. This
+/// never publishes storage.
 #[cfg(all(feature = "pvm", feature = "experimental-state-blocks"))]
 pub fn apply_standard_external_runtime_input(input: &[u8]) -> Result<Vec<u8>, DecodeError> {
     #[cfg(target_arch = "riscv64")]
@@ -2323,7 +2324,7 @@ fn apply_standard_external_runtime_input_with_reader<
         } => (
             *space,
             *agent,
-            *runtime_deployment,
+            Some(*runtime_deployment),
             state,
             matches!(
                 request.as_ref(),
@@ -2338,7 +2339,7 @@ fn apply_standard_external_runtime_input_with_reader<
         } => (
             invocation.space,
             invocation.agent,
-            invocation.runtime_deployment,
+            Some(invocation.runtime_deployment),
             state,
             true,
         ),
@@ -2347,11 +2348,14 @@ fn apply_standard_external_runtime_input_with_reader<
         } => (
             invocation.space,
             invocation.agent,
-            invocation.runtime_deployment,
+            Some(invocation.runtime_deployment),
             state,
             true,
         ),
-        _ => return Err(DecodeError::InvalidPlatform),
+        RuntimeWork::Resume { state, .. } => {
+            let scope = work.lanes()[0].base.context().scope();
+            (scope.space(), scope.agent(), None, state, true)
+        }
     };
     if supported {
         let mut decoded = encode_standard_runtime_state(&StandardRuntimeState::default());
@@ -2423,7 +2427,7 @@ fn apply_standard_external_runtime_input_with_reader<
         });
         if descriptor.identity.space != space
             || descriptor.identity.agent != agent
-            || descriptor.identity.runtime_deployment != deployment
+            || deployment.is_some_and(|selected| descriptor.identity.runtime_deployment != selected)
             || descriptor.runtime_contract.lifecycle_abi
                 != crate::agent_sdk::state_execution::STATE_EXECUTION_ABI_ID
             || descriptor.capabilities.lanes.bits() != declared
@@ -2451,12 +2455,13 @@ fn apply_standard_external_runtime_input_with_reader<
                 request,
                 authority,
                 observed_slot,
+                runtime_deployment,
                 ..
             } => {
                 let outcome = runtime.apply_clean_management(
                     space,
                     agent,
-                    deployment,
+                    *runtime_deployment,
                     request.as_ref().clone(),
                     authority.as_deref().cloned(),
                     *observed_slot,
@@ -2541,7 +2546,45 @@ fn apply_standard_external_runtime_input_with_reader<
                 }
                 (successor, result.outcome)
             }
-            _ => unreachable!(),
+            RuntimeWork::Resume { resume, .. } => {
+                // External Merge observations need frontier-aware row semantics.
+                // Keep the same fail-closed boundary as Invoke.
+                if runtime
+                    .clean_actor_record(resume.actor)
+                    .is_some_and(|record| {
+                        record
+                            .entry
+                            .lanes
+                            .contains(crate::agent_sdk::StateLane::Merge)
+                    })
+                {
+                    return Err(DecodeError::InvalidPlatform);
+                }
+                let mut storage = ExternalInvocationStorage {
+                    reader: &mut reader,
+                    lanes: work.lanes(),
+                    limits: work.limits(),
+                    reads: &mut reads,
+                    writes: &mut writes,
+                    candidate: None,
+                };
+                let result = apply_clean_resume_restored(
+                    decoded.clone(),
+                    runtime,
+                    limit,
+                    resume.as_ref().clone(),
+                    CleanExecutionAdmission::direct(),
+                    &mut storage,
+                )?;
+                let successor = clean_state_to_legacy(&result.state);
+                if let Some((expected, update)) = storage.candidate {
+                    if expected != successor {
+                        return Err(DecodeError::NonCanonical);
+                    }
+                    row_candidate = Some(update);
+                }
+                (successor, result.outcome)
+            }
         };
         if successor.encoded_len().is_none_or(|bytes| bytes > limit) {
             return Err(DecodeError::LimitExceeded);
@@ -3553,17 +3596,6 @@ fn apply_clean_resume(
     resume: crate::agent_sdk::ResumeWork,
     admission: CleanExecutionAdmission<'_>,
 ) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
-    use crate::agent_sdk::{InvocationError, RuntimeOutcome, RuntimeTransition};
-
-    if resume.input.is_some() {
-        // Cooperative continuations accept no external completion payload.
-        // A mismatched resume must not become a durable error for the
-        // original invocation or retire its still-valid continuation.
-        return Ok(clean_completed(
-            state,
-            Err(InvocationError::StaleContinuation),
-        ));
-    }
     // Resume needs the same single owned rollback image as Invoke/ACK.
     let original_state = RuntimeState {
         control: state.control,
@@ -3571,7 +3603,36 @@ fn apply_clean_resume(
         merge: state.merge,
         local: state.local,
     };
-    let (mut runtime, state_limit) = restore_standard_runtime_state(&original_state)?;
+    let (runtime, state_limit) = restore_standard_runtime_state(&original_state)?;
+    apply_clean_resume_restored(
+        original_state,
+        runtime,
+        state_limit,
+        resume,
+        admission,
+        &mut ImageInvocationStorage,
+    )
+}
+
+#[cfg(feature = "pvm")]
+fn apply_clean_resume_restored(
+    original_state: RuntimeState,
+    mut runtime: StandardAgentRuntime,
+    state_limit: usize,
+    resume: crate::agent_sdk::ResumeWork,
+    admission: CleanExecutionAdmission<'_>,
+    storage_backend: &mut impl CleanInvocationStorage,
+) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
+    use crate::agent_sdk::{InvocationError, RuntimeOutcome, RuntimeTransition};
+    if resume.input.is_some() {
+        // Cooperative continuations accept no external completion payload.
+        // A mismatched resume must not become a durable error for the
+        // original invocation or retire its still-valid continuation.
+        return Ok(clean_completed(
+            legacy_state_to_clean(original_state),
+            Err(InvocationError::StaleContinuation),
+        ));
+    }
     let (record, work) = match runtime.resolve_clean_resume(&resume) {
         Ok(value) => value,
         Err(error) => {
@@ -3655,8 +3716,7 @@ fn apply_clean_resume(
         })
         .and_then(|before| {
             let visible = before.visible_for(invocation.mode);
-            let outcome = {
-                let storage = runtime.resolve_clean_storage_reader(&work, &actor_schema)?;
+            let outcome = storage_backend.execute(&runtime, &work, &actor_schema, |storage| {
                 super::execution::run_inner_actor_with_storage(
                     &invocation,
                     Some(crate::agent_sdk::InvocationContext::from_work(
@@ -3667,9 +3727,9 @@ fn apply_clean_resume(
                     installation_data.as_ref().map(|data| data.bytes.as_slice()),
                     &visible,
                     Some(record.continuation.clone()),
-                    Some(&storage),
+                    Some(storage),
                 )
-            };
+            });
             outcome.and_then(|outcome| match outcome {
                 super::execution::ActorRunOutcome::Completed {
                     mut reply,
@@ -3698,17 +3758,14 @@ fn apply_clean_resume(
                                 Some(record.ready_sequence),
                             )
                         };
-                        if rows.is_empty() {
-                            commit(&mut runtime)?;
-                        } else {
-                            runtime.commit_clean_row_batch(
-                                &work,
-                                &actor_schema,
-                                inline,
-                                rows,
-                                commit,
-                            )?;
-                        }
+                        storage_backend.commit(
+                            &mut runtime,
+                            &work,
+                            &actor_schema,
+                            inline,
+                            rows,
+                            commit,
+                        )?;
                     } else {
                         terminal_sequence = Some(record.ready_sequence);
                     }
@@ -3742,17 +3799,14 @@ fn apply_clean_resume(
                             Some((accepted.clone(), authorization.clone())),
                         )
                     };
-                    if rows.is_empty() {
-                        commit(&mut runtime)?;
-                    } else {
-                        runtime.commit_clean_row_batch(
-                            &work,
-                            &actor_schema,
-                            inline,
-                            rows,
-                            commit,
-                        )?;
-                    }
+                    storage_backend.commit(
+                        &mut runtime,
+                        &work,
+                        &actor_schema,
+                        inline,
+                        rows,
+                        commit,
+                    )?;
                     Ok(reply)
                 }
             })
