@@ -177,6 +177,14 @@ executes Install from a candidate lacking its artifacts and reruns the
 file-backed crash/reopen cases; an invalid fence rolls back newly staged
 bytes. This is a prerequisite for Install, not yet the lifecycle Install
 coordinator or released ingress.
+Install application observation now uses the replay-authenticated management
+evidence's original Ordered position and logical slot, rather than the mutable
+current head. The physical fixture returns the same observation after
+checkpoint/reopen and later actor work, and checks a signed final ACK against
+it while rejecting substituted receipt, Agent identity and application hash.
+The existing issuer must still authorize, finalize and retire each Install
+before the next management operation; neither this evidence helper nor the
+publication helper is released ingress or a complete Install coordinator.
 Focused r04/s04 evidence: SDK feature-on/off suites passed (248 passed/1
 ignored and 247 passed/1 ignored); the compiled Standard physical
 Create/Install/Invoke/ACK/checkpoint/reopen test passed, including retained

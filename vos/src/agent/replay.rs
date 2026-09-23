@@ -23265,6 +23265,103 @@ pub(crate) mod tests {
         let installed = pinned.materialization().unwrap().clone();
         assert_eq!(installed.external_roots, before.external_roots);
         assert_ne!(installed.state.control, before.state.control);
+        let ReplayOperation::CleanManage {
+            request: install_request,
+            authority: install_authority,
+            ..
+        } = &entry.input.operation
+        else {
+            unreachable!()
+        };
+        let install_observation =
+            super::super::external_local_executor::observe_external_install_application(
+                &installed,
+                descriptor,
+                install_request,
+                install_authority,
+            )
+            .unwrap();
+        assert_eq!(
+            install_observation.result(),
+            &sdk::ManagementReply::Installed(install.entry.clone())
+        );
+        assert_eq!(install_observation.applied_at(), 11);
+        assert_ne!(install_observation.reopened_state(), sdk::Hash::ZERO);
+        let mut install_ack = sdk::authority::ManagementApplicationAck {
+            authorization_invocation: sdk::InvocationId([0x81; 32]),
+            acknowledgement_invocation: sdk::InvocationId([0x82; 32]),
+            authority: sdk::authority::AuthorityActorTarget {
+                space: descriptor.identity.space,
+                system_agent: sdk::AgentId([0x83; 32]),
+                system_runtime_deployment: sdk::DeploymentId([0x84; 32]),
+                binding: descriptor.authority,
+            },
+            managed: sdk::authority::ManagedAgentTarget {
+                space: descriptor.identity.space,
+                agent: descriptor.identity.agent,
+                owner: descriptor.identity.owner,
+                profile: descriptor.identity.profile,
+                runtime_deployment: descriptor.identity.runtime_deployment,
+                transition_producer: descriptor.identity.transition_producer,
+            },
+            credential_call: sdk::Hash([0x85; 32]),
+            approval: sdk::Hash([0x86; 32]),
+            authorization_sequence: std::num::NonZeroU64::new(
+                install_authority.selector.decision_sequence,
+            )
+            .unwrap(),
+            request: install_request.replay_commitment(),
+            receipt: install_authority.clone(),
+            application: install_observation.result().clone(),
+            reopened_state: install_observation.reopened_state(),
+            applied_at: install_observation.applied_at(),
+            signature: [0; 64],
+        };
+        use ed25519_dalek::Signer;
+        install_ack.signature = signing.sign(&install_ack.signing_bytes()).to_bytes();
+        super::super::external_local_executor::verify_external_install_ack(
+            &installed,
+            descriptor,
+            install_request,
+            install_authority,
+            &install_ack,
+        )
+        .unwrap();
+        let mut wrong_ack = install_ack.clone();
+        wrong_ack.reopened_state.0[0] ^= 1;
+        wrong_ack.signature = signing.sign(&wrong_ack.signing_bytes()).to_bytes();
+        assert!(
+            super::super::external_local_executor::verify_external_install_ack(
+                &installed,
+                descriptor,
+                install_request,
+                install_authority,
+                &wrong_ack,
+            )
+            .is_err()
+        );
+        let mut wrong_receipt = install_authority.clone();
+        wrong_receipt.signature[0] ^= 1;
+        assert!(
+            super::super::external_local_executor::observe_external_install_application(
+                &installed,
+                descriptor,
+                install_request,
+                &wrong_receipt,
+            )
+            .is_err()
+        );
+        let mut wrong_descriptor = descriptor.as_ref().clone();
+        wrong_descriptor.identity.agent.0[0] ^= 1;
+        assert!(
+            super::super::external_local_executor::observe_external_install_application(
+                &installed,
+                &wrong_descriptor,
+                install_request,
+                install_authority,
+            )
+            .is_err()
+        );
         let executions = executor.executions;
         assert!(matches!(
             pinned
@@ -23363,11 +23460,28 @@ pub(crate) mod tests {
             compacted.clean_management_evidence(),
             installed.clean_management_evidence()
         );
+        assert_eq!(
+            super::super::external_local_executor::observe_external_install_application(
+                &compacted,
+                descriptor,
+                install_request,
+                install_authority,
+            )
+            .unwrap(),
+            install_observation
+        );
+        super::super::external_local_executor::verify_external_install_ack(
+            &compacted,
+            descriptor,
+            install_request,
+            install_authority,
+            &install_ack,
+        )
+        .unwrap();
         use crate::actors::{
             codec::{Decode, Encode},
             value::{Msg, TAG_DYNAMIC, Value},
         };
-        use ed25519_dalek::Signer;
         let record = &page.entries[0];
         for (index, expected) in [42_u64, 43].into_iter().enumerate() {
             let mut message = vec![TAG_DYNAMIC];
@@ -23537,6 +23651,16 @@ pub(crate) mod tests {
             )
             .unwrap();
             assert_eq!(after_retry.state(), before_retry.state());
+            assert_eq!(
+                super::super::external_local_executor::observe_external_install_application(
+                    &after_retry,
+                    descriptor,
+                    install_request,
+                    install_authority,
+                )
+                .unwrap(),
+                install_observation
+            );
             if let Some(recovery) = head_recovery {
                 assert!(
                     !super::super::external_local_executor::committed_recovery_is_domain_head(

@@ -623,6 +623,114 @@ impl ExternalLocalManagementObservation {
     }
 }
 
+/// Derive a stable Install application identity from authenticated replay
+/// evidence, not the current journal-head ID. A later Invoke, ACK or
+/// maintenance checkpoint may change the head before the issuer retries its
+/// acknowledgement; the retained management evidence still names the exact
+/// successful Install and its original observation slot. A later management
+/// mutation replaces that evidence; the lifecycle coordinator must retire
+/// the prior operation before admitting its successor.
+#[cfg(feature = "experimental-state-blocks")]
+pub(crate) fn observe_external_install_application(
+    recovered: &super::replay::ReplayMaterialization,
+    descriptor: &AgentDescriptor,
+    request: &ManagementRequest,
+    receipt: &crate::agent_sdk::authority::AuthorityReceipt,
+) -> Result<ExternalLocalManagementObservation, super::journal_store::JournalStoreError> {
+    use super::journal_store::JournalStoreError;
+    use crate::agent_sdk::{self as sdk, ManagementReply};
+
+    let ManagementRequest::Install(install) = request else {
+        return Err(JournalStoreError::NonCanonical);
+    };
+    let evidence = recovered
+        .clean_management_evidence()
+        .ok_or(JournalStoreError::Unavailable)?;
+    let head = evidence.ordered.head.ok_or(JournalStoreError::Corrupt)?;
+    if descriptor.validate().is_err()
+        || descriptor.identity.profile != AgentProfile::Local
+        || descriptor.identity.space.0 != recovered.runtime().space.0
+        || descriptor.identity.agent.0 != recovered.runtime().agent.0
+        || descriptor.identity.runtime_deployment.0 != recovered.runtime().deployment.0
+        || evidence.ordered.index == 0
+        || evidence.ordered.index > recovered.heads().ordered_index
+        || evidence.input == ReplayInputId::ZERO
+        || evidence.request != request.replay_commitment()
+        || evidence.authority != receipt.commitment()
+        || evidence.epoch != receipt.selector.epoch
+        || evidence.sequence != receipt.selector.decision_sequence
+        || evidence.result != Ok(ManagementReply::Installed(install.entry.clone()))
+        || super::driver::verify_clean_management_receipt(
+            descriptor,
+            request,
+            receipt,
+            evidence.observed_slot,
+            false,
+        )
+        .is_err()
+    {
+        return Err(JournalStoreError::ScopeMismatch);
+    }
+    let reopened_state = sdk::Hash::digest(
+        b"vos/agent/local/external-install-application/v1",
+        &[
+            &recovered.heads().genesis.0,
+            &evidence.input.0,
+            &head.0,
+            &evidence.ordered.index.to_le_bytes(),
+            &evidence.authority.0,
+            &evidence.request.0,
+            &evidence.observed_slot.to_le_bytes(),
+        ],
+    );
+    Ok(ExternalLocalManagementObservation {
+        receipt: receipt.clone(),
+        result: ManagementReply::Installed(install.entry.clone()),
+        reopened_state,
+        applied_at: evidence.observed_slot,
+    })
+}
+
+/// A finalized issuer ACK is an exact-retry input, not fresh permission to
+/// install. Rebind it to the authenticated physical Install evidence before
+/// a lifecycle handoff or route refresh may trust it.
+#[cfg(feature = "experimental-state-blocks")]
+pub(crate) fn verify_external_install_ack(
+    recovered: &super::replay::ReplayMaterialization,
+    descriptor: &AgentDescriptor,
+    request: &ManagementRequest,
+    receipt: &crate::agent_sdk::authority::AuthorityReceipt,
+    acknowledgement: &crate::agent_sdk::authority::ManagementApplicationAck,
+) -> Result<(), super::journal_store::JournalStoreError> {
+    use super::journal_store::JournalStoreError;
+
+    let observation =
+        observe_external_install_application(recovered, descriptor, request, receipt)?;
+    let identity = &descriptor.identity;
+    if acknowledgement.validate_shape().is_err()
+        || acknowledgement
+            .verify_with(&super::clean_bootstrap::RawCredentialVerifier)
+            .is_err()
+        || acknowledgement.authority.space != identity.space
+        || acknowledgement.authority.binding != descriptor.authority
+        || acknowledgement.managed.space != identity.space
+        || acknowledgement.managed.agent != identity.agent
+        || acknowledgement.managed.owner != identity.owner
+        || acknowledgement.managed.profile != identity.profile
+        || acknowledgement.managed.runtime_deployment != identity.runtime_deployment
+        || acknowledgement.managed.transition_producer != identity.transition_producer
+        || acknowledgement.authorization_sequence.get() != receipt.selector.decision_sequence
+        || acknowledgement.request != request.replay_commitment()
+        || acknowledgement.receipt != *receipt
+        || acknowledgement.application != *observation.result()
+        || acknowledgement.reopened_state != observation.reopened_state()
+        || acknowledgement.applied_at != observation.applied_at()
+    {
+        return Err(JournalStoreError::ScopeMismatch);
+    }
+    Ok(())
+}
+
 /// One admitted external runtime, immutable actor catalog resolver and exact
 /// genesis descriptor. No standard-runtime private state is decoded here.
 /// Unsupported lifecycle forms fail closed until their external lane and
@@ -1670,6 +1778,41 @@ impl ExternalLocalJournalOwner {
                 ),
                 applied_at: expected.observed_slot,
             })
+        })
+    }
+
+    /// Re-observe the latest applied Install from authenticated management
+    /// evidence, including after unrelated Invoke/ACK and checkpoint work.
+    /// The issuer still owns approval, signing, finalization and retirement.
+    pub(crate) fn observe_install_application(
+        &self,
+        request: &ManagementRequest,
+        receipt: &crate::agent_sdk::authority::AuthorityReceipt,
+    ) -> Result<ExternalLocalManagementObservation, super::journal_store::JournalStoreError> {
+        self.cursor.inspect(|_, recovered| {
+            observe_external_install_application(
+                recovered,
+                &self.executor.descriptor,
+                request,
+                receipt,
+            )
+        })
+    }
+
+    pub(crate) fn verify_finalized_install_ack(
+        &self,
+        request: &ManagementRequest,
+        receipt: &crate::agent_sdk::authority::AuthorityReceipt,
+        acknowledgement: &crate::agent_sdk::authority::ManagementApplicationAck,
+    ) -> Result<(), super::journal_store::JournalStoreError> {
+        self.cursor.inspect(|_, recovered| {
+            verify_external_install_ack(
+                recovered,
+                &self.executor.descriptor,
+                request,
+                receipt,
+                acknowledgement,
+            )
         })
     }
 
