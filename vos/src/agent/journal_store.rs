@@ -17402,6 +17402,110 @@ mod tests {
             // Standard-runtime lifecycle mutations need their own Install and
             // receipt/fence setup; never feed it the probe's synthetic markers.
             if !probe_mutations {
+                // Qualify the production locked owner, not only the generic
+                // pinned publisher used by the fault-injection cases below.
+                let directory = TestDirectory::new("standard-install-owner");
+                let mut store = acquire_production_local_slot(&directory, sealed)
+                    .open_external_genesis(sealed, false, &mut ReadBudget::new(10000, 10000000))
+                    .unwrap();
+                store
+                    .put_blob(
+                        JournalBlobClass::CatalogArtifact,
+                        &sealed.genesis().runtime().package,
+                        package,
+                    )
+                    .unwrap();
+                store
+                    .initialize_external_local(sealed, &mut ReadBudget::new(10000, 10000000))
+                    .unwrap();
+                store
+                    .commit_external_genesis_exposure(
+                        sealed,
+                        PRODUCTION_LOCAL_INTENT,
+                        &mut ReadBudget::new(10000, 10000000),
+                    )
+                    .unwrap();
+                drop(store);
+                let runtime_catalog = [super::super::execution::RuntimeBlob {
+                    reference: sealed.genesis().runtime().package.clone(),
+                    bytes: package.to_vec(),
+                }];
+                let reopen_seal = || {
+                    super::super::local_journal_driver::LocalJournalAgentDriver::<
+                        MemoryAgentJournalStore,
+                    >::prepare_external_local_genesis(
+                        sealed.genesis().create.clone(),
+                        sealed.replica(),
+                        &runtime_catalog,
+                        sealed.replica().node,
+                    )
+                    .unwrap()
+                };
+                let mut owned =
+                    super::super::external_local_executor::ExternalLocalJournalOwner::open(
+                        acquire_production_local_slot(&directory, sealed),
+                        reopen_seal(),
+                        &mut ReadBudget::new(10000, 10000000),
+                    )
+                    .unwrap();
+                let ReplayOperation::CleanManage {
+                    request: crate::agent_sdk::ManagementRequest::Create(descriptor),
+                    ..
+                } = &sealed.genesis().create.operation
+                else {
+                    unreachable!()
+                };
+                let (install, _, actor_bytes) =
+                    super::super::state_block_pvm::lifecycle_tests::compiled_install_fixture(
+                        descriptor,
+                    );
+                let actor =
+                    super::super::package_admission::admit_actor_package(&actor_bytes).unwrap();
+                let request = crate::agent_sdk::ManagementRequest::Install(Box::new(install));
+                let receipt = super::super::replay::tests::signed_opaque_clean_receipt(
+                    descriptor,
+                    &request,
+                    admitted.deployment(),
+                    2,
+                    &SigningKey::from_bytes(&[0x31; 32]),
+                );
+                let input = super::super::journal::ReplayInput {
+                    runtime: sealed.genesis().runtime().clone(),
+                    operation: ReplayOperation::CleanManage {
+                        request: request.clone(),
+                        authority: receipt.clone(),
+                        observed_slot: 11,
+                    },
+                };
+                let published = owned
+                    .publish_install(input.clone(), &actor, &mut ReadBudget::new(10000, 10000000))
+                    .unwrap();
+                assert!(matches!(
+                    published,
+                    super::super::replay::ExternalJournalCommit::Published(_, _, None)
+                ));
+                let observation = owned
+                    .observe_install_application(&request, &receipt)
+                    .unwrap();
+                assert!(matches!(
+                    owned.publish_install(input, &actor, &mut ReadBudget::new(10000, 10000000),),
+                    Err(JournalStoreError::Conflict)
+                ));
+                drop(owned);
+                let reopened =
+                    super::super::external_local_executor::ExternalLocalJournalOwner::open(
+                        acquire_production_local_slot(&directory, sealed),
+                        reopen_seal(),
+                        &mut ReadBudget::new(10000, 10000000),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    reopened
+                        .observe_install_application(&request, &receipt)
+                        .unwrap(),
+                    observation
+                );
+                drop(reopened);
                 for failure in [
                     PublicationPoint::ObjectDurable,
                     PublicationPoint::HeadsStaged,

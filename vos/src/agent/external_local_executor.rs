@@ -2043,6 +2043,110 @@ impl ExternalLocalJournalOwner {
         )
     }
 
+    /// Publish one Authority-approved Install through the pinned file owner.
+    /// The actor's signed closure and constructor bytes are staged under the
+    /// current authenticated predecessor, then the physical guest preflight
+    /// must accept before any new head is published. `Rejected` leaves the
+    /// Authority decision pending; the lifecycle coordinator must not sign an
+    /// application ACK or expose a route for it. After any error the caller
+    /// must reopen this locked generation before deciding whether to retry.
+    pub(crate) fn publish_install(
+        &mut self,
+        input: ReplayInput,
+        package: &super::package_admission::AdmittedActorPackage,
+        budget: &mut ReadBudget,
+    ) -> Result<super::replay::ExternalJournalCommit, super::journal_store::JournalStoreError> {
+        use super::journal::OrderedEntry;
+        use super::journal_store::{CatalogBlobResolverFactory, JournalStoreError};
+        use super::replay::{ReplayError, ReplayMaterializationSourceError};
+
+        let ReplayOperation::CleanManage {
+            request: ManagementRequest::Install(install),
+            authority,
+            observed_slot,
+        } = &input.operation
+        else {
+            return Err(JournalStoreError::NonCanonical);
+        };
+        if input.validate().is_err() || input.runtime != *self.materialization()?.runtime() {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        let request = ManagementRequest::Install(install.clone());
+        super::driver::verify_clean_management_receipt(
+            &self.executor.descriptor,
+            &request,
+            authority,
+            *observed_slot,
+            false,
+        )
+        .map_err(|_| JournalStoreError::ScopeMismatch)?;
+        super::driver::validate_sdk_management_artifacts(
+            &self.executor.descriptor,
+            &request,
+            SdkManagementArtifacts::Actor(package),
+        )
+        .map_err(|_| JournalStoreError::ScopeMismatch)?;
+        if self
+            .materialization()?
+            .clean_management_evidence()
+            .is_some_and(|evidence| {
+                evidence.request == request.replay_commitment()
+                    && evidence.authority == authority.commitment()
+            })
+        {
+            // The lifecycle owner must recover and acknowledge the existing
+            // physical application, not append a second ordered transition.
+            return Err(JournalStoreError::Conflict);
+        }
+
+        let catalog = [
+            package.exact_bytes(),
+            package.program_bytes(),
+            package.state_lane_schema_bytes(),
+            package.method_policy_bytes(),
+        ]
+        .into_iter()
+        .chain(
+            install
+                .installation_data
+                .as_ref()
+                .map(|data| data.bytes.as_slice()),
+        )
+        .map(|bytes| super::execution::RuntimeBlob {
+            reference: BlobRef::of_bytes(bytes),
+            bytes: bytes.to_vec(),
+        })
+        .collect::<Vec<_>>();
+        let heads = self.materialization()?.heads().clone();
+        let entry = OrderedEntry {
+            genesis: heads.genesis,
+            index: heads
+                .ordered_index
+                .checked_add(1)
+                .ok_or(JournalStoreError::LimitExceeded)?,
+            parent: heads.ordered_head,
+            merge_frontier: heads.merge_frontier,
+            merge_seal: Some(self.cursor.persist_current_merge_seal(&self.seal)?),
+            input,
+        };
+        self.cursor
+            .apply_install_with_catalog(
+                &mut self.executor,
+                &entry,
+                &catalog,
+                budget,
+                |store, executor| {
+                    executor.replace_resolver(store.catalog_blob_resolver()?);
+                    Ok(())
+                },
+            )
+            .map_err(|error| match error {
+                ReplayError::Source(ReplayMaterializationSourceError::Journal(error)) => error,
+                ReplayError::ReplayLimit => JournalStoreError::Backpressure,
+                _ => JournalStoreError::Unavailable,
+            })
+    }
+
     pub(crate) fn apply_local(
         &mut self,
         entry: &super::journal::LocalEntry,

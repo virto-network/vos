@@ -200,6 +200,14 @@ Install but does not terminalize an already Authority-approved intent: the
 issuer has no cancellation transition for that case. Keep external Install
 ingress disabled until lifecycle handling of permanent guest rejection and
 response-loss recovery is qualified.
+The locked file owner now accepts a validated signed Install plus the admitted
+actor package, derives its exact catalog and Merge fence from its pinned
+generation, and invokes that preflight/publication helper. It refuses to
+append an already observed approval: a retry must re-observe the durable
+application instead. A physical Standard guest test publishes through this
+owner, reopens the file generation, and recovers the same observation. The
+retained issuer/lifecycle Install coordinator and rejected-approval resolution
+are still missing; this owner method is not released ingress.
 Focused r04/s04 evidence: SDK feature-on/off suites passed (248 passed/1
 ignored and 247 passed/1 ignored); the compiled Standard physical
 Create/Install/Invoke/ACK/checkpoint/reopen test passed, including retained
