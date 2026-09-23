@@ -24,7 +24,8 @@ use vos::agent::authority_operation_issuer::{
 };
 use vos::agent::bootstrap::MAX_SYSTEM_AGENT_GENESIS_PROVISION_BYTES;
 use vos::agent::clean_authority_issuer::{
-    CleanManagementActorStore, CleanManagementIssuerStore, CleanManagementRuntimeStore,
+    CleanExternalLocalCreateArchiveStore, CleanManagementActorStore, CleanManagementIssuerStore,
+    CleanManagementRuntimeStore, MAX_CLEAN_EXTERNAL_LOCAL_CREATE_ARCHIVE_BYTES,
     MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES, MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
 };
 use vos::agent::clean_bootstrap::{
@@ -62,6 +63,8 @@ const LIFECYCLE_RUNTIME_FILE: &str = "management.runtime";
 const LIFECYCLE_RUNTIME_STAGE_FILE: &str = "management.runtime.next";
 const LIFECYCLE_ACTOR_FILE: &str = "management.actor";
 const LIFECYCLE_ACTOR_STAGE_FILE: &str = "management.actor.next";
+const LIFECYCLE_EXTERNAL_CREATE_ARCHIVE_FILE: &str = "management.external-create";
+const LIFECYCLE_EXTERNAL_CREATE_ARCHIVE_STAGE_FILE: &str = "management.external-create.next";
 pub(crate) const SHARED_LIFECYCLE_DIRECTORY: &str = "shared-agent-lifecycle";
 pub(crate) const SHARED_COMMITTEE_DIRECTORY: &str = "shared-agent-committee";
 pub(crate) const SHARED_ARCHIVE_DIRECTORY: &str = "shared-agent-genesis";
@@ -84,7 +87,7 @@ const CREDENTIAL_QUERY_ENTRIES: [&str; 3] = [
     CREDENTIAL_QUERY_FILE,
     CREDENTIAL_QUERY_STAGE_FILE,
 ];
-const LIFECYCLE_ENTRIES: [&str; 9] = [
+const LIFECYCLE_ENTRIES: [&str; 11] = [
     LOCK_FILE,
     INTENT_FILE,
     INTENT_STAGE_FILE,
@@ -94,6 +97,8 @@ const LIFECYCLE_ENTRIES: [&str; 9] = [
     LIFECYCLE_RUNTIME_STAGE_FILE,
     LIFECYCLE_ACTOR_FILE,
     LIFECYCLE_ACTOR_STAGE_FILE,
+    LIFECYCLE_EXTERNAL_CREATE_ARCHIVE_FILE,
+    LIFECYCLE_EXTERNAL_CREATE_ARCHIVE_STAGE_FILE,
 ];
 
 pub(crate) const MAX_CLEAN_SYSTEM_AGENT_GENESIS_ARCHIVE_BYTES: usize =
@@ -214,6 +219,7 @@ enum StoreRole {
     OrdinaryGenesisReply = 42,
     OrdinaryGenesisPublication = 43,
     OrdinaryGenesisPublicationReply = 44,
+    ExternalLocalCreateArchive = 45,
 }
 
 impl StoreRole {
@@ -232,6 +238,7 @@ impl StoreRole {
             Self::LifecycleRuntime => LIFECYCLE_RUNTIME_FILE,
             Self::LocalCreateDenial => LOCAL_DENIAL_FILE,
             Self::LifecycleActor => LIFECYCLE_ACTOR_FILE,
+            Self::ExternalLocalCreateArchive => LIFECYCLE_EXTERNAL_CREATE_ARCHIVE_FILE,
             Self::LocalInstallRequest => "local-install.request",
             Self::LocalInstallAcknowledgement => "local-install.acknowledgement",
             Self::InvocationRequest => "invocation.request",
@@ -281,6 +288,7 @@ impl StoreRole {
             Self::LifecycleRuntime => LIFECYCLE_RUNTIME_STAGE_FILE,
             Self::LocalCreateDenial => LOCAL_DENIAL_STAGE_FILE,
             Self::LifecycleActor => LIFECYCLE_ACTOR_STAGE_FILE,
+            Self::ExternalLocalCreateArchive => LIFECYCLE_EXTERNAL_CREATE_ARCHIVE_STAGE_FILE,
             Self::LocalInstallRequest => "local-install.request.next",
             Self::LocalInstallAcknowledgement => "local-install.acknowledgement.next",
             Self::InvocationRequest => "invocation.request.next",
@@ -434,6 +442,7 @@ impl StoreRole {
             }
             Self::LifecycleRuntime => MAX_PACKAGE_ENCODED_BYTES,
             Self::LifecycleActor => MAX_PACKAGE_ENCODED_BYTES,
+            Self::ExternalLocalCreateArchive => MAX_CLEAN_EXTERNAL_LOCAL_CREATE_ARCHIVE_BYTES,
             Self::LocalCreateDenial => vos::agent::local_lifecycle::LocalCreateDenial::MAX_BYTES,
             Self::CredentialReservation | Self::AdminCredentialReservation => 165,
             Self::LocalCreateAcknowledgement | Self::LocalInstallAcknowledgement => {
@@ -476,6 +485,7 @@ impl StoreRole {
             42 => Some(Self::OrdinaryGenesisReply),
             43 => Some(Self::OrdinaryGenesisPublication),
             44 => Some(Self::OrdinaryGenesisPublicationReply),
+            45 => Some(Self::ExternalLocalCreateArchive),
             1 => Some(Self::Pins),
             2 => Some(Self::Bootstrap),
             3 => Some(Self::ManagementIssuer),
@@ -1223,6 +1233,7 @@ impl CleanManagementLifecycleFiles {
                 ExactFileStore::new(Arc::clone(&root), StoreRole::ManagementIntent),
                 ExactFileStore::new(Arc::clone(&root), StoreRole::LifecycleRuntime),
                 ExactFileStore::new(Arc::clone(&root), StoreRole::LifecycleActor),
+                ExactFileStore::new(Arc::clone(&root), StoreRole::ExternalLocalCreateArchive),
             ),
             issuer: CleanManagementIssuerFile(ExactFileStore::new(
                 root,
@@ -1236,7 +1247,12 @@ impl CleanManagementLifecycleFiles {
     }
 }
 
-pub(crate) struct CleanManagementIntentFile(ExactFileStore, ExactFileStore, ExactFileStore);
+pub(crate) struct CleanManagementIntentFile(
+    ExactFileStore,
+    ExactFileStore,
+    ExactFileStore,
+    ExactFileStore,
+);
 
 /// One Authority's operation history under a shared exclusive writer lease.
 /// These are opaque durability adapters, not policy or signature verifiers.
@@ -2325,6 +2341,20 @@ impl CleanManagementActorStore for CleanManagementIntentFile {
     }
 }
 
+impl CleanExternalLocalCreateArchiveStore for CleanManagementIntentFile {
+    fn load_external_create_archive(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        let image = self.3.load(MAX_CLEAN_EXTERNAL_LOCAL_CREATE_ARCHIVE_BYTES)?;
+        if let Some(bytes) = &image {
+            self.3.commit_with_replacement(bytes, false)?;
+        }
+        Ok(image)
+    }
+
+    fn commit_external_create_archive(&mut self, archive: &[u8]) -> Result<(), Self::Error> {
+        self.3.commit_with_replacement(archive, false)
+    }
+}
+
 impl CleanSystemAgentGenesisFile {
     pub(crate) fn load(&mut self) -> Result<Option<Vec<u8>>, CleanFileStoreError> {
         self.0.load(MAX_CLEAN_SYSTEM_AGENT_GENESIS_ARCHIVE_BYTES)
@@ -2600,6 +2630,7 @@ impl ExactFileStore {
         if matches!(
             self.role,
             StoreRole::LocalCreateRequest
+                | StoreRole::ExternalLocalCreateArchive
                 | StoreRole::OrdinaryGenesisArchive
                 | StoreRole::OrdinaryGenesisQuery
                 | StoreRole::OrdinaryGenesisReply
@@ -4620,6 +4651,49 @@ pub(crate) mod tests {
             Err(CleanFileStoreError::WrongStoreRole)
         ));
         assert_eq!(issuer.load().unwrap(), Some(b"issuer".to_vec()));
+    }
+
+    #[test]
+    fn lifecycle_external_create_archive_survives_intent_handoff() {
+        let fixture = Fixture::new("lifecycle-external-create-archive");
+        let (mut intent, issuer) = CleanManagementLifecycleFiles::open_or_create(&fixture.root)
+            .unwrap()
+            .into_parts();
+        intent.commit(b"retired-create").unwrap();
+        intent.commit_runtime(b"create-runtime").unwrap();
+        stage(&intent.3, None, b"exact-create-archive");
+        assert_eq!(
+            intent.load_external_create_archive().unwrap(),
+            Some(b"exact-create-archive".to_vec())
+        );
+        assert!(
+            !fixture
+                .root
+                .join(LIFECYCLE_EXTERNAL_CREATE_ARCHIVE_STAGE_FILE)
+                .exists()
+        );
+        intent.commit(b"later-install").unwrap();
+        intent
+            .commit_external_create_archive(b"exact-create-archive")
+            .unwrap();
+        assert!(matches!(
+            intent.commit_external_create_archive(b"different-create"),
+            Err(CleanFileStoreError::RequestConflict)
+        ));
+        drop(issuer);
+        drop(intent);
+        let (mut intent, _) = CleanManagementLifecycleFiles::open_existing(&fixture.root)
+            .unwrap()
+            .into_parts();
+        assert_eq!(intent.load().unwrap(), Some(b"later-install".to_vec()));
+        assert_eq!(
+            intent.load_external_create_archive().unwrap(),
+            Some(b"exact-create-archive".to_vec())
+        );
+        assert_eq!(
+            intent.load_runtime().unwrap(),
+            Some(b"create-runtime".to_vec())
+        );
     }
 
     #[test]

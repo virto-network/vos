@@ -5101,7 +5101,8 @@ where
         SharedAgentHostError,
     >
     where
-        B: super::clean_authority_issuer::CleanManagementRuntimeStore,
+        B: super::clean_authority_issuer::CleanManagementRuntimeStore
+            + super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore,
         J: CleanManagementIssuerStore,
         S: CleanManagementReceiptSigner,
     {
@@ -5177,12 +5178,13 @@ where
         SharedAgentHostError,
     >
     where
-        B: super::clean_authority_issuer::CleanManagementRuntimeStore,
+        B: super::clean_authority_issuer::CleanManagementRuntimeStore
+            + super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore,
         J: CleanManagementIssuerStore,
         S: CleanManagementReceiptSigner,
     {
         use super::external_local_executor::{
-            ExternalLocalJournalOwner, RetainedExternalLocalCreate,
+            ExternalLocalCreateArchive, ExternalLocalJournalOwner, RetainedExternalLocalCreate,
             external_local_create_intent_hash, state_runtime_matches_descriptor,
         };
 
@@ -5308,6 +5310,17 @@ where
             owner
                 .verify_finalized_create_ack(&acknowledgement)
                 .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            let archive = ExternalLocalCreateArchive::new(
+                slot.intent()
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?
+                    .clone(),
+                receipt,
+                acknowledgement.clone(),
+                owner.genesis_id(),
+            )
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            slot.retain_external_create_archive(&archive.encode())
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
             self.finish_live_management_intent(slot, managed, &acknowledgement, issuer)?;
             return Ok((managed.agent, acknowledgement, owner));
         }
@@ -5351,6 +5364,17 @@ where
             issuer,
             true,
         )?;
+        let archive = ExternalLocalCreateArchive::new(
+            slot.intent()
+                .ok_or(SharedAgentHostError::ScopeMismatch)?
+                .clone(),
+            receipt,
+            acknowledgement.clone(),
+            owner.genesis_id(),
+        )
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        slot.retain_external_create_archive(&archive.encode())
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
         self.finish_live_management_intent(slot, managed, &acknowledgement, issuer)?;
         Ok((managed.agent, acknowledgement, owner))
     }
@@ -7208,6 +7232,7 @@ mod tests {
             image: Arc<Mutex<Option<Vec<u8>>>>,
             runtime: Arc<Mutex<Option<Vec<u8>>>>,
             actor: Arc<Mutex<Option<Vec<u8>>>>,
+            external_create_archive: Arc<Mutex<Option<Vec<u8>>>>,
             actor_failure: Arc<AtomicUsize>,
             advance_clock_after_commits: Option<(Arc<AtomicU64>, usize)>,
             fail_retirement_after_commit: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -7223,6 +7248,23 @@ mod tests {
                     return Err(MemoryError);
                 }
                 *runtime = Some(bytes.to_vec());
+                Ok(())
+            }
+        }
+
+        impl crate::agent::clean_authority_issuer::CleanExternalLocalCreateArchiveStore
+            for IssuerMemoryStore
+        {
+            fn load_external_create_archive(&mut self) -> Result<Option<Vec<u8>>, MemoryError> {
+                Ok(self.external_create_archive.lock().unwrap().clone())
+            }
+
+            fn commit_external_create_archive(&mut self, bytes: &[u8]) -> Result<(), MemoryError> {
+                let mut archive = self.external_create_archive.lock().unwrap();
+                if archive.as_ref().is_some_and(|saved| saved != bytes) {
+                    return Err(MemoryError);
+                }
+                *archive = Some(bytes.to_vec());
                 Ok(())
             }
         }
@@ -16021,16 +16063,38 @@ mod tests {
             // before CMI4 retirement releases the pending admission.
             owner.fail_finalization_once_for_test(7);
             let mut budget = ReadBudget::new(10_000, 10_000_000);
+            let first_intent = create_intent();
+            let first_runtime = runtime.clone();
+            // The all-in-one fixture needs a larger test stack, but the
+            // actual Create call must fit the default production worker's
+            // 2-MiB stack independently of the fixture's other locals.
+            let first_attempt = std::thread::scope(|scope| {
+                let owner = &mut *owner;
+                let retained_intent = &mut retained_intent;
+                let retained_issuer = &mut retained_issuer;
+                let directory = &directory;
+                let budget = &mut budget;
+                let signer = &mut signer;
+                std::thread::Builder::new()
+                    .name("external-local-create-stack".into())
+                    .stack_size(2 * 1024 * 1024)
+                    .spawn_scoped(scope, move || {
+                        owner.create_external_local_agent_on_slots(
+                            retained_intent,
+                            retained_issuer,
+                            first_intent,
+                            first_runtime,
+                            directory,
+                            budget,
+                            signer,
+                        )
+                    })
+                    .unwrap()
+                    .join()
+                    .unwrap()
+            });
             assert!(matches!(
-                owner.create_external_local_agent_on_slots(
-                    &mut retained_intent,
-                    &mut retained_issuer,
-                    create_intent(),
-                    runtime.clone(),
-                    &directory,
-                    &mut budget,
-                    &mut signer,
-                ),
+                first_attempt,
                 Err(SharedAgentHostError::Unavailable)
             ));
 
@@ -16071,7 +16135,7 @@ mod tests {
                 intent: intent_store.clone(),
                 issuer: issuer_store.clone(),
             };
-            let recovery =
+            let mut recovery =
                 discover_local_lifecycle_recovery(&mut stores, owner.authority_target(), 1)
                     .unwrap();
             assert_eq!(
@@ -16080,6 +16144,35 @@ mod tests {
                     .unwrap(),
                 vec![descriptor.identity.agent]
             );
+            assert_eq!(
+                recovery
+                    .external_startup_inventory(&directory, owner.pins.node, 1)
+                    .unwrap(),
+                vec![descriptor.identity.agent]
+            );
+            let saved_archive = intent_store.external_create_archive.lock().unwrap().take();
+            assert!(matches!(
+                recovery.external_startup_inventory(&directory, owner.pins.node, 1),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
+            *intent_store.external_create_archive.lock().unwrap() = saved_archive;
+            let reopened_owners = recovery
+                .open_external_finalized_owners(
+                    &directory,
+                    owner.pins.node,
+                    1,
+                    &mut ReadBudget::new(10_000, 10_000_000),
+                )
+                .unwrap();
+            assert_eq!(reopened_owners.len(), 1);
+            assert_eq!(
+                reopened_owners
+                    .get(&descriptor.identity.agent)
+                    .unwrap()
+                    .descriptor(),
+                &descriptor
+            );
+            drop(reopened_owners);
             assert!(matches!(
                 recovery.external_slot_candidates(&directory, owner.pins.node, 0),
                 Err(SharedAgentHostError::CapacityExhausted)
@@ -16164,6 +16257,88 @@ mod tests {
             external
                 .verify_finalized_create_ack(&acknowledgement)
                 .unwrap();
+            let archived = crate::agent::external_local_executor::ExternalLocalCreateArchive::new(
+                original.intent().unwrap().clone(),
+                acknowledgement.receipt.clone(),
+                acknowledgement.clone(),
+                external.genesis_id(),
+            )
+            .unwrap();
+            let archive_bytes = archived.encode();
+            assert!(
+                archive_bytes.len()
+                    <= crate::agent::external_local_executor::ExternalLocalCreateArchive::MAX_BYTES
+            );
+            assert_eq!(
+                *intent_store.external_create_archive.lock().unwrap(),
+                Some(archive_bytes.clone())
+            );
+            let reopened_archive =
+                crate::agent::external_local_executor::ExternalLocalCreateArchive::decode(
+                    &archive_bytes,
+                )
+                .unwrap();
+            assert_eq!(reopened_archive.encode(), archive_bytes);
+            let install_package = crate::agent::package_admission::admitted_standard_actor_for_test(
+                "external-local-scope",
+                StateLane::Local,
+                0x68,
+            );
+            let install_request =
+                install_request(descriptor.identity.agent, &install_package, 0x69, None);
+            let (mut install_call, _) =
+                credential_call_and_approval(&descriptor, &install_request, &credential_key);
+            install_call.authority = owner.authority_target();
+            install_call.request_sequence = core::num::NonZeroU64::new(2).unwrap();
+            install_call.invocation = install_call.expected_invocation();
+            install_call.signature = credential_key
+                .sign(&install_call.signing_bytes())
+                .to_bytes();
+            let install_intent = CleanManagementIntent::new(
+                owner.authority_target(),
+                install_call.managed,
+                install_request,
+                install_call,
+                &RawCredentialVerifier,
+            )
+            .unwrap();
+            assert!(reopened_archive.matches_current_scope(
+                &install_intent,
+                owner.authority_target(),
+                owner.pins.node,
+            ));
+            assert!(!reopened_archive.matches_current_scope(
+                &install_intent,
+                owner.authority_target(),
+                crate::agent::sdk::NodeId([0x99; 32]),
+            ));
+            assert_eq!(
+                reopened_archive
+                    .prepare(
+                        runtime.exact_bytes().to_vec(),
+                        owner.authority_target(),
+                        owner.pins.node,
+                    )
+                    .unwrap()
+                    .intent(),
+                crate::agent::external_local_executor::external_local_create_intent_hash(
+                    original.intent().unwrap()
+                )
+            );
+            let mut wrong_genesis = archive_bytes.clone();
+            *wrong_genesis.last_mut().unwrap() ^= 1;
+            assert!(
+                crate::agent::external_local_executor::ExternalLocalCreateArchive::decode(
+                    &wrong_genesis,
+                )
+                .unwrap()
+                .prepare(
+                    runtime.exact_bytes().to_vec(),
+                    owner.authority_target(),
+                    owner.pins.node,
+                )
+                .is_err()
+            );
             assert!(
                 DurableCleanManagementIssuer::open(
                     issuer_store.clone(),
@@ -16177,6 +16352,18 @@ mod tests {
             );
             let first_head = external.materialization().unwrap().heads().clone();
             drop(external);
+
+            let from_archive = reopened_archive
+                .open_existing(
+                    runtime.exact_bytes().to_vec(),
+                    owner.authority_target(),
+                    owner.pins.node,
+                    &directory,
+                    &mut ReadBudget::new(10_000, 10_000_000),
+                )
+                .unwrap();
+            assert_eq!(from_archive.materialization().unwrap().heads(), &first_head);
+            drop(from_archive);
 
             // Finalized exact retry must reopen the already-published owner,
             // even after the physical receipt's original validity window.

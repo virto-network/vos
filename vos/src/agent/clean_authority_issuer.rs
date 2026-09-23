@@ -95,6 +95,32 @@ pub trait CleanManagementRuntimeStore: CleanManagementIssuerStore {
     fn commit_runtime(&mut self, package: &[u8]) -> Result<(), Self::Error>;
 }
 
+/// Immutable Create recovery input retained through later lifecycle intents.
+/// The record is separately verified against the selected Authority and
+/// physical journal before it can make a Local Agent routable.
+pub trait CleanExternalLocalCreateArchiveStore: CleanManagementIssuerStore {
+    fn load_external_create_archive(&mut self) -> Result<Option<Vec<u8>>, Self::Error>;
+    fn commit_external_create_archive(&mut self, archive: &[u8]) -> Result<(), Self::Error>;
+}
+
+impl<B: CleanExternalLocalCreateArchiveStore + ?Sized> CleanExternalLocalCreateArchiveStore
+    for &mut B
+{
+    fn load_external_create_archive(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        (**self).load_external_create_archive()
+    }
+    fn commit_external_create_archive(&mut self, archive: &[u8]) -> Result<(), Self::Error> {
+        (**self).commit_external_create_archive(archive)
+    }
+}
+
+pub const MAX_CLEAN_EXTERNAL_LOCAL_CREATE_ARCHIVE_BYTES: usize = 4
+    + 3 * 4
+    + super::clean_management_intent::MAX_INTENT_BYTES
+    + crate::agent_sdk::wire::MAX_AUTHORITY_RECEIPT_WIRE_BYTES
+    + crate::agent_sdk::wire::MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES
+    + 32;
+
 impl<B: CleanManagementRuntimeStore + ?Sized> CleanManagementRuntimeStore for &mut B {
     fn load_runtime(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
         (**self).load_runtime()

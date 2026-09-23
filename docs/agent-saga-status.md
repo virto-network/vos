@@ -81,6 +81,23 @@ The external Create coordinator now also accepts already-open intent and issuer
 slots; a crash-point retry test keeps both slots alive across ambiguous errors.
 This lets a startup controller retain those leases instead of reopening them
 per attempt. It does not yet perform startup recovery or enable `LCQ2` ingress.
+Physical Create-seal preparation is separate from the mutable lifecycle
+slot so recovery can consume immutable retained Create facts. This is needed
+before Install handoff: CMI4 may replace the Create intent with Install, while
+CIS2 retains only its latest acknowledged decision. The journal's signed
+Create genesis does not retain the original credential call used for the
+stable-lock intent hash. Experimental Create now writes a bounded immutable
+archive of the signed intent, receipt, ACK and physical genesis ID before
+retirement; the runtime package remains in its immutable lifecycle sidecar.
+The archive survives later intent replacement but is only recovery input, not
+route authority. Released Install still needs startup selection that verifies
+this archive against the independently selected Authority and physical journal;
+without that cutover, post-Install restart could strand the Agent.
+The expanded all-in-one physical Create/retry fixture overflows its default
+2-MiB test thread stack but passes at 4 MiB. Its isolated Create call passes
+on a 2-MiB thread, matching the default control worker stack. That narrows the
+issue to fixture frame pressure; the complete production lifecycle and other
+external operations still need released-worker qualification.
 The coordinator now accepts an operator-selected, filesystem-descriptor-pinned
 external directory owner rather than a request-controlled slot-opening
 callback; replacing that directory pathname cannot redirect a retained owner.
@@ -89,8 +106,13 @@ only; a missing lock fails without minting a replacement.
 The pinned directory can now discover bounded lock-only and exposed slot
 candidates, rejecting malformed names, orphan generations and limit overflow.
 The startup recovery model matches those candidates against independently
-verified lifecycle stores. Discovery is not authority: controller integration
-must still replay every matched generation before route attachment.
+verified lifecycle stores and now rejects a missing stable lock after saved
+authorization or a missing immutable Create archive after finality/Install.
+It can reopen archived generations under their original locked physical
+journals while retaining the lifecycle leases. Discovery and physical reopen
+are not route authority: controller integration must still verify system
+finality, finish pending lifecycle work and preserve those owners through
+route attachment.
 The external owner can build route identities from its authenticated read-only
 directory, reusing the same bounded paging and identity checks as image Local.
 It can also reconstruct an installed Actor's exact signed package, program,
@@ -176,7 +198,10 @@ External Local cutover TODOs, in order: (1) pass the Space/Node-pinned external
 directory into startup and explicitly select the fresh external format for
 that root, then recover its complete external lifecycle set under startup
 admission before publishing any route; existing image roots stay on their
-current path, and mixed-format migration is deferred; (2) attach the internal
+current path, and mixed-format migration is deferred; verify the retained
+Create archive against physical journal and selected Authority even after
+Install replaces the current-operation slot;
+(2) attach the internal
 external per-Agent Direct Invoke/ACK worker after finality, and add
 Install/Resume using the
 existing signed journal semantics, not an image-host fallback; (3) qualify

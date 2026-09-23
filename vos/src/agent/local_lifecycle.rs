@@ -795,6 +795,146 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
             .collect()
     }
 
+    /// Fail closed over the complete fresh external root before route
+    /// publication. A saved authorization already owns a stable lock; a
+    /// finalized Create or any later Install also needs its immutable Create
+    /// archive. This is candidate admission only, not physical replay or
+    /// proof that the selected Authority finalized the archived operation.
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    pub(crate) fn external_startup_inventory(
+        &mut self,
+        directory: &super::journal_store::ExternalLocalJournalDirectory,
+        node: super::sdk::NodeId,
+        maximum: usize,
+    ) -> Result<Vec<AgentId>, SharedAgentHostError>
+    where
+        I: super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore,
+    {
+        use super::external_local_executor::ExternalLocalCreateArchive;
+        if self.entries.len() > maximum {
+            return Err(SharedAgentHostError::CapacityExhausted);
+        }
+        let physical = self.external_slot_candidates(directory, node, maximum)?;
+        for entry in &mut self.entries {
+            let has_slot = physical.binary_search(&entry.agent).is_ok();
+            let retired = entry
+                .intent
+                .retirement_complete()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            let denied = entry
+                .intent
+                .denial_complete()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            let archived = entry
+                .intent
+                .load_external_create_archive()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            let current = entry
+                .intent
+                .intent()
+                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            match current.request() {
+                ManagementRequest::Create(_) => {
+                    let authorized = entry
+                        .intent
+                        .authorization_work()
+                        .map_err(|_| SharedAgentHostError::Unavailable)?
+                        .is_some();
+                    if authorized && !has_slot {
+                        return Err(SharedAgentHostError::ScopeMismatch);
+                    }
+                    if (retired || entry.finalized.is_some()) && !denied && archived.is_none() {
+                        return Err(SharedAgentHostError::ScopeMismatch);
+                    }
+                }
+                ManagementRequest::Install(_) => {
+                    if !has_slot || archived.is_none() || denied {
+                        return Err(SharedAgentHostError::ScopeMismatch);
+                    }
+                }
+                _ => return Err(SharedAgentHostError::ScopeMismatch),
+            }
+            if let Some(bytes) = archived {
+                if denied || !has_slot {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                let archive = ExternalLocalCreateArchive::decode(&bytes)
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                if !archive.matches_current_scope(current, self.authority, node) {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+            }
+        }
+        Ok(physical)
+    }
+
+    /// Reopen all archived, physically finalized external generations under
+    /// their original stable locks. Pending Creates without an archive remain
+    /// in the retained lifecycle set for normal authorization/application
+    /// recovery. The returned owners are deliberately not route attachments:
+    /// the caller must still authenticate system finality and complete every
+    /// pending lifecycle operation before admitting any external route.
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    pub(crate) fn open_external_finalized_owners(
+        &mut self,
+        directory: &super::journal_store::ExternalLocalJournalDirectory,
+        node: super::sdk::NodeId,
+        maximum: usize,
+        budget: &mut super::sdk::state_blocks::ReadBudget,
+    ) -> Result<
+        BTreeMap<AgentId, super::external_local_executor::ExternalLocalJournalOwner>,
+        SharedAgentHostError,
+    >
+    where
+        I: super::clean_authority_issuer::CleanManagementRuntimeStore
+            + super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore,
+    {
+        use super::external_local_executor::ExternalLocalCreateArchive;
+        self.external_startup_inventory(directory, node, maximum)?;
+        let mut owners = BTreeMap::new();
+        for entry in &mut self.entries {
+            let Some(archive_bytes) = entry
+                .intent
+                .load_external_create_archive()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            else {
+                continue;
+            };
+            let archive = ExternalLocalCreateArchive::decode(&archive_bytes)
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            if !archive.matches_current_scope(
+                entry
+                    .intent
+                    .intent()
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?,
+                self.authority,
+                node,
+            ) {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            let runtime = entry
+                .intent
+                .load_runtime()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .ok_or(SharedAgentHostError::Unavailable)?;
+            let owner = archive.open_existing(runtime, self.authority, node, directory, budget)?;
+            if owner.descriptor().identity.agent != entry.agent
+                || owners.insert(entry.agent, owner).is_some()
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+        }
+        Ok(owners)
+    }
+
     pub fn startup_admission(
         &self,
     ) -> Result<LocalLifecycleStartupAdmission, SharedAgentHostError> {

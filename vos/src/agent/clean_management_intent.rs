@@ -127,6 +127,14 @@ impl CleanManagementIntent {
         &self.call
     }
 
+    pub(crate) fn authorization_work(&self) -> Option<&RuntimeWork> {
+        self.authorization_work.as_ref()
+    }
+
+    pub(crate) fn finalization_work(&self) -> Option<&RuntimeWork> {
+        self.finalization_work.as_ref()
+    }
+
     pub(crate) fn authorization_message(&self) -> Vec<u8> {
         use crate::actors::codec::Encode as _;
         let mut bytes = vec![crate::actors::value::TAG_DYNAMIC];
@@ -556,6 +564,44 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
     /// The next protocol owner must reopen and validate its durable image.
     pub(crate) fn into_store(self) -> B {
         self.store
+    }
+
+    pub(crate) fn load_external_create_archive(
+        &mut self,
+    ) -> Result<Option<Vec<u8>>, IntentSlotError<B::Error>>
+    where
+        B: super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore,
+    {
+        if self.poisoned {
+            return Err(IntentSlotError::Poisoned);
+        }
+        self.store
+            .load_external_create_archive()
+            .map_err(IntentSlotError::Storage)
+    }
+
+    pub(crate) fn retain_external_create_archive(
+        &mut self,
+        archive: &[u8],
+    ) -> Result<(), IntentSlotError<B::Error>>
+    where
+        B: super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore,
+    {
+        if self.poisoned {
+            return Err(IntentSlotError::Poisoned);
+        }
+        match self.load_external_create_archive()? {
+            Some(bytes) if bytes == archive => Ok(()),
+            Some(_) => Err(IntentSlotError::Conflict),
+            None => {
+                self.poisoned = true;
+                self.store
+                    .commit_external_create_archive(archive)
+                    .map_err(IntentSlotError::Storage)?;
+                self.poisoned = false;
+                Ok(())
+            }
+        }
     }
 
     pub(crate) fn load_runtime(&mut self) -> Result<Option<Vec<u8>>, IntentSlotError<B::Error>>

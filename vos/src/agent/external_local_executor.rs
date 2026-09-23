@@ -66,6 +66,223 @@ pub(crate) struct RetainedExternalLocalCreate {
     intent: crate::service::Hash,
 }
 
+/// Immutable recovery input for the original Create after the per-Agent CMI4
+/// slot has handed off to Install. The exact runtime package remains in the
+/// lifecycle runtime sidecar; neither this record nor its file envelope is
+/// authority. Startup must independently verify the selected Authority and
+/// the physical journal before publishing routes.
+#[cfg(all(target_os = "linux", feature = "storage"))]
+pub(crate) struct ExternalLocalCreateArchive {
+    intent: super::clean_management_intent::CleanManagementIntent,
+    receipt: crate::agent_sdk::authority::AuthorityReceipt,
+    acknowledgement: crate::agent_sdk::authority::ManagementApplicationAck,
+    genesis: AgentJournalGenesisId,
+}
+
+#[cfg(all(target_os = "linux", feature = "storage"))]
+impl ExternalLocalCreateArchive {
+    pub(crate) const MAX_BYTES: usize =
+        super::clean_authority_issuer::MAX_CLEAN_EXTERNAL_LOCAL_CREATE_ARCHIVE_BYTES;
+
+    pub(crate) fn new(
+        intent: super::clean_management_intent::CleanManagementIntent,
+        receipt: crate::agent_sdk::authority::AuthorityReceipt,
+        acknowledgement: crate::agent_sdk::authority::ManagementApplicationAck,
+        genesis: AgentJournalGenesisId,
+    ) -> Result<Self, crate::service::wire::DecodeError> {
+        let archive = Self {
+            intent,
+            receipt,
+            acknowledgement,
+            genesis,
+        };
+        archive.validate_shape()?;
+        Ok(archive)
+    }
+
+    fn validate_shape(&self) -> Result<(), crate::service::wire::DecodeError> {
+        use crate::agent_sdk::{ManagementReply, ManagementRequest, RuntimeWork};
+        use crate::service::wire::DecodeError;
+        let ManagementRequest::Create(descriptor) = self.intent.request() else {
+            return Err(DecodeError::NonCanonical);
+        };
+        let Some(RuntimeWork::Invoke { observed_slot, .. }) = self.intent.authorization_work()
+        else {
+            return Err(DecodeError::NonCanonical);
+        };
+        let Some(RuntimeWork::Invoke { invocation, .. }) = self.intent.finalization_work() else {
+            return Err(DecodeError::NonCanonical);
+        };
+        if self.genesis == AgentJournalGenesisId::ZERO
+            || self
+                .intent
+                .verify(
+                    self.acknowledgement.authority,
+                    self.acknowledgement.managed,
+                    &super::clean_bootstrap::RawCredentialVerifier,
+                )
+                .is_err()
+            || self
+                .acknowledgement
+                .verify_with(&super::clean_bootstrap::RawCredentialVerifier)
+                .is_err()
+            || self.acknowledgement.receipt != self.receipt
+            || self.acknowledgement.credential_call != self.intent.call().commitment()
+            || self.acknowledgement.request != self.intent.request().replay_commitment()
+            || self.acknowledgement.application
+                != ManagementReply::Created(descriptor.identity.clone())
+            || self.acknowledgement.applied_at < *observed_slot
+            || invocation.message
+                != super::clean_management_intent::CleanManagementIntent::finalization_message(
+                    &self.acknowledgement,
+                )
+            || super::driver::verify_clean_management_receipt(
+                descriptor,
+                self.intent.request(),
+                &self.receipt,
+                *observed_slot,
+                true,
+            )
+            .is_err()
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
+
+    /// A later lifecycle operation may replace CMI4/CIS2, but it cannot
+    /// select a different original Create for this Agent's stable lock.
+    pub(crate) fn matches_current_scope(
+        &self,
+        current: &super::clean_management_intent::CleanManagementIntent,
+        selected_authority: crate::agent_sdk::authority::AuthorityActorTarget,
+        selected_node: crate::agent_sdk::NodeId,
+    ) -> bool {
+        let ManagementRequest::Create(descriptor) = self.intent.request() else {
+            return false;
+        };
+        self.validate_shape().is_ok()
+            && self.intent.call().authority == selected_authority
+            && current.call().authority == selected_authority
+            && self.intent.call().managed == current.call().managed
+            && descriptor.replicas.len() == 1
+            && descriptor.replicas[0].node == selected_node
+            && matches!(
+                current.request(),
+                ManagementRequest::Create(_) | ManagementRequest::Install(_)
+            )
+            && (!matches!(current.request(), ManagementRequest::Create(_))
+                || (current.request() == self.intent.request()
+                    && current.call() == self.intent.call()))
+    }
+
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        use crate::service::wire::ServiceWire as _;
+        let mut bytes = b"ELC1".to_vec();
+        let mut encoder = crate::service::wire::Encoder(&mut bytes);
+        encoder.bytes(&self.intent.encode());
+        encoder.bytes(&self.receipt.encode().expect("validated receipt"));
+        encoder.bytes(&self.acknowledgement.encode().expect("validated ACK"));
+        encoder.fixed(self.genesis.as_bytes());
+        bytes
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, crate::service::wire::DecodeError> {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        use crate::service::wire::{DecodeError, Decoder, ServiceWire as _};
+        if bytes.len() > Self::MAX_BYTES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        if bytes.get(..4) != Some(b"ELC1") {
+            return Err(DecodeError::InvalidTag);
+        }
+        let mut decoder = Decoder::new(&bytes[4..]);
+        let intent_bytes = decoder.bytes_ref()?;
+        let receipt_bytes = decoder.bytes_ref()?;
+        let acknowledgement_bytes = decoder.bytes_ref()?;
+        let genesis = AgentJournalGenesisId(decoder.fixed()?);
+        if !decoder.exhausted()
+            || intent_bytes.len() > super::clean_management_intent::MAX_INTENT_BYTES
+            || receipt_bytes.len() > crate::agent_sdk::wire::MAX_AUTHORITY_RECEIPT_WIRE_BYTES
+            || acknowledgement_bytes.len()
+                > crate::agent_sdk::wire::MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        let archive = Self::new(
+            super::clean_management_intent::CleanManagementIntent::decode(intent_bytes)?,
+            crate::agent_sdk::authority::AuthorityReceipt::decode(receipt_bytes)
+                .map_err(|_| DecodeError::NonCanonical)?,
+            crate::agent_sdk::authority::ManagementApplicationAck::decode(acknowledgement_bytes)
+                .map_err(|_| DecodeError::NonCanonical)?,
+            genesis,
+        )?;
+        if archive.encode() != bytes {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(archive)
+    }
+
+    pub(crate) fn prepare(
+        &self,
+        runtime_package: Vec<u8>,
+        selected_authority: crate::agent_sdk::authority::AuthorityActorTarget,
+        selected_node: crate::agent_sdk::NodeId,
+    ) -> Result<RetainedExternalLocalCreate, super::shared_host::SharedAgentHostError> {
+        use super::shared_host::SharedAgentHostError;
+        self.validate_shape()
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if self.acknowledgement.authority != selected_authority {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let prepared = RetainedExternalLocalCreate::prepare_from_retained(
+            &self.intent,
+            runtime_package,
+            selected_authority,
+            &self.receipt,
+            selected_node,
+        )?;
+        if prepared.seal.genesis().id() != self.genesis {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        Ok(prepared)
+    }
+
+    /// Reopen the exact physical generation using only the immutable Create
+    /// archive and runtime sidecar, even if CMI4 now names a later Install.
+    /// The caller must already have authenticated the archive's system
+    /// lifecycle against its independently selected Authority; this method
+    /// verifies the signed Create, physical genesis, journal and Create ACK.
+    pub(crate) fn open_existing(
+        &self,
+        runtime_package: Vec<u8>,
+        selected_authority: crate::agent_sdk::authority::AuthorityActorTarget,
+        selected_node: crate::agent_sdk::NodeId,
+        directory: &super::journal_store::ExternalLocalJournalDirectory,
+        budget: &mut ReadBudget,
+    ) -> Result<ExternalLocalJournalOwner, super::shared_host::SharedAgentHostError> {
+        use super::shared_host::SharedAgentHostError;
+        if directory.space() != SpaceId(selected_authority.space.0)
+            || directory.node() != crate::service::NodeId(selected_node.0)
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let prepared = self.prepare(runtime_package, selected_authority, selected_node)?;
+        let agent = AgentId(self.intent.call().managed.agent.0);
+        let slot = directory
+            .acquire_existing(agent, prepared.intent())
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let (seal, _) = prepared.into_parts();
+        let owner = ExternalLocalJournalOwner::open(slot, seal, budget)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        owner
+            .verify_finalized_create_ack(&self.acknowledgement)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        Ok(owner)
+    }
+}
+
 #[cfg(all(target_os = "linux", feature = "storage"))]
 impl RetainedExternalLocalCreate {
     pub(crate) fn prepare<B: super::clean_authority_issuer::CleanManagementRuntimeStore>(
@@ -75,16 +292,44 @@ impl RetainedExternalLocalCreate {
         selected_node: crate::agent_sdk::NodeId,
     ) -> Result<Self, super::shared_host::SharedAgentHostError> {
         use super::shared_host::SharedAgentHostError;
-        use crate::agent_sdk::{self as sdk, AgentProfile, ManagementRequest, RuntimeWork};
-
-        if selected_node == sdk::NodeId::ZERO
-            || slot
-                .denial_complete()
-                .map_err(|_| SharedAgentHostError::Unavailable)?
+        if slot
+            .denial_complete()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
+        let runtime_package = slot
+            .load_runtime()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .ok_or(SharedAgentHostError::Unavailable)?;
         let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
+        Self::prepare_from_retained(
+            intent,
+            runtime_package,
+            selected_authority,
+            issued_receipt,
+            selected_node,
+        )
+    }
+
+    /// Reconstruct the exact physical Create seal from authenticated retained
+    /// inputs without requiring the current mutable lifecycle slot to still
+    /// contain Create. An immutable startup archive will supply these bytes
+    /// after later Install operations hand off that slot. This function does
+    /// not itself prove Authority actor finality or journal publication.
+    pub(crate) fn prepare_from_retained(
+        intent: &super::clean_management_intent::CleanManagementIntent,
+        runtime_package: Vec<u8>,
+        selected_authority: crate::agent_sdk::authority::AuthorityActorTarget,
+        issued_receipt: &crate::agent_sdk::authority::AuthorityReceipt,
+        selected_node: crate::agent_sdk::NodeId,
+    ) -> Result<Self, super::shared_host::SharedAgentHostError> {
+        use super::shared_host::SharedAgentHostError;
+        use crate::agent_sdk::{self as sdk, AgentProfile, ManagementRequest, RuntimeWork};
+
+        if selected_node == sdk::NodeId::ZERO {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
         let ManagementRequest::Create(descriptor) = intent.request() else {
             return Err(SharedAgentHostError::ScopeMismatch);
         };
@@ -107,10 +352,7 @@ impl RetainedExternalLocalCreate {
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
         let request = intent.request().clone();
         let intent_hash = external_local_create_intent_hash(intent);
-        let Some(RuntimeWork::Invoke { observed_slot, .. }) = slot
-            .authorization_work()
-            .map_err(|_| SharedAgentHostError::Unavailable)?
-        else {
+        let Some(RuntimeWork::Invoke { observed_slot, .. }) = intent.authorization_work() else {
             return Err(SharedAgentHostError::ScopeMismatch);
         };
         let observed_slot = *observed_slot;
@@ -122,10 +364,6 @@ impl RetainedExternalLocalCreate {
             true,
         )
         .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-        let runtime_package = slot
-            .load_runtime()
-            .map_err(|_| SharedAgentHostError::Unavailable)?
-            .ok_or(SharedAgentHostError::Unavailable)?;
         let runtime = super::package_admission::admit_state_runtime_package(&runtime_package)
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
         if !state_runtime_matches_descriptor(&descriptor, &runtime) {
@@ -1189,6 +1427,10 @@ impl ExternalLocalJournalOwner {
         &self.executor.descriptor
     }
 
+    pub(crate) fn genesis_id(&self) -> AgentJournalGenesisId {
+        self.seal.genesis().id()
+    }
+
     /// Return an exact-head response-loss result only while the locked store
     /// still names the same committed input/position. The executor may have
     /// seen an uncommitted staged head during open or a failed preparation;
@@ -2176,6 +2418,36 @@ mod tests {
                 .into_parts();
         assert_eq!(seal.genesis().create, create);
         assert_eq!(runtime, admitted.exact_bytes());
+        let archived = RetainedExternalLocalCreate::prepare_from_retained(
+            slot.intent().unwrap(),
+            runtime.clone(),
+            authority,
+            receipt,
+            replica.node,
+        )
+        .unwrap();
+        let (archived_seal, archived_runtime) = archived.into_parts();
+        assert_eq!(archived_seal.genesis(), seal.genesis());
+        assert_eq!(archived_seal.initial_heads(), seal.initial_heads());
+        assert_eq!(archived_runtime, runtime);
+        let unprepared = CleanManagementIntent::new(
+            authority,
+            managed,
+            request.clone(),
+            call.clone(),
+            &crate::agent::clean_bootstrap::RawCredentialVerifier,
+        )
+        .unwrap();
+        assert!(
+            RetainedExternalLocalCreate::prepare_from_retained(
+                &unprepared,
+                runtime.clone(),
+                authority,
+                receipt,
+                replica.node,
+            )
+            .is_err()
+        );
         let mut altered_receipt = receipt.clone();
         altered_receipt.signature[0] ^= 1;
         assert!(
