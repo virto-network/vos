@@ -50,9 +50,12 @@ batch 1; subsequent integration stays on `wip/ch08-runtime-directory`:
 Immediate integration seam: the external-state package, physical Create,
 sealed Local genesis, file journal and pinned Invoke/ACK owner now exist and
 pass prototype recovery tests, but no production route selects them. The
-pinned cursor can now own its file store and stable lock across mutations;
-the active Local lifecycle still needs an external replay executor, durable
-intent/slot selection and route adapter before it can use that owner.
+pinned cursor can now own its file store and stable lock across mutations.
+An experimental external replay adapter now authenticates signed Create,
+Install, Invoke and ACK, resolves exact Install artifacts and replays the
+physical guest without decoding its private state. The active Local lifecycle
+still needs durable intent/slot selection, a retained owner using that adapter,
+and a route adapter before serving it.
 `LocalJournalAgentDriver::prepare_local_genesis` still builds an r19 binding
 and `StandardLocalReplayExecutor`. A separate external Local preparer now
 authenticates the signed package, exact catalog closure, Create receipt and
@@ -626,6 +629,16 @@ correct pinned root. Missing blocks mean unavailable state, never absent keys.
   the complete prototype gate passed at `task-tmp/state-owned-cursor-prototype.log`
   (SDK 247/1 ignored, replay 69, physical PVM 17, journal-store 105 and
   feature-disabled groups).
+  The external replay adapter independently materializes the complete physical
+  Install, two Invoke and ACK histories after file-backed publication faults.
+  A forged Install signature and missing catalog artifact fail before execution.
+  The focused compiled file test passed at `task-tmp/external-local-physical-test.log`.
+  The complete prototype gate passed after the missing-artifact check at
+  `task-tmp/external-local-prototype.log` (SDK 247/1 ignored, replay 69,
+  physical PVM 17, journal-store 105 and feature-disabled groups).
+  This is a replay seam, not an active production owner: its caller must derive
+  the descriptor and admitted package from exact durable intent and retain the
+  slot lock. The fixture's credentials are not released-binary admission.
   Production actor-package issuance and authoritative heads remain separate.
   Local Create-preparation follow-up: the new external preparer consumes a
   bounded immutable supplied catalog, rejects a missing package, verifies the

@@ -43,6 +43,8 @@ pub mod contract;
 #[cfg(feature = "std")]
 pub mod driver;
 pub mod execution;
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+pub(crate) mod external_local_executor;
 pub mod genesis;
 pub mod genesis_archive;
 #[cfg(feature = "std")]

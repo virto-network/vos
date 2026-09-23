@@ -22433,6 +22433,7 @@ pub(crate) mod tests {
     ) where
         S: super::super::journal_store::ExternalMutationStore
             + super::super::journal_store::AuditedCheckpointStore
+            + super::super::journal_store::CatalogBlobResolverFactory
             + TransitionProofPublicationStore
             + ReplaySource<Error = JournalStoreError>,
     {
@@ -22926,6 +22927,72 @@ pub(crate) mod tests {
             executor.pending = None;
             store = reopen(store, &mut executor);
         }
+        // Recover the complete physical lifecycle through the production
+        // authorization adapter, independently of the fixture's captured
+        // responses. This also re-resolves Install artifacts from the catalog.
+        let expected = materialize_external_genesis(
+            &mut store,
+            sealed,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &mut ReadBudget::new(10000, 10000000),
+        )
+        .unwrap();
+        let resolver =
+            super::super::journal_store::CatalogBlobResolverFactory::catalog_blob_resolver(&store)
+                .unwrap();
+        let mut production =
+            super::super::external_local_executor::ExternalLocalReplayExecutor::new(
+                admitted.clone(),
+                descriptor.as_ref().clone(),
+                resolver,
+            )
+            .unwrap();
+        production.seed_genesis(sealed.genesis()).unwrap();
+        let mut forged = entry.input.clone();
+        let ReplayOperation::CleanManage { authority, .. } = &mut forged.operation else {
+            unreachable!()
+        };
+        authority.signature[0] ^= 1;
+        assert!(
+            production
+                .authenticate(&forged, before.state(), position)
+                .is_err()
+        );
+        let empty_catalog = super::super::journal_store::MemoryAgentJournalStore::new(
+            entry.input.runtime.agent,
+            sealed.replica().node,
+        )
+        .unwrap();
+        let missing_resolver =
+            super::super::journal_store::CatalogBlobResolverFactory::catalog_blob_resolver(
+                &empty_catalog,
+            )
+            .unwrap();
+        let mut missing = super::super::external_local_executor::ExternalLocalReplayExecutor::new(
+            admitted.clone(),
+            descriptor.as_ref().clone(),
+            missing_resolver,
+        )
+        .unwrap();
+        missing.seed_genesis(sealed.genesis()).unwrap();
+        assert!(matches!(
+            missing.authenticate(&entry.input, before.state(), position),
+            Err(
+                super::super::local_journal_driver::LocalReplayExecutorError::ArtifactUnavailable(
+                    _
+                )
+            )
+        ));
+        let actual = materialize_external_genesis(
+            &mut store,
+            sealed,
+            &mut production,
+            &NoPrunedOrderedBases,
+            &mut ReadBudget::new(10000, 10000000),
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
     }
 
     /// Probe-specific mutation markers qualify storage/replay, not actor execution.
