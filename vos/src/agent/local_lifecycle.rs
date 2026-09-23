@@ -622,6 +622,49 @@ pub(crate) struct LocalLifecycleRecoveryEntry<
 }
 
 impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycleRecovery<I, J> {
+    /// Match bounded external slot names to independently verified lifecycle
+    /// stores before any startup route can be published. This is only candidate
+    /// selection; each matched slot still needs its exact signed-intent lock,
+    /// journal replay and physical application checks during recovery.
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    pub(crate) fn external_slot_candidates(
+        &self,
+        directory: &super::journal_store::ExternalLocalJournalDirectory,
+        node: super::sdk::NodeId,
+        maximum: usize,
+    ) -> Result<Vec<AgentId>, SharedAgentHostError> {
+        if directory.space() != crate::service::SpaceId(self.authority.space.0)
+            || directory.node() != crate::service::NodeId(node.0)
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        directory
+            .discover_slots(maximum)
+            .map_err(|error| match error {
+                super::journal_store::JournalStoreError::LimitExceeded => {
+                    SharedAgentHostError::CapacityExhausted
+                }
+                _ => SharedAgentHostError::Unavailable,
+            })?
+            .into_iter()
+            .map(|agent| {
+                let agent = AgentId(agent.0);
+                let index = self
+                    .entries
+                    .binary_search_by_key(&agent, |entry| entry.agent)
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                if self.entries[index].intent.intent().is_none() {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                Ok(agent)
+            })
+            .collect()
+    }
+
     pub fn startup_admission(
         &self,
     ) -> Result<LocalLifecycleStartupAdmission, SharedAgentHostError> {

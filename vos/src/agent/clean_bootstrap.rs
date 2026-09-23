@@ -15814,7 +15814,49 @@ mod tests {
             use crate::agent::clean_management_intent::{
                 CleanManagementIntent, CleanManagementIntentSlot,
             };
+            use crate::agent::local_lifecycle::{
+                LocalLifecycleStoreFactory, discover_local_lifecycle_recovery,
+            };
             use crate::agent::sdk::state_blocks::ReadBudget;
+
+            struct ExternalStores {
+                space: SpaceId,
+                agent: AgentId,
+                intent: IssuerMemoryStore,
+                issuer: IssuerMemoryStore,
+            }
+
+            impl LocalLifecycleStoreFactory for ExternalStores {
+                type Intent = IssuerMemoryStore;
+                type Issuer = IssuerMemoryStore;
+                type Error = ();
+
+                fn discover(&mut self, space: SpaceId, maximum: usize) -> Result<Vec<AgentId>, ()> {
+                    if space != self.space || maximum == 0 {
+                        return Err(());
+                    }
+                    Ok(vec![self.agent])
+                }
+
+                fn open_existing(
+                    &mut self,
+                    space: SpaceId,
+                    agent: AgentId,
+                ) -> Result<(Self::Intent, Self::Issuer), ()> {
+                    if space != self.space || agent != self.agent {
+                        return Err(());
+                    }
+                    Ok((self.intent.clone(), self.issuer.clone()))
+                }
+
+                fn open(
+                    &mut self,
+                    space: SpaceId,
+                    agent: AgentId,
+                ) -> Result<(Self::Intent, Self::Issuer), ()> {
+                    self.open_existing(space, agent)
+                }
+            }
 
             // The native system fixture drives the real Authority actor, while
             // the ordinary Local Create executes the physical state guest.
@@ -15927,6 +15969,36 @@ mod tests {
             assert!(!lock.exists());
             assert_eq!(std::fs::read_dir(&root).unwrap().count(), entries_before);
             std::fs::rename(&parked_lock, &lock).unwrap();
+
+            // Startup matches every physical candidate against the separate
+            // signed lifecycle store before deciding which format to recover.
+            let mut stores = ExternalStores {
+                space: descriptor.identity.space,
+                agent: descriptor.identity.agent,
+                intent: intent_store.clone(),
+                issuer: issuer_store.clone(),
+            };
+            let recovery =
+                discover_local_lifecycle_recovery(&mut stores, owner.authority_target(), 1)
+                    .unwrap();
+            assert_eq!(
+                recovery
+                    .external_slot_candidates(&directory, owner.pins.node, 1)
+                    .unwrap(),
+                vec![descriptor.identity.agent]
+            );
+            assert!(matches!(
+                recovery.external_slot_candidates(&directory, owner.pins.node, 0),
+                Err(SharedAgentHostError::CapacityExhausted)
+            ));
+            assert!(matches!(
+                recovery.external_slot_candidates(
+                    &directory,
+                    crate::agent::sdk::NodeId([0x99; 32]),
+                    1,
+                ),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
 
             // A syntactically valid CMI4 with the exact signed request and
             // finalized issuer record cannot substitute a different system
@@ -16058,6 +16130,17 @@ mod tests {
             assert!(!lock.exists());
             assert_eq!(std::fs::read_dir(&root).unwrap().count(), entries_before);
             std::fs::rename(&parked_lock, &lock).unwrap();
+
+            let orphan = crate::service::AgentId([0x77; 32]);
+            assert_ne!(orphan.0, agent.0);
+            let orphan_slot = directory
+                .acquire(orphan, crate::service::Hash([0x66; 32]))
+                .unwrap();
+            assert!(matches!(
+                recovery.external_slot_candidates(&directory, owner.pins.node, 2),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
+            drop(orphan_slot);
 
             // A pathname replacement cannot redirect the pinned owner into
             // a new empty directory or mint a fresh stable lock there.

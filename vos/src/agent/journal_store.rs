@@ -9964,6 +9964,47 @@ impl ExternalLocalJournalDirectory {
         self.node
     }
 
+    /// Enumerate the pinned directory before startup route publication. A
+    /// slot name is only a candidate: lifecycle stores and journal replay
+    /// still have to authenticate its exact signed Create and generation.
+    /// Lock-only slots are included so interrupted Create is not skipped.
+    pub(crate) fn discover_slots(&self, maximum: usize) -> Result<Vec<AgentId>, JournalStoreError> {
+        let parent = self.parent.get()?;
+        validate_owned_directory(parent)?;
+        let mut agents = BTreeSet::new();
+        for entry in
+            std::fs::read_dir(proc_fd_path(parent)).map_err(|_| JournalStoreError::Unavailable)?
+        {
+            let entry = entry.map_err(|_| JournalStoreError::Unavailable)?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| JournalStoreError::Corrupt)?;
+            let stem = name
+                .strip_suffix(".agent-lock")
+                .or_else(|| name.strip_suffix(".agent"))
+                .ok_or(JournalStoreError::Corrupt)?;
+            let agent = decode_agent_id(stem).ok_or(JournalStoreError::Corrupt)?;
+            if !agents.contains(&agent) && agents.len() == maximum {
+                return Err(JournalStoreError::LimitExceeded);
+            }
+            agents.insert(agent);
+        }
+        for agent in &agents {
+            let stem = encode_hex(agent.as_bytes());
+            let generation = stat_at(parent, &c_name(&format!("{stem}.agent"))?)
+                .map_err(|_| JournalStoreError::Unavailable)?;
+            let lock = stat_at(parent, &c_name(&format!("{stem}.agent-lock"))?)
+                .map_err(|_| JournalStoreError::Unavailable)?;
+            validate_slot_entry_shapes(generation.as_ref(), None, None, lock.as_ref())?;
+            if lock.is_none() {
+                return Err(JournalStoreError::Corrupt);
+            }
+        }
+        self.parent.get()?;
+        Ok(agents.into_iter().collect())
+    }
+
     pub(crate) fn acquire(
         &self,
         agent: AgentId,
@@ -16132,6 +16173,41 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    #[test]
+    fn external_local_directory_discovers_only_bounded_locked_candidates() {
+        let root = TestDirectory::new("external-local-discovery");
+        let directory = ExternalLocalJournalDirectory::open_existing(
+            root.0.clone(),
+            SpaceId([1; 32]),
+            NodeId([2; 32]),
+        )
+        .unwrap();
+        assert!(directory.discover_slots(2).unwrap().is_empty());
+        let first = AgentId([3; 32]);
+        let second = AgentId([4; 32]);
+        let first_slot = directory.acquire(first, Hash([5; 32])).unwrap();
+        assert_eq!(directory.discover_slots(1).unwrap(), vec![first]);
+        assert_eq!(
+            directory.discover_slots(0),
+            Err(JournalStoreError::LimitExceeded)
+        );
+        let second_slot = directory.acquire(second, Hash([6; 32])).unwrap();
+        assert_eq!(directory.discover_slots(2).unwrap(), vec![first, second]);
+        assert_eq!(
+            directory.discover_slots(1),
+            Err(JournalStoreError::LimitExceeded)
+        );
+        drop((first_slot, second_slot));
+
+        fs::write(root.0.join("unexpected"), []).unwrap();
+        assert_eq!(directory.discover_slots(2), Err(JournalStoreError::Corrupt));
     }
 
     #[cfg(target_os = "linux")]

@@ -71,6 +71,11 @@ external directory owner rather than a request-controlled slot-opening
 callback; replacing that directory pathname cannot redirect a retained owner.
 Retries after saved authorization or retirement reopen an existing stable lock
 only; a missing lock fails without minting a replacement.
+The pinned directory can now discover bounded lock-only and exposed slot
+candidates, rejecting malformed names, orphan generations and limit overflow.
+The startup recovery model matches those candidates against independently
+verified lifecycle stores. Discovery is not authority: controller integration
+must still replay every matched generation before route attachment.
 
 No released startup, lifecycle queue or route adapter selects this owner yet;
 the caller must choose Space/Node storage roots independently and attach a
