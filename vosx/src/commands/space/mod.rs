@@ -39,6 +39,8 @@ pub mod info;
 #[cfg(target_os = "linux")]
 pub(crate) mod invocation_progress;
 pub mod list;
+#[cfg(target_os = "linux")]
+mod local_call;
 pub mod local_config;
 #[cfg(target_os = "linux")]
 pub(crate) mod local_create;
@@ -83,6 +85,9 @@ pub enum SpaceCommand {
     /// Authorize, deliver and positively retire exact Local invocation intent.
     #[cfg(target_os = "linux")]
     InvokeLocal(local_operation::AuthorizeLocalArgs),
+    /// Invoke an installed Local actor using a signed package's method schema.
+    #[cfg(target_os = "linux")]
+    CallLocalActor(local_call::CallLocalArgs),
     /// Prepare and authorize exact ATQ1 intent on an operator-owned Local Agent.
     /// Does not apply the invocation; issuance leaves the credential pending.
     #[cfg(target_os = "linux")]
@@ -215,6 +220,7 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
     match cmd {
         #[cfg(target_os = "linux")]
         SpaceCommand::InvokeLocal(args) => local_operation::run_invocation(args),
+        SpaceCommand::CallLocalActor(args) => local_call::run(args),
         #[cfg(target_os = "linux")]
         SpaceCommand::AuthorizeLocalInvocation(args) => local_operation::run(args),
         #[cfg(target_os = "linux")]

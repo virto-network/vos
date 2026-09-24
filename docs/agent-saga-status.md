@@ -35,9 +35,9 @@ neither completes batch 1. Subsequent integration stays on
    bounded external-state/Clerk integration (the Agent ledger-core port and
    one physical signed transfer are done); establish one authenticated system
    lineage at fixed three-node placement before customer traffic (not three
-   singleton spaces); expose ordinary Shared
-   Create/Install through durable reservation/publication/application/finalize/
-   retirement; add schema-aware CLI invocation. Qualify with actual release
+   singleton spaces); expose ordinary Shared Create/Install through durable
+   reservation/publication/application/finalize/
+   retirement; finish schema-aware CLI invocation. Qualify with actual release
    binaries, not fixture-only issuer handoffs. Check Clerk growth feasibility
    before investing in the rest of this integration.
 2. **Measured performance.** Attribute credential/Authority, queue, VM, quorum,
@@ -451,6 +451,39 @@ external Install under the same file-backed owner and a public actor route
 after authenticated Create publication. Shared common finality and Clerk
 follow within batch 1. Candidate package admission is not release admission;
 the large ACK's 5-billion-gas success is not a release-latency guarantee.
+
+Current source's debug `vosx` binary has now also completed an isolated image-
+Local CLI smoke: new Space with HTTP/SSH enabled, Local Create, signed Counter
+package build and Install, Counter mutation and query (`7`), daemon restart,
+and exact retained Create and invocation retries. The live daemon was stopped
+cleanly afterward. This exercises the actual file owner and route, but the
+first CLI reply was received; it is not a lost-response test or optimized
+release-binary qualification. Fresh Create and Install took roughly 20 and 27
+seconds respectively on this machine; the delay is not production-acceptable
+and the diagnostic timing decomposition above remains the performance lead.
+The new `space call-local-actor` command uses a signed package's AMP2 method
+shape to encode flat scalar, byte and simple list arguments, then uses the
+existing retained Local authorization/Invoke/ACK path. It prints the decoded
+reply and exact retry command. The canonical ATQ1 is now persisted before
+credential reservation, preventing a crash after reservation from losing a
+CLI-minted invocation ID. The signed package is only an encoding aid: live
+physical preparation and Authority still select and validate the installed
+actor. This is a scoped first CLI slice, not general Agent CLI completion:
+only operator-owned top-level Local actors, no role-claim UX, no complex
+argument types, and no Shared calls yet. Exact replay after restart passed;
+lost-response and optimized release-binary CLI tests remain open. The full
+current `vosx` CLI test binary passed offline with loopback access: 287 passed,
+20 ignored; the five socket tests fail in the sandbox without loopback bind
+permission, then pass with it.
+Two sequential Counter `value` calls on the same disposable, already-running
+Space using a current release-profile `vosx` binary returned `7` in 14.205
+and 16.043 seconds end to end. The daemon was stopped cleanly. This rules out
+debug compilation as the whole delay, but is only a two-call diagnostic,
+not a throughput or isolated VM benchmark. Next measurement should split
+credential/Authority issuance, physical Invoke, ACK, persistence and route
+reconciliation for this exact released-profile call before selecting a tuning
+pass; the earlier Create trace already implicates synchronous control-plane
+composition.
 
 External Local cutover TODOs, in order: (1) decide whether public external
 Install belongs in this release; the internal retained-lease handoff, exact

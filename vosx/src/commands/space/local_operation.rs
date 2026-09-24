@@ -163,7 +163,6 @@ fn authorize_with_application_validity(
                 .0
         }
     };
-    let status = reservation.reserve(nonce)?;
     let operations = root.join("operations");
     let _operations = ensure_private_directory(&operations)?;
     let operation = operations.join(format!(
@@ -171,7 +170,34 @@ fn authorize_with_application_validity(
         hex::encode(identity.credential().0),
         hex::encode(nonce.0)
     ));
+    if initial.is_some()
+        && let Some((current, CredentialReservationStatus::Pending)) = reservation.current()?
+    {
+        anyhow::ensure!(
+            current == nonce,
+            "another credential operation is pending; resume its original command"
+        );
+    }
     let _operation = ensure_private_directory(&operation)?;
+    if let Some(intent) = initial {
+        // A human-readable call generates its nonce in this process. Publish
+        // the exact ATQ1 before reserving the credential so a crash after
+        // reservation can always resume it without reconstructing arguments
+        // or minting a replacement invocation ID. A pre-reservation orphan is
+        // inert and never becomes a signed operation.
+        let mut retained =
+            CleanPreparationClientFile::open_or_create(operation.join("preparation"))?;
+        let bytes = intent
+            .encode()
+            .map_err(|e| anyhow::anyhow!("invalid ATQ1: {e:?}"))?;
+        match retained.load_request()? {
+            Some(existing) => {
+                anyhow::ensure!(existing == bytes, "retained intent differs from input")
+            }
+            None => retained.publish_request(&bytes)?,
+        }
+    }
+    let status = reservation.reserve(nonce)?;
     // The common request namespace rejects a pending Create/Install record
     // instead of reinterpreting it as an invocation authorization.
     let request_root = operation.join("request");

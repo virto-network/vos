@@ -107,8 +107,8 @@ pub(crate) fn validate_local_storage_roots(
     Ok(())
 }
 
-/// The opt-in external daemon can recover and serve finalized generations,
-/// but LCQ2 Create and external Install are not yet public lifecycle ingress.
+/// Image Install cannot write an external-state root. Opt-in LCQ2 Create uses
+/// its own path, while external Install is not yet public lifecycle ingress.
 /// Reject before the CLI reserves a credential or writes a request file.
 pub(crate) fn require_image_local_lifecycle(data_dir: &Path) -> anyhow::Result<()> {
     anyhow::ensure!(

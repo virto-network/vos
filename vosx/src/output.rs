@@ -50,11 +50,11 @@ pub fn print_json<T: serde::Serialize>(value: &T) {
 }
 
 /// Convert a `vos::value::Value` (the dynamic reply type from
-/// `space call`) into a `serde_json::Value`. Bytes become
+/// `space call-local-actor`) into a `serde_json::Value`. Bytes become
 /// hex-encoded strings for symmetry with the rest of the CLI;
 /// `Unit` collapses to `null`.
 pub fn value_to_json(v: &vos::value::Value) -> serde_json::Value {
-    use serde_json::{Number, Value as J};
+    use serde_json::Value as J;
     use vos::value::Value as V;
     match v {
         V::Unit => J::Null,
@@ -64,12 +64,22 @@ pub fn value_to_json(v: &vos::value::Value) -> serde_json::Value {
         V::U32(n) => J::Number((*n as u64).into()),
         V::U64(n) => J::Number((*n).into()),
         V::I32(n) => J::Number((*n as i64).into()),
-        V::I64(n) => Number::from_f64(*n as f64)
-            .map(J::Number)
-            .unwrap_or_else(|| J::String(n.to_string())),
+        V::I64(n) => J::Number((*n).into()),
         V::Str(s) => J::String(s.clone()),
         V::Bytes(b) => J::String(format!("0x{}", hex::encode(b))),
         V::ListU32(xs) => J::Array(xs.iter().map(|x| J::Number((*x as u64).into())).collect()),
         V::ListStr(xs) => J::Array(xs.iter().map(|s| J::String(s.clone())).collect()),
+    }
+}
+
+#[cfg(test)]
+mod value_tests {
+    #[test]
+    fn signed_integer_reply_does_not_round_through_float() {
+        let number = i64::MAX;
+        assert_eq!(
+            super::value_to_json(&vos::value::Value::I64(number)),
+            serde_json::json!(number)
+        );
     }
 }
