@@ -457,18 +457,23 @@ guest accepted and published its Install, and the file-backed owner reopened
 the finalized generation. A signed anonymous `journal_id` read then executed
 through the physical guest, retained its exact reply across retry, and ACKed
 with an exact ACK retry. Reopening the locked generation preserved that
-retirement result without advancing the head. Clerk's
-Agent-only read mode is explicitly `LinearizableQuery`: default `Query`
-currently cannot publish an external-state replay record (`InvalidRecord`).
+retirement result without advancing the head. A test-Authority-signed Operator
+call also applied one note commitment: Clerk returned archived `Status::Ok`,
+the exact unretired result survived owner reopen without a second head, and a
+separately signed Member read after reopen observed count one. This verifies
+one persisted actor-state write/read through the physical external guest.
+This does not establish public credential-role grants or retained transfer
+growth. Clerk's Agent-only read mode is explicitly `LinearizableQuery`:
+default `Query` currently cannot publish an external-state replay record
+(`InvalidRecord`).
 The legacy service read mode remains unchanged. Ordered reads add publication
-work, so their service cost belongs in the Clerk load gate. This does not yet
-exercise Clerk mutation, role grants, unretired Invoke response-loss recovery,
-or root parity. Backend
-credentials, Shared finality and retained growth also remain unqualified.
+work, so their service cost belongs in the Clerk load gate. Transfer mutation,
+kernel root parity, backend credentials, Shared finality and retained growth
+remain unqualified.
 Proof-record and reciprocal voucher-origin behavior on the clean Agent path
 also remain unqualified and must stay out of a first-release claim until
-tested. Next qualify real mutation/restart with unchanged kernel roots,
-then multi-row growth and three-node publication. A separate external-state
+tested. Next qualify transfer mutation and unchanged kernel roots, then
+multi-row growth and three-node publication. A separate external-state
 default-`Query` design remains deferred; do not infer its support from Clerk's
 explicit ordered reads.
 

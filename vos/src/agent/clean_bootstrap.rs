@@ -17225,7 +17225,7 @@ mod tests {
                     .heads(),
                 &installed_head,
             );
-            let mut clerk_ack_reopen = None;
+            let mut clerk_reopen = None;
             if std::env::var_os("CLERK_AGENT_PACKAGE").is_some() {
                 use crate::actors::codec::{Decode as _, Encode as _};
                 use crate::actors::value::{Msg, TAG_DYNAMIC, Value};
@@ -17355,14 +17355,135 @@ mod tests {
                         .unwrap(),
                     retired,
                 );
-                clerk_ack_reopen = Some((
+                let policy =
+                    ActorMethodPolicyArtifact::decode(install_package.method_policy_bytes())
+                        .unwrap();
+                let operator = policy
+                    .methods
+                    .iter()
+                    .find(|method| method.name == "submit_note_commitment")
+                    .expect("signed Clerk mutation policy")
+                    .authorization_policy;
+                let AuthorizationPolicySelector::ActorRole(operator) = operator else {
+                    panic!("Clerk note commitment must require Operator");
+                };
+                let mut mutation = work.clone();
+                mutation.invocation = InvocationId([0xe2; 32]);
+                mutation.mode = MethodMode::Linear;
+                mutation.origin.principal = Some(PrincipalId([0xe3; 32]));
+                mutation.roles.actor = Some(operator);
+                mutation.message = vec![TAG_DYNAMIC];
+                mutation.message.extend(
+                    Msg::new("submit_note_commitment")
+                        .with("commitment", Value::Bytes(vec![0xe4; 32]))
+                        .encode(),
+                );
+                let mut mutation_receipt = install_receipt.clone();
+                mutation_receipt.selector.operation =
+                    crate::agent::sdk::authority::AuthorityOperationKind::InvokeActor;
+                mutation_receipt.selector.actor = Some(mutation.actor);
+                mutation_receipt.selector.actor_deployment = Some(mutation.deployment);
+                mutation_receipt.selector.request = mutation.commitment();
+                mutation_receipt.selector.decision_sequence = 0;
+                mutation_receipt.selector.acknowledged_through = 0;
+                mutation_receipt.selector.expires_at = LOGICAL_SLOT + 100;
+                mutation_receipt.signature = SigningKey::from_bytes(&[RECEIPT_SEED; 32])
+                    .sign(&mutation_receipt.signing_bytes())
+                    .to_bytes();
+                let before_mutation = installed.materialization().unwrap().heads().clone();
+                let mutation_runtime = installed.materialization().unwrap().runtime().clone();
+                let mutation_input = ReplayInput {
+                    runtime: mutation_runtime,
+                    operation: ReplayOperation::CleanInvoke {
+                        context: crate::agent::sdk::RuntimeExecutionContext::Direct,
+                        work: mutation,
+                        authorization: crate::agent::sdk::InvocationAuthorization::AuthorityReceipt(
+                            mutation_receipt,
+                        ),
+                        observed_slot: LOGICAL_SLOT + 20,
+                    },
+                };
+                let mutation_outcome = installed
+                    .submit_direct_clean(
+                        mutation_input.clone(),
+                        LOGICAL_SLOT + 20,
+                        &mut ReadBudget::new(10_000, 10_000_000),
+                    )
+                    .unwrap();
+                let RuntimeOutcome::Completed(Ok(mutation_reply)) = &mutation_outcome else {
+                    panic!("physical Clerk note commitment failed: {mutation_outcome:?}");
+                };
+                assert_eq!(
+                    Value::decode(&mutation_reply.reply),
+                    Value::Bytes(vec![0]),
+                    "the archived Clerk Status must be Ok, not just a completed call"
+                );
+                assert_ne!(
+                    installed.materialization().unwrap().heads(),
+                    &before_mutation
+                );
+                let member = policy
+                    .methods
+                    .iter()
+                    .find(|method| method.name == "note_commitment_count")
+                    .expect("signed Clerk count policy")
+                    .authorization_policy;
+                let AuthorizationPolicySelector::ActorRole(member) = member else {
+                    panic!("Clerk note count must require Member");
+                };
+                let mut count_work = work.clone();
+                count_work.invocation = InvocationId([0xe5; 32]);
+                count_work.origin.principal = Some(PrincipalId([0xe3; 32]));
+                count_work.roles.actor = Some(member);
+                count_work.message = vec![TAG_DYNAMIC];
+                count_work
+                    .message
+                    .extend(Msg::new("note_commitment_count").encode());
+                let mut count_receipt = install_receipt.clone();
+                count_receipt.selector.operation =
+                    crate::agent::sdk::authority::AuthorityOperationKind::InvokeActor;
+                count_receipt.selector.actor = Some(count_work.actor);
+                count_receipt.selector.actor_deployment = Some(count_work.deployment);
+                count_receipt.selector.request = count_work.commitment();
+                count_receipt.selector.decision_sequence = 0;
+                count_receipt.selector.acknowledged_through = 0;
+                count_receipt.selector.expires_at = LOGICAL_SLOT + 100;
+                count_receipt.signature = SigningKey::from_bytes(&[RECEIPT_SEED; 32])
+                    .sign(&count_receipt.signing_bytes())
+                    .to_bytes();
+                let count_input = ReplayInput {
+                    runtime: installed.materialization().unwrap().runtime().clone(),
+                    operation: ReplayOperation::CleanInvoke {
+                        context: crate::agent::sdk::RuntimeExecutionContext::Direct,
+                        work: count_work,
+                        authorization: crate::agent::sdk::InvocationAuthorization::AuthorityReceipt(
+                            count_receipt,
+                        ),
+                        observed_slot: LOGICAL_SLOT + 20,
+                    },
+                };
+                clerk_reopen = Some((
                     acknowledge,
                     retired,
+                    mutation_input,
+                    mutation_outcome,
+                    count_input,
                     installed.materialization().unwrap().heads().clone(),
                 ));
             }
             drop(post_install_owners);
-            if let Some((acknowledge, retired, after_retirement)) = clerk_ack_reopen {
+            if let Some((
+                acknowledge,
+                retired,
+                mutation_input,
+                mutation_outcome,
+                count_input,
+                after_clerk_operations,
+            )) = clerk_reopen
+            {
+                use crate::actors::codec::Decode as _;
+                use crate::actors::value::Value;
+
                 let mut reopened = reopened_archive
                     .open_existing(
                         runtime.exact_bytes().to_vec(),
@@ -17374,7 +17495,21 @@ mod tests {
                     .unwrap();
                 assert_eq!(
                     reopened.materialization().unwrap().heads(),
-                    &after_retirement
+                    &after_clerk_operations
+                );
+                assert_eq!(
+                    reopened
+                        .submit_direct_clean(
+                            mutation_input,
+                            LOGICAL_SLOT + 20,
+                            &mut ReadBudget::new(10_000, 10_000_000),
+                        )
+                        .unwrap(),
+                    mutation_outcome,
+                );
+                assert_eq!(
+                    reopened.materialization().unwrap().heads(),
+                    &after_clerk_operations
                 );
                 assert_eq!(
                     reopened
@@ -17388,8 +17523,19 @@ mod tests {
                 );
                 assert_eq!(
                     reopened.materialization().unwrap().heads(),
-                    &after_retirement
+                    &after_clerk_operations
                 );
+                let count = reopened
+                    .submit_direct_clean(
+                        count_input,
+                        LOGICAL_SLOT + 20,
+                        &mut ReadBudget::new(10_000, 10_000_000),
+                    )
+                    .unwrap();
+                let RuntimeOutcome::Completed(Ok(count_reply)) = &count else {
+                    panic!("physical Clerk note count failed: {count:?}");
+                };
+                assert_eq!(Value::decode(&count_reply.reply), Value::U32(1));
             }
 
             let orphan = crate::service::AgentId([0x77; 32]);
