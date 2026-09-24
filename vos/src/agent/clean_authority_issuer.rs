@@ -3023,6 +3023,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "experimental-state-blocks")]
     fn install_request(agent: AgentId, tag: u8) -> ManagementRequest {
         use crate::agent::sdk::contract::ActorPackageContract;
         use crate::agent::sdk::{
@@ -3788,6 +3789,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "experimental-state-blocks")]
     #[test]
     fn rejected_local_install_uses_the_same_durable_pledge_and_exact_retry() {
         let store = MemoryImageStore::default();

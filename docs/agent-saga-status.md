@@ -1598,8 +1598,11 @@ backup or long-running retention tests.
   deployment is claimed.
 - Current focused checks are recorded above: Create subprocess response loss,
   physical rejected Install/restart, 14 issuer tests, SDK/Authority failure
-  suites, default non-experimental check and format/diff checks. Full prototype,
-  final release-binary and workspace qualification have not been rerun.
+  suites, default non-experimental check and format/diff checks. The complete
+  `just test-agent-state-prototype` gate now passes at the WIP head after
+  correctly feature-gating the rejected-Install issuer test. This gate covers
+  prototype SDK/guests/replay/journal staging; final release-binary and
+  workspace qualification have not been rerun.
 - Master is unchanged; nothing is pushed. Review read-only and apply findings
   on the implementation branch to avoid conflicting fixes.
 - Historical bounded-state checkpoint gate passed at
