@@ -842,7 +842,9 @@ pub(crate) type CleanSharedGenesisController =
 
 /// Discover ordinary Shared recovery before opening the physical host. Fresh
 /// spaces have no Shared control directories; do not create them during reads.
-/// A partial set is an interrupted/invalid setup, never an empty recovery set.
+/// An empty partial set is a crash during first-time namespace creation, not
+/// an Agent reservation. Never create missing directories during discovery or
+/// hide a partial namespace containing durable data.
 pub(crate) fn discover_shared_genesis_startup(
     data_dir: &Path,
     authority: vos::agent::sdk::authority::AuthorityActorTarget,
@@ -857,21 +859,33 @@ pub(crate) fn discover_shared_genesis_startup(
         data_dir.join(SHARED_COMMITTEE_DIRECTORY),
         data_dir.join(SHARED_ARCHIVE_DIRECTORY),
     ];
-    let mut present = 0;
+    let mut present_paths = Vec::new();
     for path in &paths {
         match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.is_dir() => present += 1,
+            Ok(metadata) if metadata.is_dir() => present_paths.push(path),
             Ok(_) => return Err(CleanFileStoreError::InvalidPath),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
             Err(error) => return Err(error.into()),
         }
     }
-    if present == 0 {
+    if present_paths.is_empty() {
         validate_opened_directory(&directory, data_dir, true)?;
         return Ok(None);
     }
-    if present != paths.len() {
-        return Err(CleanFileStoreError::Corrupt);
+    if present_paths.len() != paths.len() {
+        for path in present_paths {
+            let opened = open_private_directory(path, false)?;
+            #[cfg(target_os = "linux")]
+            let scan = PathBuf::from(format!("/proc/self/fd/{}", opened.as_raw_fd()));
+            #[cfg(not(target_os = "linux"))]
+            let scan = path;
+            if fs::read_dir(scan)?.next().is_some() {
+                return Err(CleanFileStoreError::Corrupt);
+            }
+            validate_opened_directory(&opened, path, false)?;
+        }
+        validate_opened_directory(&directory, data_dir, true)?;
+        return Ok(None);
     }
     let space = vos::service::SpaceId(authority.space.0);
     let mut lifecycle = CleanManagementLifecycleStoreFactory::new(&paths[0], authority.space)?;
@@ -5340,7 +5354,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ordinary_genesis_startup_discovery_is_noncreating_and_refuses_partial_namespaces() {
+    fn ordinary_genesis_startup_discovery_tolerates_only_empty_partial_namespaces() {
         let fixture = Fixture::new("shared-startup-discovery");
         let (_, authority, _, _) = super::super::local_create::tests::fixture();
         let paths = [
@@ -5359,10 +5373,11 @@ pub(crate) mod tests {
         for (index, name) in paths.iter().enumerate() {
             ensure_private_directory(&fixture.parent.join(name)).unwrap();
             if index < 2 {
-                assert!(matches!(
-                    discover_shared_genesis_startup(&fixture.parent, authority, 1),
-                    Err(CleanFileStoreError::Corrupt)
-                ));
+                assert!(
+                    discover_shared_genesis_startup(&fixture.parent, authority, 1)
+                        .unwrap()
+                        .is_none()
+                );
                 for missing in &paths[index + 1..] {
                     assert!(!fixture.parent.join(missing).exists());
                 }
@@ -5376,6 +5391,17 @@ pub(crate) mod tests {
         for name in paths {
             assert_eq!(fs::read_dir(fixture.parent.join(name)).unwrap().count(), 0);
         }
+
+        let incomplete = Fixture::new("shared-startup-partial-reservation");
+        let lifecycle = incomplete.parent.join(SHARED_LIFECYCLE_DIRECTORY);
+        ensure_private_directory(&lifecycle).unwrap();
+        write_private(&lifecycle.join("unexpected"), b"retained reservation");
+        assert!(matches!(
+            discover_shared_genesis_startup(&incomplete.parent, authority, 1),
+            Err(CleanFileStoreError::Corrupt)
+        ));
+        assert!(!incomplete.parent.join(SHARED_COMMITTEE_DIRECTORY).exists());
+        assert!(!incomplete.parent.join(SHARED_ARCHIVE_DIRECTORY).exists());
     }
 
     #[cfg(unix)]

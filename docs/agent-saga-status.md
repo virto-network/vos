@@ -105,6 +105,12 @@ generation, but live Create must first own the lifecycle/committee/archive
 stores and carry that proof through provisioning, application ACK,
 finalization and route publication. Cross-root first-Create crash recovery
 remains a gate. Do not replace the refusing verifier with a permissive one.
+Startup discovery now treats only an empty, private partial set of the three
+Shared control parent directories as an interrupted first-time setup; it
+creates nothing, and any retained entry still fails closed. This removes one
+first-Create crash edge, not the larger gate: a signed reservation before its
+archive needs a durable independently selected replica roster and phase-aware
+recovery before public Create can be enabled.
 
 Immediate integration seam: the experimental external-state package, physical
 Create, sealed Local genesis, file journal, pinned Invoke/ACK owner, and
