@@ -962,13 +962,30 @@ impl CleanAgentGenesisArchiveStoreFactory {
         }) {
             return Err(CleanFileStoreError::UnexpectedResidue);
         }
+        let mut expected_committees = committee.discover(maximum)?;
         let recoveries = committee.discover_recovery(lifecycle, authority, maximum)?;
-        if recoveries.len() != agents.len()
-            || recoveries.iter().zip(&agents).any(|(recovery, agent)| {
-                recovery.locator().space != self.space || recovery.locator().agent.0 != agent.0
-            })
-        {
+        if archives.iter().any(|locator| {
+            recoveries
+                .binary_search_by_key(&locator.agent, |recovery| recovery.locator().agent)
+                .is_err()
+        }) {
             return Err(CleanFileStoreError::UnexpectedResidue);
+        }
+        // Signed Creates may establish a previously absent empty query slot.
+        // No other directory may appear during discovery, including a racing
+        // orphan that would otherwise escape the initial validation pass.
+        for recovery in &recoveries {
+            let locator = recovery.locator();
+            if !expected_committees
+                .iter()
+                .any(|found| found.agent == locator.agent)
+            {
+                expected_committees.push(locator);
+            }
+        }
+        expected_committees.sort_unstable_by_key(|locator| locator.agent);
+        if expected_committees.len() > maximum {
+            return Err(CleanFileStoreError::Oversized);
         }
         let mut entries = Vec::with_capacity(recoveries.len());
         for recovery in recoveries {
@@ -995,10 +1012,6 @@ impl CleanAgentGenesisArchiveStoreFactory {
             };
             entries.push(CleanSharedGenesisStartupEntry { recovery, archive });
         }
-        let expected_committees: Vec<_> = entries
-            .iter()
-            .map(|entry| entry.recovery.locator())
-            .collect();
         if self.discover(maximum)? != archives
             || lifecycle.discover(authority.space, maximum)? != agents
             || committee.discover(maximum)? != expected_committees
@@ -1034,6 +1047,7 @@ impl CleanAgentGenesisCommitteeStoreFactory {
         maximum: usize,
     ) -> Result<Vec<CleanSharedGenesisRecovery>, CleanFileStoreError> {
         use vos::agent::local_lifecycle::LocalLifecycleStoreFactory as _;
+        use vos::service::ServiceWire as _;
         if !authority.is_valid() || authority.space.0 != self.space.0 {
             return Err(CleanFileStoreError::InvalidPath);
         }
@@ -1053,7 +1067,51 @@ impl CleanAgentGenesisCommitteeStoreFactory {
                 space: self.space,
                 agent: vos::service::AgentId(agent.0),
             };
-            let (intent, issuer) = lifecycle.open_existing(authority.space, agent)?;
+            let (mut intent, mut issuer) = lifecycle.open_existing(authority.space, agent)?;
+            let has_intent = intent.load()?.is_some();
+            if !has_intent {
+                // A crash before the signed pledge may leave an empty scoped
+                // directory or exact staged inputs. It is not an Agent. Do
+                // not create a missing committee/query directory while
+                // inspecting it, and never hide an issuer or phase image.
+                if issuer.load()?.is_some()
+                    || intent.load_actor()?.is_some()
+                    || intent.load_external_create_archive()?.is_some()
+                {
+                    return Err(CleanFileStoreError::UnexpectedResidue);
+                }
+                if let Some(bytes) = intent.load_runtime()? {
+                    vos::agent::package_admission::admit_runtime_package(&bytes)
+                        .map_err(|_| CleanFileStoreError::Corrupt)?;
+                }
+                if committees
+                    .binary_search_by_key(&locator.agent, |found| found.agent)
+                    .is_ok()
+                {
+                    let (mut query, mut reply) = self.open_existing(locator)?;
+                    let mut publication = query.publication();
+                    let mut publication_reply = query.publication_reply();
+                    if query.load()?.is_some()
+                        || reply.load()?.is_some()
+                        || publication.load()?.is_some()
+                        || publication_reply.load()?.is_some()
+                    {
+                        return Err(CleanFileStoreError::UnexpectedResidue);
+                    }
+                    if let Some(bytes) = query.load_replicas()? {
+                        let replicas = vos::agent::genesis::AgentReplicaCommittee::decode(&bytes)
+                            .map_err(|_| CleanFileStoreError::Corrupt)?;
+                        if replicas.encode() != bytes
+                            || replicas.space() != locator.space
+                            || replicas.agent() != locator.agent
+                            || replicas.profile() != vos::agent::AgentProfile::Shared
+                        {
+                            return Err(CleanFileStoreError::Corrupt);
+                        }
+                    }
+                }
+                continue;
+            }
             let (query, reply) = if committees
                 .binary_search_by_key(&locator.agent, |found| found.agent)
                 .is_ok()
@@ -5593,6 +5651,173 @@ pub(crate) mod tests {
         selected_replicas
             .validate_for_clean_descriptor(&descriptor)
             .unwrap();
+        let staged = Fixture::new("ordinary-genesis-staged-create");
+        let staged_archives_path = staged.parent.join(SHARED_ARCHIVE_DIRECTORY);
+        ensure_private_directory(&staged_archives_path).unwrap();
+        let staged_archives = CleanAgentGenesisArchiveStoreFactory::open_existing(
+            &staged_archives_path,
+            locator.space,
+        )
+        .unwrap();
+        let staged_committee = CleanAgentGenesisCommitteeStoreFactory::open_or_create(
+            &staged.parent.join(SHARED_COMMITTEE_DIRECTORY),
+            locator.space,
+        )
+        .unwrap();
+        let mut staged_lifecycle = CleanManagementLifecycleStoreFactory::open_or_create(
+            staged.parent.join(SHARED_LIFECYCLE_DIRECTORY),
+            authority.space,
+        )
+        .unwrap();
+        let (mut staged_intent, staged_issuer) = staged_lifecycle
+            .open(authority.space, descriptor.identity.agent)
+            .unwrap();
+        staged_intent.commit_runtime(runtime.exact_bytes()).unwrap();
+        let (mut staged_query, staged_reply) =
+            CleanAgentGenesisCommitteeFile::open_pair(&staged_committee.parent, locator).unwrap();
+        staged_query
+            .commit_replicas(&selected_replicas.encode())
+            .unwrap();
+        drop((staged_intent, staged_issuer, staged_query, staged_reply));
+        assert!(
+            staged_archives
+                .discover_recovery(&mut staged_lifecycle, &staged_committee, authority, 1)
+                .unwrap()
+                .is_empty()
+        );
+        let (staged_intent, staged_issuer) = staged_lifecycle
+            .open_existing(authority.space, descriptor.identity.agent)
+            .unwrap();
+        let (staged_query, staged_reply) = staged_committee.open_existing(locator).unwrap();
+        let staged_publication = staged_query.publication();
+        let staged_publication_reply = staged_query.publication_reply();
+        let recovery = CleanSharedGenesisRecovery::reserve_create_with_replicas(
+            authority,
+            locator,
+            descriptor.clone(),
+            call.clone(),
+            runtime.clone(),
+            selected_replicas.clone(),
+            (
+                staged_intent,
+                staged_issuer,
+                staged_query,
+                staged_reply,
+                staged_publication,
+                staged_publication_reply,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            recovery.runtime().unwrap().exact_bytes(),
+            runtime.exact_bytes()
+        );
+        drop(recovery);
+        let entries = staged_archives
+            .discover_recovery(&mut staged_lifecycle, &staged_committee, authority, 1)
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].archive.is_none());
+        drop(entries);
+        let (staged_intent, staged_issuer) = staged_lifecycle
+            .open_existing(authority.space, descriptor.identity.agent)
+            .unwrap();
+        let (staged_query, staged_reply) = staged_committee.open_existing(locator).unwrap();
+        let staged_publication = staged_query.publication();
+        let staged_publication_reply = staged_query.publication_reply();
+        let mut retried = CleanSharedGenesisRecovery::reserve_create_with_replicas(
+            authority,
+            locator,
+            descriptor.clone(),
+            call.clone(),
+            runtime.clone(),
+            selected_replicas.clone(),
+            (
+                staged_intent,
+                staged_issuer,
+                staged_query,
+                staged_reply,
+                staged_publication,
+                staged_publication_reply,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            retried.retained_replicas().unwrap(),
+            Some(selected_replicas.clone())
+        );
+        drop(retried);
+        let fresh = Fixture::new("ordinary-genesis-fresh-create");
+        ensure_private_directory(&fresh.parent.join(SHARED_ARCHIVE_DIRECTORY)).unwrap();
+        let fresh_committee = CleanAgentGenesisCommitteeStoreFactory::open_or_create(
+            &fresh.parent.join(SHARED_COMMITTEE_DIRECTORY),
+            locator.space,
+        )
+        .unwrap();
+        let mut fresh_lifecycle = CleanManagementLifecycleStoreFactory::open_or_create(
+            fresh.parent.join(SHARED_LIFECYCLE_DIRECTORY),
+            authority.space,
+        )
+        .unwrap();
+        let (fresh_intent, fresh_issuer) = fresh_lifecycle
+            .open(authority.space, descriptor.identity.agent)
+            .unwrap();
+        let (fresh_query, fresh_reply) =
+            CleanAgentGenesisCommitteeFile::open_pair(&fresh_committee.parent, locator).unwrap();
+        let fresh_publication = fresh_query.publication();
+        let fresh_publication_reply = fresh_query.publication_reply();
+        let mut forged = call.clone();
+        forged.signature[0] ^= 1;
+        assert!(matches!(
+            CleanSharedGenesisRecovery::reserve_create_with_replicas(
+                authority,
+                locator,
+                descriptor.clone(),
+                forged,
+                runtime.clone(),
+                selected_replicas.clone(),
+                (
+                    fresh_intent,
+                    fresh_issuer,
+                    fresh_query,
+                    fresh_reply,
+                    fresh_publication,
+                    fresh_publication_reply,
+                ),
+            ),
+            Err(vos::agent::shared_host::SharedAgentHostError::ScopeMismatch)
+        ));
+        let (mut fresh_intent, fresh_issuer) = fresh_lifecycle
+            .open_existing(authority.space, descriptor.identity.agent)
+            .unwrap();
+        let (mut fresh_query, fresh_reply) = fresh_committee.open_existing(locator).unwrap();
+        assert!(fresh_intent.load().unwrap().is_none());
+        assert!(fresh_intent.load_runtime().unwrap().is_none());
+        assert!(fresh_query.load_replicas().unwrap().is_none());
+        let fresh_publication = fresh_query.publication();
+        let fresh_publication_reply = fresh_query.publication_reply();
+        let mut fresh_recovery = CleanSharedGenesisRecovery::reserve_create_with_replicas(
+            authority,
+            locator,
+            descriptor.clone(),
+            call.clone(),
+            runtime.clone(),
+            selected_replicas.clone(),
+            (
+                fresh_intent,
+                fresh_issuer,
+                fresh_query,
+                fresh_reply,
+                fresh_publication,
+                fresh_publication_reply,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            fresh_recovery.retained_replicas().unwrap(),
+            Some(selected_replicas.clone())
+        );
+        drop(fresh_recovery);
         let foreign = Fixture::new("ordinary-genesis-foreign-roster");
         let mut foreign_lifecycle = CleanManagementLifecycleStoreFactory::open_or_create(
             foreign.parent.join(SHARED_LIFECYCLE_DIRECTORY),
@@ -5973,6 +6198,93 @@ pub(crate) mod tests {
             intent.load().unwrap(),
             Some(b"not a signed Shared Create".to_vec())
         );
+    }
+
+    #[test]
+    fn ordinary_genesis_discovery_keeps_unpledged_staging_inert() {
+        use vos::agent::local_lifecycle::LocalLifecycleStoreFactory as _;
+        use vos::service::ServiceWire as _;
+
+        let fixture = Fixture::new("ordinary-genesis-unpledged-staging");
+        let (_, authority, _, runtime) = super::super::local_create::tests::fixture();
+        let space = vos::service::SpaceId(authority.space.0);
+        let locator = vos::agent::genesis::AgentGenesisLocator {
+            space,
+            agent: vos::service::AgentId([2; 32]),
+        };
+        let archives_path = fixture.parent.join(SHARED_ARCHIVE_DIRECTORY);
+        ensure_private_directory(&archives_path).unwrap();
+        let archives =
+            CleanAgentGenesisArchiveStoreFactory::open_existing(&archives_path, space).unwrap();
+        let committee = CleanAgentGenesisCommitteeStoreFactory::open_or_create(
+            &fixture.parent.join(SHARED_COMMITTEE_DIRECTORY),
+            space,
+        )
+        .unwrap();
+        let mut lifecycle = CleanManagementLifecycleStoreFactory::open_or_create(
+            fixture.parent.join(SHARED_LIFECYCLE_DIRECTORY),
+            authority.space,
+        )
+        .unwrap();
+        let (mut intent, issuer) = lifecycle
+            .open(authority.space, vos::agent::sdk::AgentId(locator.agent.0))
+            .unwrap();
+        drop((intent, issuer));
+        assert!(
+            archives
+                .discover_recovery(&mut lifecycle, &committee, authority, 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(committee.discover(0).unwrap().is_empty());
+
+        let (mut intent, issuer) = lifecycle
+            .open_existing(authority.space, vos::agent::sdk::AgentId(locator.agent.0))
+            .unwrap();
+        intent.commit_runtime(runtime.exact_bytes()).unwrap();
+        drop((intent, issuer));
+        let node_key = libp2p::identity::Keypair::ed25519_from_bytes([0x47; 32]).unwrap();
+        let peer = node_key.public().to_peer_id().to_bytes();
+        let public = ed25519_dalek::SigningKey::from_bytes(&[0x47; 32])
+            .verifying_key()
+            .to_bytes();
+        let member = vos::agent::genesis::AgentReplicaMember::new(
+            vos::agent::AgentReplica {
+                node: vos::service::NodeId::of_authenticated_peer(&peer),
+                principal: vos::service::PrincipalId::of_public_key(&public),
+                role: vos::agent::ReplicaRole::Voter,
+            },
+            peer.clone(),
+            public,
+            Some(vos::agent::genesis::derive_replica_raft_slot(&peer)),
+        )
+        .unwrap();
+        let replicas = vos::agent::genesis::AgentReplicaCommittee::new(
+            space,
+            locator.agent,
+            vos::agent::AgentProfile::Shared,
+            vec![member],
+        )
+        .unwrap();
+        let (mut query, reply) =
+            CleanAgentGenesisCommitteeFile::open_pair(&committee.parent, locator).unwrap();
+        query.commit_replicas(&replicas.encode()).unwrap();
+        drop((query, reply));
+        assert!(
+            archives
+                .discover_recovery(&mut lifecycle, &committee, authority, 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(committee.discover(1).unwrap(), vec![locator]);
+
+        let archive =
+            CleanAgentGenesisArchiveFile::open_or_create(&archives_path, locator).unwrap();
+        drop(archive);
+        assert!(matches!(
+            archives.discover_recovery(&mut lifecycle, &committee, authority, 1),
+            Err(CleanFileStoreError::UnexpectedResidue)
+        ));
     }
 
     #[test]

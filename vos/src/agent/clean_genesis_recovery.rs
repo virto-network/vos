@@ -2,6 +2,10 @@
 
 use super::genesis_issuance::RetainedCommitteeQuery;
 use super::*;
+use crate::agent::clean_authority_issuer::{
+    CleanExternalLocalCreateArchiveStore as _, CleanManagementActorStore as _,
+    CleanManagementRuntimeStore as _, CleanSharedGenesisReplicaStore as _,
+};
 use crate::agent::clean_management_intent::{
     CleanManagementIntent, CleanManagementIntentSlot, ManagementJournalAnchor,
 };
@@ -167,6 +171,151 @@ impl<
     P: CleanManagementIssuerStore,
 > NativeSharedGenesisRecovery<I, J, Q, R, W, P>
 {
+    /// First-release Shared reservation: durably stage the exact package and
+    /// independently selected peer roster before pledging the signed Create.
+    /// A crash before the pledge leaves an inert candidate; a crash after it
+    /// leaves both inputs available for phase-aware recovery. No Authority
+    /// work or route is admitted here.
+    pub fn reserve_create_with_replicas(
+        authority: AuthorityActorTarget,
+        locator: super::super::genesis::AgentGenesisLocator,
+        descriptor: AgentDescriptor,
+        call: super::super::sdk::authority::AuthorityCredentialCall,
+        runtime: AdmittedRuntimePackage,
+        replicas: AgentReplicaCommittee,
+        stores: (I, J, Q, R, W, P),
+    ) -> Result<Self, SharedAgentHostError>
+    where
+        I: super::super::clean_authority_issuer::CleanManagementActorStore
+            + super::super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore,
+        Q: super::super::clean_authority_issuer::CleanSharedGenesisReplicaStore,
+    {
+        locator
+            .validate()
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if authority.space != descriptor.identity.space
+            || locator.space.0 != descriptor.identity.space.0
+            || locator.agent.0 != descriptor.identity.agent.0
+            || replicas.validate_for_clean_descriptor(&descriptor).is_err()
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        super::super::driver::verify_clean_runtime_package_binding(&descriptor, &runtime)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let signed = CleanManagementIntent::new(
+            authority,
+            call.managed,
+            ManagementRequest::Create(Box::new(descriptor)),
+            call,
+            &RawCredentialVerifier,
+        )
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let (
+            intent_store,
+            mut issuer,
+            mut query,
+            mut reply,
+            mut publication,
+            mut publication_reply,
+        ) = stores;
+        let mut intent = CleanManagementIntentSlot::open(intent_store)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let selected = replicas.encode();
+        if intent.intent().is_some() {
+            let mut recovered = Self::open(
+                authority,
+                locator,
+                intent.into_store(),
+                issuer,
+                query,
+                reply,
+                publication,
+                publication_reply,
+            )?;
+            recovered
+                .intent
+                .pledge(signed)
+                .map_err(|_| SharedAgentHostError::Conflict)?;
+            if recovered
+                .runtime
+                .as_ref()
+                .map(AdmittedRuntimePackage::exact_bytes)
+                != Some(runtime.exact_bytes())
+                || recovered.retained_replicas()? != Some(replicas)
+            {
+                return Err(SharedAgentHostError::Conflict);
+            }
+            return Ok(recovered);
+        }
+        let mut intent_store = intent.into_store();
+        if issuer
+            .load()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .is_some()
+            || query
+                .load()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .is_some()
+            || reply
+                .load()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .is_some()
+            || publication
+                .load()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .is_some()
+            || publication_reply
+                .load()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .is_some()
+            || intent_store
+                .load_actor()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .is_some()
+            || intent_store
+                .load_external_create_archive()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .is_some()
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        match query
+            .load_replicas()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        {
+            Some(existing) if existing == selected => (),
+            Some(_) => return Err(SharedAgentHostError::Conflict),
+            None => query
+                .commit_replicas(&selected)
+                .map_err(|_| SharedAgentHostError::Unavailable)?,
+        }
+        match intent_store
+            .load_runtime()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        {
+            Some(existing) if existing == runtime.exact_bytes() => (),
+            Some(_) => return Err(SharedAgentHostError::Conflict),
+            None => intent_store
+                .commit_runtime(runtime.exact_bytes())
+                .map_err(|_| SharedAgentHostError::Unavailable)?,
+        }
+        let mut intent = CleanManagementIntentSlot::open(intent_store)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        intent
+            .pledge(signed)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        Self::open(
+            authority,
+            locator,
+            intent.into_store(),
+            issuer,
+            query,
+            reply,
+            publication,
+            publication_reply,
+        )
+    }
+
     /// Retain an exact signed Shared Create and its admitted runtime before any
     /// authorization execution. This reserves durable inputs only: it grants no
     /// authority receipt, finality or permission to publish a route.

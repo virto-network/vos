@@ -116,16 +116,20 @@ sidecar under its existing exclusive lease. File tests cover exact retry,
 reopen, and refusal of a staged replacement. An on-demand recovery method
 decodes canonical peer identities and checks the retained roster against the
 verified signed Create using the same binding rule as live preparation. Startup
-opening now invokes that check for any present sidecar; absence is still
-accepted because reservation does not yet retain the roster. Startup cannot
-resume a pre-archive Create. Do not use the sidecar as authority until
-reservation and that phase-aware recovery are integrated.
-Shared first-Create recovery order: (1) verify the signed call and stage the
-exact runtime plus selected roster before pledging the intent; (2) discover
-and retain only safe unpledged candidates without creating extra phase files;
-(3) resume a signed pre-archive Create from those durable inputs and quorum
-signatures while keeping its route absent; (4) verify publication, application
-ACK, retirement and route exposure through the existing owner. An incomplete
+opening now invokes that check for any present sidecar. The new
+`reserve_create_with_replicas` path stages the exact roster and runtime before
+pledging a signed Create, and startup discovery verifies and skips a safe
+unpledged candidate without creating a committee/query slot. A file-backed
+staging/retry test covers that boundary. The older fixture reservation still
+permits an absent roster; no public Create ingress uses the new path yet.
+Startup still cannot resume a signed pre-archive Create or publish its route.
+Shared first-Create recovery order: (1) stage the signed call's exact runtime
+and selected roster before pledging the intent (internal path exists); (2)
+discover only safe unpledged candidates without creating extra phase files
+(file path exists); (3) resume a signed pre-archive Create from those durable
+inputs and quorum signatures while keeping its route absent; (4) verify
+publication, application ACK, retirement and route exposure through the
+existing owner. An incomplete
 Create must not make already published generations unrecoverable.
 
 Immediate integration seam: the experimental external-state package, physical
