@@ -80,6 +80,24 @@ Qualify the joiners' fresh-key recovery, catch-up and final three-voter state
 before selecting this over direct three-voter root-bootstrap changes. Existing
 portable Shared restore is same-node only, so it cannot serve as the joiner
 handoff without a separate authenticated onboarding path.
+A focused signed V2 Raft regression now applies the exact one-voter-to-three-
+voter committee shape and reopens its ledger after prepare, joint and stable
+phases; both it and the original committee-replacement recovery test pass.
+The test supplies already-committed entries, so it establishes only the
+transition ledger's authorization, application and recovery for this shape.
+It does not exercise a real quorum, enroll fresh node keys, transfer an
+authenticated generation to joiners or qualify released CLI orchestration.
+Those remain the decision gate before choosing staged expansion over direct
+three-voter genesis.
+The ordinary Shared startup finality gap is not a one-line adapter swap:
+`discover_shared_genesis_startup` returns no controller for a fresh Space,
+the retained production controller's type-erased Shared access exposes
+recovery only, and the startup verifier deliberately refuses unproved live
+provisions. The owner can produce replay-verified proof for an exact published
+generation, but a live Create path must first own the lifecycle/committee/
+archive stores and carry that proof through provisioning, application ACK,
+finalization and route publication. Do not replace the refusing verifier with
+a permissive one to make a fixture pass.
 
 Immediate integration seam: the experimental external-state package, physical
 Create, sealed Local genesis, file journal, pinned Invoke/ACK owner, and

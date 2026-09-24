@@ -9671,6 +9671,117 @@ mod tests {
 
     #[cfg(feature = "storage")]
     #[test]
+    fn v2_one_voter_to_three_voters_commits_signed_transition_and_reopens() {
+        // This is the exact committee shape proposed for the fixed three-node
+        // system rollout. It qualifies the Raft primitive, not joiner
+        // enrollment, Authority finality, or a released operator workflow.
+        let directory = TempDirectory::new("v2_system_one_to_three");
+        let path = directory.database();
+        let initial = committee(&[key(1)], &[]);
+        let next = committee(&[key(1), key(2), key(3)], &[]);
+        let generation = route(&initial).generation();
+        let store = journal_store(0xc3);
+        let change = committee_change(
+            generation,
+            &initial,
+            &next,
+            COMMITTEE_AUTHORITY_EPOCH,
+            1,
+            10,
+        );
+        let previous_voters = change.previous_voters().to_vec();
+        let next_voters = change.next_voters().to_vec();
+        let transition = change.transition();
+
+        {
+            let database = Arc::new(Database::create(&path).unwrap());
+            let ledger =
+                open_transition_ledger(Arc::clone(&database), initial.clone(), store).unwrap();
+            ledger
+                .append_committed_for_test(
+                    7,
+                    &EntryKind::Data {
+                        payload: AgentRaftCommand::PrepareCommitteeChange(change).encode(),
+                    },
+                )
+                .unwrap();
+            let prepared = ledger.next_committed_slot().unwrap().unwrap();
+            assert!(matches!(
+                ledger.apply_foundation_slot(&prepared).unwrap(),
+                AgentRaftFoundationApplyOutcomeV2::Applied(_)
+            ));
+            assert_eq!(ledger.active_committee().unwrap(), initial);
+            assert_eq!(
+                ledger.pending_transition().unwrap(),
+                Some((transition, false))
+            );
+        }
+
+        {
+            let database = Arc::new(Database::create(&path).unwrap());
+            let ledger =
+                open_transition_ledger(Arc::clone(&database), initial.clone(), store).unwrap();
+            assert_eq!(
+                ledger.pending_transition().unwrap(),
+                Some((transition, false))
+            );
+            append_committed_kind(
+                &database,
+                8,
+                &EntryKind::ConfigChange {
+                    joint_old: Some(previous_voters),
+                    members: next_voters.clone(),
+                },
+            );
+            let joint = ledger.next_committed_slot().unwrap().unwrap();
+            assert!(matches!(
+                ledger.apply_foundation_slot(&joint).unwrap(),
+                AgentRaftFoundationApplyOutcomeV2::Applied(_)
+            ));
+            assert_eq!(
+                ledger.pending_transition().unwrap(),
+                Some((transition, true))
+            );
+        }
+
+        {
+            let database = Arc::new(Database::create(&path).unwrap());
+            let ledger =
+                open_transition_ledger(Arc::clone(&database), initial.clone(), store).unwrap();
+            assert_eq!(
+                ledger.pending_transition().unwrap(),
+                Some((transition, true))
+            );
+            append_committed_kind(
+                &database,
+                8,
+                &EntryKind::ConfigChange {
+                    joint_old: None,
+                    members: next_voters,
+                },
+            );
+            let stable = ledger.next_committed_slot().unwrap().unwrap();
+            assert!(matches!(
+                ledger.apply_foundation_slot(&stable).unwrap(),
+                AgentRaftFoundationApplyOutcomeV2::Applied(_)
+            ));
+            assert_eq!(ledger.active_committee().unwrap(), next);
+            assert_eq!(ledger.pending_transition().unwrap(), None);
+        }
+
+        let database = Arc::new(Database::create(&path).unwrap());
+        let ledger = open_transition_ledger(database, initial, store).unwrap();
+        ledger.audit_recovery().unwrap();
+        assert_eq!(ledger.active_committee().unwrap(), next);
+        assert_eq!(ledger.pending_transition().unwrap(), None);
+        assert_eq!(
+            ledger.authority_epoch().unwrap(),
+            COMMITTEE_AUTHORITY_EPOCH + 1
+        );
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
     fn v2_snapshot_retains_rotation_evidence_after_audit_prefix_retirement() {
         let directory = TempDirectory::new("v2_snapshot_rotation_evidence");
         let path = directory.database();
