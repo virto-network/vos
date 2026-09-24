@@ -33,8 +33,9 @@ neither completes batch 1. Subsequent integration stays on
 
 1. **Authenticated storage + customer workflow (in progress).** Finish
    bounded external-state/Clerk integration (the Agent ledger-core port and
-   one physical signed transfer are done); establish common authenticated static
-   three-node genesis (not three singleton spaces); expose ordinary Shared
+   one physical signed transfer are done); establish one authenticated system
+   lineage at fixed three-node placement before customer traffic (not three
+   singleton spaces); expose ordinary Shared
    Create/Install through durable reservation/publication/application/finalize/
    retirement; add schema-aware CLI invocation. Qualify with actual release
    binaries, not fixture-only issuer handoffs. Check Clerk growth feasibility
@@ -73,6 +74,12 @@ rejects `ChangeReplicas`; three-node system placement therefore needs a real
 bootstrap/placement cutover, not merely a CLI wrapper around existing calls.
 The V2 Raft committee-transition primitive exists, but it is not an operator
 onboarding workflow or a substitute for node-local authenticated recovery.
+The smallest candidate is to keep the existing one-voter root bootstrap, then
+admit two nodes and use that signed V2 transition before customer traffic.
+Qualify the joiners' fresh-key recovery, catch-up and final three-voter state
+before selecting this over direct three-voter root-bootstrap changes. Existing
+portable Shared restore is same-node only, so it cannot serve as the joiner
+handoff without a separate authenticated onboarding path.
 
 Immediate integration seam: the experimental external-state package, physical
 Create, sealed Local genesis, file journal, pinned Invoke/ACK owner, and
