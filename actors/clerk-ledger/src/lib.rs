@@ -31,9 +31,10 @@
 //! per-key rows bound by incrementally-maintained SMT roots. Kernel
 //! point operations touch individual rows, and the composite state root
 //! reads in O(1) from six per-field root rows instead of an O(N log N)
-//! rebuild. This does not bound host/runtime work by the touched set:
-//! the Agent lane image materializes the rows and enforces aggregate
-//! row and byte limits. The auxiliary collections below use plain storage:
+//! rebuild. This does not by itself bound host/runtime work by the touched
+//! set: the released image lane still materializes rows and enforces aggregate
+//! row and byte limits. The opt-in Agent build has not yet qualified Clerk
+//! against external-state storage. The auxiliary collections below use plain storage:
 //!
 //! - `journal`: one-entry committed map (the journal sub-SMT);
 //!   `journal_id` in the blob is the O(1) handle to it.
@@ -226,11 +227,17 @@ macro_rules! decode_or_bad_input {
 pub mod roles;
 pub use roles::{CLERK_LEDGER_SPACE_ROLE_MAP, ClerkLedgerRole};
 
-#[actor(
+#[cfg_attr(feature = "agent", actor(
+    agent,
     role = ClerkLedgerRole,
     default_role = ClerkLedgerRole::None,
     space_role_map = CLERK_LEDGER_SPACE_ROLE_MAP,
-)]
+))]
+#[cfg_attr(not(feature = "agent"), actor(
+    role = ClerkLedgerRole,
+    default_role = ClerkLedgerRole::None,
+    space_role_map = CLERK_LEDGER_SPACE_ROLE_MAP,
+))]
 pub struct ClerkLedger {
     /// The bootstrapped journal's id — `None` until `bootstrap`. The
     /// journal row itself lives in the committed `journal` map (its
@@ -318,10 +325,21 @@ impl ClerkLedger {
     /// Host-controlled System calls remain available for local operator tooling; members must
     /// carry the authenticated role bytes supplied by their ingress boundary.
     fn authorize_proof_operator(ctx: &mut Context<Self>) -> bool {
-        let allowed = match ctx.origin() {
-            Origin::System => true,
-            Origin::Member(_) => ctx.has_role(ClerkLedgerRole::Operator),
-            Origin::Anonymous | Origin::Actor(_) => false,
+        let allowed = if ctx.agent_invocation_context().is_some() {
+            #[cfg(feature = "agent")]
+            {
+                ctx.has_agent_actor_role(roles::CLERK_OPERATOR_AGENT_ROLE)
+            }
+            #[cfg(not(feature = "agent"))]
+            {
+                false
+            }
+        } else {
+            match ctx.origin() {
+                Origin::System => true,
+                Origin::Member(_) => ctx.has_role(ClerkLedgerRole::Operator),
+                Origin::Anonymous | Origin::Actor(_) => false,
+            }
         };
         if !allowed {
             ctx.__mark_forbidden();
@@ -374,19 +392,19 @@ impl ClerkLedger {
     /// hashes — the roots are maintained incrementally as the maps
     /// mutate.
     fn composite_root(&self) -> [u8; 32] {
-        composite_root_from_subroots(
-            &self.accounts.root(),
-            &self.transfers.root(),
-            &self.journal.root(),
-            &self.external_ids.root(),
-            &self.voided_transfers.root(),
-            &self.pending_statuses.root(),
+        clerk_composite_root(
+            &self.accounts,
+            &self.transfers,
+            &self.journal,
+            &self.external_ids,
+            &self.voided_transfers,
+            &self.pending_statuses,
         )
     }
 
     /// The bootstrapped journal row, if any.
     fn journal_row(&self) -> Option<CcJournal> {
-        self.journal_id.and_then(|id| self.journal.get(&id))
+        clerk_journal_row(self.journal_id, &self.journal)
     }
 
     /// State-hiding signature preflight shared by the direct and provable
@@ -394,43 +412,14 @@ impl ClerkLedger {
     /// referenced pending transfer inside the kernel, so it deliberately
     /// skips the entries-based check here.
     fn transfer_signatures_valid(&self, transfer: &CcTransfer) -> bool {
-        let is_pending_finalize = transfer
-            .flags
-            .contains(TransferFlags::POST_PENDING_TRANSFER)
-            || transfer
-                .flags
-                .contains(TransferFlags::VOID_PENDING_TRANSFER);
-        if is_pending_finalize {
-            return true;
-        }
-
-        let mut distinct_debits: Vec<CcAccountId> = Vec::new();
-        for entry in &transfer.entries {
-            if entry.direction == Direction::Debit && !distinct_debits.contains(&entry.account_id) {
-                distinct_debits.push(entry.account_id);
-            }
-        }
-        if transfer.signatures.len() != distinct_debits.len() {
-            return false;
-        }
-        let msg = transfer.signing_payload();
-        distinct_debits
-            .iter()
-            .zip(&transfer.signatures)
-            .all(|(account_id, signature)| {
-                self.accounts
-                    .get(&account_id.0)
-                    .is_some_and(|account| verify_signature(&account.auth_key, &msg, signature))
-            })
+        clerk_transfer_signatures_valid(&self.accounts, transfer)
     }
 
     /// An ordinary reversal may not target a transfer whose voucher anchor
     /// has already committed. This check runs after signature preflight so
     /// unauthenticated junk cannot use the status as a lock-membership oracle.
     fn voids_voucher_locked_transfer(&self, transfer: &CcTransfer) -> bool {
-        transfer
-            .void_of
-            .is_some_and(|original| self.voucher_locked_transfers.contains(&original.0))
+        clerk_voids_voucher_locked_transfer(&self.voucher_locked_transfers, transfer)
     }
 
     fn lock_voucher_anchor(
@@ -438,24 +427,170 @@ impl ClerkLedger {
         id: [u8; 16],
         amount_commit: [u8; 32],
     ) -> Option<LedgerVoucherAnchor> {
-        let transfer = self.transfers.get(&id)?;
-        let roots = self.transfer_roots.get(&id)?;
-        let currency = voucher_transfer_currency(
-            &transfer,
-            &amount_commit,
-            self.voided_transfers.contains(&id),
-        )?;
-        self.voucher_locked_transfers.insert(&id);
-        Some(LedgerVoucherAnchor {
+        clerk_lock_voucher_anchor(
+            &self.transfers,
+            &self.transfer_roots,
+            &self.voided_transfers,
+            &mut self.voucher_locked_transfers,
+            id,
             amount_commit,
-            currency,
-            root_before: roots.root_before,
-            root_after: roots.root_after,
-        })
+        )
     }
 }
 
-#[messages]
+// Field-level helpers are shared by the legacy actor and the Agent lane
+// views. Passing the fields explicitly keeps Agent handlers inside the Linear
+// view instead of bypassing it through an unrestricted `&self` helper.
+fn clerk_composite_root(
+    accounts: &CommittedMap<[u8; 16], CcAccount>,
+    transfers: &CommittedMap<[u8; 16], CcTransfer>,
+    journal: &CommittedMap<[u8; 16], CcJournal>,
+    external_ids: &CommittedMap<[u8; 16], [u8; 32]>,
+    voided_transfers: &CommittedMap<[u8; 16], u8>,
+    pending_statuses: &CommittedMap<[u8; 16], u8>,
+) -> [u8; 32] {
+    composite_root_from_subroots(
+        &accounts.root(),
+        &transfers.root(),
+        &journal.root(),
+        &external_ids.root(),
+        &voided_transfers.root(),
+        &pending_statuses.root(),
+    )
+}
+
+fn clerk_journal_row(
+    journal_id: Option<[u8; 16]>,
+    journal: &CommittedMap<[u8; 16], CcJournal>,
+) -> Option<CcJournal> {
+    journal_id.and_then(|id| journal.get(&id))
+}
+
+fn clerk_transfer_signatures_valid(
+    accounts: &CommittedMap<[u8; 16], CcAccount>,
+    transfer: &CcTransfer,
+) -> bool {
+    let is_pending_finalize = transfer
+        .flags
+        .contains(TransferFlags::POST_PENDING_TRANSFER)
+        || transfer
+            .flags
+            .contains(TransferFlags::VOID_PENDING_TRANSFER);
+    if is_pending_finalize {
+        return true;
+    }
+
+    let mut distinct_debits: Vec<CcAccountId> = Vec::new();
+    for entry in &transfer.entries {
+        if entry.direction == Direction::Debit && !distinct_debits.contains(&entry.account_id) {
+            distinct_debits.push(entry.account_id);
+        }
+    }
+    if transfer.signatures.len() != distinct_debits.len() {
+        return false;
+    }
+    let msg = transfer.signing_payload();
+    distinct_debits
+        .iter()
+        .zip(&transfer.signatures)
+        .all(|(account_id, signature)| {
+            accounts
+                .get(&account_id.0)
+                .is_some_and(|account| verify_signature(&account.auth_key, &msg, signature))
+        })
+}
+
+fn clerk_voids_voucher_locked_transfer(
+    locks: &StorageSet<[u8; 16]>,
+    transfer: &CcTransfer,
+) -> bool {
+    transfer
+        .void_of
+        .is_some_and(|original| locks.contains(&original.0))
+}
+
+fn clerk_lock_voucher_anchor(
+    transfers: &CommittedMap<[u8; 16], CcTransfer>,
+    transfer_roots: &StorageMap<[u8; 16], TransferRootEntry>,
+    voided_transfers: &CommittedMap<[u8; 16], u8>,
+    locks: &mut StorageSet<[u8; 16]>,
+    id: [u8; 16],
+    amount_commit: [u8; 32],
+) -> Option<LedgerVoucherAnchor> {
+    let transfer = transfers.get(&id)?;
+    let roots = transfer_roots.get(&id)?;
+    let currency =
+        voucher_transfer_currency(&transfer, &amount_commit, voided_transfers.contains(&id))?;
+    locks.insert(&id);
+    Some(LedgerVoucherAnchor {
+        amount_commit,
+        currency,
+        root_before: roots.root_before,
+        root_after: roots.root_after,
+    })
+}
+
+#[cfg(feature = "agent")]
+impl __VosClerkLedgerDefaultMutationView<'_> {
+    fn composite_root(&self) -> [u8; 32] {
+        clerk_composite_root(
+            self.accounts,
+            self.transfers,
+            self.journal,
+            self.external_ids,
+            self.voided_transfers,
+            self.pending_statuses,
+        )
+    }
+
+    fn journal_row(&self) -> Option<CcJournal> {
+        clerk_journal_row(*self.journal_id, self.journal)
+    }
+
+    fn transfer_signatures_valid(&self, transfer: &CcTransfer) -> bool {
+        clerk_transfer_signatures_valid(self.accounts, transfer)
+    }
+
+    fn voids_voucher_locked_transfer(&self, transfer: &CcTransfer) -> bool {
+        clerk_voids_voucher_locked_transfer(self.voucher_locked_transfers, transfer)
+    }
+
+    fn lock_voucher_anchor(
+        &mut self,
+        id: [u8; 16],
+        amount_commit: [u8; 32],
+    ) -> Option<LedgerVoucherAnchor> {
+        clerk_lock_voucher_anchor(
+            self.transfers,
+            self.transfer_roots,
+            self.voided_transfers,
+            self.voucher_locked_transfers,
+            id,
+            amount_commit,
+        )
+    }
+}
+
+#[cfg(feature = "agent")]
+impl __VosClerkLedgerSharedQueryView<'_> {
+    fn composite_root(&self) -> [u8; 32] {
+        clerk_composite_root(
+            self.accounts,
+            self.transfers,
+            self.journal,
+            self.external_ids,
+            self.voided_transfers,
+            self.pending_statuses,
+        )
+    }
+
+    fn journal_row(&self) -> Option<CcJournal> {
+        clerk_journal_row(*self.journal_id, self.journal)
+    }
+}
+
+#[cfg_attr(feature = "agent", messages(agent))]
+#[cfg_attr(not(feature = "agent"), messages)]
 impl ClerkLedger {
     fn new() -> Self {
         Self {
@@ -481,7 +616,7 @@ impl ClerkLedger {
     /// One-time initialization. Records the journal id, registrar
     /// pubkey, and journal type code. Idempotent in identical
     /// arguments.
-    #[msg(role = ClerkLedgerRole::Operator)]
+    #[msg(role = ClerkLedgerRole::Operator, actor_role_id = "0727707313c8a3ab999ff2ad14fec1a5bb5d124f9b09af3d6ff1bdd5597919b2")]
     async fn bootstrap(
         &mut self,
         journal_id: [u8; 16],
@@ -524,7 +659,7 @@ impl ClerkLedger {
     /// Accept a registrar-signed `CreateAccount`. Signature gate
     /// before any state-dependent rejection so attackers can't
     /// probe state by submitting junk-signed creates.
-    #[msg(role = ClerkLedgerRole::Operator)]
+    #[msg(role = ClerkLedgerRole::Operator, actor_role_id = "0727707313c8a3ab999ff2ad14fec1a5bb5d124f9b09af3d6ff1bdd5597919b2")]
     async fn create_account(
         &mut self,
         create_account_bytes: Vec<u8>,
@@ -567,7 +702,7 @@ impl ClerkLedger {
     /// kernel, and one junk-signed item rejects the whole batch
     /// without touching state. Replies with one `Status` byte per
     /// item (a single byte on batch-level rejection).
-    #[msg(role = ClerkLedgerRole::Operator)]
+    #[msg(role = ClerkLedgerRole::Operator, actor_role_id = "0727707313c8a3ab999ff2ad14fec1a5bb5d124f9b09af3d6ff1bdd5597919b2")]
     async fn create_accounts(
         &mut self,
         creates_bytes: Vec<u8>,
@@ -622,7 +757,7 @@ impl ClerkLedger {
     /// clerk-ledger `Status` taxonomy. On `Status::Ok` the transfer
     /// is recorded in state and the touched accounts' balance
     /// commits are updated via the Pedersen homomorphism.
-    #[msg(role = ClerkLedgerRole::Operator)]
+    #[msg(role = ClerkLedgerRole::Operator, actor_role_id = "0727707313c8a3ab999ff2ad14fec1a5bb5d124f9b09af3d6ff1bdd5597919b2")]
     async fn apply_transfer(
         &mut self,
         transfer_bytes: Vec<u8>,
@@ -734,7 +869,7 @@ impl ClerkLedger {
     /// resulting witness to the producer-private record sidecar before
     /// committing actor state. CRDT Task packages remain fail-closed until
     /// private input availability has a causal replication protocol.
-    #[msg(role = ClerkLedgerRole::Operator)]
+    #[msg(role = ClerkLedgerRole::Operator, actor_role_id = "0727707313c8a3ab999ff2ad14fec1a5bb5d124f9b09af3d6ff1bdd5597919b2")]
     async fn apply_transfer_provable(
         &mut self,
         transfer_bytes: Vec<u8>,
@@ -899,7 +1034,7 @@ impl ClerkLedger {
     /// Export the producer-private proof-record entry for one accepted
     /// provable transfer. Operator-gated because the entry contains the
     /// exact witness, including commitment openings.
-    #[msg(role = ClerkLedgerRole::Operator)]
+    #[msg(role = ClerkLedgerRole::Operator, actor_role_id = "0727707313c8a3ab999ff2ad14fec1a5bb5d124f9b09af3d6ff1bdd5597919b2")]
     async fn transfer_proof_record(
         &self,
         transfer_id: [u8; 16],
@@ -920,7 +1055,7 @@ impl ClerkLedger {
 
     /// Canonical producer-record export consumed by
     /// `vosx zk prove --from <actor> --tag <hex>`.
-    #[msg(role = ClerkLedgerRole::Operator)]
+    #[msg(role = ClerkLedgerRole::Operator, actor_role_id = "0727707313c8a3ab999ff2ad14fec1a5bb5d124f9b09af3d6ff1bdd5597919b2")]
     async fn proof_record(&self, tag: [u8; 32], ctx: &mut Context<Self>) -> Vec<u8> {
         if !Self::authorize_proof_operator(ctx) {
             return Vec::new();
@@ -936,7 +1071,7 @@ impl ClerkLedger {
 
     /// Delete a producer-private record after proof publication or settlement
     /// expiry. Idempotent: a missing tag returns false.
-    #[msg(role = ClerkLedgerRole::Operator)]
+    #[msg(role = ClerkLedgerRole::Operator, actor_role_id = "0727707313c8a3ab999ff2ad14fec1a5bb5d124f9b09af3d6ff1bdd5597919b2")]
     async fn prune_proof_record(&mut self, tag: [u8; 32], ctx: &mut Context<Self>) -> bool {
         if !Self::authorize_proof_operator(ctx) {
             return false;
@@ -951,13 +1086,13 @@ impl ClerkLedger {
     }
 
     /// Read an account by id.
-    #[msg(role = ClerkLedgerRole::Member)]
+    #[msg(role = ClerkLedgerRole::Member, actor_role_id = "a1b12a800f4dc4d99707ddb39f91403bc9b8b87a1eb14aeaeb14fc1a63d28a21")]
     async fn account(&self, id: [u8; 16]) -> Option<CcAccount> {
         self.accounts.get(&id)
     }
 
     /// Read a transfer by id.
-    #[msg(role = ClerkLedgerRole::Member)]
+    #[msg(role = ClerkLedgerRole::Member, actor_role_id = "a1b12a800f4dc4d99707ddb39f91403bc9b8b87a1eb14aeaeb14fc1a63d28a21")]
     async fn transfer(&self, id: [u8; 16]) -> Option<CcTransfer> {
         self.transfers.get(&id)
     }
@@ -989,12 +1124,12 @@ impl ClerkLedger {
         self.lock_voucher_anchor(id, amount_commit)
     }
 
-    #[msg(role = ClerkLedgerRole::Member)]
+    #[msg(role = ClerkLedgerRole::Member, actor_role_id = "a1b12a800f4dc4d99707ddb39f91403bc9b8b87a1eb14aeaeb14fc1a63d28a21")]
     async fn account_count(&self) -> u32 {
         self.accounts.len() as u32
     }
 
-    #[msg(role = ClerkLedgerRole::Member)]
+    #[msg(role = ClerkLedgerRole::Member, actor_role_id = "a1b12a800f4dc4d99707ddb39f91403bc9b8b87a1eb14aeaeb14fc1a63d28a21")]
     async fn transfer_count(&self) -> u32 {
         self.transfers.len() as u32
     }
@@ -1011,7 +1146,7 @@ impl ClerkLedger {
     /// Runtime cost: O(1) — six per-field root-row reads and five node
     /// hashes; the roots are maintained incrementally as the committed
     /// maps mutate.
-    #[msg(role = ClerkLedgerRole::Member)]
+    #[msg(role = ClerkLedgerRole::Member, actor_role_id = "a1b12a800f4dc4d99707ddb39f91403bc9b8b87a1eb14aeaeb14fc1a63d28a21")]
     async fn state_root(&self) -> Vec<u8> {
         match self.journal_id {
             Some(_) => self.composite_root().to_vec(),
@@ -1036,7 +1171,7 @@ impl ClerkLedger {
     /// commitment isn't 32 bytes. (Pedersen-point validity beyond
     /// length is the kernel's / verifier's concern; clerk-ledger
     /// just stores bytes.)
-    #[msg(role = ClerkLedgerRole::Operator)]
+    #[msg(role = ClerkLedgerRole::Operator, actor_role_id = "0727707313c8a3ab999ff2ad14fec1a5bb5d124f9b09af3d6ff1bdd5597919b2")]
     async fn submit_note_commitment(&mut self, commitment: Vec<u8>) -> Status {
         let Some(bytes) = try_array::<32>(commitment) else {
             return Status::BadInput;
@@ -1046,14 +1181,14 @@ impl ClerkLedger {
     }
 
     /// Number of note commitments in the L3 pool.
-    #[msg(role = ClerkLedgerRole::Member)]
+    #[msg(role = ClerkLedgerRole::Member, actor_role_id = "a1b12a800f4dc4d99707ddb39f91403bc9b8b87a1eb14aeaeb14fc1a63d28a21")]
     async fn note_commitment_count(&self) -> u32 {
         self.note_commitments.len() as u32
     }
 
     /// Read a note commitment by its insertion index. Returns an
     /// empty `Vec` for out-of-range indices.
-    #[msg(role = ClerkLedgerRole::Member)]
+    #[msg(role = ClerkLedgerRole::Member, actor_role_id = "a1b12a800f4dc4d99707ddb39f91403bc9b8b87a1eb14aeaeb14fc1a63d28a21")]
     async fn note_commitment_at(&self, index: u32) -> Vec<u8> {
         self.note_commitments
             .get(index as u64)

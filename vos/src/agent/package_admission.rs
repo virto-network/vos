@@ -1302,6 +1302,46 @@ pub(super) mod tests {
     }
 
     #[test]
+    #[ignore = "set CLERK_AGENT_PACKAGE to a canonical `vosx actor build` output"]
+    fn canonical_clerk_agent_package_passes_host_admission() {
+        let path = std::env::var_os("CLERK_AGENT_PACKAGE")
+            .expect("CLERK_AGENT_PACKAGE must name the canonical signed VOS3 package");
+        let bytes = std::fs::read(path).expect("read canonical Clerk Agent package");
+        let admitted = admit_actor_package(&bytes).expect("host admits signed Clerk Agent package");
+        assert_eq!(admitted.manifest().name, "clerk-ledger");
+        assert_eq!(admitted.exact_bytes(), bytes);
+        assert_eq!(
+            admitted.manifest().requirements.lanes,
+            LaneSet::of(StateLane::Linear)
+        );
+        assert_eq!(
+            admitted.program(),
+            ProgramId::of_pvm(admitted.program_bytes())
+        );
+        let policy = ActorMethodPolicyArtifact::decode(admitted.method_policy_bytes())
+            .expect("signed Clerk method policy");
+        let selector = |name| {
+            policy
+                .methods
+                .iter()
+                .find(|method| method.name == name)
+                .expect("signed Clerk method")
+                .authorization_policy
+        };
+        let vos_agent_sdk::method_policy::AuthorizationPolicySelector::ActorRole(operator) =
+            selector("apply_transfer")
+        else {
+            panic!("transfer mutation must require the Operator role");
+        };
+        let vos_agent_sdk::method_policy::AuthorizationPolicySelector::ActorRole(member) =
+            selector("account")
+        else {
+            panic!("account read must require the Member role");
+        };
+        assert_ne!(operator, member);
+    }
+
+    #[test]
     fn rejects_previous_generations_wrong_kinds_and_bad_signatures() {
         assert_eq!(
             admit_actor_package(b"VOSKprevious-generation").unwrap_err(),

@@ -1422,14 +1422,21 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .to_compile_error()
                 .into();
             }
-        } else if actor_role_id.is_some() || space_role_id.is_some() {
+        } else if (actor_role_id.is_some() && role_expr.is_none())
+            || (space_role_id.is_some() && space_role_expr.is_none())
+        {
             return syn::Error::new_spanned(
                 &method.sig,
-                "actor_role_id and space_role_id are valid only in #[messages(agent)]",
+                "portable role identity requires the matching legacy role predicate",
             )
             .to_compile_error()
             .into();
         }
+
+        // An actor compiled for both service and Agent ABIs may carry its
+        // Agent-only portable role identity beside the legacy role byte. The
+        // legacy dispatcher still checks only its established role predicate;
+        // the portable identity is emitted and enforced only in Agent mode.
 
         if is_attested && is_job {
             return syn::Error::new_spanned(

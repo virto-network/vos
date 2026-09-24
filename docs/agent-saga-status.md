@@ -441,6 +441,27 @@ startup path retains locked journal owners. Do not enable external mode in the
 default binary or present this experimental ingress as a supported customer
 workflow until the file-backed and artifact gates pass.
 
+Clerk Agent port, WIP only: `clerk-ledger` now has an opt-in `agent` build over
+the same state fields, cipher-clerk kernel, signature checks and composite-root
+helpers; the legacy service build remains the default. Agent methods carry
+portable exact Operator/Member role identities. Unlike the legacy ordered role
+byte, one Agent invocation carries one exact role claim: an Operator principal
+needs a Member grant for Member-only reads. The clean Agent entry avoids
+linking the nested service runner, and an Agent-only linker layout puts its
+writable data in the standard PVM region. Legacy and Agent host suites passed
+(13 and 14 tests); both PVM builds succeeded; the canonical `vosx actor build`
+produced a signed VOS3 Clerk package, and host package admission accepted it.
+The ignored physical external-Local Create/Install/restart fixture also passed
+with that exact package supplied by `CLERK_AGENT_PACKAGE`: the standard state
+guest accepted and published its Install, and the file-backed owner reopened
+the finalized generation. This is not a Clerk method Invoke, role-grant or
+root-parity test. Backend credentials, Shared finality and retained growth
+also remain unqualified.
+Proof-record and reciprocal voucher-origin behavior on the clean Agent path
+also remain unqualified and must stay out of a first-release claim until
+tested. Next qualify real Install/Invoke with unchanged kernel roots, then
+multi-row growth and three-node publication.
+
 Provisional acceptance envelope (customer confirmation required before sign-off):
 
 - Three separate 8-vCPU/16-GiB/SSD nodes, inter-node RTT at most 5 ms.

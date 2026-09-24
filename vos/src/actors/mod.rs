@@ -77,6 +77,14 @@ pub fn run_refine_entry<A: Actor>(args_address: u64, args_len: u64) {
 /// marker, while standard agent actors have one kernel-free refine entry.
 #[cfg(feature = "service")]
 pub fn run_actor_entry<A: Actor>(a0: u64, a1: u64, a2: u64, a3: u64) {
+    // Agent actors use the clean single-entry ABI even when their crate also
+    // depends on legacy service helpers. Do not link the nested service
+    // runner into an Agent artifact: it carries dynamic host calls outside
+    // the standard PVM profile.
+    if A::AGENT_ACTOR_SOURCE {
+        run::run_refine::<A>(a0, a1);
+        return;
+    }
     if a3 == crate::service::NESTED_ACTOR_CALL_MAGIC {
         run_nested_actor_entry::<A>(a0, a1, a2)
     } else {

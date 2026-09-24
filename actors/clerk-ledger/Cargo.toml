@@ -12,6 +12,9 @@ default = ["bin"]
 # depending on this crate as a Ref source turn it off via
 # `default-features = false` so no entries land in their link.
 bin = []
+# Build the same Clerk state and kernel through the Agent actor ABI. The
+# service package remains the default until the Agent package is qualified.
+agent = []
 
 [lib]
 crate-type = ["rlib", "cdylib"]

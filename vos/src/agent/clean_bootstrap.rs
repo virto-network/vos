@@ -16847,11 +16847,20 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(reopened_archive.encode(), archive_bytes);
-            let install_package = crate::agent::package_admission::admitted_standard_actor_for_test(
-                "external-local-scope",
-                StateLane::Local,
-                0x68,
-            );
+            let install_package = if let Some(path) = std::env::var_os("CLERK_AGENT_PACKAGE") {
+                let package = crate::agent::package_admission::admit_actor_package(
+                    &std::fs::read(path).expect("read canonical Clerk Agent package"),
+                )
+                .expect("admit canonical Clerk Agent package");
+                assert_eq!(package.manifest().name.as_str(), "clerk-ledger");
+                package
+            } else {
+                crate::agent::package_admission::admitted_standard_actor_for_test(
+                    "external-local-scope",
+                    StateLane::Local,
+                    0x68,
+                )
+            };
             let install_request =
                 install_request(descriptor.identity.agent, &install_package, 0x69, None);
             let (mut install_call, _) =

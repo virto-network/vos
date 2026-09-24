@@ -32,6 +32,60 @@ use crate::{ClerkLedger, ClerkLedgerRole, voucher_transfer_currency};
 const LEAF_DOMAIN: &[u8] = cipher_clerk::merkle::SMT_LEAF;
 const NODE_DOMAIN: &[u8] = cipher_clerk::merkle::SMT_NODE;
 
+#[cfg(feature = "agent")]
+#[test]
+fn agent_port_binds_linear_kernel_methods_and_exact_roles() {
+    use crate::roles::{CLERK_MEMBER_AGENT_ROLE, CLERK_OPERATOR_AGENT_ROLE};
+    use vos::Actor;
+    use vos::agent::sdk::MethodMode;
+    use vos::metadata::AgentAuthorizationSelectorMeta;
+
+    assert!(<ClerkLedger as Actor>::AGENT_ACTOR_SOURCE);
+    assert_ne!(CLERK_MEMBER_AGENT_ROLE, CLERK_OPERATOR_AGENT_ROLE);
+    let mode = |name| {
+        crate::ClerkLedgerMsg::AGENT_METHODS
+            .iter()
+            .find(|method| method.name == name)
+            .expect("signed Clerk method")
+            .mode
+    };
+    for name in [
+        "bootstrap",
+        "create_account",
+        "create_accounts",
+        "apply_transfer",
+    ] {
+        assert_eq!(mode(name), MethodMode::Linear);
+    }
+    for name in ["account", "transfer", "state_root"] {
+        assert_eq!(mode(name), MethodMode::Query);
+    }
+    let selector = |name| {
+        crate::ClerkLedgerMsg::AGENT_AUTHORIZATIONS
+            .iter()
+            .find(|method| method.name == name)
+            .expect("signed Clerk authorization")
+            .selector
+    };
+    for name in [
+        "bootstrap",
+        "create_account",
+        "create_accounts",
+        "apply_transfer",
+    ] {
+        assert_eq!(
+            selector(name),
+            AgentAuthorizationSelectorMeta::ActorRole(CLERK_OPERATOR_AGENT_ROLE.0)
+        );
+    }
+    for name in ["account", "transfer", "state_root"] {
+        assert_eq!(
+            selector(name),
+            AgentAuthorizationSelectorMeta::ActorRole(CLERK_MEMBER_AGENT_ROLE.0)
+        );
+    }
+}
+
 fn mk_account(id_byte: u8) -> CcAccount {
     CcAccount::new(
         CcAccountId([id_byte; 16]),
