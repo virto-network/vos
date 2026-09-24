@@ -537,6 +537,38 @@ impl AgentReplicaCommittee {
         Ok(())
     }
 
+    /// Bind independently selected peer identities to the exact nodes,
+    /// principals and roles authorized by a signed Shared Create descriptor.
+    /// The descriptor does not carry peer IDs or keys, so it cannot be used to
+    /// reconstruct this committee after a crash.
+    pub fn validate_for_clean_descriptor(
+        &self,
+        descriptor: &crate::agent_sdk::AgentDescriptor,
+    ) -> Result<(), AgentGenesisError> {
+        self.validate()?;
+        if descriptor.validate().is_err()
+            || descriptor.identity.profile != crate::agent_sdk::AgentProfile::Shared
+            || self.space.0 != descriptor.identity.space.0
+            || self.agent.0 != descriptor.identity.agent.0
+            || self.profile != AgentProfile::Shared
+            || self.members.len() != descriptor.replicas.len()
+            || self
+                .members
+                .iter()
+                .zip(&descriptor.replicas)
+                .any(|(member, replica)| {
+                    let selected = member.replica();
+                    selected.node.0 != replica.node.0
+                        || selected.principal.0 != replica.principal.0
+                        || (selected.role == ReplicaRole::Voter)
+                            != (replica.role == crate::agent_sdk::ReplicaRole::Voter)
+                })
+        {
+            return Err(AgentGenesisError::InvalidReplicaCommittee);
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), AgentGenesisError> {
         if self.space == SpaceId::ZERO
             || self.agent == AgentId::ZERO
@@ -2371,6 +2403,29 @@ mod tests {
                 .collect(),
         };
         descriptor.validate().unwrap();
+        let selected_replicas = AgentReplicaCommittee::new(
+            SpaceId(space.0),
+            AgentId(agent.0),
+            AgentProfile::Shared,
+            baseline.replicas.members().to_vec(),
+        )
+        .unwrap();
+        selected_replicas
+            .validate_for_clean_descriptor(&descriptor)
+            .unwrap();
+        let mut altered_descriptor = descriptor.clone();
+        altered_descriptor.replicas[0].principal.0[0] ^= 1;
+        assert!(
+            selected_replicas
+                .validate_for_clean_descriptor(&altered_descriptor)
+                .is_err()
+        );
+        assert!(
+            baseline
+                .replicas
+                .validate_for_clean_descriptor(&descriptor)
+                .is_err()
+        );
         let request = sdk::ManagementRequest::Create(Box::new(descriptor.clone()));
         let mut call = AuthorityCredentialCall {
             invocation: sdk::InvocationId::ZERO,

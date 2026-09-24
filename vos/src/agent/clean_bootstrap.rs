@@ -3566,25 +3566,12 @@ where
         let descriptor = (**descriptor).clone();
         if descriptor.identity.profile != AgentProfile::Shared
             || descriptor.identity.space != self.pins.space
-            || committee.space().0 != self.pins.space.0
-            || committee.agent().0 != descriptor.identity.agent.0
-            || committee.profile() != super::AgentProfile::Shared
-            || committee.validate().is_err()
+            || committee
+                .validate_for_clean_descriptor(&descriptor)
+                .is_err()
             || committee
                 .member_by_node(crate::service::NodeId(self.pins.node.0))
                 .is_none()
-            || committee.members().len() != descriptor.replicas.len()
-            || committee
-                .members()
-                .iter()
-                .zip(&descriptor.replicas)
-                .any(|(member, replica)| {
-                    let member = member.replica();
-                    member.node.0 != replica.node.0
-                        || member.principal.0 != replica.principal.0
-                        || (member.role == super::ReplicaRole::Voter)
-                            != (replica.role == super::sdk::ReplicaRole::Voter)
-                })
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
@@ -7705,6 +7692,7 @@ mod tests {
         struct IssuerMemoryStore {
             image: Arc<Mutex<Option<Vec<u8>>>>,
             runtime: Arc<Mutex<Option<Vec<u8>>>>,
+            shared_replicas: Arc<Mutex<Option<Vec<u8>>>>,
             actor: Arc<Mutex<Option<Vec<u8>>>>,
             external_create_archive: Arc<Mutex<Option<Vec<u8>>>>,
             #[cfg(feature = "experimental-state-blocks")]
@@ -7724,6 +7712,21 @@ mod tests {
                     return Err(MemoryError);
                 }
                 *runtime = Some(bytes.to_vec());
+                Ok(())
+            }
+        }
+
+        impl crate::agent::clean_authority_issuer::CleanSharedGenesisReplicaStore for IssuerMemoryStore {
+            fn load_replicas(&mut self) -> Result<Option<Vec<u8>>, MemoryError> {
+                Ok(self.shared_replicas.lock().unwrap().clone())
+            }
+
+            fn commit_replicas(&mut self, bytes: &[u8]) -> Result<(), MemoryError> {
+                let mut replicas = self.shared_replicas.lock().unwrap();
+                if replicas.as_ref().is_some_and(|saved| saved != bytes) {
+                    return Err(MemoryError);
+                }
+                *replicas = Some(bytes.to_vec());
                 Ok(())
             }
         }

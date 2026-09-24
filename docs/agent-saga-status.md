@@ -111,6 +111,22 @@ creates nothing, and any retained entry still fails closed. This removes one
 first-Create crash edge, not the larger gate: a signed reservation before its
 archive needs a durable independently selected replica roster and phase-aware
 recovery before public Create can be enabled.
+The committee store now has an immutable, 64-KiB-bounded replica-roster
+sidecar under its existing exclusive lease. File tests cover exact retry,
+reopen, and refusal of a staged replacement. An on-demand recovery method
+decodes canonical peer identities and checks the retained roster against the
+verified signed Create using the same binding rule as live preparation. Startup
+opening now invokes that check for any present sidecar; absence is still
+accepted because reservation does not yet retain the roster. Startup cannot
+resume a pre-archive Create. Do not use the sidecar as authority until
+reservation and that phase-aware recovery are integrated.
+Shared first-Create recovery order: (1) verify the signed call and stage the
+exact runtime plus selected roster before pledging the intent; (2) discover
+and retain only safe unpledged candidates without creating extra phase files;
+(3) resume a signed pre-archive Create from those durable inputs and quorum
+signatures while keeping its route absent; (4) verify publication, application
+ACK, retirement and route exposure through the existing owner. An incomplete
+Create must not make already published generations unrecoverable.
 
 Immediate integration seam: the experimental external-state package, physical
 Create, sealed Local genesis, file journal, pinned Invoke/ACK owner, and

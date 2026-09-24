@@ -97,6 +97,25 @@ pub trait CleanManagementRuntimeStore: CleanManagementIssuerStore {
     fn commit_runtime(&mut self, package: &[u8]) -> Result<(), Self::Error>;
 }
 
+/// Independently selected initial Shared replica identities retained before
+/// Create issuance. The signed descriptor binds their node/principal/role;
+/// recovery must additionally validate the peer keys and exact roster bytes.
+/// This store is not Authority approval or genesis finality.
+pub trait CleanSharedGenesisReplicaStore: CleanManagementIssuerStore {
+    fn load_replicas(&mut self) -> Result<Option<Vec<u8>>, Self::Error>;
+    fn commit_replicas(&mut self, replicas: &[u8]) -> Result<(), Self::Error>;
+}
+
+impl<B: CleanSharedGenesisReplicaStore + ?Sized> CleanSharedGenesisReplicaStore for &mut B {
+    fn load_replicas(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        (**self).load_replicas()
+    }
+
+    fn commit_replicas(&mut self, replicas: &[u8]) -> Result<(), Self::Error> {
+        (**self).commit_replicas(replicas)
+    }
+}
+
 /// Immutable Create recovery input retained through later lifecycle intents.
 /// The record is separately verified against the selected Authority and
 /// physical journal before it can make a Local Agent routable.

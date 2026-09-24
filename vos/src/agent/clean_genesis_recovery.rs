@@ -180,7 +180,10 @@ impl<
         call: super::super::sdk::authority::AuthorityCredentialCall,
         runtime: AdmittedRuntimePackage,
         stores: (I, J, Q, R, W, P),
-    ) -> Result<Self, SharedAgentHostError> {
+    ) -> Result<Self, SharedAgentHostError>
+    where
+        Q: super::super::clean_authority_issuer::CleanSharedGenesisReplicaStore,
+    {
         locator
             .validate()
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
@@ -299,7 +302,10 @@ impl<
         mut reply: R,
         mut publication: W,
         mut publication_reply: P,
-    ) -> Result<Self, SharedAgentHostError> {
+    ) -> Result<Self, SharedAgentHostError>
+    where
+        Q: super::super::clean_authority_issuer::CleanSharedGenesisReplicaStore,
+    {
         locator
             .validate()
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
@@ -536,7 +542,7 @@ impl<
         if retired {
             pending.clear();
         }
-        Ok(Self {
+        let mut recovered = Self {
             locator,
             authority,
             pending,
@@ -550,7 +556,12 @@ impl<
             issued,
             admission_valid: true,
             retired,
-        })
+        };
+        // A roster sidecar is untrusted storage, even if its role envelope is
+        // intact. Validate any present candidate before startup admission;
+        // absence is still possible on the legacy/pre-staging test path.
+        recovered.retained_replicas()?;
+        Ok(recovered)
     }
 
     /// The exact locator checked against the signed Create during opening.
@@ -566,6 +577,39 @@ impl<
 
     pub fn issued_receipt(&self) -> Option<&AuthorityReceipt> {
         self.issued.as_ref()
+    }
+
+    /// Re-admit a retained replica roster under the same committee lease as
+    /// the query. The file envelope is not authority: peer identities must be
+    /// canonical and the roster must match the already verified signed Create.
+    pub fn retained_replicas(
+        &mut self,
+    ) -> Result<Option<AgentReplicaCommittee>, SharedAgentHostError>
+    where
+        Q: super::super::clean_authority_issuer::CleanSharedGenesisReplicaStore,
+    {
+        let Some(bytes) = self
+            .query
+            .load_replicas()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        else {
+            return Ok(None);
+        };
+        if bytes.len() > MAX_AGENT_REPLICA_COMMITTEE_BYTES {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let replicas = AgentReplicaCommittee::decode(&bytes)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let Some(ManagementRequest::Create(descriptor)) =
+            self.intent.intent().map(CleanManagementIntent::request)
+        else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        if replicas.encode() != bytes || replicas.validate_for_clean_descriptor(descriptor).is_err()
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        Ok(Some(replicas))
     }
 
     /// Return the still-leased stores for the owning lifecycle controller.

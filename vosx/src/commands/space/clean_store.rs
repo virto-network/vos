@@ -27,8 +27,9 @@ use vos::agent::bootstrap::MAX_SYSTEM_AGENT_GENESIS_PROVISION_BYTES;
 use vos::agent::clean_authority_issuer::CleanExternalLocalPendingInstallStore;
 use vos::agent::clean_authority_issuer::{
     CleanExternalLocalCreateArchiveStore, CleanManagementActorStore, CleanManagementIssuerStore,
-    CleanManagementRuntimeStore, MAX_CLEAN_EXTERNAL_LOCAL_CREATE_ARCHIVE_BYTES,
-    MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES, MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
+    CleanManagementRuntimeStore, CleanSharedGenesisReplicaStore,
+    MAX_CLEAN_EXTERNAL_LOCAL_CREATE_ARCHIVE_BYTES, MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES,
+    MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
 };
 use vos::agent::clean_bootstrap::{
     CleanSystemAgentBootstrapStore, MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES,
@@ -240,6 +241,7 @@ enum StoreRole {
     OrdinaryGenesisPublicationReply = 44,
     ExternalLocalCreateArchive = 45,
     ExternalLocalPendingInstall = 46,
+    OrdinaryGenesisReplicas = 47,
 }
 
 impl StoreRole {
@@ -291,6 +293,7 @@ impl StoreRole {
             Self::OrdinaryGenesisReply => "ordinary-agent.genesis-reply",
             Self::OrdinaryGenesisPublication => "ordinary-agent.genesis-publication",
             Self::OrdinaryGenesisPublicationReply => "ordinary-agent.genesis-publication-reply",
+            Self::OrdinaryGenesisReplicas => "ordinary-agent.genesis-replicas",
         }
     }
 
@@ -344,6 +347,7 @@ impl StoreRole {
             Self::OrdinaryGenesisPublicationReply => {
                 "ordinary-agent.genesis-publication-reply.next"
             }
+            Self::OrdinaryGenesisReplicas => "ordinary-agent.genesis-replicas.next",
         }
     }
 
@@ -414,6 +418,7 @@ impl StoreRole {
             Self::OrdinaryGenesisPublicationReply => {
                 vos::agent::clean_authority_issuer::MAX_CLEAN_GENESIS_PUBLICATION_REPLY_IMAGE_BYTES
             }
+            Self::OrdinaryGenesisReplicas => vos::agent::genesis::MAX_AGENT_REPLICA_COMMITTEE_BYTES,
             Self::ManagementIntent => MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES,
             Self::LifecycleIssuer => MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
             Self::LocalCreateRequest => {
@@ -512,6 +517,7 @@ impl StoreRole {
             44 => Some(Self::OrdinaryGenesisPublicationReply),
             45 => Some(Self::ExternalLocalCreateArchive),
             46 => Some(Self::ExternalLocalPendingInstall),
+            47 => Some(Self::OrdinaryGenesisReplicas),
             1 => Some(Self::Pins),
             2 => Some(Self::Bootstrap),
             3 => Some(Self::ManagementIssuer),
@@ -801,6 +807,8 @@ pub(crate) struct CleanAgentGenesisCommitteeFile(ExactFileStore);
 
 const GENESIS_COMMITTEE_ENTRIES: &[&str] = &[
     LOCK_FILE,
+    "ordinary-agent.genesis-replicas",
+    "ordinary-agent.genesis-replicas.next",
     "ordinary-agent.genesis-query",
     "ordinary-agent.genesis-query.next",
     "ordinary-agent.genesis-reply",
@@ -1195,6 +1203,30 @@ impl CleanManagementIssuerStore for CleanAgentGenesisCommitteeFile {
     }
     fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
         self.0.commit_with_replacement(image, false)
+    }
+}
+
+impl CleanSharedGenesisReplicaStore for CleanAgentGenesisCommitteeFile {
+    fn load_replicas(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        let mut store =
+            ExactFileStore::new(Arc::clone(&self.0.root), StoreRole::OrdinaryGenesisReplicas);
+        let image = store.load(StoreRole::OrdinaryGenesisReplicas.maximum_bytes())?;
+        if let Some(bytes) = &image {
+            // A previous rename may have succeeded before directory sync.
+            store.commit_with_replacement(bytes, false)?;
+        }
+        Ok(image)
+    }
+
+    fn commit_replicas(&mut self, replicas: &[u8]) -> Result<(), Self::Error> {
+        match self.load_replicas()? {
+            Some(bytes) if bytes == replicas => Ok(()),
+            Some(_) => Err(CleanFileStoreError::RequestConflict),
+            None => {
+                ExactFileStore::new(Arc::clone(&self.0.root), StoreRole::OrdinaryGenesisReplicas)
+                    .commit_with_replacement(replicas, false)
+            }
+        }
     }
 }
 
@@ -2719,6 +2751,7 @@ impl ExactFileStore {
                 | StoreRole::OrdinaryGenesisReply
                 | StoreRole::OrdinaryGenesisPublication
                 | StoreRole::OrdinaryGenesisPublicationReply
+                | StoreRole::OrdinaryGenesisReplicas
                 | StoreRole::CredentialQuery
                 | StoreRole::LocalCreateAcknowledgement
                 | StoreRole::LocalCreateDenial
@@ -5423,9 +5456,64 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn ordinary_genesis_replicas_are_immutable_under_committee_lease() {
+        let fixture = Fixture::new("ordinary-genesis-replicas");
+        let locator = vos::agent::genesis::AgentGenesisLocator {
+            space: vos::service::SpaceId([1; 32]),
+            agent: vos::service::AgentId([2; 32]),
+        };
+        let (mut query, reply) =
+            CleanAgentGenesisCommitteeFile::open_pair(&fixture.parent, locator).unwrap();
+        assert_eq!(query.load_replicas().unwrap(), None);
+        assert!(matches!(
+            query.commit_replicas(&vec![
+                0;
+                StoreRole::OrdinaryGenesisReplicas.maximum_bytes() + 1
+            ]),
+            Err(CleanFileStoreError::Oversized)
+        ));
+        query.commit_replicas(b"selected roster").unwrap();
+        query.commit_replicas(b"selected roster").unwrap();
+        assert!(matches!(
+            query.commit_replicas(b"replacement roster"),
+            Err(CleanFileStoreError::RequestConflict)
+        ));
+        assert_eq!(
+            query.load_replicas().unwrap(),
+            Some(b"selected roster".to_vec())
+        );
+        drop((query, reply));
+
+        let (mut reopened, _reply) =
+            CleanAgentGenesisCommitteeFile::open_pair(&fixture.parent, locator).unwrap();
+        assert_eq!(
+            reopened.load_replicas().unwrap(),
+            Some(b"selected roster".to_vec())
+        );
+        assert!(matches!(
+            CleanAgentGenesisCommitteeFile::open_pair(&fixture.parent, locator),
+            Err(CleanFileStoreError::Busy)
+        ));
+        let roster = ExactFileStore::new(
+            Arc::clone(&reopened.0.root),
+            StoreRole::OrdinaryGenesisReplicas,
+        );
+        let current = roster
+            .reconcile(StoreRole::OrdinaryGenesisReplicas.maximum_bytes())
+            .unwrap()
+            .unwrap();
+        stage(&roster, Some(current.commitment()), b"replacement roster");
+        assert!(matches!(
+            reopened.load_replicas(),
+            Err(CleanFileStoreError::RequestConflict)
+        ));
+    }
+
+    #[test]
     fn ordinary_genesis_signed_reservation_retries_and_joint_discovery_holds_leases() {
         use vos::agent::local_lifecycle::LocalLifecycleStoreFactory as _;
         use vos::agent::sdk::{AgentProfile, ManagementRequest};
+        use vos::service::ServiceWire as _;
         struct FailRuntimeCommit(CleanManagementIntentFile, bool);
         impl CleanManagementIssuerStore for FailRuntimeCommit {
             type Error = CleanFileStoreError;
@@ -5462,6 +5550,13 @@ pub(crate) mod tests {
         .unwrap();
         let (_, mut call, _) = submission.into_parts();
         descriptor.identity.profile = AgentProfile::Shared;
+        let node_key = libp2p::identity::Keypair::ed25519_from_bytes([0x46; 32]).unwrap();
+        let peer = node_key.public().to_peer_id().to_bytes();
+        let node_public = ed25519_dalek::SigningKey::from_bytes(&[0x46; 32])
+            .verifying_key()
+            .to_bytes();
+        descriptor.replicas[0].node =
+            vos::agent::sdk::NodeId(vos::service::NodeId::of_authenticated_peer(&peer).0);
         call.managed.profile = AgentProfile::Shared;
         call.plan = ManagementRequest::Create(Box::new(descriptor.clone()))
             .authorization_plan()
@@ -5476,6 +5571,73 @@ pub(crate) mod tests {
             space: vos::service::SpaceId(authority.space.0),
             agent: vos::service::AgentId(descriptor.identity.agent.0),
         };
+        let selected_replicas = vos::agent::genesis::AgentReplicaCommittee::new(
+            locator.space,
+            locator.agent,
+            vos::agent::AgentProfile::Shared,
+            vec![
+                vos::agent::genesis::AgentReplicaMember::new(
+                    vos::agent::AgentReplica {
+                        node: vos::service::NodeId(descriptor.replicas[0].node.0),
+                        principal: vos::service::PrincipalId(descriptor.replicas[0].principal.0),
+                        role: vos::agent::ReplicaRole::Voter,
+                    },
+                    peer.clone(),
+                    node_public,
+                    Some(vos::agent::genesis::derive_replica_raft_slot(&peer)),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        selected_replicas
+            .validate_for_clean_descriptor(&descriptor)
+            .unwrap();
+        let foreign = Fixture::new("ordinary-genesis-foreign-roster");
+        let mut foreign_lifecycle = CleanManagementLifecycleStoreFactory::open_or_create(
+            foreign.parent.join(SHARED_LIFECYCLE_DIRECTORY),
+            authority.space,
+        )
+        .unwrap();
+        let (foreign_intent, foreign_issuer) = foreign_lifecycle
+            .open(authority.space, descriptor.identity.agent)
+            .unwrap();
+        ensure_private_directory(&foreign.parent.join(SHARED_COMMITTEE_DIRECTORY)).unwrap();
+        let (mut foreign_query, foreign_reply) = CleanAgentGenesisCommitteeFile::open_pair(
+            &foreign.parent.join(SHARED_COMMITTEE_DIRECTORY),
+            locator,
+        )
+        .unwrap();
+        let wrong_replicas = vos::agent::genesis::AgentReplicaCommittee::new(
+            locator.space,
+            vos::service::AgentId([0xa1; 32]),
+            vos::agent::AgentProfile::Shared,
+            selected_replicas.members().to_vec(),
+        )
+        .unwrap();
+        foreign_query
+            .commit_replicas(&wrong_replicas.encode())
+            .unwrap();
+        let foreign_publication = foreign_query.publication();
+        let foreign_publication_reply = foreign_query.publication_reply();
+        assert!(matches!(
+            CleanSharedGenesisRecovery::reserve_create(
+                authority,
+                locator,
+                descriptor.clone(),
+                call.clone(),
+                runtime.clone(),
+                (
+                    foreign_intent,
+                    foreign_issuer,
+                    foreign_query,
+                    foreign_reply,
+                    foreign_publication,
+                    foreign_publication_reply,
+                ),
+            ),
+            Err(vos::agent::shared_host::SharedAgentHostError::ScopeMismatch)
+        ));
         let archives_path = fixture.parent.join(SHARED_ARCHIVE_DIRECTORY);
         ensure_private_directory(&archives_path).unwrap();
         let archives =
@@ -5592,6 +5754,24 @@ pub(crate) mod tests {
             runtime.exact_bytes()
         );
         assert!(recovery.issued_receipt().is_none());
+        let (intent, issuer, mut query, reply, publication, publication_reply) =
+            recovery.into_stores();
+        query.commit_replicas(&selected_replicas.encode()).unwrap();
+        let mut recovery = CleanSharedGenesisRecovery::open(
+            authority,
+            locator,
+            intent,
+            issuer,
+            query,
+            reply,
+            publication,
+            publication_reply,
+        )
+        .unwrap();
+        assert_eq!(
+            recovery.retained_replicas().unwrap(),
+            Some(selected_replicas.clone())
+        );
         let (mut intent, issuer, query, reply, publication, publication_reply) =
             recovery.into_stores();
         assert_eq!(intent.load().unwrap(), Some(retained_intent));
