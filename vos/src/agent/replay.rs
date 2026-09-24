@@ -16099,6 +16099,33 @@ mod aggregate {
                 entry,
                 catalog,
                 budget,
+                false,
+                refresh,
+                |store, seal, availability| store.publish_external_mutation(seal, availability),
+            )
+        }
+
+        /// Publish even a physically rejected Install as an ordered
+        /// transition. Its exact guest error then becomes replay-authenticated
+        /// management evidence for a later signed terminal-failure decision.
+        /// Callers must not treat publication alone as Authority finality.
+        pub(crate) fn apply_install_with_catalog_terminal<E: ReplayExecutor>(
+            &mut self,
+            executor: &mut E,
+            entry: &OrderedEntry,
+            catalog: &[super::super::execution::RuntimeBlob],
+            budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+            refresh: impl FnMut(&S, &mut E) -> Result<(), JournalStoreError>,
+        ) -> Result<ExternalJournalCommit, MaterializeError<core::convert::Infallible, E::Error>>
+        where
+            S: super::super::journal_store::UnpublishedCatalogBlobStore,
+        {
+            self.apply_install_with_catalog_using(
+                executor,
+                entry,
+                catalog,
+                budget,
+                true,
                 refresh,
                 |store, seal, availability| store.publish_external_mutation(seal, availability),
             )
@@ -16168,7 +16195,7 @@ mod aggregate {
             S: super::super::journal_store::UnpublishedCatalogBlobStore,
         {
             self.apply_install_with_catalog_using(
-                executor, entry, catalog, budget, refresh, publish,
+                executor, entry, catalog, budget, false, refresh, publish,
             )
         }
 
@@ -16178,6 +16205,7 @@ mod aggregate {
             entry: &OrderedEntry,
             catalog: &[super::super::execution::RuntimeBlob],
             budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+            terminalize_rejection: bool,
             mut refresh: impl FnMut(&S, &mut E) -> Result<(), JournalStoreError>,
             publish: impl FnOnce(
                 &mut S,
@@ -16215,7 +16243,8 @@ mod aggregate {
                 return Err(journal(error));
             }
             let expected = match self.preview_install_entry(executor, entry, budget) {
-                Ok(Ok(reply)) => reply,
+                Ok(Ok(reply)) => Ok(reply),
+                Ok(Err(rejection)) if terminalize_rejection => Err(rejection),
                 Ok(Err(rejection)) => {
                     self.rollback_catalog(staged).map_err(journal)?;
                     refresh(&*self.store, executor).map_err(journal)?;
@@ -16238,7 +16267,7 @@ mod aggregate {
                     .iter()
                     .find(|execution| execution.input() == entry.input.id())
                     .and_then(|execution| execution.clean_management_result())
-                    != Some(&Ok(expected))
+                    != Some(&expected)
             {
                 // The guest disagreed with its own preflight after durable
                 // publication. Do not reuse this cursor or issue an ACK.
@@ -23004,7 +23033,7 @@ pub(crate) mod tests {
         admitted: &super::super::package_admission::AdmittedStateRuntimePackage,
         expect_interruption: bool,
         interrupt_actor_operations: bool,
-        duplicate_candidate: impl FnOnce(&S) -> Option<S>,
+        duplicate_candidate: impl Fn(&S) -> Option<S>,
         publish: impl FnOnce(
             &mut S,
             &ReplaySealedPublication,
@@ -23399,16 +23428,14 @@ pub(crate) mod tests {
             ),
             observed_slot: 12,
         };
-        assert!(
-            pinned
-                .preview_install_entry(
-                    &mut executor,
-                    &duplicate_entry,
-                    &mut ReadBudget::new(10000, 10000000),
-                )
-                .unwrap()
-                .is_err()
-        );
+        let expected_rejection = pinned
+            .preview_install_entry(
+                &mut executor,
+                &duplicate_entry,
+                &mut ReadBudget::new(10000, 10000000),
+            )
+            .unwrap()
+            .unwrap_err();
         assert_eq!(pinned.materialization().unwrap().heads(), installed.heads());
         let rejection_bytes = b"rejected-install-catalog-rollback".to_vec();
         let rejection_reference = BlobRef::of_bytes(&rejection_bytes);
@@ -23437,6 +23464,127 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_none()
         );
+        if let Some(mut rejected_store) = duplicate_candidate(pinned.store_for_test()) {
+            // The original fail-closed helper above still rolls back. A
+            // separate terminal path must instead commit the exact rejected
+            // guest result as replayable management evidence. The guest may
+            // advance its control metadata even though the actor is rejected.
+            let mut rejected_executor = CapturedExternalExecutor {
+                physical_runtime: Some(admitted.clone()),
+                management_descriptor: Some(descriptor.as_ref().clone()),
+                ..Default::default()
+            };
+            let mut terminal = PinnedExternalJournal::open(
+                &mut rejected_store,
+                sealed,
+                &mut rejected_executor,
+                &NoPrunedOrderedBases,
+                &mut ReadBudget::new(10000, 10000000),
+            )
+            .unwrap();
+            let published = terminal
+                .apply_install_with_catalog_terminal(
+                    &mut rejected_executor,
+                    &duplicate_entry,
+                    &rejection_catalog,
+                    &mut ReadBudget::new(10000, 10000000),
+                    |_, _| Ok(()),
+                )
+                .unwrap();
+            let ExternalJournalCommit::Published(_, results, None) = published else {
+                panic!("terminal Install rejection must publish exact evidence");
+            };
+            assert_eq!(
+                results.last().unwrap().clean_management_result(),
+                Some(&Err(expected_rejection))
+            );
+            let terminalized = terminal.materialization().unwrap().clone();
+            assert_eq!(
+                terminalized.heads().ordered_head,
+                Some(duplicate_entry.id())
+            );
+            assert_eq!(
+                terminalized.clean_management_evidence().unwrap().result,
+                Err(expected_rejection)
+            );
+            let ReplayOperation::CleanManage {
+                request: rejected_request,
+                authority: rejected_receipt,
+                ..
+            } = &duplicate_entry.input.operation
+            else {
+                unreachable!()
+            };
+            let rejection =
+                super::super::external_local_executor::observe_external_install_rejection(
+                    &terminalized,
+                    descriptor,
+                    rejected_request,
+                    rejected_receipt,
+                )
+                .unwrap();
+            assert_eq!(rejection.error(), expected_rejection);
+            assert_eq!(rejection.receipt(), rejected_receipt);
+            assert_eq!(rejection.applied_at(), 12);
+            assert_ne!(rejection.reopened_state(), sdk::Hash::ZERO);
+            assert!(
+                super::super::external_local_executor::observe_external_install_application(
+                    &terminalized,
+                    descriptor,
+                    rejected_request,
+                    rejected_receipt,
+                )
+                .is_err()
+            );
+            assert!(
+                terminal
+                    .store_for_test()
+                    .load_blob(JournalBlobClass::CatalogArtifact, &rejection_reference)
+                    .unwrap()
+                    .is_some(),
+                "the rejected input's catalog must remain available for replay"
+            );
+            assert!(matches!(
+                terminal
+                    .apply_install_with_catalog_terminal(
+                        &mut rejected_executor,
+                        &duplicate_entry,
+                        &rejection_catalog,
+                        &mut ReadBudget::new(0, 0),
+                        |_, _| Ok(()),
+                    )
+                    .unwrap(),
+                ExternalJournalCommit::AlreadyCommitted(_)
+            ));
+            drop(terminal);
+            rejected_executor.captures.clear();
+            rejected_executor.pending = None;
+            let reopened = materialize_external_genesis(
+                &mut rejected_store,
+                sealed,
+                &mut rejected_executor,
+                &NoPrunedOrderedBases,
+                &mut ReadBudget::new(10000, 10000000),
+            )
+            .unwrap();
+            assert_eq!(reopened.heads(), terminalized.heads());
+            assert_eq!(reopened.state(), terminalized.state());
+            assert_eq!(reopened.external_roots, terminalized.external_roots);
+            assert_eq!(
+                reopened.clean_management_evidence(),
+                terminalized.clean_management_evidence()
+            );
+            assert_eq!(
+                super::super::external_local_executor::observe_external_install_rejection(
+                    &reopened,
+                    descriptor,
+                    rejected_request,
+                    rejected_receipt,
+                )
+                .unwrap(),
+                rejection
+            );
+        }
         let ReplayOperation::CleanManage {
             request: install_request,
             authority: install_authority,

@@ -17492,7 +17492,7 @@ mod tests {
                     Err(JournalStoreError::Conflict)
                 ));
                 drop(owned);
-                let reopened =
+                let mut reopened =
                     super::super::external_local_executor::ExternalLocalJournalOwner::open(
                         acquire_production_local_slot(&directory, sealed),
                         reopen_seal(),
@@ -17504,6 +17504,78 @@ mod tests {
                         .observe_install_application(&request, &receipt)
                         .unwrap(),
                     observation
+                );
+                let crate::agent_sdk::ManagementRequest::Install(installed) = &request else {
+                    unreachable!()
+                };
+                let mut conflicting = installed.as_ref().clone();
+                conflicting.installation_id.0[0] ^= 1;
+                let rejected_request =
+                    crate::agent_sdk::ManagementRequest::Install(Box::new(conflicting));
+                let rejected_receipt = super::super::replay::tests::signed_opaque_clean_receipt(
+                    descriptor,
+                    &rejected_request,
+                    admitted.deployment(),
+                    3,
+                    &SigningKey::from_bytes(&[0x31; 32]),
+                );
+                let rejected_input = super::super::journal::ReplayInput {
+                    runtime: sealed.genesis().runtime().clone(),
+                    operation: ReplayOperation::CleanManage {
+                        request: rejected_request.clone(),
+                        authority: rejected_receipt.clone(),
+                        observed_slot: 12,
+                    },
+                };
+                let rejected = reopened
+                    .publish_install_for_finality(
+                        rejected_input.clone(),
+                        &actor,
+                        &mut ReadBudget::new(10000, 10000000),
+                    )
+                    .unwrap();
+                let super::super::replay::ExternalJournalCommit::Published(_, results, None) =
+                    rejected
+                else {
+                    panic!("rejected Install must publish through locked file owner");
+                };
+                assert!(matches!(
+                    results.last().unwrap().clean_management_result(),
+                    Some(Err(_))
+                ));
+                let rejection = reopened
+                    .observe_install_rejection(&rejected_request, &rejected_receipt)
+                    .unwrap();
+                assert_eq!(
+                    results.last().unwrap().clean_management_result(),
+                    Some(&Err(rejection.error()))
+                );
+                assert!(matches!(
+                    reopened.publish_install_for_finality(
+                        rejected_input,
+                        &actor,
+                        &mut ReadBudget::new(10000, 10000000),
+                    ),
+                    Err(JournalStoreError::Conflict)
+                ));
+                drop(reopened);
+                let reopened =
+                    super::super::external_local_executor::ExternalLocalJournalOwner::open(
+                        acquire_production_local_slot(&directory, sealed),
+                        reopen_seal(),
+                        &mut ReadBudget::new(10000, 10000000),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    reopened
+                        .observe_install_rejection(&rejected_request, &rejected_receipt)
+                        .unwrap(),
+                    rejection
+                );
+                assert!(
+                    reopened
+                        .observe_install_application(&rejected_request, &rejected_receipt)
+                        .is_err()
                 );
                 drop(reopened);
                 for failure in [

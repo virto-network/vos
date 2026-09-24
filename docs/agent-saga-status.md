@@ -210,6 +210,20 @@ terminal-failure transition for that approved Install, or retain image Local
 Install for the first customer release and defer public external Local Install.
 Do not expose the existing internal external Install method as ingress while
 approval can be stranded.
+An internal opt-in journal path now publishes a rejected Install's exact
+guest result as an authenticated Ordered transition, instead of discarding
+the preflight result. Rejected management work may advance runtime control
+metadata even when it installs no actor; recovery must replay the resulting
+state, not assume a no-op. A separate read-only observer binds the replayed
+error to its receipt, request, original Ordered position and observation slot.
+The ordinary rollback-before-publication helper remains the default. This is
+physical failure evidence, not a signed Authority failure ACK or retirement;
+public external Install remains closed. Rejected input catalog bytes must
+remain available for replay until checkpoint/GC rules are qualified.
+The Standard guest fixture passed on an in-memory journal and the production
+locked file owner: the exact rejected result survived reopen, while positive
+Install observation refused the rejected entry. Checkpoint/GC and failure
+finalization remain open.
 The locked file owner now accepts a validated signed Install plus the admitted
 actor package, derives its exact catalog and Merge fence from its pinned
 generation, and invokes that preflight/publication helper. It refuses to

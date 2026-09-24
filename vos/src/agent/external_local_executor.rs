@@ -653,26 +653,56 @@ impl ExternalLocalManagementObservation {
     }
 }
 
-/// Derive a stable Install application identity from authenticated replay
-/// evidence, not the current journal-head ID. A later Invoke, ACK or
-/// maintenance checkpoint may change the head before the issuer retries its
-/// acknowledgement; the retained management evidence still names the exact
-/// successful Install and its original observation slot. A later management
-/// mutation replaces that evidence; the lifecycle coordinator must retire
-/// the prior operation before admitting its successor.
+/// A rejected Install re-observed from the authenticated journal, rather than
+/// from a live preflight or a caller-supplied error. It is evidence for a
+/// future signed failure-finality protocol, not finality by itself.
 #[cfg(feature = "experimental-state-blocks")]
-pub(crate) fn observe_external_install_application(
-    recovered: &super::replay::ReplayMaterialization,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExternalLocalManagementRejection {
+    receipt: crate::agent_sdk::authority::AuthorityReceipt,
+    error: crate::agent_sdk::ManagementError,
+    reopened_state: crate::agent_sdk::Hash,
+    applied_at: u64,
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+impl ExternalLocalManagementRejection {
+    pub(crate) fn receipt(&self) -> &crate::agent_sdk::authority::AuthorityReceipt {
+        &self.receipt
+    }
+
+    pub(crate) fn error(&self) -> crate::agent_sdk::ManagementError {
+        self.error
+    }
+
+    pub(crate) fn reopened_state(&self) -> crate::agent_sdk::Hash {
+        self.reopened_state
+    }
+
+    pub(crate) fn applied_at(&self) -> u64 {
+        self.applied_at
+    }
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+fn external_install_observation<'a>(
+    recovered: &'a super::replay::ReplayMaterialization,
     descriptor: &AgentDescriptor,
     request: &ManagementRequest,
     receipt: &crate::agent_sdk::authority::AuthorityReceipt,
-) -> Result<ExternalLocalManagementObservation, super::journal_store::JournalStoreError> {
+    domain: &'static [u8],
+) -> Result<
+    (
+        &'a super::journal::CleanManagementEvidence,
+        crate::agent_sdk::Hash,
+    ),
+    super::journal_store::JournalStoreError,
+> {
     use super::journal_store::JournalStoreError;
-    use crate::agent_sdk::{self as sdk, ManagementReply};
 
-    let ManagementRequest::Install(install) = request else {
+    if !matches!(request, ManagementRequest::Install(_)) {
         return Err(JournalStoreError::NonCanonical);
-    };
+    }
     let evidence = recovered
         .clean_management_evidence()
         .ok_or(JournalStoreError::Unavailable)?;
@@ -689,7 +719,6 @@ pub(crate) fn observe_external_install_application(
         || evidence.authority != receipt.commitment()
         || evidence.epoch != receipt.selector.epoch
         || evidence.sequence != receipt.selector.decision_sequence
-        || evidence.result != Ok(ManagementReply::Installed(install.entry.clone()))
         || super::driver::verify_clean_management_receipt(
             descriptor,
             request,
@@ -701,8 +730,8 @@ pub(crate) fn observe_external_install_application(
     {
         return Err(JournalStoreError::ScopeMismatch);
     }
-    let reopened_state = sdk::Hash::digest(
-        b"vos/agent/local/external-install-application/v1",
+    let reopened_state = crate::agent_sdk::Hash::digest(
+        domain,
         &[
             &recovered.heads().genesis.0,
             &evidence.input.0,
@@ -713,9 +742,71 @@ pub(crate) fn observe_external_install_application(
             &evidence.observed_slot.to_le_bytes(),
         ],
     );
+    Ok((evidence, reopened_state))
+}
+
+/// Derive a stable Install application identity from authenticated replay
+/// evidence, not the current journal-head ID. A later Invoke, ACK or
+/// maintenance checkpoint may change the head before the issuer retries its
+/// acknowledgement; the retained management evidence still names the exact
+/// successful Install and its original observation slot. A later management
+/// mutation replaces that evidence; the lifecycle coordinator must retire
+/// the prior operation before admitting its successor.
+#[cfg(feature = "experimental-state-blocks")]
+pub(crate) fn observe_external_install_application(
+    recovered: &super::replay::ReplayMaterialization,
+    descriptor: &AgentDescriptor,
+    request: &ManagementRequest,
+    receipt: &crate::agent_sdk::authority::AuthorityReceipt,
+) -> Result<ExternalLocalManagementObservation, super::journal_store::JournalStoreError> {
+    use super::journal_store::JournalStoreError;
+    use crate::agent_sdk::ManagementReply;
+
+    let ManagementRequest::Install(install) = request else {
+        return Err(JournalStoreError::NonCanonical);
+    };
+    let (evidence, reopened_state) = external_install_observation(
+        recovered,
+        descriptor,
+        request,
+        receipt,
+        b"vos/agent/local/external-install-application/v1",
+    )?;
+    if evidence.result != Ok(ManagementReply::Installed(install.entry.clone())) {
+        return Err(JournalStoreError::ScopeMismatch);
+    }
     Ok(ExternalLocalManagementObservation {
         receipt: receipt.clone(),
         result: ManagementReply::Installed(install.entry.clone()),
+        reopened_state,
+        applied_at: evidence.observed_slot,
+    })
+}
+
+/// Observe only a durably published guest rejection. Positive Install and
+/// uncommitted preflight errors cannot manufacture this evidence.
+#[cfg(feature = "experimental-state-blocks")]
+pub(crate) fn observe_external_install_rejection(
+    recovered: &super::replay::ReplayMaterialization,
+    descriptor: &AgentDescriptor,
+    request: &ManagementRequest,
+    receipt: &crate::agent_sdk::authority::AuthorityReceipt,
+) -> Result<ExternalLocalManagementRejection, super::journal_store::JournalStoreError> {
+    use super::journal_store::JournalStoreError;
+
+    let (evidence, reopened_state) = external_install_observation(
+        recovered,
+        descriptor,
+        request,
+        receipt,
+        b"vos/agent/local/external-install-rejection/v1",
+    )?;
+    let Err(error) = &evidence.result else {
+        return Err(JournalStoreError::ScopeMismatch);
+    };
+    Ok(ExternalLocalManagementRejection {
+        receipt: receipt.clone(),
+        error: *error,
         reopened_state,
         applied_at: evidence.observed_slot,
     })
@@ -1834,6 +1925,24 @@ impl ExternalLocalJournalOwner {
         })
     }
 
+    /// Reopen a terminally published guest rejection through the same locked
+    /// generation. A preflight-only rejection has no journal evidence and
+    /// cannot be observed here.
+    pub(crate) fn observe_install_rejection(
+        &self,
+        request: &ManagementRequest,
+        receipt: &crate::agent_sdk::authority::AuthorityReceipt,
+    ) -> Result<ExternalLocalManagementRejection, super::journal_store::JournalStoreError> {
+        self.cursor.inspect(|_, recovered| {
+            observe_external_install_rejection(
+                recovered,
+                &self.executor.descriptor,
+                request,
+                receipt,
+            )
+        })
+    }
+
     pub(crate) fn verify_finalized_install_ack(
         &self,
         request: &ManagementRequest,
@@ -2088,6 +2197,28 @@ impl ExternalLocalJournalOwner {
         package: &super::package_admission::AdmittedActorPackage,
         budget: &mut ReadBudget,
     ) -> Result<super::replay::ExternalJournalCommit, super::journal_store::JournalStoreError> {
+        self.publish_install_with_rejection_policy(input, package, budget, false)
+    }
+
+    /// Internal failure-finality path. A guest rejection is published as an
+    /// authenticated Ordered transition so recovery can observe the exact
+    /// result. It still requires a separate signed Authority terminal step.
+    pub(crate) fn publish_install_for_finality(
+        &mut self,
+        input: ReplayInput,
+        package: &super::package_admission::AdmittedActorPackage,
+        budget: &mut ReadBudget,
+    ) -> Result<super::replay::ExternalJournalCommit, super::journal_store::JournalStoreError> {
+        self.publish_install_with_rejection_policy(input, package, budget, true)
+    }
+
+    fn publish_install_with_rejection_policy(
+        &mut self,
+        input: ReplayInput,
+        package: &super::package_admission::AdmittedActorPackage,
+        budget: &mut ReadBudget,
+        terminalize_rejection: bool,
+    ) -> Result<super::replay::ExternalJournalCommit, super::journal_store::JournalStoreError> {
         use super::journal::OrderedEntry;
         use super::journal_store::{CatalogBlobResolverFactory, JournalStoreError};
         use super::replay::{ReplayError, ReplayMaterializationSourceError};
@@ -2161,8 +2292,8 @@ impl ExternalLocalJournalOwner {
             merge_seal: Some(self.cursor.persist_current_merge_seal(&self.seal)?),
             input,
         };
-        self.cursor
-            .apply_install_with_catalog(
+        let committed = if terminalize_rejection {
+            self.cursor.apply_install_with_catalog_terminal(
                 &mut self.executor,
                 &entry,
                 &catalog,
@@ -2172,11 +2303,23 @@ impl ExternalLocalJournalOwner {
                     Ok(())
                 },
             )
-            .map_err(|error| match error {
-                ReplayError::Source(ReplayMaterializationSourceError::Journal(error)) => error,
-                ReplayError::ReplayLimit => JournalStoreError::Backpressure,
-                _ => JournalStoreError::Unavailable,
-            })
+        } else {
+            self.cursor.apply_install_with_catalog(
+                &mut self.executor,
+                &entry,
+                &catalog,
+                budget,
+                |store, executor| {
+                    executor.replace_resolver(store.catalog_blob_resolver()?);
+                    Ok(())
+                },
+            )
+        };
+        committed.map_err(|error| match error {
+            ReplayError::Source(ReplayMaterializationSourceError::Journal(error)) => error,
+            ReplayError::ReplayLimit => JournalStoreError::Backpressure,
+            _ => JournalStoreError::Unavailable,
+        })
     }
 
     pub(crate) fn apply_local(
