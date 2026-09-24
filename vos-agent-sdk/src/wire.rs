@@ -24,7 +24,7 @@ use crate::authority::{
     MAX_AUTHORITY_INVENTORY_PAGE_ENTRIES, MAX_AUTHORITY_INVENTORY_PROJECTION_BYTES,
     MAX_AUTHORITY_PRINCIPAL_GRANTS, MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES,
     MAX_AUTHORITY_REPLICA_PAGE_ENTRIES, ManagedAgentTarget, ManagementApplicationAck,
-    ManagementApproval, ManagementAuthorizationPlan,
+    ManagementApplicationFailure, ManagementApproval, ManagementAuthorizationPlan,
 };
 use crate::catalog::{
     CatalogActorTarget, CatalogAlias, CatalogEntry, CatalogMutationCall, CatalogMutationKind,
@@ -2616,6 +2616,98 @@ impl CanonicalWire for ManagementApplicationAck {
     }
 }
 
+fn encode_management_application_failure_unsigned(
+    encoder: &mut Encoder<'_>,
+    value: &ManagementApplicationFailure,
+) {
+    encoder.fixed(value.authorization_invocation.as_bytes());
+    encoder.fixed(value.acknowledgement_invocation.as_bytes());
+    encode_authority_actor_target(encoder, value.authority);
+    encode_managed_agent_target(encoder, value.managed);
+    encoder.fixed(value.credential_call.as_bytes());
+    encoder.fixed(value.approval.as_bytes());
+    encoder.u64(value.authorization_sequence.get());
+    encoder.fixed(value.request.as_bytes());
+    encode_authority_receipt_body(encoder, &value.receipt);
+    encode_management_error(encoder, value.error);
+    encoder.fixed(value.reopened_state.as_bytes());
+    encoder.u64(value.failed_at);
+}
+
+pub(crate) fn management_application_failure_signing_bytes(
+    value: &ManagementApplicationFailure,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"MF1S");
+    bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    encode_management_application_failure_unsigned(&mut Encoder(&mut bytes), value);
+    bytes
+}
+
+pub(crate) fn management_application_failure_encoded_len(
+    value: &ManagementApplicationFailure,
+) -> usize {
+    let mut body = Vec::new();
+    encode_management_application_failure_unsigned(&mut Encoder(&mut body), value);
+    HEADER_BYTES
+        .saturating_add(body.len())
+        .saturating_add(AUTHORITY_SIGNATURE_BYTES)
+}
+
+impl CanonicalWire for ManagementApplicationFailure {
+    const MAGIC: [u8; 4] = *b"MAF1";
+    const MAX_ENCODED_BYTES: usize = MAX_INVOCATION_MESSAGE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate_shape().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_management_application_failure_unsigned(encoder, self);
+        encoder.0.extend_from_slice(&self.signature);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let authorization_invocation = InvocationId(decoder.fixed()?);
+        let acknowledgement_invocation = InvocationId(decoder.fixed()?);
+        let authority = decode_authority_actor_target(decoder)?;
+        let managed = decode_managed_agent_target(decoder)?;
+        let credential_call = Hash(decoder.fixed()?);
+        let approval = Hash(decoder.fixed()?);
+        let authorization_sequence =
+            core::num::NonZeroU64::new(decoder.u64()?).ok_or(DecodeError::NonCanonical)?;
+        let request = Hash(decoder.fixed()?);
+        let receipt = decode_authority_receipt_body(decoder)?;
+        let error = decode_management_error(decoder)?;
+        let reopened_state = Hash(decoder.fixed()?);
+        let failed_at = decoder.u64()?;
+        let signature = decoder
+            .take(AUTHORITY_SIGNATURE_BYTES)?
+            .try_into()
+            .map_err(|_| DecodeError::Truncated)?;
+        let value = Self {
+            authorization_invocation,
+            acknowledgement_invocation,
+            authority,
+            managed,
+            credential_call,
+            approval,
+            authorization_sequence,
+            request,
+            receipt,
+            error,
+            reopened_state,
+            failed_at,
+            signature,
+        };
+        value
+            .validate_shape()
+            .is_ok()
+            .then_some(value)
+            .ok_or(DecodeError::NonCanonical)
+    }
+}
+
 pub(crate) fn encode_catalog_actor_target(encoder: &mut Encoder<'_>, value: CatalogActorTarget) {
     encoder.fixed(value.space.as_bytes());
     encoder.fixed(value.system_agent.as_bytes());
@@ -4445,6 +4537,16 @@ pub fn management_reply_commitment(value: &ManagementReply) -> Hash {
     Hash::digest(b"vos/agent/management-reply/v2", &[&bytes])
 }
 
+/// Separate domain for a signed terminal guest error. An error may never be
+/// confused with a successful management reply in Authority retry state.
+pub fn management_error_commitment(value: ManagementError) -> Hash {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"MEC1");
+    bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    encode_management_error(&mut Encoder(&mut bytes), value);
+    Hash::digest(b"vos/agent/management-error/v1", &[&bytes])
+}
+
 fn encode_management_reply(encoder: &mut Encoder<'_>, value: &ManagementReply) {
     match value {
         ManagementReply::Created(value) => {
@@ -5774,7 +5876,7 @@ mod tests {
         assert!(acknowledgement_bytes.len() <= MAX_INVOCATION_MESSAGE_BYTES);
         assert_eq!(
             ManagementApplicationAck::decode(&acknowledgement_bytes),
-            Ok(acknowledgement)
+            Ok(acknowledgement.clone())
         );
         assert_eq!(
             Hash::digest(b"vos/test/maa2-golden", &[&acknowledgement_bytes]).0,
@@ -5784,6 +5886,35 @@ mod tests {
                 0x78, 0x99, 0xfb, 0xa6,
             ]
         );
+
+        let mut failure_receipt = acknowledgement.receipt.clone();
+        failure_receipt.selector.operation = AuthorityOperationKind::InstallActor;
+        let failure = ManagementApplicationFailure {
+            authorization_invocation: acknowledgement.authorization_invocation,
+            acknowledgement_invocation: acknowledgement.acknowledgement_invocation,
+            authority: acknowledgement.authority,
+            managed: ManagedAgentTarget {
+                profile: crate::AgentProfile::Local,
+                ..acknowledgement.managed
+            },
+            credential_call: acknowledgement.credential_call,
+            approval: acknowledgement.approval,
+            authorization_sequence: acknowledgement.authorization_sequence,
+            request: acknowledgement.request,
+            receipt: failure_receipt,
+            error: crate::ManagementError::AlreadyExists,
+            reopened_state: acknowledgement.reopened_state,
+            failed_at: acknowledgement.applied_at,
+            signature: acknowledgement.signature,
+        };
+        let failure_bytes = failure.encode().unwrap();
+        assert_eq!(failure_bytes.get(..4), Some(b"MAF1".as_slice()));
+        assert_eq!(
+            ManagementApplicationFailure::decode(&failure_bytes),
+            Ok(failure)
+        );
+        assert!(ManagementApplicationAck::decode(&failure_bytes).is_err());
+        assert!(ManagementApplicationFailure::decode(&acknowledgement_bytes).is_err());
     }
 
     #[test]

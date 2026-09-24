@@ -205,14 +205,21 @@ Install but does not terminalize an already Authority-approved intent: the
 issuer has no cancellation transition for that case. Keep external Install
 ingress disabled until lifecycle handling of permanent guest rejection and
 response-loss recovery is qualified.
-Release-scope decision pending: either add an authenticated, recoverable
+Release-scope decision pending: either complete an authenticated, recoverable
 terminal-failure transition for that approved Install, or retain image Local
 Install for the first customer release and defer public external Local Install.
-Do not expose the existing internal external Install method as ingress while
-approval can be stranded.
+The approved fresh-root rule is independent of this Install decision. Do not
+expose the existing internal external Install method as ingress while approval
+can be stranded.
 An internal opt-in journal path now publishes a rejected Install's exact
 guest result as an authenticated Ordered transition, instead of discarding
 the preflight result. Rejected management work may advance runtime control
+metadata, so it cannot be treated as an unchanged no-op. Replay and the locked
+file owner can re-observe the exact failure. The SDK now has a distinct signed
+`MAF1` failure artifact; the Authority actor finalizes it only against a pending
+Local Install, retains exact retry across restart, and leaves the actor absent.
+This is not yet an issuer pledge or lifecycle recovery path: `CIS2`, the
+controller and public Install ingress still need to consume the failure.
 metadata even when it installs no actor; recovery must replay the resulting
 state, not assume a no-op. A separate read-only observer binds the replayed
 error to its receipt, request, original Ordered position and observation slot.
@@ -278,8 +285,9 @@ signed pending package replaces the retired Install's sidecar and that restart
 recovers the later ACK. The real `vosx` file adapter separately exercises the
 pre-handoff and post-handoff file order, including a staged `.next` recovery,
 but this is not yet a full file-backed daemon lifecycle run.
-A permanently guest-rejected approved Install has no terminal failure
-transition, so public Install ingress remains disabled.
+A permanently guest-rejected approved Install still lacks a complete
+issuer-to-controller terminal-failure handoff, so public Install ingress
+remains disabled.
 The internal lifecycle controller now has an explicit external backing that
 consumes the complete signed startup recovery, retains each locked file owner
 and its selected directory, and creates per-Agent Direct route attachments

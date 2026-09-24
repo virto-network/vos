@@ -36,7 +36,7 @@ use vos::agent_sdk::authority::{
     AuthorityProjectionQuery, AuthorityProjectionSelector, AuthorityVerifier,
     CompactAgentDescriptor, CompactInstallActor, CompactReplicaSlot,
     MAX_AUTHORITY_PRINCIPAL_GRANTS, ManagedAgentTarget, ManagementApplicationAck,
-    ManagementApproval, ManagementAuthorizationPlan,
+    ManagementApplicationFailure, ManagementApproval, ManagementAuthorizationPlan,
 };
 use vos::agent_sdk::authority_operation::{
     AuthorityOperationApproval, AuthorityOperationCall, AuthorityOperationIntent,
@@ -59,8 +59,8 @@ use vos::agent_sdk::{
     ActorId, AgentId, AgentIdentity, AgentProfile, AgentReplica, CapabilityId, CredentialId,
     DeploymentId, Hash, InvocationContext, InvocationId, MAX_AGENT_REPLICAS,
     MAX_INVOCATION_MESSAGE_BYTES, MAX_INVOCATION_REPLY_BYTES, MAX_RUNTIME_STATE_BYTES,
-    ManagementReply, PrincipalId, PrivateRecoveryBinding, ProducerId, ProgramId, RUNTIME_ABI_ID,
-    ReplicaRole, RoleId, RuntimeCapabilities, RuntimeRequirements, SpaceId,
+    ManagementError, ManagementReply, PrincipalId, PrivateRecoveryBinding, ProducerId, ProgramId,
+    RUNTIME_ABI_ID, ReplicaRole, RoleId, RuntimeCapabilities, RuntimeRequirements, SpaceId,
     replica_roster_commitment, replica_set_generation,
 };
 use vos::prelude::*;
@@ -1408,8 +1408,8 @@ impl SystemAuthority {
     }
 
     /// Finalize a pending policy effect only after the durable issuer signs a
-    /// canonical MAA2 post-reopen acknowledgement. Exact acknowledgement
-    /// retries return `true` without changing state.
+    /// canonical MAA2 post-reopen acknowledgement, or retire a rejected Local
+    /// Install with a distinct signed MAF1. Exact retries change no state.
     #[msg(linear)]
     fn finalize(&mut self, ack: Vec<u8>, ctx: &mut Context<Self>) -> bool {
         let Some(context) = ctx.agent_invocation_context().copied() else {
@@ -3319,6 +3319,9 @@ fn finalize_application_staged(
     if encoded_ack.len() > MAX_INVOCATION_MESSAGE_BYTES {
         return false;
     }
+    if encoded_ack.starts_with(b"MAF1") {
+        return finalize_application_failure_staged(configuration, state, encoded_ack, context);
+    }
     let Ok(ack) = ManagementApplicationAck::decode(encoded_ack) else {
         return false;
     };
@@ -3402,6 +3405,105 @@ fn finalize_application_staged(
     };
     let mut candidate = state.clone();
     apply_application_plan(&mut candidate, plan);
+    candidate.retries.remove(record_index);
+    match candidate
+        .latest_management_acks
+        .binary_search_by(|record| record.credential.cmp(&latest.credential))
+    {
+        Ok(index) => {
+            if candidate.latest_management_acks[index].request_sequence >= latest.request_sequence {
+                return false;
+            }
+            candidate.latest_management_acks[index] = latest;
+        }
+        Err(index) => candidate.latest_management_acks.insert(index, latest),
+    }
+    if !refresh_state_integrity_commitment(configuration, &mut candidate)
+        || !authority_state_is_valid(configuration, &candidate)
+    {
+        return false;
+    }
+    *state = candidate;
+    true
+}
+
+fn finalize_application_failure_staged(
+    configuration: &SystemAuthorityConfiguration,
+    state: &mut AuthorityLinearState,
+    encoded_failure: &[u8],
+    context: &InvocationContext,
+) -> bool {
+    let Ok(failure) = ManagementApplicationFailure::decode(encoded_failure) else {
+        return false;
+    };
+    if !failure.matches_invocation_context(context)
+        || !authority_target_matches(configuration, &failure.authority)
+        || failure.verify_with(&Ed25519CredentialVerifier).is_err()
+        || !authority_state_is_valid(configuration, state)
+    {
+        return false;
+    }
+    let failure_commitment = failure.commitment();
+    let error_commitment = vos::agent_sdk::wire::management_error_commitment(failure.error);
+    if let Some(record) = state
+        .latest_management_acks
+        .iter()
+        .find(|record| record.acknowledgement_invocation == failure.acknowledgement_invocation.0)
+    {
+        return record.authorization_invocation == failure.authorization_invocation.0
+            && record.authorization_sequence == failure.authorization_sequence.get()
+            && record.credential_call == failure.credential_call.0
+            && record.approval == failure.approval.0
+            && record.request == failure.request.0
+            && record.application == error_commitment.0
+            && record.acknowledgement == failure_commitment.0
+            && record.acknowledgement_bytes == encoded_failure
+            && record.reopened_state == failure.reopened_state.0
+            && record.applied_at == failure.failed_at;
+    }
+
+    let Some(record_index) = state.retries.iter().position(|record| {
+        record.acknowledgement_invocation == failure.acknowledgement_invocation.0
+    }) else {
+        return false;
+    };
+    let record = &state.retries[record_index];
+    if record.invocation != failure.authorization_invocation.0
+        || record.credential_call != failure.credential_call.0
+        || record.approval_commitment != failure.approval.0
+        || record.authorization_sequence != failure.authorization_sequence.get()
+        || !matches!(record.effect, PendingManagementEffect::InstallActor { .. })
+    {
+        return false;
+    }
+    let Ok(call) = AuthorityCredentialCall::decode(&record.credential_call_bytes) else {
+        return false;
+    };
+    let Ok(approval) = ManagementApproval::decode(&record.approval) else {
+        return false;
+    };
+    if !failure.matches_pending(&call, &approval)
+        || reconstruction_effect(configuration, state, &call).as_ref() != Some(&record.effect)
+    {
+        return false;
+    }
+    let latest = LatestManagementAckRow {
+        credential: record.credential,
+        request_sequence: record.request_sequence,
+        authorization_invocation: record.invocation,
+        acknowledgement_invocation: record.acknowledgement_invocation,
+        authorization_sequence: record.authorization_sequence,
+        credential_call: record.credential_call,
+        credential_call_bytes: record.credential_call_bytes.clone(),
+        approval: record.approval_commitment,
+        request: failure.request.0,
+        application: error_commitment.0,
+        acknowledgement: failure_commitment.0,
+        acknowledgement_bytes: encoded_failure.to_vec(),
+        reopened_state: failure.reopened_state.0,
+        applied_at: failure.failed_at,
+    };
+    let mut candidate = state.clone();
     candidate.retries.remove(record_index);
     match candidate
         .latest_management_acks
@@ -7693,10 +7795,7 @@ fn latest_management_ack_is_valid(
     let Ok(call) = AuthorityCredentialCall::decode(&record.credential_call_bytes) else {
         return false;
     };
-    let Ok(ack) = ManagementApplicationAck::decode(&record.acknowledgement_bytes) else {
-        return false;
-    };
-    record.credential != [0; 32]
+    let common = record.credential != [0; 32]
         && record.request_sequence != 0
         && record.authorization_invocation != [0; 32]
         && record.acknowledgement_invocation != [0; 32]
@@ -7717,7 +7816,43 @@ fn latest_management_ack_is_valid(
         && call.encode().ok().as_deref() == Some(record.credential_call_bytes.as_slice())
         && call.verify_with(&Ed25519CredentialVerifier).is_ok()
         && authority_target_matches(configuration, &call.authority)
-        && ack.authorization_invocation.0 == record.authorization_invocation
+        && state.credentials.iter().any(|credential| {
+            credential.credential == record.credential
+                && credential.principal == call.principal.0
+                && credential.public_key == call.credential_public_key
+                && credential.management_request_high_water >= record.request_sequence
+        });
+    if !common {
+        return false;
+    }
+    if record.acknowledgement_bytes.starts_with(b"MAF1") {
+        let Ok(failure) = ManagementApplicationFailure::decode(&record.acknowledgement_bytes)
+        else {
+            return false;
+        };
+        return matches!(&call.plan, ManagementAuthorizationPlan::Install(_))
+            && failure.authorization_invocation.0 == record.authorization_invocation
+            && failure.acknowledgement_invocation.0 == record.acknowledgement_invocation
+            && failure.authority == call.authority
+            && failure.managed == call.managed
+            && failure.authorization_sequence.get() == record.authorization_sequence
+            && failure.credential_call.0 == record.credential_call
+            && failure.approval.0 == record.approval
+            && failure.request.0 == record.request
+            && failure.request == call.plan.commitment()
+            && vos::agent_sdk::wire::management_error_commitment(failure.error).0
+                == record.application
+            && failure.commitment().0 == record.acknowledgement
+            && failure.encode().ok().as_deref() == Some(record.acknowledgement_bytes.as_slice())
+            && failure.reopened_state.0 == record.reopened_state
+            && failure.failed_at == record.applied_at
+            && failure.verify_with(&Ed25519CredentialVerifier).is_ok()
+            && authority_target_matches(configuration, &failure.authority);
+    }
+    let Ok(ack) = ManagementApplicationAck::decode(&record.acknowledgement_bytes) else {
+        return false;
+    };
+    ack.authorization_invocation.0 == record.authorization_invocation
         && ack.acknowledgement_invocation.0 == record.acknowledgement_invocation
         && ack.authorization_sequence.get() == record.authorization_sequence
         && ack.credential_call.0 == record.credential_call
@@ -7732,12 +7867,6 @@ fn latest_management_ack_is_valid(
         && ack.applied_at == record.applied_at
         && ack.verify_with(&Ed25519CredentialVerifier).is_ok()
         && authority_target_matches(configuration, &ack.authority)
-        && state.credentials.iter().any(|credential| {
-            credential.credential == record.credential
-                && credential.principal == call.principal.0
-                && credential.public_key == call.credential_public_key
-                && credential.management_request_high_water >= record.request_sequence
-        })
 }
 
 fn active_operation_record_is_valid(
@@ -17004,6 +17133,81 @@ mod tests {
         let before_retry = restarted.state.clone();
         assert!(dispatch_ack(&mut restarted, &ack));
         assert_eq!(restarted.state, before_retry);
+    }
+
+    #[test]
+    fn signed_local_install_rejection_retires_pending_without_installing_and_restarts() {
+        let config = configuration();
+        let mut actor = actor();
+        let descriptor = descriptor(config, ADMIN_PRINCIPAL, AgentProfile::Local, 0xd1);
+        insert_live(&mut actor, &descriptor);
+        let managed = target_for(&descriptor);
+        let install = actor_install(managed.agent, "rejected-worker", 0xd2);
+        let mut call = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0xd3,
+            managed,
+            ManagementRequest::Install(Box::new(install.clone())),
+        );
+        prepare_management_call(&actor, &mut call, &signing(0x21));
+        let approval = ManagementApproval::decode(&dispatch(&mut actor, &call))
+            .expect("Local Install must reserve an approval");
+        let success = application_ack(config, &actor.state, &call, &approval);
+        let mut failure = ManagementApplicationFailure {
+            authorization_invocation: success.authorization_invocation,
+            acknowledgement_invocation: success.acknowledgement_invocation,
+            authority: success.authority,
+            managed: success.managed,
+            credential_call: success.credential_call,
+            approval: success.approval,
+            authorization_sequence: success.authorization_sequence,
+            request: success.request,
+            receipt: success.receipt.clone(),
+            error: ManagementError::AlreadyExists,
+            reopened_state: Hash([0xd4; 32]),
+            failed_at: approval.valid_from,
+            signature: [1; 64],
+        };
+        failure.signature = signing(0x71).sign(&failure.signing_bytes()).to_bytes();
+        let bytes = failure.encode().expect("valid signed MAF1");
+        let context = InvocationContext {
+            invocation: failure.acknowledgement_invocation,
+            actor: failure.authority.binding.issuer.actor,
+            mode: MethodMode::Linear,
+            origin: InvocationOrigin::anonymous(),
+            roles: InvocationRoleClaims::none(),
+            observed_slot: failure.failed_at,
+        };
+        let pending = actor.state.clone();
+        let mut tampered = bytes.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(!dispatch_ack_bytes(&mut actor, tampered, Some(context)));
+        assert_eq!(actor.state, pending);
+        assert!(dispatch_ack_bytes(&mut actor, bytes.clone(), Some(context)));
+        assert!(actor.state.retries.is_empty());
+        assert!(managed_actor(&actor.state, managed.agent, install.entry.actor).is_err());
+        assert!(authority_state_is_valid(&config, &actor.state));
+
+        let finalized = actor.state.clone();
+        assert!(dispatch_ack_bytes(&mut actor, bytes.clone(), Some(context)));
+        assert_eq!(actor.state, finalized);
+        assert!(!dispatch_ack(&mut actor, &success));
+        assert_eq!(actor.state, finalized);
+
+        let linear = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
+        let mut restarted = <SystemAuthority as vos::Actor>::__load_agent_state(
+            Some(&config.encode()),
+            Some(&linear),
+            None,
+            None,
+        )
+        .expect("failed finality must survive restart");
+        assert_eq!(restarted.state, finalized);
+        assert!(dispatch_ack_bytes(&mut restarted, bytes, Some(context)));
+        assert_eq!(restarted.state, finalized);
     }
 
     #[test]

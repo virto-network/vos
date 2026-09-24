@@ -10,9 +10,9 @@ use crate::private::NodeEncryptionEnrollment;
 use crate::{
     ActorEntry, ActorId, AgentDescriptor, AgentId, AgentIdentity, AgentProfile, AgentReplica,
     BlobRef, CapabilityId, CredentialId, DeploymentId, Hash, InstallationId, InvocationContext,
-    InvocationId, InvocationRoleClaims, ManagementReply, ManagementRequest, MethodMode, NodeId,
-    PrincipalId, PrivateRecoveryBinding, ProducerId, ProgramId, ReplicaRole, RoleId,
-    RuntimeCapabilities, RuntimeRequirements, RuntimeUpgrade, SpaceId, UpgradeActor,
+    InvocationId, InvocationRoleClaims, ManagementError, ManagementReply, ManagementRequest,
+    MethodMode, NodeId, PrincipalId, PrivateRecoveryBinding, ProducerId, ProgramId, ReplicaRole,
+    RoleId, RuntimeCapabilities, RuntimeRequirements, RuntimeUpgrade, SpaceId, UpgradeActor,
 };
 
 pub const AUTHORITY_PUBLIC_KEY_BYTES: usize = 32;
@@ -2024,6 +2024,130 @@ impl ManagementApplicationAck {
     }
 }
 
+/// Distinct signed finality for a physically rejected external Local Install.
+///
+/// The ordinary MAA2 success wire remains byte-identical. MAF1 can only
+/// resolve an already-approved Install after the exact guest rejection and
+/// resulting state have been durably reopened. Its signature does not grant
+/// permission to skip physical replay or to cancel an ambiguous publication.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagementApplicationFailure {
+    pub authorization_invocation: InvocationId,
+    pub acknowledgement_invocation: InvocationId,
+    pub authority: AuthorityActorTarget,
+    pub managed: ManagedAgentTarget,
+    pub credential_call: Hash,
+    pub approval: Hash,
+    pub authorization_sequence: NonZeroU64,
+    pub request: Hash,
+    pub receipt: AuthorityReceipt,
+    pub error: ManagementError,
+    pub reopened_state: Hash,
+    pub failed_at: u64,
+    pub signature: [u8; AUTHORITY_SIGNATURE_BYTES],
+}
+
+impl ManagementApplicationFailure {
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        crate::wire::management_application_failure_signing_bytes(self)
+    }
+
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(
+            b"vos/agent/management-application-failure/v1",
+            &[&self.signing_bytes(), &self.signature],
+        )
+    }
+
+    pub fn validate_shape(&self) -> Result<(), AuthorityActorProtocolError> {
+        if self.authorization_invocation == InvocationId::ZERO
+            || self.acknowledgement_invocation == InvocationId::ZERO
+            || self.authorization_invocation == self.acknowledgement_invocation
+            || !self.authority.is_valid()
+            || !self.managed.is_valid()
+            || self.authority.space != self.managed.space
+        {
+            return Err(AuthorityActorProtocolError::InvalidTarget);
+        }
+        if self.managed.profile != AgentProfile::Local
+            || self.credential_call == Hash::ZERO
+            || self.approval == Hash::ZERO
+            || self.request == Hash::ZERO
+            || self.reopened_state == Hash::ZERO
+            || self.signature == [0; AUTHORITY_SIGNATURE_BYTES]
+        {
+            return Err(AuthorityActorProtocolError::InvalidApplication);
+        }
+        let selector = &self.receipt.selector;
+        if self.receipt.validate_shape().is_err()
+            || !self.authority.binding.accepts(&self.receipt)
+            || selector.space != self.managed.space
+            || selector.agent != self.managed.agent
+            || selector.runtime_deployment != self.managed.runtime_deployment
+            || selector.operation != AuthorityOperationKind::InstallActor
+            || selector.request != self.request
+            || !selector.is_live_at(self.failed_at)
+        {
+            return Err(AuthorityActorProtocolError::InvalidApplication);
+        }
+        if crate::wire::management_application_failure_encoded_len(self)
+            > crate::MAX_INVOCATION_MESSAGE_BYTES
+        {
+            return Err(AuthorityActorProtocolError::LimitExceeded);
+        }
+        Ok(())
+    }
+
+    pub fn verify_with<V: AuthorityVerifier>(
+        &self,
+        verifier: &V,
+    ) -> Result<(), AuthorityActorProtocolError> {
+        self.validate_shape()?;
+        self.receipt
+            .verify_at(self.failed_at, verifier)
+            .map_err(|_| AuthorityActorProtocolError::InvalidSignature)?;
+        if !verifier.verify(
+            &self.authority.binding.public_key,
+            &self.signing_bytes(),
+            &self.signature,
+        ) {
+            return Err(AuthorityActorProtocolError::InvalidSignature);
+        }
+        Ok(())
+    }
+
+    pub fn matches_pending(
+        &self,
+        call: &AuthorityCredentialCall,
+        approval: &ManagementApproval,
+    ) -> bool {
+        self.validate_shape().is_ok()
+            && matches!(&call.plan, ManagementAuthorizationPlan::Install(_))
+            && approval.matches_call(call)
+            && self.authorization_invocation == call.invocation
+            && self.acknowledgement_invocation == approval.acknowledgement_invocation
+            && self.authority == call.authority
+            && self.managed == call.managed
+            && self.credential_call == call.commitment()
+            && self.credential_call == approval.credential_call
+            && self.approval == approval.commitment()
+            && self.authorization_sequence == approval.authorization_sequence
+            && self.request == approval.plan_commitment
+            && receipt_matches_approval(&self.receipt, approval)
+    }
+
+    pub fn matches_invocation_context(&self, context: &InvocationContext) -> bool {
+        self.validate_shape().is_ok()
+            && context.validate()
+            && context.invocation == self.acknowledgement_invocation
+            && context.actor == self.authority.binding.issuer.actor
+            && context.mode == MethodMode::Linear
+            && context.origin.actor.is_none()
+            && context.origin.capability.is_none()
+            && context.roles == InvocationRoleClaims::none()
+    }
+}
+
 /// Match application facts using only fields present in ACC3. Every variant is
 /// exact against the call except `ReplicasChanged`: its generation also binds
 /// the Agent creation nonce. The authority actor compares that value with the
@@ -3079,6 +3203,95 @@ mod tests {
         let mut wrong_context = context;
         wrong_context.invocation = call.invocation;
         assert!(!ack.matches_invocation_context(&wrong_context));
+    }
+
+    #[test]
+    fn application_failure_is_signed_and_bound_to_a_pending_local_install() {
+        let entry = crate::ActorEntry {
+            actor: ActorId([61; 32]),
+            name: "fixture".into(),
+            parent: None,
+            deployment: DeploymentId([62; 32]),
+            program: ProgramId([63; 32]),
+            package: BlobRef::of_bytes(b"failure-package"),
+            agent_schema: BlobRef::of_bytes(b"failure-schema"),
+            method_policy: BlobRef::of_bytes(b"failure-policy"),
+            constructor_abi: Hash([64; 32]),
+            installation_data: None,
+            state_layout: Hash([65; 32]),
+            lanes: crate::LaneSet::NONE,
+            suspended: false,
+        };
+        let install = crate::InstallActor {
+            installation_id: InstallationId([66; 32]),
+            registry_reservation: Hash([67; 32]),
+            producer: ProducerId([68; 32]),
+            package: entry.package.clone(),
+            agent_schema: entry.agent_schema.clone(),
+            method_policy: entry.method_policy.clone(),
+            constructor_abi: entry.constructor_abi,
+            installation_data: None,
+            state_layout: entry.state_layout,
+            contract: ActorPackageContract::canonical(),
+            requirements: RuntimeRequirements::default(),
+            entry: entry.clone(),
+        };
+        let mut call = credential_call(ManagementRequest::Install(Box::new(install)));
+        call.managed.profile = AgentProfile::Local;
+        resign(&mut call);
+        let approval = approval(&call);
+        let success =
+            application_ack_with_reply(&call, &approval, ManagementReply::Installed(entry));
+        assert!(success.matches_pending(&call, &approval));
+        let mut failure = ManagementApplicationFailure {
+            authorization_invocation: success.authorization_invocation,
+            acknowledgement_invocation: success.acknowledgement_invocation,
+            authority: success.authority,
+            managed: success.managed,
+            credential_call: success.credential_call,
+            approval: success.approval,
+            authorization_sequence: success.authorization_sequence,
+            request: success.request,
+            receipt: success.receipt.clone(),
+            error: ManagementError::AlreadyExists,
+            reopened_state: Hash([69; 32]),
+            failed_at: success.applied_at,
+            signature: [1; AUTHORITY_SIGNATURE_BYTES],
+        };
+        failure.signature = test_signature(
+            &failure.authority.binding.public_key,
+            &failure.signing_bytes(),
+        );
+        assert_eq!(failure.validate_shape(), Ok(()));
+        assert!(failure.matches_pending(&call, &approval));
+        assert_eq!(failure.verify_with(&TestCredentialVerifier), Ok(()));
+        assert_ne!(failure.commitment(), success.commitment());
+
+        let mut forged_error = failure.clone();
+        forged_error.error = ManagementError::ResourceLimit;
+        assert_eq!(
+            forged_error.verify_with(&TestCredentialVerifier),
+            Err(AuthorityActorProtocolError::InvalidSignature)
+        );
+        let mut wrong_request = failure.clone();
+        wrong_request.request = Hash([70; 32]);
+        wrong_request.signature = test_signature(
+            &wrong_request.authority.binding.public_key,
+            &wrong_request.signing_bytes(),
+        );
+        assert!(!wrong_request.matches_pending(&call, &approval));
+        let mut wrong_profile = failure.clone();
+        wrong_profile.managed.profile = AgentProfile::Shared;
+        assert_eq!(
+            wrong_profile.validate_shape(),
+            Err(AuthorityActorProtocolError::InvalidApplication)
+        );
+        let mut expired = failure;
+        expired.failed_at = expired.receipt.selector.expires_at + 1;
+        assert_eq!(
+            expired.validate_shape(),
+            Err(AuthorityActorProtocolError::InvalidApplication)
+        );
     }
 
     #[test]
