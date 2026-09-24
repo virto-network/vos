@@ -1585,20 +1585,21 @@ backup or long-running retention tests.
 
 ## Branch boundary
 
-- Reviewer: `saga/agents` carries the fresh-root external Local Create
+- Reviewer: `saga/agents` carries code checkpoint `86045e53`, the external Local recovery
   checkpoint described in [the review guide](agent-saga-review.md), relative
-  to the previous reviewed `0ffe19fc` response-recovery checkpoint. Neither
-  is production release evidence.
-- Implementation continues on `wip/ch08-runtime-directory` after this
-  checkpoint. Fresh external-root startup, signed LCQ2 Create through the
-  binary, restart and exact ACK retry pass with checked opt-in artifacts.
-  Install and publicly routed actor Invoke/ACK remain batch-1 gates. No
-  production deployment is claimed.
-- Current focused checks are recorded above: binary-subprocess external Create
-  and exact restart retry, image startup and Create regressions, candidate
-  signed runtime admission, physical Standard Invoke/ACK checkpoint recovery,
-  and SDK feature-on/off. Full prototype, final release-binary and workspace
-  qualification have not been rerun for r04/s04.
+  to the previous `90d6c37d` fresh-root Create checkpoint. Neither is
+  production release evidence.
+- Implementation continues on `wip/ch08-runtime-directory`. Fresh external-root
+  startup, signed LCQ2 Create through the binary, deliberate public HTTP
+  response loss, restart and exact ACK retry pass with checked opt-in
+  artifacts. Internal guest-rejected Install now reaches signed failure
+  finality, retirement and exact restart retry. Public external Install and
+  publicly routed actor Invoke/ACK remain batch-1 gates. No production
+  deployment is claimed.
+- Current focused checks are recorded above: Create subprocess response loss,
+  physical rejected Install/restart, 14 issuer tests, SDK/Authority failure
+  suites, default non-experimental check and format/diff checks. Full prototype,
+  final release-binary and workspace qualification have not been rerun.
 - Master is unchanged; nothing is pushed. Review read-only and apply findings
   on the implementation branch to avoid conflicting fixes.
 - Historical bounded-state checkpoint gate passed at
