@@ -26,9 +26,10 @@ recover every pending lifecycle generation before its first route is published.
 The external format is never inferred from the image root's contents; startup
 must select the two paths explicitly.
 
-Three release-work batches remain. The bounded-state vertical slice is a
-separate intermediate review checkpoint on `saga/agents`, not completion of
-batch 1; subsequent integration stays on `wip/ch08-runtime-directory`:
+Three release-work batches remain. The code through `49a0ae44` on
+`saga/agents` includes the bounded-state slice and the opt-in Clerk
+external-Local checkpoint; neither completes batch 1. Subsequent integration
+stays on `wip/ch08-runtime-directory`:
 
 1. **Authenticated storage + customer workflow (in progress).** First qualify
    the bounded external-state vertical slice below, then port Clerk's
@@ -1621,26 +1622,20 @@ backup or long-running retention tests.
 
 ## Branch boundary
 
-- Reviewer: `saga/agents` carries code checkpoint `86045e53`, the external Local recovery
-  checkpoint described in [the review guide](agent-saga-review.md), relative
-  to the previous `90d6c37d` fresh-root Create checkpoint. Neither is
-  production release evidence.
-- Implementation continues on `wip/ch08-runtime-directory`. Fresh external-root
-  startup, signed LCQ2 Create through the binary, deliberate public HTTP
-  response loss, restart and exact ACK retry pass with checked opt-in
-  artifacts. Internal guest-rejected Install now reaches signed failure
-  finality, retirement and exact restart retry. Public external Install and
-  publicly routed actor Invoke/ACK remain batch-1 gates. No production
-  deployment is claimed.
-- Current focused checks are recorded above: Create subprocess response loss,
-  physical rejected Install/restart, 14 issuer tests, SDK/Authority failure
-  suites, default non-experimental check and format/diff checks. The complete
-  `just test-agent-state-prototype` gate now passes at the WIP head after
-  correctly feature-gating the rejected-Install issuer test. This gate covers
-  prototype SDK/guests/replay/journal staging; final release-binary and
-  workspace qualification have not been rerun.
-- Master is unchanged; nothing is pushed. Review read-only and apply findings
-  on the implementation branch to avoid conflicting fixes.
+- Reviewer: `saga/agents` carries code checkpoint `49a0ae44`, the opt-in Clerk
+  external-Local slice described in [the review guide](agent-saga-review.md),
+  relative to `e3335407`. It is not production release evidence.
+- Implementation continues on `wip/ch08-runtime-directory`. Fresh-root
+  Create/restart and internal physical Install/Invoke/ACK recovery are
+  qualified, including one Clerk note write/read. Public external Install,
+  publicly routed actor Invoke/ACK, transfer/root parity, and three-node
+  Shared remain batch-1 gates. No production deployment is claimed.
+- The focused Clerk checks are in the review guide. The complete
+  `just test-agent-state-prototype` gate last passed at `e3335407`, before
+  this Clerk checkpoint; it and final release-binary/workspace qualification
+  have not been rerun on the new code.
+- Review read-only and apply findings on the implementation branch to avoid
+  conflicting fixes.
 - Historical bounded-state checkpoint gate passed at
   `task-tmp/state-review-checkpoint-prototype.log`: SDK 247/1 ignored,
   replay 69, physical PVM 16, journal-store 105 and feature-disabled groups.
@@ -1676,7 +1671,7 @@ multi-node replication, backup or throughput. Whole-state execution and Shared
 host-wide locking remain. Historical optimized Local Create/Install timings
 (about 15.6/19.7 seconds) are not current throughput data.
 
-## Current implementation verification
+## Historical bounded-state verification
 
 The actor-storage test group passed: 11 passed, 0 failed, 0 ignored (0.11 seconds
 after compilation), including the new row-capacity regression. Command:
@@ -1687,9 +1682,10 @@ cargo +nightly-2025-05-09 test --offline --locked -p vos --lib \
   agent::actor_storage::tests -- --nocapture
 ```
 
-No released Clerk/PVM benchmark has run. This proves the current codec boundary,
-not an exact supported ledger size or throughput. Clerk port, three-node workflow,
-CLI, performance and backup implementation remain pending.
+No released Clerk/PVM benchmark has run. These pre-Clerk checks prove the codec
+boundary, not an exact supported ledger size or throughput. The opt-in Clerk
+external-Local slice above is now implemented; its transfer/kernel-root parity,
+three-node workflow, CLI, performance and backup qualification remain pending.
 Feature-enabled SDK suite after explicit experimental contract admission: 232
 passed, 0 failed, 1 ignored. Coverage includes maximum audit frontier (256
 pending siblings plus 16 value chunks), unreachable historical blocks, opaque
