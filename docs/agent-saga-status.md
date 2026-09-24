@@ -1628,20 +1628,22 @@ backup or long-running retention tests.
 
 ## Branch boundary
 
-- Reviewer: `saga/agents` carries code checkpoint `49a0ae44`, the opt-in Clerk
-  external-Local slice described in [the review guide](agent-saga-review.md),
-  relative to `e3335407`. It is not production release evidence.
+- Reviewer: `saga/agents` carries code checkpoint `9a003d58`, the opt-in Clerk
+  external-Local signed-transfer/root slice described in
+  [the review guide](agent-saga-review.md), relative to `a3d7c295`. It is not
+  production release evidence.
 - Implementation continues on `wip/ch08-runtime-directory`. Fresh-root
   Create/restart and internal physical Install/Invoke/ACK recovery are
-  qualified, including one Clerk note write/read. Public external Install,
-  publicly routed actor Invoke/ACK, transfer/root parity, and three-node
+  qualified, including one Clerk note write/read and one signed transfer/root
+  comparison through the physical PVM and owner reopen. Public external
+  Install, publicly routed actor Invoke/ACK, retained growth and three-node
   Shared remain batch-1 gates. No production deployment is claimed.
 - The focused Clerk checks are in the review guide. The complete
-  `just test-agent-state-prototype` gate passed on the Clerk checkpoint,
-  including SDK, replay, physical PVM, journal-store and feature-disabled
-  groups. Offline/locked `cargo check -p vosx --tests` and workspace
-  formatting passed. Final release-binary/workspace qualification remains
-  open.
+  `just test-agent-state-prototype` gate and offline/locked `vosx --tests`
+  check passed at `a3d7c295`; the later Agent/legacy Clerk suites and
+  canonical-package physical transfer/reopen fixture passed at `9a003d58`.
+  The `vosx` fresh-root non-migration test also passed. Final
+  release-binary/workspace qualification remains open.
 - Review read-only and apply findings on the implementation branch to avoid
   conflicting fixes.
 - Historical bounded-state checkpoint gate passed at
