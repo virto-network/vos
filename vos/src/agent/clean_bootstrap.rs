@@ -17225,6 +17225,136 @@ mod tests {
                     .heads(),
                 &installed_head,
             );
+            if std::env::var_os("CLERK_AGENT_PACKAGE").is_some() {
+                use crate::actors::codec::{Decode as _, Encode as _};
+                use crate::actors::value::{Msg, TAG_DYNAMIC, Value};
+                use crate::agent::journal::{ReplayInput, ReplayOperation};
+
+                let clerk_schema =
+                    crate::agent::sdk::schema::decode(install_package.state_lane_schema_bytes())
+                        .unwrap();
+                let clerk_read = clerk_schema
+                    .methods
+                    .iter()
+                    .find(|method| method.name == "journal_id")
+                    .expect("signed Clerk schema includes journal_id");
+                assert_eq!(clerk_read.mode, MethodMode::LinearizableQuery);
+
+                let installed = post_install_owners
+                    .get_mut(&descriptor.identity.agent)
+                    .unwrap();
+                let record = installed
+                    .inspect_actors(
+                        None,
+                        1,
+                        LOGICAL_SLOT + 20,
+                        &mut ReadBudget::new(10_000, 10_000_000),
+                    )
+                    .unwrap()
+                    .entries
+                    .remove(0);
+                let material = installed
+                    .physical_invocation_material(
+                        record.entry.actor,
+                        LOGICAL_SLOT + 20,
+                        &mut ReadBudget::new(10_000, 10_000_000),
+                    )
+                    .unwrap();
+                let mut availability = vec![material.program, material.schema, material.policies];
+                availability.extend(material.installation_data);
+                availability.sort_by(|a, b| a.reference.cmp(&b.reference));
+                let mut message = vec![TAG_DYNAMIC];
+                message.extend(Msg::new("journal_id").encode());
+                let work = InvocationWork {
+                    space: descriptor.identity.space,
+                    agent: descriptor.identity.agent,
+                    runtime_deployment: runtime.deployment(),
+                    invocation: InvocationId([0xe1; 32]),
+                    actor: record.entry.actor,
+                    incarnation: record.incarnation,
+                    deployment: record.entry.deployment,
+                    program: record.entry.program,
+                    mode: MethodMode::LinearizableQuery,
+                    origin: InvocationOrigin::anonymous(),
+                    roles: InvocationRoleClaims::none(),
+                    message,
+                    installation_data: record.entry.installation_data.clone(),
+                    availability,
+                    gas: 100_000_000,
+                    recovery_only: false,
+                };
+                let mut receipt = install_receipt.clone();
+                receipt.selector.operation =
+                    crate::agent::sdk::authority::AuthorityOperationKind::InvokeActor;
+                receipt.selector.actor = Some(work.actor);
+                receipt.selector.actor_deployment = Some(work.deployment);
+                receipt.selector.request = work.commitment();
+                receipt.selector.decision_sequence = 0;
+                receipt.selector.acknowledged_through = 0;
+                receipt.selector.expires_at = LOGICAL_SLOT + 100;
+                receipt.signature = SigningKey::from_bytes(&[RECEIPT_SEED; 32])
+                    .sign(&receipt.signing_bytes())
+                    .to_bytes();
+                let authorization =
+                    crate::agent::sdk::InvocationAuthorization::AuthorityReceipt(receipt);
+                let invoke = ReplayInput {
+                    runtime: installed.materialization().unwrap().runtime().clone(),
+                    operation: ReplayOperation::CleanInvoke {
+                        context: crate::agent::sdk::RuntimeExecutionContext::Direct,
+                        work: work.clone(),
+                        authorization: authorization.clone(),
+                        observed_slot: LOGICAL_SLOT + 20,
+                    },
+                };
+                let outcome = installed
+                    .submit_direct_clean(
+                        invoke.clone(),
+                        LOGICAL_SLOT + 20,
+                        &mut ReadBudget::new(10_000, 10_000_000),
+                    )
+                    .unwrap();
+                let RuntimeOutcome::Completed(Ok(reply)) = &outcome else {
+                    panic!("physical Clerk journal_id failed: {outcome:?}");
+                };
+                assert_eq!(Value::decode(&reply.reply), Value::Bytes(Vec::new()));
+                assert_eq!(
+                    installed
+                        .submit_direct_clean(
+                            invoke,
+                            LOGICAL_SLOT + 20,
+                            &mut ReadBudget::new(10_000, 10_000_000)
+                        )
+                        .unwrap(),
+                    outcome,
+                );
+                let acknowledge = ReplayInput {
+                    runtime: installed.materialization().unwrap().runtime().clone(),
+                    operation: ReplayOperation::CleanAcknowledge {
+                        context: crate::agent::sdk::RuntimeExecutionContext::Direct,
+                        expected_live: None,
+                        work: crate::agent::sdk::InvocationRetirement::from_work(&work),
+                        authorization,
+                    },
+                };
+                let retired = installed
+                    .submit_direct_clean(
+                        acknowledge.clone(),
+                        LOGICAL_SLOT + 20,
+                        &mut ReadBudget::new(10_000, 10_000_000),
+                    )
+                    .unwrap();
+                assert!(matches!(retired, RuntimeOutcome::Acknowledged(Ok(_))));
+                assert_eq!(
+                    installed
+                        .submit_direct_clean(
+                            acknowledge,
+                            LOGICAL_SLOT + 20,
+                            &mut ReadBudget::new(10_000, 10_000_000),
+                        )
+                        .unwrap(),
+                    retired,
+                );
+            }
             drop(post_install_owners);
 
             let orphan = crate::service::AgentId([0x77; 32]);

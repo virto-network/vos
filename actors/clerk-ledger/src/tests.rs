@@ -57,9 +57,26 @@ fn agent_port_binds_linear_kernel_methods_and_exact_roles() {
     ] {
         assert_eq!(mode(name), MethodMode::Linear);
     }
-    for name in ["account", "transfer", "state_root"] {
-        assert_eq!(mode(name), MethodMode::Query);
+    for name in [
+        "ping",
+        "journal_id",
+        "registrar_pubkey",
+        "account",
+        "transfer",
+        "state_root",
+        "account_count",
+        "transfer_count",
+        "note_commitment_count",
+        "note_commitment_at",
+    ] {
+        assert_eq!(mode(name), MethodMode::LinearizableQuery);
     }
+    assert!(
+        crate::ClerkLedgerMsg::AGENT_METHODS
+            .iter()
+            .all(|method| !matches!(method.mode, MethodMode::Query | MethodMode::LocalQuery)),
+        "external-state Clerk must not publish unsupported default Query results"
+    );
     let selector = |name| {
         crate::ClerkLedgerMsg::AGENT_AUTHORIZATIONS
             .iter()

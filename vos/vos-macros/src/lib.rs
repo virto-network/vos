@@ -1282,6 +1282,7 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
         let mut capability: Option<syn::LitStr> = None;
         let mut is_attested = false;
         let mut execution_mode: Option<syn::Ident> = None;
+        let mut agent_linearizable = false;
         // `#[msg(timeout_ms = N)]` — per-handler invoke timeout in ms
         // (0 = client default), recorded in `.vos_meta` so the dispatcher
         // waits long enough for a legitimately slow handler.
@@ -1306,6 +1307,10 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
                 if meta.path.is_ident("attested") {
                     is_attested = true;
+                    return Ok(());
+                }
+                if meta.path.is_ident("agent_linearizable") {
+                    agent_linearizable = true;
                     return Ok(());
                 }
                 for name in [
@@ -1469,6 +1474,14 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
             Some(FnArg::Receiver(r)) => r.mutability.is_none(),
             _ => false,
         };
+        if agent_linearizable && (!is_query || execution_mode.is_some()) {
+            return syn::Error::new_spanned(
+                &method.sig,
+                "agent_linearizable requires a query method without another execution mode",
+            )
+            .to_compile_error()
+            .into();
+        }
         let explicit_execution_mode = execution_mode.is_some();
         if agent_messages && !is_query && !explicit_execution_mode {
             all_agent_mutations_explicit = false;
@@ -1525,6 +1538,9 @@ pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
                 )
                 .to_compile_error()
                 .into();
+            }
+            None if is_query && agent_messages && agent_linearizable => {
+                quote! { vos::agent::MethodMode::LinearizableQuery }
             }
             None if is_query => quote! { vos::agent::MethodMode::Query },
             None => quote! { <#actor_name as vos::Actor>::DEFAULT_MUTATION_MODE },

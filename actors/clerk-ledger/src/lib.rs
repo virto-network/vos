@@ -608,7 +608,7 @@ impl ClerkLedger {
     }
 
     /// Diagnostic — this clerk-ledger's own `ServiceId` packed as u32.
-    #[msg]
+    #[msg(agent_linearizable)]
     async fn ping(&self, ctx: &mut Context<Self>) -> u32 {
         ctx.id().0
     }
@@ -644,12 +644,12 @@ impl ClerkLedger {
         }
     }
 
-    #[msg]
+    #[msg(agent_linearizable)]
     async fn journal_id(&self) -> Vec<u8> {
         self.journal_id.map(|id| id.to_vec()).unwrap_or_default()
     }
 
-    #[msg]
+    #[msg(agent_linearizable)]
     async fn registrar_pubkey(&self) -> Vec<u8> {
         self.journal_row()
             .map(|j| j.registrar_auth_key.0.to_vec())
@@ -1034,7 +1034,7 @@ impl ClerkLedger {
     /// Export the producer-private proof-record entry for one accepted
     /// provable transfer. Operator-gated because the entry contains the
     /// exact witness, including commitment openings.
-    #[msg(role = ClerkLedgerRole::Operator, actor_role_id = "0727707313c8a3ab999ff2ad14fec1a5bb5d124f9b09af3d6ff1bdd5597919b2")]
+    #[msg(role = ClerkLedgerRole::Operator, actor_role_id = "0727707313c8a3ab999ff2ad14fec1a5bb5d124f9b09af3d6ff1bdd5597919b2", agent_linearizable)]
     async fn transfer_proof_record(
         &self,
         transfer_id: [u8; 16],
@@ -1055,7 +1055,7 @@ impl ClerkLedger {
 
     /// Canonical producer-record export consumed by
     /// `vosx zk prove --from <actor> --tag <hex>`.
-    #[msg(role = ClerkLedgerRole::Operator, actor_role_id = "0727707313c8a3ab999ff2ad14fec1a5bb5d124f9b09af3d6ff1bdd5597919b2")]
+    #[msg(role = ClerkLedgerRole::Operator, actor_role_id = "0727707313c8a3ab999ff2ad14fec1a5bb5d124f9b09af3d6ff1bdd5597919b2", agent_linearizable)]
     async fn proof_record(&self, tag: [u8; 32], ctx: &mut Context<Self>) -> Vec<u8> {
         if !Self::authorize_proof_operator(ctx) {
             return Vec::new();
@@ -1086,13 +1086,13 @@ impl ClerkLedger {
     }
 
     /// Read an account by id.
-    #[msg(role = ClerkLedgerRole::Member, actor_role_id = "a1b12a800f4dc4d99707ddb39f91403bc9b8b87a1eb14aeaeb14fc1a63d28a21")]
+    #[msg(role = ClerkLedgerRole::Member, actor_role_id = "a1b12a800f4dc4d99707ddb39f91403bc9b8b87a1eb14aeaeb14fc1a63d28a21", agent_linearizable)]
     async fn account(&self, id: [u8; 16]) -> Option<CcAccount> {
         self.accounts.get(&id)
     }
 
     /// Read a transfer by id.
-    #[msg(role = ClerkLedgerRole::Member, actor_role_id = "a1b12a800f4dc4d99707ddb39f91403bc9b8b87a1eb14aeaeb14fc1a63d28a21")]
+    #[msg(role = ClerkLedgerRole::Member, actor_role_id = "a1b12a800f4dc4d99707ddb39f91403bc9b8b87a1eb14aeaeb14fc1a63d28a21", agent_linearizable)]
     async fn transfer(&self, id: [u8; 16]) -> Option<CcTransfer> {
         self.transfers.get(&id)
     }
@@ -1124,12 +1124,12 @@ impl ClerkLedger {
         self.lock_voucher_anchor(id, amount_commit)
     }
 
-    #[msg(role = ClerkLedgerRole::Member, actor_role_id = "a1b12a800f4dc4d99707ddb39f91403bc9b8b87a1eb14aeaeb14fc1a63d28a21")]
+    #[msg(role = ClerkLedgerRole::Member, actor_role_id = "a1b12a800f4dc4d99707ddb39f91403bc9b8b87a1eb14aeaeb14fc1a63d28a21", agent_linearizable)]
     async fn account_count(&self) -> u32 {
         self.accounts.len() as u32
     }
 
-    #[msg(role = ClerkLedgerRole::Member, actor_role_id = "a1b12a800f4dc4d99707ddb39f91403bc9b8b87a1eb14aeaeb14fc1a63d28a21")]
+    #[msg(role = ClerkLedgerRole::Member, actor_role_id = "a1b12a800f4dc4d99707ddb39f91403bc9b8b87a1eb14aeaeb14fc1a63d28a21", agent_linearizable)]
     async fn transfer_count(&self) -> u32 {
         self.transfers.len() as u32
     }
@@ -1146,7 +1146,7 @@ impl ClerkLedger {
     /// Runtime cost: O(1) — six per-field root-row reads and five node
     /// hashes; the roots are maintained incrementally as the committed
     /// maps mutate.
-    #[msg(role = ClerkLedgerRole::Member, actor_role_id = "a1b12a800f4dc4d99707ddb39f91403bc9b8b87a1eb14aeaeb14fc1a63d28a21")]
+    #[msg(role = ClerkLedgerRole::Member, actor_role_id = "a1b12a800f4dc4d99707ddb39f91403bc9b8b87a1eb14aeaeb14fc1a63d28a21", agent_linearizable)]
     async fn state_root(&self) -> Vec<u8> {
         match self.journal_id {
             Some(_) => self.composite_root().to_vec(),
@@ -1181,14 +1181,14 @@ impl ClerkLedger {
     }
 
     /// Number of note commitments in the L3 pool.
-    #[msg(role = ClerkLedgerRole::Member, actor_role_id = "a1b12a800f4dc4d99707ddb39f91403bc9b8b87a1eb14aeaeb14fc1a63d28a21")]
+    #[msg(role = ClerkLedgerRole::Member, actor_role_id = "a1b12a800f4dc4d99707ddb39f91403bc9b8b87a1eb14aeaeb14fc1a63d28a21", agent_linearizable)]
     async fn note_commitment_count(&self) -> u32 {
         self.note_commitments.len() as u32
     }
 
     /// Read a note commitment by its insertion index. Returns an
     /// empty `Vec` for out-of-range indices.
-    #[msg(role = ClerkLedgerRole::Member, actor_role_id = "a1b12a800f4dc4d99707ddb39f91403bc9b8b87a1eb14aeaeb14fc1a63d28a21")]
+    #[msg(role = ClerkLedgerRole::Member, actor_role_id = "a1b12a800f4dc4d99707ddb39f91403bc9b8b87a1eb14aeaeb14fc1a63d28a21", agent_linearizable)]
     async fn note_commitment_at(&self, index: u32) -> Vec<u8> {
         self.note_commitments
             .get(index as u64)
