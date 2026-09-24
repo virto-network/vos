@@ -74,10 +74,15 @@ where
         if admission.authority != self.authority {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
+        let empty = self.entries.is_empty();
         for (recovery, _) in &mut self.entries {
             admission = admission.include_shared_genesis(recovery)?;
         }
-        Ok(admission.with_deferred_shared_genesis())
+        Ok(if empty {
+            admission
+        } else {
+            admission.with_deferred_shared_genesis()
+        })
     }
 
     /// Re-read all leased archives before replaying any entry. Successful
@@ -100,6 +105,11 @@ where
         }
         if owner.authority_target() != self.authority {
             return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if self.entries.is_empty() {
+            owner.verify_empty_shared_genesis_startup()?;
+            self.recovered = true;
+            return Ok(());
         }
         let records = self.entries.iter().map(|(recovery, archive)| {
             let archive = archive.as_ref().ok_or(SharedAgentHostError::Unavailable)?;

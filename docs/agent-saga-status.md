@@ -90,14 +90,21 @@ authenticated generation to joiners or qualify released CLI orchestration.
 Those remain the decision gate before choosing staged expansion over direct
 three-voter genesis.
 The ordinary Shared startup finality gap is not a one-line adapter swap:
-`discover_shared_genesis_startup` returns no controller for a fresh Space,
-the retained production controller's type-erased Shared access exposes
+fresh discovery remains noncreating, but startup now retains an empty Shared
+lifecycle controller under the production owner without creating any Shared
+control roots or entering deferred host opening. It checks that the opened
+host contains only the authenticated system generation. The PVM-gated
+empty-controller ownership tests pass, and a debug `vosx` daemon reopened the
+disposable image-Local Space with all three Shared roots absent while its
+Counter route still returned `7`. This establishes a live owner for later
+Shared Create, not a new generation or public Create ingress.
+The retained production controller's type-erased Shared access still exposes
 recovery only, and the startup verifier deliberately refuses unproved live
 provisions. The owner can produce replay-verified proof for an exact published
-generation, but a live Create path must first own the lifecycle/committee/
-archive stores and carry that proof through provisioning, application ACK,
-finalization and route publication. Do not replace the refusing verifier with
-a permissive one to make a fixture pass.
+generation, but live Create must first own the lifecycle/committee/archive
+stores and carry that proof through provisioning, application ACK,
+finalization and route publication. Cross-root first-Create crash recovery
+remains a gate. Do not replace the refusing verifier with a permissive one.
 
 Immediate integration seam: the experimental external-state package, physical
 Create, sealed Local genesis, file journal, pinned Invoke/ACK owner, and

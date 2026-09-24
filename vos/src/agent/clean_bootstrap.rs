@@ -4029,6 +4029,21 @@ where
             )
     }
 
+    /// A fresh Space retains an empty Shared lifecycle controller without
+    /// creating any Shared roots. Confirm the opened host contains only the
+    /// authenticated system generation; an empty archive cannot authorize or
+    /// conceal an existing ordinary generation.
+    pub(crate) fn verify_empty_shared_genesis_startup(&self) -> Result<(), SharedAgentHostError> {
+        let host = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if host.has_deferred_open() || !host.deferred_agent_ids().is_empty() || host.len() != 1 {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        Ok(())
+    }
+
     /// Reopen the complete deferred ordinary set from leased recovery records.
     /// The caller must keep the archive and all lifecycle stores exclusively
     /// leased for the running controller's lifetime. Archive data is not trusted:
@@ -11370,17 +11385,17 @@ mod tests {
 
         #[test]
         fn native_deferred_system_bootstrap_reopens_root_and_completes_once() {
-            check_deferred_system_bootstrap(0);
+            check_shared_system_bootstrap(0);
         }
 
         #[test]
-        fn native_shared_genesis_controller_completes_empty_deferred_set_once() {
-            check_deferred_system_bootstrap(1);
+        fn native_shared_genesis_controller_retains_empty_fresh_owner_once() {
+            check_shared_system_bootstrap(1);
         }
 
         #[test]
         fn native_shared_genesis_controller_is_adopted_by_lifecycle_owner() {
-            check_deferred_system_bootstrap(2);
+            check_shared_system_bootstrap(2);
         }
 
         #[test]
@@ -11491,7 +11506,7 @@ mod tests {
             harness.stop();
         }
 
-        fn check_deferred_system_bootstrap(use_controller: u8) {
+        fn check_shared_system_bootstrap(use_controller: u8) {
             struct NoArchive;
             impl crate::agent::genesis_archive::AgentGenesisArchiveStore for NoArchive {
                 type Error = ();
@@ -11562,6 +11577,11 @@ mod tests {
             assert_eq!(owner.ordered_index_for_test().unwrap(), before);
             assert_eq!(owner.host.lock().unwrap().len(), 1);
             assert!(owner.host.lock().unwrap().deferred_agent_ids().is_empty());
+            assert_eq!(
+                owner.host.lock().unwrap().has_deferred_open(),
+                use_controller == 0,
+                "an empty controller must not force deferred opening"
+            );
             if use_controller == 2 {
                 struct NoLocalStores;
                 impl crate::agent::local_lifecycle::LocalLifecycleStoreFactory for NoLocalStores {

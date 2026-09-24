@@ -453,7 +453,7 @@ pub(crate) fn start_clean_system_agent(
     let lifecycle_admission = lifecycle_recovery.startup_admission()
         .map_err(|error| anyhow::anyhow!("Local lifecycle requires incomplete-phase recovery before startup; preserved all stores: {error:?}"))?;
     report_phase("lifecycle_discovery");
-    let mut shared_genesis = discover_shared_genesis_startup(
+    let discovered_shared_genesis = discover_shared_genesis_startup(
         data_dir,
         authority_target,
         vos::agent::shared_host::MAX_SHARED_HOST_AGENTS,
@@ -463,10 +463,19 @@ pub(crate) fn start_clean_system_agent(
             "verify Shared lifecycle stores before startup; preserved stores: {error:?}"
         )
     })?;
+    let existing_shared_roots = discovered_shared_genesis.is_some();
+    let mut shared_genesis = match discovered_shared_genesis {
+        Some(controller) => controller,
+        None => super::clean_store::CleanSharedGenesisStartupEntry::into_controller(
+            authority_target,
+            Vec::new(),
+        )
+        .map_err(|error| anyhow::anyhow!("initialize empty Shared owner: {error:?}"))?,
+    };
     report_phase("shared_lifecycle_discovery");
     tracing::debug!(
-        configured = shared_genesis.is_some(),
-        "Shared lifecycle recovery discovered"
+        existing_roots = existing_shared_roots,
+        "Shared lifecycle owner selected"
     );
     let operation_journal = CleanNativeAuthorityOperationJournal::open_or_create(
         data_dir.join(OPERATION_JOURNAL_DIRECTORY),
@@ -521,14 +530,11 @@ pub(crate) fn start_clean_system_agent(
             anyhow::anyhow!("verify admin recovery before startup; preserved stores: {error:?}")
         })?;
     report_phase("operation_admission");
-    let operation_admission = match shared_genesis.as_mut() {
-        Some(shared) => shared
-            .startup_admission(operation_admission)
-            .map_err(|error| {
-                anyhow::anyhow!("admit Shared recovery before startup; preserved stores: {error:?}")
-            })?,
-        None => operation_admission,
-    };
+    let operation_admission = shared_genesis
+        .startup_admission(operation_admission)
+        .map_err(|error| {
+            anyhow::anyhow!("admit Shared recovery before startup; preserved stores: {error:?}")
+        })?;
     let mut owner = CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
         pins_store,
         record_store,
@@ -619,12 +625,11 @@ pub(crate) fn start_clean_system_agent(
             }
         }
     };
-    let lifecycle = match shared_genesis {
-        Some(shared) => lifecycle.with_shared_genesis(shared).map_err(|error| {
+    let lifecycle = lifecycle
+        .with_shared_genesis(shared_genesis)
+        .map_err(|error| {
             anyhow::anyhow!("complete Shared recovery before routes; preserved stores: {error:?}")
-        })?,
-        None => lifecycle,
-    };
+        })?;
     report_phase("shared_lifecycle_recovery");
     let lifecycle = lifecycle
         .with_operations(
