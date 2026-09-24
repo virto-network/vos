@@ -200,11 +200,11 @@ The publisher now physically preflights Install against that same pinned
 predecessor. A conflicting installation identity returns a guest rejection
 without advancing heads or retaining newly staged catalog bytes; an exact
 repeat remains idempotently successful. A successful preflight is re-executed
-for publication and its result must match. This avoids a durable failed
-Install but does not terminalize an already Authority-approved intent: the
-issuer has no cancellation transition for that case. Keep external Install
-ingress disabled until lifecycle handling of permanent guest rejection and
-response-loss recovery is qualified.
+for publication and its result must match. That early fail-closed helper does
+not terminalize an already Authority-approved intent; the separate terminal
+rejection path below does so only within the physical journal, issuer and
+Authority actor. Keep external Install ingress disabled until lifecycle
+handling and response-loss recovery are qualified.
 Release-scope decision pending: either complete an authenticated, recoverable
 terminal-failure transition for that approved Install, or retain image Local
 Install for the first customer release and defer public external Local Install.
@@ -218,8 +218,12 @@ metadata, so it cannot be treated as an unchanged no-op. Replay and the locked
 file owner can re-observe the exact failure. The SDK now has a distinct signed
 `MAF1` failure artifact; the Authority actor finalizes it only against a pending
 Local Install, retains exact retry across restart, and leaves the actor absent.
-This is not yet an issuer pledge or lifecycle recovery path: `CIS2`, the
-controller and public Install ingress still need to consume the failure.
+`CIS2` now pledges, signs and retains the same exact failure bytes across
+signer errors and restart, using its existing durable slot with a distinct
+error commitment. It records Authority finality only after the controller
+reopens the exact actor result. The controller's failed-Install recovery,
+retirement and public response-loss path remain unimplemented; public Install
+ingress stays disabled.
 metadata even when it installs no actor; recovery must replay the resulting
 state, not assume a no-op. A separate read-only observer binds the replayed
 error to its receipt, request, original Ordered position and observation slot.

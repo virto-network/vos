@@ -13,12 +13,14 @@ use crate::agent::sdk::authority::{
     AgentAuthorityBinding, AuthorityActorTarget, AuthorityCredentialCall,
     AuthorityCredentialVerifier, AuthorityEvidence, AuthorityIssuer, AuthorityLaneRoots,
     AuthorityOperationKind, AuthorityReceipt, AuthorityReceiptSelector, ManagedAgentTarget,
-    ManagementApplicationAck, ManagementApproval,
+    ManagementApplicationAck, ManagementApplicationFailure, ManagementApproval,
 };
-use crate::agent::sdk::wire::{CanonicalWire, management_reply_commitment};
+use crate::agent::sdk::wire::{
+    CanonicalWire, management_error_commitment, management_reply_commitment,
+};
 use crate::agent::sdk::{
-    ActorId, AgentId, AgentProfile, BlobRef, DeploymentId, Hash, InvocationId, ManagementReply,
-    ManagementRequest, PrincipalId, ProducerId, ProgramId, SpaceId,
+    ActorId, AgentId, AgentProfile, BlobRef, DeploymentId, Hash, InvocationId, ManagementError,
+    ManagementReply, ManagementRequest, PrincipalId, ProducerId, ProgramId, SpaceId,
 };
 use vos_protocol::wire::{DecodeError, Decoder, Encoder};
 
@@ -621,6 +623,75 @@ struct PendingApplicationAck {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+enum SignedManagementTerminal {
+    Applied(ManagementApplicationAck),
+    Rejected(ManagementApplicationFailure),
+}
+
+impl SignedManagementTerminal {
+    fn signing_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::Applied(value) => value.signing_bytes(),
+            Self::Rejected(value) => value.signing_bytes(),
+        }
+    }
+
+    fn set_signature(&mut self, signature: [u8; 64]) {
+        match self {
+            Self::Applied(value) => value.signature = signature,
+            Self::Rejected(value) => value.signature = signature,
+        }
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, crate::agent::sdk::wire::WireError> {
+        match self {
+            Self::Applied(value) => value.encode(),
+            Self::Rejected(value) => value.encode(),
+        }
+    }
+
+    fn matches_result(
+        &self,
+        result: Result<&ManagementReply, ManagementError>,
+        reopened_state: Hash,
+        applied_at: u64,
+    ) -> bool {
+        match (self, result) {
+            (Self::Applied(value), Ok(reply)) => {
+                value.application == *reply
+                    && value.reopened_state == reopened_state
+                    && value.applied_at == applied_at
+            }
+            (Self::Rejected(value), Err(error)) => {
+                value.error == error
+                    && value.reopened_state == reopened_state
+                    && value.failed_at == applied_at
+            }
+            _ => false,
+        }
+    }
+}
+
+fn decode_signed_management_terminal(bytes: &[u8]) -> Option<SignedManagementTerminal> {
+    if bytes.starts_with(b"MAF1") {
+        ManagementApplicationFailure::decode(bytes)
+            .ok()
+            .map(SignedManagementTerminal::Rejected)
+    } else {
+        ManagementApplicationAck::decode(bytes)
+            .ok()
+            .map(SignedManagementTerminal::Applied)
+    }
+}
+
+fn terminal_result_commitment(result: Result<&ManagementReply, ManagementError>) -> Hash {
+    match result {
+        Ok(reply) => management_reply_commitment(reply),
+        Err(error) => management_error_commitment(error),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct CleanManagementIssuerImage {
     binding: AgentAuthorityBinding,
     space: SpaceId,
@@ -766,16 +837,28 @@ impl CleanManagementIssuerImage {
                 ) {
                     (None, None, false) => false,
                     (Some(_), Some(bytes), _) => {
-                        let Ok(ack) = ManagementApplicationAck::decode(bytes) else {
+                        let Some(terminal) = decode_signed_management_terminal(bytes) else {
                             return false;
                         };
-                        ack.encode().ok().as_deref() != Some(bytes.as_slice())
-                            || !application_ack_matches_decision(
-                                &self.binding,
-                                &decision,
-                                &receipt,
-                                &ack,
-                            )
+                        terminal.encode().ok().as_deref() != Some(bytes.as_slice())
+                            || !match terminal {
+                                SignedManagementTerminal::Applied(ack) => {
+                                    application_ack_matches_decision(
+                                        &self.binding,
+                                        &decision,
+                                        &receipt,
+                                        &ack,
+                                    )
+                                }
+                                SignedManagementTerminal::Rejected(failure) => {
+                                    application_failure_matches_decision(
+                                        &self.binding,
+                                        &decision,
+                                        &receipt,
+                                        &failure,
+                                    )
+                                }
+                            }
                     }
                     _ => true,
                 }
@@ -1301,6 +1384,26 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         applied_at: u64,
         signer: &mut S,
     ) -> Result<ManagementApplicationAck, CleanManagementIssuerError<B::Error, S::Error>> {
+        match self.observe_durable_terminal(
+            receipt,
+            Ok(application),
+            reopened_state,
+            applied_at,
+            signer,
+        )? {
+            SignedManagementTerminal::Applied(ack) => Ok(ack),
+            SignedManagementTerminal::Rejected(_) => Err(CleanManagementIssuerError::InvalidState),
+        }
+    }
+
+    fn observe_durable_terminal<S: CleanManagementReceiptSigner>(
+        &mut self,
+        receipt: &AuthorityReceipt,
+        result: Result<&ManagementReply, ManagementError>,
+        reopened_state: Hash,
+        applied_at: u64,
+        signer: &mut S,
+    ) -> Result<SignedManagementTerminal, CleanManagementIssuerError<B::Error, S::Error>> {
         self.ensure_live()?;
         if self.image.pending.is_some() {
             return Err(CleanManagementIssuerError::Rejected(
@@ -1341,29 +1444,33 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
             };
             let decision = decode_authorized_decision(&record.decision)
                 .map_err(|_| CleanManagementIssuerError::InvalidState)?;
-            let acknowledgement = record
+            let terminal = record
                 .application_ack
                 .as_ref()
                 .ok_or(CleanManagementIssuerError::InvalidState)
                 .and_then(|bytes| {
-                    ManagementApplicationAck::decode(bytes)
-                        .map_err(|_| CleanManagementIssuerError::InvalidState)
+                    decode_signed_management_terminal(bytes)
+                        .ok_or(CleanManagementIssuerError::InvalidState)
                 })?;
-            if acknowledgement.reopened_state != reopened_state
-                || acknowledgement.applied_at != applied_at
-                || acknowledgement.application != *application
-                || !application_ack_matches_decision(
-                    &self.image.binding,
-                    &decision,
-                    receipt,
-                    &acknowledgement,
-                )
-            {
+            let matches_decision = match &terminal {
+                SignedManagementTerminal::Applied(ack) => {
+                    application_ack_matches_decision(&self.image.binding, &decision, receipt, ack)
+                }
+                SignedManagementTerminal::Rejected(failure) => {
+                    application_failure_matches_decision(
+                        &self.image.binding,
+                        &decision,
+                        receipt,
+                        failure,
+                    )
+                }
+            };
+            if !terminal.matches_result(result, reopened_state, applied_at) || !matches_decision {
                 return Err(CleanManagementIssuerError::Rejected(
                     CleanManagementIssuerRejection::DivergentApplicationAck,
                 ));
             }
-            return Ok(acknowledgement);
+            return Ok(terminal);
         }
         if sequence != self.image.decision_sequence_high_water {
             return Err(CleanManagementIssuerError::Rejected(
@@ -1388,10 +1495,18 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
                 CleanManagementIssuerRejection::ApplicationAckRequired,
             ));
         };
+        if result.is_err()
+            && (decision.operation != AuthorityOperationKind::InstallActor
+                || application_route.managed.profile != AgentProfile::Local)
+        {
+            return Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::InvalidObservation,
+            ));
+        }
         let requested = PendingApplicationAck {
             sequence,
             acknowledgement_invocation: application_route.acknowledgement_invocation,
-            application: management_reply_commitment(application),
+            application: terminal_result_commitment(result),
             reopened_state,
             applied_at,
         };
@@ -1427,24 +1542,39 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
                 self.commit_candidate::<S::Error>(pledged)?;
             }
         }
-        let mut acknowledgement =
-            application_ack_for(&decision, receipt, application.clone(), requested, [0; 64])
-                .ok_or(CleanManagementIssuerError::InvalidState)?;
-        let message = acknowledgement.signing_bytes();
-        acknowledgement.signature = signer
-            .sign_management_application_ack(&message)
-            .map_err(CleanManagementIssuerError::Signer)?;
-        if !application_ack_matches_decision(
-            &self.image.binding,
-            &decision,
-            receipt,
-            &acknowledgement,
-        ) {
+        let mut terminal = match result {
+            Ok(application) => SignedManagementTerminal::Applied(
+                application_ack_for(&decision, receipt, application.clone(), requested, [0; 64])
+                    .ok_or(CleanManagementIssuerError::InvalidState)?,
+            ),
+            Err(error) => SignedManagementTerminal::Rejected(
+                application_failure_for(&decision, receipt, error, requested, [0; 64])
+                    .ok_or(CleanManagementIssuerError::InvalidState)?,
+            ),
+        };
+        let message = terminal.signing_bytes();
+        terminal.set_signature(
+            signer
+                .sign_management_application_ack(&message)
+                .map_err(CleanManagementIssuerError::Signer)?,
+        );
+        let matches_decision = match &terminal {
+            SignedManagementTerminal::Applied(ack) => {
+                application_ack_matches_decision(&self.image.binding, &decision, receipt, ack)
+            }
+            SignedManagementTerminal::Rejected(failure) => application_failure_matches_decision(
+                &self.image.binding,
+                &decision,
+                receipt,
+                failure,
+            ),
+        };
+        if !matches_decision {
             return Err(CleanManagementIssuerError::Rejected(
                 CleanManagementIssuerRejection::WrongSigner,
             ));
         }
-        let acknowledgement_bytes = acknowledgement
+        let acknowledgement_bytes = terminal
             .encode()
             .map_err(|_| CleanManagementIssuerError::InvalidState)?;
         let mut completed = self.image.clone();
@@ -1455,7 +1585,7 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         completed.retained.clear();
         completed.pending_application_ack = None;
         self.commit_candidate::<S::Error>(completed)?;
-        Ok(acknowledgement)
+        Ok(terminal)
     }
 
     /// Recover a previously pledged or signed application acknowledgement
@@ -1542,6 +1672,26 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         )
     }
 
+    /// Only the locked journal owner's replay-authenticated terminal guest
+    /// rejection may be signed. A live preflight error has no such evidence.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn observe_external_local_install_rejection<S: CleanManagementReceiptSigner>(
+        &mut self,
+        observation: &super::external_local_executor::ExternalLocalManagementRejection,
+        signer: &mut S,
+    ) -> Result<ManagementApplicationFailure, CleanManagementIssuerError<B::Error, S::Error>> {
+        match self.observe_durable_terminal(
+            observation.receipt(),
+            Err(observation.error()),
+            observation.reopened_state(),
+            observation.applied_at(),
+            signer,
+        )? {
+            SignedManagementTerminal::Rejected(failure) => Ok(failure),
+            SignedManagementTerminal::Applied(_) => Err(CleanManagementIssuerError::InvalidState),
+        }
+    }
+
     fn observe_verified_local_application<S: CleanManagementReceiptSigner>(
         &mut self,
         receipt: &AuthorityReceipt,
@@ -1570,6 +1720,27 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         acknowledgement: &ManagementApplicationAck,
     ) -> Result<bool, CleanManagementIssuerError<B::Error>> {
         if self.application_finalization_status(acknowledgement)? {
+            return Ok(false);
+        }
+        let mut completed = self.image.clone();
+        completed
+            .acknowledged
+            .as_mut()
+            .ok_or(CleanManagementIssuerError::InvalidState)?
+            .application_finalized = true;
+        self.commit_candidate::<Infallible>(completed)?;
+        Ok(true)
+    }
+
+    /// The owning controller calls this only after reopening the Authority
+    /// actor's exact MAF1 finalization. It does not infer finality from the
+    /// issuer's signed bytes or from the rejected guest result alone.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn observe_durable_actor_failure_finalization(
+        &mut self,
+        failure: &ManagementApplicationFailure,
+    ) -> Result<bool, CleanManagementIssuerError<B::Error>> {
+        if self.failure_finalization_status(failure)? {
             return Ok(false);
         }
         let mut completed = self.image.clone();
@@ -1909,11 +2080,28 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         &self,
         acknowledgement: &ManagementApplicationAck,
     ) -> Result<bool, CleanManagementIssuerError<B::Error>> {
+        self.terminal_finalization_status(&SignedManagementTerminal::Applied(
+            acknowledgement.clone(),
+        ))
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn failure_finalization_status(
+        &self,
+        failure: &ManagementApplicationFailure,
+    ) -> Result<bool, CleanManagementIssuerError<B::Error>> {
+        self.terminal_finalization_status(&SignedManagementTerminal::Rejected(failure.clone()))
+    }
+
+    fn terminal_finalization_status(
+        &self,
+        terminal: &SignedManagementTerminal,
+    ) -> Result<bool, CleanManagementIssuerError<B::Error>> {
         self.ensure_live()?;
         if self.image.pending.is_some() || self.image.pending_application_ack.is_some() {
             return Err(CleanManagementIssuerError::InvalidState);
         }
-        let acknowledgement_bytes = acknowledgement.encode().map_err(|_| {
+        let acknowledgement_bytes = terminal.encode().map_err(|_| {
             CleanManagementIssuerError::Rejected(CleanManagementIssuerRejection::InvalidObservation)
         })?;
         let Some(record) = self.image.acknowledged.as_ref() else {
@@ -1932,12 +2120,18 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
             .map_err(|_| CleanManagementIssuerError::InvalidState)?;
         let receipt = AuthorityReceipt::decode(&record.receipt)
             .map_err(|_| CleanManagementIssuerError::InvalidState)?;
-        if !application_ack_matches_decision(
-            &self.image.binding,
-            &decision,
-            &receipt,
-            acknowledgement,
-        ) {
+        let matches_decision = match terminal {
+            SignedManagementTerminal::Applied(ack) => {
+                application_ack_matches_decision(&self.image.binding, &decision, &receipt, ack)
+            }
+            SignedManagementTerminal::Rejected(failure) => application_failure_matches_decision(
+                &self.image.binding,
+                &decision,
+                &receipt,
+                failure,
+            ),
+        };
+        if !matches_decision {
             return Err(CleanManagementIssuerError::Rejected(
                 CleanManagementIssuerRejection::InvalidObservation,
             ));
@@ -2158,6 +2352,67 @@ fn application_ack_matches_decision(
             &binding.public_key,
             &acknowledgement.signing_bytes(),
             &acknowledgement.signature,
+        )
+}
+
+fn application_failure_for(
+    decision: &AuthorizedCleanManagementDecision,
+    receipt: &AuthorityReceipt,
+    error: ManagementError,
+    pending: PendingApplicationAck,
+    signature: [u8; 64],
+) -> Option<ManagementApplicationFailure> {
+    let application = decision.application?;
+    if decision.operation != AuthorityOperationKind::InstallActor
+        || application.managed.profile != AgentProfile::Local
+        || pending.acknowledgement_invocation != application.acknowledgement_invocation
+        || pending.application != management_error_commitment(error)
+    {
+        return None;
+    }
+    Some(ManagementApplicationFailure {
+        authorization_invocation: application.authorization_invocation,
+        acknowledgement_invocation: application.acknowledgement_invocation,
+        authority: application.authority,
+        managed: application.managed,
+        credential_call: application.credential_call,
+        approval: application.approval,
+        authorization_sequence: decision.authorization_id,
+        request: decision.request,
+        receipt: receipt.clone(),
+        error,
+        reopened_state: pending.reopened_state,
+        failed_at: pending.applied_at,
+        signature,
+    })
+}
+
+fn application_failure_matches_decision(
+    binding: &AgentAuthorityBinding,
+    decision: &AuthorizedCleanManagementDecision,
+    receipt: &AuthorityReceipt,
+    failure: &ManagementApplicationFailure,
+) -> bool {
+    let Some(application) = decision.application else {
+        return false;
+    };
+    decision.operation == AuthorityOperationKind::InstallActor
+        && application.managed.profile == AgentProfile::Local
+        && failure.validate_shape().is_ok()
+        && failure.authority.binding == *binding
+        && failure.authorization_invocation == application.authorization_invocation
+        && failure.acknowledgement_invocation == application.acknowledgement_invocation
+        && failure.authority == application.authority
+        && failure.managed == application.managed
+        && failure.credential_call == application.credential_call
+        && failure.approval == application.approval
+        && failure.authorization_sequence == decision.authorization_id
+        && failure.request == decision.request
+        && failure.receipt == *receipt
+        && crate::agent::authority::verify_raw_ed25519(
+            &binding.public_key,
+            &failure.signing_bytes(),
+            &failure.signature,
         )
 }
 
@@ -2638,6 +2893,46 @@ mod tests {
             ManagementRequest::RemoveLeaf { actor, .. } => ManagementReply::Removed(*actor),
             _ => panic!("issuer test fixture uses only RemoveLeaf requests"),
         }
+    }
+
+    fn install_request(agent: AgentId, tag: u8) -> ManagementRequest {
+        use crate::agent::sdk::contract::ActorPackageContract;
+        use crate::agent::sdk::{
+            ActorEntry, InstallActor, InstallationId, LaneSet, RuntimeRequirements,
+        };
+
+        let package = BlobRef::of_bytes(b"issuer-install-package");
+        let agent_schema = BlobRef::of_bytes(b"issuer-install-schema");
+        let method_policy = BlobRef::of_bytes(b"issuer-install-policy");
+        let entry = ActorEntry {
+            actor: ActorId::top_level(agent, "rejected"),
+            name: "rejected".into(),
+            parent: None,
+            deployment: DeploymentId([tag; 32]),
+            program: ProgramId([tag.wrapping_add(1); 32]),
+            package: package.clone(),
+            agent_schema: agent_schema.clone(),
+            method_policy: method_policy.clone(),
+            constructor_abi: Hash([tag.wrapping_add(2); 32]),
+            installation_data: None,
+            state_layout: Hash([tag.wrapping_add(3); 32]),
+            lanes: LaneSet::NONE,
+            suspended: false,
+        };
+        ManagementRequest::Install(Box::new(InstallActor {
+            installation_id: InstallationId([tag.wrapping_add(4); 32]),
+            registry_reservation: Hash([tag.wrapping_add(5); 32]),
+            producer: ProducerId([tag.wrapping_add(6); 32]),
+            package,
+            agent_schema,
+            method_policy,
+            constructor_abi: entry.constructor_abi,
+            installation_data: None,
+            state_layout: entry.state_layout,
+            contract: ActorPackageContract::canonical(),
+            requirements: RuntimeRequirements::default(),
+            entry,
+        }))
     }
 
     fn decision(
@@ -3363,6 +3658,147 @@ mod tests {
                 .unwrap(),
             acknowledgement
         );
+    }
+
+    #[test]
+    fn rejected_local_install_uses_the_same_durable_pledge_and_exact_retry() {
+        let store = MemoryImageStore::default();
+        let mut signer = CountingSigner::new(0x28);
+        let fixture = fixture(&signer);
+        let install = install_request(fixture.agent, 0xb1);
+        let (call, approval) = approved_call(&fixture, 1, &install);
+        let approved_decision = AuthorizedCleanManagementDecision::from_approval(
+            call.authority,
+            call.managed,
+            &install,
+            &call,
+            &approval,
+            &TestCredentialVerifier,
+        )
+        .unwrap();
+        let mut issuer = open(store.clone(), &fixture);
+        let receipt = issuer.issue(&approved_decision, &mut signer).unwrap();
+        let reopened_state = Hash([0xb2; 32]);
+        let failed_at = fixture.context.valid_from;
+        signer.fail_next = true;
+        assert!(matches!(
+            issuer.observe_durable_terminal(
+                &receipt,
+                Err(ManagementError::AlreadyExists),
+                reopened_state,
+                failed_at,
+                &mut signer,
+            ),
+            Err(CleanManagementIssuerError::Signer(TestSignerError))
+        ));
+        assert!(issuer.image.pending_application_ack.is_some());
+        drop(issuer);
+
+        let mut issuer = open(store.clone(), &fixture);
+        let before = store.image();
+        assert!(matches!(
+            issuer.observe_durable_terminal(
+                &receipt,
+                Err(ManagementError::ResourceLimit),
+                reopened_state,
+                failed_at,
+                &mut signer,
+            ),
+            Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::DivergentApplicationAck
+            ))
+        ));
+        assert_eq!(store.image(), before);
+        let SignedManagementTerminal::Rejected(failure) = issuer
+            .observe_durable_terminal(
+                &receipt,
+                Err(ManagementError::AlreadyExists),
+                reopened_state,
+                failed_at,
+                &mut signer,
+            )
+            .unwrap()
+        else {
+            panic!("the signed terminal result must be MAF1");
+        };
+        assert!(failure.matches_pending(&call, &approval));
+        assert_eq!(failure.verify_with(&TestCredentialVerifier), Ok(()));
+        assert_eq!(failure.encode().unwrap().get(..4), Some(b"MAF1".as_slice()));
+        assert!(!issuer.failure_finalization_status(&failure).unwrap());
+        assert!(
+            issuer
+                .observe_durable_actor_failure_finalization(&failure)
+                .unwrap()
+        );
+        assert!(issuer.failure_finalization_status(&failure).unwrap());
+        drop(issuer);
+
+        let mut reopened = open(store.clone(), &fixture);
+        let calls = signer.calls;
+        let SignedManagementTerminal::Rejected(retried) = reopened
+            .observe_durable_terminal(
+                &receipt,
+                Err(ManagementError::AlreadyExists),
+                reopened_state,
+                failed_at,
+                &mut signer,
+            )
+            .unwrap()
+        else {
+            panic!("exact retry changed terminal kind");
+        };
+        assert_eq!(retried, failure);
+        assert_eq!(signer.calls, calls);
+        let ManagementRequest::Install(install_request) = &install else {
+            unreachable!();
+        };
+        let wrong_success = ManagementReply::Installed(install_request.entry.clone());
+        assert!(matches!(
+            reopened.observe_durable_application(
+                &receipt,
+                &wrong_success,
+                reopened_state,
+                failed_at,
+                &mut signer,
+            ),
+            Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::DivergentApplicationAck
+            ))
+        ));
+        assert_eq!(signer.calls, calls);
+        assert!(
+            !reopened
+                .observe_durable_actor_failure_finalization(&failure)
+                .unwrap()
+        );
+        let later_request = request(0xb3);
+        let (later_call, later_approval) = approved_call(&fixture, 2, &later_request);
+        let later = AuthorizedCleanManagementDecision::from_approval(
+            later_call.authority,
+            later_call.managed,
+            &later_request,
+            &later_call,
+            &later_approval,
+            &TestCredentialVerifier,
+        )
+        .unwrap();
+        let later_receipt = reopened.issue(&later, &mut signer).unwrap();
+        let before = store.image();
+        let calls = signer.calls;
+        assert!(matches!(
+            reopened.observe_durable_terminal(
+                &later_receipt,
+                Err(ManagementError::AlreadyExists),
+                Hash([0xb4; 32]),
+                failed_at,
+                &mut signer,
+            ),
+            Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::InvalidObservation
+            ))
+        ));
+        assert_eq!(store.image(), before);
+        assert_eq!(signer.calls, calls);
     }
 
     #[test]
