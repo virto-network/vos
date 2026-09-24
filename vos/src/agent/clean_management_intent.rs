@@ -162,14 +162,22 @@ impl CleanManagementIntent {
     pub(crate) fn finalization_message(
         ack: &crate::agent_sdk::authority::ManagementApplicationAck,
     ) -> Vec<u8> {
+        Self::finalization_message_bytes(&ack.encode().unwrap_or_default())
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn failure_finalization_message(
+        failure: &crate::agent_sdk::authority::ManagementApplicationFailure,
+    ) -> Vec<u8> {
+        Self::finalization_message_bytes(&failure.encode().unwrap_or_default())
+    }
+
+    fn finalization_message_bytes(ack: &[u8]) -> Vec<u8> {
         use crate::actors::codec::Encode as _;
         let mut bytes = vec![crate::actors::value::TAG_DYNAMIC];
         bytes.extend(
             crate::actors::value::Msg::new("finalize")
-                .with(
-                    "ack",
-                    crate::actors::value::Value::Bytes(ack.encode().unwrap_or_default()),
-                )
+                .with("ack", crate::actors::value::Value::Bytes(ack.to_vec()))
                 .encode(),
         );
         bytes
@@ -246,6 +254,8 @@ impl CleanManagementIntent {
             };
             let (expected_invocation, expected_origin, expected_message) = if finalization {
                 use crate::actors::codec::Decode as _;
+                #[cfg(feature = "experimental-state-blocks")]
+                use crate::agent_sdk::authority::ManagementApplicationFailure;
                 use crate::agent_sdk::authority::{ManagementApplicationAck, ManagementApproval};
                 let message = crate::actors::value::Msg::try_decode(
                     invocation
@@ -258,23 +268,48 @@ impl CleanManagementIntent {
                 else {
                     return Err(DecodeError::NonCanonical);
                 };
-                let ack = ManagementApplicationAck::decode(bytes)
-                    .map_err(|_| DecodeError::NonCanonical)?;
-                if ack.authority != self.call.authority
-                    || ack.managed != self.call.managed
-                    || ack.authorization_invocation != self.call.invocation
-                    || ack.acknowledgement_invocation
-                        != ManagementApproval::derive_acknowledgement_invocation(&self.call)
-                    || ack.credential_call != self.call.commitment()
-                    || ack.request != self.request.commitment()
-                    || ack.applied_at > *observed_slot
-                {
+                let invocation = if bytes.starts_with(b"MAF1") {
+                    #[cfg(not(feature = "experimental-state-blocks"))]
                     return Err(DecodeError::NonCanonical);
-                }
+                    #[cfg(feature = "experimental-state-blocks")]
+                    {
+                        let failure = ManagementApplicationFailure::decode(bytes)
+                            .map_err(|_| DecodeError::NonCanonical)?;
+                        if !matches!(self.request, ManagementRequest::Install(_))
+                            || self.call.managed.profile != crate::agent_sdk::AgentProfile::Local
+                            || failure.authority != self.call.authority
+                            || failure.managed != self.call.managed
+                            || failure.authorization_invocation != self.call.invocation
+                            || failure.acknowledgement_invocation
+                                != ManagementApproval::derive_acknowledgement_invocation(&self.call)
+                            || failure.credential_call != self.call.commitment()
+                            || failure.request != self.request.commitment()
+                            || failure.failed_at > *observed_slot
+                        {
+                            return Err(DecodeError::NonCanonical);
+                        }
+                        failure.acknowledgement_invocation
+                    }
+                } else {
+                    let ack = ManagementApplicationAck::decode(bytes)
+                        .map_err(|_| DecodeError::NonCanonical)?;
+                    if ack.authority != self.call.authority
+                        || ack.managed != self.call.managed
+                        || ack.authorization_invocation != self.call.invocation
+                        || ack.acknowledgement_invocation
+                            != ManagementApproval::derive_acknowledgement_invocation(&self.call)
+                        || ack.credential_call != self.call.commitment()
+                        || ack.request != self.request.commitment()
+                        || ack.applied_at > *observed_slot
+                    {
+                        return Err(DecodeError::NonCanonical);
+                    }
+                    ack.acknowledgement_invocation
+                };
                 (
-                    ack.acknowledgement_invocation,
+                    invocation,
                     InvocationOrigin::anonymous(),
-                    Self::finalization_message(&ack),
+                    Self::finalization_message_bytes(bytes),
                 )
             } else {
                 (
@@ -967,6 +1002,25 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
         &mut self,
         acknowledgement: &crate::agent_sdk::authority::ManagementApplicationAck,
     ) -> Result<bool, IntentSlotError<B::Error>> {
+        self.commit_retirement_for_message(&CleanManagementIntent::finalization_message(
+            acknowledgement,
+        ))
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn commit_failure_retirement(
+        &mut self,
+        failure: &crate::agent_sdk::authority::ManagementApplicationFailure,
+    ) -> Result<bool, IntentSlotError<B::Error>> {
+        self.commit_retirement_for_message(&CleanManagementIntent::failure_finalization_message(
+            failure,
+        ))
+    }
+
+    fn commit_retirement_for_message(
+        &mut self,
+        finalization_message: &[u8],
+    ) -> Result<bool, IntentSlotError<B::Error>> {
         if self.denied {
             return Err(IntentSlotError::Conflict);
         }
@@ -977,9 +1031,7 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
         let Some(RuntimeWork::Invoke { invocation, .. }) = &intent.finalization_work else {
             return Err(IntentSlotError::Invalid);
         };
-        if intent.authorization_work.is_none()
-            || invocation.message != CleanManagementIntent::finalization_message(acknowledgement)
-        {
+        if intent.authorization_work.is_none() || invocation.message != finalization_message {
             return Err(IntentSlotError::Conflict);
         }
         if self.retired {

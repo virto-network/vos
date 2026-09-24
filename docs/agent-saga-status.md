@@ -99,8 +99,8 @@ The archive survives later intent replacement but is only recovery input, not
 route authority. Released Install still needs startup selection that verifies
 this archive against the independently selected Authority and physical journal;
 without that cutover, post-Install restart could strand the Agent.
-The expanded all-in-one physical Create/retry fixture overflows its default
-2-MiB test thread stack but passes at 4 MiB. Its isolated Create call passes
+The expanded all-in-one physical Create/Install/retry fixture overflows its default
+2-MiB test thread stack and runs with a 16-MiB test stack. Its isolated Create call passes
 on a 2-MiB thread, matching the default control worker stack. That narrows the
 issue to fixture frame pressure; the complete production lifecycle and other
 external operations still need released-worker qualification.
@@ -193,9 +193,9 @@ before the next management operation; neither helper is released ingress.
 The pinned journal can now persist Install's Merge fence from its own
 authenticated current Merge projection; the physical test compares this
 against the independent fixture fence and uses it for an artifact-free
-candidate Install. Release-controller TODO: handle a guest rejection without
-stranding an approved intent, then qualify startup/route refresh around the
-retained issuer/lifecycle handoff below.
+candidate Install. The internal controller now finalizes and retires a physical
+guest rejection without stranding the approved intent. Public response-loss
+recovery and route refresh for Install remain open.
 The publisher now physically preflights Install against that same pinned
 predecessor. A conflicting installation identity returns a guest rejection
 without advancing heads or retaining newly staged catalog bytes; an exact
@@ -203,14 +203,11 @@ repeat remains idempotently successful. A successful preflight is re-executed
 for publication and its result must match. That early fail-closed helper does
 not terminalize an already Authority-approved intent; the separate terminal
 rejection path below does so only within the physical journal, issuer and
-Authority actor. Keep external Install ingress disabled until lifecycle
-handling and response-loss recovery are qualified.
-Release-scope decision pending: either complete an authenticated, recoverable
-terminal-failure transition for that approved Install, or retain image Local
-Install for the first customer release and defer public external Local Install.
-The approved fresh-root rule is independent of this Install decision. Do not
-expose the existing internal external Install method as ingress while approval
-can be stranded.
+Authority actor. Keep external Install ingress disabled until file-backed
+daemon recovery and response-loss handling are qualified.
+Release-scope decision pending: whether first-customer external-state Local
+must expose Install, or may retain image Local Install and defer external
+Install. The approved fresh-root rule is independent of this Install decision.
 An internal opt-in journal path now publishes a rejected Install's exact
 guest result as an authenticated Ordered transition, instead of discarding
 the preflight result. Rejected management work may advance runtime control
@@ -221,20 +218,15 @@ Local Install, retains exact retry across restart, and leaves the actor absent.
 `CIS2` now pledges, signs and retains the same exact failure bytes across
 signer errors and restart, using its existing durable slot with a distinct
 error commitment. It records Authority finality only after the controller
-reopens the exact actor result. The controller's failed-Install recovery,
-retirement and public response-loss path remain unimplemented; public Install
-ingress stays disabled.
-metadata even when it installs no actor; recovery must replay the resulting
-state, not assume a no-op. A separate read-only observer binds the replayed
-error to its receipt, request, original Ordered position and observation slot.
-The ordinary rollback-before-publication helper remains the default. This is
-physical failure evidence, not a signed Authority failure ACK or retirement;
-public external Install remains closed. Rejected input catalog bytes must
-remain available for replay until checkpoint/GC rules are qualified.
+reopens the exact actor result. The internal controller now recovers the
+physical failure, finalizes and retires it, and retains exact retry after
+restart. The physical test confirms that no third actor appears and a rejected
+retry appends no head. Public Install response-loss and file-backed daemon
+recovery remain unqualified, so ingress stays disabled. Rejected input catalog
+bytes must remain available for replay until checkpoint/GC rules are qualified.
 The Standard guest fixture passed on an in-memory journal and the production
 locked file owner: the exact rejected result survived reopen, while positive
-Install observation refused the rejected entry. Checkpoint/GC and failure
-finalization remain open.
+Install observation refused the rejected entry. Checkpoint/GC remains open.
 The locked file owner now accepts a validated signed Install plus the admitted
 actor package, derives its exact catalog and Merge fence from its pinned
 generation, and invokes that preflight/publication helper. It refuses to
@@ -289,9 +281,9 @@ signed pending package replaces the retired Install's sidecar and that restart
 recovers the later ACK. The real `vosx` file adapter separately exercises the
 pre-handoff and post-handoff file order, including a staged `.next` recovery,
 but this is not yet a full file-backed daemon lifecycle run.
-A permanently guest-rejected approved Install still lacks a complete
-issuer-to-controller terminal-failure handoff, so public Install ingress
-remains disabled.
+The internal issuer-to-controller terminal-failure handoff now completes for a
+guest-rejected approved Install. Public Install ingress remains disabled until
+file-backed daemon and response-loss qualification.
 The internal lifecycle controller now has an explicit external backing that
 consumes the complete signed startup recovery, retains each locked file owner
 and its selected directory, and creates per-Agent Direct route attachments
@@ -316,7 +308,7 @@ valid unpledged candidate from startup admission. Its lifecycle stores are
 memory-backed, not the `vosx` file leases. A signed wrong-node Create is
 rejected before the store factory can create a lifecycle directory. The new
 Create wrapper also passed on a dedicated 2-MiB thread stack; the all-in-one
-fixture still uses 4 MiB. The opt-in production queue now retains LCQ2 as a
+fixture now uses a 16-MiB test stack. The opt-in production queue retains LCQ2 as a
 distinct variant, and HTTP accepts it at the existing Local Create endpoint
 only with `experimental-state-blocks`. The production owner uses the same
 route reconciliation as image Create after external physical finality. The

@@ -623,12 +623,52 @@ struct PendingApplicationAck {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum SignedManagementTerminal {
+pub(crate) enum SignedManagementTerminal {
     Applied(ManagementApplicationAck),
     Rejected(ManagementApplicationFailure),
 }
 
 impl SignedManagementTerminal {
+    pub(crate) fn as_applied(&self) -> Option<&ManagementApplicationAck> {
+        match self {
+            Self::Applied(ack) => Some(ack),
+            Self::Rejected(_) => None,
+        }
+    }
+
+    pub(crate) fn receipt(&self) -> &AuthorityReceipt {
+        match self {
+            Self::Applied(ack) => &ack.receipt,
+            Self::Rejected(failure) => &failure.receipt,
+        }
+    }
+
+    pub(crate) fn applied_at(&self) -> u64 {
+        match self {
+            Self::Applied(ack) => ack.applied_at,
+            Self::Rejected(failure) => failure.failed_at,
+        }
+    }
+
+    pub(crate) fn finalization_message(&self) -> Vec<u8> {
+        match self {
+            Self::Applied(ack) => {
+                super::clean_management_intent::CleanManagementIntent::finalization_message(ack)
+            }
+            Self::Rejected(failure) => {
+                #[cfg(feature = "experimental-state-blocks")]
+                {
+                    super::clean_management_intent::CleanManagementIntent::failure_finalization_message(failure)
+                }
+                #[cfg(not(feature = "experimental-state-blocks"))]
+                {
+                    let _ = failure;
+                    Vec::new()
+                }
+            }
+        }
+    }
+
     fn signing_bytes(&self) -> Vec<u8> {
         match self {
             Self::Applied(value) => value.signing_bytes(),
@@ -1771,6 +1811,57 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         self.recover_recorded_application(authority, managed, request, call, verifier, true)
     }
 
+    pub(crate) fn recover_finalized_terminal<V: AuthorityCredentialVerifier>(
+        &self,
+        authority: AuthorityActorTarget,
+        managed: ManagedAgentTarget,
+        request: &ManagementRequest,
+        call: &AuthorityCredentialCall,
+        verifier: &V,
+    ) -> Result<
+        Option<(AuthorityReceipt, SignedManagementTerminal)>,
+        CleanManagementIssuerError<B::Error>,
+    > {
+        self.recover_recorded_terminal(authority, managed, request, call, verifier, true)
+    }
+
+    pub(crate) fn recover_observed_terminal<V: AuthorityCredentialVerifier>(
+        &self,
+        authority: AuthorityActorTarget,
+        managed: ManagedAgentTarget,
+        request: &ManagementRequest,
+        call: &AuthorityCredentialCall,
+        verifier: &V,
+    ) -> Result<
+        Option<(AuthorityReceipt, SignedManagementTerminal)>,
+        CleanManagementIssuerError<B::Error>,
+    > {
+        self.recover_recorded_terminal(authority, managed, request, call, verifier, false)
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn recover_finalized_install_failure<V: AuthorityCredentialVerifier>(
+        &self,
+        authority: AuthorityActorTarget,
+        managed: ManagedAgentTarget,
+        request: &ManagementRequest,
+        call: &AuthorityCredentialCall,
+        verifier: &V,
+    ) -> Result<
+        Option<(AuthorityReceipt, ManagementApplicationFailure)>,
+        CleanManagementIssuerError<B::Error>,
+    > {
+        let invalid = || {
+            CleanManagementIssuerError::Rejected(CleanManagementIssuerRejection::InvalidObservation)
+        };
+        self.recover_recorded_terminal(authority, managed, request, call, verifier, true)?
+            .map(|(receipt, terminal)| match terminal {
+                SignedManagementTerminal::Rejected(failure) => Ok((receipt, failure)),
+                SignedManagementTerminal::Applied(_) => Err(invalid()),
+            })
+            .transpose()
+    }
+
     /// Recover the exact durable application acknowledgement without claiming
     /// that its Authority finalization call completed. This does not sign or
     /// advance state; the caller must reverify physical application before use.
@@ -2016,6 +2107,36 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         Option<(AuthorityReceipt, ManagementApplicationAck)>,
         CleanManagementIssuerError<B::Error>,
     > {
+        let invalid = || {
+            CleanManagementIssuerError::Rejected(CleanManagementIssuerRejection::InvalidObservation)
+        };
+        self.recover_recorded_terminal(
+            authority,
+            managed,
+            request,
+            call,
+            verifier,
+            require_finalized,
+        )?
+        .map(|(receipt, terminal)| match terminal {
+            SignedManagementTerminal::Applied(ack) => Ok((receipt, ack)),
+            SignedManagementTerminal::Rejected(_) => Err(invalid()),
+        })
+        .transpose()
+    }
+
+    fn recover_recorded_terminal<V: AuthorityCredentialVerifier>(
+        &self,
+        authority: AuthorityActorTarget,
+        managed: ManagedAgentTarget,
+        request: &ManagementRequest,
+        call: &AuthorityCredentialCall,
+        verifier: &V,
+        require_finalized: bool,
+    ) -> Result<
+        Option<(AuthorityReceipt, SignedManagementTerminal)>,
+        CleanManagementIssuerError<B::Error>,
+    > {
         self.ensure_live()?;
         let invalid = || {
             CleanManagementIssuerError::Rejected(CleanManagementIssuerRejection::InvalidObservation)
@@ -2063,15 +2184,22 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         if expected != decision {
             return Err(invalid());
         }
-        let acknowledgement = ManagementApplicationAck::decode(
+        let terminal = decode_signed_management_terminal(
             record.application_ack.as_deref().ok_or_else(invalid)?,
         )
-        .map_err(|_| invalid())?;
-        let finalized = self.application_finalization_status(&acknowledgement)?;
+        .ok_or_else(invalid)?;
+        if let SignedManagementTerminal::Rejected(failure) = &terminal {
+            if !failure.matches_pending(call, &approval) {
+                return Err(invalid());
+            }
+        }
+        let finalized = self.terminal_finalization_status(&terminal)?;
         if require_finalized && !finalized {
             return Err(invalid());
         }
-        Ok(Some((acknowledgement.receipt.clone(), acknowledgement)))
+        let receipt = AuthorityReceipt::decode(&record.receipt)
+            .map_err(|_| CleanManagementIssuerError::InvalidState)?;
+        Ok(Some((receipt, terminal)))
     }
 
     /// Validate the exact retained signed acknowledgement without advancing

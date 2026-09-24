@@ -94,6 +94,13 @@ use super::genesis::{AgentReplicaCommittee, MAX_AGENT_REPLICA_COMMITTEE_BYTES};
 use super::package_admission::{
     AdmittedActorPackage, AdmittedRuntimePackage, admit_actor_package, admit_runtime_package,
 };
+#[cfg(all(
+    feature = "storage",
+    feature = "network",
+    feature = "experimental-state-blocks",
+    target_os = "linux"
+))]
+use super::sdk::authority::ManagementApplicationFailure;
 use super::sdk::authority::{
     AgentAuthorityBinding, AuthorityActorTarget, AuthorityCredentialCall,
     AuthorityCredentialVerifier, AuthorityIssuer, AuthorityOperationKind, AuthorityProjectionQuery,
@@ -138,6 +145,75 @@ use super::shared_host::{SharedAgentHost, SharedAgentHostError};
 use super::shared_raft::CommitteeChangeAuthorityBinding;
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 use crate::network::{Network, SharedAgentNetworkHost};
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+#[derive(Clone, Copy)]
+enum ManagementTerminalRef<'a> {
+    Applied(&'a ManagementApplicationAck),
+    #[cfg(feature = "experimental-state-blocks")]
+    Rejected(&'a ManagementApplicationFailure),
+}
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+#[derive(Clone, Copy)]
+struct ManagementTerminalFacts {
+    authority: AuthorityActorTarget,
+    managed: ManagedAgentTarget,
+    authorization_invocation: InvocationId,
+    acknowledgement_invocation: InvocationId,
+    credential_call: Hash,
+    request: Hash,
+    applied_at: u64,
+}
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+impl ManagementTerminalRef<'_> {
+    fn facts(self) -> ManagementTerminalFacts {
+        match self {
+            Self::Applied(ack) => ManagementTerminalFacts {
+                authority: ack.authority,
+                managed: ack.managed,
+                authorization_invocation: ack.authorization_invocation,
+                acknowledgement_invocation: ack.acknowledgement_invocation,
+                credential_call: ack.credential_call,
+                request: ack.request,
+                applied_at: ack.applied_at,
+            },
+            #[cfg(feature = "experimental-state-blocks")]
+            Self::Rejected(failure) => ManagementTerminalFacts {
+                authority: failure.authority,
+                managed: failure.managed,
+                authorization_invocation: failure.authorization_invocation,
+                acknowledgement_invocation: failure.acknowledgement_invocation,
+                credential_call: failure.credential_call,
+                request: failure.request,
+                applied_at: failure.failed_at,
+            },
+        }
+    }
+
+    fn finalization_message(self) -> Vec<u8> {
+        match self {
+            Self::Applied(ack) => {
+                super::clean_management_intent::CleanManagementIntent::finalization_message(ack)
+            }
+            #[cfg(feature = "experimental-state-blocks")]
+            Self::Rejected(failure) => {
+                super::clean_management_intent::CleanManagementIntent::failure_finalization_message(
+                    failure,
+                )
+            }
+        }
+    }
+
+    fn verify(self) -> bool {
+        match self {
+            Self::Applied(ack) => ack.verify_with(&RawCredentialVerifier).is_ok(),
+            #[cfg(feature = "experimental-state-blocks")]
+            Self::Rejected(failure) => failure.verify_with(&RawCredentialVerifier).is_ok(),
+        }
+    }
+}
 
 const CLEAN_SYSTEM_AGENT_PINS_MAGIC: [u8; 4] = *b"CSP2";
 const CLEAN_SYSTEM_AGENT_PLAN_MAGIC: [u8; 4] = *b"CBP3";
@@ -2923,7 +2999,51 @@ where
         B: CleanManagementIssuerStore,
         J: CleanManagementIssuerStore,
     {
+        self.finalize_management_terminal_with_admission(
+            slot,
+            managed,
+            ManagementTerminalRef::Applied(acknowledgement),
+            issuer,
+            recovering,
+        )
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn finalize_failed_install_with_admission<B, J>(
+        &mut self,
+        slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
+        managed: ManagedAgentTarget,
+        failure: &ManagementApplicationFailure,
+        issuer: &mut DurableCleanManagementIssuer<J>,
+        recovering: bool,
+    ) -> Result<bool, SharedAgentHostError>
+    where
+        B: CleanManagementIssuerStore,
+        J: CleanManagementIssuerStore,
+    {
+        self.finalize_management_terminal_with_admission(
+            slot,
+            managed,
+            ManagementTerminalRef::Rejected(failure),
+            issuer,
+            recovering,
+        )
+    }
+
+    fn finalize_management_terminal_with_admission<B, J>(
+        &mut self,
+        slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
+        managed: ManagedAgentTarget,
+        terminal: ManagementTerminalRef<'_>,
+        issuer: &mut DurableCleanManagementIssuer<J>,
+        recovering: bool,
+    ) -> Result<bool, SharedAgentHostError>
+    where
+        B: CleanManagementIssuerStore,
+        J: CleanManagementIssuerStore,
+    {
         use crate::actors::codec::Decode as _;
+        let facts = terminal.facts();
         let target = self.authority_target();
         let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
         intent
@@ -2939,22 +3059,25 @@ where
         else {
             return Err(SharedAgentHostError::ScopeMismatch);
         };
-        if acknowledgement.authority != target
-            || acknowledgement.managed != managed
-            || acknowledgement.authorization_invocation != intent.call().invocation
-            || acknowledgement.acknowledgement_invocation
+        if facts.authority != target
+            || facts.managed != managed
+            || facts.authorization_invocation != intent.call().invocation
+            || facts.acknowledgement_invocation
                 != ManagementApproval::derive_acknowledgement_invocation(intent.call())
-            || acknowledgement.credential_call != intent.call().commitment()
-            || acknowledgement.request != intent.request().commitment()
-            || acknowledgement.applied_at < *observed_slot
-            || acknowledgement.verify_with(&RawCredentialVerifier).is_err()
+            || facts.credential_call != intent.call().commitment()
+            || facts.request != intent.request().commitment()
+            || facts.applied_at < *observed_slot
+            || !terminal.verify()
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        if issuer
-            .application_finalization_status(acknowledgement)
-            .map_err(|_| SharedAgentHostError::ScopeMismatch)?
-        {
+        let finalized = match terminal {
+            ManagementTerminalRef::Applied(ack) => issuer.application_finalization_status(ack),
+            #[cfg(feature = "experimental-state-blocks")]
+            ManagementTerminalRef::Rejected(failure) => issuer.failure_finalization_status(failure),
+        }
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if finalized {
             return Ok(false);
         }
         if self.record.pending_projection.is_some() {
@@ -2970,10 +3093,7 @@ where
         material.root_provenance = false;
         let identity = super::supervisor_adapters::physical_material_identity(&material)
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-        let expected_message =
-            super::clean_management_intent::CleanManagementIntent::finalization_message(
-                acknowledgement,
-            );
+        let expected_message = terminal.finalization_message();
         #[cfg(test)]
         if self.finalization_failure_once == Some(2) {
             self.finalization_failure_once = None;
@@ -2985,7 +3105,7 @@ where
             .is_none()
         {
             let mut work = (**original).clone();
-            work.invocation = acknowledgement.acknowledgement_invocation;
+            work.invocation = facts.acknowledgement_invocation;
             work.origin = super::sdk::InvocationOrigin::anonymous();
             work.message = expected_message.clone();
             let authorization = InvocationAuthorization::PublicPreflight(
@@ -3106,9 +3226,14 @@ where
             self.finalization_failure_once = None;
             return Err(SharedAgentHostError::Unavailable);
         }
-        issuer
-            .observe_durable_actor_finalization(acknowledgement)
-            .map_err(|_| SharedAgentHostError::Unavailable)
+        match terminal {
+            ManagementTerminalRef::Applied(ack) => issuer.observe_durable_actor_finalization(ack),
+            #[cfg(feature = "experimental-state-blocks")]
+            ManagementTerminalRef::Rejected(failure) => {
+                issuer.observe_durable_actor_failure_finalization(failure)
+            }
+        }
+        .map_err(|_| SharedAgentHostError::Unavailable)
     }
 
     pub(crate) fn handoff_recovered_management(
@@ -3142,22 +3267,74 @@ where
         B: CleanManagementIssuerStore,
         J: CleanManagementIssuerStore,
     {
+        self.retire_management_terminal_results(
+            slot,
+            managed,
+            ManagementTerminalRef::Applied(acknowledgement),
+            issuer,
+        )
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn retire_failed_install_results<B, J>(
+        &mut self,
+        slot: &super::clean_management_intent::CleanManagementIntentSlot<B>,
+        managed: ManagedAgentTarget,
+        failure: &ManagementApplicationFailure,
+        issuer: &DurableCleanManagementIssuer<J>,
+    ) -> Result<bool, SharedAgentHostError>
+    where
+        B: CleanManagementIssuerStore,
+        J: CleanManagementIssuerStore,
+    {
+        self.retire_management_terminal_results(
+            slot,
+            managed,
+            ManagementTerminalRef::Rejected(failure),
+            issuer,
+        )
+    }
+
+    fn retire_management_terminal_results<B, J>(
+        &mut self,
+        slot: &super::clean_management_intent::CleanManagementIntentSlot<B>,
+        managed: ManagedAgentTarget,
+        terminal: ManagementTerminalRef<'_>,
+        issuer: &DurableCleanManagementIssuer<J>,
+    ) -> Result<bool, SharedAgentHostError>
+    where
+        B: CleanManagementIssuerStore,
+        J: CleanManagementIssuerStore,
+    {
         let target = self.authority_target();
         let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
         intent
             .verify(target, managed, &RawCredentialVerifier)
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-        let (_, retained) = issuer
-            .recover_finalized_application(
-                target,
-                managed,
-                intent.request(),
-                intent.call(),
-                &RawCredentialVerifier,
-            )
-            .map_err(|_| SharedAgentHostError::ScopeMismatch)?
-            .ok_or(SharedAgentHostError::ScopeMismatch)?;
-        if retained != *acknowledgement || self.record.pending_projection.is_some() {
+        let retained_matches = match terminal {
+            ManagementTerminalRef::Applied(ack) => issuer
+                .recover_finalized_application(
+                    target,
+                    managed,
+                    intent.request(),
+                    intent.call(),
+                    &RawCredentialVerifier,
+                )
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+                .is_some_and(|(_, retained)| retained == *ack),
+            #[cfg(feature = "experimental-state-blocks")]
+            ManagementTerminalRef::Rejected(failure) => issuer
+                .recover_finalized_install_failure(
+                    target,
+                    managed,
+                    intent.request(),
+                    intent.call(),
+                    &RawCredentialVerifier,
+                )
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+                .is_some_and(|(_, retained)| retained == *failure),
+        };
+        if !retained_matches || self.record.pending_projection.is_some() {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         let authorization_work = slot
@@ -3167,7 +3344,7 @@ where
         let RuntimeWork::Invoke { observed_slot, .. } = authorization_work else {
             return Err(SharedAgentHostError::ScopeMismatch);
         };
-        if acknowledgement.applied_at < *observed_slot {
+        if terminal.facts().applied_at < *observed_slot {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         let finalization_work = slot
@@ -3177,11 +3354,7 @@ where
         let RuntimeWork::Invoke { invocation, .. } = finalization_work else {
             return Err(SharedAgentHostError::ScopeMismatch);
         };
-        if invocation.message
-            != super::clean_management_intent::CleanManagementIntent::finalization_message(
-                acknowledgement,
-            )
-        {
+        if invocation.message != terminal.finalization_message() {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         if slot
@@ -3286,9 +3459,48 @@ where
         B: CleanManagementIssuerStore,
         J: CleanManagementIssuerStore,
     {
+        self.finish_management_terminal_retirement(
+            slot,
+            managed,
+            ManagementTerminalRef::Applied(acknowledgement),
+            issuer,
+        )
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn finish_failed_install_retirement<B, J>(
+        &mut self,
+        slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
+        managed: ManagedAgentTarget,
+        failure: &ManagementApplicationFailure,
+        issuer: &DurableCleanManagementIssuer<J>,
+    ) -> Result<bool, SharedAgentHostError>
+    where
+        B: CleanManagementIssuerStore,
+        J: CleanManagementIssuerStore,
+    {
+        self.finish_management_terminal_retirement(
+            slot,
+            managed,
+            ManagementTerminalRef::Rejected(failure),
+            issuer,
+        )
+    }
+
+    fn finish_management_terminal_retirement<B, J>(
+        &mut self,
+        slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
+        managed: ManagedAgentTarget,
+        terminal: ManagementTerminalRef<'_>,
+        issuer: &DurableCleanManagementIssuer<J>,
+    ) -> Result<bool, SharedAgentHostError>
+    where
+        B: CleanManagementIssuerStore,
+        J: CleanManagementIssuerStore,
+    {
         // Always reverify the signed intent and finalized issuer acknowledgement,
         // even when recovering the durable marker rather than journal results.
-        self.retire_management_intent_results(slot, managed, acknowledgement, issuer)?;
+        self.retire_management_terminal_results(slot, managed, terminal, issuer)?;
         let authorization = slot
             .authorization_work()
             .map_err(|_| SharedAgentHostError::Unavailable)?
@@ -3312,7 +3524,14 @@ where
             agent,
             [&authorization, &finalization],
             || {
-                slot.commit_retirement(acknowledgement)
+                let committed = match terminal {
+                    ManagementTerminalRef::Applied(ack) => slot.commit_retirement(ack),
+                    #[cfg(feature = "experimental-state-blocks")]
+                    ManagementTerminalRef::Rejected(failure) => {
+                        slot.commit_failure_retirement(failure)
+                    }
+                };
+                committed
                     .map(|_| ())
                     .map_err(|_| SharedAgentHostError::Unavailable)
             },
@@ -5415,7 +5634,7 @@ where
         package: &AdmittedActorPackage,
         budget: &mut super::sdk::state_blocks::ReadBudget,
         signer: &mut S,
-    ) -> Result<ManagementApplicationAck, SharedAgentHostError>
+    ) -> Result<super::clean_authority_issuer::SignedManagementTerminal, SharedAgentHostError>
     where
         B: super::clean_authority_issuer::CleanManagementActorStore
             + super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore,
@@ -5466,8 +5685,8 @@ where
         if !archive.matches_owner(&intent, self.authority_target(), self.pins.node, external) {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        if let Some((receipt, acknowledgement)) = issuer
-            .recover_finalized_application(
+        if let Some((receipt, terminal)) = issuer
+            .recover_finalized_terminal(
                 self.authority_target(),
                 managed,
                 &request,
@@ -5488,11 +5707,16 @@ where
             else {
                 return Err(SharedAgentHostError::ScopeMismatch);
             };
-            if acknowledgement.applied_at < *observed_slot
-                || invocation.message
-                    != super::clean_management_intent::CleanManagementIntent::finalization_message(
-                        &acknowledgement,
-                    )
+            let terminal_ref = match &terminal {
+                super::clean_authority_issuer::SignedManagementTerminal::Applied(ack) => {
+                    ManagementTerminalRef::Applied(ack)
+                }
+                super::clean_authority_issuer::SignedManagementTerminal::Rejected(failure) => {
+                    ManagementTerminalRef::Rejected(failure)
+                }
+            };
+            if terminal_ref.facts().applied_at < *observed_slot
+                || invocation.message != terminal_ref.finalization_message()
             {
                 return Err(SharedAgentHostError::ScopeMismatch);
             }
@@ -5502,10 +5726,16 @@ where
             {
                 self.verify_external_local_authorization_anchor(slot)?;
             }
-            external
-                .verify_finalized_install_ack(&request, &receipt, &acknowledgement)
-                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-            return Ok(acknowledgement);
+            match &terminal {
+                super::clean_authority_issuer::SignedManagementTerminal::Applied(ack) => {
+                    external.verify_finalized_install_ack(&request, &receipt, ack)
+                }
+                super::clean_authority_issuer::SignedManagementTerminal::Rejected(failure) => {
+                    external.verify_finalized_install_failure(&request, &receipt, failure)
+                }
+            }
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            return Ok(terminal);
         }
         slot.retain_actor(package)
             .map_err(|_| SharedAgentHostError::Unavailable)?;
@@ -5534,31 +5764,41 @@ where
                 observed_slot: *observed_slot,
             },
         };
-        match external.publish_install(input, &retained, budget) {
+        match external.publish_install_for_finality(input, &retained, budget) {
             Ok(ExternalJournalCommit::Published(_, _, None))
             | Ok(ExternalJournalCommit::AlreadyCommitted(_))
             | Err(JournalStoreError::Conflict) => {}
             Ok(ExternalJournalCommit::Rejected(_)) => {
-                // A positive application ACK cannot represent a guest
-                // rejection. Keep this approval pending and ingress closed
-                // until an explicit failure finality protocol exists.
-                return Err(SharedAgentHostError::Conflict);
+                // The terminal publisher must never discard a guest rejection
+                // before it can be replayed as authenticated failure evidence.
+                return Err(SharedAgentHostError::ScopeMismatch);
             }
             Ok(ExternalJournalCommit::Published(_, _, Some(_))) => {
                 return Err(SharedAgentHostError::Unavailable);
             }
             Err(_) => return Err(SharedAgentHostError::Unavailable),
         }
-        let observation = external
-            .observe_install_application(&request, &receipt)
+        if let Ok(observation) = external.observe_install_application(&request, &receipt) {
+            let acknowledgement = issuer
+                .observe_external_local_application(&observation, signer)
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            external
+                .verify_finalized_install_ack(&request, &receipt, &acknowledgement)
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            return Ok(
+                super::clean_authority_issuer::SignedManagementTerminal::Applied(acknowledgement),
+            );
+        }
+        let rejection = external
+            .observe_install_rejection(&request, &receipt)
             .map_err(|_| SharedAgentHostError::Unavailable)?;
-        let acknowledgement = issuer
-            .observe_external_local_application(&observation, signer)
+        let failure = issuer
+            .observe_external_local_install_rejection(&rejection, signer)
             .map_err(|_| SharedAgentHostError::Unavailable)?;
         external
-            .verify_finalized_install_ack(&request, &receipt, &acknowledgement)
+            .verify_finalized_install_failure(&request, &receipt, &failure)
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-        Ok(acknowledgement)
+        Ok(super::clean_authority_issuer::SignedManagementTerminal::Rejected(failure))
     }
 
     /// Distinguish a canonical Authority denial from transport/runtime errors
@@ -5921,13 +6161,50 @@ where
         acknowledgement: &ManagementApplicationAck,
         issuer: &DurableCleanManagementIssuer<J>,
     ) -> Result<(), SharedAgentHostError> {
+        self.finish_live_management_terminal(
+            slot,
+            managed,
+            ManagementTerminalRef::Applied(acknowledgement),
+            issuer,
+        )
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn finish_live_failed_install<
+        B: CleanManagementIssuerStore,
+        J: CleanManagementIssuerStore,
+    >(
+        &mut self,
+        slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
+        managed: ManagedAgentTarget,
+        failure: &ManagementApplicationFailure,
+        issuer: &DurableCleanManagementIssuer<J>,
+    ) -> Result<(), SharedAgentHostError> {
+        self.finish_live_management_terminal(
+            slot,
+            managed,
+            ManagementTerminalRef::Rejected(failure),
+            issuer,
+        )
+    }
+
+    fn finish_live_management_terminal<
+        B: CleanManagementIssuerStore,
+        J: CleanManagementIssuerStore,
+    >(
+        &mut self,
+        slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
+        managed: ManagedAgentTarget,
+        terminal: ManagementTerminalRef<'_>,
+        issuer: &DurableCleanManagementIssuer<J>,
+    ) -> Result<(), SharedAgentHostError> {
         if slot
             .retirement_complete()
             .map_err(|_| SharedAgentHostError::Unavailable)?
         {
             // A failed callback may have persisted CMR2 without releasing
             // live admission. Revalidate and release that exact pair on retry.
-            self.finish_management_intent_retirement(slot, managed, acknowledgement, issuer)?;
+            self.finish_management_terminal_retirement(slot, managed, terminal, issuer)?;
             return Ok(());
         }
         let authorization = slot
@@ -5944,7 +6221,7 @@ where
             self.finalization_failure_once = None;
             return Err(SharedAgentHostError::Unavailable);
         }
-        self.finish_management_intent_retirement(slot, managed, acknowledgement, issuer)?;
+        self.finish_management_terminal_retirement(slot, managed, terminal, issuer)?;
         Ok(())
     }
 
@@ -16194,7 +16471,9 @@ mod tests {
                 .expect("build experimental standard guest first"),
             )
             .unwrap();
-            let runtime = crate::agent::package_admission::tests::admitted_state_fixture(program);
+            let runtime = crate::agent::package_admission::tests::admitted_state_fixture_max_actors(
+                program, 2,
+            );
             let mut descriptor = owner.pins.descriptor.clone();
             descriptor.identity.runtime_deployment = runtime.deployment();
             descriptor.identity.runtime_program = runtime.program();
@@ -16853,7 +17132,12 @@ mod tests {
                     &mut signer,
                 )
                 .unwrap();
-            let install_ack = post_install_recovery.entries[0].finalized.clone().unwrap();
+            let crate::agent::clean_authority_issuer::SignedManagementTerminal::Applied(
+                install_ack,
+            ) = post_install_recovery.entries[0].finalized.clone().unwrap()
+            else {
+                panic!("the qualified Install must have a successful final result");
+            };
             let install_receipt = install_ack.receipt.clone();
             assert_ne!(
                 install_ack.authorization_sequence.get(),
@@ -16919,7 +17203,9 @@ mod tests {
                         &mut signer,
                     )
                     .unwrap(),
-                install_ack,
+                crate::agent::clean_authority_issuer::SignedManagementTerminal::Applied(
+                    install_ack.clone(),
+                ),
             );
             assert_eq!(
                 post_install_owners
@@ -17236,6 +17522,65 @@ mod tests {
                 .unwrap();
             assert_eq!(second_install_ack.managed.agent, fresh_agent);
             assert_ne!(second_install_ack, fresh_install_ack);
+            assert_eq!(
+                controller
+                    .install_external(
+                        crate::agent::local_lifecycle::LocalInstallSubmission::decode(
+                            &second_install_bytes,
+                        )
+                        .unwrap(),
+                        &mut ReadBudget::new(10_000, 10_000_000),
+                    )
+                    .unwrap(),
+                second_install_ack,
+                "the latest successful Install remains an exact live retry",
+            );
+
+            // The signed runtime permits two actors. Authority policy still
+            // approves an otherwise valid third Install, but the physical
+            // Standard guest rejects it with DirectoryFull. That terminal
+            // error must pass through journal, issuer, Authority finality and
+            // retirement without installing the third actor.
+            harness
+                .fixture
+                .logical_slot
+                .as_ref()
+                .unwrap()
+                .store(LOGICAL_SLOT + 23, Ordering::Release);
+            let third_package = crate::agent::package_admission::admitted_standard_actor_for_test(
+                "external-local-third",
+                StateLane::Local,
+                0x6d,
+            );
+            let third_request = self::install_request(fresh_agent, &third_package, 0x6e, None);
+            let (mut third_call, _) =
+                credential_call_and_approval(&fresh_descriptor, &third_request, &credential_key);
+            third_call.authority = fresh_call.authority;
+            third_call.request_sequence = core::num::NonZeroU64::new(6).unwrap();
+            third_call.requested_valid_from = LOGICAL_SLOT + 23;
+            third_call.requested_expires_at = LOGICAL_SLOT + 60;
+            third_call.invocation = third_call.expected_invocation();
+            third_call.signature = credential_key.sign(&third_call.signing_bytes()).to_bytes();
+            let ManagementRequest::Install(third_install) = third_request.clone() else {
+                unreachable!();
+            };
+            let third_install_bytes = crate::agent::local_lifecycle::LocalInstallSubmission::new(
+                *third_install,
+                third_call.clone(),
+                third_package,
+            )
+            .unwrap()
+            .encode();
+            assert!(matches!(
+                controller.install_external(
+                    crate::agent::local_lifecycle::LocalInstallSubmission::decode(
+                        &third_install_bytes,
+                    )
+                    .unwrap(),
+                    &mut ReadBudget::new(10_000, 10_000_000),
+                ),
+                Err(SharedAgentHostError::Conflict)
+            ));
             use crate::agent::local_lifecycle::NativeLocalLifecycle as _;
             let mut expected = vec![descriptor.identity.agent, fresh_agent];
             expected.sort_unstable();
@@ -17247,12 +17592,50 @@ mod tests {
                 .unwrap();
             let (system, directory, mut controller_stores, signer) =
                 controller.into_external_parts_for_test();
-            let restarted_recovery = discover_local_lifecycle_recovery(
+            let mut restarted_recovery = discover_local_lifecycle_recovery(
                 &mut controller_stores,
                 system.authority_target(),
                 2,
             )
             .unwrap();
+            let rejected_entry = restarted_recovery
+                .entries
+                .iter()
+                .find(|entry| entry.agent == fresh_agent)
+                .unwrap();
+            let crate::agent::clean_authority_issuer::SignedManagementTerminal::Rejected(failure) =
+                rejected_entry.finalized.as_ref().unwrap()
+            else {
+                panic!("the physically rejected Install must have signed finality");
+            };
+            assert_eq!(
+                failure.error,
+                crate::agent::sdk::ManagementError::DirectoryFull
+            );
+            assert_eq!(failure.credential_call, third_call.commitment());
+            assert!(rejected_entry.intent.retirement_complete().unwrap());
+            let retained_failure = failure.clone();
+            let head_before_restart = {
+                let owners = restarted_recovery
+                    .external_finalized_startup_owners(
+                        &directory,
+                        system.pins.node,
+                        2,
+                        &mut ReadBudget::new(10_000, 10_000_000),
+                    )
+                    .unwrap();
+                let owner = owners.get(&fresh_agent).unwrap();
+                let page = owner
+                    .inspect_actors(
+                        None,
+                        8,
+                        LOGICAL_SLOT + 23,
+                        &mut ReadBudget::new(10_000, 10_000_000),
+                    )
+                    .unwrap();
+                assert_eq!(page.entries.len(), 2);
+                owner.materialization().unwrap().heads().clone()
+            };
             let mut restarted =
                 crate::agent::local_lifecycle::LocalLifecycleController::with_external_recovery(
                     system,
@@ -17266,19 +17649,16 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(restarted.local_agents().unwrap(), Some(expected));
-            assert_eq!(
-                restarted
-                    .install_external(
-                        crate::agent::local_lifecycle::LocalInstallSubmission::decode(
-                            &second_install_bytes,
-                        )
-                        .unwrap(),
-                        &mut ReadBudget::new(10_000, 10_000_000),
+            assert!(matches!(
+                restarted.install_external(
+                    crate::agent::local_lifecycle::LocalInstallSubmission::decode(
+                        &third_install_bytes,
                     )
                     .unwrap(),
-                second_install_ack,
-                "the successor Install must replace the prior staged package and recover exactly",
-            );
+                    &mut ReadBudget::new(10_000, 10_000_000),
+                ),
+                Err(SharedAgentHostError::Conflict)
+            ));
             assert_eq!(
                 restarted
                     .create_external(fresh_submission(), &mut ReadBudget::new(10_000, 10_000_000),)
@@ -17286,7 +17666,44 @@ mod tests {
                 (fresh_agent, fresh_ack),
                 "recovered Create must keep its exact ACK and original file generation",
             );
-            drop(restarted);
+            let (system, directory, mut stores, _) = restarted.into_external_parts_for_test();
+            let mut recovered =
+                discover_local_lifecycle_recovery(&mut stores, system.authority_target(), 2)
+                    .unwrap();
+            let entry = recovered
+                .entries
+                .iter()
+                .find(|entry| entry.agent == fresh_agent)
+                .unwrap();
+            assert_eq!(
+                entry.finalized,
+                Some(
+                    crate::agent::clean_authority_issuer::SignedManagementTerminal::Rejected(
+                        retained_failure,
+                    )
+                )
+            );
+            let reopened = recovered
+                .external_finalized_startup_owners(
+                    &directory,
+                    system.pins.node,
+                    2,
+                    &mut ReadBudget::new(10_000, 10_000_000),
+                )
+                .unwrap();
+            assert_eq!(
+                reopened
+                    .get(&fresh_agent)
+                    .unwrap()
+                    .materialization()
+                    .unwrap()
+                    .heads(),
+                &head_before_restart,
+                "a finalized rejected Install retry cannot append another physical head",
+            );
+            drop(reopened);
+            drop(recovered);
+            drop(system);
             harness.stop();
         }
 

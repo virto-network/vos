@@ -1119,6 +1119,20 @@ pub(super) mod tests {
     }
 
     #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn admitted_state_fixture_max_actors(
+        program: Vec<u8>,
+        max_actors: u32,
+    ) -> AdmittedStateRuntimePackage {
+        let mut envelope = state_runtime_envelope(program);
+        let PackageManifest::AgentRuntime(manifest) = &mut envelope.manifest else {
+            unreachable!()
+        };
+        manifest.capabilities.max_actors = max_actors;
+        let bytes = sign(envelope).encode().unwrap();
+        admit_state_runtime_package(&bytes).unwrap()
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
     pub(crate) fn admitted_state_fixture_row_limits(
         program: Vec<u8>,
         limits: vos_agent_sdk::contract::ExternalStateResourceLimits,

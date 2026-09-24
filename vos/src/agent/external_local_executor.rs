@@ -854,6 +854,40 @@ pub(crate) fn verify_external_install_ack(
     Ok(())
 }
 
+#[cfg(feature = "experimental-state-blocks")]
+pub(crate) fn verify_external_install_failure(
+    recovered: &super::replay::ReplayMaterialization,
+    descriptor: &AgentDescriptor,
+    request: &ManagementRequest,
+    receipt: &crate::agent_sdk::authority::AuthorityReceipt,
+    failure: &crate::agent_sdk::authority::ManagementApplicationFailure,
+) -> Result<(), super::journal_store::JournalStoreError> {
+    use super::journal_store::JournalStoreError;
+
+    let observation = observe_external_install_rejection(recovered, descriptor, request, receipt)?;
+    let identity = &descriptor.identity;
+    if failure
+        .verify_with(&super::clean_bootstrap::RawCredentialVerifier)
+        .is_err()
+        || failure.authority.space != identity.space
+        || failure.authority.binding != descriptor.authority
+        || failure.managed.space != identity.space
+        || failure.managed.agent != identity.agent
+        || failure.managed.owner != identity.owner
+        || failure.managed.profile != identity.profile
+        || failure.managed.runtime_deployment != identity.runtime_deployment
+        || failure.managed.transition_producer != identity.transition_producer
+        || failure.request != request.replay_commitment()
+        || failure.receipt != *receipt
+        || failure.error != observation.error()
+        || failure.reopened_state != observation.reopened_state()
+        || failure.failed_at != observation.applied_at()
+    {
+        return Err(JournalStoreError::ScopeMismatch);
+    }
+    Ok(())
+}
+
 /// One admitted external runtime, immutable actor catalog resolver and exact
 /// genesis descriptor. No standard-runtime private state is decoded here.
 /// Unsupported lifecycle forms fail closed until their external lane and
@@ -1956,6 +1990,23 @@ impl ExternalLocalJournalOwner {
                 request,
                 receipt,
                 acknowledgement,
+            )
+        })
+    }
+
+    pub(crate) fn verify_finalized_install_failure(
+        &self,
+        request: &ManagementRequest,
+        receipt: &crate::agent_sdk::authority::AuthorityReceipt,
+        failure: &crate::agent_sdk::authority::ManagementApplicationFailure,
+    ) -> Result<(), super::journal_store::JournalStoreError> {
+        self.cursor.inspect(|_, recovered| {
+            verify_external_install_failure(
+                recovered,
+                &self.executor.descriptor,
+                request,
+                receipt,
+                failure,
             )
         })
     }

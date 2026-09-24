@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use super::clean_authority_issuer::{CleanManagementIssuerStore, CleanManagementReceiptSigner};
+use super::clean_authority_issuer::{
+    CleanManagementIssuerStore, CleanManagementReceiptSigner, SignedManagementTerminal,
+};
 use super::clean_bootstrap::{CleanSystemAgentBootstrapOwner, CleanSystemAgentBootstrapStore};
 use super::local_sdk_host::LocalAgentHost;
 use super::package_admission::AdmittedRuntimePackage;
@@ -801,8 +803,8 @@ pub(crate) struct LocalLifecycleRecoveryEntry<
     pub(crate) agent: AgentId,
     pub(crate) intent: super::clean_management_intent::CleanManagementIntentSlot<I>,
     pub(crate) issuer: super::clean_authority_issuer::DurableCleanManagementIssuer<J>,
-    pub(crate) finalized: Option<ManagementApplicationAck>,
-    pub(crate) observed: Option<ManagementApplicationAck>,
+    pub(crate) finalized: Option<SignedManagementTerminal>,
+    pub(crate) observed: Option<SignedManagementTerminal>,
     pub(crate) issued: Option<super::sdk::authority::AuthorityReceipt>,
     pub(crate) unissued_authorization: bool,
 }
@@ -1128,9 +1130,9 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
                 .intent
                 .intent()
                 .ok_or(SharedAgentHostError::ScopeMismatch)?;
-            let (receipt, acknowledgement) = entry
+            let (receipt, terminal) = entry
                 .issuer
-                .recover_finalized_application(
+                .recover_finalized_terminal(
                     self.authority,
                     intent.call().managed,
                     intent.request(),
@@ -1139,22 +1141,30 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
                 )
                 .map_err(|_| SharedAgentHostError::ScopeMismatch)?
                 .ok_or(SharedAgentHostError::Conflict)?;
-            if entry.finalized.as_ref() != Some(&acknowledgement)
+            if entry.finalized.as_ref() != Some(&terminal)
                 || entry
                     .observed
                     .as_ref()
-                    .is_some_and(|observed| observed != &acknowledgement)
+                    .is_some_and(|observed| observed != &terminal)
             {
                 return Err(SharedAgentHostError::ScopeMismatch);
             }
             let owner = owners
                 .get(&entry.agent)
                 .ok_or(SharedAgentHostError::ScopeMismatch)?;
-            let physical = match intent.request() {
-                ManagementRequest::Create(_) => owner.verify_finalized_create_ack(&acknowledgement),
-                ManagementRequest::Install(_) => {
-                    owner.verify_finalized_install_ack(intent.request(), &receipt, &acknowledgement)
-                }
+            let physical = match (intent.request(), &terminal) {
+                (
+                    ManagementRequest::Create(_),
+                    super::clean_authority_issuer::SignedManagementTerminal::Applied(ack),
+                ) => owner.verify_finalized_create_ack(ack),
+                (
+                    ManagementRequest::Install(_),
+                    super::clean_authority_issuer::SignedManagementTerminal::Applied(ack),
+                ) => owner.verify_finalized_install_ack(intent.request(), &receipt, ack),
+                (
+                    ManagementRequest::Install(_),
+                    super::clean_authority_issuer::SignedManagementTerminal::Rejected(failure),
+                ) => owner.verify_finalized_install_failure(intent.request(), &receipt, failure),
                 _ => return Err(SharedAgentHostError::ScopeMismatch),
             };
             physical.map_err(|_| SharedAgentHostError::ScopeMismatch)?;
@@ -1284,17 +1294,25 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
                             budget,
                             signer,
                         )?;
-                    if agent != entry.agent
-                        || entry
-                            .finalized
-                            .as_ref()
-                            .is_some_and(|saved| saved != &acknowledgement)
-                    {
+                    if agent != entry.agent || entry.finalized.as_ref().is_some_and(|saved| {
+                        saved
+                            != &super::clean_authority_issuer::SignedManagementTerminal::Applied(
+                                acknowledgement.clone(),
+                            )
+                    }) {
                         return Err(SharedAgentHostError::ScopeMismatch);
                     }
                     entry.issued = Some(acknowledgement.receipt.clone());
-                    entry.observed = Some(acknowledgement.clone());
-                    entry.finalized = Some(acknowledgement);
+                    entry.observed = Some(
+                        super::clean_authority_issuer::SignedManagementTerminal::Applied(
+                            acknowledgement.clone(),
+                        ),
+                    );
+                    entry.finalized = Some(
+                        super::clean_authority_issuer::SignedManagementTerminal::Applied(
+                            acknowledgement,
+                        ),
+                    );
                     entry.unissued_authorization = false;
                     drop(owner);
                 }
@@ -1335,7 +1353,7 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
                         .load_actor()
                         .map_err(|_| SharedAgentHostError::Unavailable)?
                         .ok_or(SharedAgentHostError::Unavailable)?;
-                    let acknowledgement = system.install_external_local_on_slots(
+                    let terminal = system.install_external_local_on_slots(
                         &mut entry.intent,
                         &mut entry.issuer,
                         &mut owner,
@@ -1346,28 +1364,59 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
                     if entry
                         .finalized
                         .as_ref()
-                        .is_some_and(|saved| saved != &acknowledgement)
+                        .is_some_and(|saved| saved != &terminal)
                     {
                         return Err(SharedAgentHostError::ScopeMismatch);
                     }
                     if entry.finalized.is_none() {
-                        system.finalize_management_intent_with_admission(
-                            &mut entry.intent,
-                            intent.call().managed,
-                            &acknowledgement,
-                            &mut entry.issuer,
-                            true,
-                        )?;
+                        match &terminal {
+                            super::clean_authority_issuer::SignedManagementTerminal::Applied(
+                                ack,
+                            ) => {
+                                system.finalize_management_intent_with_admission(
+                                    &mut entry.intent,
+                                    intent.call().managed,
+                                    ack,
+                                    &mut entry.issuer,
+                                    true,
+                                )?;
+                            }
+                            super::clean_authority_issuer::SignedManagementTerminal::Rejected(
+                                failure,
+                            ) => {
+                                system.finalize_failed_install_with_admission(
+                                    &mut entry.intent,
+                                    intent.call().managed,
+                                    failure,
+                                    &mut entry.issuer,
+                                    true,
+                                )?;
+                            }
+                        }
                     }
-                    system.finish_live_management_intent(
-                        &mut entry.intent,
-                        intent.call().managed,
-                        &acknowledgement,
-                        &entry.issuer,
-                    )?;
-                    entry.issued = Some(acknowledgement.receipt.clone());
-                    entry.observed = Some(acknowledgement.clone());
-                    entry.finalized = Some(acknowledgement);
+                    match &terminal {
+                        super::clean_authority_issuer::SignedManagementTerminal::Applied(ack) => {
+                            system.finish_live_management_intent(
+                                &mut entry.intent,
+                                intent.call().managed,
+                                ack,
+                                &entry.issuer,
+                            )?;
+                        }
+                        super::clean_authority_issuer::SignedManagementTerminal::Rejected(
+                            failure,
+                        ) => {
+                            system.finish_live_failed_install(
+                                &mut entry.intent,
+                                intent.call().managed,
+                                failure,
+                                &entry.issuer,
+                            )?;
+                        }
+                    }
+                    entry.issued = Some(terminal.receipt().clone());
+                    entry.observed = Some(terminal.clone());
+                    entry.finalized = Some(terminal);
                     entry.unissued_authorization = false;
                 }
                 _ => return Err(SharedAgentHostError::ScopeMismatch),
@@ -1643,7 +1692,7 @@ pub fn discover_local_lifecycle_recovery<F: LocalLifecycleStoreFactory>(
 ) -> Result<LocalLifecycleRecovery<F::Intent, F::Issuer>, SharedAgentHostError> {
     use super::clean_authority_issuer::DurableCleanManagementIssuer;
     use super::clean_bootstrap::RawCredentialVerifier;
-    use super::clean_management_intent::{CleanManagementIntent, CleanManagementIntentSlot};
+    use super::clean_management_intent::CleanManagementIntentSlot;
     if !authority.is_valid() {
         return Err(SharedAgentHostError::ScopeMismatch);
     }
@@ -1684,7 +1733,7 @@ pub fn discover_local_lifecycle_recovery<F: LocalLifecycleStoreFactory>(
         .map_err(|_| SharedAgentHostError::Unavailable)?;
         let finalized = if let Some(request) = intent.intent() {
             let recovered = issuer
-                .recover_finalized_application(
+                .recover_finalized_terminal(
                     authority,
                     request.call().managed,
                     request.request(),
@@ -1698,7 +1747,7 @@ pub fn discover_local_lifecycle_recovery<F: LocalLifecycleStoreFactory>(
             if final_work.is_some() && issuer.sequence_high_water() == 0 {
                 return Err(SharedAgentHostError::ScopeMismatch);
             }
-            if let Some((_, acknowledgement)) = recovered {
+            if let Some((_, terminal)) = recovered {
                 // A different outstanding issuance cannot be hidden behind
                 // the previous finalized acknowledgement during startup.
                 if issuer.has_pending_decision()
@@ -1716,13 +1765,12 @@ pub fn discover_local_lifecycle_recovery<F: LocalLifecycleStoreFactory>(
                 else {
                     return Err(SharedAgentHostError::ScopeMismatch);
                 };
-                if acknowledgement.applied_at < *observed_slot
-                    || invocation.message
-                        != CleanManagementIntent::finalization_message(&acknowledgement)
+                if terminal.applied_at() < *observed_slot
+                    || invocation.message != terminal.finalization_message()
                 {
                     return Err(SharedAgentHostError::ScopeMismatch);
                 }
-                Some(acknowledgement)
+                Some(terminal)
             } else {
                 if intent
                     .retirement_complete()
@@ -1743,7 +1791,7 @@ pub fn discover_local_lifecycle_recovery<F: LocalLifecycleStoreFactory>(
         };
         let observed = if let Some(request) = intent.intent() {
             issuer
-                .recover_observed_application(
+                .recover_observed_terminal(
                     authority,
                     request.call().managed,
                     request.request(),
@@ -1751,7 +1799,7 @@ pub fn discover_local_lifecycle_recovery<F: LocalLifecycleStoreFactory>(
                     &RawCredentialVerifier,
                 )
                 .map_err(|_| SharedAgentHostError::ScopeMismatch)?
-                .map(|(_, ack)| ack)
+                .map(|(_, terminal)| terminal)
         } else {
             None
         };
@@ -1766,7 +1814,7 @@ pub fn discover_local_lifecycle_recovery<F: LocalLifecycleStoreFactory>(
             .finalization_work()
             .map_err(|_| SharedAgentHostError::Unavailable)?
         {
-            let acknowledgement = observed
+            let terminal = observed
                 .as_ref()
                 .ok_or(SharedAgentHostError::ScopeMismatch)?;
             let Some(super::sdk::RuntimeWork::Invoke { observed_slot, .. }) = intent
@@ -1775,9 +1823,8 @@ pub fn discover_local_lifecycle_recovery<F: LocalLifecycleStoreFactory>(
             else {
                 return Err(SharedAgentHostError::ScopeMismatch);
             };
-            if acknowledgement.applied_at < *observed_slot
-                || invocation.message
-                    != CleanManagementIntent::finalization_message(acknowledgement)
+            if terminal.applied_at() < *observed_slot
+                || invocation.message != terminal.finalization_message()
             {
                 return Err(SharedAgentHostError::ScopeMismatch);
             }
@@ -2956,6 +3003,16 @@ where
         if recovery.authority != system.authority_target()
             || local.space() != system.pins().space()
             || local.node() != system.pins().node()
+            || recovery.entries.iter().any(|entry| {
+                entry
+                    .observed
+                    .as_ref()
+                    .is_some_and(|value| value.as_applied().is_none())
+                    || entry
+                        .finalized
+                        .as_ref()
+                        .is_some_and(|value| value.as_applied().is_none())
+            })
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
@@ -3093,14 +3150,12 @@ where
                 .issuer
                 .observe_local_application(&observation, &mut signer)
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
-            if entry
-                .observed
-                .as_ref()
-                .is_some_and(|saved| saved != &acknowledgement)
-            {
+            if entry.observed.as_ref().is_some_and(|saved| {
+                saved != &SignedManagementTerminal::Applied(acknowledgement.clone())
+            }) {
                 return Err(SharedAgentHostError::ScopeMismatch);
             }
-            entry.observed = Some(acknowledgement.clone());
+            entry.observed = Some(SignedManagementTerminal::Applied(acknowledgement.clone()));
             if entry.finalized.is_none() {
                 system.finalize_management_intent_with_admission(
                     &mut entry.intent,
@@ -3109,7 +3164,7 @@ where
                     &mut entry.issuer,
                     true,
                 )?;
-                entry.finalized = Some(acknowledgement.clone());
+                entry.finalized = Some(SignedManagementTerminal::Applied(acknowledgement.clone()));
                 let authorization = entry
                     .intent
                     .authorization_work()
@@ -3224,19 +3279,20 @@ where
                 .issuer
                 .observe_local_application(&observation, &mut signer)
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
-            if entry
-                .observed
-                .as_ref()
-                .is_some_and(|saved| saved != &acknowledgement)
-            {
+            if entry.observed.as_ref().is_some_and(|saved| {
+                saved != &SignedManagementTerminal::Applied(acknowledgement.clone())
+            }) {
                 return Err(SharedAgentHostError::ScopeMismatch);
             }
-            entry.observed = Some(acknowledgement);
+            entry.observed = Some(SignedManagementTerminal::Applied(acknowledgement));
         }
         let mut recovered_pairs = Vec::new();
         for entry in &mut recovery.entries {
             if entry.finalized.is_none()
-                && let Some(acknowledgement) = &entry.observed
+                && let Some(acknowledgement) = entry
+                    .observed
+                    .as_ref()
+                    .and_then(SignedManagementTerminal::as_applied)
             {
                 // Saved work keeps its clock. Missing finalization is reserved
                 // before publication, without releasing the predecessor gate.
@@ -3253,7 +3309,7 @@ where
                     &mut entry.issuer,
                     true,
                 )?;
-                entry.finalized = Some(acknowledgement.clone());
+                entry.finalized = Some(SignedManagementTerminal::Applied(acknowledgement.clone()));
                 recovered_pairs.push([
                     entry
                         .intent
@@ -3286,7 +3342,11 @@ where
             {
                 continue;
             }
-            if let Some(acknowledgement) = &entry.finalized {
+            if let Some(acknowledgement) = entry
+                .finalized
+                .as_ref()
+                .and_then(SignedManagementTerminal::as_applied)
+            {
                 let managed = entry
                     .intent
                     .intent()
@@ -3577,8 +3637,8 @@ where
             previous
                 .verify(target, managed, &RawCredentialVerifier)
                 .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-            let (receipt, ack) = issuer
-                .recover_finalized_application(
+            let (receipt, terminal) = issuer
+                .recover_finalized_terminal(
                     target,
                     managed,
                     previous.request(),
@@ -3587,10 +3647,20 @@ where
                 )
                 .map_err(|_| SharedAgentHostError::ScopeMismatch)?
                 .ok_or(SharedAgentHostError::ScopeMismatch)?;
-            match previous.request() {
-                ManagementRequest::Create(_) => external.verify_finalized_create_ack(&ack),
-                ManagementRequest::Install(_) => {
-                    external.verify_finalized_install_ack(previous.request(), &receipt, &ack)
+            match (previous.request(), &terminal) {
+                (
+                    ManagementRequest::Create(_),
+                    super::clean_authority_issuer::SignedManagementTerminal::Applied(ack),
+                ) => external.verify_finalized_create_ack(ack),
+                (
+                    ManagementRequest::Install(_),
+                    super::clean_authority_issuer::SignedManagementTerminal::Applied(ack),
+                ) => external.verify_finalized_install_ack(previous.request(), &receipt, ack),
+                (
+                    ManagementRequest::Install(_),
+                    super::clean_authority_issuer::SignedManagementTerminal::Rejected(failure),
+                ) => {
+                    external.verify_finalized_install_failure(previous.request(), &receipt, failure)
                 }
                 _ => return Err(SharedAgentHostError::ScopeMismatch),
             }
@@ -3603,7 +3673,7 @@ where
             slot.stage_external_pending_install(&previous, &next, &submission)
                 .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
         }
-        let acknowledgement = system.install_external_local_on_slots(
+        let terminal = system.install_external_local_on_slots(
             &mut slot,
             &mut issuer,
             &mut external,
@@ -3615,16 +3685,35 @@ where
             .retirement_complete()
             .map_err(|_| SharedAgentHostError::Unavailable)?
         {
-            system.finalize_management_intent_with_admission(
-                &mut slot,
-                managed,
-                &acknowledgement,
-                &mut issuer,
-                true,
-            )?;
-            system.finish_live_management_intent(&mut slot, managed, &acknowledgement, &issuer)?;
+            match &terminal {
+                super::clean_authority_issuer::SignedManagementTerminal::Applied(ack) => {
+                    system.finalize_management_intent_with_admission(
+                        &mut slot,
+                        managed,
+                        ack,
+                        &mut issuer,
+                        true,
+                    )?;
+                    system.finish_live_management_intent(&mut slot, managed, ack, &issuer)?;
+                }
+                super::clean_authority_issuer::SignedManagementTerminal::Rejected(failure) => {
+                    system.finalize_failed_install_with_admission(
+                        &mut slot,
+                        managed,
+                        failure,
+                        &mut issuer,
+                        true,
+                    )?;
+                    system.finish_live_failed_install(&mut slot, managed, failure, &issuer)?;
+                }
+            }
         }
-        Ok(acknowledgement)
+        match terminal {
+            super::clean_authority_issuer::SignedManagementTerminal::Applied(ack) => Ok(ack),
+            super::clean_authority_issuer::SignedManagementTerminal::Rejected(_) => {
+                Err(SharedAgentHostError::Conflict)
+            }
+        }
     }
 
     /// Install into an existing Local Agent, retaining the same exclusive

@@ -243,7 +243,7 @@ test-agent-state-local-create: build-agent-standard-state-guest build-agent-stat
     export TMPDIR="$state_target/task-tmp"
     mkdir -p "$TMPDIR"
     cd "$repository_root"
-    cargo +nightly-2025-05-09 test --offline --locked -p vos --lib --features 'agent-runtime storage network http-ingress experimental-state-blocks' agent::clean_bootstrap::tests::physical::native_external_local_create_finalizes_and_retries -- --ignored --exact --test-threads=1
+    RUST_MIN_STACK=16777216 cargo +nightly-2025-05-09 test --offline --locked -p vos --lib --features 'agent-runtime storage network http-ingress experimental-state-blocks' agent::clean_bootstrap::tests::physical::native_external_local_create_finalizes_and_retries -- --ignored --exact --test-threads=1
 
 build-agent-state-actor:
     #!/usr/bin/env bash
