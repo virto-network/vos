@@ -26,14 +26,14 @@ recover every pending lifecycle generation before its first route is published.
 The external format is never inferred from the image root's contents; startup
 must select the two paths explicitly.
 
-Three release-work batches remain. The code through `49a0ae44` on
-`saga/agents` includes the bounded-state slice and the opt-in Clerk
-external-Local checkpoint; neither completes batch 1. Subsequent integration
-stays on `wip/ch08-runtime-directory`:
+Three release-work batches remain. The code through `9a003d58` includes the
+bounded-state slice and opt-in Clerk external-Local transfer/root checkpoint;
+neither completes batch 1. Subsequent integration stays on
+`wip/ch08-runtime-directory`:
 
-1. **Authenticated storage + customer workflow (in progress).** First qualify
-   the bounded external-state vertical slice below, then port Clerk's
-   ledger core to the Agent interface; establish common authenticated static
+1. **Authenticated storage + customer workflow (in progress).** Finish
+   bounded external-state/Clerk integration (the Agent ledger-core port and
+   one physical signed transfer are done); establish common authenticated static
    three-node genesis (not three singleton spaces); expose ordinary Shared
    Create/Install through durable reservation/publication/application/finalize/
    retirement; add schema-aware CLI invocation. Qualify with actual release
@@ -429,14 +429,13 @@ after authenticated Create publication. Shared common finality and Clerk
 follow within batch 1. Candidate package admission is not release admission;
 the large ACK's 5-billion-gas success is not a release-latency guarantee.
 
-External Local cutover TODOs, in order: (1) complete the external Install
-handoff under the retained leases (the internal actor-sidecar crash window has
-a physical fixture); resolve approved-but-guest-rejected Install without
-stranding its intent, and qualify Install response-loss recovery;
-(2) qualify publicly routed Invoke/ACK and Resume through the locked owner,
-including response-loss retry after restart without an image-host fallback;
-(3) qualify
-near-ceiling ACK, candidate artifact identities and released-binary behavior.
+External Local cutover TODOs, in order: (1) decide whether public external
+Install belongs in this release; the internal retained-lease handoff, exact
+retry, guest rejection and restart cases have physical fixtures, but public
+Install ingress is still closed; (2) qualify publicly routed Invoke/ACK and
+Resume through the locked owner, including response-loss retry after restart
+without an image-host fallback; (3) qualify near-ceiling ACK, candidate
+artifact identities and released-binary behavior.
 The image `with_recovery` still assumes an image host; the separate external
 startup path retains locked journal owners. Do not enable external mode in the
 default binary or present this experimental ingress as a supported customer
@@ -450,7 +449,7 @@ byte, one Agent invocation carries one exact role claim: an Operator principal
 needs a Member grant for Member-only reads. The clean Agent entry avoids
 linking the nested service runner, and an Agent-only linker layout puts its
 writable data in the standard PVM region. Legacy and Agent host suites passed
-(13 and 14 tests); both PVM builds succeeded; the canonical `vosx actor build`
+(14 and 15 tests); both PVM builds succeeded; the canonical `vosx actor build`
 produced a signed VOS3 Clerk package, and host package admission accepted it.
 The ignored physical external-Local Create/Install/restart fixture also passed
 with that exact package supplied by `CLERK_AGENT_PACKAGE`: the standard state
@@ -463,18 +462,25 @@ call also applied one note commitment: Clerk returned archived `Status::Ok`,
 the exact unretired result survived owner reopen without a second head, and a
 separately signed Member read after reopen observed count one. This verifies
 one persisted actor-state write/read through the physical external guest.
-This does not establish public credential-role grants or retained transfer
-growth. Clerk's Agent-only read mode is explicitly `LinearizableQuery`:
+The signed-transfer parity test applies registrar-signed account creations and
+a debit-signed transfer through the committed-map view and cipher-clerk's
+reference ledger, checking accepted statuses, stored transfer and composite
+root. The physical external-Local fixture executes those same kinds of signed
+events through the canonical Clerk Agent PVM, compares its public root to the
+reference ledger, and reads the same root with a fresh invocation after
+reopening the locked owner. This is one accepted transfer, not a growth or
+load result. It does not establish public credential-role grants. Clerk's
+Agent-only read mode is explicitly `LinearizableQuery`:
 default `Query` currently cannot publish an external-state replay record
 (`InvalidRecord`).
 The legacy service read mode remains unchanged. Ordered reads add publication
-work, so their service cost belongs in the Clerk load gate. Transfer mutation,
-kernel root parity, backend credentials, Shared finality and retained growth
-remain unqualified.
+work, so their service cost belongs in the Clerk load gate. Production backend
+credentials, Shared finality, retained growth and transfer throughput remain
+unqualified.
 Proof-record and reciprocal voucher-origin behavior on the clean Agent path
 also remain unqualified and must stay out of a first-release claim until
-tested. Next qualify transfer mutation and unchanged kernel roots, then
-multi-row growth and three-node publication. A separate external-state
+tested. Next qualify multi-row retained growth and three-node publication,
+then measure service cost. A separate external-state
 default-`Query` design remains deferred; do not infer its support from Clerk's
 explicit ordered reads.
 

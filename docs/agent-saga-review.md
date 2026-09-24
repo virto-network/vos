@@ -1,62 +1,55 @@
-# Agent saga: Clerk Agent Local checkpoint
+# Agent saga: signed Clerk transfer checkpoint
 
-Review the code through `49a0ae44` on `saga/agents` relative to `e3335407`;
-the subsequent handoff-docs commit adds no code. This is one scoped,
-opt-in Clerk Agent integration checkpoint, **not** first-customer release or
-three-node Shared qualification. The [live release plan](agent-saga-status.md)
-remains authoritative. Please return findings without editing `saga/agents`;
-implementation continues on `wip/ch08-runtime-directory`.
+Review `a3d7c295..9a003d58` on `saga/agents`. This is an incremental,
+test-focused checkpoint following the earlier opt-in Clerk Agent port. It is
+**not** first-customer release or three-node Shared qualification. The
+[live release plan](agent-saga-status.md) remains authoritative. Please return
+findings without editing `saga/agents`; implementation continues on
+`wip/ch08-runtime-directory`.
 
 ## What changed
 
-- `clerk-ledger` has an opt-in `agent` build over its existing state fields,
-  cipher-clerk kernel, signatures and committed-root helpers. The legacy
-  service build remains the default. Agent package methods carry exact
-  Operator/Member role IDs and signed schema/policy metadata.
-- The dual-ABI macro accepts an Agent-only `agent_linearizable` read mode and
-  portable role ID beside the unchanged legacy role predicate. Explicit
-  ordered reads avoid the external-state default-`Query` publication gap; they
-  also add per-read publication cost that must be measured under load.
-- The Agent artifact uses a clean refine entry and Agent-only linker layout.
-  The canonical `vosx actor build` produced a signed VOS3 package admitted by
-  the host's standard-PVM/package checks.
-- With that exact package, the ignored physical external-Local fixture covers
-  Create, Install, an anonymous Clerk read, ACK, an Operator note-commitment
-  write, a Member count read, and exact result recovery after reopening the
-  locked owner. It verifies archived `Status::Ok`, count one, and no duplicate
-  head on retries. The original synthetic-package fixture also still passes.
+- A host test runs real registrar-signed account creations and a debit-signed
+  transfer through both Clerk's committed-map `LedgerView` and cipher-clerk's
+  `MemLedger`. It checks accepted kernel statuses, the stored transfer, and
+  byte-identical composite roots after bootstrap, creations and transfer.
+- The existing ignored physical external-Local fixture, using the canonical
+  signed Clerk Agent package, now invokes `bootstrap`, two `create_account`
+  calls, `apply_transfer` and `state_root` through the Standard PVM. It checks
+  archived `Status::Ok` for each mutation and matches the public root against
+  the reference ledger. After reopening the locked file owner, a *fresh*
+  Member-authorized `state_root` invocation returns that same root.
+- A stale Clerk source comment was corrected: the Agent build has physical
+  external-Local evidence, but transfer growth and released Shared behavior
+  remain unqualified.
 
 ## Review questions
 
-1. Do Agent-only mode and role annotations preserve legacy dispatch while the
-   signed Agent schema/policy enforces the exact intended mode and role?
-   Check the macro, Clerk metadata tests, and package admission.
-2. Does the Agent field-view rewrite continue to use the same Clerk kernel,
-   signature checks, state fields and root calculation without bypassing lane
-   access? Do not infer transfer/root parity from the note-commitment test.
-3. Can the physical fixture accidentally treat a test-signed Authority role
-   claim as evidence of a real backend credential grant, or replay a different
-   package, request, result or generation after reopen?
-4. Does the new entry/linker selection isolate the Agent PVM ABI without
-   changing legacy actor execution or admitting an unsupported host call?
+1. Does the parity test use equivalent signed inputs, timestamps and journal
+   contents, or can it pass while the Agent's kernel behavior diverges?
+2. Does the physical fixture actually execute each method and inspect its
+   archived return, instead of treating a completed envelope or cached reply
+   as success? Is the post-reopen root read a distinct signed invocation?
+3. Do the test Authority receipts and role claims remain clearly fixture-only,
+   without implying that production backend credentials and role grants work?
+4. Did any test change weaken the signed package, physical journal, or fresh
+   root selection boundaries?
 
 ## Evidence and limits
 
-The legacy Clerk suite passed 13 tests, the Agent suite 14, and `vos-macros`
-passed 23. Both Clerk PVM builds and canonical package admission passed. The
-physical external-Local fixture passed with Clerk and separately with its
-original synthetic package. The default non-experimental `vos` library check,
-formatting and diff checks passed. `just test-agent-state-prototype` also
-passed on this checkpoint, covering SDK, replay, physical PVM, journal-store
-and feature-disabled groups. Offline/locked `cargo check -p vosx --tests` and
-workspace formatting also passed. Artifact IDs from this development build
-are not release pins. The full workspace and outer-PVM gates were not rerun.
+The Agent Clerk suite passed 15 tests and legacy Clerk passed 14. The physical
+fixture passed with `CLERK_AGENT_PACKAGE` pointing at the canonical signed VOS3
+artifact, `RUST_MIN_STACK=16777216`, and the experimental state-block feature;
+the final run took 136 seconds. Workspace formatting and diff checks passed.
+The full prototype gate and offline/locked `vosx --tests` check passed at the
+preceding `a3d7c295` checkpoint; they were not rerun for this test-only code
+change. Artifact IDs from this development build are not release pins.
 
-Not covered: public external-state Install ingress, production credential-role
-grants, transfer execution and kernel-root parity, three-node Shared lifecycle,
-100,000 retained transfers, throughput, backup/restore, or release artifact
-reproduction. The external-state path remains opt-in. The fresh dedicated-root
-rule preserves existing image Local deployments; it is not a migration.
+Not covered: public external-state Install, production credential-role grants,
+high-volume retained transfers, throughput, three-node Shared quorum/finality,
+backup/restore, or release artifact reproduction. The external-state path is
+still opt-in. The approved fresh dedicated-root rule preserves existing image
+Local deployments; mixed-format migration is deferred.
 
 Please report severity, commit/file/line, violated invariant, concrete
 failure scenario and a regression. Distinguish demonstrated defects from
