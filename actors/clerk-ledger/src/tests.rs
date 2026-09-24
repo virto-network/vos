@@ -12,6 +12,7 @@
 //! rebuild.
 
 use cipher_clerk::crypto::{Amount, AuthKey, Blinding};
+use cipher_clerk::helpers::{MemLedger, MemOracle};
 use cipher_clerk::ids::{
     AccountId as CcAccountId, EntryId as CcEntryId, ExternalId as CcExternalId,
     JournalId as CcJournalId, TransferId as CcTransferId,
@@ -22,6 +23,7 @@ use cipher_clerk::types::{
     Account as CcAccount, Direction, Entry as CcEntry, Journal as CcJournal, Layer,
     Transfer as CcTransfer, TransferFlags,
 };
+use cipher_clerk::{apply_account_creations, apply_batch};
 use vos::storage::CommittedMap;
 
 use crate::oracle::NoopOracle;
@@ -409,6 +411,77 @@ fn get_journal_filters_by_id() {
     let miss = view.get_journal(&CcJournalId([0xFF; 16]), &mut NoopOracle);
     assert_eq!(hit.as_ref(), Some(&journal));
     assert_eq!(miss, None);
+}
+
+/// Run real signed kernel events through both the committed-map view and
+/// cipher-clerk's reference ledger. The mixed-record test below checks the
+/// encoding independently; this pins the root after accepted lifecycle
+/// transitions, including balance updates and a stored transfer.
+#[test]
+fn signed_transfer_root_matches_reference_ledger() {
+    use cipher_clerk::prelude::{CreateAccount, EventStatus, Keypair};
+
+    let mut maps = Maps::fresh();
+    let mut reference = MemLedger::new();
+    let registrar = Keypair::generate();
+    let journal_id = reference.bootstrap_journal(registrar.public, 1);
+    maps.set_journal(reference.journals.get(&journal_id.0).unwrap());
+    assert_eq!(maps.view().root(), reference.root(), "bootstrap root");
+
+    let alice_key = Keypair::generate();
+    let bob_key = Keypair::generate();
+    let alice = CcAccount::asset(journal_id, alice_key.public, 840, 100);
+    let bob = CcAccount::liability(journal_id, bob_key.public, 840, 200);
+    let creates = [
+        CreateAccount::signed(alice.clone(), &registrar.secret),
+        CreateAccount::signed(bob.clone(), &registrar.secret),
+    ];
+    let mut reference_oracle = MemOracle::new();
+    let mut view_oracle = reference_oracle.clone();
+    let expected =
+        apply_account_creations(&mut reference, &creates, &mut reference_oracle, 500_000);
+    let actual = apply_account_creations(&mut maps.view(), &creates, &mut view_oracle, 500_000);
+    assert_eq!(actual, expected);
+    assert!(
+        actual
+            .iter()
+            .all(|result| result.status == EventStatus::Created)
+    );
+    assert_eq!(
+        maps.view().root(),
+        reference.root(),
+        "account creation root"
+    );
+
+    let amount = reference_oracle.commit(17);
+    view_oracle = reference_oracle.clone();
+    let transfer = CcTransfer::builder(journal_id)
+        .debit(&alice, Layer::Settled, amount)
+        .credit(&bob, Layer::Settled, amount)
+        .signed_with(&[(&alice, &alice_key.secret)]);
+    let expected = apply_batch(
+        &mut reference,
+        &[transfer.clone()],
+        &mut reference_oracle,
+        1_000_000,
+    );
+    let actual = apply_batch(
+        &mut maps.view(),
+        &[transfer.clone()],
+        &mut view_oracle,
+        1_000_000,
+    );
+    assert_eq!(actual, expected);
+    assert_eq!(actual[0].status, EventStatus::Created);
+    assert_eq!(
+        maps.view().root(),
+        reference.root(),
+        "accepted transfer root"
+    );
+    assert_eq!(
+        maps.transfers.get(&transfer.id.0),
+        reference.transfers.get(&transfer.id.0).cloned()
+    );
 }
 
 /// THE parity pin: the incrementally-maintained composite root must

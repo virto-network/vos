@@ -17462,12 +17462,192 @@ mod tests {
                         observed_slot: LOGICAL_SLOT + 20,
                     },
                 };
+                // The note-pool probe above proves storage publication, but
+                // not the Clerk kernel. Exercise real registrar-signed
+                // creations and a debit-signed transfer through the physical
+                // Agent guest, then compare its public root with the same
+                // events applied to cipher-clerk's reference ledger.
+                use cipher_clerk::helpers::{MemLedger, MemOracle};
+                use cipher_clerk::prelude::{
+                    Account, CreateAccount, EventStatus, Keypair, Layer, LedgerState, Transfer,
+                };
+                let mut reference = MemLedger::new();
+                let mut reference_oracle = MemOracle::new();
+                let registrar = Keypair::generate();
+                let journal_id = reference.bootstrap_journal(registrar.public, 1);
+                let alice_key = Keypair::generate();
+                let bob_key = Keypair::generate();
+                let alice = Account::asset(journal_id, alice_key.public, 840, 100);
+                let bob = Account::liability(journal_id, bob_key.public, 840, 200);
+                let creates = [
+                    CreateAccount::signed(alice.clone(), &registrar.secret),
+                    CreateAccount::signed(bob.clone(), &registrar.secret),
+                ];
+                let mut invoke_clerk = |method: &str,
+                                        args: Vec<(&str, Value)>,
+                                        mode: MethodMode,
+                                        role: crate::agent::sdk::RoleId,
+                                        invocation: u8| {
+                    let mut call = work.clone();
+                    call.invocation = InvocationId([invocation; 32]);
+                    call.mode = mode;
+                    call.gas = crate::agent::execution::MAX_EXECUTION_GAS;
+                    call.origin.principal = Some(PrincipalId([0xe3; 32]));
+                    call.roles.actor = Some(role);
+                    let mut message = Msg::new(method);
+                    for (name, value) in args {
+                        message = message.with(name, value);
+                    }
+                    call.message = vec![TAG_DYNAMIC];
+                    call.message.extend(message.encode());
+                    let mut signed_receipt = install_receipt.clone();
+                    signed_receipt.selector.operation =
+                        crate::agent::sdk::authority::AuthorityOperationKind::InvokeActor;
+                    signed_receipt.selector.actor = Some(call.actor);
+                    signed_receipt.selector.actor_deployment = Some(call.deployment);
+                    signed_receipt.selector.request = call.commitment();
+                    signed_receipt.selector.decision_sequence = 0;
+                    signed_receipt.selector.acknowledged_through = 0;
+                    signed_receipt.selector.expires_at = LOGICAL_SLOT + 100;
+                    signed_receipt.signature = SigningKey::from_bytes(&[RECEIPT_SEED; 32])
+                        .sign(&signed_receipt.signing_bytes())
+                        .to_bytes();
+                    let input = ReplayInput {
+                        runtime: installed.materialization().unwrap().runtime().clone(),
+                        operation: ReplayOperation::CleanInvoke {
+                            context: crate::agent::sdk::RuntimeExecutionContext::Direct,
+                            work: call,
+                            authorization:
+                                crate::agent::sdk::InvocationAuthorization::AuthorityReceipt(
+                                    signed_receipt,
+                                ),
+                            observed_slot: LOGICAL_SLOT + 20,
+                        },
+                    };
+                    let outcome = installed
+                        .submit_direct_clean(
+                            input,
+                            LOGICAL_SLOT + 20,
+                            &mut ReadBudget::new(10_000, 10_000_000),
+                        )
+                        .unwrap();
+                    let RuntimeOutcome::Completed(Ok(reply)) = outcome else {
+                        panic!("physical Clerk {method} failed: {outcome:?}");
+                    };
+                    Value::decode(&reply.reply)
+                };
+                assert_eq!(
+                    invoke_clerk(
+                        "bootstrap",
+                        vec![
+                            ("journal_id", Value::Bytes(journal_id.0.to_vec())),
+                            (
+                                "registrar_pubkey",
+                                Value::Bytes(registrar.public.0.to_vec())
+                            ),
+                            ("code", Value::U32(1)),
+                        ],
+                        MethodMode::Linear,
+                        operator,
+                        0xe6,
+                    ),
+                    Value::Bytes(vec![0]),
+                );
+                for (index, create) in creates.iter().enumerate() {
+                    let timestamp = 500_000 + index as u64;
+                    let expected = cipher_clerk::apply_account_creations(
+                        &mut reference,
+                        core::slice::from_ref(create),
+                        &mut reference_oracle,
+                        timestamp,
+                    );
+                    assert_eq!(expected[0].status, EventStatus::Created);
+                    assert_eq!(
+                        invoke_clerk(
+                            "create_account",
+                            vec![
+                                (
+                                    "create_account_bytes",
+                                    Value::Bytes(
+                                        crate::rkyv::to_bytes::<crate::rkyv::rancor::Error>(create)
+                                            .unwrap()
+                                            .to_vec(),
+                                    ),
+                                ),
+                                ("batch_seed_timestamp", Value::U64(timestamp)),
+                            ],
+                            MethodMode::Linear,
+                            operator,
+                            0xe7 + index as u8,
+                        ),
+                        Value::Bytes(vec![0]),
+                    );
+                }
+                let amount = reference_oracle.commit(17);
+                let transfer = Transfer::builder(journal_id)
+                    .debit(&alice, Layer::Settled, amount)
+                    .credit(&bob, Layer::Settled, amount)
+                    .signed_with(&[(&alice, &alice_key.secret)]);
+                let (value, blinding) = reference_oracle.openings.get(&amount.0).copied().unwrap();
+                let openings = vec![cipher_clerk::state::Opening {
+                    amount,
+                    value,
+                    blinding,
+                }];
+                let expected = cipher_clerk::apply_batch(
+                    &mut reference,
+                    core::slice::from_ref(&transfer),
+                    &mut reference_oracle,
+                    1_000_000,
+                );
+                assert_eq!(expected[0].status, EventStatus::Created);
+                assert_eq!(
+                    invoke_clerk(
+                        "apply_transfer",
+                        vec![
+                            (
+                                "transfer_bytes",
+                                Value::Bytes(
+                                    crate::rkyv::to_bytes::<crate::rkyv::rancor::Error>(&transfer)
+                                        .unwrap()
+                                        .to_vec(),
+                                ),
+                            ),
+                            (
+                                "openings_bytes",
+                                Value::Bytes(
+                                    crate::rkyv::to_bytes::<crate::rkyv::rancor::Error>(&openings)
+                                        .unwrap()
+                                        .to_vec(),
+                                ),
+                            ),
+                            ("batch_seed_timestamp", Value::U64(1_000_000)),
+                        ],
+                        MethodMode::Linear,
+                        operator,
+                        0xe9,
+                    ),
+                    Value::Bytes(vec![0]),
+                );
+                assert_eq!(
+                    invoke_clerk(
+                        "state_root",
+                        Vec::new(),
+                        MethodMode::LinearizableQuery,
+                        member,
+                        0xea,
+                    ),
+                    Value::Bytes(reference.root().to_vec()),
+                    "the physical external-state Clerk must preserve the kernel root",
+                );
+                drop(invoke_clerk);
                 clerk_reopen = Some((
                     acknowledge,
                     retired,
                     mutation_input,
                     mutation_outcome,
                     count_input,
+                    reference.root(),
                     installed.materialization().unwrap().heads().clone(),
                 ));
             }
@@ -17478,11 +17658,34 @@ mod tests {
                 mutation_input,
                 mutation_outcome,
                 count_input,
+                expected_clerk_root,
                 after_clerk_operations,
             )) = clerk_reopen
             {
-                use crate::actors::codec::Decode as _;
-                use crate::actors::value::Value;
+                use crate::actors::codec::{Decode as _, Encode as _};
+                use crate::actors::value::{Msg, TAG_DYNAMIC, Value};
+
+                let mut root_input = count_input.clone();
+                let crate::agent::journal::ReplayOperation::CleanInvoke {
+                    work: root_work,
+                    authorization: root_authorization,
+                    ..
+                } = &mut root_input.operation
+                else {
+                    unreachable!();
+                };
+                root_work.invocation = InvocationId([0xeb; 32]);
+                root_work.message = vec![TAG_DYNAMIC];
+                root_work.message.extend(Msg::new("state_root").encode());
+                let crate::agent::sdk::InvocationAuthorization::AuthorityReceipt(root_receipt) =
+                    root_authorization
+                else {
+                    unreachable!();
+                };
+                root_receipt.selector.request = root_work.commitment();
+                root_receipt.signature = SigningKey::from_bytes(&[RECEIPT_SEED; 32])
+                    .sign(&root_receipt.signing_bytes())
+                    .to_bytes();
 
                 let mut reopened = reopened_archive
                     .open_existing(
@@ -17536,6 +17739,21 @@ mod tests {
                     panic!("physical Clerk note count failed: {count:?}");
                 };
                 assert_eq!(Value::decode(&count_reply.reply), Value::U32(1));
+                let root = reopened
+                    .submit_direct_clean(
+                        root_input,
+                        LOGICAL_SLOT + 20,
+                        &mut ReadBudget::new(10_000, 10_000_000),
+                    )
+                    .unwrap();
+                let RuntimeOutcome::Completed(Ok(root_reply)) = &root else {
+                    panic!("physical Clerk reopened root failed: {root:?}");
+                };
+                assert_eq!(
+                    Value::decode(&root_reply.reply),
+                    Value::Bytes(expected_clerk_root.to_vec()),
+                    "reopened physical owner must retain the signed transfer root",
+                );
             }
 
             let orphan = crate::service::AgentId([0x77; 32]);
