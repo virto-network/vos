@@ -17225,6 +17225,7 @@ mod tests {
                     .heads(),
                 &installed_head,
             );
+            let mut clerk_ack_reopen = None;
             if std::env::var_os("CLERK_AGENT_PACKAGE").is_some() {
                 use crate::actors::codec::{Decode as _, Encode as _};
                 use crate::actors::value::{Msg, TAG_DYNAMIC, Value};
@@ -17347,6 +17348,37 @@ mod tests {
                 assert_eq!(
                     installed
                         .submit_direct_clean(
+                            acknowledge.clone(),
+                            LOGICAL_SLOT + 20,
+                            &mut ReadBudget::new(10_000, 10_000_000),
+                        )
+                        .unwrap(),
+                    retired,
+                );
+                clerk_ack_reopen = Some((
+                    acknowledge,
+                    retired,
+                    installed.materialization().unwrap().heads().clone(),
+                ));
+            }
+            drop(post_install_owners);
+            if let Some((acknowledge, retired, after_retirement)) = clerk_ack_reopen {
+                let mut reopened = reopened_archive
+                    .open_existing(
+                        runtime.exact_bytes().to_vec(),
+                        owner.authority_target(),
+                        owner.pins.node,
+                        &directory,
+                        &mut ReadBudget::new(10_000, 10_000_000),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    reopened.materialization().unwrap().heads(),
+                    &after_retirement
+                );
+                assert_eq!(
+                    reopened
+                        .submit_direct_clean(
                             acknowledge,
                             LOGICAL_SLOT + 20,
                             &mut ReadBudget::new(10_000, 10_000_000),
@@ -17354,8 +17386,11 @@ mod tests {
                         .unwrap(),
                     retired,
                 );
+                assert_eq!(
+                    reopened.materialization().unwrap().heads(),
+                    &after_retirement
+                );
             }
-            drop(post_install_owners);
 
             let orphan = crate::service::AgentId([0x77; 32]);
             assert_ne!(orphan.0, agent.0);

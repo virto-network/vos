@@ -456,12 +456,14 @@ with that exact package supplied by `CLERK_AGENT_PACKAGE`: the standard state
 guest accepted and published its Install, and the file-backed owner reopened
 the finalized generation. A signed anonymous `journal_id` read then executed
 through the physical guest, retained its exact reply across retry, and ACKed
-with an exact ACK retry. Clerk's
+with an exact ACK retry. Reopening the locked generation preserved that
+retirement result without advancing the head. Clerk's
 Agent-only read mode is explicitly `LinearizableQuery`: default `Query`
 currently cannot publish an external-state replay record (`InvalidRecord`).
 The legacy service read mode remains unchanged. Ordered reads add publication
-work, so their service cost belongs in the Clerk load gate. This does not yet exercise
-Clerk mutation, role grants, post-Invoke restart recovery, or root parity. Backend
+work, so their service cost belongs in the Clerk load gate. This does not yet
+exercise Clerk mutation, role grants, unretired Invoke response-loss recovery,
+or root parity. Backend
 credentials, Shared finality and retained growth also remain unqualified.
 Proof-record and reciprocal voucher-origin behavior on the clean Agent path
 also remain unqualified and must stay out of a first-release claim until
