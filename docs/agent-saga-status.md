@@ -65,7 +65,14 @@ Create/Install workflow, and startup still installs unavailable finality for
 ordinary Shared Agents. These must converge on one authenticated three-node
 system lineage before a three-node Clerk claim; isolated Shared fixtures do
 not establish deployability. Keep this within batch 1 rather than adding a
-separate architecture workstream.
+separate architecture workstream. The current Shared host still selects the
+image-oriented file driver, not the bounded external-state executor; Local
+Clerk parity alone cannot establish 100,000-transfer Shared capacity. The
+system bootstrap currently requires exactly one voter, and the Shared host
+rejects `ChangeReplicas`; three-node system placement therefore needs a real
+bootstrap/placement cutover, not merely a CLI wrapper around existing calls.
+The V2 Raft committee-transition primitive exists, but it is not an operator
+onboarding workflow or a substitute for node-local authenticated recovery.
 
 Immediate integration seam: the experimental external-state package, physical
 Create, sealed Local genesis, file journal, pinned Invoke/ACK owner, and
@@ -509,6 +516,18 @@ not explain per-call cost or include released `vosx` routing, Shared quorum,
 queues, backend credentials or retained growth. Measure those before choosing
 a tuning change. Do not drop guest disposition verification to save the
 smaller measured fraction.
+
+First bounded tuning pass: the experimental block runner now retains one
+prepared PVM program per worker thread, keyed by exact program bytes; no
+node-wide preparation lock or execution-result cache was added. The same
+physical debug fixture passed in 122.93 seconds after this change, versus
+about 135–136 seconds before it (single-run comparison, not a throughput
+benchmark). The optimized fixture passed in 91.59 seconds, versus 101.83
+seconds before the change. These release totals are also single runs, not
+service-throughput or per-request latency evidence. Exact-byte cache-switch,
+block-runner and physical Clerk tests passed. The roughly ten-second fixture
+gain earns keeping this bounded cache, but does not resolve the Shared,
+concurrency or retained-growth gates.
 
 Provisional acceptance envelope (customer confirmation required before sign-off):
 

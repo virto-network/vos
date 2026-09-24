@@ -11,7 +11,20 @@ use crate::agent_sdk::{
     },
     state_tree::{BlockReader, TreeError},
 };
-use vos_pvm::{ExitReason, Gas, refine::Machine, refine_host::RefineContext};
+use vos_pvm::{
+    ExitReason, Gas,
+    refine::{Machine, MemoryModel, PreparedProgram},
+    refine_host::RefineContext,
+};
+
+// One exact prepared program per executing thread. The cache is only a parse
+// optimization: admission, root checks, gas, and host calls still run for each
+// invocation. It avoids a node-wide lock while bounding retained programs by
+// the number of workers; a different program replaces the old one.
+thread_local! {
+    static PREPARED_BLOCK_PROGRAM: std::cell::RefCell<Option<(Vec<u8>, PreparedProgram)>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum BlockPvmError {
@@ -365,7 +378,7 @@ fn run_block_program(
     mut fetch: impl FnMut(u64, &mut Machine) -> Result<(), BlockPvmError>,
 ) -> Result<Vec<u8>, BlockPvmError> {
     let mut failure = None;
-    let invocation = RefineContext::load(program, input, gas)
+    let invocation = load_block_context(program, input, gas)
         .map_err(|_| BlockPvmError::Load)?
         .run_with_host(|id, machine| match fetch(id, machine) {
             Ok(()) => Ok(()),
@@ -386,6 +399,31 @@ fn run_block_program(
     invocation
         .output_bounded(max_output)
         .ok_or(BlockPvmError::Output)
+}
+
+fn load_block_context(
+    program: &[u8],
+    input: &[u8],
+    gas: Gas,
+) -> Result<RefineContext, vos_pvm::refine::RefineError> {
+    if program.len() > super::execution::MAX_EXECUTION_PROGRAM_BYTES {
+        return RefineContext::load(program, input, gas);
+    }
+    PREPARED_BLOCK_PROGRAM.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot
+            .as_ref()
+            .is_none_or(|(cached, _)| cached.as_slice() != program)
+        {
+            *slot = Some((program.to_vec(), PreparedProgram::new(program)?));
+        }
+        RefineContext::load_prepared(
+            &slot.as_ref().expect("prepared program installed").1,
+            input,
+            gas,
+            MemoryModel::Auto,
+        )
+    })
 }
 
 /// Bounded declared-lane dispatch over one store and one aggregate read budget.
@@ -2087,6 +2125,29 @@ mod tests {
             "released runner must not admit the experimental call"
         );
     }
+
+    #[test]
+    fn prepared_block_program_reuses_only_exact_bytes() {
+        let (one, mut first_reader) = fixture(1, BASE + 32, 20, STATE_BLOCK_FETCH_CALL);
+        let (two, mut second_reader) = fixture(2, BASE + 32, 20, STATE_BLOCK_FETCH_CALL);
+        assert_ne!(one, two);
+        assert_eq!(
+            run(&one, &mut first_reader, 1, 100_000).unwrap(),
+            b"physical block bytes"
+        );
+        assert_eq!(first_reader.calls, 1);
+        assert_eq!(
+            run(&two, &mut second_reader, 2, 100_000).unwrap(),
+            b"physical block bytes"
+        );
+        assert_eq!(second_reader.calls, 2);
+        assert_eq!(
+            run(&one, &mut first_reader, 1, 100_000).unwrap(),
+            b"physical block bytes"
+        );
+        assert_eq!(first_reader.calls, 2);
+    }
+
     #[test]
     fn missing_and_corrupt_blocks_terminate_without_output() {
         let (program, mut reader) = fixture(1, BASE + 32, 20, STATE_BLOCK_FETCH_CALL);
