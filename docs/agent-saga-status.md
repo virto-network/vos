@@ -58,6 +58,15 @@ neither completes batch 1. Subsequent integration stays on
    Production deployment and data cutover still need operator approval; the
    first-release Local fresh-root storage rule above is already approved.
 
+Shared customer workflow remains a structural gate: `space new` currently
+creates a one-node system lineage, while `space up` derives its system Agent
+from the local daemon identity. The released CLI has no ordinary Shared
+Create/Install workflow, and startup still installs unavailable finality for
+ordinary Shared Agents. These must converge on one authenticated three-node
+system lineage before a three-node Clerk claim; isolated Shared fixtures do
+not establish deployability. Keep this within batch 1 rather than adding a
+separate architecture workstream.
+
 Immediate integration seam: the experimental external-state package, physical
 Create, sealed Local genesis, file journal, pinned Invoke/ACK owner, and
 authenticated actor inspection exist. The owner retains its locked slot,
@@ -475,14 +484,31 @@ default `Query` currently cannot publish an external-state replay record
 (`InvalidRecord`).
 The legacy service read mode remains unchanged. Ordered reads add publication
 work, so their service cost belongs in the Clerk load gate. Production backend
-credentials, Shared finality, retained growth and transfer throughput remain
-unqualified.
+Backend credential behavior, Shared finality, retained growth and transfer
+throughput remain unqualified.
 Proof-record and reciprocal voucher-origin behavior on the clean Agent path
 also remain unqualified and must stay out of a first-release claim until
 tested. Next qualify multi-row retained growth and three-node publication,
 then measure service cost. A separate external-state
 default-`Query` design remains deferred; do not infer its support from Clerk's
 explicit ordered reads.
+
+Diagnostic only: the debug-profile physical external-Local fixture measured
+fresh Clerk `create_account` calls at 1.341/1.354 seconds, `apply_transfer`
+at 1.548 seconds and `state_root` at 1.392 seconds. The fail-closed guest
+disposition check took about 0.13–0.16 seconds; publication preparation took
+about 1.09–1.23 seconds for these calls, with block staging and filesystem
+publication generally below 0.1 seconds each. A bootstrap staging outlier
+reached 0.756 seconds. Outer PVM load cost about 0.10–0.11 seconds per call;
+mutation guest execution took about 0.9–1.1 seconds and inspection about
+0.03 seconds. The same physical fixture passed in an optimized `vos` test
+binary in 101.83 seconds end to end, versus about 135–136 seconds in the
+debug test binary. It exercises bootstrap and several lifecycle operations,
+so neither total is a service-throughput result. The optimized result does
+not explain per-call cost or include released `vosx` routing, Shared quorum,
+queues, backend credentials or retained growth. Measure those before choosing
+a tuning change. Do not drop guest disposition verification to save the
+smaller measured fraction.
 
 Provisional acceptance envelope (customer confirmation required before sign-off):
 

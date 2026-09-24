@@ -1,5 +1,5 @@
-//! Experimental physical block-fetch boundary. No production driver selects
-//! this runner yet. The owner must authenticate the program/root snapshot and
+//! Feature-gated physical block-fetch boundary used by the external-Local
+//! owner. The owner must authenticate the program/root snapshot and
 //! the guest must traverse/verify references from that root. Host verification
 //! below is defense in depth, not permission to omit guest verification.
 

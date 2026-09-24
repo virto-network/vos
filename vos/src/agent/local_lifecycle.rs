@@ -1207,7 +1207,6 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
             + super::clean_authority_issuer::CleanExternalLocalPendingInstallStore,
         S: CleanManagementReceiptSigner,
     {
-        use super::clean_bootstrap::RawCredentialVerifier;
         use super::external_local_executor::{
             ExternalLocalCreateArchive, external_local_create_intent_hash,
         };

@@ -33,9 +33,9 @@
 //! reads in O(1) from six per-field root rows instead of an O(N log N)
 //! rebuild. This does not by itself bound host/runtime work by the touched
 //! set: the released image lane still materializes rows and enforces aggregate
-//! row and byte limits. The opt-in Agent build has a physical external-Local
-//! read and note-commitment checkpoint, but transfer/root parity through that
-//! runtime and released Shared execution remain unqualified. The auxiliary
+//! row and byte limits. The opt-in Agent build has physical external-Local
+//! transfer/root and note-commitment fixtures; released Shared execution and
+//! retained-growth qualification remain open. The auxiliary
 //! collections below use plain storage:
 //!
 //! - `journal`: one-entry committed map (the journal sub-SMT);
