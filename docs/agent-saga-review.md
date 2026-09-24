@@ -46,9 +46,11 @@ The legacy Clerk suite passed 13 tests, the Agent suite 14, and `vos-macros`
 passed 23. Both Clerk PVM builds and canonical package admission passed. The
 physical external-Local fixture passed with Clerk and separately with its
 original synthetic package. The default non-experimental `vos` library check,
-formatting and diff checks passed. Artifact IDs from this development build
-are not release pins. The full prototype/workspace and outer-PVM gates were
-not rerun for this checkpoint.
+formatting and diff checks passed. `just test-agent-state-prototype` also
+passed on this checkpoint, covering SDK, replay, physical PVM, journal-store
+and feature-disabled groups. Offline/locked `cargo check -p vosx --tests` and
+workspace formatting also passed. Artifact IDs from this development build
+are not release pins. The full workspace and outer-PVM gates were not rerun.
 
 Not covered: public external-state Install ingress, production credential-role
 grants, transfer execution and kernel-root parity, three-node Shared lifecycle,

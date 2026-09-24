@@ -1631,9 +1631,11 @@ backup or long-running retention tests.
   publicly routed actor Invoke/ACK, transfer/root parity, and three-node
   Shared remain batch-1 gates. No production deployment is claimed.
 - The focused Clerk checks are in the review guide. The complete
-  `just test-agent-state-prototype` gate last passed at `e3335407`, before
-  this Clerk checkpoint; it and final release-binary/workspace qualification
-  have not been rerun on the new code.
+  `just test-agent-state-prototype` gate passed on the Clerk checkpoint,
+  including SDK, replay, physical PVM, journal-store and feature-disabled
+  groups. Offline/locked `cargo check -p vosx --tests` and workspace
+  formatting passed. Final release-binary/workspace qualification remains
+  open.
 - Review read-only and apply findings on the implementation branch to avoid
   conflicting fixes.
 - Historical bounded-state checkpoint gate passed at
