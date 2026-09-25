@@ -10,9 +10,9 @@ to expand these batches.
 Supported target: Linux, a fixed authenticated three-node deployment with
 replicated system Authority/Catalog and ordinary Shared Agents, plus production
 image-based Local Agents. One hot Shared Clerk ledger provides accounts,
-transfers, reads,
-authorization and idempotent retries. Preserve its existing kernel, signatures
-and committed roots; do not create a second ledger implementation. Customer
+transfers, reads, authorization and idempotent retries. Preserve its existing
+kernel, signatures and committed roots; do not create a second ledger
+implementation. Customer
 backend credentials use normal VOS roles, without foreclosing later direct
 self-custodial clients. Both Local and Shared require durable recovery and
 backup. Human-friendly create/install/invoke commands must preserve exact
@@ -74,6 +74,11 @@ not establish deployability. Keep this within batch 1 rather than adding a
 separate architecture workstream. The current Shared host still selects the
 image-oriented file driver, not the bounded external-state executor; Local
 Clerk parity alone cannot establish 100,000-transfer Shared capacity. The
+external replay executor currently admits only Local descriptors, while the
+Shared journal driver stores and reconstructs a concrete
+`StandardLocalReplayExecutor`. Shared Clerk therefore needs an explicit
+replay/executor cutover with the same authenticated publication and recovery
+rules, not a package-manifest or CLI-only switch. Keep this inside batch 1.
 system bootstrap currently requires exactly one voter, and the Shared host
 rejects `ChangeReplicas`; three-node system placement therefore needs a real
 bootstrap/placement cutover, not merely a CLI wrapper around existing calls.
@@ -140,6 +145,16 @@ journal. These are debug-profile physical tests, not released-binary evidence.
 A fat-LTO release-test build timed out after 20 minutes during linking, before
 test execution; release-profile qualification and its build-time cost remain
 open. No public Shared Create ingress uses this recovery path yet.
+The older retired/unfinished mixed Shared fixture still requires the explicit
+bundled outer-PVM mode: its default native-shortcut run fails during genesis
+endorsement before recovery. It is now explicitly ignored by default rather
+than masquerading as ordinary suite coverage; full physical qualification of
+that case remains a release gate.
+A file-backed regression now passes the same signed pre-archive reservation
+through `vosx` joint startup discovery. It checks that the lifecycle and
+committee leases remain owned, no archive is minted, and exact retry can
+reopen the stores after that controller is dropped. It does not execute the
+production owner or make the pending Create routable.
 Shared first-Create recovery order: (1) stage the signed call's exact runtime
 and selected roster before pledging the intent (internal path exists); (2)
 discover only safe unpledged candidates without creating extra phase files

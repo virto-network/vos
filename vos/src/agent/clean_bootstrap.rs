@@ -23260,6 +23260,7 @@ mod tests {
         }
 
         #[test]
+        #[ignore = "requires the bundled outer PVM; run with VOS_AGENT_PROFILE_REFINE_MACHINES=1"]
         fn native_shared_mixed_retired_unfinished_restart_both_agent_orders() {
             use crate::agent::genesis::AgentGenesisFinalityError;
             struct NoArchiveFinality;

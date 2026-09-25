@@ -5719,6 +5719,23 @@ pub(crate) mod tests {
         assert_eq!(entries.len(), 1);
         assert!(entries[0].archive.is_none());
         drop(entries);
+        // Use the exact daemon startup discovery path, not only the archive
+        // factory helper. A signed pre-archive Create must retain both leases
+        // without minting an archive or becoming a completed generation.
+        let controller = discover_shared_genesis_startup(&staged.parent, authority, 1)
+            .unwrap()
+            .unwrap();
+        assert!(!controller.is_recovered());
+        assert!(matches!(
+            staged_lifecycle.open_existing(authority.space, descriptor.identity.agent),
+            Err(CleanFileStoreError::Busy)
+        ));
+        assert!(matches!(
+            staged_committee.open_existing(locator),
+            Err(CleanFileStoreError::Busy)
+        ));
+        assert!(staged_archives.discover(1).unwrap().is_empty());
+        drop(controller);
         let (staged_intent, staged_issuer) = staged_lifecycle
             .open_existing(authority.space, descriptor.identity.agent)
             .unwrap();
