@@ -11509,18 +11509,21 @@ mod tests {
             harness.stop();
         }
 
-        #[test]
-        fn native_shared_unissued_create_restarts_without_exposing_a_route() {
+        fn check_native_shared_unissued_create_restarts(endorse: bool) {
             use crate::agent::genesis::AgentReplicaMember;
 
-            struct NoArchive;
+            struct NoArchive(bool);
             impl crate::agent::genesis_archive::AgentGenesisArchiveStore for NoArchive {
                 type Error = ();
                 fn load(
                     &self,
                     _: crate::agent::genesis::AgentGenesisLocator,
                 ) -> Result<Option<Vec<u8>>, ()> {
-                    panic!("an unissued Create has no archive lease")
+                    if self.0 {
+                        Ok(None)
+                    } else {
+                        panic!("an unissued Create has no archive lease")
+                    }
                 }
                 fn insert_if_absent(
                     &self,
@@ -11531,11 +11534,18 @@ mod tests {
                 }
             }
 
-            let mut harness = NativeProjectionOwnerHarness::new("shared-unissued-restart");
+            let mut harness = if endorse {
+                NativeProjectionOwnerHarness::with_real_bootstrap(
+                    "shared-unissued-endorsement",
+                    native_bundled_authority_fixture(),
+                )
+            } else {
+                NativeProjectionOwnerHarness::new("shared-unissued-restart")
+            };
             let owner = harness.owner.take().unwrap();
             let target = owner.authority_target();
             let before = owner.ordered_index_for_test().unwrap();
-            let runtime = shape_only_runtime();
+            let runtime = test_runtime_package(endorse);
             let mut descriptor = owner.pins.descriptor.clone();
             descriptor.creation_nonce = Hash([0xd3; 32]);
             descriptor.identity.agent = AgentId::derive(
@@ -11571,6 +11581,10 @@ mod tests {
             let request = ManagementRequest::Create(Box::new(descriptor.clone()));
             let key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
             let (mut call, _) = credential_call_and_approval(&descriptor, &request, &key);
+            if endorse {
+                // Real bootstrap already consumed sequence one for Catalog.
+                call.request_sequence = NonZeroU64::new(2).unwrap();
+            }
             call.authority = target;
             call.invocation = call.expected_invocation();
             call.signature = key.sign(&call.signing_bytes()).to_bytes();
@@ -11597,9 +11611,11 @@ mod tests {
             )
             .unwrap();
             let retained_intent = intent_store.image.lock().unwrap().clone();
-            let mut controller =
-                NativeSharedGenesisController::new(target, vec![(recovery, None::<NoArchive>)])
-                    .unwrap();
+            let mut controller = NativeSharedGenesisController::new(
+                target,
+                vec![(recovery, endorse.then_some(NoArchive(true)))],
+            )
+            .unwrap();
             let pins = owner._pins_store.clone();
             let record = owner.record_store.clone();
             let issuer = owner.issuer.into_store();
@@ -11642,9 +11658,68 @@ mod tests {
             assert_eq!(owner.ordered_index_for_test().unwrap(), before);
             assert_eq!(*intent_store.image.lock().unwrap(), retained_intent);
             assert_eq!(signer.calls, 0);
+            if endorse {
+                struct GenesisSigner(SigningKey);
+                impl super::super::genesis_issuance::GenesisClaimSigner for GenesisSigner {
+                    type Error = ();
+                    fn public_key(&self) -> [u8; 32] {
+                        self.0.verifying_key().to_bytes()
+                    }
+                    fn sign_genesis_claim(&mut self, message: &[u8; 32]) -> Result<[u8; 64], ()> {
+                        Ok(self.0.sign(message).to_bytes())
+                    }
+                }
+                let mut genesis_signer =
+                    GenesisSigner(SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]));
+                let mut signature_store = IssuerMemoryStore::default();
+                let (candidate, committee, signature) = controller
+                    .endorse_pending_create(
+                        &mut owner,
+                        locator,
+                        &mut signer,
+                        &mut signature_store,
+                        &mut genesis_signer,
+                    )
+                    .unwrap();
+                assert_eq!(candidate.proposal().locator(), locator);
+                assert_eq!(committee.members().len(), 1);
+                assert_eq!(signature.signer(), committee.members()[0].signer());
+                let endorsed_index = owner.ordered_index_for_test().unwrap();
+                let receipt_signatures = signer.calls;
+                let retained_signature = signature_store.image.lock().unwrap().clone();
+                let (retried, retried_committee, retried_signature) = controller
+                    .endorse_pending_create(
+                        &mut owner,
+                        locator,
+                        &mut signer,
+                        &mut signature_store,
+                        &mut genesis_signer,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    (retried, retried_committee, retried_signature),
+                    (candidate, committee, signature)
+                );
+                assert_eq!(owner.ordered_index_for_test().unwrap(), endorsed_index);
+                assert_eq!(signer.calls, receipt_signatures);
+                assert_eq!(*signature_store.image.lock().unwrap(), retained_signature);
+                assert!(owner.ordinary_supervisor_generations().unwrap().is_empty());
+                assert_eq!(owner.host.lock().unwrap().len(), 1);
+            }
             drop(controller);
             drop(owner);
             harness.stop();
+        }
+
+        #[test]
+        fn native_shared_unissued_create_restarts_without_exposing_a_route() {
+            check_native_shared_unissued_create_restarts(false);
+        }
+
+        #[test]
+        #[ignore = "requires the bundled outer PVM; run with VOS_AGENT_PROFILE_REFINE_MACHINES=1"]
+        fn native_shared_unissued_create_endorses_after_restart_without_route() {
+            check_native_shared_unissued_create_restarts(true);
         }
 
         fn check_shared_system_bootstrap(use_controller: u8) {

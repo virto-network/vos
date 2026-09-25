@@ -64,6 +64,69 @@ where
         self.recovered
     }
 
+    /// Resume one signed, pre-archive Create through the retained lifecycle
+    /// leases. The replica roster is re-admitted from its immutable sidecar;
+    /// caller input cannot replace it after restart. An endorsement is only
+    /// one committee signature, not publication, finality or route exposure.
+    pub(crate) fn endorse_pending_create<B, C, D, S, SignStore, K>(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<B, C, D>,
+        locator: super::super::genesis::AgentGenesisLocator,
+        receipt_signer: &mut S,
+        signature_store: &mut SignStore,
+        genesis_signer: &mut K,
+    ) -> Result<
+        (
+            AuthorizedSharedGenesisProposal,
+            super::super::committee::AuthorityCommittee,
+            super::super::committee::AuthoritySignature,
+        ),
+        SharedAgentHostError,
+    >
+    where
+        B: CleanSystemAgentBootstrapStore + Send + 'static,
+        C: CleanSystemAgentBootstrapStore + Send + 'static,
+        D: CleanManagementIssuerStore + Send + 'static,
+        S: CleanManagementReceiptSigner,
+        SignStore: CleanManagementIssuerStore,
+        K: super::genesis_issuance::GenesisClaimSigner,
+    {
+        if !self.recovered || owner.authority_target() != self.authority {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let (recovery, archive) = self
+            .entries
+            .iter_mut()
+            .find(|(recovery, _)| recovery.locator == locator)
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        if recovery.retired {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        if archive
+            .as_ref()
+            .map(|store| {
+                store
+                    .load(locator)
+                    .map_err(|_| SharedAgentHostError::Unavailable)
+            })
+            .transpose()?
+            .flatten()
+            .is_some()
+        {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let replicas = recovery
+            .retained_replicas()?
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        owner.endorse_recovered_shared_genesis(
+            recovery,
+            &replicas,
+            receipt_signer,
+            signature_store,
+            genesis_signer,
+        )
+    }
+
     /// Borrow every store until bootstrap has admitted its retained work.
     pub fn startup_admission<'a>(
         &'a mut self,

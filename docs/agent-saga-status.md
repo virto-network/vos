@@ -134,9 +134,15 @@ staging/retry test covers that boundary. The older fixture reservation still
 permits an absent roster; no public Create ingress uses the new path yet.
 Startup can now retain a signed pre-archive Create with no Authority work,
 issuer receipt or retirement when its exact runtime and replica roster are
-present. It does not advance or route that generation; completing its quorum
-signatures and archive remains a live-Create gate. A missing archive after any
-later phase still fails closed.
+present. An internal controller operation can now re-admit that retained roster
+and obtain one durable Authority genesis endorsement after startup. A bundled-
+outer-PVM restart regression passes the first endorsement and exact retry
+without a second journal append, receipt signature or route exposure. This is
+not quorum finality, archive publication or public Create ingress. A crash
+after endorsement but before quorum archive publication currently fails
+startup closed: the retained authorization/query reservations require
+phase-aware recovery without blocking already published generations. Do not
+wire this internal operation to production ingress until that gap is closed.
 The focused startup and incomplete-archive tests pass. Two separately run,
 explicit bundled-outer-PVM regressions pass for both Agent-ID orderings of a
 retired A plus unissued B: A reopens through a fresh Authority read and serves
@@ -158,8 +164,10 @@ production owner or make the pending Create routable.
 Shared first-Create recovery order: (1) stage the signed call's exact runtime
 and selected roster before pledging the intent (internal path exists); (2)
 discover only safe unpledged candidates without creating extra phase files
-(file path exists); (3) resume a signed pre-archive Create from those durable
-inputs and quorum signatures while keeping its route absent; (4) verify
+(file path exists); (3) collect quorum endorsements and publish the archived
+genesis from those durable inputs while keeping its route absent (one retained
+endorsement now works internally, but the post-endorsement/pre-archive crash
+phase does not yet reopen); (4) verify
 publication, application ACK, retirement and route exposure through the
 existing owner. An incomplete
 Create must not make already published generations unrecoverable.
