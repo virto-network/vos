@@ -7695,6 +7695,7 @@ mod tests {
             shared_replicas: Arc<Mutex<Option<Vec<u8>>>>,
             actor: Arc<Mutex<Option<Vec<u8>>>>,
             external_create_archive: Arc<Mutex<Option<Vec<u8>>>>,
+            fail_archive_once: Arc<std::sync::atomic::AtomicBool>,
             #[cfg(feature = "experimental-state-blocks")]
             external_pending_install: Arc<Mutex<Option<Vec<u8>>>>,
             actor_failure: Arc<AtomicUsize>,
@@ -7739,6 +7740,9 @@ mod tests {
             }
 
             fn commit_external_create_archive(&mut self, bytes: &[u8]) -> Result<(), MemoryError> {
+                if self.fail_archive_once.swap(false, Ordering::AcqRel) {
+                    return Err(MemoryError);
+                }
                 let mut archive = self.external_create_archive.lock().unwrap();
                 if archive.as_ref().is_some_and(|saved| saved != bytes) {
                     return Err(MemoryError);
@@ -16612,6 +16616,41 @@ mod tests {
         #[test]
         #[ignore = "requires experimental standard and Authority guests"]
         fn native_external_local_create_finalizes_and_retries() {
+            check_external_local_create(ExternalCreateCheck::Full);
+        }
+
+        #[cfg(feature = "experimental-state-blocks")]
+        #[test]
+        #[ignore = "requires experimental standard and Authority guests"]
+        fn native_external_local_archive_failure_recovers_after_restart() {
+            check_external_local_create(ExternalCreateCheck::ArchiveCrash);
+        }
+
+        #[cfg(feature = "experimental-state-blocks")]
+        #[test]
+        #[ignore = "requires experimental standard and Authority guests"]
+        fn native_external_local_denied_create_consumes_restart_capacity() {
+            check_external_local_create(ExternalCreateCheck::DeniedCapacity);
+        }
+
+        #[cfg(feature = "experimental-state-blocks")]
+        #[test]
+        #[ignore = "requires experimental standard and Authority guests"]
+        fn native_external_local_staged_create_consumes_restart_capacity() {
+            check_external_local_create(ExternalCreateCheck::StagedCapacity);
+        }
+
+        #[cfg(feature = "experimental-state-blocks")]
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum ExternalCreateCheck {
+            Full,
+            ArchiveCrash,
+            DeniedCapacity,
+            StagedCapacity,
+        }
+
+        #[cfg(feature = "experimental-state-blocks")]
+        fn check_external_local_create(check: ExternalCreateCheck) {
             use crate::agent::ExternalLocalJournalDirectory;
             use crate::agent::clean_management_intent::{
                 CleanManagementIntent, CleanManagementIntentSlot,
@@ -16622,6 +16661,7 @@ mod tests {
             use crate::agent::sdk::state_blocks::ReadBudget;
 
             struct ExternalStores {
+                fresh_opens: Arc<AtomicUsize>,
                 space: SpaceId,
                 agent: AgentId,
                 intent: IssuerMemoryStore,
@@ -16681,6 +16721,7 @@ mod tests {
                         && space == self.space
                         && agent == *fresh
                     {
+                        self.fresh_opens.fetch_add(1, Ordering::SeqCst);
                         return Ok((intent.clone(), issuer.clone()));
                     }
                     self.open_existing(space, agent)
@@ -16808,6 +16849,154 @@ mod tests {
             .unwrap();
             let intent_store = IssuerMemoryStore::default();
             let issuer_store = IssuerMemoryStore::default();
+            if matches!(
+                check,
+                ExternalCreateCheck::DeniedCapacity | ExternalCreateCheck::StagedCapacity
+            ) {
+                use crate::agent::local_lifecycle::NativeLocalLifecycle as _;
+                let denied = check == ExternalCreateCheck::DeniedCapacity;
+                let mut primary_call = call.clone();
+                if denied {
+                    primary_call.request_sequence = NonZeroU64::new(2).unwrap();
+                    primary_call.invocation = primary_call.expected_invocation();
+                    primary_call.signature = credential_key
+                        .sign(&primary_call.signing_bytes())
+                        .to_bytes();
+                } else {
+                    let mut staged = CleanManagementIntentSlot::open(intent_store.clone()).unwrap();
+                    let intent = CleanManagementIntent::new(
+                        call.authority,
+                        call.managed,
+                        request.clone(),
+                        call.clone(),
+                        &RawCredentialVerifier,
+                    )
+                    .unwrap();
+                    staged
+                        .stage_external_create_runtime(&intent, &runtime)
+                        .unwrap();
+                }
+                let mut other = descriptor.clone();
+                other.creation_nonce = Hash([0x39; 32]);
+                other.identity.agent = AgentId::derive(
+                    other.identity.space,
+                    other.identity.owner,
+                    other.creation_nonce.as_bytes(),
+                );
+                let other_request = ManagementRequest::Create(Box::new(other.clone()));
+                let (mut other_call, _) =
+                    credential_call_and_approval(&other, &other_request, &credential_key);
+                other_call.authority = call.authority;
+                other_call.invocation = other_call.expected_invocation();
+                other_call.signature = credential_key.sign(&other_call.signing_bytes()).to_bytes();
+                let fresh_opens = Arc::new(AtomicUsize::new(0));
+                let other_intent = IssuerMemoryStore::default();
+                let mut stores = ExternalStores {
+                    fresh_opens: fresh_opens.clone(),
+                    space: descriptor.identity.space,
+                    agent: descriptor.identity.agent,
+                    intent: intent_store.clone(),
+                    issuer: issuer_store.clone(),
+                    fresh: Some((
+                        other.identity.agent,
+                        other_intent.clone(),
+                        IssuerMemoryStore::default(),
+                    )),
+                };
+                let authority = owner.authority_target();
+                let node = owner.pins.node;
+                let mut recovery =
+                    discover_local_lifecycle_recovery(&mut stores, authority, 1).unwrap();
+                recovery.discard_unpledged_external_staging().unwrap();
+                assert!(recovery.entries.is_empty());
+                let mut controller = crate::agent::local_lifecycle::LocalLifecycleController::with_external_recovery(
+                    harness.owner.take().unwrap(), directory, stores, CountingSigner::new(), recovery,
+                    harness.fixture.trust.clone(), 1, &mut ReadBudget::new(10_000, 10_000_000),
+                ).unwrap();
+                for attempt in 0..2 {
+                    assert_eq!(controller.local_agents().unwrap(), Some(vec![]));
+                    if denied {
+                        assert!(matches!(
+                            controller.create_external(
+                                crate::agent::local_lifecycle::LocalStateCreateSubmission::new(
+                                    descriptor.clone(),
+                                    primary_call.clone(),
+                                    runtime.exact_bytes(),
+                                )
+                                .unwrap(),
+                                &mut ReadBudget::new(10_000, 10_000_000),
+                            ),
+                            Err(SharedAgentHostError::ScopeMismatch)
+                        ));
+                        assert!(
+                            CleanManagementIntentSlot::open(intent_store.clone())
+                                .unwrap()
+                                .denial_complete()
+                                .unwrap()
+                        );
+                    }
+                    let before = controller.ordered_index_for_test().unwrap();
+                    assert!(matches!(
+                        controller.create_external(
+                            crate::agent::local_lifecycle::LocalStateCreateSubmission::new(
+                                other.clone(),
+                                other_call.clone(),
+                                runtime.exact_bytes(),
+                            )
+                            .unwrap(),
+                            &mut ReadBudget::new(10_000, 10_000_000),
+                        ),
+                        Err(SharedAgentHostError::CapacityExhausted)
+                    ));
+                    assert_eq!(
+                        fresh_opens.load(Ordering::SeqCst),
+                        0,
+                        "capacity must reject before opening a new lifecycle directory"
+                    );
+                    assert!(other_intent.image.lock().unwrap().is_none());
+                    assert!(other_intent.runtime.lock().unwrap().is_none());
+                    assert_eq!(controller.ordered_index_for_test().unwrap(), before);
+                    if attempt == 1 {
+                        let retried = controller.create_external(
+                            crate::agent::local_lifecycle::LocalStateCreateSubmission::new(
+                                descriptor.clone(),
+                                primary_call.clone(),
+                                runtime.exact_bytes(),
+                            )
+                            .unwrap(),
+                            &mut ReadBudget::new(10_000, 10_000_000),
+                        );
+                        if denied {
+                            assert!(matches!(retried, Err(SharedAgentHostError::ScopeMismatch)));
+                            assert_eq!(controller.ordered_index_for_test().unwrap(), before);
+                        } else {
+                            assert_eq!(retried.unwrap().0, descriptor.identity.agent);
+                        }
+                        break;
+                    }
+                    let (system, directory, mut stores, signer) =
+                        controller.into_external_parts_for_test();
+                    drop(directory);
+                    let directory = ExternalLocalJournalDirectory::open_existing(
+                        root.clone(),
+                        crate::service::SpaceId(descriptor.identity.space.0),
+                        crate::service::NodeId(node.0),
+                    )
+                    .unwrap();
+                    let mut recovery =
+                        discover_local_lifecycle_recovery(&mut stores, authority, 1).unwrap();
+                    assert_eq!(recovery.entries.len(), 1);
+                    recovery.discard_unpledged_external_staging().unwrap();
+                    assert_eq!(recovery.entries.len(), usize::from(denied));
+                    controller = crate::agent::local_lifecycle::LocalLifecycleController::with_external_recovery(
+                        system, directory, stores, signer, recovery,
+                        harness.fixture.trust.clone(), 1, &mut ReadBudget::new(10_000, 10_000_000),
+                    ).unwrap();
+                }
+                drop(controller);
+                harness.stop();
+                return;
+            }
             let mut retained_intent =
                 CleanManagementIntentSlot::open(intent_store.clone()).unwrap();
             let mut retained_issuer = DurableCleanManagementIssuer::open(
@@ -16828,9 +17017,15 @@ mod tests {
                 .unwrap()
             };
             let mut signer = CountingSigner::new();
-            // Simulate a crash after the actor has consumed the ACK but
-            // before CMI4 retirement releases the pending admission.
-            owner.fail_finalization_once_for_test(7);
+            if check == ExternalCreateCheck::ArchiveCrash {
+                intent_store
+                    .fail_archive_once
+                    .store(true, Ordering::Release);
+            } else {
+                // Simulate a crash after the actor has consumed the ACK but
+                // before CMI4 retirement releases the pending admission.
+                owner.fail_finalization_once_for_test(7);
+            }
             let mut budget = ReadBudget::new(10_000, 10_000_000);
             let first_intent = create_intent();
             let first_runtime = runtime.clone();
@@ -16867,6 +17062,177 @@ mod tests {
                 Err(SharedAgentHostError::Unavailable)
             ));
 
+            if check == ExternalCreateCheck::ArchiveCrash {
+                use crate::agent::external_local_executor::{
+                    ExternalLocalJournalOwner, RetainedExternalLocalCreate,
+                    external_local_create_intent_hash,
+                };
+                use crate::agent::local_lifecycle::NativeLocalLifecycle as _;
+
+                drop(retained_intent);
+                drop(retained_issuer);
+                assert!(
+                    intent_store
+                        .external_create_archive
+                        .lock()
+                        .unwrap()
+                        .is_none()
+                );
+                let mut probe = CleanManagementIntentSlot::open(intent_store.clone()).unwrap();
+                assert!(!probe.retirement_complete().unwrap());
+                let issuer = DurableCleanManagementIssuer::open(
+                    issuer_store.clone(),
+                    descriptor.authority,
+                    descriptor.identity.space,
+                    descriptor.identity.agent,
+                )
+                .unwrap();
+                let (receipt, acknowledgement) = issuer
+                    .recover_finalized_application(
+                        owner.authority_target(),
+                        call.managed,
+                        &request,
+                        &call,
+                        &RawCredentialVerifier,
+                    )
+                    .unwrap()
+                    .expect("archive failure must follow durable issuer finality");
+                let prepared = RetainedExternalLocalCreate::prepare(
+                    &mut probe,
+                    owner.authority_target(),
+                    &receipt,
+                    owner.pins.node,
+                )
+                .unwrap();
+                let physical = directory
+                    .acquire_existing(
+                        crate::service::AgentId(descriptor.identity.agent.0),
+                        external_local_create_intent_hash(probe.intent().unwrap()),
+                    )
+                    .unwrap();
+                let physical = ExternalLocalJournalOwner::open(
+                    physical,
+                    prepared.into_parts().0,
+                    &mut ReadBudget::new(10_000, 10_000_000),
+                )
+                .unwrap();
+                let original_head = physical.materialization().unwrap().heads().clone();
+                physical
+                    .verify_finalized_create_ack(&acknowledgement)
+                    .unwrap();
+                drop(physical);
+                drop(probe);
+                drop(issuer);
+                drop(directory);
+
+                let old = harness.owner.take().unwrap();
+                let authority = old.authority_target();
+                let node = old.pins.node;
+                let pins = old._pins_store;
+                let record = old.record_store;
+                let system_issuer = old.issuer.into_store();
+                drop(old._network_host);
+                drop(old.host);
+                let directory = ExternalLocalJournalDirectory::open_existing(
+                    root,
+                    crate::service::SpaceId(descriptor.identity.space.0),
+                    crate::service::NodeId(node.0),
+                )
+                .unwrap();
+                let mut stores = ExternalStores {
+                    fresh_opens: Arc::default(),
+                    space: descriptor.identity.space,
+                    agent: descriptor.identity.agent,
+                    intent: intent_store.clone(),
+                    issuer: issuer_store.clone(),
+                    fresh: None,
+                };
+                let mut recovery =
+                    discover_local_lifecycle_recovery(&mut stores, authority, 1).unwrap();
+                assert!(matches!(
+                    recovery.external_finalized_startup_owners(
+                        &directory,
+                        node,
+                        1,
+                        &mut ReadBudget::new(10_000, 10_000_000),
+                    ),
+                    Err(SharedAgentHostError::Conflict)
+                ));
+                let admission = recovery.startup_admission().unwrap();
+                let system =
+                    CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
+                        pins,
+                        record,
+                        system_issuer,
+                        &mut signer,
+                        || panic!("archive recovery cannot bootstrap a new system"),
+                        harness._directory.host(),
+                        harness._directory.lock(),
+                        descriptor.identity.space,
+                        node,
+                        harness.fixture.trust.clone(),
+                        harness.fixture.merge.clone(),
+                        harness.fixture.finality.clone(),
+                        harness.provider.clone(),
+                        harness.network.clone(),
+                        Some(&admission),
+                        None,
+                    )
+                    .unwrap();
+                let mut controller = crate::agent::local_lifecycle::LocalLifecycleController::with_external_recovery(
+                    system, directory, stores, signer, recovery,
+                    harness.fixture.trust.clone(), 1, &mut ReadBudget::new(10_000, 10_000_000),
+                ).unwrap();
+                assert_eq!(
+                    controller.local_agents().unwrap(),
+                    Some(vec![descriptor.identity.agent])
+                );
+                assert_eq!(
+                    controller
+                        .create_external(
+                            crate::agent::local_lifecycle::LocalStateCreateSubmission::new(
+                                descriptor.clone(),
+                                call.clone(),
+                                runtime.exact_bytes(),
+                            )
+                            .unwrap(),
+                            &mut ReadBudget::new(10_000, 10_000_000),
+                        )
+                        .unwrap(),
+                    (descriptor.identity.agent, acknowledgement)
+                );
+                let (system, directory, mut stores, _) = controller.into_external_parts_for_test();
+                let mut recovery =
+                    discover_local_lifecycle_recovery(&mut stores, authority, 1).unwrap();
+                assert!(recovery.entries[0].intent.retirement_complete().unwrap());
+                let owners = recovery
+                    .external_finalized_startup_owners(
+                        &directory,
+                        node,
+                        1,
+                        &mut ReadBudget::new(10_000, 10_000_000),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    owners[&descriptor.identity.agent]
+                        .materialization()
+                        .unwrap()
+                        .heads(),
+                    &original_head
+                );
+                drop(owners);
+                // After retirement an absent archive remains corruption.
+                intent_store.external_create_archive.lock().unwrap().take();
+                assert!(matches!(
+                    recovery.external_startup_inventory(&directory, node, 1),
+                    Err(SharedAgentHostError::ScopeMismatch)
+                ));
+                drop(recovery);
+                drop(system);
+                harness.stop();
+                return;
+            }
+
             // Saved authorization already requires the original stable
             // lock, even before finalization retirement has completed.
             let lock = std::fs::read_dir(&root)
@@ -16899,6 +17265,7 @@ mod tests {
             // Startup matches every physical candidate against the separate
             // signed lifecycle store before deciding which format to recover.
             let mut stores = ExternalStores {
+                fresh_opens: Arc::default(),
                 space: descriptor.identity.space,
                 agent: descriptor.identity.agent,
                 intent: intent_store.clone(),
@@ -16921,10 +17288,13 @@ mod tests {
                 vec![descriptor.identity.agent]
             );
             let saved_archive = intent_store.external_create_archive.lock().unwrap().take();
-            assert!(matches!(
-                recovery.external_startup_inventory(&directory, owner.pins.node, 1),
-                Err(SharedAgentHostError::ScopeMismatch)
-            ));
+            assert_eq!(
+                recovery
+                    .external_startup_inventory(&directory, owner.pins.node, 1)
+                    .unwrap(),
+                vec![descriptor.identity.agent],
+                "unretired finality must reach authenticated archive reconstruction",
+            );
             *intent_store.external_create_archive.lock().unwrap() = saved_archive;
             assert!(matches!(
                 recovery.external_finalized_startup_owners(
@@ -17292,6 +17662,7 @@ mod tests {
             // A crash before the handoff keeps the retired Create routable
             // and preserves the exact future LIQ1 for its signed retry.
             let mut pre_handoff_stores = ExternalStores {
+                fresh_opens: Arc::default(),
                 space: descriptor.identity.space,
                 agent: descriptor.identity.agent,
                 intent: intent_store.clone(),
@@ -17345,6 +17716,7 @@ mod tests {
             assert!(intent_store.actor.lock().unwrap().is_none());
             drop(install_slot);
             let mut post_install_stores = ExternalStores {
+                fresh_opens: Arc::default(),
                 space: descriptor.identity.space,
                 agent: descriptor.identity.agent,
                 intent: intent_store.clone(),
@@ -17998,6 +18370,7 @@ mod tests {
                 .acquire(orphan, crate::service::Hash([0x66; 32]))
                 .unwrap();
             let mut orphan_stores = ExternalStores {
+                fresh_opens: Arc::default(),
                 space: descriptor.identity.space,
                 agent: descriptor.identity.agent,
                 intent: intent_store.clone(),
@@ -18067,6 +18440,7 @@ mod tests {
             assert!(staged_slot.intent().is_none());
             drop(staged_slot);
             let mut controller_stores = ExternalStores {
+                fresh_opens: Arc::default(),
                 space: descriptor.identity.space,
                 agent: descriptor.identity.agent,
                 intent: intent_store.clone(),

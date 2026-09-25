@@ -745,8 +745,10 @@ pub trait LocalLifecycleStoreFactory {
     type Issuer: CleanManagementIssuerStore;
     type Error;
 
-    /// Discover existing per-Agent store candidates before routes or lifecycle
-    /// writers start. Return a sorted, unique, bounded list; never truncate.
+    /// Discover existing per-Agent store candidates for startup or admission
+    /// capacity checks. Return a sorted, unique, bounded list; never truncate.
+    /// Existing stores may remain leased: discovery must not open their
+    /// images, acquire their leases or create new candidates.
     /// Names are not authority or evidence of pending work. The caller must
     /// open and independently verify every candidate's intent/issuer images.
     fn discover(&mut self, space: SpaceId, maximum: usize) -> Result<Vec<AgentId>, Self::Error>;
@@ -977,7 +979,11 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
                     if authorized && !has_slot {
                         return Err(SharedAgentHostError::ScopeMismatch);
                     }
-                    if (retired || entry.finalized.is_some()) && !denied && archived.is_none() {
+                    // Issuer finality precedes archive persistence. An
+                    // unretired Create must reach authenticated recovery,
+                    // which reopens its original generation and rebuilds the
+                    // archive before retirement or route attachment.
+                    if retired && !denied && archived.is_none() {
                         return Err(SharedAgentHostError::ScopeMismatch);
                     }
                 }
@@ -2692,7 +2698,21 @@ where
                 if owners.contains_key(&agent) {
                     return Err(SharedAgentHostError::ScopeMismatch);
                 }
-                if owners.len() >= *maximum {
+                // Startup bounds every durable lifecycle directory, including
+                // denied attempts and unpledged staging discarded from the
+                // recovery worklist. Use that same inventory before creating
+                // another store; existing staged requests can still retry at
+                // capacity. This scan is confined to lifecycle admission.
+                let discovered = self
+                    .stores
+                    .discover(target.space, *maximum)
+                    .map_err(|_| SharedAgentHostError::Unavailable)?;
+                if discovered.len() > *maximum
+                    || discovered.windows(2).any(|pair| pair[0] >= pair[1])
+                {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                if !discovered.contains(&agent) && discovered.len() >= *maximum {
                     return Err(SharedAgentHostError::CapacityExhausted);
                 }
                 let stores = self

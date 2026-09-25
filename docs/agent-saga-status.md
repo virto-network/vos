@@ -227,8 +227,23 @@ only; a missing lock fails without minting a replacement.
 The pinned directory can now discover bounded lock-only and exposed slot
 candidates, rejecting malformed names, orphan generations and limit overflow.
 The startup recovery model matches those candidates against independently
-verified lifecycle stores and now rejects a missing stable lock after saved
-authorization or a missing immutable Create archive after finality/Install.
+verified lifecycle stores and rejects a missing stable lock after saved
+authorization or a missing immutable Create archive after retirement/Install.
+Issuer finality precedes archive persistence: an unretired finalized Create
+may reach authenticated recovery, which reopens its original generation,
+verifies its signed acknowledgement and reconstructs the archive before
+retirement or route attachment. The review's archive-write crash regression
+now drops the system and physical owners, rediscovers lifecycle state and
+recovers through `with_external_recovery`; the original journal head and ACK
+are preserved. Missing archives after retirement still fail closed.
+External Create admission now counts the complete durable lifecycle inventory,
+including denied and unpledged staged entries, using the same bound as startup.
+Existing entries can retry at capacity. Physical regressions at a limit of one
+cover denied and staged reservations across controller recovery and reject a
+distinct Create before its store is opened. These address both findings in
+`target/agent-review-25b28631.OIszbA/REVIEW.md`; the four focused physical tests
+and 16 filesystem lifecycle tests pass. Lifecycle fault injection uses retained
+memory stores and real physical journals, not a released-daemon crash harness.
 It can reopen archived generations under their original locked physical
 journals while retaining the lifecycle leases. Discovery and physical reopen
 are not route authority: controller integration must still verify system
