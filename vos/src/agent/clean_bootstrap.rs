@@ -11509,6 +11509,144 @@ mod tests {
             harness.stop();
         }
 
+        #[test]
+        fn native_shared_unissued_create_restarts_without_exposing_a_route() {
+            use crate::agent::genesis::AgentReplicaMember;
+
+            struct NoArchive;
+            impl crate::agent::genesis_archive::AgentGenesisArchiveStore for NoArchive {
+                type Error = ();
+                fn load(
+                    &self,
+                    _: crate::agent::genesis::AgentGenesisLocator,
+                ) -> Result<Option<Vec<u8>>, ()> {
+                    panic!("an unissued Create has no archive lease")
+                }
+                fn insert_if_absent(
+                    &self,
+                    _: crate::agent::genesis::AgentGenesisLocator,
+                    _: &[u8],
+                ) -> Result<(), ()> {
+                    panic!("startup cannot publish an archive")
+                }
+            }
+
+            let mut harness = NativeProjectionOwnerHarness::new("shared-unissued-restart");
+            let owner = harness.owner.take().unwrap();
+            let target = owner.authority_target();
+            let before = owner.ordered_index_for_test().unwrap();
+            let runtime = shape_only_runtime();
+            let mut descriptor = owner.pins.descriptor.clone();
+            descriptor.creation_nonce = Hash([0xd3; 32]);
+            descriptor.identity.agent = AgentId::derive(
+                descriptor.identity.space,
+                descriptor.identity.owner,
+                descriptor.creation_nonce.as_bytes(),
+            );
+            descriptor.identity.runtime_deployment = runtime.deployment();
+            descriptor.identity.runtime_program = runtime.program();
+            descriptor.identity.runtime_producer = runtime.producer();
+            descriptor.runtime_package = runtime.package_ref().clone();
+            descriptor.runtime_contract = runtime.manifest().contract;
+            descriptor.capabilities = runtime.capabilities();
+            descriptor.replicas[0].principal = descriptor.identity.owner;
+            let original = &owner.pins.replicas.members()[0];
+            let mut replica = original.replica();
+            replica.principal = crate::service::PrincipalId(descriptor.identity.owner.0);
+            let member = AgentReplicaMember::new(
+                replica,
+                original.peer_id().to_vec(),
+                *original.ed25519_public_key(),
+                original.raft_slot(),
+            )
+            .unwrap();
+            let replicas = AgentReplicaCommittee::new(
+                crate::service::SpaceId(descriptor.identity.space.0),
+                HostAgentId(descriptor.identity.agent.0),
+                crate::agent::AgentProfile::Shared,
+                vec![member],
+            )
+            .unwrap();
+            replicas.validate_for_clean_descriptor(&descriptor).unwrap();
+            let request = ManagementRequest::Create(Box::new(descriptor.clone()));
+            let key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
+            let (mut call, _) = credential_call_and_approval(&descriptor, &request, &key);
+            call.authority = target;
+            call.invocation = call.expected_invocation();
+            call.signature = key.sign(&call.signing_bytes()).to_bytes();
+            let locator = crate::agent::genesis::AgentGenesisLocator {
+                space: crate::service::SpaceId(descriptor.identity.space.0),
+                agent: HostAgentId(descriptor.identity.agent.0),
+            };
+            let intent_store = IssuerMemoryStore::default();
+            let recovery = NativeSharedGenesisRecovery::reserve_create_with_replicas(
+                target,
+                locator,
+                descriptor,
+                call,
+                runtime,
+                replicas,
+                (
+                    intent_store.clone(),
+                    IssuerMemoryStore::default(),
+                    IssuerMemoryStore::default(),
+                    IssuerMemoryStore::default(),
+                    IssuerMemoryStore::default(),
+                    IssuerMemoryStore::default(),
+                ),
+            )
+            .unwrap();
+            let retained_intent = intent_store.image.lock().unwrap().clone();
+            let mut controller =
+                NativeSharedGenesisController::new(target, vec![(recovery, None::<NoArchive>)])
+                    .unwrap();
+            let pins = owner._pins_store.clone();
+            let record = owner.record_store.clone();
+            let issuer = owner.issuer.into_store();
+            drop(owner._network_host);
+            drop(owner.host);
+            let mut operations = OperationTestJournal(harness._directory.0.clone());
+            let admission =
+                NativeAuthorityOperationStartupAdmission::load(&mut operations, target, &[])
+                    .unwrap();
+            let admission = controller.startup_admission(admission).unwrap();
+            let mut owner =
+                CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
+                    pins,
+                    record,
+                    issuer,
+                    &mut CountingSigner::new(),
+                    || panic!("restart must not recreate bootstrap"),
+                    harness._directory.host(),
+                    harness._directory.lock(),
+                    harness.fixture.plan.pins.space,
+                    harness.fixture.plan.pins.node,
+                    harness.fixture.trust.clone(),
+                    harness.fixture.merge.clone(),
+                    harness.fixture.finality.clone(),
+                    harness.provider.clone(),
+                    harness.network.clone(),
+                    None,
+                    Some(&admission),
+                )
+                .unwrap();
+            drop(admission);
+            assert!(owner.host.lock().unwrap().has_deferred_open());
+            assert!(owner.host.lock().unwrap().deferred_agent_ids().is_empty());
+            let mut signer = CountingSigner::new();
+            controller.recover(&mut owner, &mut signer).unwrap();
+            assert!(controller.is_recovered());
+            assert!(!owner.host.lock().unwrap().has_deferred_open());
+            assert_eq!(owner.host.lock().unwrap().len(), 1);
+            assert!(owner.ordinary_supervisor_generations().unwrap().is_empty());
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+            assert_eq!(*intent_store.image.lock().unwrap(), retained_intent);
+            assert_eq!(signer.calls, 0);
+            drop(controller);
+            drop(owner);
+            harness.stop();
+        }
+
         fn check_shared_system_bootstrap(use_controller: u8) {
             struct NoArchive;
             impl crate::agent::genesis_archive::AgentGenesisArchiveStore for NoArchive {
@@ -23325,6 +23463,216 @@ mod tests {
                     "mixed Shared: retired-first={retired_first}, both actor Invoke/ACK pairs passed"
                 );
             }
+        }
+
+        fn check_native_shared_mixed_retired_unissued_restart(retired_first: bool) {
+            use crate::agent::genesis::{AgentGenesisFinalityError, AgentReplicaMember};
+
+            struct NoArchiveFinality;
+            impl AgentGenesisFinalityVerifier for NoArchiveFinality {
+                fn verify_finalized(
+                    &self,
+                    _: &crate::agent::genesis::AgentGenesisProvision,
+                ) -> Result<(), AgentGenesisFinalityError> {
+                    Err(AgentGenesisFinalityError::NotFinalized)
+                }
+            }
+            eprintln!("mixed unissued: retired-first={retired_first}, bootstrap");
+            let mut fixture = native_bundled_authority_fixture();
+            fixture.finality = Arc::new(NoArchiveFinality);
+            let mut harness = NativeProjectionOwnerHarness::with_real_bootstrap(
+                "mixed-retired-unissued",
+                fixture,
+            );
+            let owner = harness.owner.as_mut().unwrap();
+            let runtime = test_runtime_package(true);
+            let mut descriptors: Vec<_> = [0xe1, 0xe2]
+                .into_iter()
+                .map(|nonce| {
+                    let mut descriptor = owner.pins.descriptor.clone();
+                    descriptor.creation_nonce = Hash([nonce; 32]);
+                    descriptor.identity.agent = AgentId::derive(
+                        descriptor.identity.space,
+                        descriptor.identity.owner,
+                        descriptor.creation_nonce.as_bytes(),
+                    );
+                    descriptor.identity.runtime_deployment = runtime.deployment();
+                    descriptor.identity.runtime_program = runtime.program();
+                    descriptor.identity.runtime_producer = runtime.producer();
+                    descriptor.runtime_package = runtime.package_ref().clone();
+                    descriptor.runtime_contract = runtime.manifest().contract;
+                    descriptor.capabilities = runtime.capabilities();
+                    descriptor.replicas[0].principal = descriptor.identity.owner;
+                    descriptor.validate().unwrap();
+                    descriptor
+                })
+                .collect();
+            descriptors.sort_by_key(|descriptor| descriptor.identity.agent);
+            if !retired_first {
+                descriptors.reverse();
+            }
+            let (mut retired, retired_archive, retired_issuer, _) =
+                publish_mixed_shared(owner, descriptors[0].clone(), &runtime, 2);
+            eprintln!("mixed unissued: retired-first={retired_first}, published A");
+            for (anchor, work) in retired.pending.iter().skip(1).take(2) {
+                owner
+                    ._network_host
+                    .finish_pending_management_result(
+                        HostAgentId(owner.pins.agent.0),
+                        anchor,
+                        work,
+                        false,
+                        || Ok(()),
+                    )
+                    .unwrap();
+            }
+            owner
+                .finish_shared_genesis_application(&mut retired, &mut CountingSigner::new(), None)
+                .unwrap();
+            let retired = reopen_mixed_shared(retired);
+            assert!(retired.retired);
+            harness
+                .fixture
+                .logical_slot
+                .as_ref()
+                .unwrap()
+                .fetch_add(1, Ordering::AcqRel);
+
+            let original = &owner.pins.replicas.members()[0];
+            let mut replica = original.replica();
+            replica.principal = crate::service::PrincipalId(descriptors[1].identity.owner.0);
+            let member = AgentReplicaMember::new(
+                replica,
+                original.peer_id().to_vec(),
+                *original.ed25519_public_key(),
+                original.raft_slot(),
+            )
+            .unwrap();
+            let replicas = AgentReplicaCommittee::new(
+                crate::service::SpaceId(descriptors[1].identity.space.0),
+                HostAgentId(descriptors[1].identity.agent.0),
+                crate::agent::AgentProfile::Shared,
+                vec![member],
+            )
+            .unwrap();
+            let request = ManagementRequest::Create(Box::new(descriptors[1].clone()));
+            let key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
+            let (mut call, _) = credential_call_and_approval(&descriptors[1], &request, &key);
+            call.request_sequence = NonZeroU64::new(3).unwrap();
+            call.authority = owner.authority_target();
+            call.invocation = call.expected_invocation();
+            call.signature = key.sign(&call.signing_bytes()).to_bytes();
+            let intent_store = IssuerMemoryStore::default();
+            let unissued = NativeSharedGenesisRecovery::reserve_create_with_replicas(
+                owner.authority_target(),
+                crate::agent::genesis::AgentGenesisLocator {
+                    space: crate::service::SpaceId(descriptors[1].identity.space.0),
+                    agent: HostAgentId(descriptors[1].identity.agent.0),
+                },
+                descriptors[1].clone(),
+                call,
+                runtime.clone(),
+                replicas,
+                (
+                    intent_store.clone(),
+                    IssuerMemoryStore::default(),
+                    IssuerMemoryStore::default(),
+                    IssuerMemoryStore::default(),
+                    IssuerMemoryStore::default(),
+                    IssuerMemoryStore::default(),
+                ),
+            )
+            .unwrap();
+            assert!(unissued.pending.is_empty());
+            assert!(unissued.issued.is_none());
+            assert_eq!(
+                retired.locator().agent < unissued.locator().agent,
+                retired_first
+            );
+            let retained_intent = intent_store.image.lock().unwrap().clone();
+            let target = owner.authority_target();
+            let mut controller = NativeSharedGenesisController::new(
+                target,
+                vec![(retired, Some(retired_archive)), (unissued, None)],
+            )
+            .unwrap();
+            let owner = harness.owner.take().unwrap();
+            let pins = owner._pins_store.clone();
+            let record = owner.record_store.clone();
+            let issuer = owner.issuer.into_store();
+            drop(owner._network_host);
+            drop(owner.host);
+            let mut operations = OperationTestJournal(harness._directory.0.clone());
+            let admission =
+                NativeAuthorityOperationStartupAdmission::load(&mut operations, target, &[])
+                    .unwrap();
+            let admission = controller.startup_admission(admission).unwrap();
+            let mut owner = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
+                            pins,
+                            record,
+                            issuer,
+                            &mut CountingSigner::new(),
+                            || panic!("must not bootstrap over mixed history"),
+                            harness._directory.host(),
+                            harness._directory.lock(),
+                            harness.fixture.plan.pins.space,
+                            harness.fixture.plan.pins.node,
+                            harness.fixture.trust.clone(),
+                            harness.fixture.merge.clone(),
+                            harness.fixture.finality.clone(),
+                            harness.provider.clone(),
+                            harness.network.clone(),
+                            None,
+                            Some(&admission),
+                        )
+                        .unwrap()
+                    })
+                    .join()
+                    .unwrap()
+            });
+            drop(admission);
+            assert!(owner.host.lock().unwrap().has_deferred_open());
+            let before = owner.ordered_index_for_test().unwrap();
+            controller
+                .recover(&mut owner, &mut CountingSigner::new())
+                .unwrap();
+            eprintln!("mixed unissued: retired-first={retired_first}, recovered A");
+            assert!(controller.is_recovered());
+            assert!(!owner.host.lock().unwrap().has_deferred_open());
+            assert_eq!(owner.host.lock().unwrap().len(), 2);
+            assert_eq!(*intent_store.image.lock().unwrap(), retained_intent);
+            // A mandatory fresh Authority Query/ACK opens retired A;
+            // unissued B cannot advance the journal.
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
+            let generations = owner.ordinary_supervisor_generations().unwrap();
+            assert_eq!(generations.len(), 1);
+            assert_eq!(generations[0].agent(), descriptors[0].identity.agent);
+            serve_mixed_shared(
+                &mut owner,
+                &descriptors[0],
+                &retired_issuer,
+                harness.fixture.logical_slot.as_ref().unwrap(),
+                3,
+            );
+            eprintln!("mixed unissued: retired-first={retired_first}, A Invoke/ACK passed");
+            drop(controller);
+            harness.owner = Some(owner);
+            harness.stop();
+        }
+
+        #[test]
+        #[ignore = "requires the bundled outer PVM; run with VOS_AGENT_PROFILE_REFINE_MACHINES=1"]
+        fn native_shared_mixed_retired_unissued_restart_retired_first() {
+            check_native_shared_mixed_retired_unissued_restart(true);
+        }
+
+        #[test]
+        #[ignore = "requires the bundled outer PVM; run with VOS_AGENT_PROFILE_REFINE_MACHINES=1"]
+        fn native_shared_mixed_retired_unissued_restart_unissued_first() {
+            check_native_shared_mixed_retired_unissued_restart(false);
         }
 
         #[test]

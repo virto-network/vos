@@ -9,7 +9,8 @@ to expand these batches.
 
 Supported target: Linux, a fixed authenticated three-node deployment with
 replicated system Authority/Catalog and ordinary Shared Agents, plus production
-Local Agents. One hot Shared Clerk ledger provides accounts, transfers, reads,
+image-based Local Agents. One hot Shared Clerk ledger provides accounts,
+transfers, reads,
 authorization and idempotent retries. Preserve its existing kernel, signatures
 and committed roots; do not create a second ledger implementation. Customer
 backend credentials use normal VOS roles, without foreclosing later direct
@@ -17,14 +18,17 @@ self-custodial clients. Both Local and Shared require durable recovery and
 backup. Human-friendly create/install/invoke commands must preserve exact
 protocol requests and resumability.
 
-Approved first-release Local storage selection: a new external-state Local
-deployment uses fresh dedicated journal and lifecycle roots for its Space/Node;
-existing image-based Local deployments keep their current path. Do not migrate
-an image root in place or silently interpret mixed formats. Mixed-format
-migration is deferred, not a release gate. An external deployment still must
-recover every pending lifecycle generation before its first route is published.
-The external format is never inferred from the image root's contents; startup
-must select the two paths explicitly.
+Approved first-release Local cutover: production Local remains image-based.
+Public external-state Local Create/Install/Invoke ingress is deferred, not a
+customer-release gate. The experimental external-state Local path remains
+available for physical storage and Clerk qualification, but is not presented
+as a supported deployment. Any future external-state Local deployment must
+use fresh dedicated journal and lifecycle roots for its Space/Node; existing
+image-based Local deployments keep their current path. Do not migrate an
+image root in place or silently interpret mixed formats. Mixed-format
+migration is deferred. An external deployment still must recover every pending
+lifecycle generation before its first route is published. Startup must select
+the two paths explicitly, never infer the format from image-root contents.
 
 Three release-work batches remain. The code through `9a003d58` includes the
 bounded-state slice and opt-in Clerk external-Local transfer/root checkpoint;
@@ -57,7 +61,8 @@ neither completes batch 1. Subsequent integration stays on
    Finish artifact reproduction, full outer-PVM mixed recovery, workspace/CLI
    regressions, formatting and targeted lint before the final reviewed merge.
    Production deployment and data cutover still need operator approval; the
-   first-release Local fresh-root storage rule above is already approved.
+   image-Local first-release boundary and future fresh-root rule above are
+   already approved.
 
 Shared customer workflow remains a structural gate: `space new` currently
 creates a one-node system lineage, while `space up` derives its system Agent
@@ -122,7 +127,19 @@ pledging a signed Create, and startup discovery verifies and skips a safe
 unpledged candidate without creating a committee/query slot. A file-backed
 staging/retry test covers that boundary. The older fixture reservation still
 permits an absent roster; no public Create ingress uses the new path yet.
-Startup still cannot resume a signed pre-archive Create or publish its route.
+Startup can now retain a signed pre-archive Create with no Authority work,
+issuer receipt or retirement when its exact runtime and replica roster are
+present. It does not advance or route that generation; completing its quorum
+signatures and archive remains a live-Create gate. A missing archive after any
+later phase still fails closed.
+The focused startup and incomplete-archive tests pass. Two separately run,
+explicit bundled-outer-PVM regressions pass for both Agent-ID orderings of a
+retired A plus unissued B: A reopens through a fresh Authority read and serves
+actor Install/Invoke/ACK, while B remains unroutable and does not advance the
+journal. These are debug-profile physical tests, not released-binary evidence.
+A fat-LTO release-test build timed out after 20 minutes during linking, before
+test execution; release-profile qualification and its build-time cost remain
+open. No public Shared Create ingress uses this recovery path yet.
 Shared first-Create recovery order: (1) stage the signed call's exact runtime
 and selected roster before pledging the intent (internal path exists); (2)
 discover only safe unpledged candidates without creating extra phase files
@@ -280,9 +297,10 @@ not terminalize an already Authority-approved intent; the separate terminal
 rejection path below does so only within the physical journal, issuer and
 Authority actor. Keep external Install ingress disabled until file-backed
 daemon recovery and response-loss handling are qualified.
-Release-scope decision pending: whether first-customer external-state Local
-must expose Install, or may retain image Local Install and defer external
-Install. The approved fresh-root rule is independent of this Install decision.
+First-customer public Local Install stays on the image path. The external-state
+Install work below is retained as an experimental implementation, but its
+public ingress and release qualification are deferred. The approved future
+fresh-root rule is independent of this Install decision.
 An internal opt-in journal path now publishes a rejected Install's exact
 guest result as an authenticated Ordered transition, instead of discarding
 the preflight result. Rejected management work may advance runtime control
@@ -406,11 +424,11 @@ routed retry, performance or outer-PVM qualification.
 Only the opt-in startup selects this owner; the default binary and lifecycle
 queue do not. The caller must choose Space/Node storage roots independently
 and attach a route only after authenticated finalization. Unretired Create
-checks its
-saved authorization anchor against the pinned system journal before physical
-recovery; startup must restore its pending/retirement admission first. Keep
-the image Local path active until Install, publicly routed Invoke/ACK retry,
-near-3-MiB ACK recovery and final artifact qualification pass. The external
+checks its saved authorization anchor against the pinned system journal before
+physical recovery; startup must restore its pending/retirement admission first.
+Image Local remains the supported v1 path. External Local public ingress and
+its Install, routed retry, near-ceiling ACK and artifact qualification are
+deferred cutover work, not prerequisites to shipping image Local. The external
 replay adapter covers signed
 Create, Install, Invoke, Resume and ACK without decoding private runtime state,
 subject to the Resume/yield gates above.
@@ -444,8 +462,9 @@ LCQ2 Local runtime package. The provisional package ceilings are 500,000 rows
 and 512 MiB logical row bytes per lane; these are explicit signed limits, not
 measured service capacity. A source/revision-pinned release bundle remains
 required.
-The Local Create CLI now selects LCQ1 for image Spaces and LCQ2 for fresh
-external Spaces before reserving a request. Its retained file stores verify
+The opt-in Local Create CLI selects LCQ1 for image Spaces and LCQ2 for fresh
+experimental external Spaces before reserving a request. Its retained file
+stores verify
 either exact type, denial and ACK, while checking that the persisted type still
 matches the selected storage mode. Image-format Install continues to reject
 external Spaces before reserving a credential; external Install is not wired.
@@ -536,13 +555,13 @@ reconciliation for this exact released-profile call before selecting a tuning
 pass; the earlier Create trace already implicates synchronous control-plane
 composition.
 
-External Local cutover TODOs, in order: (1) decide whether public external
-Install belongs in this release; the internal retained-lease handoff, exact
-retry, guest rejection and restart cases have physical fixtures, but public
-Install ingress is still closed; (2) qualify publicly routed Invoke/ACK and
-Resume through the locked owner, including response-loss retry after restart
-without an image-host fallback; (3) qualify near-ceiling ACK, candidate
-artifact identities and released-binary behavior.
+Deferred external Local cutover TODOs, in order: (1) qualify public Install
+through retained leases, signed terminal failure and response-loss recovery;
+(2) qualify publicly routed Invoke/ACK and Resume through the locked owner,
+including response-loss retry after restart without an image-host fallback;
+(3) qualify near-ceiling ACK, candidate artifact identities and released-binary
+behavior. These are not first-customer release gates while production Local
+remains image-based.
 The image `with_recovery` still assumes an image host; the separate external
 startup path retains locked journal owners. Do not enable external mode in the
 default binary or present this experimental ingress as a supported customer

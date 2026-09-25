@@ -2,17 +2,14 @@
 
 use super::genesis_issuance::RetainedCommitteeQuery;
 use super::*;
-use crate::agent::clean_authority_issuer::{
-    CleanExternalLocalCreateArchiveStore as _, CleanManagementActorStore as _,
-    CleanManagementRuntimeStore as _, CleanSharedGenesisReplicaStore as _,
-};
 use crate::agent::clean_management_intent::{
     CleanManagementIntent, CleanManagementIntentSlot, ManagementJournalAnchor,
 };
 
 /// Owns the complete discovered reservation set and its archive leases through
 /// recovery and serving. Construction validates ownership scope, not finality.
-/// Missing archives are retained as incomplete work, never silently filtered.
+/// Only a signed, unissued Create with bound runtime and replicas may lack an
+/// archive; it stays retained and unroutable. Later missing archives fail closed.
 pub struct NativeSharedGenesisController<I, J: CleanManagementIssuerStore, Q, R, W, P, A> {
     authority: AuthorityActorTarget,
     entries: Vec<(NativeSharedGenesisRecovery<I, J, Q, R, W, P>, Option<A>)>,
@@ -23,7 +20,7 @@ impl<I, J, Q, R, W, P, A> NativeSharedGenesisController<I, J, Q, R, W, P, A>
 where
     I: super::super::clean_authority_issuer::CleanManagementRuntimeStore,
     J: CleanManagementIssuerStore,
-    Q: CleanManagementIssuerStore,
+    Q: super::super::clean_authority_issuer::CleanSharedGenesisReplicaStore,
     R: CleanManagementIssuerStore,
     W: CleanManagementIssuerStore,
     P: CleanManagementIssuerStore,
@@ -89,10 +86,13 @@ where
         })
     }
 
-    /// Re-read all leased archives before replaying any entry. Successful
-    /// recovery requires the owner's exact complete deferred set and independent
-    /// live-history verification; archive signatures alone never grant finality.
-    /// Errors retain all stores for an exact retry or orderly shutdown.
+    /// Re-read all leased archives before replaying any entry. A signed Create
+    /// with no Authority work and no archive is retained as an unroutable
+    /// reservation, provided its runtime and independently selected replicas
+    /// are durable and bound to that Create. Any later incomplete phase still
+    /// fails closed. Published generations require the owner's exact deferred
+    /// set and independent live-history verification; archive signatures alone
+    /// never grant finality. Errors retain all stores for an exact retry.
     pub fn recover<B, C, D, S>(
         &mut self,
         owner: &mut CleanSystemAgentBootstrapOwner<B, C, D>,
@@ -115,26 +115,49 @@ where
             self.recovered = true;
             return Ok(());
         }
-        let records = self.entries.iter().map(|(recovery, archive)| {
-            let archive = archive.as_ref().ok_or(SharedAgentHostError::Unavailable)?;
-            let bytes = archive.load(recovery.locator)
-                .map_err(|_| SharedAgentHostError::Unavailable)?
-                .ok_or(SharedAgentHostError::Unavailable)?;
-            if bytes.len() > super::super::genesis::MAX_AGENT_GENESIS_ARCHIVE_RECORD_BYTES {
-                return Err(SharedAgentHostError::ScopeMismatch);
-            }
-            let record = <super::super::genesis::AgentGenesisArchiveRecord as crate::service::ServiceWire>::decode(&bytes)
-                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-            if record.provision().proposal().locator() != recovery.locator {
-                return Err(SharedAgentHostError::ScopeMismatch);
-            }
-            Ok(record)
-        }).collect::<Result<Vec<_>, _>>()?;
+        let records = self
+            .entries
+            .iter_mut()
+            .map(|(recovery, archive)| {
+                let bytes = archive
+                    .as_ref()
+                    .map(|archive| {
+                        archive
+                            .load(recovery.locator)
+                            .map_err(|_| SharedAgentHostError::Unavailable)
+                    })
+                    .transpose()?
+                    .flatten();
+                let Some(bytes) = bytes else {
+                    // An unissued signed reservation has not touched the
+                    // system journal or created an ordinary generation. Its
+                    // exact retry can resume after startup; it cannot route.
+                    if recovery.retired
+                        || !recovery.pending.is_empty()
+                        || recovery.issued.is_some()
+                        || recovery.runtime.is_none()
+                        || recovery.retained_replicas()?.is_none()
+                    {
+                        return Err(SharedAgentHostError::Unavailable);
+                    }
+                    return Ok(None);
+                };
+                if bytes.len() > super::super::genesis::MAX_AGENT_GENESIS_ARCHIVE_RECORD_BYTES {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                let record = <super::super::genesis::AgentGenesisArchiveRecord as crate::service::ServiceWire>::decode(&bytes)
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                if record.provision().proposal().locator() != recovery.locator {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                Ok(Some(record))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut entries: Vec<_> = self
             .entries
             .iter_mut()
             .zip(&records)
-            .map(|((recovery, _), record)| (recovery, record))
+            .filter_map(|((recovery, _), record)| record.as_ref().map(|record| (recovery, record)))
             .collect();
         owner.recover_deferred_shared_generations(&mut entries, signer)?;
         self.recovered = true;
@@ -218,7 +241,7 @@ impl<
             mut publication,
             mut publication_reply,
         ) = stores;
-        let mut intent = CleanManagementIntentSlot::open(intent_store)
+        let intent = CleanManagementIntentSlot::open(intent_store)
             .map_err(|_| SharedAgentHostError::Unavailable)?;
         let selected = replicas.encode();
         if intent.intent().is_some() {

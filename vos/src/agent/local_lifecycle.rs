@@ -2466,7 +2466,7 @@ where
     S: CleanManagementReceiptSigner,
     B: super::clean_authority_issuer::CleanManagementRuntimeStore + Send,
     J: CleanManagementIssuerStore + Send,
-    Q: CleanManagementIssuerStore + Send,
+    Q: super::clean_authority_issuer::CleanSharedGenesisReplicaStore + Send,
     Reply: CleanManagementIssuerStore + Send,
     W: CleanManagementIssuerStore + Send,
     PubReply: CleanManagementIssuerStore + Send,
@@ -2793,7 +2793,7 @@ where
     where
         B: super::clean_authority_issuer::CleanManagementRuntimeStore + Send + 'static,
         J: CleanManagementIssuerStore + Send + 'static,
-        Q: CleanManagementIssuerStore + Send + 'static,
+        Q: super::clean_authority_issuer::CleanSharedGenesisReplicaStore + Send + 'static,
         Reply: CleanManagementIssuerStore + Send + 'static,
         W: CleanManagementIssuerStore + Send + 'static,
         PubReply: CleanManagementIssuerStore + Send + 'static,
