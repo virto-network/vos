@@ -345,7 +345,69 @@ fn check_shared_file_recovery(with_denial: bool, with_handoff: bool) {
             discover_shared_genesis_startup(&data, authority, 4),
             Err(CleanFileStoreError::Busy)
         ));
-        retained
+        let package = crate::bundled::root_signed_actor_package(
+            crate::bundled::system_catalog_package_template(),
+            SYSTEM_CATALOG_NAME,
+            &operator,
+        )
+        .unwrap();
+        // Preparation validates and retains opaque constructor bytes. It does
+        // not execute this actor or claim a successful constructor result.
+        let install = crate::commands::space::local_install::build_install(
+            agent,
+            vos::agent::sdk::InstallationId([0x81; 32]),
+            Hash([0x82; 32]),
+            "prepared-catalog".into(),
+            None,
+            Some(vec![1]),
+            &package,
+        )
+        .unwrap();
+        let mut install_call = call.clone();
+        install_call.request_sequence = NonZeroU64::new(3).unwrap();
+        install_call.plan = ManagementRequest::Install(Box::new(install.clone()))
+            .authorization_plan()
+            .unwrap();
+        install_call.invocation = install_call.expected_invocation();
+        install_call.signature = sign_exact(&operator, &install_call.signing_bytes()).unwrap();
+        let mut forged = install_call.clone();
+        forged.signature[0] ^= 1;
+        assert_eq!(
+            lifecycle.prepare_shared_install(install.clone(), forged, &package),
+            Err(SharedAgentHostError::ScopeMismatch)
+        );
+        assert_eq!(journal_files(&lifecycle_root), retained);
+        lifecycle
+            .prepare_shared_install(install.clone(), install_call.clone(), &package)
+            .unwrap();
+        let prepared = journal_files(&lifecycle_root);
+        for (name, bytes) in retained {
+            assert_eq!(
+                prepared.get(&name),
+                Some(&bytes),
+                "Install preparation preserves Create and issuer checkpoint"
+            );
+        }
+        assert!(prepared.contains_key(Path::new("shared-management.intent")));
+        assert!(prepared.contains_key(Path::new("shared-management.actor")));
+        lifecycle
+            .prepare_shared_install(install.clone(), install_call.clone(), &package)
+            .unwrap();
+        let mut changed = install.clone();
+        changed.installation_id = vos::agent::sdk::InstallationId([0x83; 32]);
+        let mut changed_call = install_call.clone();
+        changed_call.plan = ManagementRequest::Install(Box::new(changed.clone()))
+            .authorization_plan()
+            .unwrap();
+        changed_call.invocation = changed_call.expected_invocation();
+        changed_call.signature = sign_exact(&operator, &changed_call.signing_bytes()).unwrap();
+        assert_eq!(
+            lifecycle.prepare_shared_install(changed, changed_call, &package),
+            Err(SharedAgentHostError::Conflict)
+        );
+        assert_eq!(journal_files(&lifecycle_root), prepared);
+        assert_eq!(journal_files(&journal), applied);
+        (prepared, install, install_call, package)
     });
     drop(lifecycle);
     if with_handoff {
@@ -356,11 +418,21 @@ fn check_shared_file_recovery(with_denial: bool, with_handoff: bool) {
         assert!(discover_shared_genesis_startup(&data, authority, 4).is_err());
         assert!(!continuation.exists());
         std::fs::rename(saved, continuation).unwrap();
+        // An unissued intent may have persisted before its actor package.
+        std::fs::rename(
+            lifecycle_root.join("shared-management.actor"),
+            scratch.0.join("saved-management-actor"),
+        )
+        .unwrap();
     }
     let (_, mut lifecycle) = open();
-    if let Some(retained) = handoff_files {
-        assert_eq!(journal_files(&lifecycle_root), retained);
+    if let Some((retained, install, install_call, package)) = handoff_files {
+        assert!(!lifecycle_root.join("shared-management.actor").exists());
         lifecycle.initialize_shared_management(locator).unwrap();
+        assert!(!lifecycle_root.join("shared-management.actor").exists());
+        lifecycle
+            .prepare_shared_install(install, install_call, &package)
+            .unwrap();
         assert_eq!(journal_files(&lifecycle_root), retained);
     }
     assert_eq!(

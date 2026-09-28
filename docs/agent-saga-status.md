@@ -369,14 +369,43 @@ run loopback HTTP regression (one fixture-dependent test remains ignored).
 The default/experimental-feature daemon builds and `std`-only core build pass. Logs use
 disk-backed `target/shared-management-controller-*`.
 
+Internal Shared Install preparation now retains a signed, scope-checked request
+and admitted actor package in separate role-bound files under that same lease.
+`prepare_shared_install` verifies signature/package bindings before retaining
+inputs, preserves exact retries and refuses a competing request. It does not
+dispatch Authority, issue a management decision or install the actor. Original
+Create intent and issuer files stay immutable. Borrowed issuer-store handles
+also forward the durable source-freeze check; a regression covers that adapter.
+
+Startup retains an unissued signed Install with the idle issuer, revalidating
+its signed target and any present package. An actor package may be absent at the
+intent-before-package crash boundary; an exact caller retry may fill it only
+before authorization work exists. Orphan inputs without original Create/handoff,
+prepared authorization/finalization work and progressed issuers still fail
+closed. No new runtime reservation is inferred from signed input alone.
+The extended production-owner regression covers forged and conflicting inputs,
+exact preparation retry, restart with the retained intent but missing package,
+and completion of that package write without changing the physical generation.
+The fixture's opaque Catalog constructor bytes are not executed; this is not
+evidence of successful actor installation or constructor validation by a guest.
+The final extended outer-PVM run passes in 176.47 s. Five controller tests,
+18 issuer tests and 78 filesystem tests plus the separate loopback HTTP test
+pass; one fixture-dependent filesystem test remains ignored. Default and
+experimental daemon builds, the `std`-only core build, formatting and diff
+checks pass. Logs use disk-backed `target/shared-install-preparation-*`.
+
 Still required: replace the fixture-only issuer copy with controller-owned
-Install; retain and validate its signed intent and actor package; reuse existing
-issuance, physical application, signed terminal and retirement semantics.
-Recovery must restore pending Install admission before system execution and
-authenticate genesis before reopening the physical target. Keep the idle-only
-startup gate until that recovery exists. Public Shared management remains
-disabled; do not enable ingress from a live-only happy path. This is not yet
-Shared Install, a public customer workflow, three-node or release qualification.
+Install execution. Restore pending authorization/finalization admission before
+system execution, use the pending operation as the startup genesis-read
+predecessor where needed, and authenticate genesis before reopening the physical
+target. Then qualify physical application, signed terminal results and retirement
+under response loss/restart. Keep the unissued-only startup gate until that
+recovery exists. In particular, signed `ManagementApplicationFailure` and the
+issuer's rejection path currently restrict failures to Local Agents; Shared
+constructor failures need an explicitly qualified extension of the SDK/issuer
+and bundled Authority artifact, not a permissive host bypass. Public Shared
+management remains disabled. This is not yet Shared Install, a public customer
+workflow, three-node or release qualification.
 
 Backup quiescence must also cover unserved live generations after reservation
 release: an idle Authority admission alone does not prove all Create routes

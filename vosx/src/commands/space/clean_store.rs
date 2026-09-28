@@ -27,9 +27,9 @@ use vos::agent::bootstrap::MAX_SYSTEM_AGENT_GENESIS_PROVISION_BYTES;
 use vos::agent::clean_authority_issuer::CleanExternalLocalPendingInstallStore;
 use vos::agent::clean_authority_issuer::{
     CleanExternalLocalCreateArchiveStore, CleanManagementActorStore, CleanManagementIssuerStore,
-    CleanManagementRuntimeStore, CleanSharedGenesisReplicaStore, CleanSharedManagementIssuerStore,
-    MAX_CLEAN_EXTERNAL_LOCAL_CREATE_ARCHIVE_BYTES, MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES,
-    MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
+    CleanManagementRuntimeStore, CleanSharedGenesisReplicaStore, CleanSharedManagementIntentStore,
+    CleanSharedManagementIssuerStore, MAX_CLEAN_EXTERNAL_LOCAL_CREATE_ARCHIVE_BYTES,
+    MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES, MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
 };
 use vos::agent::clean_bootstrap::{
     CleanSystemAgentBootstrapStore, MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES,
@@ -121,7 +121,7 @@ const EXTERNAL_LIFECYCLE_ENTRIES: [&str; 13] = [
     LIFECYCLE_PENDING_INSTALL_STAGE_FILE,
 ];
 
-const SHARED_LIFECYCLE_ENTRIES: [&str; 15] = [
+const SHARED_LIFECYCLE_ENTRIES: [&str; 19] = [
     LOCK_FILE,
     INTENT_FILE,
     INTENT_STAGE_FILE,
@@ -137,6 +137,10 @@ const SHARED_LIFECYCLE_ENTRIES: [&str; 15] = [
     "shared-management.issuer.next",
     "shared-management.handoff",
     "shared-management.handoff.next",
+    "shared-management.intent",
+    "shared-management.intent.next",
+    "shared-management.actor",
+    "shared-management.actor.next",
 ];
 
 #[derive(Clone, Copy)]
@@ -279,6 +283,8 @@ enum StoreRole {
     OrdinaryGenesisReplicas = 47,
     SharedManagementIssuer = 48,
     SharedManagementHandoff = 49,
+    SharedManagementIntent = 50,
+    SharedManagementActor = 51,
 }
 
 impl StoreRole {
@@ -292,6 +298,8 @@ impl StoreRole {
             Self::LifecycleIssuer => LIFECYCLE_ISSUER_FILE,
             Self::SharedManagementIssuer => "shared-management.issuer",
             Self::SharedManagementHandoff => "shared-management.handoff",
+            Self::SharedManagementIntent => "shared-management.intent",
+            Self::SharedManagementActor => "shared-management.actor",
             Self::LocalCreateRequest => LOCAL_REQUEST_FILE,
             Self::CredentialQuery => CREDENTIAL_QUERY_FILE,
             Self::CredentialReservation => RESERVATION_FILE,
@@ -346,6 +354,8 @@ impl StoreRole {
             Self::LifecycleIssuer => LIFECYCLE_ISSUER_STAGE_FILE,
             Self::SharedManagementIssuer => "shared-management.issuer.next",
             Self::SharedManagementHandoff => "shared-management.handoff.next",
+            Self::SharedManagementIntent => "shared-management.intent.next",
+            Self::SharedManagementActor => "shared-management.actor.next",
             Self::LocalCreateRequest => LOCAL_REQUEST_STAGE_FILE,
             Self::CredentialQuery => CREDENTIAL_QUERY_STAGE_FILE,
             Self::CredentialReservation => RESERVATION_STAGE_FILE,
@@ -465,6 +475,8 @@ impl StoreRole {
                 MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES
             }
             Self::SharedManagementHandoff => 36,
+            Self::SharedManagementIntent => MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES,
+            Self::SharedManagementActor => MAX_PACKAGE_ENCODED_BYTES,
             Self::LocalCreateRequest => {
                 vos::agent::local_lifecycle::LocalCreateSubmission::MAX_BYTES
             }
@@ -564,6 +576,8 @@ impl StoreRole {
             47 => Some(Self::OrdinaryGenesisReplicas),
             48 => Some(Self::SharedManagementIssuer),
             49 => Some(Self::SharedManagementHandoff),
+            50 => Some(Self::SharedManagementIntent),
+            51 => Some(Self::SharedManagementActor),
             1 => Some(Self::Pins),
             2 => Some(Self::Bootstrap),
             3 => Some(Self::ManagementIssuer),
@@ -1344,6 +1358,10 @@ impl CleanAgentGenesisCommitteeStoreFactory {
         if !authority.is_valid() || authority.space.0 != self.space.0 {
             return Err(CleanFileStoreError::InvalidPath);
         }
+        if matches!(lifecycle.layout, LifecycleLayout::ExternalLocal) {
+            return Err(CleanFileStoreError::InvalidPath);
+        }
+        lifecycle.layout = LifecycleLayout::Shared;
         let agents = lifecycle.discover(authority.space, maximum)?;
         let committees = self.discover(maximum)?;
         // Never silently ignore a query/reply whose owning Create is absent.
@@ -2759,7 +2777,35 @@ impl CleanManagementIssuerStore for CleanManagementIntentFile {
     }
 
     fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
+        if self.0.role == StoreRole::ManagementIntent
+            && self.0.root.allowed_entries == SHARED_LIFECYCLE_ENTRIES
+            && CleanManagementIssuerFile(ExactFileStore::new(
+                Arc::clone(&self.0.root),
+                StoreRole::LifecycleIssuer,
+            ))
+            .issuance_disabled()?
+        {
+            return self.0.commit_with_replacement(image, false);
+        }
         self.0.commit(image)
+    }
+}
+
+impl CleanSharedManagementIntentStore for CleanManagementIntentFile {
+    fn management_intent_continuation(&mut self) -> Result<Self, Self::Error> {
+        if self.0.role != StoreRole::ManagementIntent
+            || self.0.root.allowed_entries != SHARED_LIFECYCLE_ENTRIES
+        {
+            return Err(CleanFileStoreError::InvalidPath);
+        }
+        let root = &self.0.root;
+        Ok(Self(
+            ExactFileStore::new(Arc::clone(root), StoreRole::SharedManagementIntent),
+            ExactFileStore::new(Arc::clone(root), StoreRole::LifecycleRuntime),
+            ExactFileStore::new(Arc::clone(root), StoreRole::SharedManagementActor),
+            ExactFileStore::new(Arc::clone(root), StoreRole::ExternalLocalCreateArchive),
+            ExactFileStore::new(Arc::clone(root), StoreRole::ExternalLocalPendingInstall),
+        ))
     }
 }
 
@@ -2877,7 +2923,13 @@ impl CleanManagementIssuerStore for CleanManagementIssuerFile {
             return Ok(false);
         }
         Ok(self.load_management_handoff()?.is_some()
-            || self.management_continuation()?.load()?.is_some())
+            || self.management_continuation()?.load()?.is_some()
+            || ExactFileStore::new(Arc::clone(&self.0.root), StoreRole::SharedManagementIntent)
+                .load(MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES)?
+                .is_some()
+            || ExactFileStore::new(Arc::clone(&self.0.root), StoreRole::SharedManagementActor)
+                .load(MAX_PACKAGE_ENCODED_BYTES)?
+                .is_some())
     }
 }
 
@@ -5126,6 +5178,61 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn shared_management_intent_files_are_separate_and_keep_the_lease() {
+        let fixture = Fixture::new("shared-management-intent");
+        let (mut original, issuer) =
+            CleanManagementLifecycleFiles::open(&fixture.root, LifecycleLayout::Shared, false)
+                .unwrap()
+                .into_parts();
+        original.commit(b"retired-create").unwrap();
+        let mut pending = original.management_intent_continuation().unwrap();
+        assert!(pending.management_intent_continuation().is_err());
+        stage(&pending.0, None, b"signed-install");
+        stage(&pending.2, None, b"actor-package");
+        assert_eq!(
+            pending.load().unwrap().as_deref(),
+            Some(b"signed-install".as_slice())
+        );
+        assert_eq!(
+            pending.load_actor().unwrap().as_deref(),
+            Some(b"actor-package".as_slice())
+        );
+        assert_eq!(
+            original.load().unwrap().as_deref(),
+            Some(b"retired-create".as_slice())
+        );
+        assert!(original.load_actor().unwrap().is_none());
+        assert!(original.commit(b"replace-create").is_err());
+        drop(original);
+        drop(issuer);
+        assert!(matches!(
+            CleanManagementLifecycleFiles::open(&fixture.root, LifecycleLayout::Shared, true),
+            Err(CleanFileStoreError::Busy)
+        ));
+        drop(pending);
+        let (mut original, _) =
+            CleanManagementLifecycleFiles::open(&fixture.root, LifecycleLayout::Shared, true)
+                .unwrap()
+                .into_parts();
+        let mut pending = original.management_intent_continuation().unwrap();
+        assert_eq!(
+            pending.load().unwrap().as_deref(),
+            Some(b"signed-install".as_slice())
+        );
+        assert_eq!(
+            pending.load_actor().unwrap().as_deref(),
+            Some(b"actor-package".as_slice())
+        );
+        // Role-bound envelopes cannot substitute the actor for signed intent.
+        std::fs::rename(
+            fixture.root.join(StoreRole::SharedManagementActor.file()),
+            fixture.root.join(StoreRole::SharedManagementIntent.file()),
+        )
+        .unwrap();
+        assert!(pending.load().is_err());
+    }
+
+    #[test]
     fn shared_management_handoff_files_preserve_source_and_one_writer_lease() {
         let fixture = Fixture::new("shared-management-handoff");
         let (intent, mut source) =
@@ -5238,23 +5345,30 @@ pub(crate) mod tests {
     #[test]
     fn shared_management_handoff_is_not_silently_ignored_by_startup() {
         use vos::agent::local_lifecycle::LocalLifecycleStoreFactory as _;
-        for marker_only in [false, true] {
+        for phase in 0..4 {
             let fixture = Fixture::new("shared-management-startup-gate");
             let (_, authority, _, _) = super::super::local_create::tests::fixture();
             let mut factory =
                 CleanSharedGenesisStoreFactory::open_or_create(&fixture.parent, authority, 4)
                     .unwrap();
-            let (intent, mut issuer) = factory
+            let (mut intent, mut issuer) = factory
                 .lifecycle
                 .open(authority.space, vos::agent::sdk::AgentId([0x93; 32]))
                 .unwrap();
-            if marker_only {
+            if phase == 0 {
                 let mut marker = b"SMH1".to_vec();
                 marker.extend_from_slice(&[0x94; 32]);
                 issuer.commit_management_handoff(&marker).unwrap();
-            } else {
+            } else if phase == 1 {
                 let continuation = issuer.management_continuation().unwrap();
                 stage(&continuation.0, None, b"unadmitted-continuation");
+            } else {
+                let mut continuation = intent.management_intent_continuation().unwrap();
+                if phase == 2 {
+                    continuation.commit(b"orphan-install").unwrap();
+                } else {
+                    continuation.commit_actor(b"orphan-actor").unwrap();
+                }
             }
             drop(intent);
             drop(issuer);

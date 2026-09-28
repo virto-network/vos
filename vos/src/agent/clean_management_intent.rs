@@ -601,6 +601,18 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
         self.store
     }
 
+    pub(crate) fn management_continuation_store(&mut self) -> Result<B, IntentSlotError<B::Error>>
+    where
+        B: super::clean_authority_issuer::CleanSharedManagementIntentStore,
+    {
+        if self.poisoned {
+            return Err(IntentSlotError::Poisoned);
+        }
+        self.store
+            .management_intent_continuation()
+            .map_err(IntentSlotError::Storage)
+    }
+
     pub(crate) fn load_external_create_archive(
         &mut self,
     ) -> Result<Option<Vec<u8>>, IntentSlotError<B::Error>>

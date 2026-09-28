@@ -104,6 +104,10 @@ impl<B: CleanManagementIssuerStore + ?Sized> CleanManagementIssuerStore for &mut
     fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
         (**self).commit(image)
     }
+
+    fn issuance_disabled(&mut self) -> Result<bool, Self::Error> {
+        (**self).issuance_disabled()
+    }
 }
 
 /// The exact Create runtime is stored independently of the intent image but
@@ -204,6 +208,14 @@ impl<B: CleanManagementRuntimeStore + ?Sized> CleanManagementRuntimeStore for &m
 pub trait CleanManagementActorStore: CleanManagementIssuerStore {
     fn load_actor(&mut self) -> Result<Option<Vec<u8>>, Self::Error>;
     fn commit_actor(&mut self, package: &[u8]) -> Result<(), Self::Error>;
+}
+
+/// One continuing management intent and actor-package slot beside immutable
+/// Shared Create evidence, retaining the same exclusive per-Agent lease.
+pub trait CleanSharedManagementIntentStore:
+    CleanManagementRuntimeStore + CleanManagementActorStore + Sized
+{
+    fn management_intent_continuation(&mut self) -> Result<Self, Self::Error>;
 }
 
 impl<B: CleanManagementActorStore + ?Sized> CleanManagementActorStore for &mut B {
@@ -1270,6 +1282,18 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         self.ensure_live()?;
         self.store
             .issuance_disabled()
+            .map_err(CleanManagementIssuerError::Storage)
+    }
+
+    pub(crate) fn creation_handoff_activated(
+        &mut self,
+    ) -> Result<bool, CleanManagementIssuerError<B::Error>>
+    where
+        B: CleanSharedManagementIssuerStore,
+    {
+        self.store
+            .load_management_handoff()
+            .map(|marker| marker.is_some())
             .map_err(CleanManagementIssuerError::Storage)
     }
 
@@ -3466,6 +3490,21 @@ mod tests {
         assert_ne!(advanced, original);
         drop(continued);
         drop(source);
+        {
+            let mut borrowed = store.clone();
+            let mut reopened = DurableCleanManagementIssuer::open(
+                &mut borrowed,
+                fixture.binding,
+                fixture.space,
+                fixture.agent,
+            )
+            .unwrap();
+            assert!(reopened.creation_continuation_retained().unwrap());
+            let calls = signer.calls;
+            assert!(reopened.issue(&next, &mut signer).is_err());
+            assert_eq!(signer.calls, calls);
+            assert_eq!(store.source.image(), original);
+        }
         let mut source = DurableCleanManagementIssuer::open(
             store.clone(),
             fixture.binding,

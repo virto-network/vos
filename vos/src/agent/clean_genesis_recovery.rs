@@ -390,6 +390,7 @@ where
         C: CleanSystemAgentBootstrapStore + Send + 'static,
         D: CleanManagementIssuerStore + Send + 'static,
         J: super::super::clean_authority_issuer::CleanSharedManagementIssuerStore,
+        I: super::super::clean_authority_issuer::CleanSharedManagementIntentStore,
         S: CleanManagementReceiptSigner,
     {
         self.complete_pending_create(owner, locator, signer)?;
@@ -399,6 +400,71 @@ where
             .find(|(entry, _)| entry.locator == locator)
             .ok_or(SharedAgentHostError::ScopeMismatch)?;
         recovery.initialize_management_issuer()
+    }
+
+    /// Retain validated Install inputs, without dispatching Authority or
+    /// changing the physical generation. Execution and terminal recovery follow.
+    pub fn prepare_install<B, C, D, S>(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<B, C, D>,
+        install: super::super::sdk::InstallActor,
+        call: super::super::sdk::authority::AuthorityCredentialCall,
+        package: &AdmittedActorPackage,
+        signer: &mut S,
+    ) -> Result<(), SharedAgentHostError>
+    where
+        B: CleanSystemAgentBootstrapStore + Send + 'static,
+        C: CleanSystemAgentBootstrapStore + Send + 'static,
+        D: CleanManagementIssuerStore + Send + 'static,
+        I: super::super::clean_authority_issuer::CleanSharedManagementIntentStore,
+        J: super::super::clean_authority_issuer::CleanSharedManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+    {
+        let request = ManagementRequest::Install(Box::new(install));
+        let index = self
+            .entries
+            .iter()
+            .position(|(entry, _)| entry.locator.agent.0 == call.managed.agent.0)
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let (recovery, _) = &self.entries[index];
+        let original = recovery
+            .intent
+            .intent()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let ManagementRequest::Create(descriptor) = original.request() else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        validate_actor_install(descriptor, &request, package)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let intent = CleanManagementIntent::new(
+            self.authority,
+            original.call().managed,
+            request,
+            call,
+            &RawCredentialVerifier,
+        )
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if recovery
+            .management_intent
+            .as_ref()
+            .and_then(|slot| slot.intent())
+            .is_some_and(|retained| {
+                retained.request() != intent.request() || retained.call() != intent.call()
+            })
+        {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let locator = recovery.locator;
+        self.initialize_management(owner, locator, signer)?;
+        let slot = self.entries[index]
+            .0
+            .management_intent
+            .as_mut()
+            .ok_or(SharedAgentHostError::Unavailable)?;
+        slot.pledge(intent)
+            .map_err(|_| SharedAgentHostError::Conflict)?;
+        slot.retain_actor(package)
+            .map_err(|_| SharedAgentHostError::Unavailable)
     }
 
     /// Borrow every store until bootstrap has admitted its retained work.
@@ -562,6 +628,7 @@ pub struct NativeSharedGenesisRecovery<I, J: CleanManagementIssuerStore, Q, R, W
     pub(super) runtime: Option<AdmittedRuntimePackage>,
     pub(super) issuer: DurableCleanManagementIssuer<J>,
     management_issuer: Option<DurableCleanManagementIssuer<J>>,
+    management_intent: Option<CleanManagementIntentSlot<I>>,
     pub(super) issued: Option<AuthorityReceipt>,
     pub(super) admission_valid: bool,
     pub(super) retired: bool,
@@ -577,16 +644,39 @@ impl<
 > NativeSharedGenesisRecovery<I, J, Q, R, W, P>
 {
     /// File discovery retains an existing handoff under the original lease.
-    /// Only a byte-identical, idle Create checkpoint needs no new admission.
+    /// Unissued inputs beside a byte-identical idle issuer need no additional
+    /// runtime-work reservation. Any prepared dispatch still fails closed.
     /// The controller must still authenticate physical genesis before serving.
     fn reopen_management_handoff(&mut self) -> Result<(), SharedAgentHostError>
     where
+        I: super::super::clean_authority_issuer::CleanSharedManagementIntentStore,
         J: super::super::clean_authority_issuer::CleanSharedManagementIssuerStore,
     {
+        let mut candidate = self
+            .intent
+            .management_continuation_store()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let inputs = candidate
+            .load()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .is_some()
+            || candidate
+                .load_actor()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .is_some();
+        if inputs
+            && !self
+                .issuer
+                .creation_handoff_activated()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+        {
+            return Err(SharedAgentHostError::Conflict);
+        }
         if self
             .issuer
             .creation_continuation_retained()
             .map_err(|_| SharedAgentHostError::Unavailable)?
+            || inputs
         {
             self.initialize_management_issuer()?;
         }
@@ -595,6 +685,7 @@ impl<
 
     fn initialize_management_issuer(&mut self) -> Result<(), SharedAgentHostError>
     where
+        I: super::super::clean_authority_issuer::CleanSharedManagementIntentStore,
         J: super::super::clean_authority_issuer::CleanSharedManagementIssuerStore,
     {
         if !self.retired || !self.admission_valid || !self.pending.is_empty() {
@@ -602,6 +693,61 @@ impl<
         }
         if self.management_issuer.is_some() {
             return Ok(());
+        }
+        let mut store = self
+            .intent
+            .management_continuation_store()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let actor = store
+            .load_actor()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let slot = CleanManagementIntentSlot::open(store)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if let Some(pending) = slot.intent() {
+            if !self
+                .issuer
+                .creation_handoff_activated()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                || !matches!(pending.request(), ManagementRequest::Install(_))
+                || slot
+                    .authorization_work()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?
+                    .is_some()
+                || slot
+                    .finalization_work()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?
+                    .is_some()
+                || slot
+                    .retirement_complete()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?
+                || slot
+                    .denial_complete()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?
+            {
+                return Err(SharedAgentHostError::Conflict);
+            }
+            let original = self
+                .intent
+                .intent()
+                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            pending
+                .verify(
+                    self.authority,
+                    original.call().managed,
+                    &RawCredentialVerifier,
+                )
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            let ManagementRequest::Create(descriptor) = original.request() else {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            };
+            if let Some(bytes) = actor {
+                let package = super::super::package_admission::admit_actor_package(&bytes)
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                validate_actor_install(descriptor, pending.request(), &package)
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            }
+        } else if actor.is_some() {
+            return Err(SharedAgentHostError::ScopeMismatch);
         }
         let continuation = self
             .issuer
@@ -613,6 +759,7 @@ impl<
             return Err(SharedAgentHostError::Conflict);
         }
         self.management_issuer = Some(continuation);
+        self.management_intent = Some(slot);
         Ok(())
     }
 
@@ -960,6 +1107,7 @@ impl<
         publication_reply: P,
     ) -> Result<Self, SharedAgentHostError>
     where
+        I: super::super::clean_authority_issuer::CleanSharedManagementIntentStore,
         J: super::super::clean_authority_issuer::CleanSharedManagementIssuerStore,
         Q: super::super::clean_authority_issuer::CleanSharedGenesisReplicaStore,
     {
@@ -1259,6 +1407,7 @@ impl<
             runtime,
             issuer,
             management_issuer: None,
+            management_intent: None,
             issued,
             admission_valid: true,
             retired,

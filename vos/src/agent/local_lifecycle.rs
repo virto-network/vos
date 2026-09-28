@@ -2491,6 +2491,15 @@ where
         signer: &mut S,
     ) -> Result<(), SharedAgentHostError>;
 
+    fn prepare_install(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        install: super::sdk::InstallActor,
+        call: AuthorityCredentialCall,
+        package: &super::package_admission::AdmittedActorPackage,
+        signer: &mut S,
+    ) -> Result<(), SharedAgentHostError>;
+
     fn reserve_create(
         &mut self,
         _: &AgentDescriptor,
@@ -2512,7 +2521,7 @@ where
     R: CleanSystemAgentBootstrapStore + Send + 'static,
     I: CleanManagementIssuerStore + Send + 'static,
     S: CleanManagementReceiptSigner,
-    B: super::clean_authority_issuer::CleanManagementRuntimeStore + Send,
+    B: super::clean_authority_issuer::CleanSharedManagementIntentStore + Send,
     J: super::clean_authority_issuer::CleanSharedManagementIssuerStore + Send,
     Q: super::clean_authority_issuer::CleanSharedGenesisReplicaStore + Send,
     Reply: CleanManagementIssuerStore + Send,
@@ -2579,6 +2588,18 @@ where
         self.0.initialize_management(owner, locator, signer)
     }
 
+    fn prepare_install(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        install: super::sdk::InstallActor,
+        call: AuthorityCredentialCall,
+        package: &super::package_admission::AdmittedActorPackage,
+        signer: &mut S,
+    ) -> Result<(), SharedAgentHostError> {
+        self.0
+            .prepare_install(owner, install, call, package, signer)
+    }
+
     fn reserve_create(
         &mut self,
         descriptor: &AgentDescriptor,
@@ -2600,7 +2621,7 @@ where
     R: CleanSystemAgentBootstrapStore + Send + 'static,
     I: CleanManagementIssuerStore + Send + 'static,
     S: CleanManagementReceiptSigner,
-    B: super::clean_authority_issuer::CleanManagementRuntimeStore + Send,
+    B: super::clean_authority_issuer::CleanSharedManagementIntentStore + Send,
     J: super::clean_authority_issuer::CleanSharedManagementIssuerStore + Send,
     Q: super::clean_authority_issuer::CleanSharedGenesisReplicaStore + Send,
     Reply: CleanManagementIssuerStore + Send,
@@ -2653,6 +2674,19 @@ where
     ) -> Result<(), SharedAgentHostError> {
         super::clean_bootstrap::NativeSharedGenesisController::initialize_management(
             self, owner, locator, signer,
+        )
+    }
+
+    fn prepare_install(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        install: super::sdk::InstallActor,
+        call: AuthorityCredentialCall,
+        package: &super::package_admission::AdmittedActorPackage,
+        signer: &mut S,
+    ) -> Result<(), SharedAgentHostError> {
+        super::clean_bootstrap::NativeSharedGenesisController::prepare_install(
+            self, owner, install, call, package, signer,
         )
     }
 }
@@ -2981,7 +3015,7 @@ where
         >,
     ) -> Result<Self, SharedAgentHostError>
     where
-        B: super::clean_authority_issuer::CleanManagementRuntimeStore + Send + 'static,
+        B: super::clean_authority_issuer::CleanSharedManagementIntentStore + Send + 'static,
         J: super::clean_authority_issuer::CleanSharedManagementIssuerStore + Send + 'static,
         Q: super::clean_authority_issuer::CleanSharedGenesisReplicaStore + Send + 'static,
         Reply: CleanManagementIssuerStore + Send + 'static,
@@ -3010,7 +3044,7 @@ where
         reserve: Factory,
     ) -> Result<Self, SharedAgentHostError>
     where
-        B: super::clean_authority_issuer::CleanManagementRuntimeStore + Send + 'static,
+        B: super::clean_authority_issuer::CleanSharedManagementIntentStore + Send + 'static,
         J: super::clean_authority_issuer::CleanSharedManagementIssuerStore + Send + 'static,
         Q: super::clean_authority_issuer::CleanSharedGenesisReplicaStore + Send + 'static,
         Reply: CleanManagementIssuerStore + Send + 'static,
@@ -3145,6 +3179,24 @@ where
             .as_mut()
             .ok_or(SharedAgentHostError::Conflict)?
             .initialize_management(&mut system, locator, &mut self.signer)
+    }
+
+    /// Retain signed Shared Install inputs without executing Authority or the
+    /// actor. Success is preparation, not an installation acknowledgement.
+    pub fn prepare_shared_install(
+        &mut self,
+        install: super::sdk::InstallActor,
+        call: AuthorityCredentialCall,
+        package: &super::package_admission::AdmittedActorPackage,
+    ) -> Result<(), SharedAgentHostError> {
+        let mut system = self
+            .system
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        self.shared_genesis
+            .as_mut()
+            .ok_or(SharedAgentHostError::Conflict)?
+            .prepare_install(&mut system, install, call, package, &mut self.signer)
     }
 
     /// Adopt the recovered admin stores for the full production-owner lifetime.

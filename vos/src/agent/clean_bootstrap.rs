@@ -8318,6 +8318,8 @@ mod tests {
         struct IssuerMemoryStore {
             image: Arc<Mutex<Option<Vec<u8>>>>,
             management_image: Arc<Mutex<Option<Vec<u8>>>>,
+            management_intent: Arc<Mutex<Option<Vec<u8>>>>,
+            management_actor: Arc<Mutex<Option<Vec<u8>>>>,
             management_handoff: Arc<Mutex<Option<Vec<u8>>>>,
             is_management_continuation: bool,
             runtime: Arc<Mutex<Option<Vec<u8>>>>,
@@ -8330,6 +8332,20 @@ mod tests {
             actor_failure: Arc<AtomicUsize>,
             advance_clock_after_commits: Option<(Arc<AtomicU64>, usize)>,
             fail_retirement_after_commit: Option<Arc<std::sync::atomic::AtomicBool>>,
+        }
+
+        impl crate::agent::clean_authority_issuer::CleanSharedManagementIntentStore for IssuerMemoryStore {
+            fn management_intent_continuation(&mut self) -> Result<Self, MemoryError> {
+                if self.is_management_continuation {
+                    return Err(MemoryError);
+                }
+                Ok(Self {
+                    image: self.management_intent.clone(),
+                    actor: self.management_actor.clone(),
+                    is_management_continuation: true,
+                    ..self.clone()
+                })
+            }
         }
 
         impl crate::agent::clean_authority_issuer::CleanManagementRuntimeStore for IssuerMemoryStore {
