@@ -1656,6 +1656,8 @@ where
     finalization_failure_once: Option<u8>,
     #[cfg(test)]
     recovery_read_failure_once: Option<RecoveryReadFailure>,
+    #[cfg(test)]
+    fail_deferred_create_stage_once: bool,
 }
 
 #[cfg(test)]
@@ -2561,6 +2563,8 @@ where
             finalization_failure_once: None,
             #[cfg(test)]
             recovery_read_failure_once: None,
+            #[cfg(test)]
+            fail_deferred_create_stage_once: false,
         };
         // Reconstruct volatile admission from the durable exact pending work
         // before returning an owner that could authenticate a fresh query.
@@ -4133,7 +4137,9 @@ where
     /// each entry is independently reauthenticated against live system history.
     /// Borrow the entries so callers retain ownership of their archive leases
     /// throughout replay and subsequent controller construction.
-    /// Missing, duplicate or extra locators fail before any entry is replayed.
+    /// Every retained generation must be covered exactly once. Additional
+    /// archived Creates may resume only without recorded application/finality;
+    /// publication is reauthenticated before staging their deferred namespace.
     pub fn recover_deferred_shared_generations<B, J, Q, ReplyStore, W, PubReply, S>(
         &mut self,
         entries: &mut [(
@@ -4204,10 +4210,12 @@ where
         if actual.windows(2).any(|pair| pair[0].agent == pair[1].agent) {
             return Err(SharedAgentHostError::Conflict);
         }
-        if actual.len() != expected.len()
-            || actual.iter().zip(&expected).any(|(locator, agent)| {
-                locator.space.0 != self.pins.space.0 || locator.agent != *agent
-            })
+        if actual
+            .iter()
+            .any(|locator| locator.space.0 != self.pins.space.0)
+            || expected
+                .iter()
+                .any(|agent| !actual.iter().any(|locator| locator.agent == *agent))
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
@@ -4224,6 +4232,30 @@ where
             {
                 return Err(SharedAgentHostError::ScopeMismatch);
             }
+            if !expected.contains(&locator.agent)
+                && (recovery.retired
+                    || recovery.issuer.has_pending_application_observation()
+                    || recovery
+                        .intent
+                        .finalization_work()
+                        .map_err(|_| SharedAgentHostError::Unavailable)?
+                        .is_some()
+                    || recovery
+                        .issuer
+                        .recover_observed_application(
+                            recovery.authority,
+                            intent.call().managed,
+                            intent.request(),
+                            intent.call(),
+                            &RawCredentialVerifier,
+                        )
+                        .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+                        .is_some())
+            {
+                // An applied generation must not be recreated from its archive
+                // after losing its physical namespace.
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
         }
         let mut proofs = Vec::with_capacity(entries.len());
         // Finish unfinished Creates before any fresh retired-generation read:
@@ -4235,12 +4267,46 @@ where
             if recovery.retired {
                 continue;
             }
-            let proof = self.verify_published_shared_genesis(
-                recovery,
-                record.provision().replicas(),
-                receipt_signer,
-                record,
-            )?;
+            let proof = if expected.contains(&record.provision().proposal().locator().agent) {
+                self.verify_published_shared_genesis(
+                    recovery,
+                    record.provision().replicas(),
+                    receipt_signer,
+                    record,
+                )?
+            } else {
+                let proof =
+                    self.resume_unprovisioned_shared_genesis(recovery, receipt_signer, record)?;
+                let intent = recovery
+                    .intent
+                    .intent()
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                let ManagementRequest::Create(descriptor) = intent.request() else {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                };
+                let authority = CommitteeChangeAuthorityBinding::new(
+                    descriptor.authority.policy,
+                    descriptor.authority.issuer,
+                    descriptor.identity.runtime_deployment,
+                    descriptor.authority.public_key,
+                    descriptor.authority.initial_epoch,
+                )
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                self.host
+                    .lock()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?
+                    .stage_deferred_replay_verified(
+                        record.provision().clone(),
+                        record.catalog().to_vec(),
+                        authority,
+                        &proof,
+                    )?;
+                #[cfg(test)]
+                if core::mem::take(&mut self.fail_deferred_create_stage_once) {
+                    return Err(SharedAgentHostError::Unavailable);
+                }
+                proof
+            };
             // Startup restores every retained phase. Successful proof replay
             // above checked both ancillary results and their positive ACKs;
             // drain those reservations without releasing the original Create.
@@ -4266,6 +4332,60 @@ where
         // The complete set is still deferred if any phase above fails. Only
         // the exact independently proved set can now become available to routes.
         self.complete_deferred_shared_genesis(proofs)
+    }
+
+    /// Resume a selected archive whose generation has not been applied. Archive
+    /// signatures alone grant no finality: reproduce its candidate and committee,
+    /// then execute/replay publication and its positive ACK through Authority.
+    fn resume_unprovisioned_shared_genesis<B, J, Q, Reply, W, PubReply, S>(
+        &mut self,
+        recovery: &mut NativeSharedGenesisRecovery<B, J, Q, Reply, W, PubReply>,
+        signer: &mut S,
+        record: &super::genesis::AgentGenesisArchiveRecord,
+    ) -> Result<ReplayVerifiedAgentGenesisFinality, SharedAgentHostError>
+    where
+        B: super::clean_authority_issuer::CleanManagementRuntimeStore,
+        J: CleanManagementIssuerStore,
+        Q: CleanManagementIssuerStore,
+        Reply: CleanManagementIssuerStore,
+        W: CleanManagementIssuerStore,
+        PubReply: CleanManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+    {
+        let (candidate, committee) = self.resume_shared_genesis_preparation(
+            recovery,
+            record.provision().replicas(),
+            signer,
+        )?;
+        if !(2..=3).contains(&recovery.pending.len()) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        recovery.admission_valid = false;
+        self.execute_genesis_publication(
+            &candidate,
+            &committee,
+            record,
+            &mut recovery.query,
+            &mut recovery.publication,
+            &mut recovery.publication_reply,
+        )?;
+        let publication = genesis_issuance::RetainedGenesisPublication::load(
+            &mut recovery.publication,
+            &candidate,
+            &committee,
+            record,
+            &recovery.authority,
+        )
+        .map_err(|_| SharedAgentHostError::Unavailable)?
+        .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        recovery.pending.truncate(2);
+        recovery
+            .pending
+            .push((publication.anchor, publication.work));
+        recovery.admission_valid = true;
+        Ok(ReplayVerifiedAgentGenesisFinality(
+            record.provision().clone(),
+        ))
     }
 
     /// Revalidate completed Create against current Authority state. Historical
@@ -8057,6 +8177,7 @@ mod tests {
             calls: usize,
             fail_receipt: bool,
             fail_denial: bool,
+            fail_application: bool,
         }
 
         impl CountingSigner {
@@ -8066,6 +8187,7 @@ mod tests {
                     calls: 0,
                     fail_receipt: false,
                     fail_denial: false,
+                    fail_application: false,
                 }
             }
         }
@@ -8101,6 +8223,9 @@ mod tests {
                 message: &[u8],
             ) -> Result<[u8; 64], Self::Error> {
                 self.calls += 1;
+                if core::mem::take(&mut self.fail_application) {
+                    return Err(MemoryError);
+                }
                 Ok(self.key.sign(message).to_bytes())
             }
         }
@@ -8110,14 +8235,25 @@ mod tests {
         impl TestDirectory {
             fn new(label: &str) -> Self {
                 static NEXT: AtomicUsize = AtomicUsize::new(1);
-                let path = std::env::temp_dir().join(format!(
-                    "vos-clean-system-bootstrap-{label}-{}-{}",
-                    std::process::id(),
-                    NEXT.fetch_add(1, Ordering::Relaxed),
-                ));
-                let _ = std::fs::remove_dir_all(&path);
-                std::fs::create_dir(&path).unwrap();
-                Self(path)
+                Self::claim(label, &NEXT)
+            }
+
+            fn claim(label: &str, next: &AtomicUsize) -> Self {
+                // Separate PID namespaces can share TMPDIR and process IDs.
+                // Claim a fresh directory atomically; never remove a path
+                // that may belong to another live fixture or a previous run.
+                loop {
+                    let path = std::env::temp_dir().join(format!(
+                        "vos-clean-system-bootstrap-{label}-{}-{}",
+                        std::process::id(),
+                        next.fetch_add(1, Ordering::Relaxed),
+                    ));
+                    match std::fs::create_dir(&path) {
+                        Ok(()) => return Self(path),
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                        Err(error) => panic!("cannot create bootstrap fixture: {error}"),
+                    }
+                }
             }
 
             fn host(&self) -> PathBuf {
@@ -8133,6 +8269,17 @@ mod tests {
             fn drop(&mut self) {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
+        }
+
+        #[test]
+        fn bootstrap_test_directories_preserve_existing_candidates() {
+            // Independent counters model two processes with the same PID in
+            // separate namespaces sharing one temporary directory.
+            let first = TestDirectory::claim("directory-collision", &AtomicUsize::new(1));
+            let second = TestDirectory::claim("directory-collision", &AtomicUsize::new(1));
+            assert_ne!(first.0, second.0);
+            drop(second);
+            assert!(first.0.is_dir());
         }
 
         struct AcceptFinality;
@@ -23807,6 +23954,34 @@ mod tests {
             IssuerMemoryStore,
             IssuerMemoryStore,
         ) {
+            prepare_mixed_shared(
+                owner,
+                descriptor,
+                runtime,
+                sequence,
+                SharedCreatePause::Provisioned,
+            )
+        }
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum SharedCreatePause {
+            Archive,
+            Published,
+            Provisioned,
+        }
+
+        fn prepare_mixed_shared(
+            owner: &mut MemoryBootstrapOwner,
+            descriptor: AgentDescriptor,
+            runtime: &AdmittedRuntimePackage,
+            sequence: u64,
+            pause: SharedCreatePause,
+        ) -> (
+            MixedSharedRecovery,
+            MixedSharedArchive,
+            IssuerMemoryStore,
+            IssuerMemoryStore,
+        ) {
             use crate::agent::clean_management_intent::{
                 CleanManagementIntent, CleanManagementIntentSlot,
             };
@@ -23890,7 +24065,7 @@ mod tests {
                     Ok(self.0.sign(message).to_bytes())
                 }
             }
-            let (_, _, signature) = owner
+            let (candidate, authority_committee, signature) = owner
                 .endorse_recovered_shared_genesis(
                     &mut recovery,
                     &committee,
@@ -23905,6 +24080,16 @@ mod tests {
                 archive_store.clone(),
             )
             .unwrap();
+            if pause == SharedCreatePause::Archive {
+                super::super::genesis_issuance::select_and_retain(
+                    &candidate,
+                    &authority_committee,
+                    vec![signature],
+                    &archive,
+                )
+                .unwrap();
+                return (recovery, archive_store, issuer_store, intent_store);
+            }
             let record = owner
                 .publish_recovered_shared_genesis(
                     &mut recovery,
@@ -23914,10 +24099,260 @@ mod tests {
                     &archive,
                 )
                 .unwrap();
-            owner
-                .provision_published_shared_genesis(&mut recovery, &mut signer, &record)
-                .unwrap();
+            if pause == SharedCreatePause::Provisioned {
+                owner
+                    .provision_published_shared_genesis(&mut recovery, &mut signer, &record)
+                    .unwrap();
+            }
             (recovery, archive_store, issuer_store, intent_store)
+        }
+
+        fn check_shared_unprovisioned_archive_restart(pause: SharedCreatePause) {
+            struct NoArchiveFinality;
+            impl AgentGenesisFinalityVerifier for NoArchiveFinality {
+                fn verify_finalized(
+                    &self,
+                    _: &crate::agent::genesis::AgentGenesisProvision,
+                ) -> Result<(), AgentGenesisFinalityError> {
+                    Err(AgentGenesisFinalityError::NotFinalized)
+                }
+            }
+            let mut fixture = native_bundled_authority_fixture();
+            fixture.finality = Arc::new(NoArchiveFinality);
+            let mut harness = NativeProjectionOwnerHarness::with_real_bootstrap(
+                "shared-unprovisioned-archive",
+                fixture,
+            );
+            let owner = harness.owner.as_mut().unwrap();
+            let runtime = test_runtime_package(true);
+            let mut descriptor = owner.pins.descriptor.clone();
+            descriptor.creation_nonce = Hash([0xf2; 32]);
+            descriptor.identity.agent = AgentId::derive(
+                descriptor.identity.space,
+                descriptor.identity.owner,
+                descriptor.creation_nonce.as_bytes(),
+            );
+            descriptor.identity.runtime_deployment = runtime.deployment();
+            descriptor.identity.runtime_program = runtime.program();
+            descriptor.identity.runtime_producer = runtime.producer();
+            descriptor.runtime_package = runtime.package_ref().clone();
+            descriptor.runtime_contract = runtime.manifest().contract;
+            descriptor.capabilities = runtime.capabilities();
+            descriptor.replicas[0].principal = descriptor.identity.owner;
+            let (recovery, archive, issuer_store, intent_store) =
+                prepare_mixed_shared(owner, descriptor.clone(), &runtime, 2, pause);
+            assert_eq!(owner.host.lock().unwrap().len(), 1);
+            assert!(owner.ordinary_supervisor_generations().unwrap().is_empty());
+            let archive_bytes = archive.0.lock().unwrap().clone();
+            assert!(archive_bytes.is_some());
+            let recovery = reopen_mixed_shared(recovery);
+            assert_eq!(
+                recovery.pending.len(),
+                if pause == SharedCreatePause::Archive {
+                    2
+                } else {
+                    3
+                }
+            );
+            let target = owner.authority_target();
+            let mut controller =
+                NativeSharedGenesisController::new(target, vec![(recovery, Some(archive.clone()))])
+                    .unwrap();
+            let owner = harness.owner.take().unwrap();
+            let pins = owner._pins_store;
+            let record = owner.record_store;
+            let issuer = owner.issuer.into_store();
+            drop(owner._network_host);
+            drop(owner.host);
+            let mut operations = OperationTestJournal(harness._directory.0.clone());
+            let admission =
+                NativeAuthorityOperationStartupAdmission::load(&mut operations, target, &[])
+                    .unwrap();
+            let admission = controller.startup_admission(admission).unwrap();
+            let mut owner =
+                CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
+                    pins,
+                    record,
+                    issuer,
+                    &mut CountingSigner::new(),
+                    || panic!("archive recovery must not bootstrap"),
+                    harness._directory.host(),
+                    harness._directory.lock(),
+                    harness.fixture.plan.pins.space,
+                    harness.fixture.plan.pins.node,
+                    harness.fixture.trust.clone(),
+                    harness.fixture.merge.clone(),
+                    harness.fixture.finality.clone(),
+                    harness.provider.clone(),
+                    harness.network.clone(),
+                    None,
+                    Some(&admission),
+                )
+                .unwrap();
+            drop(admission);
+            assert!(owner.host.lock().unwrap().has_deferred_open());
+            assert!(owner.host.lock().unwrap().deferred_agent_ids().is_empty());
+            assert!(matches!(
+                owner.ordinary_supervisor_generations(),
+                Err(SharedAgentHostError::Conflict)
+            ));
+            let before = owner.ordered_index_for_test().unwrap();
+            // Model missing physical data with a recorded observation. Neither
+            // an unsigned pledge nor a completed ACK permits recreation. These
+            // are deliberate fixture corruptions, restored only after proving
+            // recovery made no journal or namespace changes.
+            let clean_issuer_image = issuer_store.image.lock().unwrap().clone();
+            for unsigned in [true, false] {
+                let (mut recovery, saved_archive) =
+                    controller.into_entries_for_test().pop().unwrap();
+                let mut signer = CountingSigner::new();
+                signer.fail_application = unsigned;
+                let observed = recovery.issuer.observe_durable_application(
+                    recovery.issued.as_ref().unwrap(),
+                    &ManagementReply::Created(descriptor.identity.clone()),
+                    Hash([0xfc; 32]),
+                    harness
+                        .fixture
+                        .logical_slot
+                        .as_ref()
+                        .unwrap()
+                        .load(Ordering::Acquire),
+                    &mut signer,
+                );
+                if unsigned {
+                    assert!(matches!(observed, Err(crate::agent::clean_authority_issuer::CleanManagementIssuerError::Signer(_))));
+                } else {
+                    observed.unwrap();
+                }
+                controller = NativeSharedGenesisController::new(
+                    target,
+                    vec![(reopen_mixed_shared(recovery), saved_archive)],
+                )
+                .unwrap();
+                let mut signer = CountingSigner::new();
+                assert_eq!(
+                    controller.recover(&mut owner, &mut signer),
+                    Err(SharedAgentHostError::ScopeMismatch)
+                );
+                assert_eq!(signer.calls, 0);
+                assert!(!controller.is_recovered());
+                assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+                assert_eq!(owner.host.lock().unwrap().len(), 1);
+                assert!(owner.host.lock().unwrap().deferred_agent_ids().is_empty());
+                assert_eq!(*archive.0.lock().unwrap(), archive_bytes);
+                let (recovery, saved_archive) = controller.into_entries_for_test().pop().unwrap();
+                *issuer_store.image.lock().unwrap() = clean_issuer_image.clone();
+                controller = NativeSharedGenesisController::new(
+                    target,
+                    vec![(reopen_mixed_shared(recovery), saved_archive)],
+                )
+                .unwrap();
+            }
+            if pause == SharedCreatePause::Archive {
+                owner.fail_deferred_create_stage_once = true;
+                assert_eq!(
+                    controller.recover(&mut owner, &mut CountingSigner::new()),
+                    Err(SharedAgentHostError::Unavailable)
+                );
+                assert!(!owner.fail_deferred_create_stage_once);
+                assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
+                assert_eq!(owner.host.lock().unwrap().len(), 1);
+                assert_eq!(
+                    owner.host.lock().unwrap().deferred_agent_ids(),
+                    vec![HostAgentId(descriptor.identity.agent.0)]
+                );
+                assert!(matches!(
+                    owner.ordinary_supervisor_generations(),
+                    Err(SharedAgentHostError::Conflict)
+                ));
+                let entries = controller
+                    .into_entries_for_test()
+                    .into_iter()
+                    .map(|(recovery, archive)| (reopen_mixed_shared(recovery), archive))
+                    .collect();
+                controller = NativeSharedGenesisController::new(target, entries).unwrap();
+                let pins = owner._pins_store;
+                let record = owner.record_store;
+                let issuer = owner.issuer.into_store();
+                drop(owner._network_host);
+                drop(owner.host);
+                let admission =
+                    NativeAuthorityOperationStartupAdmission::load(&mut operations, target, &[])
+                        .unwrap();
+                let admission = controller.startup_admission(admission).unwrap();
+                owner = CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
+                    pins,
+                    record,
+                    issuer,
+                    &mut CountingSigner::new(),
+                    || panic!("staged intent restart must not bootstrap"),
+                    harness._directory.host(),
+                    harness._directory.lock(),
+                    harness.fixture.plan.pins.space,
+                    harness.fixture.plan.pins.node,
+                    harness.fixture.trust.clone(),
+                    harness.fixture.merge.clone(),
+                    harness.fixture.finality.clone(),
+                    harness.provider.clone(),
+                    harness.network.clone(),
+                    None,
+                    Some(&admission),
+                )
+                .unwrap();
+                drop(admission);
+                assert!(owner.host.lock().unwrap().has_deferred_open());
+                assert_eq!(owner.host.lock().unwrap().len(), 1);
+                eprintln!("unprovisioned archive: reopened after deferred intent staging");
+            }
+            controller
+                .recover(&mut owner, &mut CountingSigner::new())
+                .unwrap();
+            assert!(controller.is_recovered());
+            assert!(!owner.management_admission_held().unwrap());
+            assert_eq!(owner.host.lock().unwrap().len(), 2);
+            assert!(!owner.host.lock().unwrap().has_deferred_open());
+            assert_eq!(*archive.0.lock().unwrap(), archive_bytes);
+            assert_eq!(
+                owner.ordered_index_for_test().unwrap(),
+                before
+                    + if pause == SharedCreatePause::Archive {
+                        5
+                    } else {
+                        3
+                    }
+            );
+            let mut intent =
+                crate::agent::clean_management_intent::CleanManagementIntentSlot::open(
+                    intent_store,
+                )
+                .unwrap();
+            assert!(intent.retirement_complete().unwrap());
+            let generations = owner.ordinary_supervisor_generations().unwrap();
+            assert_eq!(generations.len(), 1);
+            assert_eq!(generations[0].agent(), descriptor.identity.agent);
+            drop(generations);
+            serve_mixed_shared(
+                &mut owner,
+                &descriptor,
+                &issuer_store,
+                harness.fixture.logical_slot.as_ref().unwrap(),
+                3,
+            );
+            drop(controller);
+            harness.owner = Some(owner);
+            harness.stop();
+        }
+
+        #[test]
+        #[ignore = "requires the bundled outer PVM; run with VOS_AGENT_PROFILE_REFINE_MACHINES=1"]
+        fn native_shared_unprovisioned_archive_restarts_before_publication() {
+            check_shared_unprovisioned_archive_restart(SharedCreatePause::Archive);
+        }
+
+        #[test]
+        #[ignore = "requires the bundled outer PVM; run with VOS_AGENT_PROFILE_REFINE_MACHINES=1"]
+        fn native_shared_unprovisioned_archive_restarts_after_publication() {
+            check_shared_unprovisioned_archive_restart(SharedCreatePause::Published);
         }
 
         fn serve_mixed_shared(

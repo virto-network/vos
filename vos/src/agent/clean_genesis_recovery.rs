@@ -161,10 +161,11 @@ where
     /// before publication stays an unroutable reservation, provided its runtime
     /// and independently selected replicas are durable and bound to that Create.
     /// Retained authorization/query work is reauthenticated through the owner;
-    /// its reservations are not released. Published generations require the
-    /// owner's exact deferred set and independent live-history verification;
-    /// archive signatures alone never grant finality. Errors retain all stores
-    /// for an exact retry.
+    /// its reservations are not released. Every deferred generation requires
+    /// a matching archive and independent live-history verification. An archive
+    /// retained before provisioning can resume publication and stage its missing
+    /// generation only if application has not been observed; archive signatures
+    /// alone never grant finality. Errors retain all stores for an exact retry.
     pub fn recover<B, C, D, S>(
         &mut self,
         owner: &mut CleanSystemAgentBootstrapOwner<B, C, D>,

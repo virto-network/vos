@@ -1235,6 +1235,12 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         self.image.pending.is_some()
     }
 
+    /// A durable application observation exists even before its acknowledgement
+    /// can be signed. Recovery must not treat that phase as an unapplied Create.
+    pub(crate) const fn has_pending_application_observation(&self) -> bool {
+        self.image.pending_application_ack.is_some()
+    }
+
     pub fn into_store(self) -> B {
         self.store
     }
@@ -4032,6 +4038,7 @@ mod tests {
         ));
         assert_eq!(store.image().unwrap(), before_pledge);
         assert!(issuer.image.pending_application_ack.is_none());
+        assert!(!issuer.has_pending_application_observation());
 
         signer.fail_next = true;
         assert!(matches!(
@@ -4046,6 +4053,7 @@ mod tests {
         ));
         assert_ne!(store.image().unwrap(), before_pledge);
         assert!(issuer.image.pending_application_ack.is_some());
+        assert!(issuer.has_pending_application_observation());
         assert!(matches!(
             issuer.issue(&decision(&fixture, 2, &request(0x2f)), &mut signer),
             Err(CleanManagementIssuerError::Rejected(
@@ -4056,6 +4064,7 @@ mod tests {
         drop(issuer);
         let mut issuer = open(store.clone(), &fixture);
         let wrong_application = ManagementReply::Removed(ActorId([0x2d; 32]));
+        assert!(issuer.has_pending_application_observation());
         let image_after_pledge = issuer.image.clone();
         let calls = signer.calls;
         assert!(matches!(
@@ -4099,6 +4108,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(acknowledgement.reopened_state, reopened_state);
+        assert!(!issuer.has_pending_application_observation());
         assert_eq!(acknowledgement.applied_at, applied_at);
         assert!(acknowledgement.matches_pending(&call, &approval));
         assert_eq!(

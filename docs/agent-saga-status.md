@@ -170,12 +170,28 @@ RUST_MIN_STACK=16777216 VOS_AGENT_PROFILE_REFINE_MACHINES=1 \
   native_shared_mixed_prearchive_recovers --lib -- --ignored --test-threads=1
 ```
 
-Next first-Create boundary: a quorum archive can be retained before publication
-ACK or physical provisioning. Current recovery still requires archived entries
-to exactly match the host's deferred generations, so an archived-but-unprovisioned
-Create fails that check. Qualify resumption of the existing publication and
-provisioning steps under the deferred-route gate; archive presence alone must
-not become finality or permission to route.
+Archived Shared Create recovery now resumes a quorum archive retained before publication
+ACK or physical provisioning. Recovery still requires every existing deferred
+generation to have an exact lifecycle/archive entry. Additional archived Creates
+can now replay authorization and committee selection, resume publication through
+Authority, and stage a generation only after its positive publication ACK. The
+normal deferred opener performs physical application; routes stay closed until
+the complete proved set finishes recovery. Missing generations with retirement,
+finalization, a signed application ACK or an unsigned application pledge are
+rejected rather than recreated. Both extended bundled outer-PVM tests pass
+(2 passed in 810.26 s): before/after publication, missing-data rejection for
+unsigned and signed application ACKs, restart after durable deferred-intent
+staging, Create retirement and actor Install/Invoke/ACK. Initial overlapping
+runs failed with `CorruptResidue`; their process-ID-based fixture paths could
+collide across sandbox namespaces and delete another live fixture. Allocation
+now atomically claims an unused directory without deleting existing paths.
+A focused collision regression passes, as does the serial physical pair.
+The pending-observation issuer test, three controller regressions and deferred
+host lease/finality test and `cargo check -p vosx` pass. These are debug tests
+with physical journals and memory-backed lifecycle stores, not released-daemon
+qualification. Next: qualify file-backed startup discovery/recovery for this
+archive boundary and integrate the retained controller into live Shared Create
+before enabling public ingress; archive presence alone never grants finality.
 The focused startup and incomplete-archive tests pass. Two separately run,
 explicit bundled-outer-PVM regressions pass for both Agent-ID orderings of a
 retired A plus unissued B: A reopens through a fresh Authority read and serves

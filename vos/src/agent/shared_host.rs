@@ -1406,6 +1406,58 @@ impl SharedAgentHost {
         Ok(status)
     }
 
+    /// Stage a publication-proved Create during startup without adding it to
+    /// the serving set. The normal deferred opener owns physical application
+    /// and crash recovery under the existing outer lease.
+    #[cfg(all(feature = "network", target_os = "linux"))]
+    pub(crate) fn stage_deferred_replay_verified(
+        &mut self,
+        provision: AgentGenesisProvision,
+        catalog: Vec<RuntimeBlob>,
+        committee_authority: CommitteeChangeAuthorityBinding,
+        finality: &super::clean_bootstrap::ReplayVerifiedAgentGenesisFinality,
+    ) -> Result<(), SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        let intent = SharedGenesisIntent::new(provision, catalog, committee_authority)?;
+        let agent = intent.agent()?;
+        if !self.deferred_open
+            || self.agents.contains_key(&agent)
+            || self.deferred_generations.contains_key(&agent)
+        {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        if intent.space() != self.scope().space
+            || intent
+                .committee()
+                .member_by_node(self.scope().node)
+                .is_none()
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if self
+            .agents
+            .len()
+            .saturating_add(self.deferred_generations.len())
+            >= MAX_SHARED_HOST_AGENTS
+        {
+            return Err(SharedAgentHostError::CapacityExhausted);
+        }
+        self.verify_and_prepare_with_finality(&intent, finality)?;
+        if scan_generation_namespaces(&self.lease)?.contains_key(&agent) {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        install_host_record(&self.intent_path(agent), &intent.encode())?;
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        self.deferred_generations.insert(
+            agent,
+            GenerationFiles {
+                intent: true,
+                ..GenerationFiles::default()
+            },
+        );
+        Ok(())
+    }
+
     pub fn list(&self) -> Result<Vec<SharedAgentStatus>, SharedAgentHostError> {
         self.agents
             .iter()
