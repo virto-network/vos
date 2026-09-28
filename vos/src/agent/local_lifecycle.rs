@@ -2477,6 +2477,13 @@ where
         signer: &mut S,
     ) -> Result<super::clean_bootstrap::PreparedSharedGenesisEndorsement, SharedAgentHostError>;
 
+    fn complete_create(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        locator: super::genesis::AgentGenesisLocator,
+        signer: &mut S,
+    ) -> Result<ManagementApplicationAck, SharedAgentHostError>;
+
     fn reserve_create(
         &mut self,
         _: &AgentDescriptor,
@@ -2547,6 +2554,15 @@ where
         self.0.prepare_pending_create(owner, locator, signer)
     }
 
+    fn complete_create(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        locator: super::genesis::AgentGenesisLocator,
+        signer: &mut S,
+    ) -> Result<ManagementApplicationAck, SharedAgentHostError> {
+        self.0.complete_pending_create(owner, locator, signer)
+    }
+
     fn reserve_create(
         &mut self,
         descriptor: &AgentDescriptor,
@@ -2602,6 +2618,15 @@ where
     ) -> Result<super::clean_bootstrap::PreparedSharedGenesisEndorsement, SharedAgentHostError>
     {
         self.prepare_pending_create(owner, locator, signer)
+    }
+
+    fn complete_create(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        locator: super::genesis::AgentGenesisLocator,
+        signer: &mut S,
+    ) -> Result<ManagementApplicationAck, SharedAgentHostError> {
+        self.complete_pending_create(owner, locator, signer)
     }
 }
 
@@ -3061,6 +3086,22 @@ where
             .as_mut()
             .ok_or(SharedAgentHostError::Conflict)?
             .publish_create(&mut system, locator, signatures, &mut self.signer)
+    }
+
+    /// Finish a published Shared Create before allowing its generation to serve.
+    /// Repeated completion returns the original signed application ACK.
+    pub fn complete_shared_create(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+    ) -> Result<ManagementApplicationAck, SharedAgentHostError> {
+        let mut system = self
+            .system
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        self.shared_genesis
+            .as_mut()
+            .ok_or(SharedAgentHostError::Conflict)?
+            .complete_create(&mut system, locator, &mut self.signer)
     }
 
     /// Adopt the recovered admin stores for the full production-owner lifetime.

@@ -291,6 +291,47 @@ where
         )
     }
 
+    /// Complete physical application, signed finalization and retirement before
+    /// admitting this generation. Exact terminal retries keep the original ACK
+    /// and still require a fresh Authority check.
+    pub fn complete_pending_create<B, C, D, S>(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<B, C, D>,
+        locator: super::super::genesis::AgentGenesisLocator,
+        signer: &mut S,
+    ) -> Result<ManagementApplicationAck, SharedAgentHostError>
+    where
+        B: CleanSystemAgentBootstrapStore + Send + 'static,
+        C: CleanSystemAgentBootstrapStore + Send + 'static,
+        D: CleanManagementIssuerStore + Send + 'static,
+        S: CleanManagementReceiptSigner,
+    {
+        if !self.recovered || owner.authority_target() != self.authority {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let predecessor = self.entries.iter().find_map(|(entry, _)| {
+            (entry.locator != locator && !entry.retired && entry.admission_valid)
+                .then(|| entry.pending.first().cloned())
+                .flatten()
+        });
+        let (recovery, archive) = self
+            .entries
+            .iter_mut()
+            .find(|(entry, _)| entry.locator == locator)
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let archive = archive.as_ref().ok_or(SharedAgentHostError::Unavailable)?;
+        let provider = super::super::genesis_archive::ArchivedAgentGenesisProvider::new(
+            locator.space,
+            archive,
+        )
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let record = provider
+            .load_record(locator)
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .ok_or(SharedAgentHostError::Unavailable)?;
+        owner.complete_live_shared_genesis(recovery, &record, signer, predecessor.as_ref())
+    }
+
     /// Borrow every store until bootstrap has admitted its retained work.
     pub fn startup_admission<'a>(
         &'a mut self,

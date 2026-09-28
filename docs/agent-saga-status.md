@@ -109,15 +109,15 @@ disposable image-Local Space with all three Shared roots absent while its
 Counter route still returned `7`. This establishes a live owner for later
 Shared Create, not a new generation or public Create ingress.
 The retained production controller's type-erased Shared access now supports
-signed-input reservation, preparation and publication as well as recovery,
-but not end-to-end live Create.
+signed-input reservation, preparation, publication and completion as well as
+recovery. These are internal orchestration seams, not public live Create.
 Its configured file factory is lazy and pins the Space directory before first
 use. Exact retries stay in the controller without reopening its leased stores.
 The startup verifier still deliberately refuses unproved live provisions. The
 owner can produce replay-verified proof for an exact published generation, but
-live Create must carry the retained inputs through endorsement/publication,
-provisioning, application ACK, finalization and route publication. File-backed
-cross-root crash recovery remains a gate. Do not replace the refusing verifier
+the completion coordinator carries published inputs through physical application,
+signed ACK, finalization, retirement and host admission. Production endorsement
+collection and file-backed cross-root crash recovery remain gates. Do not replace the refusing verifier
 with a permissive one.
 Startup discovery now treats only an empty, private partial set of the three
 Shared control parent directories as an interrupted first-time setup; it
@@ -196,7 +196,7 @@ with physical journals and memory-backed lifecycle stores, not released-daemon
 qualification. Next: qualify file-backed startup discovery/recovery for this
 archive boundary and integrate the retained controller into live Shared Create
 before enabling public ingress; archive presence alone never grants finality.
-In-progress admission integration: a file-backed Shared reservation factory stages
+Internal admission integration: a file-backed Shared reservation factory stages
 runtime/replicas and the signed Create before allocating its archive namespace.
 It uses core input validation before per-Agent allocation and the complete
 retained lifecycle inventory for capacity, permitting existing retries at the
@@ -213,7 +213,7 @@ total), including assertions that all three Shared control roots remain absent.
 This is one startup smoke measurement, not a production latency target. Archive-boundary
 execution through real file stores and live Create/route integration remain
 required; this is not public Shared management or a completed Create response.
-In-progress publication integration: the retained lifecycle owner now exposes
+Internal publication integration: the retained lifecycle owner now exposes
 preparation and quorum publication for an existing reservation. Preparation
 returns a non-wire-decodable value binding the owner-authenticated candidate
 to its independently queried committee; its endorsement method cannot accept
@@ -227,11 +227,36 @@ and publication leaves the original reservation held with no ordinary route.
 Four controller regressions, `cargo check -p vosx` and the `std`-only build
 check pass. This is a one-voter fixture with real outer-PVM/system journals but
 memory-backed lifecycle stores, not three-node or file-backed customer-workflow
-qualification. Next, complete physical application and retirement before
-admitting the new generation to routes; do not treat the existing provisioning
-helper alone as a completed Create. Production endorsement collection and
+qualification. Completion below performs physical application and retirement
+before admitting the new generation; the provisioning helper alone is not a
+completed Create. Production endorsement collection and
 end-to-end file-backed recovery also remain incomplete. Public Shared Create
 stays disabled.
+
+Internal completion integration stages a published live generation outside
+the serving map, without entering the global startup-recovery gate. The owning
+coordinator observes physical application, finalizes and retires the signed
+Create, then admits only that generation. Terminal retries preserve the original
+ACK and still perform a fresh Authority read (using an anchored successor if
+another valid Create reservation holds admission). Successful startup recovery
+now updates the retained in-memory phase to completed, enabling that same retry
+path. Four controller regressions and the deferred-host lease/finality test
+pass. The final physical completion test passes (526.89 s), including a
+post-retirement/pre-admission interruption and exact warm retries with fresh
+Authority reads while the configured verifier refuses archive-only finality.
+The extended archived-startup recovery test also passes (447.92 s), including
+the original terminal ACK retry through the recovered controller and actor
+Install/Invoke/ACK. The debug daemon
+startup/shutdown smoke also passes (23.39 s, endpoint ready at 21.00 s).
+No public ingress is enabled. Cold interruption through the real file-backed
+lifecycle owner, production quorum orchestration, Shared Install handoff and
+release performance qualification remain open. Before ingress, admission must
+also preflight physical generation capacity rather than discovering exhaustion
+only after genesis publication, and qualify signed Create denial retirement
+without leaving Authority admission held.
+Backup quiescence must also cover unserved live generations after reservation
+release: an idle Authority admission alone does not prove all Create routes
+have been admitted or that the lifecycle/physical snapshot is complete.
 
 Reproduce the lifecycle publication test with disk-backed build and temporary
 directories as above:

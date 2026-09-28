@@ -1660,6 +1660,8 @@ where
     recovery_read_failure_once: Option<RecoveryReadFailure>,
     #[cfg(test)]
     fail_deferred_create_stage_once: bool,
+    #[cfg(test)]
+    fail_live_shared_promotion_once: bool,
 }
 
 #[cfg(test)]
@@ -2612,6 +2614,8 @@ where
             recovery_read_failure_once: None,
             #[cfg(test)]
             fail_deferred_create_stage_once: false,
+            #[cfg(test)]
+            fail_live_shared_promotion_once: false,
         };
         // Reconstruct volatile admission from the durable exact pending work
         // before returning an owner that could authenticate a fresh query.
@@ -4378,7 +4382,15 @@ where
         }
         // The complete set is still deferred if any phase above fails. Only
         // the exact independently proved set can now become available to routes.
-        self.complete_deferred_shared_genesis(proofs)
+        self.complete_deferred_shared_genesis(proofs)?;
+        // The serving controller must retain the completed phase, not the
+        // pre-recovery snapshot, so a live exact retry can return its terminal.
+        for (recovery, _) in entries.iter_mut() {
+            recovery.retired = true;
+            recovery.pending.clear();
+            recovery.admission_valid = true;
+        }
+        Ok(())
     }
 
     /// Resume a selected archive whose generation has not been applied. Archive
@@ -4512,6 +4524,139 @@ where
         Ok(ReplayVerifiedAgentGenesisFinality(
             record.provision().clone(),
         ))
+    }
+
+    /// Complete a published live Create without exposing it before retirement.
+    /// Cold restart continues through the complete-set deferred recovery path.
+    pub(crate) fn complete_live_shared_genesis<B, J, Q, Reply, W, PubReply, S>(
+        &mut self,
+        recovery: &mut NativeSharedGenesisRecovery<B, J, Q, Reply, W, PubReply>,
+        record: &super::genesis::AgentGenesisArchiveRecord,
+        signer: &mut S,
+        predecessor: Option<&(
+            super::clean_management_intent::ManagementJournalAnchor,
+            RuntimeWork,
+        )>,
+    ) -> Result<ManagementApplicationAck, SharedAgentHostError>
+    where
+        B: super::clean_authority_issuer::CleanManagementRuntimeStore,
+        J: CleanManagementIssuerStore,
+        Q: CleanManagementIssuerStore,
+        Reply: CleanManagementIssuerStore,
+        W: CleanManagementIssuerStore,
+        PubReply: CleanManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+    {
+        if !recovery.admission_valid
+            || recovery.authority != self.authority_target()
+            || self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .has_deferred_open()
+        {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let proof = if recovery.retired {
+            self.verify_retired_shared_genesis(recovery, record, predecessor)?
+        } else {
+            self.verify_published_shared_genesis(
+                recovery,
+                record.provision().replicas(),
+                signer,
+                record,
+            )?
+        };
+        let agent = record.provision().proposal().locator().agent;
+        if !recovery.retired {
+            let intent = recovery
+                .intent
+                .intent()
+                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            let ManagementRequest::Create(descriptor) = intent.request() else {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            };
+            let authority = CommitteeChangeAuthorityBinding::new(
+                descriptor.authority.policy,
+                descriptor.authority.issuer,
+                descriptor.identity.runtime_deployment,
+                descriptor.authority.public_key,
+                descriptor.authority.initial_epoch,
+            )
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            {
+                let mut host = self
+                    .host
+                    .lock()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?;
+                if !host.deferred_agent_ids().contains(&agent)
+                    && (recovery.issuer.has_pending_application_observation()
+                        || recovery
+                            .issuer
+                            .recover_observed_application(
+                                recovery.authority,
+                                intent.call().managed,
+                                intent.request(),
+                                intent.call(),
+                                &RawCredentialVerifier,
+                            )
+                            .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+                            .is_some())
+                {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                host.stage_live_replay_verified(
+                    record.provision().clone(),
+                    record.catalog().to_vec(),
+                    authority,
+                    &proof,
+                )?;
+            }
+            for (anchor, envelope) in recovery.pending.iter().skip(1).take(2) {
+                self._network_host.finish_pending_management_result(
+                    crate::service::AgentId(self.pins.agent.0),
+                    anchor,
+                    envelope,
+                    false,
+                    || Ok(()),
+                )?;
+            }
+            self.finish_shared_genesis_application(recovery, signer, Some(&proof))?;
+        }
+        let intent = recovery
+            .intent
+            .intent()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        if !recovery
+            .intent
+            .retirement_complete()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let (_, acknowledgement) = recovery
+            .issuer
+            .recover_finalized_application(
+                recovery.authority,
+                intent.call().managed,
+                intent.request(),
+                intent.call(),
+                &RawCredentialVerifier,
+            )
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        recovery.retired = true;
+        recovery.pending.clear();
+        recovery.admission_valid = true;
+        #[cfg(test)]
+        if core::mem::take(&mut self.fail_live_shared_promotion_once) {
+            return Err(SharedAgentHostError::Unavailable);
+        }
+        self.host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .admit_live_replay_verified(agent, &proof)?;
+        Ok(acknowledgement)
     }
 
     /// Complete the original management operation only after physical recovery.
@@ -24147,6 +24292,25 @@ mod tests {
         #[test]
         #[ignore = "requires the bundled outer PVM; run with VOS_AGENT_PROFILE_REFINE_MACHINES=1"]
         fn native_shared_lifecycle_reservation_preparation_publication_retries() {
+            check_shared_lifecycle_publication_and_completion(false);
+        }
+
+        #[test]
+        #[ignore = "requires the bundled outer PVM; run with VOS_AGENT_PROFILE_REFINE_MACHINES=1"]
+        fn native_shared_lifecycle_completion_gates_route_and_retries_ack() {
+            check_shared_lifecycle_publication_and_completion(true);
+        }
+
+        fn check_shared_lifecycle_publication_and_completion(complete: bool) {
+            struct RefuseArchiveFinality;
+            impl AgentGenesisFinalityVerifier for RefuseArchiveFinality {
+                fn verify_finalized(
+                    &self,
+                    _: &crate::agent::genesis::AgentGenesisProvision,
+                ) -> Result<(), AgentGenesisFinalityError> {
+                    Err(AgentGenesisFinalityError::NotFinalized)
+                }
+            }
             struct NoLocalStores;
             impl crate::agent::local_lifecycle::LocalLifecycleStoreFactory for NoLocalStores {
                 type Intent = IssuerMemoryStore;
@@ -24184,9 +24348,11 @@ mod tests {
                     Ok(self.key.sign(message).to_bytes())
                 }
             }
+            let mut fixture = native_bundled_authority_fixture();
+            fixture.finality = Arc::new(RefuseArchiveFinality);
             let mut harness = NativeProjectionOwnerHarness::with_real_bootstrap(
                 "shared-live-publication",
-                native_bundled_authority_fixture(),
+                fixture,
             );
             let owner = harness.owner.take().unwrap();
             let target = owner.authority_target();
@@ -24239,6 +24405,8 @@ mod tests {
             .unwrap();
             let archive = MixedSharedArchive::default();
             let archive_lease = archive.clone();
+            let issuer_image = IssuerMemoryStore::default();
+            let issuer_lease = issuer_image.clone();
             let shared = NativeSharedGenesisController::<
                 IssuerMemoryStore,
                 IssuerMemoryStore,
@@ -24270,7 +24438,7 @@ mod tests {
                     replicas.clone(),
                     (
                         IssuerMemoryStore::default(),
-                        IssuerMemoryStore::default(),
+                        issuer_lease.clone(),
                         IssuerMemoryStore::default(),
                         IssuerMemoryStore::default(),
                         IssuerMemoryStore::default(),
@@ -24352,6 +24520,63 @@ mod tests {
                 Err(SharedAgentHostError::Conflict)
             );
             assert_eq!(lifecycle.ordered_index_for_test().unwrap(), published);
+            if complete {
+                lifecycle.system_for_test().fail_live_shared_promotion_once = true;
+                assert_eq!(
+                    lifecycle.complete_shared_create(locator),
+                    Err(SharedAgentHostError::Unavailable)
+                );
+                let retired = lifecycle.ordered_index_for_test().unwrap();
+                assert_eq!(retired, published + 3);
+                {
+                    let mut owner = lifecycle.system_for_test();
+                    assert!(!owner.management_admission_held().unwrap());
+                    assert!(owner.ordinary_supervisor_generations().unwrap().is_empty());
+                    let host = owner.host.lock().unwrap();
+                    assert!(
+                        !host.has_deferred_open(),
+                        "live staging must not enter the global startup gate"
+                    );
+                    assert_eq!(host.len(), 1);
+                    assert_eq!(host.deferred_agent_ids(), vec![locator.agent]);
+                }
+                let retained = DurableCleanManagementIssuer::open(
+                    issuer_image.clone(),
+                    descriptor.authority,
+                    descriptor.identity.space,
+                    descriptor.identity.agent,
+                )
+                .unwrap();
+                let (_, expected) = retained
+                    .recover_finalized_application(
+                        target,
+                        call.managed,
+                        &request,
+                        &call,
+                        &RawCredentialVerifier,
+                    )
+                    .unwrap()
+                    .unwrap();
+                let acknowledgement = lifecycle.complete_shared_create(locator).unwrap();
+                assert_eq!(acknowledgement, expected);
+                let admitted = lifecycle.ordered_index_for_test().unwrap();
+                assert_eq!(
+                    admitted,
+                    retired + 2,
+                    "terminal retry preserves the fresh Authority read"
+                );
+                assert_eq!(*archive.0.lock().unwrap(), stored);
+                {
+                    let mut owner = lifecycle.system_for_test();
+                    assert!(!owner.management_admission_held().unwrap());
+                    assert_eq!(owner.ordinary_supervisor_generations().unwrap().len(), 1);
+                    let host = owner.host.lock().unwrap();
+                    assert_eq!(host.len(), 2);
+                    assert!(host.deferred_agent_ids().is_empty());
+                }
+                assert_eq!(lifecycle.complete_shared_create(locator).unwrap(), expected);
+                assert_eq!(lifecycle.ordered_index_for_test().unwrap(), admitted + 2);
+            }
             drop(lifecycle);
             harness.stop();
         }
@@ -24713,6 +24938,42 @@ mod tests {
                 )
                 .unwrap();
             assert!(intent.retirement_complete().unwrap());
+            // Startup must retain the completed in-memory phase too: retry
+            // through the serving controller returns the original terminal,
+            // rather than treating its pre-recovery snapshot as still pending.
+            let signed = intent.intent().unwrap();
+            let issuer = DurableCleanManagementIssuer::open(
+                issuer_store.clone(),
+                descriptor.authority,
+                descriptor.identity.space,
+                descriptor.identity.agent,
+            )
+            .unwrap();
+            let (_, expected_ack) = issuer
+                .recover_finalized_application(
+                    target,
+                    signed.call().managed,
+                    signed.request(),
+                    signed.call(),
+                    &RawCredentialVerifier,
+                )
+                .unwrap()
+                .unwrap();
+            let completed_index = owner.ordered_index_for_test().unwrap();
+            assert_eq!(
+                controller
+                    .complete_pending_create(
+                        &mut owner,
+                        crate::agent::genesis::AgentGenesisLocator {
+                            space: crate::service::SpaceId(descriptor.identity.space.0),
+                            agent: HostAgentId(descriptor.identity.agent.0)
+                        },
+                        &mut CountingSigner::new()
+                    )
+                    .unwrap(),
+                expected_ack
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), completed_index + 2);
             let generations = owner.ordinary_supervisor_generations().unwrap();
             assert_eq!(generations.len(), 1);
             assert_eq!(generations[0].agent(), descriptor.identity.agent);

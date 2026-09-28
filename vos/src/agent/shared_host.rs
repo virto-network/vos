@@ -901,6 +901,8 @@ pub struct SharedAgentHost {
     merge: Arc<dyn LocalMergeAuthenticator>,
     finality: Arc<dyn AgentGenesisFinalityVerifier>,
     root_pins: Option<RootAnchorPins>,
+    // Unserved generations: the complete startup set when deferred_open is
+    // true, or individually staged live Creates while existing Agents serve.
     deferred_generations: BTreeMap<AgentId, GenerationFiles>,
     deferred_open: bool,
 }
@@ -1143,10 +1145,7 @@ impl SharedAgentHost {
         mut files: GenerationFiles,
         finality: &dyn AgentGenesisFinalityVerifier,
     ) -> Result<HostedSharedAgent, SharedAgentHostError> {
-        if !self.deferred_open
-            || !self.deferred_generations.contains_key(&agent)
-            || self.agents.contains_key(&agent)
-        {
+        if !self.deferred_generations.contains_key(&agent) || self.agents.contains_key(&agent) {
             return Err(SharedAgentHostError::Conflict);
         }
         let recovery = self.read_portable_restore(agent, files)?;
@@ -1183,8 +1182,8 @@ impl SharedAgentHost {
         Ok(hosted)
     }
 
-    /// Validate an unfinished Create while every ordinary generation remains
-    /// deferred. Its finality must already have been independently proved;
+    /// Validate an unfinished, unserved Create (startup or live admission).
+    /// Its finality must already have been independently proved;
     /// this method neither publishes routes nor relaxes management admission.
     pub(crate) fn observe_deferred_clean_genesis_application(
         &mut self,
@@ -1417,13 +1416,44 @@ impl SharedAgentHost {
         committee_authority: CommitteeChangeAuthorityBinding,
         finality: &super::clean_bootstrap::ReplayVerifiedAgentGenesisFinality,
     ) -> Result<(), SharedAgentHostError> {
+        if !self.deferred_open
+            || self
+                .deferred_generations
+                .contains_key(&provision.proposal().locator().agent)
+        {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        self.stage_unserved_replay_verified(provision, catalog, committee_authority, finality)
+    }
+
+    /// Live Create staging does not enter the global startup gate or change
+    /// any existing serving generation. Only the coordinator may promote it.
+    #[cfg(all(feature = "network", target_os = "linux"))]
+    pub(crate) fn stage_live_replay_verified(
+        &mut self,
+        provision: AgentGenesisProvision,
+        catalog: Vec<RuntimeBlob>,
+        committee_authority: CommitteeChangeAuthorityBinding,
+        finality: &super::clean_bootstrap::ReplayVerifiedAgentGenesisFinality,
+    ) -> Result<(), SharedAgentHostError> {
+        if self.deferred_open {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        self.stage_unserved_replay_verified(provision, catalog, committee_authority, finality)
+    }
+
+    #[cfg(all(feature = "network", target_os = "linux"))]
+    fn stage_unserved_replay_verified(
+        &mut self,
+        provision: AgentGenesisProvision,
+        catalog: Vec<RuntimeBlob>,
+        committee_authority: CommitteeChangeAuthorityBinding,
+        finality: &super::clean_bootstrap::ReplayVerifiedAgentGenesisFinality,
+    ) -> Result<(), SharedAgentHostError> {
         self.lease.validate_live().map_err(map_outer_lease_error)?;
         let intent = SharedGenesisIntent::new(provision, catalog, committee_authority)?;
         let agent = intent.agent()?;
-        if !self.deferred_open
-            || self.agents.contains_key(&agent)
-            || self.deferred_generations.contains_key(&agent)
-        {
+        if self.agents.contains_key(&agent) {
             return Err(SharedAgentHostError::Conflict);
         }
         if intent.space() != self.scope().space
@@ -1433,6 +1463,17 @@ impl SharedAgentHost {
                 .is_none()
         {
             return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if self.deferred_generations.contains_key(&agent) {
+            let files = scan_generation_namespaces(&self.lease)?
+                .get(&agent)
+                .copied()
+                .ok_or(SharedAgentHostError::CorruptResidue)?;
+            if self.read_intent(agent, files)?.0 != intent {
+                return Err(SharedAgentHostError::Conflict);
+            }
+            self.verify_and_prepare_with_finality(&intent, finality)?;
+            return Ok(());
         }
         if self
             .agents
@@ -1455,6 +1496,43 @@ impl SharedAgentHost {
                 ..GenerationFiles::default()
             },
         );
+        Ok(())
+    }
+
+    /// Called only after the lifecycle owner verifies signed finalization and
+    /// durable retirement. Startup recovery uses the complete-set opener instead.
+    #[cfg(all(feature = "network", target_os = "linux"))]
+    pub(crate) fn admit_live_replay_verified(
+        &mut self,
+        agent: AgentId,
+        finality: &super::clean_bootstrap::ReplayVerifiedAgentGenesisFinality,
+    ) -> Result<(), SharedAgentHostError> {
+        if self.deferred_open {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        if let Some(existing) = self.agents.get(&agent) {
+            let SharedGenesisAuthority::AuthorityFinalized(provision) = &existing.intent.authority
+            else {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            };
+            return finality
+                .verify_finalized(provision)
+                .map_err(|_| SharedAgentHostError::ScopeMismatch);
+        }
+        let current = scan_generation_namespaces(&self.lease)?;
+        if current.keys().any(|agent| {
+            !self.agents.contains_key(agent) && !self.deferred_generations.contains_key(agent)
+        }) {
+            return Err(SharedAgentHostError::CorruptResidue);
+        }
+        let files = *current
+            .get(&agent)
+            .ok_or(SharedAgentHostError::CorruptResidue)?;
+        let hosted = self.open_deferred_generation(agent, files, finality)?;
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        self.agents.insert(agent, hosted);
+        self.deferred_generations.remove(&agent);
         Ok(())
     }
 
