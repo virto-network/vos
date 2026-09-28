@@ -1637,6 +1637,24 @@ impl SharedAgentHost {
             .transpose()
     }
 
+    /// Read the authenticated descriptor without enumerating actor state.
+    pub(crate) fn clean_runtime_descriptor(
+        &self,
+        agent: AgentId,
+    ) -> Result<crate::agent_sdk::AgentDescriptor, SharedAgentHostError> {
+        let hosted = self
+            .agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        let descriptor = hosted.driver.clean_descriptor().map_err(map_driver_error)?;
+        if descriptor.validate().is_err()
+            || descriptor.identity.profile != crate::agent_sdk::AgentProfile::Shared
+        {
+            return Err(SharedAgentHostError::CorruptResidue);
+        }
+        Ok(descriptor)
+    }
+
     /// Reconstruct a bounded actor-directory projection from the same live
     /// journal driver that supplied the current runtime descriptor. Callers
     /// hold the outer host mutex, so descriptor and directory cannot be mixed
@@ -1649,12 +1667,7 @@ impl SharedAgentHost {
             .agents
             .get(&agent)
             .ok_or(SharedAgentHostError::AgentNotFound)?;
-        let descriptor = hosted.driver.clean_descriptor().map_err(map_driver_error)?;
-        if descriptor.validate().is_err()
-            || descriptor.identity.profile != crate::agent_sdk::AgentProfile::Shared
-        {
-            return Err(SharedAgentHostError::CorruptResidue);
-        }
+        let descriptor = self.clean_runtime_descriptor(agent)?;
         let maximum = descriptor.capabilities.max_actors as usize;
         let limit = u16::try_from(crate::agent_sdk::MAX_DIRECTORY_PAGE_ENTRIES)
             .map_err(|_| SharedAgentHostError::CorruptResidue)?;

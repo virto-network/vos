@@ -5289,6 +5289,99 @@ where
         Ok((agent, acknowledgement))
     }
 
+    /// Apply a retained ordinary Shared Install and sign only its replay-proved
+    /// terminal. The caller owns finalization/retirement and must keep the
+    /// management reservation until those phases complete. This is not a public
+    /// ingress or permission to expose a generation during startup recovery.
+    pub(crate) fn apply_shared_install_from_management_intent<B, J, S>(
+        &mut self,
+        slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
+        package: &AdmittedActorPackage,
+        issuer: &mut DurableCleanManagementIssuer<J>,
+        signer: &mut S,
+    ) -> Result<super::clean_authority_issuer::SignedManagementTerminal, SharedAgentHostError>
+    where
+        B: super::clean_authority_issuer::CleanManagementActorStore,
+        J: CleanManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+    {
+        let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let managed = intent.call().managed;
+        let request = intent.request().clone();
+        if managed.profile != AgentProfile::Shared
+            || managed.agent == self.pins.agent
+            || !matches!(request, ManagementRequest::Install(_))
+            || slot
+                .retirement_complete()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            || slot
+                .finalization_work()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .is_some()
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let descriptor = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .clean_runtime_descriptor(crate::service::AgentId(managed.agent.0))?;
+        let physical = ManagedAgentTarget {
+            space: descriptor.identity.space,
+            agent: descriptor.identity.agent,
+            owner: descriptor.identity.owner,
+            profile: descriptor.identity.profile,
+            runtime_deployment: descriptor.identity.runtime_deployment,
+            transition_producer: descriptor.identity.transition_producer,
+        };
+        if descriptor.authority != self.pins.authority {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        intent
+            .verify(self.authority_target(), physical, &RawCredentialVerifier)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        validate_actor_install(&descriptor, &request, package)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        slot.retain_actor(package)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let retained = slot
+            .load_actor()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .ok_or(SharedAgentHostError::Unavailable)?;
+        let receipt =
+            self.issue_management_intent_with_admission(slot, managed, issuer, signer, true)?;
+        let submission = self._network_host.manage_clean(
+            crate::service::AgentId(managed.agent.0),
+            request.clone(),
+            receipt.clone(),
+            SdkManagementArtifacts::Actor(&retained),
+        )?;
+        if !matches!(
+            submission,
+            crate::network::shared_agent::CleanManagementSubmission::Applied {
+                outcome: super::sdk::RuntimeOutcome::Management(_),
+                ..
+            }
+        ) {
+            // For example, a same-slot preflight conflict consumed no ordered
+            // mutation. Keep the issued receipt and reservation for exact retry;
+            // such a return must never become signed application failure.
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let observation = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .observe_durable_install(
+                crate::service::AgentId(managed.agent.0),
+                &request,
+                &receipt,
+            )?;
+        issuer
+            .observe_shared_install(&observation, signer)
+            .map_err(|_| SharedAgentHostError::Unavailable)
+    }
+
     /// Apply a retained signed Install to an independently opened Local Agent.
     /// Retains and re-admits the exact actor package before policy dispatch.
     /// The caller owns protected finalization, retirement and route publication.
@@ -28019,15 +28112,6 @@ mod tests {
             )
             .unwrap();
             let mut install_signer = CountingSigner::new();
-            let install_receipt = owner
-                .issue_management_intent_with_admission(
-                    &mut install_intent,
-                    managed,
-                    &mut install_issuer,
-                    &mut install_signer,
-                    true,
-                )
-                .unwrap();
             harness
                 .fixture
                 .logical_slot
@@ -28035,37 +28119,34 @@ mod tests {
                 .unwrap()
                 .fetch_add(1, Ordering::AcqRel);
             let installed = owner
-                ._network_host
-                .manage_clean(
-                    locator.agent,
-                    ordinary_install,
-                    install_receipt.clone(),
-                    SdkManagementArtifacts::Actor(&ordinary_package),
-                )
-                .unwrap();
-            let crate::network::shared_agent::CleanManagementSubmission::Applied {
-                outcome: RuntimeOutcome::Management(Ok(application)),
-                observed_slot,
-                ..
-            } = installed
-            else {
-                panic!("ordinary actor installation must apply");
-            };
-            let state = owner
-                .host
-                .lock()
-                .unwrap()
-                .clean_state_commitment(locator.agent)
-                .unwrap();
-            let install_ack = install_issuer
-                .observe_durable_application(
-                    &install_receipt,
-                    &application,
-                    state,
-                    observed_slot,
+                .apply_shared_install_from_management_intent(
+                    &mut install_intent,
+                    &ordinary_package,
+                    &mut install_issuer,
                     &mut install_signer,
                 )
                 .unwrap();
+            let crate::agent::clean_authority_issuer::SignedManagementTerminal::Applied(
+                install_ack,
+            ) = installed
+            else {
+                panic!("ordinary actor installation must apply");
+            };
+            let installed_head = owner.ordered_index_for_test().unwrap();
+            assert_eq!(
+                owner
+                    .apply_shared_install_from_management_intent(
+                        &mut install_intent,
+                        &ordinary_package,
+                        &mut install_issuer,
+                        &mut install_signer,
+                    )
+                    .unwrap(),
+                crate::agent::clean_authority_issuer::SignedManagementTerminal::Applied(
+                    install_ack.clone()
+                )
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), installed_head);
             owner
                 .finalize_management_intent_with_admission(
                     &mut install_intent,
@@ -28086,12 +28167,6 @@ mod tests {
             assert!(!owner.management_admission_held().unwrap());
             #[cfg(feature = "experimental-state-blocks")]
             if qualify_failure {
-                harness
-                    .fixture
-                    .logical_slot
-                    .as_ref()
-                    .unwrap()
-                    .fetch_add(1, Ordering::AcqRel);
                 let rejected_package =
                     crate::agent::package_admission::admitted_standard_query_actor_for_test(
                         "ordinary-over-capacity",
@@ -28121,68 +28196,72 @@ mod tests {
                         .unwrap(),
                     )
                     .unwrap();
-                let rejected_receipt = owner
-                    .issue_management_intent_with_admission(
-                        &mut rejected_intent,
-                        managed,
-                        &mut install_issuer,
-                        &mut install_signer,
-                        true,
-                    )
-                    .unwrap();
-                let rejected = owner
-                    ._network_host
-                    .manage_clean(
-                        locator.agent,
-                        rejected_request.clone(),
-                        rejected_receipt.clone(),
-                        SdkManagementArtifacts::Actor(&rejected_package),
-                    )
-                    .unwrap();
-                let (error, observed_slot) = match rejected {
-                    crate::network::shared_agent::CleanManagementSubmission::Applied {
-                        outcome: RuntimeOutcome::Management(Err(error)),
-                        observed_slot,
-                        ..
-                    } => (error, observed_slot),
-                    crate::network::shared_agent::CleanManagementSubmission::Denied {
-                        outcome,
-                        ..
-                    } => {
-                        panic!(
-                            "Shared Install needs durable finality, not a preflight denial: {outcome:?}"
-                        )
-                    }
-                    crate::network::shared_agent::CleanManagementSubmission::Applied {
-                        outcome,
-                        ..
-                    } => {
-                        panic!(
-                            "physical Shared Install must reject at its signed actor limit: {outcome:?}"
-                        )
-                    }
-                };
-                assert_eq!(error, crate::agent_sdk::ManagementError::DirectoryFull);
-                let state = owner
+                let state_before = owner
                     .host
                     .lock()
                     .unwrap()
                     .clean_state_commitment(locator.agent)
                     .unwrap();
-                let terminal = install_issuer
-                    .observe_shared_install(
-                        &owner
-                            .host
-                            .lock()
-                            .unwrap()
-                            .observe_durable_install(
-                                locator.agent,
-                                &rejected_request,
-                                &rejected_receipt,
-                            )
-                            .unwrap(),
+                assert_eq!(
+                    owner.apply_shared_install_from_management_intent(
+                        &mut rejected_intent,
+                        &rejected_package,
+                        &mut install_issuer,
+                        &mut install_signer,
+                    ),
+                    Err(SharedAgentHostError::Conflict)
+                );
+                assert!(owner.management_admission_held().unwrap());
+                assert!(
+                    install_issuer
+                        .recover_observed_terminal(
+                            target,
+                            managed,
+                            &rejected_request,
+                            &rejected_call,
+                            &RawCredentialVerifier,
+                        )
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(
+                    owner
+                        .host
+                        .lock()
+                        .unwrap()
+                        .clean_state_commitment(locator.agent)
+                        .unwrap(),
+                    state_before
+                );
+                let issued_before_retry = install_issuer
+                    .recover_issued_application(
+                        target,
+                        managed,
+                        &rejected_request,
+                        &rejected_call,
+                        &RawCredentialVerifier,
+                    )
+                    .unwrap()
+                    .unwrap();
+                harness
+                    .fixture
+                    .logical_slot
+                    .as_ref()
+                    .unwrap()
+                    .fetch_add(1, Ordering::AcqRel);
+                let terminal = owner
+                    .apply_shared_install_from_management_intent(
+                        &mut rejected_intent,
+                        &rejected_package,
+                        &mut install_issuer,
                         &mut install_signer,
                     )
+                    .unwrap();
+                let state = owner
+                    .host
+                    .lock()
+                    .unwrap()
+                    .clean_state_commitment(locator.agent)
                     .unwrap();
                 let crate::agent::clean_authority_issuer::SignedManagementTerminal::Rejected(
                     failure,
@@ -28191,11 +28270,24 @@ mod tests {
                     panic!("expected signed failure");
                 };
                 assert_eq!(
+                    failure.error,
+                    crate::agent_sdk::ManagementError::DirectoryFull
+                );
+                assert_eq!(failure.receipt, issued_before_retry);
+                assert_eq!(
                     failure.managed.profile,
                     crate::agent_sdk::AgentProfile::Shared
                 );
                 assert_eq!(failure.credential_call, rejected_call.commitment());
-                assert_eq!(failure.failed_at, observed_slot);
+                assert_eq!(
+                    failure.failed_at,
+                    harness
+                        .fixture
+                        .logical_slot
+                        .as_ref()
+                        .unwrap()
+                        .load(Ordering::Acquire)
+                );
                 assert_eq!(failure.reopened_state, state);
                 // Reopen the durable intent/issuer before Authority finality;
                 // retain the running physical/system owners for this protocol gate.

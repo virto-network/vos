@@ -401,6 +401,27 @@ authenticate genesis before reopening the physical target. Keep the unissued-onl
 startup gate until this recovery is qualified under response loss/restart.
 Public Shared management remains disabled; bundled artifacts are unchanged.
 
+The next integration step adds an internal bootstrap-owner Shared Install
+application helper, replacing the physical fixture's hand-assembled
+authorization/application/signing sequence. It validates the signed target
+against the live descriptor, retains and re-admits the package, captures pending
+Authority admission, and signs only a replay-verified Shared terminal. Descriptor
+validation does not enumerate the actor directory. Unconsumed preflight failures
+remain retryable conflicts with their issued receipt and reservation intact;
+they are not signed semantic failures. This helper does not yet activate
+controller dispatch or broaden startup handoff admission. The bundled
+publication/recovery regression passes through this helper, including exact
+pre-finalization Install retry (113.13 s). Six focused Shared-host regressions
+and the default-feature core build also pass. Logs:
+`target/shared-install-owner-*`.
+
+Continuation recovery must also handle an Authority refusal before receipt
+issuance, separately from an applied Install rejection: the current generic
+denial coordinator requires an initial Create/absent generation. Do not reuse
+that absence proof for Install on an existing generation or treat a refused
+authorization as MAF1. Include this boundary with pending authorization,
+application, finalization and retirement restart tests before enabling ingress.
+
 Signed Install failure finality now supports Local and Shared, retaining exact
 call/profile/receipt bindings and rejecting Private. Generic intent, issuer and
 finalization helpers no longer depend on experimental storage. Validation:
@@ -420,12 +441,15 @@ storage (3.88 s). Default-feature and standalone `std` core builds pass.
 The candidate Authority ELF SHA-256 is
 `3fe2541cdf2b9cbe9ae30cbe5c9e180cd509a6ee0716bc86afcf0b5a2f221ffd`.
 The physical gate `native_shared_candidate_install_failure_finalizes_and_retires`
-passes through the replay-backed signing boundary (468.31 s): an ordinary Shared Agent
+passes through the owner application helper and replay-backed signing boundary
+(413.61 s): an ordinary Shared Agent
 installs one actor, rejects a second with `DirectoryFull`, finalizes signed MAF1,
 releases its reservation, and exactly retries reopened intent/issuer state.
+An initial same-slot attempt preserves the ordinary state, signs no terminal,
+and retains admission; a later-slot retry uses the identical issued receipt.
 The fixture still seeds its continuing issuer directly and reopens memory-backed
-lifecycle stores; the physical journals are file-backed. The earlier corrected-clock
-run also passed (506.38 s). This is not controller-owned public Install, three-node,
+lifecycle stores; the physical journals are file-backed.
+This is not controller-owned public Install, three-node,
 load or release qualification. Logs use disk-backed `target/shared-failure-*`
 and `target/shared-install-observation-*`.
 
