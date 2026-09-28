@@ -7271,6 +7271,7 @@ mod tests {
         );
         let request = clean_install_request(descriptor.identity.agent, &package);
         let receipt = clean_management_receipt(descriptor, &request, 2, &key(0x41));
+        let first_receipt = receipt.clone();
         let commit = |host: &mut SharedAgentHost, prepared: PreparedCleanManagement| {
             let input = prepared
                 .input()
@@ -7301,7 +7302,7 @@ mod tests {
             commit(&mut host, first),
             crate::agent_sdk::RuntimeOutcome::Management(Ok(_))
         ));
-        let mut rejected = request;
+        let mut rejected = request.clone();
         let crate::agent_sdk::ManagementRequest::Install(install) = &mut rejected else {
             unreachable!();
         };
@@ -7364,6 +7365,11 @@ mod tests {
         assert_eq!(observation.result(), &evidence.result);
         assert_eq!(observation.receipt(), &receipt);
         assert_eq!(observation.applied_at(), 21);
+        assert!(
+            host.observe_durable_install(fixture.agent, &request, &first_receipt)
+                .is_err(),
+            "later management must not lend its evidence to the previous Install"
+        );
         let mut substituted = receipt.clone();
         substituted.signature[0] ^= 1;
         assert!(
@@ -7922,8 +7928,8 @@ mod tests {
         let prepared_install = host
             .prepare_clean_management(
                 fixture.agent,
-                install,
-                receipt,
+                install.clone(),
+                receipt.clone(),
                 SdkManagementArtifacts::Actor(&actor_package),
             )
             .unwrap();
@@ -7953,6 +7959,9 @@ mod tests {
         else {
             panic!("physical Query actor install did not complete")
         };
+        let install_observation = host
+            .observe_durable_install(fixture.agent, &install, &receipt)
+            .unwrap();
         let material = host
             .supervisor_invocation_material(fixture.agent, entry.actor)
             .unwrap();
@@ -8020,6 +8029,13 @@ mod tests {
             Some(1),
         );
 
+        assert_eq!(
+            host.observe_durable_install(fixture.agent, &install, &receipt)
+                .unwrap(),
+            install_observation,
+            "later Invoke must not change the identity of the retained Install"
+        );
+
         let candidate = host.request_snapshot_compaction(fixture.agent).unwrap();
         assert_eq!(candidate.claim().raft_index(), invoke_index);
         let certificate = snapshot_certificate(&candidate, &fixture);
@@ -8027,6 +8043,11 @@ mod tests {
         drop(host);
 
         let mut host = open_native_clean_host(&directory, &fixture);
+        assert_eq!(
+            host.observe_durable_install(fixture.agent, &install, &receipt)
+                .unwrap(),
+            install_observation
+        );
         let no_op_index = host.agents[&fixture.agent]
             .driver
             .ledger()
@@ -8164,7 +8185,12 @@ mod tests {
         );
         drop(host);
 
-        let host = open_native_clean_host(&directory, &fixture);
+        let mut host = open_native_clean_host(&directory, &fixture);
+        assert_eq!(
+            host.observe_durable_install(fixture.agent, &install, &receipt)
+                .unwrap(),
+            install_observation
+        );
         assert!(
             host.retained_positive_clean_acknowledgement(fixture.agent, &work, &authorization,)
                 .unwrap()

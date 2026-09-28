@@ -401,8 +401,8 @@ authenticate genesis before reopening the physical target. Keep the unissued-onl
 startup gate until this recovery is qualified under response loss/restart.
 Public Shared management remains disabled; bundled artifacts are unchanged.
 
-The next integration step adds an internal bootstrap-owner Shared Install
-application helper, replacing the physical fixture's hand-assembled
+The internal bootstrap-owner Shared Install application helper replaces the
+physical fixture's hand-assembled
 authorization/application/signing sequence. It validates the signed target
 against the live descriptor, retains and re-admits the package, captures pending
 Authority admission, and signs only a replay-verified Shared terminal. Descriptor
@@ -410,10 +410,19 @@ validation does not enumerate the actor directory. Unconsumed preflight failures
 remain retryable conflicts with their issued receipt and reservation intact;
 they are not signed semantic failures. This helper does not yet activate
 controller dispatch or broaden startup handoff admission. The bundled
-publication/recovery regression passes through this helper, including exact
-pre-finalization Install retry (113.13 s). Six focused Shared-host regressions
-and the default-feature core build also pass. Logs:
-`target/shared-install-owner-*`.
+publication/recovery regression passes through the application and completion
+helpers, including exact pre-finalization retry and identical terminal recovery
+after Invoke/ACK and owner reopen with no new system work (129.22 s). Six focused
+Shared-host regressions pass with and without experimental storage (2.53/3.12 s),
+as does the default-feature core build. Logs: `target/shared-install-stable-*`;
+the prior application-only checkpoint remains in `target/shared-install-owner-*`.
+
+Recovery now also has an internal owner completion helper: reauthenticate an
+existing signed terminal against fresh physical Install evidence, then run the
+existing finalization and retirement guards, returning the identical result.
+It never reconstructs a missing retained package after application. Controller
+discovery/admission integration remains gated; helper execution alone does not
+qualify startup restoration of pending Install reservations.
 
 Continuation recovery must also handle an Authority refusal before receipt
 issuance, separately from an applied Install rejection: the current generic
@@ -432,26 +441,40 @@ scope, exact retirement/reopen, contradictory success and cross-profile refusal.
 Shared signing now consumes only a `SharedInstallObservation` constructed by
 fresh journal replay plus Raft-ledger/checkpoint reconciliation under the host
 lease. It binds the exact receipt, request and managed target, refusing missing
-durable evidence or a later Ordered boundary. The raw test-only signing helper
-is removed. Six focused Shared-host regressions pass (3.29 s), including refusal
-of an unconsumed same-slot denial and a substituted receipt, plus exact
-observation after filesystem reopen. The same six tests pass without experimental
-storage (3.88 s). Default-feature and standalone `std` core builds pass.
+durable evidence or evidence replaced by a different management mutation.
+Its `reopened_state` is a domain-separated commitment to the authenticated
+Install boundary (genesis, input, Ordered entry, receipt/request and original
+slot), not today's entire runtime state. A regression reproduced the previous
+failure after an ordinary Invoke; stable observation now survives Invoke/ACK,
+certified checkpoint pruning and filesystem reopen. This uses the existing
+opaque signed commitment field, changes no guest/wire format, and adds no
+compatibility promise for earlier unreleased experimental Shared ACKs.
+The raw test-only signing helper is removed. The native checkpoint regression
+passes with and without experimental storage (2.20/1.92 s); the pre-fix failure
+is retained in `target/shared-install-stable-before.log`. The six host tests
+also cover unconsumed same-slot denial, substituted receipts and refusal to
+reuse evidence after a later management mutation. The standalone `std` core
+build passed at the preceding replay-observation checkpoint.
 
 The candidate Authority ELF SHA-256 is
 `3fe2541cdf2b9cbe9ae30cbe5c9e180cd509a6ee0716bc86afcf0b5a2f221ffd`.
 The physical gate `native_shared_candidate_install_failure_finalizes_and_retires`
-passes through the owner application helper and replay-backed signing boundary
-(413.61 s): an ordinary Shared Agent
+passes through the owner application/completion helpers and replay-backed
+signing boundary (468.54 s): an ordinary Shared Agent
 installs one actor, rejects a second with `DirectoryFull`, finalizes signed MAF1,
 releases its reservation, and exactly retries reopened intent/issuer state.
+After public-route Invoke/ACK and full owner reopen, the same signed terminal
+is recovered without new system-journal entries. Native tests separately cover
+ordinary-generation checkpoint pruning; the physical fixture checkpoints the
+system generation, not the ordinary one.
 An initial same-slot attempt preserves the ordinary state, signs no terminal,
 and retains admission; a later-slot retry uses the identical issued receipt.
 The fixture still seeds its continuing issuer directly and reopens memory-backed
 lifecycle stores; the physical journals are file-backed.
 This is not controller-owned public Install, three-node,
-load or release qualification. Logs use disk-backed `target/shared-failure-*`
-and `target/shared-install-observation-*`.
+load or release qualification. Current logs use disk-backed
+`target/shared-install-stable-*`; prior gates remain in
+`target/shared-failure-*` and `target/shared-install-observation-*`.
 
 Two qualification lessons remain relevant. Same-slot management correctly
 returns an unconsumed `AuthoritySequenceConflict`; advancing the fixture clock

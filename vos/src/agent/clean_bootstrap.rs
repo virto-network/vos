@@ -5289,6 +5289,90 @@ where
         Ok((agent, acknowledgement))
     }
 
+    /// Resume application, signed finalization and retirement of one retained
+    /// Shared Install. Startup must restore its admission and authenticate the
+    /// generation before calling this; this method does not admit routes.
+    pub(crate) fn complete_shared_install_from_management_intent<B, J, S>(
+        &mut self,
+        slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
+        package: &AdmittedActorPackage,
+        issuer: &mut DurableCleanManagementIssuer<J>,
+        signer: &mut S,
+    ) -> Result<super::clean_authority_issuer::SignedManagementTerminal, SharedAgentHostError>
+    where
+        B: super::clean_authority_issuer::CleanManagementActorStore,
+        J: CleanManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+    {
+        use super::clean_authority_issuer::SignedManagementTerminal;
+        let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let managed = intent.call().managed;
+        if managed.profile != AgentProfile::Shared
+            || managed.agent == self.pins.agent
+            || !matches!(intent.request(), ManagementRequest::Install(_))
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let terminal = if let Some((receipt, terminal)) = issuer
+            .recover_observed_terminal(
+                self.authority_target(),
+                managed,
+                intent.request(),
+                intent.call(),
+                &RawCredentialVerifier,
+            )
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+        {
+            let observation = self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .observe_durable_install(
+                    crate::service::AgentId(managed.agent.0),
+                    intent.request(),
+                    &receipt,
+                )?;
+            let matches = match &terminal {
+                SignedManagementTerminal::Applied(ack) => {
+                    observation.result() == &Ok(ack.application.clone())
+                        && observation.reopened_state() == ack.reopened_state
+                        && observation.applied_at() == ack.applied_at
+                }
+                SignedManagementTerminal::Rejected(failure) => {
+                    observation.result() == &Err(failure.error)
+                        && observation.reopened_state() == failure.reopened_state
+                        && observation.applied_at() == failure.failed_at
+                }
+            };
+            if !matches || observation.managed() != managed {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            // An exact completed retry must not repair or replace its package
+            // sidecar. Recovery needs the independently retained original input.
+            let retained = slot
+                .load_actor()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .ok_or(SharedAgentHostError::Unavailable)?;
+            if retained.exact_bytes() != package.exact_bytes() {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            terminal
+        } else {
+            self.apply_shared_install_from_management_intent(slot, package, issuer, signer)?
+        };
+        match &terminal {
+            SignedManagementTerminal::Applied(ack) => {
+                self.finalize_management_intent_with_admission(slot, managed, ack, issuer, true)?;
+                self.finish_live_management_intent(slot, managed, ack, issuer)?;
+            }
+            SignedManagementTerminal::Rejected(failure) => {
+                self.finalize_failed_install_with_admission(slot, managed, failure, issuer, true)?;
+                self.finish_live_failed_install(slot, managed, failure, issuer)?;
+            }
+        }
+        Ok(terminal)
+    }
+
     /// Apply a retained ordinary Shared Install and sign only its replay-proved
     /// terminal. The caller owns finalization/retirement and must keep the
     /// management reservation until those phases complete. This is not a public
@@ -28087,8 +28171,9 @@ mod tests {
             install_call.invocation = install_call.expected_invocation();
             install_call.signature = key.sign(&install_call.signing_bytes()).to_bytes();
             let managed = install_call.managed;
+            let install_intent_store = IssuerMemoryStore::default();
             let mut install_intent =
-                CleanManagementIntentSlot::open(IssuerMemoryStore::default()).unwrap();
+                CleanManagementIntentSlot::open(install_intent_store.clone()).unwrap();
             install_intent
                 .pledge(
                     CleanManagementIntent::new(
@@ -28147,24 +28232,30 @@ mod tests {
                 )
             );
             assert_eq!(owner.ordered_index_for_test().unwrap(), installed_head);
-            owner
-                .finalize_management_intent_with_admission(
-                    &mut install_intent,
-                    managed,
-                    &install_ack,
-                    &mut install_issuer,
-                    true,
+            assert_eq!(
+                owner
+                    .complete_shared_install_from_management_intent(
+                        &mut install_intent,
+                        &ordinary_package,
+                        &mut install_issuer,
+                        &mut install_signer,
+                    )
+                    .unwrap(),
+                crate::agent::clean_authority_issuer::SignedManagementTerminal::Applied(
+                    install_ack.clone()
                 )
-                .unwrap();
-            owner
-                .finish_live_management_intent(
-                    &mut install_intent,
-                    managed,
-                    &install_ack,
-                    &install_issuer,
-                )
-                .unwrap();
+            );
             assert!(!owner.management_admission_held().unwrap());
+            #[allow(unused_mut)]
+            let mut retained_install = (ordinary_install.clone(), install_ack.receipt.clone());
+            #[allow(unused_mut)]
+            let mut retained_completion = (
+                install_intent_store,
+                ordinary_package.clone(),
+                crate::agent::clean_authority_issuer::SignedManagementTerminal::Applied(
+                    install_ack.clone(),
+                ),
+            );
             #[cfg(feature = "experimental-state-blocks")]
             if qualify_failure {
                 let rejected_package =
@@ -28288,7 +28379,16 @@ mod tests {
                         .unwrap()
                         .load(Ordering::Acquire)
                 );
-                assert_eq!(failure.reopened_state, state);
+                assert_eq!(
+                    failure.reopened_state,
+                    owner
+                        .host
+                        .lock()
+                        .unwrap()
+                        .observe_durable_install(locator.agent, &rejected_request, &failure.receipt)
+                        .unwrap()
+                        .reopened_state()
+                );
                 // Reopen the durable intent/issuer before Authority finality;
                 // retain the running physical/system owners for this protocol gate.
                 drop(rejected_intent);
@@ -28302,29 +28402,26 @@ mod tests {
                     managed.agent,
                 )
                 .unwrap();
-                owner
-                    .finalize_failed_install_with_admission(
-                        &mut rejected_intent,
-                        managed,
-                        &failure,
-                        &mut install_issuer,
-                        true,
+                assert_eq!(
+                    owner
+                        .complete_shared_install_from_management_intent(
+                            &mut rejected_intent,
+                            &rejected_package,
+                            &mut install_issuer,
+                            &mut install_signer,
+                        )
+                        .unwrap(),
+                    crate::agent::clean_authority_issuer::SignedManagementTerminal::Rejected(
+                        failure.clone()
                     )
-                    .unwrap();
-                owner
-                    .finish_live_failed_install(
-                        &mut rejected_intent,
-                        managed,
-                        &failure,
-                        &install_issuer,
-                    )
-                    .unwrap();
+                );
                 assert!(!owner.management_admission_held().unwrap());
                 assert!(rejected_intent.retirement_complete().unwrap());
                 let finalized_head = owner.ordered_index_for_test().unwrap();
                 drop(rejected_intent);
                 drop(install_issuer);
-                let mut rejected_intent = CleanManagementIntentSlot::open(rejected_store).unwrap();
+                let mut rejected_intent =
+                    CleanManagementIntentSlot::open(rejected_store.clone()).unwrap();
                 let mut install_issuer = DurableCleanManagementIssuer::open(
                     install_issuer_store.clone(),
                     target.binding,
@@ -28337,23 +28434,19 @@ mod tests {
                         .failure_finalization_status(&failure)
                         .unwrap()
                 );
-                owner
-                    .finalize_failed_install_with_admission(
-                        &mut rejected_intent,
-                        managed,
-                        &failure,
-                        &mut install_issuer,
-                        true,
+                assert_eq!(
+                    owner
+                        .complete_shared_install_from_management_intent(
+                            &mut rejected_intent,
+                            &rejected_package,
+                            &mut install_issuer,
+                            &mut install_signer,
+                        )
+                        .unwrap(),
+                    crate::agent::clean_authority_issuer::SignedManagementTerminal::Rejected(
+                        failure.clone()
                     )
-                    .unwrap();
-                owner
-                    .finish_live_failed_install(
-                        &mut rejected_intent,
-                        managed,
-                        &failure,
-                        &install_issuer,
-                    )
-                    .unwrap();
+                );
                 assert_eq!(owner.ordered_index_for_test().unwrap(), finalized_head);
                 assert_eq!(
                     owner
@@ -28364,7 +28457,21 @@ mod tests {
                         .unwrap(),
                     state
                 );
+                retained_install = (rejected_request, failure.receipt.clone());
+                retained_completion = (
+                    rejected_store,
+                    rejected_package,
+                    crate::agent::clean_authority_issuer::SignedManagementTerminal::Rejected(
+                        failure,
+                    ),
+                );
             }
+            let retained_install_observation = owner
+                .host
+                .lock()
+                .unwrap()
+                .observe_durable_install(locator.agent, &retained_install.0, &retained_install.1)
+                .unwrap();
             let weak_host = Arc::downgrade(&owner.host);
             struct SharedInventoryAuthenticator(u8);
             impl crate::agent::production_owner::AuthorityProjectionQueryAuthenticator
@@ -28547,6 +28654,21 @@ mod tests {
                 ));
                 work
             };
+            assert_eq!(
+                weak_host
+                    .upgrade()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .observe_durable_install(
+                        locator.agent,
+                        &retained_install.0,
+                        &retained_install.1
+                    )
+                    .unwrap(),
+                retained_install_observation,
+                "Invoke/ACK must preserve the completed Install terminal identity"
+            );
             assert!(
                 production
                     .handle()
@@ -28636,8 +28758,47 @@ mod tests {
                 controller
                     .recover(&mut reopened, &mut signer)
                     .expect("fresh Authority decision reopens retired generation");
+                assert_eq!(
+                    reopened
+                        .host
+                        .lock()
+                        .unwrap()
+                        .observe_durable_install(
+                            locator.agent,
+                            &retained_install.0,
+                            &retained_install.1
+                        )
+                        .unwrap(),
+                    retained_install_observation
+                );
                 assert_eq!(reopened.host.lock().unwrap().len(), 2);
                 assert!(!reopened.management_admission_held().unwrap());
+                let before_install_retry = reopened.ordered_index_for_test().unwrap();
+                let mut completed_intent =
+                    CleanManagementIntentSlot::open(retained_completion.0.clone()).unwrap();
+                let mut completed_issuer = DurableCleanManagementIssuer::open(
+                    install_issuer_store.clone(),
+                    target.binding,
+                    managed.space,
+                    managed.agent,
+                )
+                .unwrap();
+                assert_eq!(
+                    reopened
+                        .complete_shared_install_from_management_intent(
+                            &mut completed_intent,
+                            &retained_completion.1,
+                            &mut completed_issuer,
+                            &mut signer,
+                        )
+                        .unwrap(),
+                    retained_completion.2
+                );
+                assert_eq!(
+                    reopened.ordered_index_for_test().unwrap(),
+                    before_install_retry,
+                    "finalized Install retry after Invoke/ACK and owner reopen must not append system work"
+                );
                 assert_eq!(
                     reopened
                         .host

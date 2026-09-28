@@ -1214,6 +1214,10 @@ where
     }
 
     /// Only fresh authenticated replay can construct an Install observation.
+    /// Bind its identity to the retained management boundary, not the mutable
+    /// current state: later Invoke/ACK and certified compaction must preserve
+    /// exact terminal recovery. A later management mutation replaces this
+    /// evidence and cannot stand in for an unfinished predecessor.
     /// This proves a durable result, not Authority finality or route readiness.
     pub(crate) fn observe_durable_install(
         &mut self,
@@ -1227,7 +1231,13 @@ where
         let evidence = recovered
             .clean_management_evidence()
             .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
-        if evidence.ordered != recovered.ordered_base()
+        let head = evidence
+            .ordered
+            .head
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        if evidence.ordered.index == 0
+            || evidence.ordered.index > recovered.ordered_base().index
+            || evidence.input == ReplayInputId::ZERO
             || evidence.authority != receipt.commitment()
             || evidence.request != request.replay_commitment()
             || evidence.epoch != receipt.selector.epoch
@@ -1247,9 +1257,22 @@ where
             false,
         )
         .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
-        let commitment =
-            super::journal::system_genesis_post_create_state_commitment(recovered.state())
-                .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        // The authenticated Ordered entry binds execution and its state roots.
+        // Its identity survives subsequent application work and checkpointing;
+        // hashing today's full runtime state would manufacture a different ACK
+        // for the same completed Install after any later invocation.
+        let commitment = crate::agent_sdk::Hash::digest(
+            b"vos/agent/shared/install-terminal/v1",
+            &[
+                &recovered.heads().genesis.0,
+                &evidence.input.0,
+                &head.0,
+                &evidence.ordered.index.to_le_bytes(),
+                &evidence.authority.0,
+                &evidence.request.0,
+                &evidence.observed_slot.to_le_bytes(),
+            ],
+        );
         Ok(SharedInstallObservation {
             managed: crate::agent_sdk::authority::ManagedAgentTarget {
                 space: descriptor.identity.space,
@@ -1261,7 +1284,7 @@ where
             },
             receipt: receipt.clone(),
             result: evidence.result.clone(),
-            reopened_state: crate::agent_sdk::Hash(commitment.0),
+            reopened_state: commitment,
             applied_at: evidence.observed_slot,
         })
     }
