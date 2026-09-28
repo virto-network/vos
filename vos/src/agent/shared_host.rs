@@ -2473,6 +2473,21 @@ impl SharedAgentHost {
         ))
     }
 
+    pub(crate) fn observe_durable_install(
+        &mut self,
+        agent: AgentId,
+        request: &crate::agent_sdk::ManagementRequest,
+        receipt: &crate::agent_sdk::authority::AuthorityReceipt,
+    ) -> Result<super::shared_journal_driver::SharedInstallObservation, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        self.agents
+            .get_mut(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .observe_durable_install(request, receipt)
+            .map_err(map_driver_error)
+    }
+
     pub(crate) fn clean_state_commitment(
         &self,
         agent: AgentId,
@@ -7204,6 +7219,170 @@ mod tests {
                 .unwrap(),
             original
         );
+    }
+
+    #[test]
+    #[cfg(feature = "pvm")]
+    fn clean_shared_install_failure_requires_fresh_slot_and_recovers() {
+        use super::super::shared_journal_driver::PreparedCleanManagement;
+        let runtime = super::super::package_admission::admitted_scripted_runtime_for_test(
+            "shared-install-terminal",
+            0x77,
+            vec![super::super::package_admission::ScriptedRuntimeCase {
+                input: vec![0],
+                output: vec![0],
+                copies: Vec::new(),
+            }],
+        );
+        let fixture = standard_projection_fixture_with_runtime(0x27, runtime);
+        let directory = TempDirectory::new("shared_install_terminal");
+        let clock = Arc::new(AtomicU64::new(20));
+        let mut host = open_native_clean_host_at_slot(&directory, &fixture, Arc::clone(&clock));
+        host.provision(
+            fixture.provision.clone(),
+            fixture.catalog.clone(),
+            fixture.committee_authority,
+        )
+        .unwrap();
+        let ReplayOperation::CleanManage {
+            request: crate::agent_sdk::ManagementRequest::Create(descriptor),
+            ..
+        } = &fixture.provision.proposal().create().operation
+        else {
+            panic!("Create");
+        };
+        let package = super::super::package_admission::admitted_standard_actor_for_test(
+            "terminal-worker",
+            crate::agent_sdk::StateLane::Linear,
+            0x78,
+        );
+        let request = clean_install_request(descriptor.identity.agent, &package);
+        let receipt = clean_management_receipt(descriptor, &request, 2, &key(0x41));
+        let commit = |host: &mut SharedAgentHost, prepared: PreparedCleanManagement| {
+            let input = prepared
+                .input()
+                .expect("terminal must have an Ordered input");
+            for payload in prepared.into_commands() {
+                let index = host.agents[&fixture.agent]
+                    .driver
+                    .ledger()
+                    .append_committed_for_test(8, &EntryKind::Data { payload })
+                    .unwrap();
+                assert_eq!(
+                    host.apply_next(fixture.agent).unwrap(),
+                    SharedAgentApplyOutcome::Applied { index }
+                );
+            }
+            host.take_clean_ordered_result(fixture.agent, input)
+                .unwrap()
+        };
+        let first = host
+            .prepare_clean_management(
+                fixture.agent,
+                request.clone(),
+                receipt,
+                SdkManagementArtifacts::Actor(&package),
+            )
+            .unwrap();
+        assert!(matches!(
+            commit(&mut host, first),
+            crate::agent_sdk::RuntimeOutcome::Management(Ok(_))
+        ));
+        let mut rejected = request;
+        let crate::agent_sdk::ManagementRequest::Install(install) = &mut rejected else {
+            unreachable!();
+        };
+        install.installation_id = crate::agent_sdk::InstallationId([0x93; 32]);
+        install.registry_reservation = crate::agent_sdk::Hash([0x94; 32]);
+        let mut receipt = clean_management_receipt(descriptor, &rejected, 3, &key(0x41));
+        receipt.selector.acknowledged_through = 2;
+        receipt.signature = key(0x41).sign(&receipt.signing_bytes()).to_bytes();
+        let before = host.journal_position(fixture.agent).unwrap();
+        let denied = host
+            .prepare_clean_management(
+                fixture.agent,
+                rejected.clone(),
+                receipt.clone(),
+                SdkManagementArtifacts::Actor(&package),
+            )
+            .unwrap();
+        assert_eq!(
+            denied.denied(),
+            Some(&crate::agent_sdk::RuntimeOutcome::Management(Err(
+                crate::agent_sdk::ManagementError::AuthoritySequenceConflict,
+            )))
+        );
+        assert!(denied.into_commands().is_empty());
+        assert_eq!(host.journal_position(fixture.agent).unwrap(), before);
+        assert!(
+            host.observe_durable_install(fixture.agent, &rejected, &receipt)
+                .is_err()
+        );
+        // A distinct signed mutation needs a strictly newer logical slot.
+        // Once admitted, the semantic rejection is recorded durably.
+        clock.store(21, Ordering::SeqCst);
+        let expected = crate::agent_sdk::RuntimeOutcome::Management(Err(
+            crate::agent_sdk::ManagementError::AlreadyExists,
+        ));
+        let prepared = host
+            .prepare_clean_management(
+                fixture.agent,
+                rejected.clone(),
+                receipt.clone(),
+                SdkManagementArtifacts::Actor(&package),
+            )
+            .unwrap();
+        assert_eq!(commit(&mut host, prepared), expected);
+        let after = host.journal_position(fixture.agent).unwrap();
+        assert_eq!(after.ordered_index, before.ordered_index + 1);
+        let evidence = host
+            .management_evidence_for_test(fixture.agent)
+            .unwrap()
+            .unwrap();
+        assert_eq!(evidence.authority, receipt.commitment());
+        assert_eq!(evidence.request, rejected.replay_commitment());
+        assert_eq!(
+            evidence.result,
+            Err(crate::agent_sdk::ManagementError::AlreadyExists)
+        );
+        let observation = host
+            .observe_durable_install(fixture.agent, &rejected, &receipt)
+            .unwrap();
+        assert_eq!(observation.result(), &evidence.result);
+        assert_eq!(observation.receipt(), &receipt);
+        assert_eq!(observation.applied_at(), 21);
+        let mut substituted = receipt.clone();
+        substituted.signature[0] ^= 1;
+        assert!(
+            host.observe_durable_install(fixture.agent, &rejected, &substituted)
+                .is_err()
+        );
+        drop(host);
+        clock.store(40, Ordering::SeqCst);
+        let mut reopened = open_native_clean_host_at_slot(&directory, &fixture, clock);
+        assert_eq!(
+            reopened
+                .observe_durable_install(fixture.agent, &rejected, &receipt)
+                .unwrap(),
+            observation
+        );
+        assert_eq!(
+            reopened
+                .management_evidence_for_test(fixture.agent)
+                .unwrap(),
+            Some(evidence)
+        );
+        let retry = reopened
+            .prepare_clean_management(
+                fixture.agent,
+                rejected,
+                receipt.clone(),
+                SdkManagementArtifacts::Actor(&package),
+            )
+            .unwrap();
+        assert_eq!(retry.retained(), Some(&expected));
+        assert!(retry.into_commands().is_empty());
+        assert_eq!(reopened.journal_position(fixture.agent).unwrap(), after);
     }
 
     #[test]

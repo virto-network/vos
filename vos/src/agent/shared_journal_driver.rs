@@ -856,6 +856,37 @@ pub(crate) enum PreparedCleanManagement {
     },
 }
 
+/// Created only by the locked journal driver's fresh replay boundary. A caller
+/// must retain lifecycle ordering until it durably pledges the signed terminal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SharedInstallObservation {
+    managed: crate::agent_sdk::authority::ManagedAgentTarget,
+    receipt: crate::agent_sdk::authority::AuthorityReceipt,
+    result: Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError>,
+    reopened_state: crate::agent_sdk::Hash,
+    applied_at: u64,
+}
+
+impl SharedInstallObservation {
+    pub(crate) fn managed(&self) -> crate::agent_sdk::authority::ManagedAgentTarget {
+        self.managed
+    }
+    pub(crate) fn receipt(&self) -> &crate::agent_sdk::authority::AuthorityReceipt {
+        &self.receipt
+    }
+    pub(crate) fn result(
+        &self,
+    ) -> &Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError> {
+        &self.result
+    }
+    pub(crate) fn reopened_state(&self) -> crate::agent_sdk::Hash {
+        self.reopened_state
+    }
+    pub(crate) fn applied_at(&self) -> u64 {
+        self.applied_at
+    }
+}
+
 impl PreparedCleanManagement {
     pub(crate) const fn input(&self) -> Option<ReplayInputId> {
         match self {
@@ -1121,6 +1152,36 @@ where
         let _entered = span.enter();
         let started = std::time::Instant::now();
         let operation = request.into_operation(0);
+        let (recovered, executor) = self.replay_verified_current()?;
+        let input = if let Some(input) = anchored_input {
+            input
+        } else {
+            recent_clean_ordered_operation(&self.store, &recovered, &operation)?
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?
+        };
+        let outcome = executor
+            .clean_ordered_result(input)
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        if !matches!(outcome, crate::agent_sdk::RuntimeOutcome::Completed(_)) {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        tracing::debug!(
+            elapsed_us = started.elapsed().as_micros() as u64,
+            "durable terminal verification complete"
+        );
+        Ok(outcome)
+    }
+
+    fn replay_verified_current(
+        &mut self,
+    ) -> Result<
+        (
+            ReplayMaterialization,
+            StandardLocalReplayExecutor<S::Resolver>,
+        ),
+        SharedJournalDriverError,
+    > {
+        let started = std::time::Instant::now();
         let resolver = self.store.catalog_blob_resolver()?;
         let mut executor = StandardLocalReplayExecutor::new_shared(
             resolver,
@@ -1149,23 +1210,60 @@ where
         {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
-        let input = if let Some(input) = anchored_input {
-            input
-        } else {
-            recent_clean_ordered_operation(&self.store, &recovered, &operation)?
-                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?
-        };
-        let outcome = executor
-            .clean_ordered_result(input)
-            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
-        if !matches!(outcome, crate::agent_sdk::RuntimeOutcome::Completed(_)) {
+        Ok((recovered, executor))
+    }
+
+    /// Only fresh authenticated replay can construct an Install observation.
+    /// This proves a durable result, not Authority finality or route readiness.
+    pub(crate) fn observe_durable_install(
+        &mut self,
+        request: &crate::agent_sdk::ManagementRequest,
+        receipt: &crate::agent_sdk::authority::AuthorityReceipt,
+    ) -> Result<SharedInstallObservation, SharedJournalDriverError> {
+        if !matches!(request, crate::agent_sdk::ManagementRequest::Install(_)) {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
-        tracing::debug!(
-            elapsed_us = started.elapsed().as_micros() as u64,
-            "durable terminal verification complete"
-        );
-        Ok(outcome)
+        let (recovered, executor) = self.replay_verified_current()?;
+        let evidence = recovered
+            .clean_management_evidence()
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        if evidence.ordered != recovered.ordered_base()
+            || evidence.authority != receipt.commitment()
+            || evidence.request != request.replay_commitment()
+            || evidence.epoch != receipt.selector.epoch
+            || evidence.sequence != receipt.selector.decision_sequence
+        {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        let descriptor = executor.trusted_current_clean_descriptor(recovered.runtime())?;
+        if descriptor.identity.profile != crate::agent_sdk::AgentProfile::Shared {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        super::driver::verify_clean_management_receipt(
+            &descriptor,
+            request,
+            receipt,
+            evidence.observed_slot,
+            false,
+        )
+        .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        let commitment =
+            super::journal::system_genesis_post_create_state_commitment(recovered.state())
+                .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        Ok(SharedInstallObservation {
+            managed: crate::agent_sdk::authority::ManagedAgentTarget {
+                space: descriptor.identity.space,
+                agent: descriptor.identity.agent,
+                owner: descriptor.identity.owner,
+                profile: descriptor.identity.profile,
+                runtime_deployment: descriptor.identity.runtime_deployment,
+                transition_producer: descriptor.identity.transition_producer,
+            },
+            receipt: receipt.clone(),
+            result: evidence.result.clone(),
+            reopened_state: crate::agent_sdk::Hash(commitment.0),
+            applied_at: evidence.observed_slot,
+        })
     }
 
     pub(crate) fn local_role(&self) -> Result<Option<ReplicaRole>, SharedJournalDriverError> {

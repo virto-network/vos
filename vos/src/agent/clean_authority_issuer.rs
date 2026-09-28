@@ -1621,6 +1621,46 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         }
     }
 
+    /// Sign only the locked Shared journal driver's replay-verified Install
+    /// result. A nondurable preflight return cannot construct this observation.
+    #[cfg(all(feature = "std", feature = "storage", target_os = "linux"))]
+    pub(crate) fn observe_shared_install<S: CleanManagementReceiptSigner>(
+        &mut self,
+        observation: &super::shared_journal_driver::SharedInstallObservation,
+        signer: &mut S,
+    ) -> Result<SignedManagementTerminal, CleanManagementIssuerError<B::Error, S::Error>> {
+        self.ensure_live()?;
+        let receipt_bytes = observation
+            .receipt()
+            .encode()
+            .map_err(|_| CleanManagementIssuerError::InvalidState)?;
+        let decision = self
+            .image
+            .retained
+            .iter()
+            .chain(self.image.acknowledged.iter())
+            .find(|record| record.receipt == receipt_bytes)
+            .and_then(|record| decode_authorized_decision(&record.decision).ok())
+            .ok_or(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::InvalidObservation,
+            ))?;
+        if decision.operation != AuthorityOperationKind::InstallActor
+            || decision.application.map(|application| application.managed)
+                != Some(observation.managed())
+        {
+            return Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::InvalidObservation,
+            ));
+        }
+        self.observe_durable_terminal(
+            observation.receipt(),
+            observation.result().as_ref().map_err(|error| *error),
+            observation.reopened_state(),
+            observation.applied_at(),
+            signer,
+        )
+    }
+
     fn observe_durable_terminal<S: CleanManagementReceiptSigner>(
         &mut self,
         receipt: &AuthorityReceipt,

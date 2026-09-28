@@ -3241,6 +3241,10 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         let invocation = if (input.len() > 700_000
             || std::env::var_os("VOS_AGENT_PROFILE_REFINE_ALL_INPUTS").is_some())
             && std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some()
+            // Physical qualification also uses PROFILE_REFINE_MACHINES to
+            // disable fixture-native execution. Permit that same real PVM
+            // path without per-instruction callbacks and hot-PC sorting.
+            && std::env::var_os("VOS_AGENT_DISABLE_REFINE_ATTRIBUTION").is_none()
         {
             profile_refine_machines(
                 context,

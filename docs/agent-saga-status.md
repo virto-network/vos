@@ -394,30 +394,57 @@ pass; one fixture-dependent filesystem test remains ignored. Default and
 experimental daemon builds, the `std`-only core build, formatting and diff
 checks pass. Logs use disk-backed `target/shared-install-preparation-*`.
 
-Still required: replace the fixture-only issuer copy with controller-owned
-Install execution. Restore pending authorization/finalization admission before
-system execution, use the pending operation as the startup genesis-read
-predecessor where needed, and authenticate genesis before reopening the physical
-target. Then qualify physical application, signed terminal results and retirement
-under response loss/restart. Keep the unissued-only startup gate until that
-recovery exists. The source extension now permits signed
-`ManagementApplicationFailure` for Local or Shared Install, retaining exact
-call/profile/receipt bindings and rejecting Private. The intent and issuer
-protocol helpers no longer depend on experimental storage; source Authority
-tests cover failed Install retirement, restart, contradictory success refusal
-and re-signed cross-profile substitution. This does not yet qualify the bundled
-Authority artifact or the Shared physical failure path. Candidate guest tests,
-artifact integration and controller-owned execution/recovery remain required;
-native protocol tests are not proof of deployed behavior. The full default SDK
-suite passes (249 tests, one ignored), as do issuer/intent suites with experimental
-storage enabled (19) and disabled (18). The latter now both retain and reopen
-the exact failure-finalization envelope and retirement marker for Local and
-Shared. The full native Authority suite passes (77 tests, two fixture exporters
-ignored), including rejection tests for both profiles.
-Formatting and diff checks pass. Logs use disk-backed `target/shared-failure-*`.
-Public Shared
-management remains disabled. This is not yet Shared Install, a public customer
-workflow, three-node or release qualification.
+Still required: controller-owned Shared Install execution and recovery. Restore
+pending authorization/finalization admission before system execution, use the
+pending operation as the startup genesis-read predecessor where needed, and
+authenticate genesis before reopening the physical target. Keep the unissued-only
+startup gate until this recovery is qualified under response loss/restart.
+Public Shared management remains disabled; bundled artifacts are unchanged.
+
+Signed Install failure finality now supports Local and Shared, retaining exact
+call/profile/receipt bindings and rejecting Private. Generic intent, issuer and
+finalization helpers no longer depend on experimental storage. Validation:
+SDK 249 passed/one ignored; issuer/intent 19 feature-on and 18 feature-off;
+native Authority 77 passed/two fixture exporters ignored. Tests cover signed
+scope, exact retirement/reopen, contradictory success and cross-profile refusal.
+
+Shared signing now consumes only a `SharedInstallObservation` constructed by
+fresh journal replay plus Raft-ledger/checkpoint reconciliation under the host
+lease. It binds the exact receipt, request and managed target, refusing missing
+durable evidence or a later Ordered boundary. The raw test-only signing helper
+is removed. Six focused Shared-host regressions pass (3.29 s), including refusal
+of an unconsumed same-slot denial and a substituted receipt, plus exact
+observation after filesystem reopen. The same six tests pass without experimental
+storage (3.88 s). Default-feature and standalone `std` core builds pass.
+
+The candidate Authority ELF SHA-256 is
+`3fe2541cdf2b9cbe9ae30cbe5c9e180cd509a6ee0716bc86afcf0b5a2f221ffd`.
+The physical gate `native_shared_candidate_install_failure_finalizes_and_retires`
+passes through the replay-backed signing boundary (468.31 s): an ordinary Shared Agent
+installs one actor, rejects a second with `DirectoryFull`, finalizes signed MAF1,
+releases its reservation, and exactly retries reopened intent/issuer state.
+The fixture still seeds its continuing issuer directly and reopens memory-backed
+lifecycle stores; the physical journals are file-backed. The earlier corrected-clock
+run also passed (506.38 s). This is not controller-owned public Install, three-node,
+load or release qualification. Logs use disk-backed `target/shared-failure-*`
+and `target/shared-install-observation-*`.
+
+Two qualification lessons remain relevant. Same-slot management correctly
+returns an unconsumed `AuthoritySequenceConflict`; advancing the fixture clock
+restored the existing durable semantic-rejection path. No new publication API
+or weakened denial semantics was needed. Production `SystemAgentTrust` uses
+Unix seconds, so controller admission/retry must preserve reservations across
+same-second management conflicts. This does not establish an equivalent limit
+for actor invocations; do not incidentally change expiry units or ordering.
+
+Test-only instruction attribution was also expensive enough to appear in a
+CPU stack sample. `VOS_AGENT_DISABLE_REFINE_ATTRIBUTION=1` suppresses it while
+`VOS_AGENT_PROFILE_REFINE_MACHINES=1` still forces physical PVM execution.
+An uninstrumented sample caught first-use inner-interpreter gas-table preparation,
+not proof generation. These samples identify measurement targets, not cost
+percentages or production performance fixes; gas semantics are unchanged.
+The interrupted profiling run and initial clock-invalid test do not count as
+qualification. Diagnostic logs are retained; aborted fixture scratch was removed.
 
 Backup quiescence must also cover unserved live generations after reservation
 release: an idle Authority admission alone does not prove all Create routes

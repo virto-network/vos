@@ -96,12 +96,7 @@ use super::genesis::{AgentReplicaCommittee, MAX_AGENT_REPLICA_COMMITTEE_BYTES};
 use super::package_admission::{
     AdmittedActorPackage, AdmittedRuntimePackage, admit_actor_package, admit_runtime_package,
 };
-#[cfg(all(
-    feature = "storage",
-    feature = "network",
-    feature = "experimental-state-blocks",
-    target_os = "linux"
-))]
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 use super::sdk::authority::ManagementApplicationFailure;
 use super::sdk::authority::{
     AgentAuthorityBinding, AuthorityActorTarget, AuthorityCredentialCall,
@@ -152,7 +147,6 @@ use crate::network::{Network, SharedAgentNetworkHost};
 #[derive(Clone, Copy)]
 enum ManagementTerminalRef<'a> {
     Applied(&'a ManagementApplicationAck),
-    #[cfg(feature = "experimental-state-blocks")]
     Rejected(&'a ManagementApplicationFailure),
 }
 
@@ -181,7 +175,6 @@ impl ManagementTerminalRef<'_> {
                 request: ack.request,
                 applied_at: ack.applied_at,
             },
-            #[cfg(feature = "experimental-state-blocks")]
             Self::Rejected(failure) => ManagementTerminalFacts {
                 authority: failure.authority,
                 managed: failure.managed,
@@ -199,7 +192,6 @@ impl ManagementTerminalRef<'_> {
             Self::Applied(ack) => {
                 super::clean_management_intent::CleanManagementIntent::finalization_message(ack)
             }
-            #[cfg(feature = "experimental-state-blocks")]
             Self::Rejected(failure) => {
                 super::clean_management_intent::CleanManagementIntent::failure_finalization_message(
                     failure,
@@ -211,7 +203,6 @@ impl ManagementTerminalRef<'_> {
     fn verify(self) -> bool {
         match self {
             Self::Applied(ack) => ack.verify_with(&RawCredentialVerifier).is_ok(),
-            #[cfg(feature = "experimental-state-blocks")]
             Self::Rejected(failure) => failure.verify_with(&RawCredentialVerifier).is_ok(),
         }
     }
@@ -3159,7 +3150,6 @@ where
         )
     }
 
-    #[cfg(feature = "experimental-state-blocks")]
     pub(crate) fn finalize_failed_install_with_admission<B, J>(
         &mut self,
         slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
@@ -3224,7 +3214,6 @@ where
         }
         let finalized = match terminal {
             ManagementTerminalRef::Applied(ack) => issuer.application_finalization_status(ack),
-            #[cfg(feature = "experimental-state-blocks")]
             ManagementTerminalRef::Rejected(failure) => issuer.failure_finalization_status(failure),
         }
         .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
@@ -3379,7 +3368,6 @@ where
         }
         match terminal {
             ManagementTerminalRef::Applied(ack) => issuer.observe_durable_actor_finalization(ack),
-            #[cfg(feature = "experimental-state-blocks")]
             ManagementTerminalRef::Rejected(failure) => {
                 issuer.observe_durable_actor_failure_finalization(failure)
             }
@@ -3426,7 +3414,6 @@ where
         )
     }
 
-    #[cfg(feature = "experimental-state-blocks")]
     pub(crate) fn retire_failed_install_results<B, J>(
         &mut self,
         slot: &super::clean_management_intent::CleanManagementIntentSlot<B>,
@@ -3473,7 +3460,6 @@ where
                 )
                 .map_err(|_| SharedAgentHostError::ScopeMismatch)?
                 .is_some_and(|(_, retained)| retained == *ack),
-            #[cfg(feature = "experimental-state-blocks")]
             ManagementTerminalRef::Rejected(failure) => issuer
                 .recover_finalized_install_failure(
                     target,
@@ -3618,7 +3604,6 @@ where
         )
     }
 
-    #[cfg(feature = "experimental-state-blocks")]
     pub(crate) fn finish_failed_install_retirement<B, J>(
         &mut self,
         slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
@@ -3677,7 +3662,6 @@ where
             || {
                 let committed = match terminal {
                     ManagementTerminalRef::Applied(ack) => slot.commit_retirement(ack),
-                    #[cfg(feature = "experimental-state-blocks")]
                     ManagementTerminalRef::Rejected(failure) => {
                         slot.commit_failure_retirement(failure)
                     }
@@ -6692,7 +6676,6 @@ where
         )
     }
 
-    #[cfg(feature = "experimental-state-blocks")]
     pub(crate) fn finish_live_failed_install<
         B: CleanManagementIssuerStore,
         J: CleanManagementIssuerStore,
@@ -10269,6 +10252,13 @@ mod tests {
         }
 
         fn test_runtime_package(bundled: bool) -> AdmittedRuntimePackage {
+            test_runtime_package_with_actor_limit(bundled, crate::agent_sdk::STANDARD_MAX_ACTORS)
+        }
+
+        fn test_runtime_package_with_actor_limit(
+            bundled: bool,
+            max_actors: u32,
+        ) -> AdmittedRuntimePackage {
             let mut assembler = Assembler::new();
             // Profiling must measure the real outer runtime, not this fixture's
             // native Standard shortcut. Ordinary tests retain their fast path.
@@ -10292,7 +10282,10 @@ mod tests {
                         external_state_limits: None,
                         outer_program: crate::agent::sdk::BlobRef::of_bytes(&program),
                         contract: crate::agent::sdk::contract::RuntimePackageContract::canonical(),
-                        capabilities: crate::agent::sdk::RuntimeCapabilities::standard(),
+                        capabilities: crate::agent::sdk::RuntimeCapabilities {
+                            max_actors,
+                            ..crate::agent::sdk::RuntimeCapabilities::standard()
+                        },
                         signing: PackageSigning {
                             producer: ProducerId::of_public_key(&public_key),
                             public_key,
@@ -26151,8 +26144,31 @@ mod tests {
         }
 
         fn check_shared_proposal_and_committee_preparation(
+            fixture: PhysicalFixture,
+            complete_publication: bool,
+        ) {
+            check_shared_proposal_and_install_failure(fixture, complete_publication, false);
+        }
+
+        #[cfg(feature = "experimental-state-blocks")]
+        #[test]
+        #[ignore = "requires freshly built candidate Authority and outer PVM execution"]
+        fn native_shared_candidate_install_failure_finalizes_and_retires() {
+            assert!(std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some());
+            let target = std::env::var_os("CARGO_TARGET_DIR")
+                .map(std::path::PathBuf::from)
+                .expect("set CARGO_TARGET_DIR to the candidate guest build root");
+            check_shared_proposal_and_install_failure(
+                native_candidate_state_authority_fixture(&target),
+                true,
+                true,
+            );
+        }
+
+        fn check_shared_proposal_and_install_failure(
             mut fixture: PhysicalFixture,
             complete_publication: bool,
+            qualify_failure: bool,
         ) {
             use crate::agent::clean_management_intent::{
                 CleanManagementIntent, CleanManagementIntentSlot,
@@ -26175,8 +26191,13 @@ mod tests {
             let owner = harness.owner.as_mut().unwrap();
             // The proposed generation must use executable runtime bytes too
             // when qualifying the full physical path, not just its system Agent.
-            let runtime = test_runtime_package(
+            let runtime = test_runtime_package_with_actor_limit(
                 std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some(),
+                if qualify_failure {
+                    1
+                } else {
+                    crate::agent_sdk::STANDARD_MAX_ACTORS
+                },
             );
             let mut descriptor = owner.pins.descriptor.clone();
             descriptor.creation_nonce = Hash([0xdd; 32]);
@@ -27991,7 +28012,7 @@ mod tests {
             *install_issuer_store.image.lock().unwrap() =
                 retired_stores.1.image.lock().unwrap().clone();
             let mut install_issuer = DurableCleanManagementIssuer::open(
-                install_issuer_store,
+                install_issuer_store.clone(),
                 target.binding,
                 managed.space,
                 managed.agent,
@@ -28063,6 +28084,195 @@ mod tests {
                 )
                 .unwrap();
             assert!(!owner.management_admission_held().unwrap());
+            #[cfg(feature = "experimental-state-blocks")]
+            if qualify_failure {
+                harness
+                    .fixture
+                    .logical_slot
+                    .as_ref()
+                    .unwrap()
+                    .fetch_add(1, Ordering::AcqRel);
+                let rejected_package =
+                    crate::agent::package_admission::admitted_standard_query_actor_for_test(
+                        "ordinary-over-capacity",
+                        StateLane::Linear,
+                        0xc1,
+                    );
+                let rejected_request =
+                    install_request(descriptor.identity.agent, &rejected_package, 0xc2, None);
+                let (mut rejected_call, _) =
+                    credential_call_and_approval(&descriptor, &rejected_request, &key);
+                rejected_call.request_sequence = NonZeroU64::new(4).unwrap();
+                rejected_call.authority = target;
+                rejected_call.invocation = rejected_call.expected_invocation();
+                rejected_call.signature = key.sign(&rejected_call.signing_bytes()).to_bytes();
+                let rejected_store = IssuerMemoryStore::default();
+                let mut rejected_intent =
+                    CleanManagementIntentSlot::open(rejected_store.clone()).unwrap();
+                rejected_intent
+                    .pledge(
+                        CleanManagementIntent::new(
+                            target,
+                            managed,
+                            rejected_request.clone(),
+                            rejected_call.clone(),
+                            &RawCredentialVerifier,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                let rejected_receipt = owner
+                    .issue_management_intent_with_admission(
+                        &mut rejected_intent,
+                        managed,
+                        &mut install_issuer,
+                        &mut install_signer,
+                        true,
+                    )
+                    .unwrap();
+                let rejected = owner
+                    ._network_host
+                    .manage_clean(
+                        locator.agent,
+                        rejected_request.clone(),
+                        rejected_receipt.clone(),
+                        SdkManagementArtifacts::Actor(&rejected_package),
+                    )
+                    .unwrap();
+                let (error, observed_slot) = match rejected {
+                    crate::network::shared_agent::CleanManagementSubmission::Applied {
+                        outcome: RuntimeOutcome::Management(Err(error)),
+                        observed_slot,
+                        ..
+                    } => (error, observed_slot),
+                    crate::network::shared_agent::CleanManagementSubmission::Denied {
+                        outcome,
+                        ..
+                    } => {
+                        panic!(
+                            "Shared Install needs durable finality, not a preflight denial: {outcome:?}"
+                        )
+                    }
+                    crate::network::shared_agent::CleanManagementSubmission::Applied {
+                        outcome,
+                        ..
+                    } => {
+                        panic!(
+                            "physical Shared Install must reject at its signed actor limit: {outcome:?}"
+                        )
+                    }
+                };
+                assert_eq!(error, crate::agent_sdk::ManagementError::DirectoryFull);
+                let state = owner
+                    .host
+                    .lock()
+                    .unwrap()
+                    .clean_state_commitment(locator.agent)
+                    .unwrap();
+                let terminal = install_issuer
+                    .observe_shared_install(
+                        &owner
+                            .host
+                            .lock()
+                            .unwrap()
+                            .observe_durable_install(
+                                locator.agent,
+                                &rejected_request,
+                                &rejected_receipt,
+                            )
+                            .unwrap(),
+                        &mut install_signer,
+                    )
+                    .unwrap();
+                let crate::agent::clean_authority_issuer::SignedManagementTerminal::Rejected(
+                    failure,
+                ) = terminal
+                else {
+                    panic!("expected signed failure");
+                };
+                assert_eq!(
+                    failure.managed.profile,
+                    crate::agent_sdk::AgentProfile::Shared
+                );
+                assert_eq!(failure.credential_call, rejected_call.commitment());
+                assert_eq!(failure.failed_at, observed_slot);
+                assert_eq!(failure.reopened_state, state);
+                // Reopen the durable intent/issuer before Authority finality;
+                // retain the running physical/system owners for this protocol gate.
+                drop(rejected_intent);
+                drop(install_issuer);
+                let mut rejected_intent =
+                    CleanManagementIntentSlot::open(rejected_store.clone()).unwrap();
+                let mut install_issuer = DurableCleanManagementIssuer::open(
+                    install_issuer_store.clone(),
+                    target.binding,
+                    managed.space,
+                    managed.agent,
+                )
+                .unwrap();
+                owner
+                    .finalize_failed_install_with_admission(
+                        &mut rejected_intent,
+                        managed,
+                        &failure,
+                        &mut install_issuer,
+                        true,
+                    )
+                    .unwrap();
+                owner
+                    .finish_live_failed_install(
+                        &mut rejected_intent,
+                        managed,
+                        &failure,
+                        &install_issuer,
+                    )
+                    .unwrap();
+                assert!(!owner.management_admission_held().unwrap());
+                assert!(rejected_intent.retirement_complete().unwrap());
+                let finalized_head = owner.ordered_index_for_test().unwrap();
+                drop(rejected_intent);
+                drop(install_issuer);
+                let mut rejected_intent = CleanManagementIntentSlot::open(rejected_store).unwrap();
+                let mut install_issuer = DurableCleanManagementIssuer::open(
+                    install_issuer_store.clone(),
+                    target.binding,
+                    managed.space,
+                    managed.agent,
+                )
+                .unwrap();
+                assert!(
+                    install_issuer
+                        .failure_finalization_status(&failure)
+                        .unwrap()
+                );
+                owner
+                    .finalize_failed_install_with_admission(
+                        &mut rejected_intent,
+                        managed,
+                        &failure,
+                        &mut install_issuer,
+                        true,
+                    )
+                    .unwrap();
+                owner
+                    .finish_live_failed_install(
+                        &mut rejected_intent,
+                        managed,
+                        &failure,
+                        &install_issuer,
+                    )
+                    .unwrap();
+                assert_eq!(owner.ordered_index_for_test().unwrap(), finalized_head);
+                assert_eq!(
+                    owner
+                        .host
+                        .lock()
+                        .unwrap()
+                        .clean_state_commitment(locator.agent)
+                        .unwrap(),
+                    state
+                );
+            }
             let weak_host = Arc::downgrade(&owner.host);
             struct SharedInventoryAuthenticator(u8);
             impl crate::agent::production_owner::AuthorityProjectionQueryAuthenticator
