@@ -322,8 +322,8 @@ generation, while the healthy generation retains its exact ACK and journal.
 Reproduce with the command above, replacing the filter with
 `shared_create_file_owner_reopens_denial_beside_retired_generation`.
 
-Shared Install integration is implementing the durable handoff that must replace
-the fixture-only issuer copy in `serve_mixed_shared`. The issuer primitive now
+Shared Install integration now uses a durable handoff in the publication/recovery
+fixture rather than copying the Create issuer image. The issuer primitive
 seeds one continuation from a finalized Shared Create, then persists a
 source-side marker bound to the exact original issuer image. A retained seed or
 marker disables source issuance across reopen. The original Create remains
@@ -394,12 +394,30 @@ pass; one fixture-dependent filesystem test remains ignored. Default and
 experimental daemon builds, the `std`-only core build, formatting and diff
 checks pass. Logs use disk-backed `target/shared-install-preparation-*`.
 
-Still required: controller-owned Shared Install execution and recovery. Restore
-pending authorization/finalization admission before system execution, use the
-pending operation as the startup genesis-read predecessor where needed, and
-authenticate genesis before reopening the physical target. Keep the unissued-only
-startup gate until this recovery is qualified under response loss/restart.
-Public Shared management remains disabled; bundled artifacts are unchanged.
+Controller discovery now validates continuing Install input/issuer phases and
+restores authorization/finalization work or unfinished retirement alongside
+immutable Create evidence. Startup admission includes the complete bounded set
+and rejects duplicate invocation IDs. A pending Install can sponsor the narrowly
+guarded fresh genesis read; finalized system results retire through the existing
+ACK guards. The controller then completes retained Install against the reopened
+physical generation. Route export stays closed until the entire set succeeds,
+including a failure after generations open; an in-process retry retains that
+verified generation set rather than repeating genesis admission.
+The observed-result restart/interruption regression passes (123.84 s), using real
+issuer handoff, memory lifecycle stores and filesystem journals. It proves closed
+route export after a finalization interruption, exact completion retry and no
+duplicate genesis read or ACK signature. The bundled retired-handoff regression
+passes (132.28 s), as do five controller regressions, the existing operation
+admission/reopen regression, the default-feature core build and experimental-feature
+daemon build. Both outer-PVM runs pass: pending observed-result startup with
+interrupted finalization (419.73 s), and candidate signed rejection with real
+continuation ownership and retired recovery (524.63 s). Logs:
+`target/shared-install-recovery-*`.
+Still required before ingress: all issuance/finalization crash boundaries under
+the production file owner (including receipt expiry before physical application),
+mixed pending continuations, Authority-denial retirement
+and crash-safe subsequent-Install input handoff. Public Shared management remains
+disabled; bundled artifacts are unchanged.
 
 The internal bootstrap-owner Shared Install application helper replaces the
 physical fixture's hand-assembled
@@ -408,8 +426,7 @@ against the live descriptor, retains and re-admits the package, captures pending
 Authority admission, and signs only a replay-verified Shared terminal. Descriptor
 validation does not enumerate the actor directory. Unconsumed preflight failures
 remain retryable conflicts with their issued receipt and reservation intact;
-they are not signed semantic failures. This helper does not yet activate
-controller dispatch or broaden startup handoff admission. The bundled
+they are not signed semantic failures. The bundled
 publication/recovery regression passes through the application and completion
 helpers, including exact pre-finalization retry and identical terminal recovery
 after Invoke/ACK and owner reopen with no new system work (129.22 s). Six focused
@@ -421,8 +438,8 @@ Recovery now also has an internal owner completion helper: reauthenticate an
 existing signed terminal against fresh physical Install evidence, then run the
 existing finalization and retirement guards, returning the identical result.
 It never reconstructs a missing retained package after application. Controller
-discovery/admission integration remains gated; helper execution alone does not
-qualify startup restoration of pending Install reservations.
+startup now uses this helper; production file-owner interruption qualification
+is still required before public dispatch.
 
 Continuation recovery must also handle an Authority refusal before receipt
 issuance, separately from an applied Install rejection: the current generic
@@ -460,7 +477,7 @@ The candidate Authority ELF SHA-256 is
 `3fe2541cdf2b9cbe9ae30cbe5c9e180cd509a6ee0716bc86afcf0b5a2f221ffd`.
 The physical gate `native_shared_candidate_install_failure_finalizes_and_retires`
 passes through the owner application/completion helpers and replay-backed
-signing boundary (468.54 s): an ordinary Shared Agent
+signing boundary with the real continuing issuer/intent handoff (524.63 s): an ordinary Shared Agent
 installs one actor, rejects a second with `DirectoryFull`, finalizes signed MAF1,
 releases its reservation, and exactly retries reopened intent/issuer state.
 After public-route Invoke/ACK and full owner reopen, the same signed terminal
@@ -469,11 +486,13 @@ ordinary-generation checkpoint pruning; the physical fixture checkpoints the
 system generation, not the ordinary one.
 An initial same-slot attempt preserves the ordinary state, signs no terminal,
 and retains admission; a later-slot retry uses the identical issued receipt.
-The fixture still seeds its continuing issuer directly and reopens memory-backed
-lifecycle stores; the physical journals are file-backed.
+The fixture now retains the original Create and opens its real continuing issuer
+and intent stores. Lifecycle stores remain memory-backed; physical journals are
+file-backed. This does not replace production file-owner qualification.
 This is not controller-owned public Install, three-node,
 load or release qualification. Current logs use disk-backed
-`target/shared-install-stable-*`; prior gates remain in
+`target/shared-install-recovery-*`; the prior stable-observation checkpoint is
+in `target/shared-install-stable-*`, and earlier gates remain in
 `target/shared-failure-*` and `target/shared-install-observation-*`.
 
 Two qualification lessons remain relevant. Same-slot management correctly

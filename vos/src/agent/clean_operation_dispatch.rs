@@ -123,8 +123,8 @@ impl<'a> NativeAuthorityOperationStartupAdmission<'a> {
         .include_shared_genesis(recovery)
     }
 
-    /// Include one verified Shared Create/query reservation while borrowing
-    /// its stores. Call for every discovered entry before opening bootstrap.
+    /// Include Create/query and continuing Install work under their original
+    /// leases. No retired Create may hide a pending continuation.
     pub fn include_shared_genesis<I, J, Q, R, W, P>(
         mut self,
         recovery: &'a mut super::NativeSharedGenesisRecovery<I, J, Q, R, W, P>,
@@ -137,18 +137,33 @@ impl<'a> NativeAuthorityOperationStartupAdmission<'a> {
     {
         if !recovery.admission_valid
             || recovery.authority != self.authority
-            || self.pending.len().saturating_add(recovery.pending.len())
+            || self
+                .pending
+                .len()
+                .saturating_add(self.retirements.len().saturating_mul(2))
+                .saturating_add(recovery.pending.len())
+                .saturating_add(recovery.management_pending.len())
+                .saturating_add(recovery.management_retirements.len().saturating_mul(2))
                 > super::super::replay::MAX_REPLAY_SUFFIX_ENTRIES
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        for (_, work) in &recovery.pending {
+        let mut invocations = alloc::collections::BTreeSet::new();
+        for work in self
+            .pending
+            .iter()
+            .map(|(_, work)| work)
+            .chain(self.retirements.iter().flatten())
+            .chain(recovery.pending.iter().map(|(_, work)| work))
+            .chain(recovery.management_pending.iter().map(|(_, work)| work))
+            .chain(recovery.management_retirements.iter().flatten())
+        {
             let RuntimeWork::Invoke { invocation, .. } = work else {
                 return Err(SharedAgentHostError::ScopeMismatch);
             };
-            if self.pending.iter().any(|(_, old)| matches!(old, RuntimeWork::Invoke { invocation: existing, .. } if existing.invocation == invocation.invocation))
-                || self.retirements.iter().flatten().any(|old| matches!(old, RuntimeWork::Invoke { invocation: existing, .. } if existing.invocation == invocation.invocation))
-            { return Err(SharedAgentHostError::Conflict); }
+            if !invocations.insert(invocation.invocation) {
+                return Err(SharedAgentHostError::Conflict);
+            }
         }
         self.has_history |= recovery.retired
             || !recovery.pending.is_empty()
@@ -157,6 +172,10 @@ impl<'a> NativeAuthorityOperationStartupAdmission<'a> {
                 .denial_complete()
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
         self.pending.extend(recovery.pending.iter().cloned());
+        self.pending
+            .extend(recovery.management_pending.iter().cloned());
+        self.retirements
+            .extend(recovery.management_retirements.iter().cloned());
         Ok(self)
     }
 

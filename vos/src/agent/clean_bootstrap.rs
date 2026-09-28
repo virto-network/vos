@@ -1645,6 +1645,7 @@ where
     // Authority inventory row or by whatever happens to be installed now.
     authority_install: super::sdk::InstallActor,
     invocation_gas: u64,
+    shared_lifecycle_recovery_pending: bool,
     #[cfg(test)]
     finalization_failure_once: Option<u8>,
     #[cfg(test)]
@@ -2599,6 +2600,7 @@ where
             root_lineage,
             authority_install: install_request(plan.authority_request())?.clone(),
             invocation_gas: plan.invocation_gas,
+            shared_lifecycle_recovery_pending: false,
             #[cfg(test)]
             finalization_failure_once: None,
             #[cfg(test)]
@@ -2713,11 +2715,12 @@ where
         &mut self,
     ) -> Result<Vec<crate::network::shared_agent::SharedAgentRouteHandle>, SharedAgentHostError>
     {
-        if self
-            .host
-            .lock()
-            .map_err(|_| SharedAgentHostError::Unavailable)?
-            .has_deferred_open()
+        if self.shared_lifecycle_recovery_pending
+            || self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .has_deferred_open()
         {
             return Err(SharedAgentHostError::Conflict);
         }
@@ -26324,7 +26327,17 @@ mod tests {
             fixture: PhysicalFixture,
             complete_publication: bool,
         ) {
-            check_shared_proposal_and_install_failure(fixture, complete_publication, false);
+            check_shared_proposal_and_install_failure(fixture, complete_publication, false, false);
+        }
+
+        #[test]
+        fn native_shared_install_observed_restarts_with_handoff() {
+            check_shared_proposal_and_install_failure(
+                native_bundled_authority_fixture(),
+                true,
+                false,
+                true,
+            );
         }
 
         #[cfg(feature = "experimental-state-blocks")]
@@ -26339,6 +26352,7 @@ mod tests {
                 native_candidate_state_authority_fixture(&target),
                 true,
                 true,
+                false,
             );
         }
 
@@ -26346,6 +26360,7 @@ mod tests {
             mut fixture: PhysicalFixture,
             complete_publication: bool,
             qualify_failure: bool,
+            recover_install: bool,
         ) {
             use crate::agent::clean_management_intent::{
                 CleanManagementIntent, CleanManagementIntentSlot,
@@ -28171,7 +28186,33 @@ mod tests {
             install_call.invocation = install_call.expected_invocation();
             install_call.signature = key.sign(&install_call.signing_bytes()).to_bytes();
             let managed = install_call.managed;
-            let install_intent_store = IssuerMemoryStore::default();
+            let mut create_issuer = DurableCleanManagementIssuer::open(
+                retired_stores.1.clone(),
+                target.binding,
+                managed.space,
+                managed.agent,
+            )
+            .unwrap();
+            let install_issuer_store = create_issuer
+                .open_creation_continuation()
+                .unwrap()
+                .into_store();
+            let install_intent_store = crate::agent::clean_authority_issuer::CleanSharedManagementIntentStore::management_intent_continuation(&mut retired_stores.0.clone()).unwrap();
+            let open_continuation = || {
+                let (intent, issuer, query, reply, publication, publication_reply) =
+                    retired_stores.clone();
+                super::super::NativeSharedGenesisRecovery::open_with_management_handoff(
+                    target,
+                    locator,
+                    intent,
+                    issuer,
+                    query,
+                    reply,
+                    publication,
+                    publication_reply,
+                )
+                .unwrap()
+            };
             let mut install_intent =
                 CleanManagementIntentSlot::open(install_intent_store.clone()).unwrap();
             install_intent
@@ -28186,9 +28227,6 @@ mod tests {
                     .unwrap(),
                 )
                 .unwrap();
-            let install_issuer_store = IssuerMemoryStore::default();
-            *install_issuer_store.image.lock().unwrap() =
-                retired_stores.1.image.lock().unwrap().clone();
             let mut install_issuer = DurableCleanManagementIssuer::open(
                 install_issuer_store.clone(),
                 target.binding,
@@ -28232,6 +28270,134 @@ mod tests {
                 )
             );
             assert_eq!(owner.ordered_index_for_test().unwrap(), installed_head);
+            let mut pending_install = open_continuation();
+            let admission =
+                NativeAuthorityOperationStartupAdmission::from_shared_genesis(&mut pending_install)
+                    .unwrap();
+            assert_eq!(admission.pending.len(), 1);
+            assert!(admission.retirements.is_empty());
+            drop(admission);
+            drop(pending_install);
+            if recover_install {
+                drop(owner);
+                drop(lifecycle);
+                drop(install_intent);
+                drop(install_issuer);
+                drop(create_issuer);
+                let mut controller = super::super::NativeSharedGenesisController::new(
+                    target,
+                    vec![(open_continuation(), Some(archive_store.clone()))],
+                )
+                .unwrap();
+                let mut operations = OperationTestJournal(harness._directory.0.clone());
+                let admission =
+                    NativeAuthorityOperationStartupAdmission::load(&mut operations, target, &[])
+                        .unwrap();
+                let admission = controller.startup_admission(admission).unwrap();
+                assert_eq!(admission.pending.len(), 1);
+                let (pins, record, issuer) = system_restart_stores.clone();
+                let mut signer = CountingSigner::new();
+                let mut reopened =
+                    CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
+                        pins,
+                        record,
+                        issuer,
+                        &mut signer,
+                        || panic!("Install recovery cannot bootstrap"),
+                        harness._directory.host(),
+                        harness._directory.lock(),
+                        target.space,
+                        harness.fixture.plan.pins.node,
+                        harness.fixture.trust.clone(),
+                        harness.fixture.merge.clone(),
+                        harness.fixture.finality.clone(),
+                        harness.provider.clone(),
+                        harness.network.clone(),
+                        None,
+                        Some(&admission),
+                    )
+                    .unwrap();
+                drop(admission);
+                assert!(matches!(
+                    reopened.ordinary_supervisor_generations(),
+                    Err(SharedAgentHostError::Conflict)
+                ));
+                reopened.finalization_failure_once = Some(2);
+                assert!(matches!(
+                    controller.recover(&mut reopened, &mut signer),
+                    Err(SharedAgentHostError::Unavailable)
+                ));
+                assert!(!controller.is_recovered());
+                assert!(!reopened.host.lock().unwrap().has_deferred_open());
+                assert!(
+                    matches!(
+                        reopened.ordinary_supervisor_generations(),
+                        Err(SharedAgentHostError::Conflict)
+                    ),
+                    "an opened generation must remain unexported until Install retirement"
+                );
+                let interrupted = reopened.ordered_index_for_test().unwrap();
+                controller.recover(&mut reopened, &mut signer).unwrap();
+                assert_eq!(
+                    reopened.ordered_index_for_test().unwrap(),
+                    interrupted + 3,
+                    "retry must finish finalization and its ACK pair, not repeat the genesis read"
+                );
+                assert!(!reopened.management_admission_held().unwrap());
+                assert_eq!(reopened.ordinary_supervisor_generations().unwrap().len(), 1);
+                let recovered = open_continuation();
+                assert!(recovered.management_pending.is_empty());
+                assert!(recovered.management_retirements.is_empty());
+                let completed = DurableCleanManagementIssuer::open(
+                    install_issuer_store.clone(),
+                    target.binding,
+                    managed.space,
+                    managed.agent,
+                )
+                .unwrap();
+                assert!(
+                    completed
+                        .application_finalization_status(&install_ack)
+                        .unwrap()
+                );
+                assert_eq!(
+                    signer.calls, 0,
+                    "retained application ACK must not be signed again"
+                );
+                let terminal_head = reopened.ordered_index_for_test().unwrap();
+                assert_eq!(
+                    controller
+                        .complete_install(&mut reopened, locator, &mut signer)
+                        .unwrap(),
+                    crate::agent::clean_authority_issuer::SignedManagementTerminal::Applied(
+                        install_ack
+                    )
+                );
+                assert_eq!(reopened.ordered_index_for_test().unwrap(), terminal_head);
+                drop(controller);
+                drop(reopened);
+                harness.stop();
+                return;
+            }
+            owner.finalization_failure_once = Some(7);
+            assert!(matches!(
+                owner.complete_shared_install_from_management_intent(
+                    &mut install_intent,
+                    &ordinary_package,
+                    &mut install_issuer,
+                    &mut install_signer,
+                ),
+                Err(SharedAgentHostError::Unavailable)
+            ));
+            let mut retiring_install = open_continuation();
+            let admission = NativeAuthorityOperationStartupAdmission::from_shared_genesis(
+                &mut retiring_install,
+            )
+            .unwrap();
+            assert!(admission.pending.is_empty());
+            assert_eq!(admission.retirements.len(), 1);
+            drop(admission);
+            drop(retiring_install);
             assert_eq!(
                 owner
                     .complete_shared_install_from_management_intent(
@@ -28250,7 +28416,7 @@ mod tests {
             let mut retained_install = (ordinary_install.clone(), install_ack.receipt.clone());
             #[allow(unused_mut)]
             let mut retained_completion = (
-                install_intent_store,
+                install_intent_store.clone(),
                 ordinary_package.clone(),
                 crate::agent::clean_authority_issuer::SignedManagementTerminal::Applied(
                     install_ack.clone(),
@@ -28272,11 +28438,13 @@ mod tests {
                 rejected_call.authority = target;
                 rejected_call.invocation = rejected_call.expected_invocation();
                 rejected_call.signature = key.sign(&rejected_call.signing_bytes()).to_bytes();
-                let rejected_store = IssuerMemoryStore::default();
+                let rejected_store = install_intent_store.clone();
                 let mut rejected_intent =
                     CleanManagementIntentSlot::open(rejected_store.clone()).unwrap();
+                let previous_intent = rejected_intent.intent().unwrap().clone();
                 rejected_intent
-                    .pledge(
+                    .handoff_retired(
+                        &previous_intent,
                         CleanManagementIntent::new(
                             target,
                             managed,
@@ -28285,6 +28453,7 @@ mod tests {
                             &RawCredentialVerifier,
                         )
                         .unwrap(),
+                        &RawCredentialVerifier,
                     )
                     .unwrap();
                 let state_before = owner
@@ -28690,17 +28859,18 @@ mod tests {
             for interrupt_read in [true, false] {
                 let (intent, issuer, query, reply, publication, publication_reply) =
                     retired_stores.clone();
-                let recovery = super::super::NativeSharedGenesisRecovery::open(
-                    target,
-                    locator,
-                    intent,
-                    issuer,
-                    query,
-                    reply,
-                    publication,
-                    publication_reply,
-                )
-                .expect("completed Create must reopen after publication history pruning");
+                let recovery =
+                    super::super::NativeSharedGenesisRecovery::open_with_management_handoff(
+                        target,
+                        locator,
+                        intent,
+                        issuer,
+                        query,
+                        reply,
+                        publication,
+                        publication_reply,
+                    )
+                    .expect("completed Create must reopen after publication history pruning");
                 assert!(recovery.retired);
                 assert!(recovery.pending.is_empty());
                 let mut controller = super::super::NativeSharedGenesisController::new(

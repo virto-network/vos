@@ -2,6 +2,7 @@
 
 use super::genesis_issuance::RetainedCommitteeQuery;
 use super::*;
+use crate::agent::clean_authority_issuer::SignedManagementTerminal;
 use crate::agent::clean_management_intent::{
     CleanManagementIntent, CleanManagementIntentSlot, ManagementJournalAnchor,
 };
@@ -15,6 +16,7 @@ pub struct NativeSharedGenesisController<I, J: CleanManagementIssuerStore, Q, R,
     authority: AuthorityActorTarget,
     entries: Vec<(NativeSharedGenesisRecovery<I, J, Q, R, W, P>, Option<A>)>,
     recovered: bool,
+    generations_recovered: bool,
 }
 
 impl<I, J, Q, R, W, P, A> NativeSharedGenesisController<I, J, Q, R, W, P, A>
@@ -54,6 +56,7 @@ where
             authority,
             entries,
             recovered: false,
+            generations_recovered: false,
         })
     }
 
@@ -393,6 +396,19 @@ where
         I: super::super::clean_authority_issuer::CleanSharedManagementIntentStore,
         S: CleanManagementReceiptSigner,
     {
+        if !self.recovered || owner.authority_target() != self.authority {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        if self
+            .entries
+            .iter()
+            .any(|(entry, _)| entry.locator == locator && entry.management_issuer.is_some())
+        {
+            // The retained owner already authenticated genesis before opening
+            // its continuation. Do not introduce a fresh read beside Install's
+            // own protected reservation on an exact initialization retry.
+            return Ok(());
+        }
         self.complete_pending_create(owner, locator, signer)?;
         let (recovery, _) = self
             .entries
@@ -467,6 +483,32 @@ where
             .map_err(|_| SharedAgentHostError::Unavailable)
     }
 
+    /// Complete the already retained Install under this recovered controller.
+    /// Exact retries use its existing issuer, package and reservation ownership.
+    pub(crate) fn complete_install<B, C, D, S>(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<B, C, D>,
+        locator: super::super::genesis::AgentGenesisLocator,
+        signer: &mut S,
+    ) -> Result<SignedManagementTerminal, SharedAgentHostError>
+    where
+        B: CleanSystemAgentBootstrapStore + Send + 'static,
+        C: CleanSystemAgentBootstrapStore + Send + 'static,
+        D: CleanManagementIssuerStore + Send + 'static,
+        I: super::super::clean_authority_issuer::CleanManagementActorStore,
+        S: CleanManagementReceiptSigner,
+    {
+        if !self.recovered || owner.authority_target() != self.authority {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let (recovery, _) = self
+            .entries
+            .iter_mut()
+            .find(|(entry, _)| entry.locator == locator)
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        Self::complete_retained_install(owner, recovery, signer)
+    }
+
     /// Borrow every store until bootstrap has admitted its retained work.
     pub fn startup_admission<'a>(
         &'a mut self,
@@ -507,6 +549,7 @@ where
         B: CleanSystemAgentBootstrapStore + Send + 'static,
         C: CleanSystemAgentBootstrapStore + Send + 'static,
         D: CleanManagementIssuerStore + Send + 'static,
+        I: super::super::clean_authority_issuer::CleanManagementActorStore,
         S: CleanManagementReceiptSigner,
     {
         if self.recovered {
@@ -520,6 +563,7 @@ where
             self.recovered = true;
             return Ok(());
         }
+        owner.shared_lifecycle_recovery_pending = true;
         let records = self
             .entries
             .iter_mut()
@@ -564,6 +608,43 @@ where
         // beside its original Create. Drain only that child before replaying
         // lifecycle preparation, which continues to exclude ordinary reads.
         owner.recover_pending_authority_projection()?;
+        // A signed finalized continuation may only need its two system ACKs.
+        // Retire these through the normal guards before fresh genesis reads;
+        // physical evidence is independently rechecked below before serving.
+        for (recovery, _) in &mut self.entries {
+            if recovery.management_retirements.is_empty() {
+                continue;
+            }
+            let slot = recovery
+                .management_intent
+                .as_mut()
+                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            let issuer = recovery
+                .management_issuer
+                .as_ref()
+                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
+            let managed = intent.call().managed;
+            let (_, terminal) = issuer
+                .recover_finalized_terminal(
+                    self.authority,
+                    managed,
+                    intent.request(),
+                    intent.call(),
+                    &RawCredentialVerifier,
+                )
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            match terminal {
+                SignedManagementTerminal::Applied(ack) => {
+                    owner.finish_live_management_intent(slot, managed, &ack, issuer)?
+                }
+                SignedManagementTerminal::Rejected(failure) => {
+                    owner.finish_live_failed_install(slot, managed, &failure, issuer)?
+                }
+            }
+            recovery.management_retirements.clear();
+        }
         for ((recovery, _), record) in self.entries.iter_mut().zip(&records) {
             if record.is_none() && owner.finish_denied_shared_genesis(recovery, signer)? {
                 continue;
@@ -595,6 +676,11 @@ where
                     .is_none()
                     .then(|| recovery.pending.first().cloned())
                     .flatten()
+            })
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .find_map(|(entry, _)| entry.management_pending.first().cloned())
             });
         let mut entries: Vec<_> = self
             .entries
@@ -602,13 +688,72 @@ where
             .zip(&records)
             .filter_map(|((recovery, _), record)| record.as_ref().map(|record| (recovery, record)))
             .collect();
-        owner.recover_deferred_shared_generations_with_pending(
-            &mut entries,
-            signer,
-            predecessor.as_ref(),
-        )?;
+        if !self.generations_recovered {
+            owner.recover_deferred_shared_generations_with_pending(
+                &mut entries,
+                signer,
+                predecessor.as_ref(),
+            )?;
+            self.generations_recovered = true;
+        }
+        drop(entries);
+        let mut installs = Vec::new();
+        for (index, (entry, _)) in self.entries.iter().enumerate() {
+            let Some(slot) = entry.management_intent.as_ref() else {
+                continue;
+            };
+            let Some(anchor) = slot
+                .authorization_anchor()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            else {
+                continue;
+            };
+            let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
+            installs.push((
+                anchor.ordered.index,
+                intent.call().request_sequence.get(),
+                entry.locator.agent,
+                index,
+            ));
+        }
+        installs.sort_unstable();
+        for (_, _, _, index) in installs {
+            Self::complete_retained_install(owner, &mut self.entries[index].0, signer)?;
+        }
+        owner.shared_lifecycle_recovery_pending = false;
         self.recovered = true;
         Ok(())
+    }
+
+    fn complete_retained_install<B, C, D, S>(
+        owner: &mut CleanSystemAgentBootstrapOwner<B, C, D>,
+        recovery: &mut NativeSharedGenesisRecovery<I, J, Q, R, W, P>,
+        signer: &mut S,
+    ) -> Result<SignedManagementTerminal, SharedAgentHostError>
+    where
+        B: CleanSystemAgentBootstrapStore + Send + 'static,
+        C: CleanSystemAgentBootstrapStore + Send + 'static,
+        D: CleanManagementIssuerStore + Send + 'static,
+        I: super::super::clean_authority_issuer::CleanManagementActorStore,
+        S: CleanManagementReceiptSigner,
+    {
+        let slot = recovery
+            .management_intent
+            .as_mut()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let issuer = recovery
+            .management_issuer
+            .as_mut()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let package = slot
+            .load_actor()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .ok_or(SharedAgentHostError::Unavailable)?;
+        let terminal =
+            owner.complete_shared_install_from_management_intent(slot, &package, issuer, signer)?;
+        recovery.management_pending.clear();
+        recovery.management_retirements.clear();
+        Ok(terminal)
     }
 }
 
@@ -620,6 +765,8 @@ pub struct NativeSharedGenesisRecovery<I, J: CleanManagementIssuerStore, Q, R, W
     locator: super::super::genesis::AgentGenesisLocator,
     pub(super) authority: AuthorityActorTarget,
     pub(super) pending: Vec<(ManagementJournalAnchor, RuntimeWork)>,
+    pub(super) management_pending: Vec<(ManagementJournalAnchor, RuntimeWork)>,
+    pub(super) management_retirements: Vec<[RuntimeWork; 2]>,
     pub(super) intent: CleanManagementIntentSlot<I>,
     pub(super) query: Q,
     pub(super) reply: R,
@@ -644,8 +791,8 @@ impl<
 > NativeSharedGenesisRecovery<I, J, Q, R, W, P>
 {
     /// File discovery retains an existing handoff under the original lease.
-    /// Unissued inputs beside a byte-identical idle issuer need no additional
-    /// runtime-work reservation. Any prepared dispatch still fails closed.
+    /// Continuing work is classified separately from immutable Create evidence
+    /// and must join startup admission before any system execution.
     /// The controller must still authenticate physical genesis before serving.
     fn reopen_management_handoff(&mut self) -> Result<(), SharedAgentHostError>
     where
@@ -710,17 +857,6 @@ impl<
                 .map_err(|_| SharedAgentHostError::Unavailable)?
                 || !matches!(pending.request(), ManagementRequest::Install(_))
                 || slot
-                    .authorization_work()
-                    .map_err(|_| SharedAgentHostError::Unavailable)?
-                    .is_some()
-                || slot
-                    .finalization_work()
-                    .map_err(|_| SharedAgentHostError::Unavailable)?
-                    .is_some()
-                || slot
-                    .retirement_complete()
-                    .map_err(|_| SharedAgentHostError::Unavailable)?
-                || slot
                     .denial_complete()
                     .map_err(|_| SharedAgentHostError::Unavailable)?
             {
@@ -745,6 +881,12 @@ impl<
                     .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
                 validate_actor_install(descriptor, pending.request(), &package)
                     .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            } else if slot
+                .authorization_work()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .is_some()
+            {
+                return Err(SharedAgentHostError::Unavailable);
             }
         } else if actor.is_some() {
             return Err(SharedAgentHostError::ScopeMismatch);
@@ -753,11 +895,121 @@ impl<
             .issuer
             .open_creation_continuation()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
-        // Pending Install admission/replay is not yet wired here. Do not hide
-        // later work merely because original Create has a retirement proof.
-        if !self.issuer.matches_creation_checkpoint(&continuation) {
-            return Err(SharedAgentHostError::Conflict);
+        let mut pending_work = Vec::new();
+        let mut retirements = Vec::new();
+        if let Some(intent) = slot.intent() {
+            let issued = continuation
+                .recover_issued_application(
+                    self.authority,
+                    intent.call().managed,
+                    intent.request(),
+                    intent.call(),
+                    &RawCredentialVerifier,
+                )
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            let observed = continuation
+                .recover_observed_terminal(
+                    self.authority,
+                    intent.call().managed,
+                    intent.request(),
+                    intent.call(),
+                    &RawCredentialVerifier,
+                )
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            let finalized = continuation
+                .recover_finalized_terminal(
+                    self.authority,
+                    intent.call().managed,
+                    intent.request(),
+                    intent.call(),
+                    &RawCredentialVerifier,
+                )
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            let retired = slot
+                .retirement_complete()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            let authorization = slot
+                .authorization_work()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            let finalization = slot
+                .finalization_work()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            if (retired && finalized.is_none())
+                || (finalized.is_some() && finalized != observed)
+                || observed.as_ref().is_some_and(|(receipt, _)| {
+                    issued.as_ref() != Some(receipt)
+                        || continuation.has_pending_decision()
+                        || continuation.retained_decisions() != 0
+                        || continuation.sequence_high_water() != continuation.acknowledged_through()
+                })
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            if issued.is_none()
+                && !continuation
+                    .can_resume_install(
+                        self.authority,
+                        intent.call().managed,
+                        intent.request(),
+                        intent.call(),
+                        &RawCredentialVerifier,
+                    )
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            if let Some(work) = finalization {
+                let (_, terminal) = observed
+                    .as_ref()
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                let Some(RuntimeWork::Invoke { observed_slot, .. }) = authorization else {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                };
+                let RuntimeWork::Invoke { invocation, .. } = work else {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                };
+                if terminal.applied_at() < *observed_slot
+                    || invocation.message != terminal.finalization_message()
+                {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+            }
+            match (authorization, finalization) {
+                (None, None)
+                    if issued.is_none()
+                        && !continuation.has_pending_decision()
+                        && !continuation.has_pending_application_observation()
+                        && observed.is_none() => {}
+                (Some(first), Some(last)) if finalized.is_some() => {
+                    if !retired {
+                        retirements.push([first.clone(), last.clone()]);
+                    }
+                }
+                (Some(first), last) if finalized.is_none() => {
+                    pending_work.push((
+                        slot.authorization_anchor()
+                            .map_err(|_| SharedAgentHostError::Unavailable)?
+                            .ok_or(SharedAgentHostError::ScopeMismatch)?
+                            .clone(),
+                        first.clone(),
+                    ));
+                    if let Some(last) = last {
+                        pending_work.push((
+                            slot.finalization_anchor()
+                                .map_err(|_| SharedAgentHostError::Unavailable)?
+                                .ok_or(SharedAgentHostError::ScopeMismatch)?
+                                .clone(),
+                            last.clone(),
+                        ));
+                    }
+                }
+                _ => return Err(SharedAgentHostError::ScopeMismatch),
+            }
+        } else if !self.issuer.matches_creation_checkpoint(&continuation) {
+            return Err(SharedAgentHostError::ScopeMismatch);
         }
+        self.management_pending = pending_work;
+        self.management_retirements = retirements;
         self.management_issuer = Some(continuation);
         self.management_intent = Some(slot);
         Ok(())
@@ -1399,6 +1651,8 @@ impl<
             locator,
             authority,
             pending,
+            management_pending: Vec::new(),
+            management_retirements: Vec::new(),
             intent,
             query,
             reply,
