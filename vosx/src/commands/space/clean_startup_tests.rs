@@ -72,9 +72,20 @@ impl GenesisClaimSigner for GenesisSigner<'_> {
 #[test]
 #[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
 fn shared_create_file_owner_reopens_preparation_publication_and_terminal() {
+    check_shared_file_recovery(false);
+}
+
+#[test]
+#[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
+fn shared_create_file_owner_reopens_denial_beside_retired_generation() {
+    check_shared_file_recovery(true);
+}
+
+fn check_shared_file_recovery(with_denial: bool) {
     use crate::commands::space::clean_store::{
         CleanAgentGenesisSignatureFile, CleanFileStoreError, ensure_private_directory,
     };
+    use vos::agent::shared_host::SharedAgentHostError;
     let scratch = Scratch::new();
     let data = scratch.0.join("space");
     drop(ensure_private_directory(&data).unwrap());
@@ -260,6 +271,46 @@ fn shared_create_file_owner_reopens_preparation_publication_and_terminal() {
     assert_eq!(acknowledgement.credential_call, call.commitment());
     let applied = journal_files(&journal);
     assert!(!applied.is_empty());
+    let denied = with_denial.then(|| {
+        let mut denied_descriptor = descriptor.clone();
+        denied_descriptor.creation_nonce = Hash([0x75; 32]);
+        denied_descriptor.identity.agent =
+            AgentId::derive(space, owner, denied_descriptor.creation_nonce.as_bytes());
+        let denied_replicas = AgentReplicaCommittee::new(
+            HostSpaceId(space.0),
+            HostAgentId(denied_descriptor.identity.agent.0),
+            HostAgentProfile::Shared,
+            replicas.members().to_vec(),
+        )
+        .unwrap();
+        let mut denied_call = call.clone();
+        denied_call.managed.agent = denied_descriptor.identity.agent;
+        denied_call.request_sequence = NonZeroU64::new(99).unwrap();
+        denied_call.plan = ManagementRequest::Create(Box::new(denied_descriptor.clone()))
+            .authorization_plan()
+            .unwrap();
+        denied_call.invocation = denied_call.expected_invocation();
+        denied_call.signature = sign_exact(&operator, &denied_call.signing_bytes()).unwrap();
+        let denied_locator = lifecycle
+            .reserve_shared_create(&denied_descriptor, &denied_call, &runtime, &denied_replicas)
+            .unwrap();
+        assert_eq!(
+            lifecycle.prepare_shared_create(denied_locator),
+            Err(SharedAgentHostError::ScopeMismatch)
+        );
+        // Successful completion's fresh Authority read would fail if the
+        // rejected Create still held its original management reservation.
+        assert_eq!(
+            lifecycle.complete_shared_create(locator).unwrap(),
+            acknowledgement
+        );
+        (
+            denied_descriptor,
+            denied_call,
+            denied_replicas,
+            denied_locator,
+        )
+    });
     drop(lifecycle);
     let (_, mut lifecycle) = open();
     assert_eq!(
@@ -277,6 +328,44 @@ fn shared_create_file_owner_reopens_preparation_publication_and_terminal() {
         applied,
         "terminal retry cannot repeat physical Create"
     );
+    if let Some((descriptor, call, replicas, denied_locator)) = denied {
+        let system_journal = data
+            .join(SHARED_AGENT_HOST_DIRECTORY)
+            .join(format!("{}.agent", hex::encode(authority.system_agent.0)));
+        let before = journal_files(&system_journal);
+        for _ in 0..2 {
+            assert_eq!(
+                lifecycle
+                    .reserve_shared_create(&descriptor, &call, &runtime, &replicas)
+                    .unwrap(),
+                denied_locator
+            );
+            assert_eq!(
+                lifecycle.prepare_shared_create(denied_locator),
+                Err(SharedAgentHostError::ScopeMismatch)
+            );
+            assert_eq!(
+                lifecycle.publish_shared_create(denied_locator, vec![]),
+                Err(SharedAgentHostError::ScopeMismatch)
+            );
+            assert_eq!(
+                lifecycle.complete_shared_create(denied_locator),
+                Err(SharedAgentHostError::ScopeMismatch)
+            );
+            assert_eq!(
+                journal_files(&system_journal),
+                before,
+                "denial retry must not repeat Authority execution"
+            );
+        }
+        assert!(
+            !data
+                .join(SHARED_AGENT_HOST_DIRECTORY)
+                .join(format!("{}.agent", hex::encode(denied_locator.agent.0)))
+                .exists()
+        );
+        assert_eq!(journal_files(&journal), applied);
+    }
     drop(lifecycle);
     network.shutdown();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);

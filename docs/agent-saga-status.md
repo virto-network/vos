@@ -237,8 +237,9 @@ Internal completion integration stages a published live generation outside
 the serving map, without entering the global startup-recovery gate. The owning
 coordinator observes physical application, finalizes and retires the signed
 Create, then admits only that generation. Terminal retries preserve the original
-ACK and still perform a fresh Authority read (using an anchored successor if
-another valid Create reservation holds admission). Successful startup recovery
+ACK and still perform a fresh Authority read. Live retries may return `Conflict`
+while another management operation owns admission; anchored verification reads
+are currently startup-only, not a live bypass of that guard. Successful startup recovery
 now updates the retained in-memory phase to completed, enabling that same retry
 path. Four controller regressions and the deferred-host lease/finality test
 pass. The final physical completion test passes (526.89 s), including a
@@ -279,9 +280,9 @@ preparation/publication retry regression also passes (240.56 s), preserving
 publication counts and the original reservation until completion. The staged-namespace absence test,
 four controller tests, five existing Local denial tests and 20 filesystem tests
 pass (one fixture-dependent file test ignored), as do daemon and `std`-only
-build checks. These denial crash fixtures still use memory lifecycle stores
-with physical system journals. File-backed
-discovery/crash qualification and public terminal-response mapping remain
+build checks. Those interrupted-signature fixtures still use memory lifecycle
+stores with physical system journals; production-file terminal recovery is
+qualified below. Process-interruption qualification and public terminal-response mapping remain
 pre-ingress gates; these internal methods still return a rejection, not a new
 public denial response format.
 
@@ -312,6 +313,23 @@ RUST_MIN_STACK=16777216 cargo test --offline --locked -p vosx \
   shared_create_file_owner_reopens_preparation_publication_and_terminal \
   -- --ignored --test-threads=1
 ```
+
+The extended file-backed regression retains a signed denied Create beside the
+completed generation, reopens both through production discovery, and requires
+the healthy generation's fresh Authority retry to succeed. It passes (156.29 s):
+denial retries leave the system journal unchanged and allocate no ordinary
+generation, while the healthy generation retains its exact ACK and journal.
+Reproduce with the command above, replacing the filter with
+`shared_create_file_owner_reopens_denial_beside_retired_generation`.
+
+Shared Install integration must first replace the fixture-only issuer copy in
+`serve_mixed_shared` with a durable handoff. Keep the immutable Create recovery
+evidence while establishing one continuing management issuer; after handoff,
+missing continuation state must fail closed rather than reseed an old sequence.
+Reuse existing management intent, issuance, physical application, signed
+terminal and retirement semantics. Recovery must restore pending Install
+admission before system execution and authenticate genesis before reopening
+the physical target; do not enable ingress from the live-only happy path.
 
 Backup quiescence must also cover unserved live generations after reservation
 release: an idle Authority admission alone does not prove all Create routes
