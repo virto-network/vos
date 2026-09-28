@@ -348,14 +348,35 @@ confirming the new Shared layout preserves that workflow; it does not activate
 or qualify Install handoff. The `std`-only core build, formatting and diff
 checks pass. Test logs use disk-backed `target/shared-management-handoff-*`.
 
-Still required: retain this continuation in the lifecycle controller only after
-physical Create/finality/retirement verification; replace the fixture copy;
-reuse existing management intent, issuance, physical application, signed terminal
-and retirement semantics. Recovery must restore pending Install admission before
-system execution and authenticate genesis before reopening the physical target.
-Until that integration exists, production startup explicitly refuses retained
-continuation state and no live caller activates the handoff. Public Shared
-management remains disabled; do not enable ingress from a live-only happy path.
+The retained lifecycle controller now initializes the continuation only after
+completed Create, physical generation and fresh Authority verification. Its
+original recovery entry owns both issuers for the same lifetime. Production
+discovery reopens the pair before system bootstrap; ordinary Create-only
+discovery explicitly refuses a handed-off source. Startup accepts only a
+byte-identical idle Create checkpoint in the continuing issuer. A pending or
+issued next decision is still rejected, not silently omitted from admission.
+This idle handoff requires no new reservation; the normal complete-set physical
+genesis proof remains mandatory before routes can be exposed.
+
+The new `shared_management_handoff_reopens_under_production_lifecycle_owner`
+outer-PVM test passes (192.80 s, experimental-feature debug build). It exercises
+initialization and exact retry, real owner drop/reopen,
+unchanged original Create files and physical journal, retained writer leases,
+missing-continuation refusal without reseeding, and a denied neighbouring Create
+that cannot initialize a continuing issuer. Five controller regressions and all
+18 issuer tests pass; the filesystem suite passes 77 tests plus its separately
+run loopback HTTP regression (one fixture-dependent test remains ignored).
+The default/experimental-feature daemon builds and `std`-only core build pass. Logs use
+disk-backed `target/shared-management-controller-*`.
+
+Still required: replace the fixture-only issuer copy with controller-owned
+Install; retain and validate its signed intent and actor package; reuse existing
+issuance, physical application, signed terminal and retirement semantics.
+Recovery must restore pending Install admission before system execution and
+authenticate genesis before reopening the physical target. Keep the idle-only
+startup gate until that recovery exists. Public Shared management remains
+disabled; do not enable ingress from a live-only happy path. This is not yet
+Shared Install, a public customer workflow, three-node or release qualification.
 
 Backup quiescence must also cover unserved live generations after reservation
 release: an idle Authority admission alone does not prove all Create routes

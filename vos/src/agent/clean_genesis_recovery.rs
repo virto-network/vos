@@ -1,4 +1,4 @@
-//! Leased reservation recovery for ordinary Shared Create through publication.
+//! Retained Shared Create recovery and continuing management ownership.
 
 use super::genesis_issuance::RetainedCommitteeQuery;
 use super::*;
@@ -376,6 +376,31 @@ where
         owner.complete_live_shared_genesis(recovery, &record, signer, predecessor.as_ref())
     }
 
+    /// Retain one continuing issuer only after authenticating the completed
+    /// Create against the live generation and fresh Authority state. This does
+    /// not execute or admit Install; the retained slot is still at Create.
+    pub fn initialize_management<B, C, D, S>(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<B, C, D>,
+        locator: super::super::genesis::AgentGenesisLocator,
+        signer: &mut S,
+    ) -> Result<(), SharedAgentHostError>
+    where
+        B: CleanSystemAgentBootstrapStore + Send + 'static,
+        C: CleanSystemAgentBootstrapStore + Send + 'static,
+        D: CleanManagementIssuerStore + Send + 'static,
+        J: super::super::clean_authority_issuer::CleanSharedManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+    {
+        self.complete_pending_create(owner, locator, signer)?;
+        let (recovery, _) = self
+            .entries
+            .iter_mut()
+            .find(|(entry, _)| entry.locator == locator)
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        recovery.initialize_management_issuer()
+    }
+
     /// Borrow every store until bootstrap has admitted its retained work.
     pub fn startup_admission<'a>(
         &'a mut self,
@@ -536,6 +561,7 @@ pub struct NativeSharedGenesisRecovery<I, J: CleanManagementIssuerStore, Q, R, W
     pub(super) publication_reply: P,
     pub(super) runtime: Option<AdmittedRuntimePackage>,
     pub(super) issuer: DurableCleanManagementIssuer<J>,
+    management_issuer: Option<DurableCleanManagementIssuer<J>>,
     pub(super) issued: Option<AuthorityReceipt>,
     pub(super) admission_valid: bool,
     pub(super) retired: bool,
@@ -550,6 +576,46 @@ impl<
     P: CleanManagementIssuerStore,
 > NativeSharedGenesisRecovery<I, J, Q, R, W, P>
 {
+    /// File discovery retains an existing handoff under the original lease.
+    /// Only a byte-identical, idle Create checkpoint needs no new admission.
+    /// The controller must still authenticate physical genesis before serving.
+    fn reopen_management_handoff(&mut self) -> Result<(), SharedAgentHostError>
+    where
+        J: super::super::clean_authority_issuer::CleanSharedManagementIssuerStore,
+    {
+        if self
+            .issuer
+            .creation_continuation_retained()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        {
+            self.initialize_management_issuer()?;
+        }
+        Ok(())
+    }
+
+    fn initialize_management_issuer(&mut self) -> Result<(), SharedAgentHostError>
+    where
+        J: super::super::clean_authority_issuer::CleanSharedManagementIssuerStore,
+    {
+        if !self.retired || !self.admission_valid || !self.pending.is_empty() {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        if self.management_issuer.is_some() {
+            return Ok(());
+        }
+        let continuation = self
+            .issuer
+            .open_creation_continuation()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        // Pending Install admission/replay is not yet wired here. Do not hide
+        // later work merely because original Create has a retirement proof.
+        if !self.issuer.matches_creation_checkpoint(&continuation) {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        self.management_issuer = Some(continuation);
+        Ok(())
+    }
+
     /// Validate exact signed inputs before a file factory allocates per-Agent
     /// stores. This grants no Authority approval, reservation or route. The
     /// actual reservation repeats this validation before writing any inputs.
@@ -859,14 +925,80 @@ impl<
         locator: super::super::genesis::AgentGenesisLocator,
         intent_store: I,
         issuer_store: J,
-        mut query: Q,
-        mut reply: R,
-        mut publication: W,
-        mut publication_reply: P,
+        query: Q,
+        reply: R,
+        publication: W,
+        publication_reply: P,
     ) -> Result<Self, SharedAgentHostError>
     where
         Q: super::super::clean_authority_issuer::CleanSharedGenesisReplicaStore,
     {
+        Self::open_inner(
+            authority,
+            locator,
+            intent_store,
+            issuer_store,
+            query,
+            reply,
+            publication,
+            publication_reply,
+            false,
+        )
+    }
+
+    /// Discover original Create and its continuing issuer together. Ordinary
+    /// `open` refuses handed-off sources, so no caller can accidentally admit
+    /// the Create while forgetting later management state.
+    pub fn open_with_management_handoff(
+        authority: AuthorityActorTarget,
+        locator: super::super::genesis::AgentGenesisLocator,
+        intent_store: I,
+        issuer_store: J,
+        query: Q,
+        reply: R,
+        publication: W,
+        publication_reply: P,
+    ) -> Result<Self, SharedAgentHostError>
+    where
+        J: super::super::clean_authority_issuer::CleanSharedManagementIssuerStore,
+        Q: super::super::clean_authority_issuer::CleanSharedGenesisReplicaStore,
+    {
+        let mut recovery = Self::open_inner(
+            authority,
+            locator,
+            intent_store,
+            issuer_store,
+            query,
+            reply,
+            publication,
+            publication_reply,
+            true,
+        )?;
+        recovery.reopen_management_handoff()?;
+        Ok(recovery)
+    }
+
+    fn open_inner(
+        authority: AuthorityActorTarget,
+        locator: super::super::genesis::AgentGenesisLocator,
+        intent_store: I,
+        mut issuer_store: J,
+        mut query: Q,
+        mut reply: R,
+        mut publication: W,
+        mut publication_reply: P,
+        include_handoff: bool,
+    ) -> Result<Self, SharedAgentHostError>
+    where
+        Q: super::super::clean_authority_issuer::CleanSharedGenesisReplicaStore,
+    {
+        if issuer_store
+            .issuance_disabled()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            && !include_handoff
+        {
+            return Err(SharedAgentHostError::Conflict);
+        }
         locator
             .validate()
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
@@ -1126,6 +1258,7 @@ impl<
             publication_reply,
             runtime,
             issuer,
+            management_issuer: None,
             issued,
             admission_valid: true,
             retired,

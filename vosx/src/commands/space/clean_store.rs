@@ -1361,18 +1361,15 @@ impl CleanAgentGenesisCommitteeStoreFactory {
                 agent: vos::service::AgentId(agent.0),
             };
             let (mut intent, mut issuer) = lifecycle.open_existing(authority.space, agent)?;
-            // Until continuing Install admission is wired into startup, never
-            // serve a generation while silently ignoring its management slot.
-            if issuer.issuance_disabled()? {
-                return Err(CleanFileStoreError::UnexpectedResidue);
-            }
+            let handoff = issuer.issuance_disabled()?;
             let has_intent = intent.load()?.is_some();
             if !has_intent {
                 // A crash before the signed pledge may leave an empty scoped
                 // directory or exact staged inputs. It is not an Agent. Do
                 // not create a missing committee/query directory while
                 // inspecting it, and never hide an issuer or phase image.
-                if issuer.load()?.is_some()
+                if handoff
+                    || issuer.load()?.is_some()
                     || intent.load_actor()?.is_some()
                     || intent.load_external_create_archive()?.is_some()
                 {
@@ -1425,19 +1422,18 @@ impl CleanAgentGenesisCommitteeStoreFactory {
             };
             let publication = query.publication();
             let publication_reply = query.publication_reply();
-            recovered.push(
-                CleanSharedGenesisRecovery::open(
-                    authority,
-                    locator,
-                    intent,
-                    issuer,
-                    query,
-                    reply,
-                    publication,
-                    publication_reply,
-                )
-                .map_err(|_| CleanFileStoreError::Corrupt)?,
-            );
+            let recovery = CleanSharedGenesisRecovery::open_with_management_handoff(
+                authority,
+                locator,
+                intent,
+                issuer,
+                query,
+                reply,
+                publication,
+                publication_reply,
+            )
+            .map_err(|_| CleanFileStoreError::Corrupt)?;
+            recovered.push(recovery);
         }
         Ok(recovered)
     }

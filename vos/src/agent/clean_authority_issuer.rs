@@ -1264,6 +1264,21 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         self.store
     }
 
+    pub(crate) fn creation_continuation_retained(
+        &mut self,
+    ) -> Result<bool, CleanManagementIssuerError<B::Error>> {
+        self.ensure_live()?;
+        self.store
+            .issuance_disabled()
+            .map_err(CleanManagementIssuerError::Storage)
+    }
+
+    /// Startup may admit an idle handoff without another reservation, but not
+    /// a pledged or issued next decision. Compare the complete canonical state.
+    pub(crate) fn matches_creation_checkpoint(&self, continuation: &Self) -> bool {
+        !self.poisoned && !continuation.poisoned && self.image == continuation.image
+    }
+
     /// The lifecycle coordinator must first prove Create application,
     /// finalization and retirement against the live physical generation.
     /// Destination durability precedes source activation. No mutation may use
@@ -3439,10 +3454,12 @@ mod tests {
         let original = store.source.image();
         let mut continued = source.open_creation_continuation().unwrap();
         assert_eq!(store.continuation.image(), original);
+        assert!(source.matches_creation_checkpoint(&continued));
         assert!(source.open_creation_continuation().is_err());
         let next = decision(&fixture, 2, &request(0x74));
         assert!(source.issue(&next, &mut signer).is_err());
         let receipt = continued.issue(&next, &mut signer).unwrap();
+        assert!(!source.matches_creation_checkpoint(&continued));
         assert_eq!(receipt.selector.decision_sequence, 2);
         assert_eq!(receipt.selector.acknowledged_through, 1);
         let advanced = store.continuation.image();
@@ -3481,6 +3498,7 @@ mod tests {
         ));
         assert!(continued.has_pending_decision());
         assert_eq!(continued.sequence_high_water(), 1);
+        assert!(!source.matches_creation_checkpoint(&continued));
         let pledged = store.continuation.image();
         drop(continued);
         drop(source);

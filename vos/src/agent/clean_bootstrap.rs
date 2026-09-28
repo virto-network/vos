@@ -8317,6 +8317,9 @@ mod tests {
         #[derive(Clone, Default)]
         struct IssuerMemoryStore {
             image: Arc<Mutex<Option<Vec<u8>>>>,
+            management_image: Arc<Mutex<Option<Vec<u8>>>>,
+            management_handoff: Arc<Mutex<Option<Vec<u8>>>>,
+            is_management_continuation: bool,
             runtime: Arc<Mutex<Option<Vec<u8>>>>,
             shared_replicas: Arc<Mutex<Option<Vec<u8>>>>,
             actor: Arc<Mutex<Option<Vec<u8>>>>,
@@ -8416,6 +8419,10 @@ mod tests {
             }
 
             fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
+                if self.issuance_disabled()? && self.image.lock().unwrap().as_deref() != Some(image)
+                {
+                    return Err(MemoryError);
+                }
                 *self.image.lock().unwrap() = Some(image.to_vec());
                 if (image.starts_with(b"CMR2") || image.starts_with(b"CND1"))
                     && self
@@ -8434,6 +8441,44 @@ mod tests {
                     }
                 }
                 Ok(())
+            }
+
+            fn issuance_disabled(&mut self) -> Result<bool, Self::Error> {
+                Ok(!self.is_management_continuation
+                    && (self.management_image.lock().unwrap().is_some()
+                        || self.management_handoff.lock().unwrap().is_some()))
+            }
+        }
+
+        impl crate::agent::clean_authority_issuer::CleanSharedManagementIssuerStore for IssuerMemoryStore {
+            fn load_management_handoff(&mut self) -> Result<Option<Vec<u8>>, MemoryError> {
+                if self.is_management_continuation {
+                    return Err(MemoryError);
+                }
+                Ok(self.management_handoff.lock().unwrap().clone())
+            }
+
+            fn commit_management_handoff(&mut self, marker: &[u8]) -> Result<(), MemoryError> {
+                if self.is_management_continuation {
+                    return Err(MemoryError);
+                }
+                let mut retained = self.management_handoff.lock().unwrap();
+                if retained.as_ref().is_some_and(|saved| saved != marker) {
+                    return Err(MemoryError);
+                }
+                *retained = Some(marker.to_vec());
+                Ok(())
+            }
+
+            fn management_continuation(&mut self) -> Result<Self, MemoryError> {
+                if self.is_management_continuation {
+                    return Err(MemoryError);
+                }
+                Ok(Self {
+                    image: self.management_image.clone(),
+                    is_management_continuation: true,
+                    ..self.clone()
+                })
             }
         }
 
@@ -12061,6 +12106,59 @@ mod tests {
         #[test]
         fn native_shared_genesis_controller_retains_live_reservation_and_exact_retry() {
             check_shared_system_bootstrap(3);
+        }
+
+        #[test]
+        fn native_shared_genesis_controller_refuses_an_unadmitted_handoff() {
+            let mut harness = NativeProjectionOwnerHarness::new("shared-unadmitted-handoff");
+            let owner = harness.owner.as_mut().unwrap();
+            let authority = owner.authority_target();
+            let locator = crate::agent::genesis::AgentGenesisLocator {
+                space: HostSpaceId(authority.space.0),
+                agent: HostAgentId([0xe9; 32]),
+            };
+            let before = owner.ordered_index_for_test().unwrap();
+            for marker in [false, true] {
+                let source = IssuerMemoryStore::default();
+                let retained = if marker {
+                    &source.management_handoff
+                } else {
+                    &source.management_image
+                };
+                *retained.lock().unwrap() = Some(vec![0x91]);
+                assert!(matches!(
+                    NativeSharedGenesisRecovery::open(
+                        authority,
+                        locator,
+                        IssuerMemoryStore::default(),
+                        source.clone(),
+                        IssuerMemoryStore::default(),
+                        IssuerMemoryStore::default(),
+                        IssuerMemoryStore::default(),
+                        IssuerMemoryStore::default(),
+                    ),
+                    Err(SharedAgentHostError::Conflict)
+                ));
+                // Explicit handoff recovery still requires the signed original
+                // Create; a sidecar alone cannot manufacture an admitted owner.
+                assert!(matches!(
+                    NativeSharedGenesisRecovery::open_with_management_handoff(
+                        authority,
+                        locator,
+                        IssuerMemoryStore::default(),
+                        source.clone(),
+                        IssuerMemoryStore::default(),
+                        IssuerMemoryStore::default(),
+                        IssuerMemoryStore::default(),
+                        IssuerMemoryStore::default(),
+                    ),
+                    Err(SharedAgentHostError::ScopeMismatch)
+                ));
+                assert_eq!(*retained.lock().unwrap(), Some(vec![0x91]));
+                assert!(source.image.lock().unwrap().is_none());
+            }
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+            harness.stop();
         }
 
         #[test]

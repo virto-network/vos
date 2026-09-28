@@ -2484,6 +2484,13 @@ where
         signer: &mut S,
     ) -> Result<ManagementApplicationAck, SharedAgentHostError>;
 
+    fn initialize_management(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        locator: super::genesis::AgentGenesisLocator,
+        signer: &mut S,
+    ) -> Result<(), SharedAgentHostError>;
+
     fn reserve_create(
         &mut self,
         _: &AgentDescriptor,
@@ -2506,7 +2513,7 @@ where
     I: CleanManagementIssuerStore + Send + 'static,
     S: CleanManagementReceiptSigner,
     B: super::clean_authority_issuer::CleanManagementRuntimeStore + Send,
-    J: CleanManagementIssuerStore + Send,
+    J: super::clean_authority_issuer::CleanSharedManagementIssuerStore + Send,
     Q: super::clean_authority_issuer::CleanSharedGenesisReplicaStore + Send,
     Reply: CleanManagementIssuerStore + Send,
     W: CleanManagementIssuerStore + Send,
@@ -2563,6 +2570,15 @@ where
         self.0.complete_pending_create(owner, locator, signer)
     }
 
+    fn initialize_management(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        locator: super::genesis::AgentGenesisLocator,
+        signer: &mut S,
+    ) -> Result<(), SharedAgentHostError> {
+        self.0.initialize_management(owner, locator, signer)
+    }
+
     fn reserve_create(
         &mut self,
         descriptor: &AgentDescriptor,
@@ -2585,7 +2601,7 @@ where
     I: CleanManagementIssuerStore + Send + 'static,
     S: CleanManagementReceiptSigner,
     B: super::clean_authority_issuer::CleanManagementRuntimeStore + Send,
-    J: CleanManagementIssuerStore + Send,
+    J: super::clean_authority_issuer::CleanSharedManagementIssuerStore + Send,
     Q: super::clean_authority_issuer::CleanSharedGenesisReplicaStore + Send,
     Reply: CleanManagementIssuerStore + Send,
     W: CleanManagementIssuerStore + Send,
@@ -2627,6 +2643,17 @@ where
         signer: &mut S,
     ) -> Result<ManagementApplicationAck, SharedAgentHostError> {
         self.complete_pending_create(owner, locator, signer)
+    }
+
+    fn initialize_management(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        locator: super::genesis::AgentGenesisLocator,
+        signer: &mut S,
+    ) -> Result<(), SharedAgentHostError> {
+        super::clean_bootstrap::NativeSharedGenesisController::initialize_management(
+            self, owner, locator, signer,
+        )
     }
 }
 
@@ -2955,7 +2982,7 @@ where
     ) -> Result<Self, SharedAgentHostError>
     where
         B: super::clean_authority_issuer::CleanManagementRuntimeStore + Send + 'static,
-        J: CleanManagementIssuerStore + Send + 'static,
+        J: super::clean_authority_issuer::CleanSharedManagementIssuerStore + Send + 'static,
         Q: super::clean_authority_issuer::CleanSharedGenesisReplicaStore + Send + 'static,
         Reply: CleanManagementIssuerStore + Send + 'static,
         W: CleanManagementIssuerStore + Send + 'static,
@@ -2984,7 +3011,7 @@ where
     ) -> Result<Self, SharedAgentHostError>
     where
         B: super::clean_authority_issuer::CleanManagementRuntimeStore + Send + 'static,
-        J: CleanManagementIssuerStore + Send + 'static,
+        J: super::clean_authority_issuer::CleanSharedManagementIssuerStore + Send + 'static,
         Q: super::clean_authority_issuer::CleanSharedGenesisReplicaStore + Send + 'static,
         Reply: CleanManagementIssuerStore + Send + 'static,
         W: CleanManagementIssuerStore + Send + 'static,
@@ -3102,6 +3129,22 @@ where
             .as_mut()
             .ok_or(SharedAgentHostError::Conflict)?
             .complete_create(&mut system, locator, &mut self.signer)
+    }
+
+    /// Retain the continuing management issuer after a fresh completed-Create
+    /// check. This internal seam admits no Install and publishes no new route.
+    pub fn initialize_shared_management(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+    ) -> Result<(), SharedAgentHostError> {
+        let mut system = self
+            .system
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        self.shared_genesis
+            .as_mut()
+            .ok_or(SharedAgentHostError::Conflict)?
+            .initialize_management(&mut system, locator, &mut self.signer)
     }
 
     /// Adopt the recovered admin stores for the full production-owner lifetime.

@@ -72,16 +72,22 @@ impl GenesisClaimSigner for GenesisSigner<'_> {
 #[test]
 #[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
 fn shared_create_file_owner_reopens_preparation_publication_and_terminal() {
-    check_shared_file_recovery(false);
+    check_shared_file_recovery(false, false);
 }
 
 #[test]
 #[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
 fn shared_create_file_owner_reopens_denial_beside_retired_generation() {
-    check_shared_file_recovery(true);
+    check_shared_file_recovery(true, false);
 }
 
-fn check_shared_file_recovery(with_denial: bool) {
+#[test]
+#[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
+fn shared_management_handoff_reopens_under_production_lifecycle_owner() {
+    check_shared_file_recovery(true, true);
+}
+
+fn check_shared_file_recovery(with_denial: bool, with_handoff: bool) {
     use crate::commands::space::clean_store::{
         CleanAgentGenesisSignatureFile, CleanFileStoreError, ensure_private_directory,
     };
@@ -220,6 +226,14 @@ fn check_shared_file_recovery(with_denial: bool) {
         .join(SHARED_AGENT_HOST_DIRECTORY)
         .join(format!("{}.agent", hex::encode(agent.0)));
     assert!(!journal.exists(), "preparation cannot apply a generation");
+    let lifecycle_root = data
+        .join(crate::commands::space::clean_store::SHARED_LIFECYCLE_DIRECTORY)
+        .join(hex::encode(agent.0));
+    if with_handoff {
+        assert!(lifecycle.initialize_shared_management(locator).is_err());
+        assert!(!lifecycle_root.join("shared-management.handoff").exists());
+        assert!(!lifecycle_root.join("shared-management.issuer").exists());
+    }
     drop(signature_store);
     drop(lifecycle);
 
@@ -311,8 +325,44 @@ fn check_shared_file_recovery(with_denial: bool) {
             denied_locator,
         )
     });
+    let handoff_files = with_handoff.then(|| {
+        let before = journal_files(&lifecycle_root);
+        lifecycle.initialize_shared_management(locator).unwrap();
+        let retained = journal_files(&lifecycle_root);
+        for (name, bytes) in before {
+            assert_eq!(
+                retained.get(&name),
+                Some(&bytes),
+                "handoff must preserve original Create evidence"
+            );
+        }
+        assert!(retained.contains_key(Path::new("shared-management.handoff")));
+        assert!(retained.contains_key(Path::new("shared-management.issuer")));
+        lifecycle.initialize_shared_management(locator).unwrap();
+        assert_eq!(journal_files(&lifecycle_root), retained);
+        assert_eq!(journal_files(&journal), applied);
+        assert!(matches!(
+            discover_shared_genesis_startup(&data, authority, 4),
+            Err(CleanFileStoreError::Busy)
+        ));
+        retained
+    });
     drop(lifecycle);
+    if with_handoff {
+        // A missing activated slot must fail without recreating its seed.
+        let continuation = lifecycle_root.join("shared-management.issuer");
+        let saved = scratch.0.join("saved-management-issuer");
+        std::fs::rename(&continuation, &saved).unwrap();
+        assert!(discover_shared_genesis_startup(&data, authority, 4).is_err());
+        assert!(!continuation.exists());
+        std::fs::rename(saved, continuation).unwrap();
+    }
     let (_, mut lifecycle) = open();
+    if let Some(retained) = handoff_files {
+        assert_eq!(journal_files(&lifecycle_root), retained);
+        lifecycle.initialize_shared_management(locator).unwrap();
+        assert_eq!(journal_files(&lifecycle_root), retained);
+    }
     assert_eq!(
         lifecycle
             .reserve_shared_create(&descriptor, &call, &runtime, &replicas)
@@ -334,6 +384,12 @@ fn check_shared_file_recovery(with_denial: bool) {
             .join(format!("{}.agent", hex::encode(authority.system_agent.0)));
         let before = journal_files(&system_journal);
         for _ in 0..2 {
+            if with_handoff {
+                assert_eq!(
+                    lifecycle.initialize_shared_management(denied_locator),
+                    Err(SharedAgentHostError::ScopeMismatch)
+                );
+            }
             assert_eq!(
                 lifecycle
                     .reserve_shared_create(&descriptor, &call, &runtime, &replicas)
