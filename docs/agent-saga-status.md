@@ -260,12 +260,30 @@ physical preparation/publication retry regression passes (228.02 s), with
 unchanged publication counts and no early route exposure. This is a capacity
 check, not a durable slot reservation: production
 orchestration must keep competing physical allocation under the lifecycle
-ordering contract and retain the staging-time check. Before ingress, qualify
-signed Create denial retirement without leaving Authority admission held.
-Reuse the existing signed management-denial replay/retirement helper with
-Shared physical-absence verification; Shared recovery currently rejects a
-completed denial, so terminal discovery/retry must be integrated too. Do not
-map a capacity preflight error into a fabricated signed Authority denial.
+ordering contract and retain the staging-time check.
+
+Shared denial integration reuses the existing management-denial
+replay, positive runtime ACK and signed CND1 retirement. Physical absence is
+checked under the Shared root lease, including staged namespaces; no runtime,
+storage or capacity error is itself a denial. Startup accepts a valid signed
+denial only without issuance, application or subsequent genesis phases. It
+counts as durable history but restores no pending reservation and requires no
+genesis archive. Preparation can retire a proven denial; publication/completion
+cannot reinterpret it as a successful Create. Two restart regressions pass with
+the bundled Authority actor and native outer-runtime shortcut (12.42 s), covering
+both completed denial and interruption after positive ACK but before signature.
+The same interrupted-signature restart passes with real bootstrap and bundled
+outer-PVM execution (149.49 s): no duplicate Invoke/ACK, no issuance/archive or
+route, and unchanged signed terminal on exact retries. The physical successful
+preparation/publication retry regression also passes (240.56 s), preserving
+publication counts and the original reservation until completion. The staged-namespace absence test,
+four controller tests, five existing Local denial tests and 20 filesystem tests
+pass (one fixture-dependent file test ignored), as do daemon and `std`-only
+build checks. These denial crash fixtures still use memory lifecycle stores
+with physical system journals. File-backed
+discovery/crash qualification and public terminal-response mapping remain
+pre-ingress gates; these internal methods still return a rejection, not a new
+public denial response format.
 Backup quiescence must also cover unserved live generations after reservation
 release: an idle Authority admission alone does not prove all Create routes
 have been admitted or that the lifecycle/physical snapshot is complete.

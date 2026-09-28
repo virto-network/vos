@@ -206,6 +206,9 @@ where
         {
             return Err(SharedAgentHostError::Conflict);
         }
+        if owner.finish_denied_shared_genesis(recovery, receipt_signer)? {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
         let replicas = recovery
             .retained_replicas()?
             .ok_or(SharedAgentHostError::ScopeMismatch)?;
@@ -215,7 +218,13 @@ where
             .map_err(|_| SharedAgentHostError::Unavailable)?
             .preflight_live_genesis_capacity(locator)?;
         let (candidate, committee) =
-            owner.resume_shared_genesis_preparation(recovery, &replicas, receipt_signer)?;
+            match owner.resume_shared_genesis_preparation(recovery, &replicas, receipt_signer) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    owner.finish_denied_shared_genesis(recovery, receipt_signer)?;
+                    return Err(error);
+                }
+            };
         Ok(PreparedSharedGenesisEndorsement {
             candidate,
             committee,
@@ -279,6 +288,13 @@ where
             return Err(SharedAgentHostError::Conflict);
         }
         let archive = archive.as_ref().ok_or(SharedAgentHostError::Unavailable)?;
+        if recovery
+            .intent
+            .denial_complete()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
         let provider = super::super::genesis_archive::ArchivedAgentGenesisProvider::new(
             locator.space,
             archive,
@@ -331,6 +347,13 @@ where
             .iter_mut()
             .find(|(entry, _)| entry.locator == locator)
             .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        if recovery
+            .intent
+            .denial_complete()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
         let archive = archive.as_ref().ok_or(SharedAgentHostError::Unavailable)?;
         let provider = super::super::genesis_archive::ArchivedAgentGenesisProvider::new(
             locator.space,
@@ -423,6 +446,9 @@ where
                     }
                     return Ok(None);
                 };
+                if recovery.intent.denial_complete().map_err(|_| SharedAgentHostError::Unavailable)? {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
                 if bytes.len() > super::super::genesis::MAX_AGENT_GENESIS_ARCHIVE_RECORD_BYTES {
                     return Err(SharedAgentHostError::ScopeMismatch);
                 }
@@ -439,6 +465,9 @@ where
         // lifecycle preparation, which continues to exclude ordinary reads.
         owner.recover_pending_authority_projection()?;
         for ((recovery, _), record) in self.entries.iter_mut().zip(&records) {
+            if record.is_none() && owner.finish_denied_shared_genesis(recovery, signer)? {
+                continue;
+            }
             if record.is_none() && !recovery.pending.is_empty() {
                 let replicas = recovery
                     .retained_replicas()?
@@ -446,8 +475,15 @@ where
                 // Saved receipts and committee replies are not execution
                 // authority. Replay their original journal intervals before
                 // accepting the retained pre-publication phase. Do not endorse
-                // genesis, mint an archive or discharge the unfinished Create.
-                owner.resume_shared_genesis_preparation(recovery, &replicas, signer)?;
+                // genesis or mint an archive. Only a replay-proved denial may
+                // discharge this unfinished Create instead of preparing it.
+                if let Err(error) =
+                    owner.resume_shared_genesis_preparation(recovery, &replicas, signer)
+                {
+                    if !owner.finish_denied_shared_genesis(recovery, signer)? {
+                        return Err(error);
+                    }
+                }
             }
         }
         let predecessor = self
@@ -837,12 +873,12 @@ impl<
         if descriptor.identity.profile != AgentProfile::Shared
             || descriptor.identity.space.0 != locator.space.0
             || descriptor.identity.agent.0 != locator.agent.0
-            || intent
-                .denial_complete()
-                .map_err(|_| SharedAgentHostError::Unavailable)?
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
+        let denied = intent
+            .denial_complete()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
         let retired = intent
             .retirement_complete()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
@@ -1055,7 +1091,19 @@ impl<
         // A completed lifecycle no longer reserves old journal anchors. Its
         // archive is still untrusted: recovery must obtain a fresh decision
         // from the live pinned Authority before opening the generation.
-        if retired {
+        if denied {
+            if retired
+                || issued.is_some()
+                || observed.is_some()
+                || pending.len() != 1
+                || issuer.sequence_high_water() != 0
+                || issuer.has_pending_decision()
+                || issuer.retained_decisions() != 0
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            pending.clear();
+        } else if retired {
             pending.clear();
         }
         let mut recovered = Self {

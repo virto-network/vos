@@ -6389,6 +6389,79 @@ where
         }))
     }
 
+    /// Retire only a replay-proved Shared denial with no physical generation
+    /// or subsequent genesis phase. An execution/storage error is not a denial.
+    pub(crate) fn finish_denied_shared_genesis<B, J, Q, Reply, W, PubReply, S>(
+        &mut self,
+        recovery: &mut NativeSharedGenesisRecovery<B, J, Q, Reply, W, PubReply>,
+        signer: &mut S,
+    ) -> Result<bool, SharedAgentHostError>
+    where
+        B: super::clean_authority_issuer::CleanManagementRuntimeStore,
+        J: CleanManagementIssuerStore,
+        Q: CleanManagementIssuerStore,
+        Reply: CleanManagementIssuerStore,
+        W: CleanManagementIssuerStore,
+        PubReply: CleanManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+    {
+        if recovery.authority != self.authority_target() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if recovery.retired
+            || recovery.issued.is_some()
+            || recovery.issuer.sequence_high_water() != 0
+            || recovery.issuer.has_pending_decision()
+            || recovery.issuer.retained_decisions() != 0
+            || recovery
+                .intent
+                .authorization_work()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .is_none()
+        {
+            return Ok(false);
+        }
+        if recovery
+            .reply
+            .load()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .is_some()
+            || recovery
+                .query
+                .load()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .is_some()
+            || recovery
+                .publication
+                .load()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .is_some()
+            || recovery
+                .publication_reply
+                .load()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .is_some()
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let host = self.host.clone();
+        let denied = self.finish_denied_management_intent_with_absence(
+            &mut recovery.intent,
+            &recovery.issuer,
+            &mut |agent| {
+                host.lock()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?
+                    .clean_genesis_is_absent(crate::service::AgentId(agent.0))
+            },
+            signer,
+        )?;
+        if denied {
+            recovery.pending.clear();
+            recovery.admission_valid = true;
+        }
+        Ok(denied)
+    }
+
     pub(crate) fn finish_denied_management_intent<
         B: CleanManagementIssuerStore,
         J: CleanManagementIssuerStore,
@@ -24287,6 +24360,213 @@ mod tests {
             Archive,
             Published,
             Provisioned,
+        }
+
+        #[test]
+        fn native_shared_denial_retires_and_reopens_without_reservation() {
+            check_shared_denial_restart(false, false);
+        }
+
+        #[test]
+        fn native_shared_denial_restart_finishes_signature_after_positive_ack() {
+            check_shared_denial_restart(true, false);
+        }
+
+        #[test]
+        #[ignore = "requires the bundled outer PVM; run with VOS_AGENT_PROFILE_REFINE_MACHINES=1"]
+        fn native_shared_denial_outer_pvm_restart_after_positive_ack() {
+            check_shared_denial_restart(true, true);
+        }
+
+        fn check_shared_denial_restart(fail_signature: bool, physical: bool) {
+            let mut harness = if physical {
+                NativeProjectionOwnerHarness::with_real_bootstrap(
+                    "shared-denial-restart",
+                    native_bundled_authority_fixture(),
+                )
+            } else {
+                NativeProjectionOwnerHarness::with_fixture(
+                    "shared-denial-restart",
+                    native_bundled_authority_fixture(),
+                )
+            };
+            let mut owner = harness.owner.take().unwrap();
+            let target = owner.authority_target();
+            let runtime = shape_only_runtime();
+            let mut descriptor = owner.pins.descriptor.clone();
+            descriptor.creation_nonce = Hash([0xea; 32]);
+            descriptor.identity.agent = AgentId::derive(
+                descriptor.identity.space,
+                descriptor.identity.owner,
+                descriptor.creation_nonce.as_bytes(),
+            );
+            descriptor.identity.runtime_deployment = runtime.deployment();
+            descriptor.identity.runtime_program = runtime.program();
+            descriptor.identity.runtime_producer = runtime.producer();
+            descriptor.runtime_package = runtime.package_ref().clone();
+            descriptor.runtime_contract = runtime.manifest().contract;
+            descriptor.capabilities = runtime.capabilities();
+            descriptor.replicas[0].principal = descriptor.identity.owner;
+            let original = &owner.pins.replicas.members()[0];
+            let mut replica = original.replica();
+            replica.principal = crate::service::PrincipalId(descriptor.identity.owner.0);
+            let replicas = AgentReplicaCommittee::new(
+                crate::service::SpaceId(descriptor.identity.space.0),
+                HostAgentId(descriptor.identity.agent.0),
+                crate::agent::AgentProfile::Shared,
+                vec![
+                    crate::agent::genesis::AgentReplicaMember::new(
+                        replica,
+                        original.peer_id().to_vec(),
+                        *original.ed25519_public_key(),
+                        original.raft_slot(),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap();
+            let key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
+            let request = ManagementRequest::Create(Box::new(descriptor.clone()));
+            let (mut call, _) = credential_call_and_approval(&descriptor, &request, &key);
+            // Authenticated but unavailable credential sequence: a canonical
+            // Authority denial, not a signature or runtime execution failure.
+            call.request_sequence = NonZeroU64::new(99).unwrap();
+            call.authority = target;
+            call.invocation = call.expected_invocation();
+            call.signature = key.sign(&call.signing_bytes()).to_bytes();
+            let locator = crate::agent::genesis::AgentGenesisLocator {
+                space: crate::service::SpaceId(descriptor.identity.space.0),
+                agent: HostAgentId(descriptor.identity.agent.0),
+            };
+            let intent_store = IssuerMemoryStore::default();
+            let issuer_store = IssuerMemoryStore::default();
+            let archive = MixedSharedArchive::default();
+            let mut controller = NativeSharedGenesisController::<
+                IssuerMemoryStore,
+                IssuerMemoryStore,
+                IssuerMemoryStore,
+                IssuerMemoryStore,
+                IssuerMemoryStore,
+                IssuerMemoryStore,
+                MixedSharedArchive,
+            >::new(target, vec![])
+            .unwrap();
+            let mut signer = CountingSigner::new();
+            controller.recover(&mut owner, &mut signer).unwrap();
+            controller
+                .reserve_create_with(&descriptor, &call, &runtime, &replicas, || {
+                    Ok((
+                        MixedSharedRecovery::reserve_create_with_replicas(
+                            target,
+                            locator,
+                            descriptor.clone(),
+                            call.clone(),
+                            runtime.clone(),
+                            replicas.clone(),
+                            (
+                                intent_store.clone(),
+                                issuer_store.clone(),
+                                IssuerMemoryStore::default(),
+                                IssuerMemoryStore::default(),
+                                IssuerMemoryStore::default(),
+                                IssuerMemoryStore::default(),
+                            ),
+                        )?,
+                        Some(archive.clone()),
+                    ))
+                })
+                .unwrap();
+            let before = owner.ordered_index_for_test().unwrap();
+            signer.fail_denial = fail_signature;
+            assert_eq!(
+                controller.prepare_pending_create(&mut owner, locator, &mut signer),
+                Err(if fail_signature {
+                    SharedAgentHostError::Unavailable
+                } else {
+                    SharedAgentHostError::ScopeMismatch
+                })
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
+            assert_eq!(owner.management_admission_held().unwrap(), fail_signature);
+            assert!(archive.0.lock().unwrap().is_none());
+            assert!(issuer_store.image.lock().unwrap().is_none());
+            assert!(owner.ordinary_supervisor_generations().unwrap().is_empty());
+            let mut entries = controller.into_entries_for_test();
+            let (recovery, archive_lease) = entries.pop().unwrap();
+            let recovery = reopen_mixed_shared(recovery);
+            assert_eq!(recovery.pending.len(), usize::from(fail_signature));
+            let mut controller =
+                NativeSharedGenesisController::new(target, vec![(recovery, archive_lease)])
+                    .unwrap();
+            let pins = owner._pins_store;
+            let record = owner.record_store;
+            let issuer = owner.issuer.into_store();
+            drop(owner._network_host);
+            drop(owner.host);
+            let mut operations = OperationTestJournal(harness._directory.0.clone());
+            let admission =
+                NativeAuthorityOperationStartupAdmission::load(&mut operations, target, &[])
+                    .unwrap();
+            let admission = controller.startup_admission(admission).unwrap();
+            let mut owner =
+                CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
+                    pins,
+                    record,
+                    issuer,
+                    &mut signer,
+                    || panic!("denial history must not bootstrap a new system"),
+                    harness._directory.host(),
+                    harness._directory.lock(),
+                    harness.fixture.plan.pins.space,
+                    harness.fixture.plan.pins.node,
+                    harness.fixture.trust.clone(),
+                    harness.fixture.merge.clone(),
+                    harness.fixture.finality.clone(),
+                    harness.provider.clone(),
+                    harness.network.clone(),
+                    None,
+                    Some(&admission),
+                )
+                .unwrap();
+            drop(admission);
+            controller.recover(&mut owner, &mut signer).unwrap();
+            assert!(!owner.management_admission_held().unwrap());
+            assert!(owner.ordinary_supervisor_generations().unwrap().is_empty());
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
+            let terminal = intent_store.image.lock().unwrap().clone().unwrap();
+            assert!(terminal.starts_with(b"CND1"));
+            let signatures = signer.calls;
+            for _ in 0..2 {
+                assert_eq!(
+                    controller.prepare_pending_create(&mut owner, locator, &mut signer),
+                    Err(SharedAgentHostError::ScopeMismatch)
+                );
+                assert_eq!(
+                    controller.publish_pending_create(&mut owner, locator, vec![], &mut signer),
+                    Err(SharedAgentHostError::ScopeMismatch)
+                );
+                assert_eq!(
+                    controller.complete_pending_create(&mut owner, locator, &mut signer),
+                    Err(SharedAgentHostError::ScopeMismatch)
+                );
+                assert!(!owner.management_admission_held().unwrap());
+                assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
+                assert_eq!(*intent_store.image.lock().unwrap(), Some(terminal.clone()));
+            }
+            assert_eq!(signer.calls, signatures);
+            assert!(archive.0.lock().unwrap().is_none());
+            // Completion has not allocated a physical generation.
+            assert!(
+                owner
+                    .host
+                    .lock()
+                    .unwrap()
+                    .clean_genesis_is_absent(locator.agent)
+                    .unwrap()
+            );
+            drop(controller);
+            harness.owner = Some(owner);
+            harness.stop();
         }
 
         #[test]

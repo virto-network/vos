@@ -1426,6 +1426,22 @@ impl SharedAgentHost {
         self.stage_unserved_replay_verified(provision, catalog, committee_authority, finality)
     }
 
+    /// Prove absence under the retained physical root lease. A staged namespace
+    /// is not absence even when no serving handle has been admitted yet.
+    #[cfg(all(feature = "network", target_os = "linux"))]
+    pub(crate) fn clean_genesis_is_absent(
+        &mut self,
+        agent: AgentId,
+    ) -> Result<bool, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        if agent == AgentId::ZERO {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        Ok(!self.agents.contains_key(&agent)
+            && !self.deferred_generations.contains_key(&agent)
+            && !scan_generation_namespaces(&self.lease)?.contains_key(&agent))
+    }
+
     /// Check physical capacity before live Authority work, including the system
     /// generation and unserved Creates. This is not a slot reservation or proof
     /// of finality; staging still validates the exact intent and capacity.
@@ -7298,6 +7314,23 @@ mod tests {
         assert!(prepare(&mut host, changed, &runtime, *observed_slot).is_err());
         assert!(host.is_empty());
         assert!(scan_generation_namespaces(&host.lease).unwrap().is_empty());
+    }
+
+    #[test]
+    #[cfg(all(feature = "network", target_os = "linux"))]
+    fn clean_genesis_absence_rejects_staged_physical_namespace() {
+        let directory = TempDirectory::new("genesis_absence");
+        let fixture = fixture(0x26);
+        let mut host = open_host(&directory, &fixture);
+        assert!(host.clean_genesis_is_absent(fixture.agent).unwrap());
+        host.deferred_generations
+            .insert(fixture.agent, GenerationFiles::default());
+        assert!(!host.clean_genesis_is_absent(fixture.agent).unwrap());
+        host.deferred_generations.clear();
+        // Even incomplete/corrupt physical intent bytes are not absence.
+        install_host_record(&host.intent_path(fixture.agent), &[0xff]).unwrap();
+        assert!(!host.clean_genesis_is_absent(fixture.agent).unwrap());
+        assert!(host.is_empty());
     }
 
     #[test]
