@@ -102,7 +102,11 @@ where
             Ok::<_, SharedAgentHostError>(
                 recovery.authority == self.authority
                     && recovery.locator == locator
-                    && recovery.intent.intent() == Some(&signed)
+                    // Execution anchors/work grow after reservation. They are
+                    // not caller inputs and cannot make an exact retry differ.
+                    && recovery.intent.intent().is_some_and(|retained| {
+                        retained.request() == signed.request() && retained.call() == signed.call()
+                    })
                     && recovery
                         .runtime
                         .as_ref()
@@ -130,6 +134,11 @@ where
         let (mut recovery, archive) = reserve()?;
         if !recovery.admission_valid
             || !matches(&mut recovery)?
+            || recovery
+                .intent
+                .authorization_work()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .is_some()
             || !recovery.pending.is_empty()
             || recovery.issued.is_some()
             || recovery.retired

@@ -24531,6 +24531,14 @@ mod tests {
             drop(admission);
             controller.recover(&mut owner, &mut signer).unwrap();
             assert!(!owner.management_admission_held().unwrap());
+            assert_eq!(
+                controller
+                    .reserve_create_with(&descriptor, &call, &runtime, &replicas, || panic!(
+                        "terminal retry must not reopen owned stores"
+                    ),)
+                    .unwrap(),
+                locator
+            );
             assert!(owner.ordinary_supervisor_generations().unwrap().is_empty());
             assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
             let terminal = intent_store.image.lock().unwrap().clone().unwrap();
@@ -24736,6 +24744,12 @@ mod tests {
             let candidate = lifecycle.prepare_shared_create(locator).unwrap();
             let prepared = lifecycle.ordered_index_for_test().unwrap();
             assert!(prepared > before);
+            assert_eq!(
+                lifecycle
+                    .reserve_shared_create(&descriptor, &call, &runtime, &replicas)
+                    .unwrap(),
+                locator
+            );
             assert_eq!(
                 lifecycle.prepare_shared_create(locator).unwrap(),
                 candidate.clone()

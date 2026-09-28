@@ -143,6 +143,57 @@ pub(crate) fn start_clean_system_agent(
     daemon: &Keypair,
     local_storage: super::local_config::LocalAgentStorage,
 ) -> anyhow::Result<()> {
+    let startup_started = std::time::Instant::now();
+    let network = node
+        .network()
+        .ok_or_else(|| anyhow::anyhow!("clean system Agent requires an attached network"))?;
+    let (clean_node, lifecycle) = open_clean_system_lifecycle(
+        network,
+        data_dir,
+        space_bytes,
+        operator,
+        daemon,
+        local_storage,
+        &crate::paths::agent_host_lock_path(&space_bytes),
+    )?;
+    node.start_clean_local_agent_production(
+        clean_node,
+        lifecycle,
+        Box::new(OperatorAuthorityProjectionAuthenticator::new(
+            operator.clone(),
+        )?),
+        AgentSupervisorLimits::default(),
+        PROJECTION_ROUTE_QUEUE_CAPACITY,
+        PROJECTION_RECONCILE_INTERVAL,
+    )?;
+    tracing::debug!(
+        phase = "production_ready",
+        elapsed_ms = startup_started.elapsed().as_millis() as u64,
+        "Clean system Agent startup phase complete"
+    );
+    Ok(())
+}
+
+type CleanProductionLifecycle = vos::agent::local_lifecycle::LocalLifecycleController<
+    super::clean_store::CleanSystemAgentPinsFile,
+    super::clean_store::CleanSystemAgentBootstrapFile,
+    super::clean_store::CleanManagementIssuerFile,
+    CleanManagementLifecycleStoreFactory,
+    OwnedCleanOperatorIdentitySigner,
+>;
+
+/// Construct and recover all file owners before handing them to the node. The
+/// explicit lock path also permits isolated recovery qualification without
+/// changing process-global configuration or exposing a second startup mode.
+fn open_clean_system_lifecycle(
+    network: Arc<vos::network::Network>,
+    data_dir: &Path,
+    space_bytes: [u8; 32],
+    operator: &Keypair,
+    daemon: &Keypair,
+    local_storage: super::local_config::LocalAgentStorage,
+    host_lock: &Path,
+) -> anyhow::Result<(vos::agent::sdk::NodeId, CleanProductionLifecycle)> {
     super::local_config::validate_local_storage_roots(data_dir, local_storage)?;
     #[cfg(not(feature = "experimental-state-blocks"))]
     anyhow::ensure!(
@@ -351,10 +402,6 @@ pub(crate) fn start_clean_system_agent(
     );
     let finality: Arc<dyn AgentGenesisFinalityVerifier> = Arc::new(UnavailableAgentFinality);
     let genesis: Arc<dyn SystemAgentGenesisProvider> = archive.clone();
-    let network = node
-        .network()
-        .ok_or_else(|| anyhow::anyhow!("clean system Agent requires an attached network"))?;
-
     let mut owner_signer = CleanOperatorIdentitySigner::new(operator)?;
     let mut planning_signer = CleanOperatorIdentitySigner::new(operator)?;
     let mut catalog_call = AuthorityCredentialCall {
@@ -542,7 +589,7 @@ pub(crate) fn start_clean_system_agent(
         &mut owner_signer,
         fresh_plan,
         data_dir.join(SHARED_AGENT_HOST_DIRECTORY),
-        crate::paths::agent_host_lock_path(&space_bytes),
+        host_lock,
         space,
         clean_node,
         Arc::clone(&trust),
@@ -648,19 +695,12 @@ pub(crate) fn start_clean_system_agent(
         )?
         .with_admins(admins, admin_signer)?;
     report_phase("lifecycle_controller");
-    node.start_clean_local_agent_production(
-        clean_node,
-        lifecycle,
-        Box::new(OperatorAuthorityProjectionAuthenticator::new(
-            operator.clone(),
-        )?),
-        AgentSupervisorLimits::default(),
-        PROJECTION_ROUTE_QUEUE_CAPACITY,
-        PROJECTION_RECONCILE_INTERVAL,
-    )?;
-    report_phase("production_ready");
-    Ok(())
+    Ok((clean_node, lifecycle))
 }
+
+#[cfg(test)]
+#[path = "clean_startup_tests.rs"]
+mod tests;
 
 fn install_request(
     agent: AgentId,

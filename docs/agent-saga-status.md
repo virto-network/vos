@@ -284,6 +284,35 @@ with physical system journals. File-backed
 discovery/crash qualification and public terminal-response mapping remain
 pre-ingress gates; these internal methods still return a rejection, not a new
 public denial response format.
+
+Production-file qualification extracts controller construction
+from route attachment inside `clean_startup`; both the daemon and test use the
+same constructor, discovery, root checks and locked stores. No public ingress
+or alternate startup mode is added. The test drops/reopens owners after durable
+endorsement, after publication before physical Create, and after terminal
+completion. Its first run found that reservation retries compared mutable
+execution bookkeeping as well as signed caller inputs. Matching now uses the
+immutable request/call (plus exact runtime and replicas), and fresh allocation
+callbacks explicitly reject already-authorized state. The full test passes
+(153.50 s), including exact re-reservation after preparation and retirement,
+reuse of the file-backed endorsement without resigning, recovery of published
+but unapplied genesis, the same terminal ACK after another reopen and unchanged
+ordinary-generation journal files. The two denial regressions and four
+controller regressions pass with the same matching fix. The experimental-feature
+daemon build also passes; default Local remains image-based.
+The daemon startup/shutdown smoke passes after the extraction (18.25 s; endpoint
+ready at 16.76 s). These are owner-reopen boundaries, not injected process kills
+or power-loss/fsync tests; those distinctions remain release-qualification work.
+The test uses one voter and production lifecycle/system/committee/archive files,
+but not public Shared ingress, Shared Install or a three-node quorum. Reproduce
+with disk-backed `CARGO_TARGET_DIR` and `TMPDIR`:
+
+```sh
+RUST_MIN_STACK=16777216 cargo test --offline --locked -p vosx \
+  shared_create_file_owner_reopens_preparation_publication_and_terminal \
+  -- --ignored --test-threads=1
+```
+
 Backup quiescence must also cover unserved live generations after reservation
 release: an idle Authority admission alone does not prove all Create routes
 have been admitted or that the lifecycle/physical snapshot is complete.
