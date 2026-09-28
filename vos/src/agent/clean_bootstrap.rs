@@ -11794,6 +11794,11 @@ mod tests {
         }
 
         #[test]
+        fn native_shared_genesis_controller_retains_live_reservation_and_exact_retry() {
+            check_shared_system_bootstrap(3);
+        }
+
+        #[test]
         fn native_shared_genesis_controller_preserves_incomplete_archive_ownership() {
             struct Archive {
                 image: Option<Vec<u8>>,
@@ -12191,14 +12196,15 @@ mod tests {
         }
 
         fn check_shared_system_bootstrap(use_controller: u8) {
-            struct NoArchive;
+            struct NoArchive(bool);
             impl crate::agent::genesis_archive::AgentGenesisArchiveStore for NoArchive {
                 type Error = ();
                 fn load(
                     &self,
                     _: crate::agent::genesis::AgentGenesisLocator,
                 ) -> Result<Option<Vec<u8>>, ()> {
-                    panic!("empty recovery must not read an archive");
+                    assert!(self.0, "empty recovery must not read an archive");
+                    Ok(None)
                 }
                 fn insert_if_absent(
                     &self,
@@ -12266,7 +12272,7 @@ mod tests {
                 use_controller == 0,
                 "an empty controller must not force deferred opening"
             );
-            if use_controller == 2 {
+            if use_controller >= 2 {
                 struct NoLocalStores;
                 impl crate::agent::local_lifecycle::LocalLifecycleStoreFactory for NoLocalStores {
                     type Intent = IssuerMemoryStore;
@@ -12304,9 +12310,130 @@ mod tests {
                     NoLocalStores,
                     CountingSigner::new(),
                 )
-                .unwrap()
-                .with_shared_genesis(controller)
                 .unwrap();
+                let lifecycle = if use_controller == 2 {
+                    lifecycle.with_shared_genesis(controller).unwrap()
+                } else {
+                    let runtime = shape_only_runtime();
+                    let mut descriptor = lifecycle.system_for_test().pins.descriptor.clone();
+                    descriptor.creation_nonce = Hash([0xde; 32]);
+                    descriptor.identity.agent = AgentId::derive(
+                        descriptor.identity.space,
+                        descriptor.identity.owner,
+                        descriptor.creation_nonce.as_bytes(),
+                    );
+                    descriptor.identity.runtime_deployment = runtime.deployment();
+                    descriptor.identity.runtime_program = runtime.program();
+                    descriptor.identity.runtime_producer = runtime.producer();
+                    descriptor.runtime_package = runtime.package_ref().clone();
+                    descriptor.runtime_contract = runtime.manifest().contract;
+                    descriptor.capabilities = runtime.capabilities();
+                    descriptor.replicas[0].principal = descriptor.identity.owner;
+                    let original = lifecycle.system_for_test().pins.replicas.members()[0].clone();
+                    let mut replica = original.replica();
+                    replica.principal = crate::service::PrincipalId(descriptor.identity.owner.0);
+                    let replicas = AgentReplicaCommittee::new(
+                        crate::service::SpaceId(descriptor.identity.space.0),
+                        HostAgentId(descriptor.identity.agent.0),
+                        crate::agent::AgentProfile::Shared,
+                        vec![
+                            crate::agent::genesis::AgentReplicaMember::new(
+                                replica,
+                                original.peer_id().to_vec(),
+                                *original.ed25519_public_key(),
+                                original.raft_slot(),
+                            )
+                            .unwrap(),
+                        ],
+                    )
+                    .unwrap();
+                    let key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
+                    let request = ManagementRequest::Create(Box::new(descriptor.clone()));
+                    let (mut call, _) = credential_call_and_approval(&descriptor, &request, &key);
+                    call.authority = target;
+                    call.invocation = call.expected_invocation();
+                    call.signature = key.sign(&call.signing_bytes()).to_bytes();
+                    assert_eq!(
+                        controller.reserve_create_with(
+                            &descriptor,
+                            &call,
+                            &runtime,
+                            &replicas,
+                            || panic!("startup must finish before reservation allocation")
+                        ),
+                        Err(SharedAgentHostError::Conflict)
+                    );
+                    let allocations = Arc::new(AtomicUsize::new(0));
+                    let allocated = allocations.clone();
+                    let mut lifecycle = lifecycle
+                        .with_shared_genesis_admission(
+                            controller,
+                            move |descriptor, call, runtime, replicas| {
+                                allocated.fetch_add(1, Ordering::Relaxed);
+                                let locator = crate::agent::genesis::AgentGenesisLocator {
+                                    space: crate::service::SpaceId(descriptor.identity.space.0),
+                                    agent: HostAgentId(descriptor.identity.agent.0),
+                                };
+                                let recovery =
+                                    NativeSharedGenesisRecovery::reserve_create_with_replicas(
+                                        target,
+                                        locator,
+                                        descriptor.clone(),
+                                        call.clone(),
+                                        runtime.clone(),
+                                        replicas.clone(),
+                                        (
+                                            IssuerMemoryStore::default(),
+                                            IssuerMemoryStore::default(),
+                                            IssuerMemoryStore::default(),
+                                            IssuerMemoryStore::default(),
+                                            IssuerMemoryStore::default(),
+                                            IssuerMemoryStore::default(),
+                                        ),
+                                    )?;
+                                Ok((recovery, Some(NoArchive(true))))
+                            },
+                        )
+                        .unwrap();
+                    let locator = lifecycle
+                        .reserve_shared_create(&descriptor, &call, &runtime, &replicas)
+                        .unwrap();
+                    assert_eq!(locator.agent.0, descriptor.identity.agent.0);
+                    assert_eq!(
+                        lifecycle.reserve_shared_create(&descriptor, &call, &runtime, &replicas),
+                        Ok(locator)
+                    );
+                    assert_eq!(allocations.load(Ordering::Relaxed), 1);
+                    let mut replacement = call.clone();
+                    replacement.request_sequence =
+                        NonZeroU64::new(call.request_sequence.get() + 1).unwrap();
+                    replacement.invocation = replacement.expected_invocation();
+                    replacement.signature = key.sign(&replacement.signing_bytes()).to_bytes();
+                    assert_eq!(
+                        lifecycle.reserve_shared_create(
+                            &descriptor,
+                            &replacement,
+                            &runtime,
+                            &replicas
+                        ),
+                        Err(SharedAgentHostError::Conflict)
+                    );
+                    assert_eq!(allocations.load(Ordering::Relaxed), 1);
+                    assert!(
+                        lifecycle
+                            .system_for_test()
+                            .ordinary_supervisor_generations()
+                            .unwrap()
+                            .is_empty()
+                    );
+                    assert!(
+                        !lifecycle
+                            .system_for_test()
+                            .management_admission_held()
+                            .unwrap()
+                    );
+                    lifecycle
+                };
                 assert!(!host.upgrade().unwrap().lock().unwrap().has_deferred_open());
                 assert_eq!(lifecycle.ordered_index_for_test().unwrap(), before);
                 drop(lifecycle);

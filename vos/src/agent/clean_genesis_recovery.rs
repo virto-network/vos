@@ -65,6 +65,99 @@ where
         self.recovered
     }
 
+    /// Retain a new signed, unissued Create after startup recovery. The factory
+    /// may only reserve inputs and acquire leases: it must not execute Authority
+    /// or provision a generation. Exact retries use the already-owned entry and
+    /// never reopen its files. The returned locator is not an execution result.
+    pub fn reserve_create_with<F>(
+        &mut self,
+        descriptor: &AgentDescriptor,
+        call: &super::super::sdk::authority::AuthorityCredentialCall,
+        runtime: &AdmittedRuntimePackage,
+        replicas: &AgentReplicaCommittee,
+        reserve: F,
+    ) -> Result<super::super::genesis::AgentGenesisLocator, SharedAgentHostError>
+    where
+        F: FnOnce() -> Result<
+            (NativeSharedGenesisRecovery<I, J, Q, R, W, P>, Option<A>),
+            SharedAgentHostError,
+        >,
+    {
+        if !self.recovered {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let locator = super::super::genesis::AgentGenesisLocator {
+            space: crate::service::SpaceId(self.authority.space.0),
+            agent: crate::service::AgentId(descriptor.identity.agent.0),
+        };
+        let signed = NativeSharedGenesisRecovery::<I, J, Q, R, W, P>::validated_create_intent(
+            self.authority,
+            locator,
+            descriptor,
+            call,
+            runtime,
+            replicas,
+        )?;
+        let matches = |recovery: &mut NativeSharedGenesisRecovery<I, J, Q, R, W, P>| {
+            Ok::<_, SharedAgentHostError>(
+                recovery.authority == self.authority
+                    && recovery.locator == locator
+                    && recovery.intent.intent() == Some(&signed)
+                    && recovery
+                        .runtime
+                        .as_ref()
+                        .map(AdmittedRuntimePackage::exact_bytes)
+                        == Some(runtime.exact_bytes())
+                    && recovery.retained_replicas()?.as_ref() == Some(replicas),
+            )
+        };
+        let position = match self
+            .entries
+            .binary_search_by_key(&locator.agent, |(entry, _)| entry.locator.agent)
+        {
+            Ok(index) => {
+                return if matches(&mut self.entries[index].0)? {
+                    Ok(locator)
+                } else {
+                    Err(SharedAgentHostError::Conflict)
+                };
+            }
+            Err(index) => index,
+        };
+        if self.entries.len() >= super::super::shared_host::MAX_SHARED_HOST_AGENTS {
+            return Err(SharedAgentHostError::CapacityExhausted);
+        }
+        let (mut recovery, archive) = reserve()?;
+        if !recovery.admission_valid
+            || !matches(&mut recovery)?
+            || !recovery.pending.is_empty()
+            || recovery.issued.is_some()
+            || recovery.retired
+            || recovery.issuer.has_pending_application_observation()
+            || recovery
+                .intent
+                .finalization_work()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .is_some()
+            || archive
+                .as_ref()
+                .map(|archive| {
+                    archive
+                        .load(locator)
+                        .map_err(|_| SharedAgentHostError::Unavailable)
+                })
+                .transpose()?
+                .flatten()
+                .is_some()
+        {
+            // Existing progressed entries must arrive through startup recovery,
+            // not bypass its publication and physical-generation checks here.
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self.entries.insert(position, (recovery, archive));
+        Ok(locator)
+    }
+
     #[cfg(test)]
     pub(super) fn into_entries_for_test(
         self,
@@ -296,6 +389,51 @@ impl<
     P: CleanManagementIssuerStore,
 > NativeSharedGenesisRecovery<I, J, Q, R, W, P>
 {
+    /// Validate exact signed inputs before a file factory allocates per-Agent
+    /// stores. This grants no Authority approval, reservation or route. The
+    /// actual reservation repeats this validation before writing any inputs.
+    pub fn validate_create_reservation(
+        authority: AuthorityActorTarget,
+        locator: super::super::genesis::AgentGenesisLocator,
+        descriptor: &AgentDescriptor,
+        call: &super::super::sdk::authority::AuthorityCredentialCall,
+        runtime: &AdmittedRuntimePackage,
+        replicas: &AgentReplicaCommittee,
+    ) -> Result<(), SharedAgentHostError> {
+        Self::validated_create_intent(authority, locator, descriptor, call, runtime, replicas)
+            .map(|_| ())
+    }
+
+    fn validated_create_intent(
+        authority: AuthorityActorTarget,
+        locator: super::super::genesis::AgentGenesisLocator,
+        descriptor: &AgentDescriptor,
+        call: &super::super::sdk::authority::AuthorityCredentialCall,
+        runtime: &AdmittedRuntimePackage,
+        replicas: &AgentReplicaCommittee,
+    ) -> Result<CleanManagementIntent, SharedAgentHostError> {
+        locator
+            .validate()
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if authority.space != descriptor.identity.space
+            || locator.space.0 != descriptor.identity.space.0
+            || locator.agent.0 != descriptor.identity.agent.0
+            || replicas.validate_for_clean_descriptor(descriptor).is_err()
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        super::super::driver::verify_clean_runtime_package_binding(descriptor, runtime)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        CleanManagementIntent::new(
+            authority,
+            call.managed,
+            ManagementRequest::Create(Box::new(descriptor.clone())),
+            call.clone(),
+            &RawCredentialVerifier,
+        )
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)
+    }
+
     /// First-release Shared reservation: durably stage the exact package and
     /// independently selected peer roster before pledging the signed Create.
     /// A crash before the pledge leaves an inert candidate; a crash after it
@@ -315,26 +453,14 @@ impl<
             + super::super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore,
         Q: super::super::clean_authority_issuer::CleanSharedGenesisReplicaStore,
     {
-        locator
-            .validate()
-            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-        if authority.space != descriptor.identity.space
-            || locator.space.0 != descriptor.identity.space.0
-            || locator.agent.0 != descriptor.identity.agent.0
-            || replicas.validate_for_clean_descriptor(&descriptor).is_err()
-        {
-            return Err(SharedAgentHostError::ScopeMismatch);
-        }
-        super::super::driver::verify_clean_runtime_package_binding(&descriptor, &runtime)
-            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-        let signed = CleanManagementIntent::new(
+        let signed = Self::validated_create_intent(
             authority,
-            call.managed,
-            ManagementRequest::Create(Box::new(descriptor)),
-            call,
-            &RawCredentialVerifier,
-        )
-        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            locator,
+            &descriptor,
+            &call,
+            &runtime,
+            &replicas,
+        )?;
         let (
             intent_store,
             mut issuer,

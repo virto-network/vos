@@ -625,8 +625,18 @@ pub(crate) fn start_clean_system_agent(
             }
         }
     };
+    let mut shared_files = super::clean_store::CleanSharedGenesisAdmissionFiles::open(
+        data_dir,
+        authority_target,
+        vos::agent::shared_host::MAX_SHARED_HOST_AGENTS,
+    )?;
     let lifecycle = lifecycle
-        .with_shared_genesis(shared_genesis)
+        .with_shared_genesis_admission(
+            shared_genesis,
+            move |descriptor, call, runtime, replicas| {
+                shared_files.reserve(descriptor, call, runtime, replicas)
+            },
+        )
         .map_err(|error| {
             anyhow::anyhow!("complete Shared recovery before routes; preserved stores: {error:?}")
         })?;

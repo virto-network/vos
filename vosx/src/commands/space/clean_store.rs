@@ -848,6 +848,235 @@ pub(crate) type CleanSharedGenesisController =
         CleanAgentGenesisArchiveFile,
     >;
 
+/// File-backed admission for ordinary Shared Create. The lifecycle owner must
+/// serialize calls with its other management admissions. Factories pin parent
+/// identities; returned entries retain the per-Agent leases until retirement
+/// and shutdown. Reserving inputs neither executes Authority nor grants a route.
+pub(crate) struct CleanSharedGenesisStoreFactory {
+    authority: vos::agent::sdk::authority::AuthorityActorTarget,
+    maximum: usize,
+    lifecycle: CleanManagementLifecycleStoreFactory,
+    committee: CleanAgentGenesisCommitteeStoreFactory,
+    archives: CleanAgentGenesisArchiveStoreFactory,
+}
+
+/// Pins the Space directory at startup without creating Shared control roots.
+/// The lifecycle owner retains this factory and serializes its first use.
+pub(crate) struct CleanSharedGenesisAdmissionFiles {
+    data_dir: PathBuf,
+    directory: File,
+    authority: vos::agent::sdk::authority::AuthorityActorTarget,
+    maximum: usize,
+    files: Option<CleanSharedGenesisStoreFactory>,
+}
+
+impl CleanSharedGenesisAdmissionFiles {
+    pub(crate) fn open(
+        data_dir: &Path,
+        authority: vos::agent::sdk::authority::AuthorityActorTarget,
+        maximum: usize,
+    ) -> Result<Self, CleanFileStoreError> {
+        if !authority.is_valid()
+            || maximum == 0
+            || maximum > vos::agent::shared_host::MAX_SHARED_HOST_AGENTS
+        {
+            return Err(CleanFileStoreError::InvalidPath);
+        }
+        Ok(Self {
+            data_dir: data_dir.to_path_buf(),
+            directory: open_private_directory(data_dir, true)?,
+            authority,
+            maximum,
+            files: None,
+        })
+    }
+
+    pub(crate) fn reserve(
+        &mut self,
+        descriptor: &vos::agent::sdk::AgentDescriptor,
+        call: &vos::agent::sdk::authority::AuthorityCredentialCall,
+        runtime: &vos::agent::package_admission::AdmittedRuntimePackage,
+        replicas: &vos::agent::genesis::AgentReplicaCommittee,
+    ) -> Result<
+        (
+            CleanSharedGenesisRecovery,
+            Option<CleanAgentGenesisArchiveFile>,
+        ),
+        vos::agent::shared_host::SharedAgentHostError,
+    > {
+        use vos::agent::shared_host::SharedAgentHostError as Error;
+        validate_opened_directory(&self.directory, &self.data_dir, true)
+            .map_err(|_| Error::Unavailable)?;
+        if self.files.is_none() {
+            self.files = Some(
+                CleanSharedGenesisStoreFactory::open_or_create(
+                    &self.data_dir,
+                    self.authority,
+                    self.maximum,
+                )
+                .map_err(|_| Error::Unavailable)?,
+            );
+        }
+        validate_opened_directory(&self.directory, &self.data_dir, true)
+            .map_err(|_| Error::Unavailable)?;
+        let entry = self
+            .files
+            .as_mut()
+            .ok_or(Error::Unavailable)?
+            .reserve_create(
+                descriptor.clone(),
+                call.clone(),
+                runtime.clone(),
+                replicas.clone(),
+            )?;
+        validate_opened_directory(&self.directory, &self.data_dir, true)
+            .map_err(|_| Error::Unavailable)?;
+        Ok((entry.recovery, entry.archive.map(|(archive, _)| archive)))
+    }
+}
+
+impl CleanSharedGenesisStoreFactory {
+    pub(crate) fn open_or_create(
+        data_dir: &Path,
+        authority: vos::agent::sdk::authority::AuthorityActorTarget,
+        maximum: usize,
+    ) -> Result<Self, CleanFileStoreError> {
+        if !authority.is_valid()
+            || maximum == 0
+            || maximum > vos::agent::shared_host::MAX_SHARED_HOST_AGENTS
+        {
+            return Err(CleanFileStoreError::InvalidPath);
+        }
+        // Do not turn an incomplete namespace with retained data into an
+        // apparently complete one. Only an empty partial setup is resumable.
+        shared_genesis_roots_present(data_dir)?;
+        let directory = open_private_directory(data_dir, true)?;
+        // Establish all three empty parents before retaining any per-Agent
+        // data. Startup already accepts an empty partial parent set.
+        let lifecycle = CleanManagementLifecycleStoreFactory::open_or_create(
+            data_dir.join(SHARED_LIFECYCLE_DIRECTORY),
+            authority.space,
+        )?;
+        let committee = CleanAgentGenesisCommitteeStoreFactory::open_or_create(
+            &data_dir.join(SHARED_COMMITTEE_DIRECTORY),
+            vos::service::SpaceId(authority.space.0),
+        )?;
+        let archive_path = data_dir.join(SHARED_ARCHIVE_DIRECTORY);
+        ensure_private_directory(&archive_path)?;
+        let archives = CleanAgentGenesisArchiveStoreFactory::open_existing(
+            &archive_path,
+            vos::service::SpaceId(authority.space.0),
+        )?;
+        validate_opened_directory(&directory, data_dir, true)?;
+        Ok(Self {
+            authority,
+            maximum,
+            lifecycle,
+            committee,
+            archives,
+        })
+    }
+
+    pub(crate) fn reserve_create(
+        &mut self,
+        descriptor: vos::agent::sdk::AgentDescriptor,
+        call: vos::agent::sdk::authority::AuthorityCredentialCall,
+        runtime: vos::agent::package_admission::AdmittedRuntimePackage,
+        replicas: vos::agent::genesis::AgentReplicaCommittee,
+    ) -> Result<CleanSharedGenesisStartupEntry, vos::agent::shared_host::SharedAgentHostError> {
+        use vos::agent::local_lifecycle::LocalLifecycleStoreFactory as _;
+        use vos::agent::shared_host::SharedAgentHostError as Error;
+        let locator = vos::agent::genesis::AgentGenesisLocator {
+            space: vos::service::SpaceId(self.authority.space.0),
+            agent: vos::service::AgentId(descriptor.identity.agent.0),
+        };
+        // Use the core's exact validation, without exposing private lifecycle
+        // representations or allocating stores for malformed inputs.
+        CleanSharedGenesisRecovery::validate_create_reservation(
+            self.authority,
+            locator,
+            &descriptor,
+            &call,
+            &runtime,
+            &replicas,
+        )?;
+        let agents = self
+            .lifecycle
+            .discover(self.authority.space, self.maximum)
+            .map_err(|_| Error::Unavailable)?;
+        // Count every retained directory, including denied or merely staged
+        // inputs. Existing exact retries are still admitted at capacity.
+        if !agents.contains(&descriptor.identity.agent) && agents.len() >= self.maximum {
+            return Err(Error::CapacityExhausted);
+        }
+        for found in self
+            .committee
+            .discover(self.maximum)
+            .map_err(|_| Error::Unavailable)?
+            .into_iter()
+            .chain(
+                self.archives
+                    .discover(self.maximum)
+                    .map_err(|_| Error::Unavailable)?,
+            )
+        {
+            if !agents.contains(&vos::agent::sdk::AgentId(found.agent.0)) {
+                return Err(Error::ScopeMismatch);
+            }
+        }
+        let (intent, issuer) = self
+            .lifecycle
+            .open(self.authority.space, descriptor.identity.agent)
+            .map_err(|_| Error::Unavailable)?;
+        validate_opened_directory(&self.committee.directory, &self.committee.parent, true)
+            .map_err(|_| Error::Unavailable)?;
+        let (query, reply) =
+            CleanAgentGenesisCommitteeFile::open_pair(&self.committee.parent, locator)
+                .map_err(|_| Error::Unavailable)?;
+        validate_opened_directory(&self.committee.directory, &self.committee.parent, true)
+            .map_err(|_| Error::Unavailable)?;
+        let publication = query.publication();
+        let publication_reply = query.publication_reply();
+        let recovery = CleanSharedGenesisRecovery::reserve_create_with_replicas(
+            self.authority,
+            locator,
+            descriptor,
+            call,
+            runtime,
+            replicas,
+            (intent, issuer, query, reply, publication, publication_reply),
+        )?;
+        // Never create an archive namespace before the signed reservation:
+        // discovery rightly rejects archives without an owning Create.
+        validate_opened_directory(&self.archives.directory, &self.archives.parent, true)
+            .map_err(|_| Error::Unavailable)?;
+        let archive = CleanAgentGenesisArchiveFile::open_or_create(&self.archives.parent, locator)
+            .map_err(|_| Error::Unavailable)?;
+        validate_opened_directory(&self.archives.directory, &self.archives.parent, true)
+            .map_err(|_| Error::Unavailable)?;
+        use vos::agent::genesis_archive::AgentGenesisArchiveStore as _;
+        use vos::service::ServiceWire as _;
+        let record = archive
+            .load(locator)
+            .map_err(|_| Error::Unavailable)?
+            .map(|bytes| {
+                vos::agent::genesis::AgentGenesisArchiveRecord::decode(&bytes)
+                    .map_err(|_| Error::ScopeMismatch)
+            })
+            .transpose()?;
+        if record
+            .as_ref()
+            .is_some_and(|record| record.provision().proposal().locator() != locator)
+        {
+            return Err(Error::ScopeMismatch);
+        }
+        Ok(CleanSharedGenesisStartupEntry {
+            recovery,
+            archive: Some((archive, record)),
+        })
+    }
+}
+
 /// Discover ordinary Shared recovery before opening the physical host. Fresh
 /// spaces have no Shared control directories; do not create them during reads.
 /// An empty partial set is a crash during first-time namespace creation, not
@@ -861,6 +1090,29 @@ pub(crate) fn discover_shared_genesis_startup(
     if !authority.is_valid() {
         return Err(CleanFileStoreError::InvalidPath);
     }
+    if !shared_genesis_roots_present(data_dir)? {
+        return Ok(None);
+    }
+    let directory = open_private_directory(data_dir, true)?;
+    let paths = [
+        data_dir.join(SHARED_LIFECYCLE_DIRECTORY),
+        data_dir.join(SHARED_COMMITTEE_DIRECTORY),
+        data_dir.join(SHARED_ARCHIVE_DIRECTORY),
+    ];
+    let space = vos::service::SpaceId(authority.space.0);
+    let mut lifecycle = CleanManagementLifecycleStoreFactory::new(&paths[0], authority.space)?;
+    let committee = CleanAgentGenesisCommitteeStoreFactory::open_existing_parent(&paths[1], space)?;
+    let archives = CleanAgentGenesisArchiveStoreFactory::open_existing(&paths[2], space)?;
+    let entries = archives.discover_recovery(&mut lifecycle, &committee, authority, maximum)?;
+    validate_opened_directory(&directory, data_dir, true)?;
+    CleanSharedGenesisStartupEntry::into_controller(authority, entries)
+        .map(Some)
+        .map_err(|_| CleanFileStoreError::Corrupt)
+}
+
+/// Shared by noncreating discovery and first-Create admission. False means
+/// absent or empty partial setup; nonempty partial setup always fails closed.
+fn shared_genesis_roots_present(data_dir: &Path) -> Result<bool, CleanFileStoreError> {
     let directory = open_private_directory(data_dir, true)?;
     let paths = [
         data_dir.join(SHARED_LIFECYCLE_DIRECTORY),
@@ -878,7 +1130,7 @@ pub(crate) fn discover_shared_genesis_startup(
     }
     if present_paths.is_empty() {
         validate_opened_directory(&directory, data_dir, true)?;
-        return Ok(None);
+        return Ok(false);
     }
     if present_paths.len() != paths.len() {
         for path in present_paths {
@@ -893,17 +1145,10 @@ pub(crate) fn discover_shared_genesis_startup(
             validate_opened_directory(&opened, path, false)?;
         }
         validate_opened_directory(&directory, data_dir, true)?;
-        return Ok(None);
+        return Ok(false);
     }
-    let space = vos::service::SpaceId(authority.space.0);
-    let mut lifecycle = CleanManagementLifecycleStoreFactory::new(&paths[0], authority.space)?;
-    let committee = CleanAgentGenesisCommitteeStoreFactory::open_existing_parent(&paths[1], space)?;
-    let archives = CleanAgentGenesisArchiveStoreFactory::open_existing(&paths[2], space)?;
-    let entries = archives.discover_recovery(&mut lifecycle, &committee, authority, maximum)?;
     validate_opened_directory(&directory, data_dir, true)?;
-    CleanSharedGenesisStartupEntry::into_controller(authority, entries)
-        .map(Some)
-        .map_err(|_| CleanFileStoreError::Corrupt)
+    Ok(true)
 }
 
 /// One startup reservation with every acquired lease still owned. An absent
@@ -5491,6 +5736,10 @@ pub(crate) mod tests {
             discover_shared_genesis_startup(&incomplete.parent, authority, 1),
             Err(CleanFileStoreError::Corrupt)
         ));
+        assert!(matches!(
+            CleanSharedGenesisStoreFactory::open_or_create(&incomplete.parent, authority, 1),
+            Err(CleanFileStoreError::Corrupt)
+        ));
         assert!(!incomplete.parent.join(SHARED_COMMITTEE_DIRECTORY).exists());
         assert!(!incomplete.parent.join(SHARED_ARCHIVE_DIRECTORY).exists());
     }
@@ -5651,6 +5900,45 @@ pub(crate) mod tests {
         selected_replicas
             .validate_for_clean_descriptor(&descriptor)
             .unwrap();
+        let lazy_space = fixture.parent.join("lazy-shared-space");
+        ensure_private_directory(&lazy_space).unwrap();
+        let mut lazy = CleanSharedGenesisAdmissionFiles::open(&lazy_space, authority, 1).unwrap();
+        assert_eq!(fs::read_dir(&lazy_space).unwrap().count(), 0);
+        let reserved = lazy
+            .reserve(&descriptor, &call, &runtime, &selected_replicas)
+            .unwrap();
+        assert!(matches!(
+            discover_shared_genesis_startup(&lazy_space, authority, 1),
+            Err(CleanFileStoreError::Busy)
+        ));
+        drop(reserved);
+        drop(
+            discover_shared_genesis_startup(&lazy_space, authority, 1)
+                .unwrap()
+                .unwrap(),
+        );
+        let displaced_space = fixture.parent.join("lazy-displaced-space");
+        fs::rename(&lazy_space, &displaced_space).unwrap();
+        ensure_private_directory(&lazy_space).unwrap();
+        assert!(matches!(
+            lazy.reserve(&descriptor, &call, &runtime, &selected_replicas),
+            Err(vos::agent::shared_host::SharedAgentHostError::Unavailable)
+        ));
+        assert_eq!(fs::read_dir(&lazy_space).unwrap().count(), 0);
+        let never_used = fixture.parent.join("lazy-never-used");
+        ensure_private_directory(&never_used).unwrap();
+        let mut lazy = CleanSharedGenesisAdmissionFiles::open(&never_used, authority, 1).unwrap();
+        fs::rename(
+            &never_used,
+            fixture.parent.join("lazy-never-used-displaced"),
+        )
+        .unwrap();
+        ensure_private_directory(&never_used).unwrap();
+        assert!(matches!(
+            lazy.reserve(&descriptor, &call, &runtime, &selected_replicas),
+            Err(vos::agent::shared_host::SharedAgentHostError::Unavailable)
+        ));
+        assert_eq!(fs::read_dir(&never_used).unwrap().count(), 0);
         let staged = Fixture::new("ordinary-genesis-staged-create");
         let staged_archives_path = staged.parent.join(SHARED_ARCHIVE_DIRECTORY);
         ensure_private_directory(&staged_archives_path).unwrap();
@@ -5811,30 +6099,160 @@ pub(crate) mod tests {
         assert!(fresh_intent.load().unwrap().is_none());
         assert!(fresh_intent.load_runtime().unwrap().is_none());
         assert!(fresh_query.load_replicas().unwrap().is_none());
-        let fresh_publication = fresh_query.publication();
-        let fresh_publication_reply = fresh_query.publication_reply();
-        let mut fresh_recovery = CleanSharedGenesisRecovery::reserve_create_with_replicas(
-            authority,
-            locator,
-            descriptor.clone(),
-            call.clone(),
-            runtime.clone(),
-            selected_replicas.clone(),
-            (
-                fresh_intent,
-                fresh_issuer,
-                fresh_query,
-                fresh_reply,
-                fresh_publication,
-                fresh_publication_reply,
-            ),
-        )
-        .unwrap();
+        drop((fresh_intent, fresh_issuer, fresh_query, fresh_reply));
+        let mut files =
+            CleanSharedGenesisStoreFactory::open_or_create(&fresh.parent, authority, 1).unwrap();
+        let mut fresh_recovery = files
+            .reserve_create(
+                descriptor.clone(),
+                call.clone(),
+                runtime.clone(),
+                selected_replicas.clone(),
+            )
+            .unwrap();
         assert_eq!(
-            fresh_recovery.retained_replicas().unwrap(),
+            fresh_recovery.recovery.retained_replicas().unwrap(),
             Some(selected_replicas.clone())
         );
+        assert!(fresh_recovery.archive.as_ref().unwrap().1.is_none());
+        assert!(matches!(
+            files.archives.open_archive(locator),
+            Err(CleanFileStoreError::Busy)
+        ));
         drop(fresh_recovery);
+        drop(files);
+        let controller = discover_shared_genesis_startup(&fresh.parent, authority, 1)
+            .unwrap()
+            .unwrap();
+        assert!(!controller.is_recovered());
+        drop(controller);
+        let mut files =
+            CleanSharedGenesisStoreFactory::open_or_create(&fresh.parent, authority, 1).unwrap();
+        let retry = files
+            .reserve_create(
+                descriptor.clone(),
+                call.clone(),
+                runtime.clone(),
+                selected_replicas.clone(),
+            )
+            .unwrap();
+        drop(retry);
+        let mut other = descriptor.clone();
+        other.creation_nonce = vos::agent::sdk::Hash([0xfa; 32]);
+        other.identity.agent = vos::agent::sdk::AgentId::derive(
+            other.identity.space,
+            other.identity.owner,
+            other.creation_nonce.as_bytes(),
+        );
+        let mut other_call = call.clone();
+        other_call.managed.agent = other.identity.agent;
+        other_call.plan = ManagementRequest::Create(Box::new(other.clone()))
+            .authorization_plan()
+            .unwrap();
+        other_call.invocation = other_call.expected_invocation();
+        other_call.signature = operator
+            .sign(&other_call.signing_bytes())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let other_replicas = vos::agent::genesis::AgentReplicaCommittee::new(
+            locator.space,
+            vos::service::AgentId(other.identity.agent.0),
+            vos::agent::AgentProfile::Shared,
+            selected_replicas.members().to_vec(),
+        )
+        .unwrap();
+        assert!(matches!(
+            files.reserve_create(
+                other.clone(),
+                other_call.clone(),
+                runtime.clone(),
+                other_replicas.clone()
+            ),
+            Err(vos::agent::shared_host::SharedAgentHostError::CapacityExhausted)
+        ));
+        assert_eq!(
+            files.lifecycle.discover(authority.space, 1).unwrap(),
+            vec![descriptor.identity.agent]
+        );
+
+        // Lock-only staging consumes the same bound before and after startup.
+        let bounded = Fixture::new("ordinary-genesis-staged-capacity");
+        let mut files =
+            CleanSharedGenesisStoreFactory::open_or_create(&bounded.parent, authority, 1).unwrap();
+        let mut forged = call.clone();
+        forged.signature[0] ^= 1;
+        assert!(matches!(
+            files.reserve_create(
+                descriptor.clone(),
+                forged,
+                runtime.clone(),
+                selected_replicas.clone()
+            ),
+            Err(vos::agent::shared_host::SharedAgentHostError::ScopeMismatch)
+        ));
+        assert!(
+            files
+                .lifecycle
+                .discover(authority.space, 1)
+                .unwrap()
+                .is_empty()
+        );
+        drop(
+            files
+                .lifecycle
+                .open(authority.space, descriptor.identity.agent)
+                .unwrap(),
+        );
+        drop(files);
+        let controller = discover_shared_genesis_startup(&bounded.parent, authority, 1)
+            .unwrap()
+            .unwrap();
+        drop(controller);
+        let mut files =
+            CleanSharedGenesisStoreFactory::open_or_create(&bounded.parent, authority, 1).unwrap();
+        assert!(matches!(
+            files.reserve_create(other, other_call, runtime.clone(), other_replicas),
+            Err(vos::agent::shared_host::SharedAgentHostError::CapacityExhausted)
+        ));
+        assert!(files.committee.discover(1).unwrap().is_empty());
+        assert!(files.archives.discover(1).unwrap().is_empty());
+        drop(
+            files
+                .reserve_create(
+                    descriptor.clone(),
+                    call.clone(),
+                    runtime.clone(),
+                    selected_replicas.clone(),
+                )
+                .unwrap(),
+        );
+        let controller = discover_shared_genesis_startup(&bounded.parent, authority, 1)
+            .unwrap()
+            .unwrap();
+        assert!(!controller.is_recovered());
+        drop(controller);
+        // A retained factory must not follow a replaced parent pathname when
+        // an exact retry opens its stores.
+        let committee_path = bounded.parent.join(SHARED_COMMITTEE_DIRECTORY);
+        fs::rename(&committee_path, bounded.parent.join("displaced-committee")).unwrap();
+        ensure_private_directory(&committee_path).unwrap();
+        assert!(matches!(
+            files.reserve_create(
+                descriptor.clone(),
+                call.clone(),
+                runtime.clone(),
+                selected_replicas.clone(),
+            ),
+            Err(vos::agent::shared_host::SharedAgentHostError::Unavailable)
+        ));
+        assert_eq!(fs::read_dir(&committee_path).unwrap().count(), 0);
+        assert!(
+            files
+                .lifecycle
+                .open_existing(authority.space, descriptor.identity.agent)
+                .is_ok()
+        );
         let foreign = Fixture::new("ordinary-genesis-foreign-roster");
         let mut foreign_lifecycle = CleanManagementLifecycleStoreFactory::open_or_create(
             foreign.parent.join(SHARED_LIFECYCLE_DIRECTORY),

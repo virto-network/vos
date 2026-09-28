@@ -2461,6 +2461,68 @@ where
         owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
         signer: &mut S,
     ) -> Result<(), SharedAgentHostError>;
+
+    fn reserve_create(
+        &mut self,
+        _: &AgentDescriptor,
+        _: &AuthorityCredentialCall,
+        _: &AdmittedRuntimePackage,
+        _: &super::genesis::AgentReplicaCommittee,
+    ) -> Result<super::genesis::AgentGenesisLocator, SharedAgentHostError> {
+        Err(SharedAgentHostError::Conflict)
+    }
+}
+
+impl<P, R, I, S, B, J, Q, Reply, W, PubReply, A, F> NativeSharedGenesisAccess<P, R, I, S>
+    for (
+        super::clean_bootstrap::NativeSharedGenesisController<B, J, Q, Reply, W, PubReply, A>,
+        F,
+    )
+where
+    P: CleanSystemAgentBootstrapStore + Send + 'static,
+    R: CleanSystemAgentBootstrapStore + Send + 'static,
+    I: CleanManagementIssuerStore + Send + 'static,
+    S: CleanManagementReceiptSigner,
+    B: super::clean_authority_issuer::CleanManagementRuntimeStore + Send,
+    J: CleanManagementIssuerStore + Send,
+    Q: super::clean_authority_issuer::CleanSharedGenesisReplicaStore + Send,
+    Reply: CleanManagementIssuerStore + Send,
+    W: CleanManagementIssuerStore + Send,
+    PubReply: CleanManagementIssuerStore + Send,
+    A: super::genesis_archive::AgentGenesisArchiveStore,
+    F: FnMut(
+            &AgentDescriptor,
+            &AuthorityCredentialCall,
+            &AdmittedRuntimePackage,
+            &super::genesis::AgentReplicaCommittee,
+        ) -> Result<
+            (
+                super::clean_bootstrap::NativeSharedGenesisRecovery<B, J, Q, Reply, W, PubReply>,
+                Option<A>,
+            ),
+            SharedAgentHostError,
+        > + Send,
+{
+    fn recover(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        signer: &mut S,
+    ) -> Result<(), SharedAgentHostError> {
+        self.0.recover(owner, signer)
+    }
+
+    fn reserve_create(
+        &mut self,
+        descriptor: &AgentDescriptor,
+        call: &AuthorityCredentialCall,
+        runtime: &AdmittedRuntimePackage,
+        replicas: &super::genesis::AgentReplicaCommittee,
+    ) -> Result<super::genesis::AgentGenesisLocator, SharedAgentHostError> {
+        let (controller, reserve) = self;
+        controller.reserve_create_with(descriptor, call, runtime, replicas, || {
+            reserve(descriptor, call, runtime, replicas)
+        })
+    }
 }
 
 impl<P, R, I, S, B, J, Q, Reply, W, PubReply, A> NativeSharedGenesisAccess<P, R, I, S>
@@ -2799,7 +2861,7 @@ where
     /// and the production lifecycle owner is dropped. No archive-only verifier
     /// is installed, and failed recovery never returns a serving controller.
     pub fn with_shared_genesis<B, J, Q, Reply, W, PubReply, A>(
-        mut self,
+        self,
         shared: super::clean_bootstrap::NativeSharedGenesisController<
             B,
             J,
@@ -2819,10 +2881,65 @@ where
         PubReply: CleanManagementIssuerStore + Send + 'static,
         A: super::genesis_archive::AgentGenesisArchiveStore + 'static,
     {
+        self.with_shared_access(Box::new(shared))
+    }
+
+    /// Retain the configured reservation factory with the recovered Shared
+    /// controller. The factory reserves signed inputs only; it must not execute
+    /// Authority, provision a generation or publish routes. It may open its
+    /// control roots lazily on first admission, preserving noncreating startup.
+    pub fn with_shared_genesis_admission<B, J, Q, Reply, W, PubReply, A, Factory>(
+        self,
+        shared: super::clean_bootstrap::NativeSharedGenesisController<
+            B,
+            J,
+            Q,
+            Reply,
+            W,
+            PubReply,
+            A,
+        >,
+        reserve: Factory,
+    ) -> Result<Self, SharedAgentHostError>
+    where
+        B: super::clean_authority_issuer::CleanManagementRuntimeStore + Send + 'static,
+        J: CleanManagementIssuerStore + Send + 'static,
+        Q: super::clean_authority_issuer::CleanSharedGenesisReplicaStore + Send + 'static,
+        Reply: CleanManagementIssuerStore + Send + 'static,
+        W: CleanManagementIssuerStore + Send + 'static,
+        PubReply: CleanManagementIssuerStore + Send + 'static,
+        A: super::genesis_archive::AgentGenesisArchiveStore + 'static,
+        Factory: FnMut(
+                &AgentDescriptor,
+                &AuthorityCredentialCall,
+                &AdmittedRuntimePackage,
+                &super::genesis::AgentReplicaCommittee,
+            ) -> Result<
+                (
+                    super::clean_bootstrap::NativeSharedGenesisRecovery<
+                        B,
+                        J,
+                        Q,
+                        Reply,
+                        W,
+                        PubReply,
+                    >,
+                    Option<A>,
+                ),
+                SharedAgentHostError,
+            > + Send
+            + 'static,
+    {
+        self.with_shared_access(Box::new((shared, reserve)))
+    }
+
+    fn with_shared_access(
+        mut self,
+        mut shared: Box<dyn NativeSharedGenesisAccess<P, R, I, S>>,
+    ) -> Result<Self, SharedAgentHostError> {
         if self.shared_genesis.is_some() {
             return Err(SharedAgentHostError::Conflict);
         }
-        let mut shared: Box<dyn NativeSharedGenesisAccess<P, R, I, S>> = Box::new(shared);
         {
             let mut system = self
                 .system
@@ -2832,6 +2949,26 @@ where
         }
         self.shared_genesis = Some(shared);
         Ok(self)
+    }
+
+    /// Reserve exact Shared Create inputs under the lifecycle owner's ordering
+    /// lock. This is an internal preparation boundary, not a completed Create
+    /// response; no route or physical generation is produced here.
+    pub fn reserve_shared_create(
+        &mut self,
+        descriptor: &AgentDescriptor,
+        call: &AuthorityCredentialCall,
+        runtime: &AdmittedRuntimePackage,
+        replicas: &super::genesis::AgentReplicaCommittee,
+    ) -> Result<super::genesis::AgentGenesisLocator, SharedAgentHostError> {
+        let _system = self
+            .system
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        self.shared_genesis
+            .as_mut()
+            .ok_or(SharedAgentHostError::Conflict)?
+            .reserve_create(descriptor, call, runtime, replicas)
     }
 
     /// Adopt the recovered admin stores for the full production-owner lifetime.

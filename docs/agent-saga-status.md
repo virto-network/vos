@@ -108,13 +108,16 @@ empty-controller ownership tests pass, and a debug `vosx` daemon reopened the
 disposable image-Local Space with all three Shared roots absent while its
 Counter route still returned `7`. This establishes a live owner for later
 Shared Create, not a new generation or public Create ingress.
-The retained production controller's type-erased Shared access still exposes
-recovery only, and the startup verifier deliberately refuses unproved live
-provisions. The owner can produce replay-verified proof for an exact published
-generation, but live Create must first own the lifecycle/committee/archive
-stores and carry that proof through provisioning, application ACK,
-finalization and route publication. Cross-root first-Create crash recovery
-remains a gate. Do not replace the refusing verifier with a permissive one.
+The retained production controller's type-erased Shared access now supports
+signed-input reservation as well as recovery, but not end-to-end live Create.
+Its configured file factory is lazy and pins the Space directory before first
+use. Exact retries stay in the controller without reopening its leased stores.
+The startup verifier still deliberately refuses unproved live provisions. The
+owner can produce replay-verified proof for an exact published generation, but
+live Create must carry the retained inputs through endorsement/publication,
+provisioning, application ACK, finalization and route publication. File-backed
+cross-root crash recovery remains a gate. Do not replace the refusing verifier
+with a permissive one.
 Startup discovery now treats only an empty, private partial set of the three
 Shared control parent directories as an interrupted first-time setup; it
 creates nothing, and any retained entry still fails closed. This removes one
@@ -192,6 +195,23 @@ with physical journals and memory-backed lifecycle stores, not released-daemon
 qualification. Next: qualify file-backed startup discovery/recovery for this
 archive boundary and integrate the retained controller into live Shared Create
 before enabling public ingress; archive presence alone never grants finality.
+In-progress admission integration: a file-backed Shared reservation factory stages
+runtime/replicas and the signed Create before allocating its archive namespace.
+It uses core input validation before per-Agent allocation and the complete
+retained lifecycle inventory for capacity, permitting existing retries at the
+bound. Startup and admission share the empty-partial-namespace rule. The
+focused file suite passes (20 tests, one fixture-dependent test ignored),
+including exact retry, staged capacity across restart, malformed-input refusal,
+archive lease retention and replaced-parent refusal. Four core controller
+regressions pass, including startup-gated live reservation through the retained
+lifecycle owner, one allocation across exact retries, changed-request refusal,
+and no journal advance or route exposure. Production startup now retains the
+lazy factory without creating ordinary Shared control roots. The disposable
+debug daemon startup/shutdown test passes (endpoint ready in 15.60 s, 17.14 s
+total), including assertions that all three Shared control roots remain absent.
+This is one startup smoke measurement, not a production latency target. Archive-boundary
+execution through real file stores and live Create/route integration remain
+required; this is not public Shared management or a completed Create response.
 The focused startup and incomplete-archive tests pass. Two separately run,
 explicit bundled-outer-PVM regressions pass for both Agent-ID orderings of a
 retired A plus unissued B: A reopens through a fresh Authority read and serves

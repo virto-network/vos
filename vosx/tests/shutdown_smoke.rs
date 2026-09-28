@@ -337,6 +337,18 @@ fn run_shutdown_smoke(space_name: &str, external: bool, lose_first_reply: bool) 
             "{space_name} boot {boot} endpoint ready after {} ms",
             daemon_started.elapsed().as_millis()
         );
+        // Startup retains the Shared admission factory lazily. Neither system
+        // bootstrap nor Local mode selection may create ordinary Shared roots.
+        for name in [
+            "shared-agent-lifecycle",
+            "shared-agent-committee",
+            "shared-agent-genesis",
+        ] {
+            assert!(
+                !space_root.join(name).exists(),
+                "startup eagerly created {name}"
+            );
+        }
         if external {
             assert!(space_root.join("local-agent-external").is_dir());
             assert!(space_root.join("local-agent-external-lifecycle").is_dir());
