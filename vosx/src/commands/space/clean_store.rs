@@ -27,7 +27,7 @@ use vos::agent::bootstrap::MAX_SYSTEM_AGENT_GENESIS_PROVISION_BYTES;
 use vos::agent::clean_authority_issuer::CleanExternalLocalPendingInstallStore;
 use vos::agent::clean_authority_issuer::{
     CleanExternalLocalCreateArchiveStore, CleanManagementActorStore, CleanManagementIssuerStore,
-    CleanManagementRuntimeStore, CleanSharedGenesisReplicaStore,
+    CleanManagementRuntimeStore, CleanSharedGenesisReplicaStore, CleanSharedManagementIssuerStore,
     MAX_CLEAN_EXTERNAL_LOCAL_CREATE_ARCHIVE_BYTES, MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES,
     MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
 };
@@ -120,6 +120,41 @@ const EXTERNAL_LIFECYCLE_ENTRIES: [&str; 13] = [
     LIFECYCLE_PENDING_INSTALL_FILE,
     LIFECYCLE_PENDING_INSTALL_STAGE_FILE,
 ];
+
+const SHARED_LIFECYCLE_ENTRIES: [&str; 15] = [
+    LOCK_FILE,
+    INTENT_FILE,
+    INTENT_STAGE_FILE,
+    LIFECYCLE_ISSUER_FILE,
+    LIFECYCLE_ISSUER_STAGE_FILE,
+    LIFECYCLE_RUNTIME_FILE,
+    LIFECYCLE_RUNTIME_STAGE_FILE,
+    LIFECYCLE_ACTOR_FILE,
+    LIFECYCLE_ACTOR_STAGE_FILE,
+    LIFECYCLE_EXTERNAL_CREATE_ARCHIVE_FILE,
+    LIFECYCLE_EXTERNAL_CREATE_ARCHIVE_STAGE_FILE,
+    "shared-management.issuer",
+    "shared-management.issuer.next",
+    "shared-management.handoff",
+    "shared-management.handoff.next",
+];
+
+#[derive(Clone, Copy)]
+enum LifecycleLayout {
+    ImageLocal,
+    ExternalLocal,
+    Shared,
+}
+
+impl LifecycleLayout {
+    fn entries(self) -> &'static [&'static str] {
+        match self {
+            Self::ImageLocal => &LIFECYCLE_ENTRIES,
+            Self::ExternalLocal => &EXTERNAL_LIFECYCLE_ENTRIES,
+            Self::Shared => &SHARED_LIFECYCLE_ENTRIES,
+        }
+    }
+}
 
 pub(crate) const MAX_CLEAN_SYSTEM_AGENT_GENESIS_ARCHIVE_BYTES: usize =
     MAX_SYSTEM_AGENT_GENESIS_PROVISION_BYTES + MAX_PACKAGE_ENCODED_BYTES + 1024;
@@ -242,6 +277,8 @@ enum StoreRole {
     ExternalLocalCreateArchive = 45,
     ExternalLocalPendingInstall = 46,
     OrdinaryGenesisReplicas = 47,
+    SharedManagementIssuer = 48,
+    SharedManagementHandoff = 49,
 }
 
 impl StoreRole {
@@ -253,6 +290,8 @@ impl StoreRole {
             Self::GenesisArchive => GENESIS_FILE,
             Self::ManagementIntent => INTENT_FILE,
             Self::LifecycleIssuer => LIFECYCLE_ISSUER_FILE,
+            Self::SharedManagementIssuer => "shared-management.issuer",
+            Self::SharedManagementHandoff => "shared-management.handoff",
             Self::LocalCreateRequest => LOCAL_REQUEST_FILE,
             Self::CredentialQuery => CREDENTIAL_QUERY_FILE,
             Self::CredentialReservation => RESERVATION_FILE,
@@ -305,6 +344,8 @@ impl StoreRole {
             Self::GenesisArchive => GENESIS_STAGE_FILE,
             Self::ManagementIntent => INTENT_STAGE_FILE,
             Self::LifecycleIssuer => LIFECYCLE_ISSUER_STAGE_FILE,
+            Self::SharedManagementIssuer => "shared-management.issuer.next",
+            Self::SharedManagementHandoff => "shared-management.handoff.next",
             Self::LocalCreateRequest => LOCAL_REQUEST_STAGE_FILE,
             Self::CredentialQuery => CREDENTIAL_QUERY_STAGE_FILE,
             Self::CredentialReservation => RESERVATION_STAGE_FILE,
@@ -420,7 +461,10 @@ impl StoreRole {
             }
             Self::OrdinaryGenesisReplicas => vos::agent::genesis::MAX_AGENT_REPLICA_COMMITTEE_BYTES,
             Self::ManagementIntent => MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES,
-            Self::LifecycleIssuer => MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
+            Self::LifecycleIssuer | Self::SharedManagementIssuer => {
+                MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES
+            }
+            Self::SharedManagementHandoff => 36,
             Self::LocalCreateRequest => {
                 vos::agent::local_lifecycle::LocalCreateSubmission::MAX_BYTES
             }
@@ -518,6 +562,8 @@ impl StoreRole {
             45 => Some(Self::ExternalLocalCreateArchive),
             46 => Some(Self::ExternalLocalPendingInstall),
             47 => Some(Self::OrdinaryGenesisReplicas),
+            48 => Some(Self::SharedManagementIssuer),
+            49 => Some(Self::SharedManagementHandoff),
             1 => Some(Self::Pins),
             2 => Some(Self::Bootstrap),
             3 => Some(Self::ManagementIssuer),
@@ -953,9 +999,10 @@ impl CleanSharedGenesisStoreFactory {
         let directory = open_private_directory(data_dir, true)?;
         // Establish all three empty parents before retaining any per-Agent
         // data. Startup already accepts an empty partial parent set.
-        let lifecycle = CleanManagementLifecycleStoreFactory::open_or_create(
-            data_dir.join(SHARED_LIFECYCLE_DIRECTORY),
+        let lifecycle = CleanManagementLifecycleStoreFactory::open_or_create_format(
+            &data_dir.join(SHARED_LIFECYCLE_DIRECTORY),
             authority.space,
+            LifecycleLayout::Shared,
         )?;
         let committee = CleanAgentGenesisCommitteeStoreFactory::open_or_create(
             &data_dir.join(SHARED_COMMITTEE_DIRECTORY),
@@ -1101,6 +1148,7 @@ pub(crate) fn discover_shared_genesis_startup(
     ];
     let space = vos::service::SpaceId(authority.space.0);
     let mut lifecycle = CleanManagementLifecycleStoreFactory::new(&paths[0], authority.space)?;
+    lifecycle.layout = LifecycleLayout::Shared;
     let committee = CleanAgentGenesisCommitteeStoreFactory::open_existing_parent(&paths[1], space)?;
     let archives = CleanAgentGenesisArchiveStoreFactory::open_existing(&paths[2], space)?;
     let entries = archives.discover_recovery(&mut lifecycle, &committee, authority, maximum)?;
@@ -1313,6 +1361,11 @@ impl CleanAgentGenesisCommitteeStoreFactory {
                 agent: vos::service::AgentId(agent.0),
             };
             let (mut intent, mut issuer) = lifecycle.open_existing(authority.space, agent)?;
+            // Until continuing Install admission is wired into startup, never
+            // serve a generation while silently ignoring its management slot.
+            if issuer.issuance_disabled()? {
+                return Err(CleanFileStoreError::UnexpectedResidue);
+            }
             let has_intent = intent.load()?.is_some();
             if !has_intent {
                 // A crash before the signed pledge may leave an empty scoped
@@ -1587,19 +1640,19 @@ pub(crate) struct CleanManagementLifecycleFiles {
 
 impl CleanManagementLifecycleFiles {
     pub(crate) fn open_or_create(root: impl AsRef<Path>) -> Result<Self, CleanFileStoreError> {
-        Self::open(root.as_ref(), false, false)
+        Self::open(root.as_ref(), LifecycleLayout::ImageLocal, false)
     }
 
     fn open_existing(root: &Path) -> Result<Self, CleanFileStoreError> {
-        Self::open(root, false, true)
+        Self::open(root, LifecycleLayout::ImageLocal, true)
     }
 
-    fn open(root: &Path, external: bool, existing: bool) -> Result<Self, CleanFileStoreError> {
-        let entries: &[&str] = if external {
-            &EXTERNAL_LIFECYCLE_ENTRIES
-        } else {
-            &LIFECYCLE_ENTRIES
-        };
+    fn open(
+        root: &Path,
+        layout: LifecycleLayout,
+        existing: bool,
+    ) -> Result<Self, CleanFileStoreError> {
+        let entries = layout.entries();
         Ok(Self::from_root(StoreRoot::open_with_entries_mode(
             root, entries, !existing,
         )?))
@@ -2533,7 +2586,7 @@ pub(crate) struct CleanManagementLifecycleStoreFactory {
     parent: PathBuf,
     directory: File,
     space: vos::agent::sdk::SpaceId,
-    external: bool,
+    layout: LifecycleLayout,
 }
 
 impl CleanManagementLifecycleStoreFactory {
@@ -2541,7 +2594,7 @@ impl CleanManagementLifecycleStoreFactory {
         parent: impl AsRef<Path>,
         space: vos::agent::sdk::SpaceId,
     ) -> Result<Self, CleanFileStoreError> {
-        Self::open_or_create_format(parent.as_ref(), space, false)
+        Self::open_or_create_format(parent.as_ref(), space, LifecycleLayout::ImageLocal)
     }
 
     #[cfg(feature = "experimental-state-blocks")]
@@ -2549,13 +2602,13 @@ impl CleanManagementLifecycleStoreFactory {
         parent: impl AsRef<Path>,
         space: vos::agent::sdk::SpaceId,
     ) -> Result<Self, CleanFileStoreError> {
-        Self::open_or_create_format(parent.as_ref(), space, true)
+        Self::open_or_create_format(parent.as_ref(), space, LifecycleLayout::ExternalLocal)
     }
 
     fn open_or_create_format(
         path: &Path,
         space: vos::agent::sdk::SpaceId,
-        external: bool,
+        layout: LifecycleLayout,
     ) -> Result<Self, CleanFileStoreError> {
         if space == vos::agent::sdk::SpaceId::ZERO {
             return Err(CleanFileStoreError::InvalidPath);
@@ -2565,7 +2618,7 @@ impl CleanManagementLifecycleStoreFactory {
             parent: path.to_path_buf(),
             directory,
             space,
-            external,
+            layout,
         })
     }
 
@@ -2582,7 +2635,7 @@ impl CleanManagementLifecycleStoreFactory {
             parent,
             directory,
             space,
-            external: false,
+            layout: LifecycleLayout::ImageLocal,
         })
     }
 }
@@ -2676,7 +2729,7 @@ impl vos::agent::local_lifecycle::LocalLifecycleStoreFactory
         validate_opened_directory(&self.directory, &self.parent, true)?;
         let stores = CleanManagementLifecycleFiles::open(
             &self.parent.join(hex::encode(agent.0)),
-            self.external,
+            self.layout,
             true,
         )?;
         validate_opened_directory(&self.directory, &self.parent, true)?;
@@ -2694,7 +2747,7 @@ impl vos::agent::local_lifecycle::LocalLifecycleStoreFactory
         validate_opened_directory(&self.directory, &self.parent, true)?;
         let stores = CleanManagementLifecycleFiles::open(
             &self.parent.join(hex::encode(agent.0)),
-            self.external,
+            self.layout,
             false,
         )?;
         validate_opened_directory(&self.directory, &self.parent, true)?;
@@ -2815,7 +2868,62 @@ impl CleanManagementIssuerStore for CleanManagementIssuerFile {
     }
 
     fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
+        if self.issuance_disabled()? {
+            return self.0.commit_with_replacement(image, false);
+        }
         self.0.commit(image)
+    }
+
+    fn issuance_disabled(&mut self) -> Result<bool, Self::Error> {
+        if self.0.role != StoreRole::LifecycleIssuer
+            || self.0.root.allowed_entries != SHARED_LIFECYCLE_ENTRIES
+        {
+            return Ok(false);
+        }
+        Ok(self.load_management_handoff()?.is_some()
+            || self.management_continuation()?.load()?.is_some())
+    }
+}
+
+impl CleanSharedManagementIssuerStore for CleanManagementIssuerFile {
+    fn load_management_handoff(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.validate_shared_source()?;
+        let mut marker =
+            ExactFileStore::new(Arc::clone(&self.0.root), StoreRole::SharedManagementHandoff);
+        let bytes = marker.load(36)?;
+        if let Some(bytes) = &bytes {
+            // A previous rename may have preceded a failed directory sync.
+            marker.commit_with_replacement(bytes, false)?;
+        }
+        Ok(bytes)
+    }
+
+    fn commit_management_handoff(&mut self, marker: &[u8]) -> Result<(), Self::Error> {
+        self.validate_shared_source()?;
+        if marker.len() != 36 || &marker[..4] != b"SMH1" {
+            return Err(CleanFileStoreError::Corrupt);
+        }
+        ExactFileStore::new(Arc::clone(&self.0.root), StoreRole::SharedManagementHandoff)
+            .commit_with_replacement(marker, false)
+    }
+
+    fn management_continuation(&mut self) -> Result<Self, Self::Error> {
+        self.validate_shared_source()?;
+        Ok(Self(ExactFileStore::new(
+            Arc::clone(&self.0.root),
+            StoreRole::SharedManagementIssuer,
+        )))
+    }
+}
+
+impl CleanManagementIssuerFile {
+    fn validate_shared_source(&self) -> Result<(), CleanFileStoreError> {
+        if self.0.role != StoreRole::LifecycleIssuer
+            || self.0.root.allowed_entries != SHARED_LIFECYCLE_ENTRIES
+        {
+            return Err(CleanFileStoreError::InvalidPath);
+        }
+        Ok(())
     }
 }
 
@@ -3055,6 +3163,7 @@ impl ExactFileStore {
                 | StoreRole::OrdinaryGenesisPublication
                 | StoreRole::OrdinaryGenesisPublicationReply
                 | StoreRole::OrdinaryGenesisReplicas
+                | StoreRole::SharedManagementHandoff
                 | StoreRole::CredentialQuery
                 | StoreRole::LocalCreateAcknowledgement
                 | StoreRole::LocalCreateDenial
@@ -5017,6 +5126,147 @@ pub(crate) mod tests {
             };
             assert!(loaded.is_err());
             assert_eq!(fs::read(fixture.root.join(other.file())).unwrap(), encoded);
+        }
+    }
+
+    #[test]
+    fn shared_management_handoff_files_preserve_source_and_one_writer_lease() {
+        let fixture = Fixture::new("shared-management-handoff");
+        let (intent, mut source) =
+            CleanManagementLifecycleFiles::open(&fixture.root, LifecycleLayout::Shared, false)
+                .unwrap()
+                .into_parts();
+        source.commit(b"finalized-create").unwrap();
+        let mut continuation = source.management_continuation().unwrap();
+        continuation.commit(b"finalized-create").unwrap();
+        let mut marker = b"SMH1".to_vec();
+        marker.extend_from_slice(&[0x91; 32]);
+        source.commit_management_handoff(&marker).unwrap();
+        assert!(source.issuance_disabled().unwrap());
+        assert!(!continuation.issuance_disabled().unwrap());
+        assert!(source.commit(b"changed-create").is_err());
+        source.commit(b"finalized-create").unwrap();
+        let mut different = marker.clone();
+        different[4] ^= 1;
+        assert!(source.commit_management_handoff(&different).is_err());
+        assert!(continuation.management_continuation().is_err());
+        continuation.commit(b"next-management-decision").unwrap();
+        drop(intent);
+        drop(source);
+        assert!(matches!(
+            CleanManagementLifecycleFiles::open(&fixture.root, LifecycleLayout::Shared, true,),
+            Err(CleanFileStoreError::Busy)
+        ));
+        drop(continuation);
+        // Shared sidecars do not silently become accepted Local state.
+        assert!(CleanManagementLifecycleFiles::open_existing(&fixture.root).is_err());
+        let (_intent, mut source) =
+            CleanManagementLifecycleFiles::open(&fixture.root, LifecycleLayout::Shared, true)
+                .unwrap()
+                .into_parts();
+        assert_eq!(
+            source.load().unwrap().as_deref(),
+            Some(b"finalized-create".as_slice())
+        );
+        assert_eq!(source.load_management_handoff().unwrap(), Some(marker));
+        assert!(source.issuance_disabled().unwrap());
+        assert_eq!(
+            source
+                .management_continuation()
+                .unwrap()
+                .load()
+                .unwrap()
+                .as_deref(),
+            Some(b"next-management-decision".as_slice())
+        );
+    }
+
+    #[test]
+    fn shared_management_handoff_recovers_staging_and_rejects_local_layout() {
+        let fixture = Fixture::new("shared-management-handoff-stage");
+        let (intent, mut source) =
+            CleanManagementLifecycleFiles::open(&fixture.root, LifecycleLayout::Shared, false)
+                .unwrap()
+                .into_parts();
+        source.commit(b"finalized-create").unwrap();
+        let continuation = source.management_continuation().unwrap();
+        stage(&continuation.0, None, b"finalized-create");
+        let mut marker = b"SMH1".to_vec();
+        marker.extend_from_slice(&[0x92; 32]);
+        let marker_store = ExactFileStore::new(
+            Arc::clone(&source.0.root),
+            StoreRole::SharedManagementHandoff,
+        );
+        stage(&marker_store, None, &marker);
+        drop(marker_store);
+        drop(continuation);
+        drop(source);
+        drop(intent);
+        let (_intent, mut source) =
+            CleanManagementLifecycleFiles::open(&fixture.root, LifecycleLayout::Shared, true)
+                .unwrap()
+                .into_parts();
+        assert!(source.issuance_disabled().unwrap());
+        assert_eq!(source.load_management_handoff().unwrap(), Some(marker));
+        assert_eq!(
+            source
+                .management_continuation()
+                .unwrap()
+                .load()
+                .unwrap()
+                .as_deref(),
+            Some(b"finalized-create".as_slice())
+        );
+        assert!(
+            !fixture
+                .root
+                .join(StoreRole::SharedManagementHandoff.stage_file())
+                .exists()
+        );
+        assert!(
+            !fixture
+                .root
+                .join(StoreRole::SharedManagementIssuer.stage_file())
+                .exists()
+        );
+
+        let local = Fixture::new("shared-management-reject-local");
+        let (_intent, mut issuer) = CleanManagementLifecycleFiles::open_or_create(&local.root)
+            .unwrap()
+            .into_parts();
+        assert!(!issuer.issuance_disabled().unwrap());
+        assert!(issuer.management_continuation().is_err());
+        assert!(issuer.load_management_handoff().is_err());
+    }
+
+    #[test]
+    fn shared_management_handoff_is_not_silently_ignored_by_startup() {
+        use vos::agent::local_lifecycle::LocalLifecycleStoreFactory as _;
+        for marker_only in [false, true] {
+            let fixture = Fixture::new("shared-management-startup-gate");
+            let (_, authority, _, _) = super::super::local_create::tests::fixture();
+            let mut factory =
+                CleanSharedGenesisStoreFactory::open_or_create(&fixture.parent, authority, 4)
+                    .unwrap();
+            let (intent, mut issuer) = factory
+                .lifecycle
+                .open(authority.space, vos::agent::sdk::AgentId([0x93; 32]))
+                .unwrap();
+            if marker_only {
+                let mut marker = b"SMH1".to_vec();
+                marker.extend_from_slice(&[0x94; 32]);
+                issuer.commit_management_handoff(&marker).unwrap();
+            } else {
+                let continuation = issuer.management_continuation().unwrap();
+                stage(&continuation.0, None, b"unadmitted-continuation");
+            }
+            drop(intent);
+            drop(issuer);
+            drop(factory);
+            assert!(matches!(
+                discover_shared_genesis_startup(&fixture.parent, authority, 4),
+                Err(CleanFileStoreError::UnexpectedResidue)
+            ));
         }
     }
 

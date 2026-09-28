@@ -56,6 +56,23 @@ pub trait CleanManagementIssuerStore {
     fn load(&mut self) -> Result<Option<Vec<u8>>, Self::Error>;
 
     fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error>;
+
+    /// A handed-off source remains readable for original Create recovery,
+    /// but must never allocate another management sequence, even after reopen.
+    fn issuance_disabled(&mut self) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+}
+
+/// One continuation slot under the same exclusive per-Agent lease as the
+/// immutable Create issuer. The handoff marker belongs to the source, so a
+/// lost continuation cannot be mistaken for first-time initialization.
+/// Implementations must disable source issuance as soon as either the
+/// continuation or its activation marker is retained, including staged data.
+pub trait CleanSharedManagementIssuerStore: CleanManagementIssuerStore + Sized {
+    fn load_management_handoff(&mut self) -> Result<Option<Vec<u8>>, Self::Error>;
+    fn commit_management_handoff(&mut self, marker: &[u8]) -> Result<(), Self::Error>;
+    fn management_continuation(&mut self) -> Result<Self, Self::Error>;
 }
 
 /// Per-candidate genesis signer slot: domain tag, authorization invocation,
@@ -1178,6 +1195,7 @@ pub struct DurableCleanManagementIssuer<B: CleanManagementIssuerStore> {
     store: B,
     image: CleanManagementIssuerImage,
     poisoned: bool,
+    continuation_open: bool,
 }
 
 impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
@@ -1212,6 +1230,7 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
             store,
             image,
             poisoned: false,
+            continuation_open: false,
         })
     }
 
@@ -1245,6 +1264,106 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         self.store
     }
 
+    /// The lifecycle coordinator must first prove Create application,
+    /// finalization and retirement against the live physical generation.
+    /// Destination durability precedes source activation. No mutation may use
+    /// the destination until this returns successfully.
+    pub(crate) fn open_creation_continuation(
+        &mut self,
+    ) -> Result<Self, CleanManagementIssuerError<B::Error>>
+    where
+        B: CleanSharedManagementIssuerStore,
+    {
+        use CleanManagementIssuerError as Error;
+        if self.poisoned
+            || self.continuation_open
+            || self.image.decision_sequence_high_water != 1
+            || self.image.acknowledged_through != 1
+            || self.image.pending.is_some()
+            || self.image.pending_application_ack.is_some()
+            || !self.image.retained.is_empty()
+        {
+            return Err(Error::InvalidState);
+        }
+        let completed = self
+            .image
+            .acknowledged
+            .as_ref()
+            .ok_or(Error::InvalidState)?;
+        let decision = AuthorizedCleanManagementDecision::from_canonical_bytes(&completed.decision)
+            .map_err(|_| Error::InvalidState)?;
+        if !completed.application_finalized
+            || completed.application_ack.is_none()
+            || decision.operation() != AuthorityOperationKind::CreateAgent
+            || !decision
+                .application
+                .is_some_and(|context| context.managed.profile == AgentProfile::Shared)
+        {
+            return Err(Error::InvalidState);
+        }
+        let seed = self.image.encode();
+        let mut marker = b"SMH1".to_vec();
+        marker.extend_from_slice(
+            Hash::digest(b"vos/shared-management/create-handoff/v1", &[&seed]).as_bytes(),
+        );
+        let retained = self
+            .store
+            .load_management_handoff()
+            .map_err(Error::Storage)?;
+        if retained.as_ref().is_some_and(|bytes| bytes != &marker) {
+            return Err(Error::InvalidState);
+        }
+        let mut continuation = self
+            .store
+            .management_continuation()
+            .map_err(Error::Storage)?;
+        let current = continuation.load().map_err(Error::Storage)?;
+        if retained.is_some() {
+            if current.is_none() {
+                return Err(Error::InvalidState);
+            }
+        } else {
+            if current.as_ref().is_some_and(|bytes| bytes != &seed) {
+                return Err(Error::InvalidState);
+            }
+            // A failed write can have crossed its durability boundary. Keep
+            // this owner unusable until its stores have been reopened.
+            self.poisoned = true;
+            continuation.commit(&seed).map_err(Error::Storage)?;
+            if continuation.load().map_err(Error::Storage)?.as_ref() != Some(&seed) {
+                return Err(Error::InvalidState);
+            }
+            self.store
+                .commit_management_handoff(&marker)
+                .map_err(Error::Storage)?;
+            if self
+                .store
+                .load_management_handoff()
+                .map_err(Error::Storage)?
+                .as_ref()
+                != Some(&marker)
+            {
+                return Err(Error::InvalidState);
+            }
+        }
+        let continued = Self::open(
+            continuation,
+            self.image.binding,
+            self.image.space,
+            self.image.agent,
+        )?;
+        if continued.sequence_high_water() < self.sequence_high_water()
+            || continued.acknowledged_through() < self.acknowledged_through()
+            || (continued.acknowledged_through() == self.acknowledged_through()
+                && continued.image.acknowledged != self.image.acknowledged)
+        {
+            return Err(Error::InvalidState);
+        }
+        self.poisoned = false;
+        self.continuation_open = true;
+        Ok(continued)
+    }
+
     /// Allocate, pledge, sign, and retain one exact authorized decision.
     /// Exact retained retries return before inspecting or invoking `signer`.
     pub(crate) fn issue<S: CleanManagementReceiptSigner>(
@@ -1253,6 +1372,14 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         signer: &mut S,
     ) -> Result<AuthorityReceipt, CleanManagementIssuerError<B::Error, S::Error>> {
         self.ensure_live()?;
+        if self.continuation_open
+            || self
+                .store
+                .issuance_disabled()
+                .map_err(CleanManagementIssuerError::Storage)?
+        {
+            return Err(CleanManagementIssuerError::InvalidState);
+        }
         if !decision.is_valid()
             || decision.space != self.image.space
             || decision.agent != self.image.agent
@@ -2902,6 +3029,72 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct HandoffStore {
+        source: MemoryImageStore,
+        continuation: MemoryImageStore,
+        marker: MemoryImageStore,
+        is_continuation: bool,
+    }
+
+    impl CleanManagementIssuerStore for HandoffStore {
+        type Error = MemoryStoreError;
+
+        fn load(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+            if self.is_continuation {
+                self.continuation.load()
+            } else {
+                self.source.load()
+            }
+        }
+
+        fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
+            if self.is_continuation {
+                self.continuation.commit(image)
+            } else {
+                self.source.commit(image)
+            }
+        }
+
+        fn issuance_disabled(&mut self) -> Result<bool, Self::Error> {
+            Ok(!self.is_continuation
+                && (self.marker.load()?.is_some() || self.continuation.load()?.is_some()))
+        }
+    }
+
+    impl CleanSharedManagementIssuerStore for HandoffStore {
+        fn load_management_handoff(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+            if self.is_continuation {
+                return Err(MemoryStoreError);
+            }
+            self.marker.load()
+        }
+
+        fn commit_management_handoff(&mut self, marker: &[u8]) -> Result<(), Self::Error> {
+            if self.is_continuation {
+                return Err(MemoryStoreError);
+            }
+            if self
+                .marker
+                .image()
+                .is_some_and(|existing| existing != marker)
+            {
+                return Err(MemoryStoreError);
+            }
+            self.marker.commit(marker)
+        }
+
+        fn management_continuation(&mut self) -> Result<Self, Self::Error> {
+            if self.is_continuation {
+                return Err(MemoryStoreError);
+            }
+            Ok(Self {
+                is_continuation: true,
+                ..self.clone()
+            })
+        }
+    }
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct TestSignerError;
 
@@ -3143,6 +3336,11 @@ mod tests {
             plan: request.authorization_plan().unwrap(),
             signature: [0; 64],
         };
+        if let ManagementRequest::Create(descriptor) = request {
+            call.managed.owner = descriptor.identity.owner;
+            call.managed.profile = descriptor.identity.profile;
+            call.managed.transition_producer = descriptor.identity.transition_producer;
+        }
         call.invocation = call.expected_invocation();
         call.signature = credential_key.sign(&call.signing_bytes()).to_bytes();
         let approval = ManagementApproval::from_call(
@@ -3156,6 +3354,223 @@ mod tests {
         )
         .unwrap();
         (call, approval)
+    }
+
+    fn finalized_shared_create(
+        store: HandoffStore,
+    ) -> (
+        DurableCleanManagementIssuer<HandoffStore>,
+        Fixture,
+        CountingSigner,
+    ) {
+        use crate::agent::sdk::{
+            AgentDescriptor, AgentIdentity, AgentReplica, NodeId, ReplicaRole, RuntimeCapabilities,
+        };
+        let mut signer = CountingSigner::new(0x28);
+        let mut fixture = fixture(&signer);
+        let owner = PrincipalId([0x26; 32]);
+        let nonce = Hash([0x70; 32]);
+        fixture.agent = AgentId::derive(fixture.space, owner, nonce.as_bytes());
+        fixture.context.agent = fixture.agent;
+        let identity = AgentIdentity {
+            space: fixture.space,
+            agent: fixture.agent,
+            owner,
+            profile: AgentProfile::Shared,
+            runtime_deployment: fixture.context.runtime_deployment,
+            runtime_program: ProgramId([0x71; 32]),
+            runtime_producer: ProducerId([0x72; 32]),
+            transition_producer: ProducerId([0x27; 32]),
+        };
+        let request = ManagementRequest::Create(Box::new(AgentDescriptor {
+            identity: identity.clone(),
+            creation_nonce: nonce,
+            authority: fixture.binding,
+            private_recovery: None,
+            runtime_package: BlobRef::of_bytes(b"shared-handoff-runtime"),
+            runtime_contract: crate::agent::sdk::contract::RuntimePackageContract::canonical(),
+            capabilities: RuntimeCapabilities::standard(),
+            replicas: vec![AgentReplica {
+                node: NodeId([0x25; 32]),
+                principal: owner,
+                role: ReplicaRole::Voter,
+            }],
+        }));
+        let (call, approval) = approved_call(&fixture, 1, &request);
+        let decision = AuthorizedCleanManagementDecision::from_approval(
+            call.authority,
+            call.managed,
+            &request,
+            &call,
+            &approval,
+            &TestCredentialVerifier,
+        )
+        .unwrap();
+        let mut issuer = DurableCleanManagementIssuer::open(
+            store.clone(),
+            fixture.binding,
+            fixture.space,
+            fixture.agent,
+        )
+        .unwrap();
+        assert!(issuer.open_creation_continuation().is_err());
+        let receipt = issuer.issue(&decision, &mut signer).unwrap();
+        assert!(issuer.open_creation_continuation().is_err());
+        let ack = issuer
+            .observe_durable_application(
+                &receipt,
+                &ManagementReply::Created(identity),
+                Hash([0x73; 32]),
+                fixture.context.valid_from,
+                &mut signer,
+            )
+            .unwrap();
+        assert!(issuer.open_creation_continuation().is_err());
+        assert!(store.marker.image().is_none());
+        assert!(store.continuation.image().is_none());
+        issuer.observe_durable_actor_finalization(&ack).unwrap();
+        (issuer, fixture, signer)
+    }
+
+    #[test]
+    fn shared_issuer_handoff_preserves_create_and_continues_sequence_after_reopen() {
+        let store = HandoffStore::default();
+        let (mut source, fixture, mut signer) = finalized_shared_create(store.clone());
+        let original = store.source.image();
+        let mut continued = source.open_creation_continuation().unwrap();
+        assert_eq!(store.continuation.image(), original);
+        assert!(source.open_creation_continuation().is_err());
+        let next = decision(&fixture, 2, &request(0x74));
+        assert!(source.issue(&next, &mut signer).is_err());
+        let receipt = continued.issue(&next, &mut signer).unwrap();
+        assert_eq!(receipt.selector.decision_sequence, 2);
+        assert_eq!(receipt.selector.acknowledged_through, 1);
+        let advanced = store.continuation.image();
+        assert_ne!(advanced, original);
+        drop(continued);
+        drop(source);
+        let mut source = DurableCleanManagementIssuer::open(
+            store.clone(),
+            fixture.binding,
+            fixture.space,
+            fixture.agent,
+        )
+        .unwrap();
+        // The durable marker blocks allocation before the continuation is reopened.
+        assert!(source.issue(&next, &mut signer).is_err());
+        let calls = signer.calls;
+        let mut continued = source.open_creation_continuation().unwrap();
+        assert_eq!(continued.issue(&next, &mut signer).unwrap(), receipt);
+        assert_eq!(signer.calls, calls);
+        assert_eq!(store.source.image(), original);
+        assert_eq!(store.continuation.image(), advanced);
+        assert!(continued.open_creation_continuation().is_err());
+    }
+
+    #[test]
+    fn shared_issuer_handoff_recovers_unsigned_next_decision() {
+        let store = HandoffStore::default();
+        let (mut source, fixture, mut signer) = finalized_shared_create(store.clone());
+        let original = store.source.image();
+        let mut continued = source.open_creation_continuation().unwrap();
+        let next = decision(&fixture, 2, &request(0x74));
+        signer.fail_next = true;
+        assert!(matches!(
+            continued.issue(&next, &mut signer),
+            Err(CleanManagementIssuerError::Signer(TestSignerError))
+        ));
+        assert!(continued.has_pending_decision());
+        assert_eq!(continued.sequence_high_water(), 1);
+        let pledged = store.continuation.image();
+        drop(continued);
+        drop(source);
+        let mut source = DurableCleanManagementIssuer::open(
+            store.clone(),
+            fixture.binding,
+            fixture.space,
+            fixture.agent,
+        )
+        .unwrap();
+        let mut continued = source.open_creation_continuation().unwrap();
+        assert_eq!(store.continuation.image(), pledged);
+        assert!(
+            continued
+                .issue(&decision(&fixture, 3, &request(0x75)), &mut signer)
+                .is_err()
+        );
+        let receipt = continued.issue(&next, &mut signer).unwrap();
+        assert_eq!(receipt.selector.decision_sequence, 2);
+        assert_eq!(store.source.image(), original);
+    }
+
+    #[test]
+    fn shared_issuer_handoff_recovers_each_ambiguous_write() {
+        for marker_write in [false, true] {
+            for fail_after in [false, true] {
+                let store = HandoffStore::default();
+                let (mut source, fixture, _) = finalized_shared_create(store.clone());
+                let original = store.source.image();
+                let failing = if marker_write {
+                    &store.marker
+                } else {
+                    &store.continuation
+                };
+                if fail_after {
+                    failing.fail_after_commit(1);
+                } else {
+                    failing.fail_before_next_commit();
+                }
+                assert!(matches!(
+                    source.open_creation_continuation(),
+                    Err(CleanManagementIssuerError::Storage(MemoryStoreError))
+                ));
+                assert!(source.open_creation_continuation().is_err());
+                drop(source);
+                let mut source = DurableCleanManagementIssuer::open(
+                    store.clone(),
+                    fixture.binding,
+                    fixture.space,
+                    fixture.agent,
+                )
+                .unwrap();
+                let continued = source.open_creation_continuation().unwrap();
+                assert_eq!(continued.sequence_high_water(), 1);
+                assert_eq!(continued.acknowledged_through(), 1);
+                assert_eq!(store.source.image(), original);
+                assert_eq!(store.continuation.image(), original);
+                assert!(store.marker.image().is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn shared_issuer_handoff_never_reseeds_lost_or_substituted_continuation() {
+        for corrupt_marker in [false, true] {
+            let store = HandoffStore::default();
+            let (mut source, fixture, mut signer) = finalized_shared_create(store.clone());
+            drop(source.open_creation_continuation().unwrap());
+            drop(source);
+            if corrupt_marker {
+                store.marker.replace_image(vec![0; 36]);
+            } else {
+                store.continuation.inner.lock().unwrap().image = None;
+            }
+            let before = store.continuation.image();
+            let mut source = DurableCleanManagementIssuer::open(
+                store.clone(),
+                fixture.binding,
+                fixture.space,
+                fixture.agent,
+            )
+            .unwrap();
+            assert!(source.open_creation_continuation().is_err());
+            assert!(
+                source
+                    .issue(&decision(&fixture, 2, &request(0x74)), &mut signer)
+                    .is_err()
+            );
+            assert_eq!(store.continuation.image(), before);
+        }
     }
 
     #[test]

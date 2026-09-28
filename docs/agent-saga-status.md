@@ -322,14 +322,40 @@ generation, while the healthy generation retains its exact ACK and journal.
 Reproduce with the command above, replacing the filter with
 `shared_create_file_owner_reopens_denial_beside_retired_generation`.
 
-Shared Install integration must first replace the fixture-only issuer copy in
-`serve_mixed_shared` with a durable handoff. Keep the immutable Create recovery
-evidence while establishing one continuing management issuer; after handoff,
-missing continuation state must fail closed rather than reseed an old sequence.
-Reuse existing management intent, issuance, physical application, signed
-terminal and retirement semantics. Recovery must restore pending Install
-admission before system execution and authenticate genesis before reopening
-the physical target; do not enable ingress from the live-only happy path.
+Shared Install integration is implementing the durable handoff that must replace
+the fixture-only issuer copy in `serve_mixed_shared`. The issuer primitive now
+seeds one continuation from a finalized Shared Create, then persists a
+source-side marker bound to the exact original issuer image. A retained seed or
+marker disables source issuance across reopen. The original Create remains
+immutable; missing continuation state after activation fails closed rather than
+reseeding an old sequence. Reopening preserves an unsigned next decision as
+well as an issued receipt. The production file adapter retains the existing
+per-Agent lease, uses separate role-bound files, and keeps Shared sidecars out
+of both Local layouts. No new guest artifact or management wire format is
+introduced.
+
+Current evidence: all 18 issuer tests pass, including four handoff regressions
+covering both sides of each initialization write, source freeze after reopen,
+exact sequence/receipt retry, interrupted signing and missing/corrupt handoff
+state. The filesystem suite passes 77 tests (one fixture-dependent test ignored);
+its loopback HTTP test passes separately outside the socket-restricted sandbox.
+The three new filesystem tests cover lease retention, immutable source/marker,
+staged publication recovery, layout separation and the startup gate. These are
+issuer and file-adapter tests, not a completed Shared Install workflow.
+The existing production-file Shared Create preparation/publication/terminal
+reopen regression also passes (130.61 s, experimental-feature debug build),
+confirming the new Shared layout preserves that workflow; it does not activate
+or qualify Install handoff. The `std`-only core build, formatting and diff
+checks pass. Test logs use disk-backed `target/shared-management-handoff-*`.
+
+Still required: retain this continuation in the lifecycle controller only after
+physical Create/finality/retirement verification; replace the fixture copy;
+reuse existing management intent, issuance, physical application, signed terminal
+and retirement semantics. Recovery must restore pending Install admission before
+system execution and authenticate genesis before reopening the physical target.
+Until that integration exists, production startup explicitly refuses retained
+continuation state and no live caller activates the handoff. Public Shared
+management remains disabled; do not enable ingress from a live-only happy path.
 
 Backup quiescence must also cover unserved live generations after reservation
 release: an idle Authority admission alone does not prove all Create routes
