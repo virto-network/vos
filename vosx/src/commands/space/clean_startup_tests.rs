@@ -72,22 +72,28 @@ impl GenesisClaimSigner for GenesisSigner<'_> {
 #[test]
 #[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
 fn shared_create_file_owner_reopens_preparation_publication_and_terminal() {
-    check_shared_file_recovery(false, false);
+    check_shared_file_recovery(false, false, false);
 }
 
 #[test]
 #[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
 fn shared_create_file_owner_reopens_denial_beside_retired_generation() {
-    check_shared_file_recovery(true, false);
+    check_shared_file_recovery(true, false, false);
 }
 
 #[test]
 #[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
 fn shared_management_handoff_reopens_under_production_lifecycle_owner() {
-    check_shared_file_recovery(true, true);
+    check_shared_file_recovery(true, true, false);
 }
 
-fn check_shared_file_recovery(with_denial: bool, with_handoff: bool) {
+#[test]
+#[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
+fn shared_install_file_owner_recovers_staged_finalization() {
+    check_shared_file_recovery(true, true, true);
+}
+
+fn check_shared_file_recovery(with_denial: bool, with_handoff: bool, interrupt_install: bool) {
     use crate::commands::space::clean_store::{
         CleanAgentGenesisSignatureFile, CleanFileStoreError, ensure_private_directory,
     };
@@ -518,6 +524,37 @@ fn check_shared_file_recovery(with_denial: bool, with_handoff: bool) {
     }
     if with_handoff {
         use vos::agent::clean_authority_issuer::SignedManagementTerminal;
+        if interrupt_install {
+            // The first changed intent write retains authorization work; the
+            // second retains finalization work after the signed observation.
+            // Leave its real staged envelope on disk, without publication.
+            let fault = super::super::clean_store::SharedIntentStageFault::arm(&lifecycle_root, 2);
+            assert_eq!(
+                lifecycle.complete_shared_install(locator),
+                Err(SharedAgentHostError::Unavailable)
+            );
+            assert!(fault.fired());
+            assert!(
+                lifecycle_root
+                    .join("shared-management.intent.next")
+                    .exists()
+            );
+            let installed = journal_files(&journal);
+            assert_ne!(installed, applied, "fault must follow physical application");
+            drop(fault);
+            drop(lifecycle);
+            (_, lifecycle) = open();
+            assert!(
+                !lifecycle_root
+                    .join("shared-management.intent.next")
+                    .exists()
+            );
+            assert_eq!(
+                journal_files(&journal),
+                installed,
+                "recovery must not reapply Install"
+            );
+        }
         let terminal = lifecycle.complete_shared_install(locator).unwrap();
         let SignedManagementTerminal::Applied(ack) = &terminal else {
             panic!("valid retained Install must apply: {terminal:?}");

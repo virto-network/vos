@@ -608,11 +608,14 @@ where
         // beside its original Create. Drain only that child before replaying
         // lifecycle preparation, which continues to exclude ordinary reads.
         owner.recover_pending_authority_projection()?;
-        // A signed finalized continuation may only need its two system ACKs.
-        // Retire these through the normal guards before fresh genesis reads;
-        // physical evidence is independently rechecked below before serving.
+        // Replay a retained signed finalization before any fresh read advances
+        // the system runtime's logical clock beyond its immutable preflight.
+        // This resumes only an already signed outcome, never signs a new one.
+        // Physical evidence and fresh genesis authority are still independently
+        // rechecked below, with route export closed throughout recovery.
         for (recovery, _) in &mut self.entries {
-            if recovery.management_retirements.is_empty() {
+            if recovery.management_retirements.is_empty() && recovery.management_pending.len() != 2
+            {
                 continue;
             }
             let slot = recovery
@@ -621,12 +624,12 @@ where
                 .ok_or(SharedAgentHostError::ScopeMismatch)?;
             let issuer = recovery
                 .management_issuer
-                .as_ref()
+                .as_mut()
                 .ok_or(SharedAgentHostError::ScopeMismatch)?;
             let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
             let managed = intent.call().managed;
             let (_, terminal) = issuer
-                .recover_finalized_terminal(
+                .recover_observed_terminal(
                     self.authority,
                     managed,
                     intent.request(),
@@ -637,12 +640,19 @@ where
                 .ok_or(SharedAgentHostError::ScopeMismatch)?;
             match terminal {
                 SignedManagementTerminal::Applied(ack) => {
+                    owner.finalize_management_intent_with_admission(
+                        slot, managed, &ack, issuer, true,
+                    )?;
                     owner.finish_live_management_intent(slot, managed, &ack, issuer)?
                 }
                 SignedManagementTerminal::Rejected(failure) => {
+                    owner.finalize_failed_install_with_admission(
+                        slot, managed, &failure, issuer, true,
+                    )?;
                     owner.finish_live_failed_install(slot, managed, &failure, issuer)?
                 }
             }
+            recovery.management_pending.clear();
             recovery.management_retirements.clear();
         }
         for ((recovery, _), record) in self.entries.iter_mut().zip(&records) {

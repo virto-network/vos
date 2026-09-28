@@ -424,6 +424,25 @@ daemon compilation, edition-2024 formatting and diff checks also pass. Evidence:
 `target/shared-install-file-owner.log` and
 `target/shared-install-file-owner-default-check.log`. This does not inject an
 interrupted Install write, test public routing, or qualify a three-node quorum.
+The file-owner staged-finalization regression exposed a real clock-ordering
+defect: startup's fresh genesis read advanced logical time before the saved
+finalization, which then returned `AuthoritySlotRegressed` (initial failure
+178.81 s; diagnostic reproduction 171.58 s). Recovery now replays already-signed
+retained finalization and its guarded ACK retirement before fresh genesis reads.
+It never signs a replacement outcome or changes the saved preflight timestamp;
+fresh Authority and physical-result verification still precede route export.
+`shared_install_file_owner_recovers_staged_finalization` now passes (214.26 s):
+the production owner consumes the staged envelope, preserves the applied Agent
+journal across restart, and returns the exact terminal on further retries.
+The hook is test-only, thread/root scoped, after staged-file sync and before
+publication; this is an owner-reopen test, not process-kill/power-loss evidence.
+Five controller tests, 78 file-store tests plus the separate socket-enabled
+HTTP test, default daemon build, formatting and diff checks pass. One
+fixture-dependent store test remains ignored. Evidence:
+`target/shared-install-file-interruption{,-diagnostic,-fixed,-controller-qualified,-stores,-http,-fixed-default-check}.log`.
+An initial controller filter selected zero tests and is not counted. Earlier
+authorization/issuance boundaries, multiple pending continuations and recovery
+of roots already advanced by the old failing startup are not qualified here.
 Still required before ingress: all issuance/finalization crash boundaries under
 the production file owner (including receipt expiry before physical application),
 mixed pending continuations, Authority-denial retirement
