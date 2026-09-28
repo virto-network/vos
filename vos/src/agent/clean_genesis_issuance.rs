@@ -14,7 +14,7 @@ pub(crate) const MAX_GENESIS_SIGNATURE_IMAGE_BYTES: usize =
 
 /// The signer must be deterministic/idempotent for an exact message. Failure
 /// after signing but before durable signature retention may repeat that message.
-pub(crate) trait GenesisClaimSigner {
+pub trait GenesisClaimSigner {
     type Error;
     fn public_key(&self) -> [u8; 32];
     fn sign_genesis_claim(&mut self, message: &[u8; 32]) -> Result<[u8; 64], Self::Error>;

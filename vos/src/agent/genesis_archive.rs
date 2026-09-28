@@ -24,6 +24,22 @@ pub trait AgentGenesisArchiveStore: Send + Sync {
     ) -> Result<(), Self::Error>;
 }
 
+// Coordinators may borrow an archive without transferring its lifetime lease
+// out of the retained lifecycle controller.
+impl<S: AgentGenesisArchiveStore + ?Sized> AgentGenesisArchiveStore for &S {
+    type Error = S::Error;
+    fn load(&self, locator: AgentGenesisLocator) -> Result<Option<Vec<u8>>, Self::Error> {
+        (**self).load(locator)
+    }
+    fn insert_if_absent(
+        &self,
+        locator: AgentGenesisLocator,
+        record: &[u8],
+    ) -> Result<(), Self::Error> {
+        (**self).insert_if_absent(locator, record)
+    }
+}
+
 /// Provider backed by exact archived provisions. `create` only reproduces an
 /// already archived matching record; issuance and policy publication belong
 /// to the coordinator, not this archive. No result carries trusted finality.

@@ -109,7 +109,8 @@ disposable image-Local Space with all three Shared roots absent while its
 Counter route still returned `7`. This establishes a live owner for later
 Shared Create, not a new generation or public Create ingress.
 The retained production controller's type-erased Shared access now supports
-signed-input reservation as well as recovery, but not end-to-end live Create.
+signed-input reservation, preparation and publication as well as recovery,
+but not end-to-end live Create.
 Its configured file factory is lazy and pins the Space directory before first
 use. Exact retries stay in the controller without reopening its leased stores.
 The startup verifier still deliberately refuses unproved live provisions. The
@@ -212,6 +213,35 @@ total), including assertions that all three Shared control roots remain absent.
 This is one startup smoke measurement, not a production latency target. Archive-boundary
 execution through real file stores and live Create/route integration remain
 required; this is not public Shared management or a completed Create response.
+In-progress publication integration: the retained lifecycle owner now exposes
+preparation and quorum publication for an existing reservation. Preparation
+returns a non-wire-decodable value binding the owner-authenticated candidate
+to its independently queried committee; its endorsement method cannot accept
+a replacement committee. The existing durable signature pledge and quorum
+verification remain authoritative. Publication borrows the controller's archive
+lease and reuses immutable evidence on retry; it neither provisions a generation
+nor releases the original Create reservation. The final physical lifecycle
+test passes (234.26 s): preparation/publication retries add no journal entries,
+an outsider is rejected before signing, a valid endorsement is retained once,
+and publication leaves the original reservation held with no ordinary route.
+Four controller regressions, `cargo check -p vosx` and the `std`-only build
+check pass. This is a one-voter fixture with real outer-PVM/system journals but
+memory-backed lifecycle stores, not three-node or file-backed customer-workflow
+qualification. Next, complete physical application and retirement before
+admitting the new generation to routes; do not treat the existing provisioning
+helper alone as a completed Create. Production endorsement collection and
+end-to-end file-backed recovery also remain incomplete. Public Shared Create
+stays disabled.
+
+Reproduce the lifecycle publication test with disk-backed build and temporary
+directories as above:
+
+```sh
+RUST_MIN_STACK=16777216 VOS_AGENT_PROFILE_REFINE_MACHINES=1 \
+  cargo test --offline --locked -p vos --features pvm \
+  native_shared_lifecycle_reservation_preparation_publication_retries --lib \
+  -- --ignored --test-threads=1
+```
 The focused startup and incomplete-archive tests pass. Two separately run,
 explicit bundled-outer-PVM regressions pass for both Agent-ID orderings of a
 retired A plus unissued B: A reopens through a fresh Authority read and serves

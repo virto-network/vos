@@ -167,30 +167,20 @@ where
 
     /// Resume one signed, pre-archive Create through the retained lifecycle
     /// leases. The replica roster is re-admitted from its immutable sidecar;
-    /// caller input cannot replace it after restart. An endorsement is only
-    /// one committee signature, not publication, finality or route exposure.
-    pub(crate) fn endorse_pending_create<B, C, D, S, SignStore, K>(
+    /// caller input cannot replace it after restart. The returned value binds
+    /// the candidate to its independently queried committee for signing; it
+    /// carries no signatures, publication, finality or route permission.
+    pub fn prepare_pending_create<B, C, D, S>(
         &mut self,
         owner: &mut CleanSystemAgentBootstrapOwner<B, C, D>,
         locator: super::super::genesis::AgentGenesisLocator,
         receipt_signer: &mut S,
-        signature_store: &mut SignStore,
-        genesis_signer: &mut K,
-    ) -> Result<
-        (
-            AuthorizedSharedGenesisProposal,
-            super::super::committee::AuthorityCommittee,
-            super::super::committee::AuthoritySignature,
-        ),
-        SharedAgentHostError,
-    >
+    ) -> Result<PreparedSharedGenesisEndorsement, SharedAgentHostError>
     where
         B: CleanSystemAgentBootstrapStore + Send + 'static,
         C: CleanSystemAgentBootstrapStore + Send + 'static,
         D: CleanManagementIssuerStore + Send + 'static,
         S: CleanManagementReceiptSigner,
-        SignStore: CleanManagementIssuerStore,
-        K: super::genesis_issuance::GenesisClaimSigner,
     {
         if !self.recovered || owner.authority_target() != self.authority {
             return Err(SharedAgentHostError::Conflict);
@@ -219,12 +209,85 @@ where
         let replicas = recovery
             .retained_replicas()?
             .ok_or(SharedAgentHostError::ScopeMismatch)?;
-        owner.endorse_recovered_shared_genesis(
+        let (candidate, committee) =
+            owner.resume_shared_genesis_preparation(recovery, &replicas, receipt_signer)?;
+        Ok(PreparedSharedGenesisEndorsement {
+            candidate,
+            committee,
+        })
+    }
+
+    pub(crate) fn endorse_pending_create<B, C, D, S, SignStore, K>(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<B, C, D>,
+        locator: super::super::genesis::AgentGenesisLocator,
+        receipt_signer: &mut S,
+        signature_store: &mut SignStore,
+        genesis_signer: &mut K,
+    ) -> Result<
+        (
+            AuthorizedSharedGenesisProposal,
+            super::super::committee::AuthorityCommittee,
+            super::super::committee::AuthoritySignature,
+        ),
+        SharedAgentHostError,
+    >
+    where
+        B: CleanSystemAgentBootstrapStore + Send + 'static,
+        C: CleanSystemAgentBootstrapStore + Send + 'static,
+        D: CleanManagementIssuerStore + Send + 'static,
+        S: CleanManagementReceiptSigner,
+        SignStore: CleanManagementIssuerStore,
+        K: super::genesis_issuance::GenesisClaimSigner,
+    {
+        let prepared = self.prepare_pending_create(owner, locator, receipt_signer)?;
+        let signature = prepared.endorse(signature_store, genesis_signer)?;
+        Ok((prepared.candidate, prepared.committee, signature))
+    }
+
+    /// Select and publish quorum evidence under the retained reservation and
+    /// archive leases. The owner reauthenticates candidate/committee and checks
+    /// the publication's positive ACK. Neither provisioning nor route exposure
+    /// is part of this operation. Exact retry reuses the immutable archive.
+    pub fn publish_pending_create<B, C, D, S>(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<B, C, D>,
+        locator: super::super::genesis::AgentGenesisLocator,
+        signatures: Vec<super::super::committee::AuthoritySignature>,
+        receipt_signer: &mut S,
+    ) -> Result<super::super::genesis::AgentGenesisArchiveRecord, SharedAgentHostError>
+    where
+        B: CleanSystemAgentBootstrapStore + Send + 'static,
+        C: CleanSystemAgentBootstrapStore + Send + 'static,
+        D: CleanManagementIssuerStore + Send + 'static,
+        S: CleanManagementReceiptSigner,
+    {
+        if !self.recovered || owner.authority_target() != self.authority {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let (recovery, archive) = self
+            .entries
+            .iter_mut()
+            .find(|(recovery, _)| recovery.locator == locator)
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        if recovery.retired {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let archive = archive.as_ref().ok_or(SharedAgentHostError::Unavailable)?;
+        let provider = super::super::genesis_archive::ArchivedAgentGenesisProvider::new(
+            locator.space,
+            archive,
+        )
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let replicas = recovery
+            .retained_replicas()?
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        owner.publish_recovered_shared_genesis(
             recovery,
             &replicas,
             receipt_signer,
-            signature_store,
-            genesis_signer,
+            signatures,
+            &provider,
         )
     }
 

@@ -12,6 +12,8 @@ pub(crate) mod genesis_issuance;
 #[path = "clean_genesis_recovery.rs"]
 mod genesis_recovery;
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+pub use genesis_issuance::GenesisClaimSigner;
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 pub use genesis_recovery::{NativeSharedGenesisController, NativeSharedGenesisRecovery};
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
@@ -1782,7 +1784,7 @@ impl RetainedGenesisCommitteeReply {
 /// its exact claim before signing, and recovery must re-run the coordinator.
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct AuthorizedSharedGenesisProposal {
+pub struct AuthorizedSharedGenesisProposal {
     proposal: super::genesis::AgentGenesisProposal,
     catalog: Vec<RuntimeBlob>,
     replicas: AgentReplicaCommittee,
@@ -1792,20 +1794,65 @@ pub(crate) struct AuthorizedSharedGenesisProposal {
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 impl AuthorizedSharedGenesisProposal {
-    pub(crate) fn proposal(&self) -> &super::genesis::AgentGenesisProposal {
+    pub fn proposal(&self) -> &super::genesis::AgentGenesisProposal {
         &self.proposal
     }
-    pub(crate) fn catalog(&self) -> &[RuntimeBlob] {
+    pub fn catalog(&self) -> &[RuntimeBlob] {
         &self.catalog
     }
-    pub(crate) fn replicas(&self) -> &AgentReplicaCommittee {
+    pub fn replicas(&self) -> &AgentReplicaCommittee {
         &self.replicas
     }
-    pub(crate) fn claim(&self) -> &super::genesis::AgentGenesisClaim {
+    pub fn claim(&self) -> &super::genesis::AgentGenesisClaim {
         &self.claim
     }
-    pub(crate) fn authorization(&self) -> InvocationId {
+    pub fn authorization(&self) -> InvocationId {
         self.authorization
+    }
+
+    /// Pledge and retain one committee member's endorsement of this owner-
+    /// authenticated candidate. This does not assemble a quorum, publish to
+    /// Authority, grant finality or provision a generation.
+    pub(crate) fn endorse<S: CleanManagementIssuerStore, K: GenesisClaimSigner>(
+        &self,
+        committee: &super::committee::AuthorityCommittee,
+        store: &mut S,
+        signer: &mut K,
+    ) -> Result<super::committee::AuthoritySignature, SharedAgentHostError> {
+        genesis_issuance::issue(self, committee, store, signer).map_err(|error| match error {
+            genesis_issuance::GenesisIssuanceError::Unavailable => {
+                SharedAgentHostError::Unavailable
+            }
+            genesis_issuance::GenesisIssuanceError::Conflict => SharedAgentHostError::Conflict,
+            _ => SharedAgentHostError::ScopeMismatch,
+        })
+    }
+}
+
+/// An owner-authenticated candidate bound to the committee returned by its
+/// Authority query. No public constructor or wire decoder can replace either
+/// half. Endorsement is still only one signature, not quorum or finality.
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedSharedGenesisEndorsement {
+    candidate: AuthorizedSharedGenesisProposal,
+    committee: super::committee::AuthorityCommittee,
+}
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+impl PreparedSharedGenesisEndorsement {
+    pub fn candidate(&self) -> &AuthorizedSharedGenesisProposal {
+        &self.candidate
+    }
+    pub fn committee(&self) -> &super::committee::AuthorityCommittee {
+        &self.committee
+    }
+    pub fn endorse<S: CleanManagementIssuerStore, K: GenesisClaimSigner>(
+        &self,
+        store: &mut S,
+        signer: &mut K,
+    ) -> Result<super::committee::AuthoritySignature, SharedAgentHostError> {
+        self.candidate.endorse(&self.committee, store, signer)
     }
 }
 
@@ -24095,6 +24142,218 @@ mod tests {
             Archive,
             Published,
             Provisioned,
+        }
+
+        #[test]
+        #[ignore = "requires the bundled outer PVM; run with VOS_AGENT_PROFILE_REFINE_MACHINES=1"]
+        fn native_shared_lifecycle_reservation_preparation_publication_retries() {
+            struct NoLocalStores;
+            impl crate::agent::local_lifecycle::LocalLifecycleStoreFactory for NoLocalStores {
+                type Intent = IssuerMemoryStore;
+                type Issuer = IssuerMemoryStore;
+                type Error = ();
+                fn discover(&mut self, _: SpaceId, _: usize) -> Result<Vec<AgentId>, ()> {
+                    Ok(vec![])
+                }
+                fn open_existing(
+                    &mut self,
+                    _: SpaceId,
+                    _: AgentId,
+                ) -> Result<(Self::Intent, Self::Issuer), ()> {
+                    Err(())
+                }
+                fn open(
+                    &mut self,
+                    _: SpaceId,
+                    _: AgentId,
+                ) -> Result<(Self::Intent, Self::Issuer), ()> {
+                    Err(())
+                }
+            }
+            struct Signer {
+                key: SigningKey,
+                calls: usize,
+            }
+            impl GenesisClaimSigner for Signer {
+                type Error = ();
+                fn public_key(&self) -> [u8; 32] {
+                    self.key.verifying_key().to_bytes()
+                }
+                fn sign_genesis_claim(&mut self, message: &[u8; 32]) -> Result<[u8; 64], ()> {
+                    self.calls += 1;
+                    Ok(self.key.sign(message).to_bytes())
+                }
+            }
+            let mut harness = NativeProjectionOwnerHarness::with_real_bootstrap(
+                "shared-live-publication",
+                native_bundled_authority_fixture(),
+            );
+            let owner = harness.owner.take().unwrap();
+            let target = owner.authority_target();
+            let runtime = test_runtime_package(true);
+            let mut descriptor = owner.pins.descriptor.clone();
+            descriptor.creation_nonce = Hash([0xf3; 32]);
+            descriptor.identity.agent = AgentId::derive(
+                descriptor.identity.space,
+                descriptor.identity.owner,
+                descriptor.creation_nonce.as_bytes(),
+            );
+            descriptor.identity.runtime_deployment = runtime.deployment();
+            descriptor.identity.runtime_program = runtime.program();
+            descriptor.identity.runtime_producer = runtime.producer();
+            descriptor.runtime_package = runtime.package_ref().clone();
+            descriptor.runtime_contract = runtime.manifest().contract;
+            descriptor.capabilities = runtime.capabilities();
+            descriptor.replicas[0].principal = descriptor.identity.owner;
+            let original = owner.pins.replicas.members()[0].clone();
+            let mut replica = original.replica();
+            replica.principal = crate::service::PrincipalId(descriptor.identity.owner.0);
+            let replicas = AgentReplicaCommittee::new(
+                crate::service::SpaceId(descriptor.identity.space.0),
+                HostAgentId(descriptor.identity.agent.0),
+                crate::agent::AgentProfile::Shared,
+                vec![
+                    crate::agent::genesis::AgentReplicaMember::new(
+                        replica,
+                        original.peer_id().to_vec(),
+                        *original.ed25519_public_key(),
+                        original.raft_slot(),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap();
+            let key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
+            let request = ManagementRequest::Create(Box::new(descriptor.clone()));
+            let (mut call, _) = credential_call_and_approval(&descriptor, &request, &key);
+            call.request_sequence = NonZeroU64::new(2).unwrap();
+            call.authority = target;
+            call.invocation = call.expected_invocation();
+            call.signature = key.sign(&call.signing_bytes()).to_bytes();
+            let local = crate::agent::local_sdk_host::LocalAgentHost::create(
+                harness._directory.0.join("local"),
+                owner.pins.space,
+                owner.pins.node,
+                harness.fixture.trust.clone(),
+            )
+            .unwrap();
+            let archive = MixedSharedArchive::default();
+            let archive_lease = archive.clone();
+            let shared = NativeSharedGenesisController::<
+                IssuerMemoryStore,
+                IssuerMemoryStore,
+                IssuerMemoryStore,
+                IssuerMemoryStore,
+                IssuerMemoryStore,
+                IssuerMemoryStore,
+                MixedSharedArchive,
+            >::new(target, vec![])
+            .unwrap();
+            let mut lifecycle = crate::agent::local_lifecycle::LocalLifecycleController::new(
+                owner,
+                local,
+                NoLocalStores,
+                CountingSigner::new(),
+            )
+            .unwrap()
+            .with_shared_genesis_admission(shared, move |descriptor, call, runtime, replicas| {
+                let locator = crate::agent::genesis::AgentGenesisLocator {
+                    space: crate::service::SpaceId(descriptor.identity.space.0),
+                    agent: HostAgentId(descriptor.identity.agent.0),
+                };
+                let recovery = MixedSharedRecovery::reserve_create_with_replicas(
+                    target,
+                    locator,
+                    descriptor.clone(),
+                    call.clone(),
+                    runtime.clone(),
+                    replicas.clone(),
+                    (
+                        IssuerMemoryStore::default(),
+                        IssuerMemoryStore::default(),
+                        IssuerMemoryStore::default(),
+                        IssuerMemoryStore::default(),
+                        IssuerMemoryStore::default(),
+                        IssuerMemoryStore::default(),
+                    ),
+                )?;
+                Ok((recovery, Some(archive_lease.clone())))
+            })
+            .unwrap();
+            let before = lifecycle.ordered_index_for_test().unwrap();
+            let locator = lifecycle
+                .reserve_shared_create(&descriptor, &call, &runtime, &replicas)
+                .unwrap();
+            assert_eq!(lifecycle.ordered_index_for_test().unwrap(), before);
+            let candidate = lifecycle.prepare_shared_create(locator).unwrap();
+            let prepared = lifecycle.ordered_index_for_test().unwrap();
+            assert!(prepared > before);
+            assert_eq!(
+                lifecycle.prepare_shared_create(locator).unwrap(),
+                candidate.clone()
+            );
+            assert_eq!(lifecycle.ordered_index_for_test().unwrap(), prepared);
+            let mut signature_store = IssuerMemoryStore::default();
+            let mut outsider = Signer {
+                key: SigningKey::from_bytes(&[0xfa; 32]),
+                calls: 0,
+            };
+            assert_eq!(
+                candidate.endorse(&mut signature_store, &mut outsider),
+                Err(SharedAgentHostError::ScopeMismatch)
+            );
+            assert_eq!(outsider.calls, 0);
+            assert!(signature_store.image.lock().unwrap().is_none());
+            let mut signer = Signer { key, calls: 0 };
+            let signature = candidate
+                .endorse(&mut signature_store, &mut signer)
+                .unwrap();
+            assert_eq!(
+                candidate
+                    .endorse(&mut signature_store, &mut signer)
+                    .unwrap(),
+                signature
+            );
+            assert_eq!(signer.calls, 1);
+            let record = lifecycle
+                .publish_shared_create(locator, vec![signature])
+                .unwrap();
+            let published = lifecycle.ordered_index_for_test().unwrap();
+            assert_eq!(
+                published,
+                prepared + 2,
+                "publication executes exactly one Invoke/ACK pair"
+            );
+            let stored = archive.0.lock().unwrap().clone();
+            // Once selected, the immutable quorum archive suffices for exact
+            // retry; callers need not recollect signatures or replace evidence.
+            assert_eq!(
+                lifecycle.publish_shared_create(locator, vec![]).unwrap(),
+                record
+            );
+            assert_eq!(lifecycle.ordered_index_for_test().unwrap(), published);
+            assert_eq!(*archive.0.lock().unwrap(), stored);
+            assert!(
+                lifecycle
+                    .system_for_test()
+                    .management_admission_held()
+                    .unwrap()
+            );
+            assert_eq!(lifecycle.system_for_test().host.lock().unwrap().len(), 1);
+            assert!(
+                lifecycle
+                    .system_for_test()
+                    .ordinary_supervisor_generations()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                lifecycle.prepare_shared_create(locator),
+                Err(SharedAgentHostError::Conflict)
+            );
+            assert_eq!(lifecycle.ordered_index_for_test().unwrap(), published);
+            drop(lifecycle);
+            harness.stop();
         }
 
         fn prepare_mixed_shared(

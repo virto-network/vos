@@ -2462,6 +2462,21 @@ where
         signer: &mut S,
     ) -> Result<(), SharedAgentHostError>;
 
+    fn publish_create(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        locator: super::genesis::AgentGenesisLocator,
+        signatures: Vec<super::committee::AuthoritySignature>,
+        signer: &mut S,
+    ) -> Result<super::genesis::AgentGenesisArchiveRecord, SharedAgentHostError>;
+
+    fn prepare_create(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        locator: super::genesis::AgentGenesisLocator,
+        signer: &mut S,
+    ) -> Result<super::clean_bootstrap::PreparedSharedGenesisEndorsement, SharedAgentHostError>;
+
     fn reserve_create(
         &mut self,
         _: &AgentDescriptor,
@@ -2511,6 +2526,27 @@ where
         self.0.recover(owner, signer)
     }
 
+    fn publish_create(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        locator: super::genesis::AgentGenesisLocator,
+        signatures: Vec<super::committee::AuthoritySignature>,
+        signer: &mut S,
+    ) -> Result<super::genesis::AgentGenesisArchiveRecord, SharedAgentHostError> {
+        self.0
+            .publish_pending_create(owner, locator, signatures, signer)
+    }
+
+    fn prepare_create(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        locator: super::genesis::AgentGenesisLocator,
+        signer: &mut S,
+    ) -> Result<super::clean_bootstrap::PreparedSharedGenesisEndorsement, SharedAgentHostError>
+    {
+        self.0.prepare_pending_create(owner, locator, signer)
+    }
+
     fn reserve_create(
         &mut self,
         descriptor: &AgentDescriptor,
@@ -2546,6 +2582,26 @@ where
         signer: &mut S,
     ) -> Result<(), SharedAgentHostError> {
         super::clean_bootstrap::NativeSharedGenesisController::recover(self, owner, signer)
+    }
+
+    fn publish_create(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        locator: super::genesis::AgentGenesisLocator,
+        signatures: Vec<super::committee::AuthoritySignature>,
+        signer: &mut S,
+    ) -> Result<super::genesis::AgentGenesisArchiveRecord, SharedAgentHostError> {
+        self.publish_pending_create(owner, locator, signatures, signer)
+    }
+
+    fn prepare_create(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        locator: super::genesis::AgentGenesisLocator,
+        signer: &mut S,
+    ) -> Result<super::clean_bootstrap::PreparedSharedGenesisEndorsement, SharedAgentHostError>
+    {
+        self.prepare_pending_create(owner, locator, signer)
     }
 }
 
@@ -2969,6 +3025,42 @@ where
             .as_mut()
             .ok_or(SharedAgentHostError::Conflict)?
             .reserve_create(descriptor, call, runtime, replicas)
+    }
+
+    /// Reauthenticate retained Create inputs and query their Authority committee.
+    /// The sealed candidate can obtain durable endorsements; it grants neither
+    /// publication nor finality. A caller cannot supply a replacement committee.
+    pub fn prepare_shared_create(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+    ) -> Result<super::clean_bootstrap::PreparedSharedGenesisEndorsement, SharedAgentHostError>
+    {
+        let mut system = self
+            .system
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        self.shared_genesis
+            .as_mut()
+            .ok_or(SharedAgentHostError::Conflict)?
+            .prepare_create(&mut system, locator, &mut self.signer)
+    }
+
+    /// Publish collected Shared genesis evidence through the retained owner.
+    /// This returns an authenticated archive, not a completed Create ACK or
+    /// permission to expose an ordinary route. Application/retirement follow.
+    pub fn publish_shared_create(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+        signatures: Vec<super::committee::AuthoritySignature>,
+    ) -> Result<super::genesis::AgentGenesisArchiveRecord, SharedAgentHostError> {
+        let mut system = self
+            .system
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        self.shared_genesis
+            .as_mut()
+            .ok_or(SharedAgentHostError::Conflict)?
+            .publish_create(&mut system, locator, signatures, &mut self.signer)
     }
 
     /// Adopt the recovered admin stores for the full production-owner lifetime.
