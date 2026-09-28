@@ -250,10 +250,22 @@ Install/Invoke/ACK. The debug daemon
 startup/shutdown smoke also passes (23.39 s, endpoint ready at 21.00 s).
 No public ingress is enabled. Cold interruption through the real file-backed
 lifecycle owner, production quorum orchestration, Shared Install handoff and
-release performance qualification remain open. Before ingress, admission must
-also preflight physical generation capacity rather than discovering exhaustion
-only after genesis publication, and qualify signed Create denial retirement
-without leaving Authority admission held.
+release performance qualification remain open. After the `65f35760` review
+checkpoint, live preparation and publication now preflight physical host
+capacity, counting the system and unserved generations while allowing existing
+targets to retry at the bound. The synthetic occupancy regression passes with
+one real serving generation and no preflight filesystem changes; four controller
+regressions, the daemon build check and the `std`-only build check pass. The
+physical preparation/publication retry regression passes (228.02 s), with
+unchanged publication counts and no early route exposure. This is a capacity
+check, not a durable slot reservation: production
+orchestration must keep competing physical allocation under the lifecycle
+ordering contract and retain the staging-time check. Before ingress, qualify
+signed Create denial retirement without leaving Authority admission held.
+Reuse the existing signed management-denial replay/retirement helper with
+Shared physical-absence verification; Shared recovery currently rejects a
+completed denial, so terminal discovery/retry must be integrated too. Do not
+map a capacity preflight error into a fabricated signed Authority denial.
 Backup quiescence must also cover unserved live generations after reservation
 release: an idle Authority admission alone does not prove all Create routes
 have been admitted or that the lifecycle/physical snapshot is complete.

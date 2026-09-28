@@ -1426,6 +1426,34 @@ impl SharedAgentHost {
         self.stage_unserved_replay_verified(provision, catalog, committee_authority, finality)
     }
 
+    /// Check physical capacity before live Authority work, including the system
+    /// generation and unserved Creates. This is not a slot reservation or proof
+    /// of finality; staging still validates the exact intent and capacity.
+    #[cfg(all(feature = "network", target_os = "linux"))]
+    pub(crate) fn preflight_live_genesis_capacity(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+    ) -> Result<(), SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        if self.deferred_open {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        if locator.space != self.scope().space || locator.agent == AgentId::ZERO {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if !self.agents.contains_key(&locator.agent)
+            && !self.deferred_generations.contains_key(&locator.agent)
+            && self
+                .agents
+                .len()
+                .saturating_add(self.deferred_generations.len())
+                >= MAX_SHARED_HOST_AGENTS
+        {
+            return Err(SharedAgentHostError::CapacityExhausted);
+        }
+        Ok(())
+    }
+
     /// Live Create staging does not enter the global startup gate or change
     /// any existing serving generation. Only the coordinator may promote it.
     #[cfg(all(feature = "network", target_os = "linux"))]
@@ -7270,6 +7298,60 @@ mod tests {
         assert!(prepare(&mut host, changed, &runtime, *observed_slot).is_err());
         assert!(host.is_empty());
         assert!(scan_generation_namespaces(&host.lease).unwrap().is_empty());
+    }
+
+    #[test]
+    #[cfg(all(feature = "network", feature = "pvm", target_os = "linux"))]
+    fn live_genesis_capacity_counts_serving_and_unserved_generations() {
+        let directory = TempDirectory::new("live_genesis_capacity");
+        let fixture = fixture(0x25);
+        let mut host = open_host(&directory, &fixture);
+        host.provision(
+            fixture.provision.clone(),
+            fixture.catalog.clone(),
+            fixture.committee_authority,
+        )
+        .unwrap();
+        let locator = |agent| super::super::genesis::AgentGenesisLocator {
+            space: fixture.space,
+            agent,
+        };
+        let fresh = AgentId([0xf0; 32]);
+        assert_eq!(host.preflight_live_genesis_capacity(locator(fresh)), Ok(()));
+        let before = physical_bytes(&directory);
+        // Synthetic occupancy tests the exact boundary without materializing
+        // thousands of journals. One real serving generation counts too.
+        for index in 1..MAX_SHARED_HOST_AGENTS {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            host.deferred_generations
+                .insert(AgentId(bytes), GenerationFiles::default());
+        }
+        assert_eq!(
+            host.preflight_live_genesis_capacity(locator(fresh)),
+            Err(SharedAgentHostError::CapacityExhausted)
+        );
+        assert_eq!(
+            host.preflight_live_genesis_capacity(locator(fixture.agent)),
+            Ok(())
+        );
+        let staged = *host.deferred_generations.keys().next().unwrap();
+        assert_eq!(
+            host.preflight_live_genesis_capacity(locator(staged)),
+            Ok(())
+        );
+        let mut foreign = locator(fresh);
+        foreign.space = SpaceId([0xf1; 32]);
+        assert_eq!(
+            host.preflight_live_genesis_capacity(foreign),
+            Err(SharedAgentHostError::ScopeMismatch)
+        );
+        host.deferred_open = true;
+        assert_eq!(
+            host.preflight_live_genesis_capacity(locator(staged)),
+            Err(SharedAgentHostError::Conflict)
+        );
+        assert_eq!(physical_bytes(&directory), before);
     }
 
     #[test]

@@ -209,6 +209,11 @@ where
         let replicas = recovery
             .retained_replicas()?
             .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        owner
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .preflight_live_genesis_capacity(locator)?;
         let (candidate, committee) =
             owner.resume_shared_genesis_preparation(recovery, &replicas, receipt_signer)?;
         Ok(PreparedSharedGenesisEndorsement {
@@ -282,6 +287,13 @@ where
         let replicas = recovery
             .retained_replicas()?
             .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        // Endorsement collection can separate preparation from publication.
+        // Recheck physical capacity before any publication-side Authority work.
+        owner
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .preflight_live_genesis_capacity(locator)?;
         owner.publish_recovered_shared_genesis(
             recovery,
             &replicas,
