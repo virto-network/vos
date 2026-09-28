@@ -351,15 +351,34 @@ fn check_shared_file_recovery(with_denial: bool, with_handoff: bool) {
             &operator,
         )
         .unwrap();
-        // Preparation validates and retains opaque constructor bytes. It does
-        // not execute this actor or claim a successful constructor result.
+        let configuration = SystemCatalogConfiguration {
+            space: space.0,
+            system_agent: agent.0,
+            system_runtime_deployment: runtime.deployment().0,
+            actor: ActorId::top_level(agent, "prepared-catalog").0,
+            deployment: package.deployment().0,
+            program: package.program().0,
+            authority: CatalogAuthorityState {
+                policy: authority.binding.policy.0,
+                issuer: CatalogIssuerState {
+                    principal: authority.binding.issuer.principal.0,
+                    actor: authority.binding.issuer.actor.0,
+                    deployment: authority.binding.issuer.deployment.0,
+                    program: authority.binding.issuer.program.0,
+                    producer: authority.binding.issuer.producer.0,
+                },
+                public_key: authority.binding.public_key,
+                initial_epoch: authority.binding.initial_epoch,
+            },
+        };
+        assert!(configuration.is_valid());
         let install = crate::commands::space::local_install::build_install(
             agent,
             vos::agent::sdk::InstallationId([0x81; 32]),
             Hash([0x82; 32]),
             "prepared-catalog".into(),
             None,
-            Some(vec![1]),
+            Some(configuration.encode()),
             &package,
         )
         .unwrap();
@@ -426,6 +445,9 @@ fn check_shared_file_recovery(with_denial: bool, with_handoff: bool) {
         .unwrap();
     }
     let (_, mut lifecycle) = open();
+    let install_commitment = handoff_files
+        .as_ref()
+        .map(|(_, _, call, _)| call.commitment());
     if let Some((retained, install, install_call, package)) = handoff_files {
         assert!(!lifecycle_root.join("shared-management.actor").exists());
         lifecycle.initialize_shared_management(locator).unwrap();
@@ -494,7 +516,43 @@ fn check_shared_file_recovery(with_denial: bool, with_handoff: bool) {
         );
         assert_eq!(journal_files(&journal), applied);
     }
-    drop(lifecycle);
+    if with_handoff {
+        use vos::agent::clean_authority_issuer::SignedManagementTerminal;
+        let terminal = lifecycle.complete_shared_install(locator).unwrap();
+        let SignedManagementTerminal::Applied(ack) = &terminal else {
+            panic!("valid retained Install must apply: {terminal:?}");
+        };
+        assert_eq!(Some(ack.credential_call), install_commitment);
+        let completed = journal_files(&journal);
+        assert_ne!(completed, applied, "Install must execute physically");
+        let system_journal = data
+            .join(SHARED_AGENT_HOST_DIRECTORY)
+            .join(format!("{}.agent", hex::encode(authority.system_agent.0)));
+        let system_completed = journal_files(&system_journal);
+        let lifecycle_completed = journal_files(&lifecycle_root);
+        assert_eq!(
+            lifecycle.complete_shared_install(locator).unwrap(),
+            terminal
+        );
+        assert_eq!(journal_files(&system_journal), system_completed);
+        drop(lifecycle);
+        let (_, mut lifecycle) = open();
+        let recovered_system = journal_files(&system_journal);
+        assert_eq!(
+            lifecycle.complete_shared_install(locator).unwrap(),
+            terminal
+        );
+        assert_eq!(journal_files(&journal), completed);
+        assert_eq!(journal_files(&system_journal), recovered_system);
+        assert_eq!(journal_files(&lifecycle_root), lifecycle_completed);
+        assert!(matches!(
+            discover_shared_genesis_startup(&data, authority, 4),
+            Err(CleanFileStoreError::Busy)
+        ));
+        drop(lifecycle);
+    } else {
+        drop(lifecycle);
+    }
     network.shutdown();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while Arc::strong_count(&network) != 1 && std::time::Instant::now() < deadline {

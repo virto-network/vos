@@ -413,6 +413,17 @@ daemon build. Both outer-PVM runs pass: pending observed-result startup with
 interrupted finalization (419.73 s), and candidate signed rejection with real
 continuation ownership and retired recovery (524.63 s). Logs:
 `target/shared-install-recovery-*`.
+Production-owner completion qualification: the retained lifecycle exposes an
+internal completion seam using the existing signed-terminal type, without new
+wire formats or public ingress. The file-owner handoff test now supplies a valid
+Catalog constructor, completes Install, drops/reopens the production owner and
+checks byte-identical terminal retry with unchanged physical/system journals.
+The bundled outer-PVM test passes (193.52 s), with the actual production
+lifecycle/issuer/package files and their retained exclusive lease. Default
+daemon compilation, edition-2024 formatting and diff checks also pass. Evidence:
+`target/shared-install-file-owner.log` and
+`target/shared-install-file-owner-default-check.log`. This does not inject an
+interrupted Install write, test public routing, or qualify a three-node quorum.
 Still required before ingress: all issuance/finalization crash boundaries under
 the production file owner (including receipt expiry before physical application),
 mixed pending continuations, Authority-denial retirement

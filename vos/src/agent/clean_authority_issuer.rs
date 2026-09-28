@@ -670,8 +670,10 @@ struct PendingApplicationAck {
     applied_at: u64,
 }
 
+/// Signed application outcome. This value alone does not establish Authority
+/// finalization, retirement, or permission to expose a generation's routes.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum SignedManagementTerminal {
+pub enum SignedManagementTerminal {
     Applied(ManagementApplicationAck),
     Rejected(ManagementApplicationFailure),
 }

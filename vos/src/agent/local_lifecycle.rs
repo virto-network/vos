@@ -2500,6 +2500,13 @@ where
         signer: &mut S,
     ) -> Result<(), SharedAgentHostError>;
 
+    fn complete_install(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        locator: super::genesis::AgentGenesisLocator,
+        signer: &mut S,
+    ) -> Result<SignedManagementTerminal, SharedAgentHostError>;
+
     fn reserve_create(
         &mut self,
         _: &AgentDescriptor,
@@ -2600,6 +2607,15 @@ where
             .prepare_install(owner, install, call, package, signer)
     }
 
+    fn complete_install(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        locator: super::genesis::AgentGenesisLocator,
+        signer: &mut S,
+    ) -> Result<SignedManagementTerminal, SharedAgentHostError> {
+        self.0.complete_install(owner, locator, signer)
+    }
+
     fn reserve_create(
         &mut self,
         descriptor: &AgentDescriptor,
@@ -2687,6 +2703,17 @@ where
     ) -> Result<(), SharedAgentHostError> {
         super::clean_bootstrap::NativeSharedGenesisController::prepare_install(
             self, owner, install, call, package, signer,
+        )
+    }
+
+    fn complete_install(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        locator: super::genesis::AgentGenesisLocator,
+        signer: &mut S,
+    ) -> Result<SignedManagementTerminal, SharedAgentHostError> {
+        super::clean_bootstrap::NativeSharedGenesisController::complete_install(
+            self, owner, locator, signer,
         )
     }
 }
@@ -3197,6 +3224,23 @@ where
             .as_mut()
             .ok_or(SharedAgentHostError::Conflict)?
             .prepare_install(&mut system, install, call, package, &mut self.signer)
+    }
+
+    /// Complete a retained Shared Install through application, signed finality,
+    /// and retirement. This orchestration seam does not enable public ingress.
+    /// Exact retries return the original signed success or rejection.
+    pub fn complete_shared_install(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+    ) -> Result<SignedManagementTerminal, SharedAgentHostError> {
+        let mut system = self
+            .system
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        self.shared_genesis
+            .as_mut()
+            .ok_or(SharedAgentHostError::Conflict)?
+            .complete_install(&mut system, locator, &mut self.signer)
     }
 
     /// Adopt the recovered admin stores for the full production-owner lifetime.
