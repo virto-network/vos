@@ -72,28 +72,34 @@ impl GenesisClaimSigner for GenesisSigner<'_> {
 #[test]
 #[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
 fn shared_create_file_owner_reopens_preparation_publication_and_terminal() {
-    check_shared_file_recovery(false, false, false);
+    check_shared_file_recovery(false, false, 0);
 }
 
 #[test]
 #[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
 fn shared_create_file_owner_reopens_denial_beside_retired_generation() {
-    check_shared_file_recovery(true, false, false);
+    check_shared_file_recovery(true, false, 0);
 }
 
 #[test]
 #[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
 fn shared_management_handoff_reopens_under_production_lifecycle_owner() {
-    check_shared_file_recovery(true, true, false);
+    check_shared_file_recovery(true, true, 0);
 }
 
 #[test]
 #[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
 fn shared_install_file_owner_recovers_staged_finalization() {
-    check_shared_file_recovery(true, true, true);
+    check_shared_file_recovery(true, true, 2);
 }
 
-fn check_shared_file_recovery(with_denial: bool, with_handoff: bool, interrupt_install: bool) {
+#[test]
+#[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
+fn shared_install_file_owner_recovers_staged_authorization() {
+    check_shared_file_recovery(true, true, 1);
+}
+
+fn check_shared_file_recovery(with_denial: bool, with_handoff: bool, interrupt_install: usize) {
     use crate::commands::space::clean_store::{
         CleanAgentGenesisSignatureFile, CleanFileStoreError, ensure_private_directory,
     };
@@ -524,11 +530,14 @@ fn check_shared_file_recovery(with_denial: bool, with_handoff: bool, interrupt_i
     }
     if with_handoff {
         use vos::agent::clean_authority_issuer::SignedManagementTerminal;
-        if interrupt_install {
+        if interrupt_install != 0 {
             // The first changed intent write retains authorization work; the
             // second retains finalization work after the signed observation.
             // Leave its real staged envelope on disk, without publication.
-            let fault = super::super::clean_store::SharedIntentStageFault::arm(&lifecycle_root, 2);
+            let fault = super::super::clean_store::SharedIntentStageFault::arm(
+                &lifecycle_root,
+                interrupt_install,
+            );
             assert_eq!(
                 lifecycle.complete_shared_install(locator),
                 Err(SharedAgentHostError::Unavailable)
@@ -540,20 +549,48 @@ fn check_shared_file_recovery(with_denial: bool, with_handoff: bool, interrupt_i
                     .exists()
             );
             let installed = journal_files(&journal);
-            assert_ne!(installed, applied, "fault must follow physical application");
+            if interrupt_install == 1 {
+                assert_eq!(
+                    installed, applied,
+                    "authorization fault must precede application"
+                );
+            } else {
+                assert_ne!(
+                    installed, applied,
+                    "finalization fault must follow application"
+                );
+            }
             drop(fault);
             drop(lifecycle);
+            // Force a later wall-clock slot so fast machines cannot hide a
+            // stale-envelope bug behind same-second recovery reads.
+            let interrupted_at = system_logical_slot().unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while system_logical_slot().unwrap() <= interrupted_at
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(system_logical_slot().unwrap() > interrupted_at);
             (_, lifecycle) = open();
             assert!(
                 !lifecycle_root
                     .join("shared-management.intent.next")
                     .exists()
             );
-            assert_eq!(
-                journal_files(&journal),
-                installed,
-                "recovery must not reapply Install"
-            );
+            if interrupt_install == 1 {
+                assert_ne!(
+                    journal_files(&journal),
+                    installed,
+                    "recovery must apply Install"
+                );
+            } else {
+                assert_eq!(
+                    journal_files(&journal),
+                    installed,
+                    "recovery must not reapply Install"
+                );
+            }
         }
         let terminal = lifecycle.complete_shared_install(locator).unwrap();
         let SignedManagementTerminal::Applied(ack) = &terminal else {

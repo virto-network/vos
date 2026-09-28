@@ -422,29 +422,33 @@ The bundled outer-PVM test passes (193.52 s), with the actual production
 lifecycle/issuer/package files and their retained exclusive lease. Default
 daemon compilation, edition-2024 formatting and diff checks also pass. Evidence:
 `target/shared-install-file-owner.log` and
-`target/shared-install-file-owner-default-check.log`. This does not inject an
-interrupted Install write, test public routing, or qualify a three-node quorum.
-The file-owner staged-finalization regression exposed a real clock-ordering
-defect: startup's fresh genesis read advanced logical time before the saved
-finalization, which then returned `AuthoritySlotRegressed` (initial failure
-178.81 s; diagnostic reproduction 171.58 s). Recovery now replays already-signed
-retained finalization and its guarded ACK retirement before fresh genesis reads.
-It never signs a replacement outcome or changes the saved preflight timestamp;
-fresh Authority and physical-result verification still precede route export.
-`shared_install_file_owner_recovers_staged_finalization` now passes (214.26 s):
-the production owner consumes the staged envelope, preserves the applied Agent
-journal across restart, and returns the exact terminal on further retries.
-The hook is test-only, thread/root scoped, after staged-file sync and before
-publication; this is an owner-reopen test, not process-kill/power-loss evidence.
-Five controller tests, 78 file-store tests plus the separate socket-enabled
-HTTP test, default daemon build, formatting and diff checks pass. One
-fixture-dependent store test remains ignored. Evidence:
-`target/shared-install-file-interruption{,-diagnostic,-fixed,-controller-qualified,-stores,-http,-fixed-default-check}.log`.
-An initial controller filter selected zero tests and is not counted. Earlier
-authorization/issuance boundaries, multiple pending continuations and recovery
-of roots already advanced by the old failing startup are not qualified here.
-Still required before ingress: all issuance/finalization crash boundaries under
-the production file owner (including receipt expiry before physical application),
+`target/shared-install-file-owner-default-check.log`.
+
+Production-file interruption tests exposed a clock-ordering defect: startup's
+fresh genesis read advanced logical time before older saved system work.
+Staged finalization returned `AuthoritySlotRegressed` (178.81 s failure,
+171.58 s diagnostic reproduction); staged authorization also failed startup
+(163.94 s). Recovery now replays retained authorization and already-signed
+finalization before fresh reads. Authorization retains its reservation and does
+not apply the ordinary Install before generation verification. Finalization
+uses its original signed outcome and guarded ACK retirement. Neither replaces
+saved preflight timestamps; fresh Authority and physical-result verification
+still precede route export.
+Both `shared_install_file_owner_recovers_staged_authorization` and
+`shared_install_file_owner_recovers_staged_finalization` pass together (249.98 s).
+The tests force a later clock slot, consume real staged envelopes on reopen,
+apply exactly once, and retain byte-identical terminal retries. Five controller
+regressions (15.14 s), default daemon compilation, formatting and diff checks
+also pass. Latest evidence: `target/shared-install-file-authorization-{before,fixed,controller,default-check}.log`.
+Earlier finalization diagnosis and the passing 78 file-store tests plus separate
+socket-enabled HTTP test remain in `target/shared-install-file-interruption*.log`;
+one fixture-dependent store test was ignored, and a zero-test controller filter
+is not counted. Fault hooks are test-only and thread/root scoped, after
+staged-file sync and before publication. These are owner-reopen tests, not
+process-kill/power-loss, public-routing, or three-node qualification.
+Still required before ingress: remaining issuer/finalization crash boundaries
+under the production file owner, receipt expiry before physical application,
+and recovery of roots already advanced by the old failing startup;
 mixed pending continuations, Authority-denial retirement
 and crash-safe subsequent-Install input handoff. Public Shared management remains
 disabled; bundled artifacts are unchanged.

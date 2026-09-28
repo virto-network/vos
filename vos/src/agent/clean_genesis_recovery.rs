@@ -608,13 +608,13 @@ where
         // beside its original Create. Drain only that child before replaying
         // lifecycle preparation, which continues to exclude ordinary reads.
         owner.recover_pending_authority_projection()?;
-        // Replay a retained signed finalization before any fresh read advances
-        // the system runtime's logical clock beyond its immutable preflight.
-        // This resumes only an already signed outcome, never signs a new one.
-        // Physical evidence and fresh genesis authority are still independently
-        // rechecked below, with route export closed throughout recovery.
+        // Replay retained system work before fresh reads can advance the clock
+        // beyond its immutable preflight. Authorization only yields a receipt;
+        // finalization only resumes an already signed application outcome.
+        // Physical execution/evidence and fresh genesis authority remain gated
+        // below, with route export closed throughout recovery.
         for (recovery, _) in &mut self.entries {
-            if recovery.management_retirements.is_empty() && recovery.management_pending.len() != 2
+            if recovery.management_retirements.is_empty() && recovery.management_pending.is_empty()
             {
                 continue;
             }
@@ -628,7 +628,7 @@ where
                 .ok_or(SharedAgentHostError::ScopeMismatch)?;
             let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
             let managed = intent.call().managed;
-            let (_, terminal) = issuer
+            let observed = issuer
                 .recover_observed_terminal(
                     self.authority,
                     managed,
@@ -636,8 +636,18 @@ where
                     intent.call(),
                     &RawCredentialVerifier,
                 )
-                .map_err(|_| SharedAgentHostError::ScopeMismatch)?
-                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            if recovery.management_pending.len() == 1 {
+                if observed.is_none() {
+                    owner.issue_management_intent_with_admission(
+                        slot, managed, issuer, signer, true,
+                    )?;
+                }
+                // Keep the reservation until generation verification and
+                // physical application yield a replay-proved signed outcome.
+                continue;
+            }
+            let (_, terminal) = observed.ok_or(SharedAgentHostError::ScopeMismatch)?;
             match terminal {
                 SignedManagementTerminal::Applied(ack) => {
                     owner.finalize_management_intent_with_admission(
