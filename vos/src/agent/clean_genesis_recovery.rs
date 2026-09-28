@@ -8,8 +8,9 @@ use crate::agent::clean_management_intent::{
 
 /// Owns the complete discovered reservation set and its archive leases through
 /// recovery and serving. Construction validates ownership scope, not finality.
-/// Only a signed, unissued Create with bound runtime and replicas may lack an
-/// archive; it stays retained and unroutable. Later missing archives fail closed.
+/// A signed Create before publication with bound runtime and replicas may lack
+/// an archive; it stays retained and unroutable. Publication without its archive
+/// fails closed.
 pub struct NativeSharedGenesisController<I, J: CleanManagementIssuerStore, Q, R, W, P, A> {
     authority: AuthorityActorTarget,
     entries: Vec<(NativeSharedGenesisRecovery<I, J, Q, R, W, P>, Option<A>)>,
@@ -150,12 +151,13 @@ where
     }
 
     /// Re-read all leased archives before replaying any entry. A signed Create
-    /// with no Authority work and no archive is retained as an unroutable
-    /// reservation, provided its runtime and independently selected replicas
-    /// are durable and bound to that Create. Any later incomplete phase still
-    /// fails closed. Published generations require the owner's exact deferred
-    /// set and independent live-history verification; archive signatures alone
-    /// never grant finality. Errors retain all stores for an exact retry.
+    /// before publication stays an unroutable reservation, provided its runtime
+    /// and independently selected replicas are durable and bound to that Create.
+    /// Retained authorization/query work is reauthenticated through the owner;
+    /// its reservations are not released. Published generations require the
+    /// owner's exact deferred set and independent live-history verification;
+    /// archive signatures alone never grant finality. Errors retain all stores
+    /// for an exact retry.
     pub fn recover<B, C, D, S>(
         &mut self,
         owner: &mut CleanSystemAgentBootstrapOwner<B, C, D>,
@@ -192,12 +194,11 @@ where
                     .transpose()?
                     .flatten();
                 let Some(bytes) = bytes else {
-                    // An unissued signed reservation has not touched the
-                    // system journal or created an ordinary generation. Its
-                    // exact retry can resume after startup; it cannot route.
+                    // Authorization and committee selection precede archive
+                    // publication. Their presence is not evidence of a lost
+                    // archive. Publication/finalization, however, require it.
                     if recovery.retired
-                        || !recovery.pending.is_empty()
-                        || recovery.issued.is_some()
+                        || recovery.pending.len() > 2
                         || recovery.runtime.is_none()
                         || recovery.retained_replicas()?.is_none()
                     {
@@ -216,6 +217,18 @@ where
                 Ok(Some(record))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        for ((recovery, _), record) in self.entries.iter_mut().zip(&records) {
+            if record.is_none() && !recovery.pending.is_empty() {
+                let replicas = recovery
+                    .retained_replicas()?
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                // Saved receipts and committee replies are not execution
+                // authority. Replay their original journal intervals before
+                // accepting the retained pre-publication phase. Do not endorse
+                // genesis, mint an archive or discharge the unfinished Create.
+                owner.resume_shared_genesis_preparation(recovery, &replicas, signer)?;
+            }
+        }
         let mut entries: Vec<_> = self
             .entries
             .iter_mut()

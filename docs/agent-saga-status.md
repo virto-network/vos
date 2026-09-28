@@ -138,11 +138,32 @@ present. An internal controller operation can now re-admit that retained roster
 and obtain one durable Authority genesis endorsement after startup. A bundled-
 outer-PVM restart regression passes the first endorsement and exact retry
 without a second journal append, receipt signature or route exposure. This is
-not quorum finality, archive publication or public Create ingress. A crash
-after endorsement but before quorum archive publication currently fails
-startup closed: the retained authorization/query reservations require
-phase-aware recovery without blocking already published generations. Do not
-wire this internal operation to production ingress until that gap is closed.
+not quorum finality, archive publication or public Create ingress. Startup now
+reauthenticates retained pre-publication authorization/query work without
+requiring an archive that has not yet been published. A bundled outer-PVM test
+drops the system and lifecycle owners after endorsement, reopens from their
+stores and recovers the identical endorsement without another journal append
+or receipt signature; the original reservation remains held and no ordinary
+route appears (1 passed, 198.19 s, debug profile). Missing archives after
+publication or retirement still fail closed. This is an isolated pending-Create
+recovery slice, not closure of the mixed-generation gate: its held reservation
+still conflicts with a retired generation's mandatory fresh Authority read.
+Both mixed-order guard tests pass (2 passed, 978.96 s, bundled outer PVM),
+preserving the reservation, deferred routes and journal head on repeated
+recovery attempts. Do not interpret their expected rejection as successful
+recovery. The three controller tests and the unissued-Create restart test also
+pass. These physical fixtures retain memory-backed lifecycle stores; they are
+not released-daemon crash qualification. The next integration must resolve
+that dependency while retaining both the fresh read and reservation protection.
+Do not wire this internal operation to production ingress until that gap is closed.
+Next bounded recovery change: investigate admitting only the startup
+`GenesisDecision` verification read as a durably anchored management successor,
+using the existing combined pending-work capacity accounting. Ordinary
+projection admission must remain excluded; acknowledging this recovery read
+must release only that read, never the unfinished Create. Qualification must
+include crashes before Invoke, between Invoke/ACK and before durable cleanup,
+plus successful recovery of both mixed Agent-ID orderings. This requires
+coordinated bootstrap-record restoration, not just changing a projection guard.
 The focused startup and incomplete-archive tests pass. Two separately run,
 explicit bundled-outer-PVM regressions pass for both Agent-ID orderings of a
 retired A plus unissued B: A reopens through a fresh Authority read and serves
@@ -166,8 +187,8 @@ and selected roster before pledging the intent (internal path exists); (2)
 discover only safe unpledged candidates without creating extra phase files
 (file path exists); (3) collect quorum endorsements and publish the archived
 genesis from those durable inputs while keeping its route absent (one retained
-endorsement now works internally, but the post-endorsement/pre-archive crash
-phase does not yet reopen); (4) verify
+endorsement and isolated post-endorsement restart now work internally, but
+mixed-generation recovery still blocks on the retained reservation); (4) verify
 publication, application ACK, retirement and route exposure through the
 existing owner. An incomplete
 Create must not make already published generations unrecoverable.

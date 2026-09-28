@@ -11597,6 +11597,14 @@ mod tests {
                 agent: HostAgentId(descriptor.identity.agent.0),
             };
             let intent_store = IssuerMemoryStore::default();
+            let retained_stores = (
+                intent_store.clone(),
+                IssuerMemoryStore::default(),
+                IssuerMemoryStore::default(),
+                IssuerMemoryStore::default(),
+                IssuerMemoryStore::default(),
+                IssuerMemoryStore::default(),
+            );
             let recovery = NativeSharedGenesisRecovery::reserve_create_with_replicas(
                 target,
                 locator,
@@ -11604,14 +11612,7 @@ mod tests {
                 call,
                 runtime,
                 replicas,
-                (
-                    intent_store.clone(),
-                    IssuerMemoryStore::default(),
-                    IssuerMemoryStore::default(),
-                    IssuerMemoryStore::default(),
-                    IssuerMemoryStore::default(),
-                    IssuerMemoryStore::default(),
-                ),
+                retained_stores.clone(),
             )
             .unwrap();
             let retained_intent = intent_store.image.lock().unwrap().clone();
@@ -11689,6 +11690,8 @@ mod tests {
                 assert_eq!(committee.members().len(), 1);
                 assert_eq!(signature.signer(), committee.members()[0].signer());
                 let endorsed_index = owner.ordered_index_for_test().unwrap();
+                let expected_endorsement =
+                    (candidate.clone(), committee.clone(), signature.clone());
                 let receipt_signatures = signer.calls;
                 let retained_signature = signature_store.image.lock().unwrap().clone();
                 let (retried, retried_committee, retried_signature) = controller
@@ -11706,6 +11709,79 @@ mod tests {
                 );
                 assert_eq!(owner.ordered_index_for_test().unwrap(), endorsed_index);
                 assert_eq!(signer.calls, receipt_signatures);
+                assert_eq!(*signature_store.image.lock().unwrap(), retained_signature);
+                assert!(owner.ordinary_supervisor_generations().unwrap().is_empty());
+                assert_eq!(owner.host.lock().unwrap().len(), 1);
+                // Lose every lifecycle and system owner after endorsement,
+                // while no archive or ordinary generation exists yet.
+                drop(controller);
+                let pins = owner._pins_store;
+                let record = owner.record_store;
+                let issuer = owner.issuer.into_store();
+                drop(owner._network_host);
+                drop(owner.host);
+                let (intent, issued, query, reply, publication, publication_reply) =
+                    retained_stores;
+                let recovery = NativeSharedGenesisRecovery::open(
+                    target,
+                    locator,
+                    intent,
+                    issued,
+                    query,
+                    reply,
+                    publication,
+                    publication_reply,
+                )
+                .unwrap();
+                assert_eq!(recovery.pending.len(), 2);
+                assert!(recovery.issued.is_some());
+                controller = NativeSharedGenesisController::new(
+                    target,
+                    vec![(recovery, Some(NoArchive(true)))],
+                )
+                .unwrap();
+                let admission =
+                    NativeAuthorityOperationStartupAdmission::load(&mut operations, target, &[])
+                        .unwrap();
+                let admission = controller.startup_admission(admission).unwrap();
+                owner = CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
+                    pins,
+                    record,
+                    issuer,
+                    &mut signer,
+                    || panic!("endorsed restart cannot recreate bootstrap"),
+                    harness._directory.host(),
+                    harness._directory.lock(),
+                    harness.fixture.plan.pins.space,
+                    harness.fixture.plan.pins.node,
+                    harness.fixture.trust.clone(),
+                    harness.fixture.merge.clone(),
+                    harness.fixture.finality.clone(),
+                    harness.provider.clone(),
+                    harness.network.clone(),
+                    None,
+                    Some(&admission),
+                )
+                .unwrap();
+                drop(admission);
+                controller.recover(&mut owner, &mut signer).unwrap();
+                assert!(controller.is_recovered());
+                assert_eq!(owner.ordered_index_for_test().unwrap(), endorsed_index);
+                assert_eq!(signer.calls, receipt_signatures);
+                assert!(owner.management_admission_held().unwrap());
+                assert_eq!(
+                    controller
+                        .endorse_pending_create(
+                            &mut owner,
+                            locator,
+                            &mut signer,
+                            &mut signature_store,
+                            &mut genesis_signer,
+                        )
+                        .unwrap(),
+                    expected_endorsement,
+                );
+                assert_eq!(owner.ordered_index_for_test().unwrap(), endorsed_index);
                 assert_eq!(*signature_store.image.lock().unwrap(), retained_signature);
                 assert!(owner.ordinary_supervisor_generations().unwrap().is_empty());
                 assert_eq!(owner.host.lock().unwrap().len(), 1);
@@ -23915,7 +23991,10 @@ mod tests {
             }
         }
 
-        fn check_native_shared_mixed_retired_unissued_restart(retired_first: bool) {
+        fn check_native_shared_mixed_retired_prearchive_restart(
+            retired_first: bool,
+            prepared: bool,
+        ) {
             use crate::agent::genesis::{AgentGenesisFinalityError, AgentReplicaMember};
 
             struct NoArchiveFinality;
@@ -24013,7 +24092,7 @@ mod tests {
             call.invocation = call.expected_invocation();
             call.signature = key.sign(&call.signing_bytes()).to_bytes();
             let intent_store = IssuerMemoryStore::default();
-            let unissued = NativeSharedGenesisRecovery::reserve_create_with_replicas(
+            let mut unissued = NativeSharedGenesisRecovery::reserve_create_with_replicas(
                 owner.authority_target(),
                 crate::agent::genesis::AgentGenesisLocator {
                     space: crate::service::SpaceId(descriptors[1].identity.space.0),
@@ -24022,7 +24101,7 @@ mod tests {
                 descriptors[1].clone(),
                 call,
                 runtime.clone(),
-                replicas,
+                replicas.clone(),
                 (
                     intent_store.clone(),
                     IssuerMemoryStore::default(),
@@ -24035,6 +24114,18 @@ mod tests {
             .unwrap();
             assert!(unissued.pending.is_empty());
             assert!(unissued.issued.is_none());
+            if prepared {
+                owner
+                    .resume_shared_genesis_preparation(
+                        &mut unissued,
+                        &replicas,
+                        &mut CountingSigner::new(),
+                    )
+                    .unwrap();
+                unissued = reopen_mixed_shared(unissued);
+                assert_eq!(unissued.pending.len(), 2);
+                assert!(unissued.issued.is_some());
+            }
             assert_eq!(
                 retired.locator().agent < unissued.locator().agent,
                 retired_first
@@ -24086,6 +24177,29 @@ mod tests {
             drop(admission);
             assert!(owner.host.lock().unwrap().has_deferred_open());
             let before = owner.ordered_index_for_test().unwrap();
+            if prepared {
+                // Known mixed-generation integration gate: the unfinished
+                // Create still excludes retired A's mandatory fresh read.
+                // Pre-archive replay must not weaken that guard to pass startup.
+                for _ in 0..2 {
+                    assert_eq!(
+                        controller.recover(&mut owner, &mut CountingSigner::new()),
+                        Err(SharedAgentHostError::Conflict),
+                    );
+                    assert!(!controller.is_recovered());
+                    assert!(owner.management_admission_held().unwrap());
+                    assert!(owner.host.lock().unwrap().has_deferred_open());
+                    assert!(matches!(
+                        owner.ordinary_supervisor_generations(),
+                        Err(SharedAgentHostError::Conflict)
+                    ));
+                    assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+                }
+                drop(controller);
+                harness.owner = Some(owner);
+                harness.stop();
+                return;
+            }
             controller
                 .recover(&mut owner, &mut CountingSigner::new())
                 .unwrap();
@@ -24116,13 +24230,25 @@ mod tests {
         #[test]
         #[ignore = "requires the bundled outer PVM; run with VOS_AGENT_PROFILE_REFINE_MACHINES=1"]
         fn native_shared_mixed_retired_unissued_restart_retired_first() {
-            check_native_shared_mixed_retired_unissued_restart(true);
+            check_native_shared_mixed_retired_prearchive_restart(true, false);
         }
 
         #[test]
         #[ignore = "requires the bundled outer PVM; run with VOS_AGENT_PROFILE_REFINE_MACHINES=1"]
         fn native_shared_mixed_retired_unissued_restart_unissued_first() {
-            check_native_shared_mixed_retired_unissued_restart(false);
+            check_native_shared_mixed_retired_prearchive_restart(false, false);
+        }
+
+        #[test]
+        #[ignore = "requires the bundled outer PVM; run with VOS_AGENT_PROFILE_REFINE_MACHINES=1"]
+        fn native_shared_mixed_prearchive_preserves_guards_retired_first() {
+            check_native_shared_mixed_retired_prearchive_restart(true, true);
+        }
+
+        #[test]
+        #[ignore = "requires the bundled outer PVM; run with VOS_AGENT_PROFILE_REFINE_MACHINES=1"]
+        fn native_shared_mixed_prearchive_preserves_guards_pending_first() {
+            check_native_shared_mixed_retired_prearchive_restart(false, true);
         }
 
         #[test]
