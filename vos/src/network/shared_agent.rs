@@ -4641,6 +4641,17 @@ impl SharedAgentNetworkHost {
         self.acknowledge_pending_management_result(expected, anchor, envelope)
     }
 
+    pub(crate) fn supervisor_acknowledge_genesis_recovery_read(
+        &self,
+        expected: crate::agent::supervisor::AgentRouteIdentity,
+        proof: &crate::agent::clean_bootstrap::PendingAuthorityProjection,
+    ) -> Result<RuntimeOutcome, SharedAgentHostError> {
+        let (anchor, envelope) = proof
+            .management_envelope()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        self.acknowledge_pending_management_result(expected, anchor, envelope)
+    }
+
     pub(crate) fn supervisor_acknowledge_genesis_publication(
         &self,
         expected: crate::agent::supervisor::AgentRouteIdentity,

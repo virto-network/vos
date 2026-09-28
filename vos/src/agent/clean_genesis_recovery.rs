@@ -65,6 +65,13 @@ where
         self.recovered
     }
 
+    #[cfg(test)]
+    pub(super) fn into_entries_for_test(
+        self,
+    ) -> Vec<(NativeSharedGenesisRecovery<I, J, Q, R, W, P>, Option<A>)> {
+        self.entries
+    }
+
     /// Resume one signed, pre-archive Create through the retained lifecycle
     /// leases. The replica roster is re-admitted from its immutable sidecar;
     /// caller input cannot replace it after restart. An endorsement is only
@@ -217,6 +224,10 @@ where
                 Ok(Some(record))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        // A crash may have retained the narrowly admitted verification read
+        // beside its original Create. Drain only that child before replaying
+        // lifecycle preparation, which continues to exclude ordinary reads.
+        owner.recover_pending_authority_projection()?;
         for ((recovery, _), record) in self.entries.iter_mut().zip(&records) {
             if record.is_none() && !recovery.pending.is_empty() {
                 let replicas = recovery
@@ -229,13 +240,27 @@ where
                 owner.resume_shared_genesis_preparation(recovery, &replicas, signer)?;
             }
         }
+        let predecessor = self
+            .entries
+            .iter()
+            .zip(&records)
+            .find_map(|((recovery, _), record)| {
+                record
+                    .is_none()
+                    .then(|| recovery.pending.first().cloned())
+                    .flatten()
+            });
         let mut entries: Vec<_> = self
             .entries
             .iter_mut()
             .zip(&records)
             .filter_map(|((recovery, _), record)| record.as_ref().map(|record| (recovery, record)))
             .collect();
-        owner.recover_deferred_shared_generations(&mut entries, signer)?;
+        owner.recover_deferred_shared_generations_with_pending(
+            &mut entries,
+            signer,
+            predecessor.as_ref(),
+        )?;
         self.recovered = true;
         Ok(())
     }

@@ -1242,12 +1242,24 @@ impl AuthorityReadRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct PendingAuthorityProjection {
+pub(crate) struct PendingAuthorityProjection {
     query: AuthorityReadRequest,
     work: RuntimeWork,
+    // Present only for a startup GenesisDecision read admitted as a child of
+    // retained management work. Ordinary projections never use this lane.
+    management_anchor: Option<super::clean_management_intent::ManagementJournalAnchor>,
 }
 
 impl PendingAuthorityProjection {
+    pub(crate) fn management_envelope(
+        &self,
+    ) -> Option<(
+        &super::clean_management_intent::ManagementJournalAnchor,
+        &RuntimeWork,
+    )> {
+        self.validate().then_some(())?;
+        Some((self.management_anchor.as_ref()?, &self.work))
+    }
     fn validate(&self) -> bool {
         let RuntimeWork::Invoke {
             context,
@@ -1264,6 +1276,15 @@ impl PendingAuthorityProjection {
         };
         let target = self.query.authority();
         self.query.is_valid()
+            && self.management_anchor.as_ref().is_none_or(|anchor| {
+                use crate::service::ServiceWire as _;
+                matches!(self.query, AuthorityReadRequest::GenesisDecision { .. })
+                    && super::clean_management_intent::ManagementJournalAnchor::decode(
+                        &anchor.encode(),
+                    )
+                    .as_ref()
+                        == Ok(anchor)
+            })
             && *context == RuntimeExecutionContext::Direct
             && state.is_empty()
             && *observed_slot == preflight.observed_slot
@@ -1316,6 +1337,10 @@ impl CanonicalWire for PendingAuthorityProjection {
                 .encode()
                 .expect("validated pending work is canonical"),
         );
+        if let Some(anchor) = &self.management_anchor {
+            use crate::service::ServiceWire as _;
+            encoder.bytes(&anchor.encode());
+        }
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -1325,7 +1350,22 @@ impl CanonicalWire for PendingAuthorityProjection {
         .map_err(|_| DecodeError::NonCanonical)?;
         let work = RuntimeWork::decode(&decoder.bytes_bounded(MAX_RUNTIME_WORK_WIRE_BYTES)?)
             .map_err(|_| DecodeError::NonCanonical)?;
-        let value = Self { query, work };
+        let management_anchor = if decoder.exhausted() {
+            None
+        } else {
+            use crate::service::ServiceWire as _;
+            Some(
+                super::clean_management_intent::ManagementJournalAnchor::decode(
+                    &decoder.bytes_bounded(256)?,
+                )
+                .map_err(|_| DecodeError::NonCanonical)?,
+            )
+        };
+        let value = Self {
+            query,
+            work,
+            management_anchor,
+        };
         value
             .validate()
             .then_some(value)
@@ -1455,7 +1495,19 @@ impl CleanSystemAgentBootstrapRecord {
         bytes.extend_from_slice(&CLEAN_SYSTEM_AGENT_BOOTSTRAP_MAGIC);
         let mut encoder = Encoder(&mut bytes);
         encoder.fixed(super::sdk::RUNTIME_ABI_ID.as_bytes());
-        encoder.u8(CLEAN_SYSTEM_AGENT_BOOTSTRAP_VERSION);
+        // Preserve exact v3 bytes for existing records. v4 explicitly marks
+        // the anchored recovery-read extension; older owners must reject it.
+        encoder.u8(
+            if self
+                .pending_projection
+                .as_ref()
+                .is_some_and(|pending| pending.management_anchor.is_some())
+            {
+                4
+            } else {
+                CLEAN_SYSTEM_AGENT_BOOTSTRAP_VERSION
+            },
+        );
         encoder.u8(self.phase as u8);
         encoder.fixed(self.pins_commitment.as_bytes());
         encoder.fixed(self.plan_commitment.as_bytes());
@@ -1480,7 +1532,7 @@ impl CleanSystemAgentBootstrapRecord {
         if Hash(decoder.fixed()?) != super::sdk::RUNTIME_ABI_ID {
             return Err(DecodeError::InvalidPlatform);
         }
-        if decoder.u8()? != CLEAN_SYSTEM_AGENT_BOOTSTRAP_VERSION {
+        if ![CLEAN_SYSTEM_AGENT_BOOTSTRAP_VERSION, 4].contains(&decoder.u8()?) {
             return Err(DecodeError::InvalidTag);
         }
         let phase = match decoder.u8()? {
@@ -1602,6 +1654,16 @@ where
     invocation_gas: u64,
     #[cfg(test)]
     finalization_failure_once: Option<u8>,
+    #[cfg(test)]
+    recovery_read_failure_once: Option<RecoveryReadFailure>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryReadFailure {
+    BeforeInvoke,
+    AfterInvoke,
+    BeforeCleanup,
 }
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
@@ -2237,7 +2299,15 @@ where
         report_phase("pending_projection_recovery");
         let management = lifecycle.filter(|admission| !admission.is_empty());
         let operations = operations.filter(|admission| !admission.is_empty());
-        if (management.is_some() || operations.is_some()) && record.pending_projection.is_some() {
+        let anchored_read = record
+            .pending_projection
+            .as_ref()
+            .and_then(PendingAuthorityProjection::management_envelope)
+            .map(|(anchor, work)| (anchor.clone(), work.clone()));
+        if (management.is_some() || operations.is_some())
+            && record.pending_projection.is_some()
+            && anchored_read.is_none()
+        {
             return Err(CleanSystemAgentBootstrapError::Host(
                 SharedAgentHostError::Conflict,
             ));
@@ -2260,6 +2330,14 @@ where
                     .into_iter()
                     .flat_map(|admission| admission.pending.iter().cloned()),
             );
+            if let Some(read) = anchored_read {
+                if pending.is_empty() {
+                    return Err(CleanSystemAgentBootstrapError::Host(
+                        SharedAgentHostError::Conflict,
+                    ));
+                }
+                pending.push(read);
+            }
             SharedAgentNetworkHost::attach_recovering_management_set(
                 Arc::clone(&host),
                 network,
@@ -2268,6 +2346,11 @@ where
                 retirements,
             )
         } else if let Some(pending) = &record.pending_projection {
+            if pending.management_anchor.is_some() {
+                return Err(CleanSystemAgentBootstrapError::Host(
+                    SharedAgentHostError::Conflict,
+                ));
+            }
             let (work, authorization) = pending
                 .invocation()
                 .ok_or_else(|| rejected(CleanSystemAgentBootstrapRejection::DivergentRecord))?;
@@ -2476,11 +2559,24 @@ where
             invocation_gas: plan.invocation_gas,
             #[cfg(test)]
             finalization_failure_once: None,
+            #[cfg(test)]
+            recovery_read_failure_once: None,
         };
         // Reconstruct volatile admission from the durable exact pending work
         // before returning an owner that could authenticate a fresh query.
         // This reservation is idempotent with the first recovery drive.
         if let Some(pending) = owner.record.pending_projection.clone() {
+            if let Some((anchor, work)) = pending.management_envelope() {
+                owner
+                    ._network_host
+                    .ensure_management_pending_member(
+                        crate::service::AgentId(owner.pins.agent.0),
+                        anchor,
+                        work,
+                    )
+                    .map_err(CleanSystemAgentBootstrapError::Host)?;
+                return Ok(owner);
+            }
             let (work, authorization) = pending
                 .invocation()
                 .ok_or_else(|| rejected(CleanSystemAgentBootstrapRejection::DivergentRecord))?;
@@ -4055,6 +4151,38 @@ where
         PubReply: CleanManagementIssuerStore,
         S: CleanManagementReceiptSigner,
     {
+        self.recover_deferred_shared_generations_with_pending(entries, receipt_signer, None)
+    }
+
+    pub(crate) fn recover_deferred_shared_generations_with_pending<
+        B,
+        J,
+        Q,
+        ReplyStore,
+        W,
+        PubReply,
+        S,
+    >(
+        &mut self,
+        entries: &mut [(
+            &mut NativeSharedGenesisRecovery<B, J, Q, ReplyStore, W, PubReply>,
+            &super::genesis::AgentGenesisArchiveRecord,
+        )],
+        receipt_signer: &mut S,
+        predecessor: Option<&(
+            super::clean_management_intent::ManagementJournalAnchor,
+            RuntimeWork,
+        )>,
+    ) -> Result<(), SharedAgentHostError>
+    where
+        B: super::clean_authority_issuer::CleanManagementRuntimeStore,
+        J: CleanManagementIssuerStore,
+        Q: CleanManagementIssuerStore,
+        ReplyStore: CleanManagementIssuerStore,
+        W: CleanManagementIssuerStore,
+        PubReply: CleanManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+    {
         if entries.len() > super::shared_host::MAX_SHARED_HOST_AGENTS {
             return Err(SharedAgentHostError::CapacityExhausted);
         }
@@ -4132,7 +4260,7 @@ where
         }
         for (recovery, record) in entries.iter_mut() {
             if recovery.retired {
-                proofs.push(self.verify_retired_shared_genesis(recovery, record)?);
+                proofs.push(self.verify_retired_shared_genesis(recovery, record, predecessor)?);
             }
         }
         // The complete set is still deferred if any phase above fails. Only
@@ -4146,6 +4274,10 @@ where
         &mut self,
         recovery: &NativeSharedGenesisRecovery<B, J, Q, ReplyStore, W, PubReply>,
         record: &super::genesis::AgentGenesisArchiveRecord,
+        predecessor: Option<&(
+            super::clean_management_intent::ManagementJournalAnchor,
+            RuntimeWork,
+        )>,
     ) -> Result<ReplayVerifiedAgentGenesisFinality, SharedAgentHostError>
     where
         B: CleanManagementIssuerStore,
@@ -4202,7 +4334,11 @@ where
             agent,
             nonce,
         };
-        let response = self.invoke_authority_read(request)?;
+        let response = if let Some(predecessor) = predecessor {
+            self.invoke_genesis_recovery_read(request, predecessor)?
+        } else {
+            self.invoke_authority_read(request)?
+        };
         if response != record.provision().decision().encode() {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
@@ -6286,6 +6422,18 @@ where
         let Some(pending) = self.record.pending_projection.clone() else {
             return Ok(false);
         };
+        if let Some((anchor, work)) = pending.management_envelope() {
+            self._network_host.ensure_management_pending_member(
+                crate::service::AgentId(self.pins.agent.0),
+                anchor,
+                work,
+            )?;
+            // Recommit after an ambiguous pre-dispatch write before executing
+            // the exact in-memory candidate retained by admission.
+            commit_bootstrap_record(&mut self.record_store, &self.record)
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            return self.execute_pending_authority_projection().map(|_| true);
+        }
         let (work, authorization) = pending
             .invocation()
             .ok_or(SharedAgentHostError::ScopeMismatch)?;
@@ -6309,6 +6457,49 @@ where
         query: AuthorityProjectionQuery,
     ) -> Result<Vec<u8>, SharedAgentHostError> {
         self.invoke_authority_read(AuthorityReadRequest::Projection(query))
+    }
+
+    /// Startup-only verification read. Extend a real retained reservation and
+    /// charge combined replay headroom; never bypass ordinary projection guards.
+    fn invoke_genesis_recovery_read(
+        &mut self,
+        query: AuthorityReadRequest,
+        predecessor: &(
+            super::clean_management_intent::ManagementJournalAnchor,
+            RuntimeWork,
+        ),
+    ) -> Result<Vec<u8>, SharedAgentHostError> {
+        if !matches!(query, AuthorityReadRequest::GenesisDecision { .. })
+            || self.record.pending_projection.is_some()
+            || !self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .has_deferred_open()
+        {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let pending = self.prepare_authority_read(query)?;
+        self.pending_authority_projection_identity(&pending, false)?;
+        let mut record = self.record.clone();
+        let record_store = &mut self.record_store;
+        let retained = &mut self.record;
+        self._network_host.extend_management_pending(
+            crate::service::AgentId(self.pins.agent.0),
+            predecessor,
+            &pending.work,
+            |(anchor, work)| {
+                let mut pending = pending.clone();
+                pending.management_anchor = Some(anchor.clone());
+                pending.work = work.clone();
+                record.pending_projection = Some(pending);
+                *retained = record.clone();
+                commit_bootstrap_record(record_store, &record)
+                    .map_err(|_| SharedAgentHostError::Unavailable)
+            },
+        )?;
+        self.execute_pending_authority_projection()?
+            .ok_or(SharedAgentHostError::Unavailable)
     }
 
     fn invoke_authority_read(
@@ -6499,6 +6690,7 @@ where
         );
         let pending = PendingAuthorityProjection {
             query,
+            management_anchor: None,
             work: RuntimeWork::Invoke {
                 context: RuntimeExecutionContext::Direct,
                 state: RuntimeState::default(),
@@ -6552,11 +6744,18 @@ where
             phase = "reopen",
             "Authority projection execution phase complete"
         );
-        let outcome = self.supervisor_invoke_terminal_reserved(
-            identity,
-            work.clone(),
-            authorization.clone(),
-        )?;
+        #[cfg(test)]
+        self.check_recovery_read_failure(&pending, RecoveryReadFailure::BeforeInvoke)?;
+        let outcome = if let Some(anchor) = &pending.management_anchor {
+            self.supervisor_invoke_persisted_management(
+                identity,
+                work.clone(),
+                authorization.clone(),
+                anchor,
+            )?
+        } else {
+            self.supervisor_invoke_terminal_reserved(identity, work.clone(), authorization.clone())?
+        };
         tracing::debug!(
             elapsed_ms = started.elapsed().as_millis() as u64,
             phase = "invoke",
@@ -6595,8 +6794,14 @@ where
         if !matches!(outcome, super::sdk::RuntimeOutcome::Completed(_)) {
             return Err(SharedAgentHostError::Unavailable);
         }
-        let acknowledgement =
-            self.supervisor_acknowledge_reserved(identity, work.clone(), authorization.clone())?;
+        #[cfg(test)]
+        self.check_recovery_read_failure(&pending, RecoveryReadFailure::AfterInvoke)?;
+        let acknowledgement = if pending.management_anchor.is_some() {
+            self._network_host
+                .supervisor_acknowledge_genesis_recovery_read(identity, &pending)?
+        } else {
+            self.supervisor_acknowledge_reserved(identity, work.clone(), authorization.clone())?
+        };
         tracing::debug!(
             elapsed_ms = started.elapsed().as_millis() as u64,
             phase = "acknowledge",
@@ -6615,6 +6820,8 @@ where
         {
             return Err(SharedAgentHostError::Unavailable);
         }
+        #[cfg(test)]
+        self.check_recovery_read_failure(&pending, RecoveryReadFailure::BeforeCleanup)?;
         self.complete_pending_authority_projection(work, authorization)?;
         tracing::debug!(
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -6622,6 +6829,19 @@ where
             "Authority projection execution phase complete"
         );
         Ok(response)
+    }
+
+    #[cfg(test)]
+    fn check_recovery_read_failure(
+        &mut self,
+        pending: &PendingAuthorityProjection,
+        stage: RecoveryReadFailure,
+    ) -> Result<(), SharedAgentHostError> {
+        if pending.management_anchor.is_some() && self.recovery_read_failure_once == Some(stage) {
+            self.recovery_read_failure_once = None;
+            return Err(SharedAgentHostError::Unavailable);
+        }
+        Ok(())
     }
 
     fn pending_authority_projection_identity(
@@ -6689,6 +6909,27 @@ where
         authorization: &super::sdk::InvocationAuthorization,
     ) -> Result<(), SharedAgentHostError> {
         let mut record = self.record.clone();
+        if let Some(pending) = self.record.pending_projection.clone()
+            && let Some((anchor, envelope)) = pending.management_envelope()
+        {
+            if pending.invocation() != Some((work, authorization)) {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            record.pending_projection = None;
+            let store = &mut self.record_store;
+            self._network_host.finish_pending_management_result(
+                crate::service::AgentId(self.pins.agent.0),
+                anchor,
+                envelope,
+                false,
+                || {
+                    commit_bootstrap_record(store, &record)
+                        .map_err(|_| SharedAgentHostError::Unavailable)
+                },
+            )?;
+            self.record = record;
+            return Ok(());
+        }
         record.pending_projection = None;
         let network_host = &self._network_host;
         let record_store = &mut self.record_store;
@@ -23395,6 +23636,57 @@ mod tests {
                 PendingAuthorityProjection::decode(&encoded).unwrap(),
                 pending
             );
+            let position = owner
+                .host
+                .lock()
+                .unwrap()
+                .journal_position(HostAgentId(owner.pins.agent.0))
+                .unwrap();
+            let anchor = crate::agent::clean_management_intent::ManagementJournalAnchor {
+                genesis: position.genesis,
+                admission: position.admission,
+                runtime: position.runtime.commitment(),
+                ordered: crate::agent::journal::OrderedBase {
+                    index: position.ordered_index,
+                    head: position.ordered_head,
+                },
+            };
+            let mut anchored = pending.clone();
+            anchored.management_anchor = Some(anchor.clone());
+            assert_eq!(
+                PendingAuthorityProjection::decode(&anchored.encode().unwrap()).unwrap(),
+                anchored
+            );
+            let mut record = owner.record.clone();
+            record.pending_projection = Some(pending.clone());
+            let legacy = record.encode();
+            assert_eq!(legacy[36], 3);
+            assert_eq!(
+                CleanSystemAgentBootstrapRecord::decode(&legacy)
+                    .unwrap()
+                    .encode(),
+                legacy
+            );
+            record.pending_projection = Some(anchored.clone());
+            let extended = record.encode();
+            assert_eq!(extended[36], 4);
+            assert_eq!(
+                CleanSystemAgentBootstrapRecord::decode(&extended).unwrap(),
+                record
+            );
+            let mut wrong_version = extended;
+            wrong_version[36] = 3;
+            assert!(CleanSystemAgentBootstrapRecord::decode(&wrong_version).is_err());
+            anchored.management_anchor.as_mut().unwrap().runtime = crate::service::Hash::ZERO;
+            assert!(!anchored.validate());
+            let mut ordinary = owner
+                .prepare_authority_projection(signed_credential_projection_query(owner, 0xef))
+                .unwrap();
+            ordinary.management_anchor = Some(anchor);
+            assert!(
+                !ordinary.validate(),
+                "ordinary reads cannot enter the recovery management lane"
+            );
             let mut trailing = encoded;
             trailing.push(0);
             assert!(PendingAuthorityProjection::decode(&trailing).is_err());
@@ -23634,12 +23926,10 @@ mod tests {
             genesis_issuer: &IssuerMemoryStore,
             clock: &AtomicU64,
             sequence: u64,
-        ) {
-            use crate::actors::codec::Encode as _;
+        ) -> crate::agent_sdk::ActorId {
             use crate::agent::clean_management_intent::{
                 CleanManagementIntent, CleanManagementIntentSlot,
             };
-            use crate::agent::supervisor_adapters::physical_material_identity;
             let package = crate::agent::package_admission::admitted_standard_query_actor_for_test(
                 "mixed-query",
                 StateLane::Linear,
@@ -23733,11 +24023,23 @@ mod tests {
             owner
                 .finish_live_management_intent(&mut intent, managed, &ack, &issuer)
                 .unwrap();
+            invoke_mixed_shared(owner, descriptor, actor, sequence);
+            actor
+        }
+
+        fn invoke_mixed_shared(
+            owner: &mut MemoryBootstrapOwner,
+            descriptor: &AgentDescriptor,
+            actor: crate::agent_sdk::ActorId,
+            sequence: u64,
+        ) {
+            use crate::actors::codec::Encode as _;
+            use crate::agent::supervisor_adapters::physical_material_identity;
             let generation = owner
                 .ordinary_supervisor_generations()
                 .unwrap()
                 .into_iter()
-                .find(|generation| generation.agent() == managed.agent)
+                .find(|generation| generation.agent() == descriptor.identity.agent)
                 .unwrap();
             let material = generation.material(actor).unwrap();
             let identity = physical_material_identity(&material).unwrap();
@@ -23747,8 +24049,8 @@ mod tests {
             availability.extend(material.installation_data);
             availability.sort_unstable_by(|left, right| left.reference.cmp(&right.reference));
             let work = InvocationWork {
-                space: managed.space,
-                agent: managed.agent,
+                space: descriptor.identity.space,
+                agent: descriptor.identity.agent,
                 runtime_deployment: descriptor.identity.runtime_deployment,
                 invocation: InvocationId([sequence as u8; 32]),
                 actor,
@@ -23994,6 +24296,7 @@ mod tests {
         fn check_native_shared_mixed_retired_prearchive_restart(
             retired_first: bool,
             prepared: bool,
+            crash_read: bool,
         ) {
             use crate::agent::genesis::{AgentGenesisFinalityError, AgentReplicaMember};
 
@@ -24060,6 +24363,15 @@ mod tests {
                 .unwrap();
             let retired = reopen_mixed_shared(retired);
             assert!(retired.retired);
+            let existing_actor = prepared.then(|| {
+                serve_mixed_shared(
+                    owner,
+                    &descriptors[0],
+                    &retired_issuer,
+                    harness.fixture.logical_slot.as_ref().unwrap(),
+                    3,
+                )
+            });
             harness
                 .fixture
                 .logical_slot
@@ -24087,7 +24399,7 @@ mod tests {
             let request = ManagementRequest::Create(Box::new(descriptors[1].clone()));
             let key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
             let (mut call, _) = credential_call_and_approval(&descriptors[1], &request, &key);
-            call.request_sequence = NonZeroU64::new(3).unwrap();
+            call.request_sequence = NonZeroU64::new(if prepared { 4 } else { 3 }).unwrap();
             call.authority = owner.authority_target();
             call.invocation = call.expected_invocation();
             call.signature = key.sign(&call.signing_bytes()).to_bytes();
@@ -24178,14 +24490,32 @@ mod tests {
             assert!(owner.host.lock().unwrap().has_deferred_open());
             let before = owner.ordered_index_for_test().unwrap();
             if prepared {
-                // Known mixed-generation integration gate: the unfinished
-                // Create still excludes retired A's mandatory fresh read.
-                // Pre-archive replay must not weaken that guard to pass startup.
-                for _ in 0..2 {
+                assert!(owner.management_admission_held().unwrap());
+                assert_eq!(
+                    owner.invoke_authority_read(AuthorityReadRequest::GenesisDecision {
+                        authority: target,
+                        agent: descriptors[0].identity.agent,
+                        nonce: Hash([0xfa; 32]),
+                    }),
+                    Err(SharedAgentHostError::Conflict)
+                );
+            }
+            if crash_read {
+                let mut exact = None;
+                for (index, stage) in [
+                    RecoveryReadFailure::BeforeInvoke,
+                    RecoveryReadFailure::AfterInvoke,
+                    RecoveryReadFailure::BeforeCleanup,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    owner.recovery_read_failure_once = Some(stage);
                     assert_eq!(
                         controller.recover(&mut owner, &mut CountingSigner::new()),
-                        Err(SharedAgentHostError::Conflict),
+                        Err(SharedAgentHostError::Unavailable)
                     );
+                    assert_eq!(owner.recovery_read_failure_once, None);
                     assert!(!controller.is_recovered());
                     assert!(owner.management_admission_held().unwrap());
                     assert!(owner.host.lock().unwrap().has_deferred_open());
@@ -24193,12 +24523,54 @@ mod tests {
                         owner.ordinary_supervisor_generations(),
                         Err(SharedAgentHostError::Conflict)
                     ));
-                    assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+                    assert_eq!(
+                        owner.ordered_index_for_test().unwrap(),
+                        before + index as u64
+                    );
+                    let pending = owner.record.pending_projection.clone().unwrap();
+                    assert!(pending.management_anchor.is_some());
+                    assert_eq!(&pending, exact.get_or_insert(pending.clone()));
+                    let entries = controller
+                        .into_entries_for_test()
+                        .into_iter()
+                        .map(|(recovery, archive)| (reopen_mixed_shared(recovery), archive))
+                        .collect();
+                    controller = NativeSharedGenesisController::new(target, entries).unwrap();
+                    let pins = owner._pins_store;
+                    let record = owner.record_store;
+                    let issuer = owner.issuer.into_store();
+                    drop(owner._network_host);
+                    drop(owner.host);
+                    let admission = NativeAuthorityOperationStartupAdmission::load(
+                        &mut operations,
+                        target,
+                        &[],
+                    )
+                    .unwrap();
+                    let admission = controller.startup_admission(admission).unwrap();
+                    owner =
+                        CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
+                            pins,
+                            record,
+                            issuer,
+                            &mut CountingSigner::new(),
+                            || panic!("recovery-read restart cannot bootstrap"),
+                            harness._directory.host(),
+                            harness._directory.lock(),
+                            harness.fixture.plan.pins.space,
+                            harness.fixture.plan.pins.node,
+                            harness.fixture.trust.clone(),
+                            harness.fixture.merge.clone(),
+                            harness.fixture.finality.clone(),
+                            harness.provider.clone(),
+                            harness.network.clone(),
+                            None,
+                            Some(&admission),
+                        )
+                        .unwrap();
+                    drop(admission);
+                    eprintln!("mixed prearchive: reopened after {stage:?}");
                 }
-                drop(controller);
-                harness.owner = Some(owner);
-                harness.stop();
-                return;
             }
             controller
                 .recover(&mut owner, &mut CountingSigner::new())
@@ -24210,17 +24582,34 @@ mod tests {
             assert_eq!(*intent_store.image.lock().unwrap(), retained_intent);
             // A mandatory fresh Authority Query/ACK opens retired A;
             // unissued B cannot advance the journal.
-            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
+            assert_eq!(
+                owner.ordered_index_for_test().unwrap(),
+                before + if crash_read { 4 } else { 2 }
+            );
             let generations = owner.ordinary_supervisor_generations().unwrap();
             assert_eq!(generations.len(), 1);
             assert_eq!(generations[0].agent(), descriptors[0].identity.agent);
-            serve_mixed_shared(
-                &mut owner,
-                &descriptors[0],
-                &retired_issuer,
-                harness.fixture.logical_slot.as_ref().unwrap(),
-                3,
-            );
+            if let Some(actor) = existing_actor {
+                assert!(owner.management_admission_held().unwrap());
+                assert!(owner.record.pending_projection.is_none());
+                assert_eq!(
+                    owner.invoke_authority_read(AuthorityReadRequest::GenesisDecision {
+                        authority: target,
+                        agent: descriptors[0].identity.agent,
+                        nonce: Hash([0xfb; 32]),
+                    }),
+                    Err(SharedAgentHostError::Conflict)
+                );
+                invoke_mixed_shared(&mut owner, &descriptors[0], actor, 4);
+            } else {
+                serve_mixed_shared(
+                    &mut owner,
+                    &descriptors[0],
+                    &retired_issuer,
+                    harness.fixture.logical_slot.as_ref().unwrap(),
+                    3,
+                );
+            }
             eprintln!("mixed unissued: retired-first={retired_first}, A Invoke/ACK passed");
             drop(controller);
             harness.owner = Some(owner);
@@ -24230,25 +24619,31 @@ mod tests {
         #[test]
         #[ignore = "requires the bundled outer PVM; run with VOS_AGENT_PROFILE_REFINE_MACHINES=1"]
         fn native_shared_mixed_retired_unissued_restart_retired_first() {
-            check_native_shared_mixed_retired_prearchive_restart(true, false);
+            check_native_shared_mixed_retired_prearchive_restart(true, false, false);
         }
 
         #[test]
         #[ignore = "requires the bundled outer PVM; run with VOS_AGENT_PROFILE_REFINE_MACHINES=1"]
         fn native_shared_mixed_retired_unissued_restart_unissued_first() {
-            check_native_shared_mixed_retired_prearchive_restart(false, false);
+            check_native_shared_mixed_retired_prearchive_restart(false, false, false);
         }
 
         #[test]
         #[ignore = "requires the bundled outer PVM; run with VOS_AGENT_PROFILE_REFINE_MACHINES=1"]
-        fn native_shared_mixed_prearchive_preserves_guards_retired_first() {
-            check_native_shared_mixed_retired_prearchive_restart(true, true);
+        fn native_shared_mixed_prearchive_recovers_retired_first() {
+            check_native_shared_mixed_retired_prearchive_restart(true, true, false);
         }
 
         #[test]
         #[ignore = "requires the bundled outer PVM; run with VOS_AGENT_PROFILE_REFINE_MACHINES=1"]
-        fn native_shared_mixed_prearchive_preserves_guards_pending_first() {
-            check_native_shared_mixed_retired_prearchive_restart(false, true);
+        fn native_shared_mixed_prearchive_recovers_pending_first() {
+            check_native_shared_mixed_retired_prearchive_restart(false, true, false);
+        }
+
+        #[test]
+        #[ignore = "requires the bundled outer PVM; run with VOS_AGENT_PROFILE_REFINE_MACHINES=1"]
+        fn native_shared_mixed_prearchive_recovers_interrupted_read() {
+            check_native_shared_mixed_retired_prearchive_restart(true, true, true);
         }
 
         #[test]
@@ -26985,6 +27380,7 @@ mod tests {
             );
             let pending = PendingAuthorityProjection {
                 query: AuthorityReadRequest::Projection(query),
+                management_anchor: None,
                 work: RuntimeWork::Invoke {
                     context: RuntimeExecutionContext::Direct,
                     state: RuntimeState::default(),
