@@ -165,7 +165,6 @@ impl CleanManagementIntent {
         Self::finalization_message_bytes(&ack.encode().unwrap_or_default())
     }
 
-    #[cfg(feature = "experimental-state-blocks")]
     pub(crate) fn failure_finalization_message(
         failure: &crate::agent_sdk::authority::ManagementApplicationFailure,
     ) -> Vec<u8> {
@@ -254,7 +253,6 @@ impl CleanManagementIntent {
             };
             let (expected_invocation, expected_origin, expected_message) = if finalization {
                 use crate::actors::codec::Decode as _;
-                #[cfg(feature = "experimental-state-blocks")]
                 use crate::agent_sdk::authority::ManagementApplicationFailure;
                 use crate::agent_sdk::authority::{ManagementApplicationAck, ManagementApproval};
                 let message = crate::actors::value::Msg::try_decode(
@@ -269,14 +267,15 @@ impl CleanManagementIntent {
                     return Err(DecodeError::NonCanonical);
                 };
                 let invocation = if bytes.starts_with(b"MAF1") {
-                    #[cfg(not(feature = "experimental-state-blocks"))]
-                    return Err(DecodeError::NonCanonical);
-                    #[cfg(feature = "experimental-state-blocks")]
                     {
                         let failure = ManagementApplicationFailure::decode(bytes)
                             .map_err(|_| DecodeError::NonCanonical)?;
                         if !matches!(self.request, ManagementRequest::Install(_))
-                            || self.call.managed.profile != crate::agent_sdk::AgentProfile::Local
+                            || !matches!(
+                                self.call.managed.profile,
+                                crate::agent_sdk::AgentProfile::Local
+                                    | crate::agent_sdk::AgentProfile::Shared
+                            )
                             || failure.authority != self.call.authority
                             || failure.managed != self.call.managed
                             || failure.authorization_invocation != self.call.invocation
@@ -1019,7 +1018,6 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
         ))
     }
 
-    #[cfg(feature = "experimental-state-blocks")]
     pub(crate) fn commit_failure_retirement(
         &mut self,
         failure: &crate::agent_sdk::authority::ManagementApplicationFailure,

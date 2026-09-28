@@ -400,10 +400,22 @@ system execution, use the pending operation as the startup genesis-read
 predecessor where needed, and authenticate genesis before reopening the physical
 target. Then qualify physical application, signed terminal results and retirement
 under response loss/restart. Keep the unissued-only startup gate until that
-recovery exists. In particular, signed `ManagementApplicationFailure` and the
-issuer's rejection path currently restrict failures to Local Agents; Shared
-constructor failures need an explicitly qualified extension of the SDK/issuer
-and bundled Authority artifact, not a permissive host bypass. Public Shared
+recovery exists. The source extension now permits signed
+`ManagementApplicationFailure` for Local or Shared Install, retaining exact
+call/profile/receipt bindings and rejecting Private. The intent and issuer
+protocol helpers no longer depend on experimental storage; source Authority
+tests cover failed Install retirement, restart, contradictory success refusal
+and re-signed cross-profile substitution. This does not yet qualify the bundled
+Authority artifact or the Shared physical failure path. Candidate guest tests,
+artifact integration and controller-owned execution/recovery remain required;
+native protocol tests are not proof of deployed behavior. The full default SDK
+suite passes (249 tests, one ignored), as do issuer/intent suites with experimental
+storage enabled (19) and disabled (18). The latter now both retain and reopen
+the exact failure-finalization envelope and retirement marker for Local and
+Shared. The full native Authority suite passes (77 tests, two fixture exporters
+ignored), including rejection tests for both profiles.
+Formatting and diff checks pass. Logs use disk-backed `target/shared-failure-*`.
+Public Shared
 management remains disabled. This is not yet Shared Install, a public customer
 workflow, three-node or release qualification.
 

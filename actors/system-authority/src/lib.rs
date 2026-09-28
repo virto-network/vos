@@ -17137,9 +17137,18 @@ mod tests {
 
     #[test]
     fn signed_local_install_rejection_retires_pending_without_installing_and_restarts() {
+        check_signed_install_rejection(AgentProfile::Local);
+    }
+
+    #[test]
+    fn signed_shared_install_rejection_retires_pending_without_installing_and_restarts() {
+        check_signed_install_rejection(AgentProfile::Shared);
+    }
+
+    fn check_signed_install_rejection(profile: AgentProfile) {
         let config = configuration();
         let mut actor = actor();
-        let descriptor = descriptor(config, ADMIN_PRINCIPAL, AgentProfile::Local, 0xd1);
+        let descriptor = descriptor(config, ADMIN_PRINCIPAL, profile, 0xd1);
         insert_live(&mut actor, &descriptor);
         let managed = target_for(&descriptor);
         let install = actor_install(managed.agent, "rejected-worker", 0xd2);
@@ -17154,7 +17163,7 @@ mod tests {
         );
         prepare_management_call(&actor, &mut call, &signing(0x21));
         let approval = ManagementApproval::decode(&dispatch(&mut actor, &call))
-            .expect("Local Install must reserve an approval");
+            .expect("Install must reserve an approval");
         let success = application_ack(config, &actor.state, &call, &approval);
         let mut failure = ManagementApplicationFailure {
             authorization_invocation: success.authorization_invocation,
@@ -17185,6 +17194,18 @@ mod tests {
         let mut tampered = bytes.clone();
         *tampered.last_mut().unwrap() ^= 1;
         assert!(!dispatch_ack_bytes(&mut actor, tampered, Some(context)));
+        assert_eq!(actor.state, pending);
+        let mut substituted = failure.clone();
+        substituted.managed.profile = match profile {
+            AgentProfile::Local => AgentProfile::Shared,
+            _ => AgentProfile::Local,
+        };
+        substituted.signature = signing(0x71).sign(&substituted.signing_bytes()).to_bytes();
+        assert!(!dispatch_ack_bytes(
+            &mut actor,
+            substituted.encode().unwrap(),
+            Some(context),
+        ));
         assert_eq!(actor.state, pending);
         assert!(dispatch_ack_bytes(&mut actor, bytes.clone(), Some(context)));
         assert!(actor.state.retries.is_empty());

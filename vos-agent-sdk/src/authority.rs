@@ -2024,7 +2024,7 @@ impl ManagementApplicationAck {
     }
 }
 
-/// Distinct signed finality for a physically rejected external Local Install.
+/// Distinct signed finality for a physically rejected Local or Shared Install.
 ///
 /// The ordinary MAA2 success wire remains byte-identical. MAF1 can only
 /// resolve an already-approved Install after the exact guest rejection and
@@ -2069,8 +2069,10 @@ impl ManagementApplicationFailure {
         {
             return Err(AuthorityActorProtocolError::InvalidTarget);
         }
-        if self.managed.profile != AgentProfile::Local
-            || self.credential_call == Hash::ZERO
+        if !matches!(
+            self.managed.profile,
+            AgentProfile::Local | AgentProfile::Shared
+        ) || self.credential_call == Hash::ZERO
             || self.approval == Hash::ZERO
             || self.request == Hash::ZERO
             || self.reopened_state == Hash::ZERO
@@ -3207,6 +3209,15 @@ mod tests {
 
     #[test]
     fn application_failure_is_signed_and_bound_to_a_pending_local_install() {
+        check_application_failure(AgentProfile::Local);
+    }
+
+    #[test]
+    fn application_failure_is_signed_and_bound_to_a_pending_shared_install() {
+        check_application_failure(AgentProfile::Shared);
+    }
+
+    fn check_application_failure(profile: AgentProfile) {
         let entry = crate::ActorEntry {
             actor: ActorId([61; 32]),
             name: "fixture".into(),
@@ -3237,7 +3248,7 @@ mod tests {
             entry: entry.clone(),
         };
         let mut call = credential_call(ManagementRequest::Install(Box::new(install)));
-        call.managed.profile = AgentProfile::Local;
+        call.managed.profile = profile;
         resign(&mut call);
         let approval = approval(&call);
         let success =
@@ -3281,7 +3292,7 @@ mod tests {
         );
         assert!(!wrong_request.matches_pending(&call, &approval));
         let mut wrong_profile = failure.clone();
-        wrong_profile.managed.profile = AgentProfile::Shared;
+        wrong_profile.managed.profile = AgentProfile::Private;
         assert_eq!(
             wrong_profile.validate_shape(),
             Err(AuthorityActorProtocolError::InvalidApplication)

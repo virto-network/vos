@@ -704,15 +704,9 @@ impl SignedManagementTerminal {
                 super::clean_management_intent::CleanManagementIntent::finalization_message(ack)
             }
             Self::Rejected(failure) => {
-                #[cfg(feature = "experimental-state-blocks")]
-                {
-                    super::clean_management_intent::CleanManagementIntent::failure_finalization_message(failure)
-                }
-                #[cfg(not(feature = "experimental-state-blocks"))]
-                {
-                    let _ = failure;
-                    Vec::new()
-                }
+                super::clean_management_intent::CleanManagementIntent::failure_finalization_message(
+                    failure,
+                )
             }
         }
     }
@@ -1728,7 +1722,10 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         };
         if result.is_err()
             && (decision.operation != AuthorityOperationKind::InstallActor
-                || application_route.managed.profile != AgentProfile::Local)
+                || !matches!(
+                    application_route.managed.profile,
+                    AgentProfile::Local | AgentProfile::Shared
+                ))
         {
             return Err(CleanManagementIssuerError::Rejected(
                 CleanManagementIssuerRejection::InvalidObservation,
@@ -1966,7 +1963,6 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
     /// The owning controller calls this only after reopening the Authority
     /// actor's exact MAF1 finalization. It does not infer finality from the
     /// issuer's signed bytes or from the rejected guest result alone.
-    #[cfg(feature = "experimental-state-blocks")]
     pub(crate) fn observe_durable_actor_failure_finalization(
         &mut self,
         failure: &ManagementApplicationFailure,
@@ -2030,7 +2026,6 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         self.recover_recorded_terminal(authority, managed, request, call, verifier, false)
     }
 
-    #[cfg(feature = "experimental-state-blocks")]
     pub(crate) fn recover_finalized_install_failure<V: AuthorityCredentialVerifier>(
         &self,
         authority: AuthorityActorTarget,
@@ -2404,7 +2399,6 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         ))
     }
 
-    #[cfg(feature = "experimental-state-blocks")]
     pub(crate) fn failure_finalization_status(
         &self,
         failure: &ManagementApplicationFailure,
@@ -2683,7 +2677,10 @@ fn application_failure_for(
 ) -> Option<ManagementApplicationFailure> {
     let application = decision.application?;
     if decision.operation != AuthorityOperationKind::InstallActor
-        || application.managed.profile != AgentProfile::Local
+        || !matches!(
+            application.managed.profile,
+            AgentProfile::Local | AgentProfile::Shared
+        )
         || pending.acknowledgement_invocation != application.acknowledgement_invocation
         || pending.application != management_error_commitment(error)
     {
@@ -2716,7 +2713,10 @@ fn application_failure_matches_decision(
         return false;
     };
     decision.operation == AuthorityOperationKind::InstallActor
-        && application.managed.profile == AgentProfile::Local
+        && matches!(
+            application.managed.profile,
+            AgentProfile::Local | AgentProfile::Shared
+        )
         && failure.validate_shape().is_ok()
         && failure.authority.binding == *binding
         && failure.authorization_invocation == application.authorization_invocation
@@ -3280,7 +3280,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "experimental-state-blocks")]
     fn install_request(agent: AgentId, tag: u8) -> ManagementRequest {
         use crate::agent::sdk::contract::ActorPackageContract;
         use crate::agent::sdk::{
@@ -3347,6 +3346,20 @@ mod tests {
         authorization_sequence: u64,
         request: &ManagementRequest,
     ) -> (AuthorityCredentialCall, ManagementApproval) {
+        approved_call_for_profile(
+            fixture,
+            authorization_sequence,
+            request,
+            AgentProfile::Local,
+        )
+    }
+
+    fn approved_call_for_profile(
+        fixture: &Fixture,
+        authorization_sequence: u64,
+        request: &ManagementRequest,
+        profile: AgentProfile,
+    ) -> (AuthorityCredentialCall, ManagementApproval) {
         let credential_key = SigningKey::from_bytes(&[0x29; 32]);
         let credential_public_key = credential_key.verifying_key().to_bytes();
         let mut call = AuthorityCredentialCall {
@@ -3361,7 +3374,7 @@ mod tests {
                 space: fixture.space,
                 agent: fixture.agent,
                 owner: PrincipalId([0x26; 32]),
-                profile: crate::agent::sdk::AgentProfile::Local,
+                profile,
                 runtime_deployment: fixture.context.runtime_deployment,
                 transition_producer: ProducerId([0x27; 32]),
             },
@@ -4286,14 +4299,101 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "experimental-state-blocks")]
     #[test]
     fn rejected_local_install_uses_the_same_durable_pledge_and_exact_retry() {
+        check_rejected_install(AgentProfile::Local);
+    }
+
+    #[test]
+    fn rejected_shared_install_uses_the_same_durable_pledge_and_exact_retry() {
+        check_rejected_install(AgentProfile::Shared);
+    }
+
+    fn check_failure_intent_retirement(
+        request: &ManagementRequest,
+        call: &AuthorityCredentialCall,
+        failure: &ManagementApplicationFailure,
+    ) {
+        use super::super::clean_management_intent::{
+            CleanManagementIntent, CleanManagementIntentSlot, ManagementJournalAnchor,
+        };
+        use crate::agent_sdk::{
+            InvocationAuthorization, InvocationOrigin, InvocationRoleClaims, InvocationWork,
+            MethodMode, PublicPreflight, RuntimeExecutionContext, RuntimeState, RuntimeWork,
+        };
+        let intent = CleanManagementIntent::new(
+            call.authority,
+            call.managed,
+            request.clone(),
+            call.clone(),
+            &TestCredentialVerifier,
+        )
+        .unwrap();
+        let mut invocation = InvocationWork {
+            space: call.authority.space,
+            agent: call.authority.system_agent,
+            runtime_deployment: call.authority.system_runtime_deployment,
+            invocation: call.invocation,
+            actor: call.authority.binding.issuer.actor,
+            incarnation: Hash([0x3f; 32]),
+            deployment: call.authority.binding.issuer.deployment,
+            program: call.authority.binding.issuer.program,
+            mode: MethodMode::Linear,
+            origin: intent.authorization_origin(),
+            roles: InvocationRoleClaims::none(),
+            message: intent.authorization_message(),
+            installation_data: None,
+            availability: Vec::new(),
+            gas: 100,
+            recovery_only: false,
+        };
+        let envelope = |invocation: InvocationWork| RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct,
+            state: RuntimeState::default(),
+            authorization: Box::new(InvocationAuthorization::PublicPreflight(
+                PublicPreflight::for_work(&invocation, failure.failed_at),
+            )),
+            invocation: Box::new(invocation),
+            observed_slot: failure.failed_at,
+        };
+        let anchor = ManagementJournalAnchor {
+            genesis: super::super::journal::AgentJournalGenesisId([0xa1; 32]),
+            admission: super::super::genesis::AgentGenesisAdmissionId::from_bytes([0xa2; 32]),
+            runtime: crate::service::Hash([0xa3; 32]),
+            ordered: super::super::journal::OrderedBase::post_genesis(),
+        };
+        let store = MemoryImageStore::default();
+        let mut slot = CleanManagementIntentSlot::open(store.clone()).unwrap();
+        slot.pledge(intent).unwrap();
+        slot.pledge_authorization_work(envelope(invocation.clone()), anchor.clone())
+            .unwrap();
+        invocation.invocation = failure.acknowledgement_invocation;
+        invocation.origin = InvocationOrigin::anonymous();
+        invocation.message =
+            SignedManagementTerminal::Rejected(failure.clone()).finalization_message();
+        assert!(!invocation.message.is_empty());
+        slot.pledge_finalization_work(envelope(invocation), anchor)
+            .unwrap();
+        drop(slot);
+        let mut reopened = CleanManagementIntentSlot::open(store.clone()).unwrap();
+        reopened
+            .intent()
+            .unwrap()
+            .verify(call.authority, call.managed, &TestCredentialVerifier)
+            .unwrap();
+        assert!(reopened.commit_failure_retirement(failure).unwrap());
+        drop(reopened);
+        let mut retired = CleanManagementIntentSlot::open(store).unwrap();
+        assert!(retired.retirement_complete().unwrap());
+        assert!(!retired.commit_failure_retirement(failure).unwrap());
+    }
+
+    fn check_rejected_install(profile: AgentProfile) {
         let store = MemoryImageStore::default();
         let mut signer = CountingSigner::new(0x28);
         let fixture = fixture(&signer);
         let install = install_request(fixture.agent, 0xb1);
-        let (call, approval) = approved_call(&fixture, 1, &install);
+        let (call, approval) = approved_call_for_profile(&fixture, 1, &install, profile);
         let approved_decision = AuthorizedCleanManagementDecision::from_approval(
             call.authority,
             call.managed,
@@ -4351,6 +4451,7 @@ mod tests {
         assert!(failure.matches_pending(&call, &approval));
         assert_eq!(failure.verify_with(&TestCredentialVerifier), Ok(()));
         assert_eq!(failure.encode().unwrap().get(..4), Some(b"MAF1".as_slice()));
+        check_failure_intent_retirement(&install, &call, &failure);
         assert!(!issuer.failure_finalization_status(&failure).unwrap());
         assert!(
             issuer
@@ -4399,7 +4500,8 @@ mod tests {
                 .unwrap()
         );
         let later_request = request(0xb3);
-        let (later_call, later_approval) = approved_call(&fixture, 2, &later_request);
+        let (later_call, later_approval) =
+            approved_call_for_profile(&fixture, 2, &later_request, profile);
         let later = AuthorizedCleanManagementDecision::from_approval(
             later_call.authority,
             later_call.managed,
