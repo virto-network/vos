@@ -19,7 +19,9 @@ use vos::agent::authority::ed25519_public_key_wire;
 use vos::agent::bootstrap::SystemAgentGenesisProvider;
 use vos::agent::clean_bootstrap::{
     AuthorizedCleanSystemAgentBootstrap, CleanSystemAgentBootstrapError,
-    PendingCleanSystemAgentBootstrap,
+    CleanSystemAgentBootstrapRecord, CleanSystemAgentBootstrapStore,
+    MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES, MAX_CLEAN_SYSTEM_AGENT_PINS_BYTES,
+    PendingCleanSystemAgentBootstrap, PreparedCleanSystemAgentBootstrap,
 };
 use vos::agent::driver::AgentTrustProvider;
 use vos::agent::genesis::{
@@ -206,6 +208,7 @@ fn open_clean_system_lifecycle(
         daemon,
         local_storage,
         host_lock,
+        None,
         #[cfg(test)]
         None,
     )
@@ -227,6 +230,7 @@ fn open_clean_system_lifecycle_with_inputs(
     daemon: &Keypair,
     local_storage: super::local_config::LocalAgentStorage,
     host_lock: &Path,
+    certified_inputs: Option<&PreparedCleanSystemAgentBootstrap>,
     #[cfg(test)] test_inputs: Option<&StartupTestInputs>,
 ) -> anyhow::Result<(vos::agent::sdk::NodeId, CleanProductionLifecycle)> {
     super::local_config::validate_local_storage_roots(data_dir, local_storage)?;
@@ -278,6 +282,21 @@ fn open_clean_system_lifecycle_with_inputs(
     )?;
     #[cfg(test)]
     let catalog_package = test_inputs.map_or(catalog_package, |inputs| inputs.catalog.clone());
+    let (runtime, authority_package, catalog_package) = match certified_inputs {
+        Some(inputs) => {
+            let plan = inputs.plan();
+            anyhow::ensure!(
+                plan.pins().space() == space && plan.pins().node() == clean_node,
+                "certified bootstrap inputs belong to another Space or node"
+            );
+            (
+                vos::agent::package_admission::admit_runtime_package(plan.runtime_package_bytes())?,
+                vos::agent::package_admission::admit_actor_package(plan.authority_package_bytes())?,
+                vos::agent::package_admission::admit_actor_package(plan.catalog_package_bytes())?,
+            )
+        }
+        None => (runtime, authority_package, catalog_package),
+    };
     authority_package.require_runtime(AgentProfile::Shared, &runtime)?;
     catalog_package.require_runtime(AgentProfile::Shared, &runtime)?;
 
@@ -422,7 +441,8 @@ fn open_clean_system_lifecycle_with_inputs(
 
     let stores =
         CleanSystemAgentFileStores::open_or_create(data_dir.join(SYSTEM_AGENT_CONTROL_DIRECTORY))?;
-    let (pins_store, record_store, issuer_store, genesis_store) = stores.into_production_parts();
+    let (mut pins_store, mut record_store, issuer_store, genesis_store) =
+        stores.into_production_parts();
     let archive = Arc::new(CleanSystemAgentGenesisArchive::new(
         genesis_store,
         HostSpaceId(space.0),
@@ -431,6 +451,39 @@ fn open_clean_system_lifecycle_with_inputs(
         HostHash(authority.commitment().0),
         operator.clone(),
     )?);
+    if let Some(inputs) = certified_inputs {
+        anyhow::ensure!(
+            inputs.plan().pins().descriptor().authority == authority,
+            "certified bootstrap authority differs from configured root packages"
+        );
+        let pins = pins_store.load(MAX_CLEAN_SYSTEM_AGENT_PINS_BYTES)?;
+        let record = record_store.load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)?;
+        match (pins, record) {
+            (None, None) => {
+                match std::fs::symlink_metadata(data_dir.join(SHARED_AGENT_HOST_DIRECTORY)) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                    _ => anyhow::bail!("cannot import bootstrap beside a preexisting Shared host"),
+                }
+                archive.import_certified(inputs.provision(), inputs.catalog())?;
+            }
+            (Some(_), Some(bytes)) => {
+                let stored = CleanSystemAgentBootstrapRecord::authorized_plan(&bytes)
+                    .map_err(|error| anyhow::anyhow!("invalid stored bootstrap plan: {error:?}"))?;
+                anyhow::ensure!(
+                    stored.commitment() == inputs.plan().commitment(),
+                    "certified bootstrap differs from stored plan"
+                );
+                // Import is not repair permission for a missing/corrupt archive
+                // after plan publication. Existing startup remains read-only.
+                anyhow::ensure!(
+                    archive.create(inputs.provision().proposal(), inputs.catalog())?
+                        == *inputs.provision(),
+                    "stored genesis evidence differs from import"
+                );
+            }
+            _ => anyhow::bail!("cannot import bootstrap into partial plan stores"),
+        }
+    }
     let observed_slot = archive
         .stored_observed_slot()?
         .unwrap_or(system_logical_slot()?);
@@ -494,6 +547,9 @@ fn open_clean_system_lifecycle_with_inputs(
     let plan_trust = Arc::clone(&trust);
     let plan_merge = Arc::clone(&merge);
     let fresh_plan = move || {
+        if let Some(inputs) = certified_inputs {
+            return Ok(inputs.plan().clone());
+        }
         AuthorizedCleanSystemAgentBootstrap::prepare_root_authorized(
             descriptor,
             runtime.exact_bytes().to_vec(),
@@ -649,6 +705,12 @@ fn open_clean_system_lifecycle_with_inputs(
         Some(&lifecycle_admission),
         Some(&operation_admission),
     )?;
+    if let Some(inputs) = certified_inputs {
+        anyhow::ensure!(
+            pending.pins() == inputs.plan().pins(),
+            "stored bootstrap differs from supplied certified inputs"
+        );
+    }
     anyhow::ensure!(
         pending.pins().replicas().members().len() == 1,
         "public startup requires singleton bootstrap until signed cluster configuration is integrated"

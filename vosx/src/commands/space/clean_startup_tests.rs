@@ -288,6 +288,7 @@ fn candidate_certified_genesis_import_is_scoped_immutable_and_restartable() {
         &daemon,
         crate::commands::space::local_config::LocalAgentStorage::Image,
         &scratch.0.join("source-host.lock"),
+        None,
         Some(&inputs),
     )
     .unwrap();
@@ -303,6 +304,21 @@ fn candidate_certified_genesis_import_is_scoped_immutable_and_restartable() {
     let node = HostNodeId(node.0);
     let space = HostSpaceId(space.0);
     let binding = HostHash(authority.binding.commitment().0);
+    use vos::agent::clean_bootstrap::{
+        CleanSystemAgentBootstrapRecord, CleanSystemAgentBootstrapStore,
+        MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES,
+    };
+    let plan = {
+        let (_, mut record, _, _) =
+            CleanSystemAgentFileStores::open_or_create(data.join(SYSTEM_AGENT_CONTROL_DIRECTORY))
+                .unwrap()
+                .into_production_parts();
+        let bytes = record
+            .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
+            .unwrap()
+            .unwrap();
+        CleanSystemAgentBootstrapRecord::authorized_plan(&bytes).unwrap()
+    };
     let make_archive = |path: &Path, space, agent, node, binding, signer| {
         let (_, _, _, store) = CleanSystemAgentFileStores::open_or_create(path)
             .unwrap()
@@ -328,6 +344,66 @@ fn candidate_certified_genesis_import_is_scoped_immutable_and_restartable() {
             bytes: source.load_catalog(locator, reference).unwrap().unwrap(),
         })
         .collect();
+    let certified = PreparedCleanSystemAgentBootstrap::from_certified_parts(
+        plan.clone(),
+        provision.clone(),
+        catalog.clone(),
+        Arc::new(SystemAgentTrust::new(
+            plan.pins().observed_slot(),
+            space,
+            host_authority_binding(authority.system_agent, authority.binding),
+        )),
+        Arc::new(Ed25519NodeMergeAuthenticator::new(daemon.clone()).unwrap()),
+    )
+    .unwrap();
+    let imported_data = scratch.0.join("imported-startup");
+    drop(ensure_private_directory(&imported_data).unwrap());
+    for supplied in [Some(&certified), None, Some(&certified)] {
+        let (_, recovered) = open_clean_system_lifecycle_with_inputs(
+            network.clone(),
+            &imported_data,
+            space.0,
+            &operator,
+            &daemon,
+            crate::commands::space::local_config::LocalAgentStorage::Image,
+            &scratch.0.join("imported-host.lock"),
+            supplied,
+            Some(&inputs),
+        )
+        .unwrap();
+        drop(recovered);
+        let archived = make_archive(
+            &imported_data.join(SYSTEM_AGENT_CONTROL_DIRECTORY),
+            space,
+            agent,
+            node,
+            binding,
+            operator.clone(),
+        );
+        assert_eq!(archived.reproduce(locator).unwrap(), provision);
+    }
+    let archive_path = imported_data
+        .join(SYSTEM_AGENT_CONTROL_DIRECTORY)
+        .join("system-agent.genesis-archive");
+    let saved_archive = scratch.0.join("saved-imported-genesis");
+    std::fs::rename(&archive_path, &saved_archive).unwrap();
+    let missing_archive_files = journal_files(&imported_data);
+    assert!(
+        open_clean_system_lifecycle_with_inputs(
+            network.clone(),
+            &imported_data,
+            space.0,
+            &operator,
+            &daemon,
+            crate::commands::space::local_config::LocalAgentStorage::Image,
+            &scratch.0.join("imported-host.lock"),
+            Some(&certified),
+            Some(&inputs),
+        )
+        .is_err()
+    );
+    assert_eq!(journal_files(&imported_data), missing_archive_files);
+    std::fs::rename(&saved_archive, &archive_path).unwrap();
     for (label, scoped_space, scoped_agent, scoped_node, scoped_binding, key) in [
         (
             "space",
@@ -588,6 +664,7 @@ fn check_shared_file_recovery_with_candidate(
             &daemon,
             crate::commands::space::local_config::LocalAgentStorage::Image,
             &lock,
+            None,
             expiry.as_ref(),
         )
         .unwrap()
@@ -1263,6 +1340,7 @@ fn check_shared_file_recovery_with_candidate(
                     &daemon,
                     crate::commands::space::local_config::LocalAgentStorage::Image,
                     &lock,
+                    None,
                     expiry.as_ref(),
                 )
                 .is_err()

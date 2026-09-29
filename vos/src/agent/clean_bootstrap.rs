@@ -490,6 +490,86 @@ pub struct PreparedCleanSystemAgentBootstrap {
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 impl PreparedCleanSystemAgentBootstrap {
+    /// Admit externally supplied bootstrap inputs as one exact local bundle.
+    /// Signature checks alone do not tie an arbitrary provision to this plan:
+    /// reproduce Create with the original receipt and compare its physical
+    /// proposal before allowing callers to publish any imported evidence.
+    pub fn from_certified_parts(
+        plan: AuthorizedCleanSystemAgentBootstrap,
+        provision: SystemAgentGenesisProvision,
+        catalog: Vec<RuntimeBlob>,
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+    ) -> Result<Self, CleanSystemAgentBootstrapError> {
+        plan.validate().map_err(rejected)?;
+        provision
+            .validate()
+            .map_err(CleanSystemAgentBootstrapError::Bootstrap)?;
+        let locator = SystemAgentGenesisLocator {
+            space: crate::service::SpaceId(plan.pins.space.0),
+            agent: crate::service::AgentId(plan.pins.agent.0),
+            node: crate::service::NodeId(plan.pins.node.0),
+        };
+        if provision.root() != &plan.pins.root
+            || provision.proposal().locator() != locator
+            || merge.node() != locator.node
+        {
+            return Err(rejected(CleanSystemAgentBootstrapRejection::WrongScope));
+        }
+        let super::journal::ReplayOperation::CleanManage {
+            authority: receipt, ..
+        } = &provision.proposal().create().operation
+        else {
+            return Err(rejected(
+                CleanSystemAgentBootstrapRejection::InvalidDecision,
+            ));
+        };
+        validate_exact_receipt(&plan, &plan.create_decision, receipt, 1, 0)?;
+        let runtime = plan.runtime().map_err(rejected)?;
+        let (create, expected_catalog) =
+            LocalJournalAgentDriver::<FileAgentJournalStore>::clean_shared_system_genesis_input(
+                plan.pins.descriptor.clone(),
+                &runtime,
+                receipt.clone(),
+                plan.pins.observed_slot,
+                &trust,
+                &merge,
+            )
+            .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidDecision))?;
+        if create != *provision.proposal().create() || catalog != expected_catalog {
+            return Err(rejected(
+                CleanSystemAgentBootstrapRejection::DivergentRecord,
+            ));
+        }
+        let member = plan
+            .pins
+            .replicas
+            .member_by_node(locator.node)
+            .ok_or_else(|| rejected(CleanSystemAgentBootstrapRejection::WrongScope))?;
+        let prepared = LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_system_genesis(
+            create,
+            member.replica(),
+            &catalog,
+            trust,
+            merge,
+        )
+        .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidDecision))?;
+        validate_prepared_system_agent_genesis_root(&prepared, &plan.pins.root)
+            .map_err(CleanSystemAgentBootstrapError::Bootstrap)?;
+        let proposal = SystemAgentGenesisProposal::from_prepared(locator, &prepared)
+            .map_err(CleanSystemAgentBootstrapError::Bootstrap)?;
+        if &proposal != provision.proposal() {
+            return Err(rejected(
+                CleanSystemAgentBootstrapRejection::DivergentRecord,
+            ));
+        }
+        Ok(Self {
+            plan,
+            provision,
+            catalog,
+        })
+    }
+
     pub const fn plan(&self) -> &AuthorizedCleanSystemAgentBootstrap {
         &self.plan
     }
@@ -862,7 +942,9 @@ impl AuthorizedCleanSystemAgentBootstrap {
         }
     }
 
-    fn commitment(&self) -> Hash {
+    /// Commitment to the complete local bootstrap plan, including its signed
+    /// inputs. This identifies a plan; it does not prove startup completion.
+    pub fn commitment(&self) -> Hash {
         Hash::digest(
             b"vos/clean-system-agent-bootstrap-plan/v3",
             &[&self.canonical_bytes()],
@@ -1424,6 +1506,21 @@ pub struct CleanSystemAgentBootstrapRecord {
 }
 
 impl CleanSystemAgentBootstrapRecord {
+    /// Recover the exact signed bootstrap inputs, not authority to serve this
+    /// record's phase. Owners must still authenticate journals and issuer state.
+    pub fn authorized_plan(
+        bytes: &[u8],
+    ) -> Result<AuthorizedCleanSystemAgentBootstrap, CleanSystemAgentBootstrapRejection> {
+        let record =
+            Self::decode(bytes).map_err(|_| CleanSystemAgentBootstrapRejection::InvalidRecord)?;
+        let plan = AuthorizedCleanSystemAgentBootstrap::decode(&record.plan)
+            .map_err(|_| CleanSystemAgentBootstrapRejection::InvalidRecord)?;
+        if !record.matches_plan(&plan) {
+            return Err(CleanSystemAgentBootstrapRejection::DivergentRecord);
+        }
+        Ok(plan)
+    }
+
     pub const fn phase(&self) -> CleanSystemAgentBootstrapPhase {
         self.phase
     }
@@ -11508,6 +11605,59 @@ mod tests {
         #[test]
         fn fixed_system_bootstrap_plans_preserve_signed_origin_across_local_nodes() {
             let _ = fixed_system_bootstrap_fixtures();
+        }
+
+        #[test]
+        fn fixed_system_certified_inputs_bind_plan_provision_and_catalog() {
+            let fixtures = fixed_system_bootstrap_fixtures();
+            for (index, fixture) in fixtures.iter().enumerate() {
+                let admit = |plan, provision, catalog| {
+                    PreparedCleanSystemAgentBootstrap::from_certified_parts(
+                        plan,
+                        provision,
+                        catalog,
+                        fixture.trust.clone(),
+                        fixture.merge.clone(),
+                    )
+                };
+                let accepted = admit(
+                    fixture.plan.clone(),
+                    fixture.provision.clone(),
+                    fixture.catalog.clone(),
+                )
+                .unwrap();
+                assert_eq!(
+                    accepted.plan().canonical_bytes(),
+                    fixture.plan.canonical_bytes()
+                );
+                assert_eq!(accepted.provision(), &fixture.provision);
+                assert_eq!(accepted.catalog(), fixture.catalog.as_slice());
+                let foreign = &fixtures[(index + 1) % fixtures.len()];
+                assert!(
+                    admit(
+                        foreign.plan.clone(),
+                        fixture.provision.clone(),
+                        fixture.catalog.clone()
+                    )
+                    .is_err()
+                );
+                assert!(
+                    admit(
+                        fixture.plan.clone(),
+                        foreign.provision.clone(),
+                        fixture.catalog.clone()
+                    )
+                    .is_err()
+                );
+                let mut changed = fixture.catalog.clone();
+                changed[0].bytes[0] ^= 1;
+                assert!(admit(fixture.plan.clone(), fixture.provision.clone(), changed).is_err());
+                let mut changed = fixture.plan.clone();
+                changed.pins.observed_slot += 1;
+                assert!(
+                    admit(changed, fixture.provision.clone(), fixture.catalog.clone()).is_err()
+                );
+            }
         }
 
         fn fixed_system_bootstrap_fixtures() -> Vec<PhysicalFixture> {

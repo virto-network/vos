@@ -338,9 +338,30 @@ replica identity separation without granting authority to a foreign operator key
 The final rerun after removing a redundant catalog copy passes (8.64 s),
 `target/fixed-system-certified-import-final.log`; CLI test build, formatting and
 diff checks pass. No bundled artifacts or reviewer branch were changed.
-This is archive-boundary qualification, not imported-plan startup or three-node
-deployment. Operator configuration still needs to supply the common plan and
-per-node provision together, with cross-validation before publication/startup.
+Imported inputs now enter through `PreparedCleanSystemAgentBootstrap::from_certified_parts`:
+the plan, exact root, node scope, signed Create receipt and catalog must agree,
+and physical Create reproduction must yield the supplied certified proposal.
+The fixed-three-node admission regression passes (2.90 s),
+`target/fixed-system-certified-parts.log`, including swapped node plans/provisions,
+altered catalog bytes and altered observed slot. It qualifies bundle admission,
+not the later three-node lifecycle.
+The internal startup path accepts this validated bundle and imports its archive
+only for a fresh plan root. Existing plans require an exact commitment match and
+read-only archive verification: supplying a bundle cannot repair a missing archive
+after publication. Partial plan stores and preexisting unplanned Shared hosts are
+refused before import. The expanded production-file candidate test passes
+(27.79 s), `target/fixed-system-certified-startup.log`: imported singleton startup,
+restart without resupplying inputs, restart with exact supplied inputs, unchanged
+certified evidence, and missing-archive refusal without file mutations.
+CLI test build and `std`-only library check pass (3.08 s for the latter):
+`target/fixed-system-certified-startup-archive-guard-build.log` and
+`target/fixed-system-certified-parts-std.log`. Early compilation attempts exposed
+private-codec access mistakes; they are not counted as qualification.
+Operator-facing bounded bundle configuration/transport remains unwired, and the
+CLI singleton guard stays intact. Next connect common signed plan/per-node inputs
+to that configuration and qualify all three production owners together before
+removing the guard. No three-node deployment or throughput claim follows from
+these singleton startup and separate fixed-roster admission tests.
 The current full Authority host suite passes: 81 passed, 2 ignored (30.76 s),
 `fixed-roster-guest.ImAzBc/mutation-host-suite.log`.
 The candidate Authority node-table header now supports exactly one or three
