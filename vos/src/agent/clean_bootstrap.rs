@@ -26488,6 +26488,18 @@ mod tests {
         #[test]
         #[ignore = "requires rebuilt candidate runtime and Authority with outer PVM execution"]
         fn native_shared_candidate_install_expiry_finalizes_and_retires() {
+            check_candidate_install_expiry(false);
+        }
+
+        #[cfg(feature = "experimental-state-blocks")]
+        #[test]
+        #[ignore = "requires rebuilt candidate runtime and Authority with outer PVM execution"]
+        fn native_shared_candidate_install_expiry_recovers_owner_and_interrupted_finalization() {
+            check_candidate_install_expiry(true);
+        }
+
+        #[cfg(feature = "experimental-state-blocks")]
+        fn check_candidate_install_expiry(recover: bool) {
             assert!(std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some());
             assert!(std::env::var_os("VOS_AGENT_RUNTIME_COST_CANDIDATE").is_some());
             let target = std::env::var_os("CARGO_TARGET_DIR")
@@ -26497,7 +26509,7 @@ mod tests {
                 native_candidate_state_authority_fixture(&target),
                 true,
                 true,
-                false,
+                recover,
                 true,
             );
         }
@@ -28506,6 +28518,116 @@ mod tests {
                         Some((receipt.clone(), terminal.clone()))
                     );
                     clock.fetch_add(1, Ordering::AcqRel);
+                }
+                if recover_install {
+                    drop(owner);
+                    drop(lifecycle);
+                    drop(install_intent);
+                    drop(install_issuer);
+                    drop(create_issuer);
+                    let mut controller = super::super::NativeSharedGenesisController::new(
+                        target,
+                        vec![(open_continuation(), Some(archive_store.clone()))],
+                    )
+                    .unwrap();
+                    let mut operations = OperationTestJournal(harness._directory.0.clone());
+                    let admission = NativeAuthorityOperationStartupAdmission::load(
+                        &mut operations,
+                        target,
+                        &[],
+                    )
+                    .unwrap();
+                    let admission = controller.startup_admission(admission).unwrap();
+                    assert_eq!(admission.pending.len(), 1);
+                    let (pins, record, issuer) = system_restart_stores.clone();
+                    let mut signer = CountingSigner::new();
+                    let mut reopened =
+                        CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
+                            pins,
+                            record,
+                            issuer,
+                            &mut signer,
+                            || panic!("expiry recovery cannot bootstrap"),
+                            harness._directory.host(),
+                            harness._directory.lock(),
+                            target.space,
+                            harness.fixture.plan.pins.node,
+                            harness.fixture.trust.clone(),
+                            harness.fixture.merge.clone(),
+                            harness.fixture.finality.clone(),
+                            harness.provider.clone(),
+                            harness.network.clone(),
+                            None,
+                            Some(&admission),
+                        )
+                        .unwrap();
+                    drop(admission);
+                    assert!(matches!(
+                        reopened.ordinary_supervisor_generations(),
+                        Err(SharedAgentHostError::Conflict)
+                    ));
+                    reopened.finalization_failure_once = Some(2);
+                    assert!(matches!(
+                        controller.recover(&mut reopened, &mut signer),
+                        Err(SharedAgentHostError::Unavailable)
+                    ));
+                    assert!(!controller.is_recovered());
+                    assert!(matches!(
+                        reopened.ordinary_supervisor_generations(),
+                        Err(SharedAgentHostError::Conflict)
+                    ));
+                    let interrupted = reopened.ordered_index_for_test().unwrap();
+                    controller.recover(&mut reopened, &mut signer).unwrap();
+                    assert_eq!(reopened.ordered_index_for_test().unwrap(), interrupted + 3);
+                    assert!(!reopened.management_admission_held().unwrap());
+                    assert_eq!(reopened.ordinary_supervisor_generations().unwrap().len(), 1);
+                    let recovered = open_continuation();
+                    assert!(recovered.management_pending.is_empty());
+                    assert!(recovered.management_retirements.is_empty());
+                    let completed = DurableCleanManagementIssuer::open(
+                        install_issuer_store.clone(),
+                        target.binding,
+                        managed.space,
+                        managed.agent,
+                    )
+                    .unwrap();
+                    assert!(completed.failure_finalization_status(failure).unwrap());
+                    assert_eq!(
+                        signer.calls, 0,
+                        "recovery must reuse the signed expiry terminal"
+                    );
+                    let finalized = reopened.ordered_index_for_test().unwrap();
+                    assert_eq!(
+                        controller
+                            .complete_install(&mut reopened, locator, &mut signer)
+                            .unwrap(),
+                        terminal
+                    );
+                    assert_eq!(reopened.ordered_index_for_test().unwrap(), finalized);
+                    assert_eq!(
+                        reopened
+                            .host
+                            .lock()
+                            .unwrap()
+                            .journal_position(locator.agent)
+                            .unwrap(),
+                        fenced
+                    );
+                    assert_eq!(
+                        reopened
+                            .host
+                            .lock()
+                            .unwrap()
+                            .inspect_clean_management(locator.agent, &inspect)
+                            .unwrap(),
+                        actors_before
+                    );
+                    drop(completed);
+                    drop(recovered);
+                    drop(controller);
+                    drop(reopened);
+                    harness.stop();
+                    return;
                 }
                 if qualify_failure {
                     assert!(owner.management_admission_held().unwrap());

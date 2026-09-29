@@ -516,8 +516,8 @@ reload. The issuer suite passes (21 tests), SDK suite passes (251, one ignored),
 Authority suite passes (78, two ignored), and default `vosx` check passes. These
 are native contract/recovery tests, not physical expiry qualification.
 This is not yet a production fix: bundled guests are unchanged. Remaining expiry
-gates are full lifecycle-owner restart with a pending expiry terminal, interruption
-of finalization/retirement writes, and release-artifact reproduction and cutover.
+gates are production lifecycle-file interruption of expiry finalization/retirement,
+and release-artifact reproduction and cutover.
 Keep generic errors and
 uncommitted previews ineligible for finality. Logs: `target/shared-install-expiry-*`,
 `target/shared-expiry-finality-*` and `target/shared-expiry-host-*`
@@ -546,6 +546,22 @@ build/test logs use `target/shared-expiry-*` in the shared build root. Release p
 and bundled files remain unchanged. An initial experimental-runtime conversion
 was rejected by the image-runtime host-call verifier; the first test attempt had
 no candidate PVM and failed before exercising expiry. Those are not test evidence.
+
+The candidate expiry owner-recovery test passes (370.60 s). It drops
+the lifecycle/system owner after signing the expiry result, restores pending
+admission, and interrupts recovery before finalization dispatch. It verifies route
+nonexposure until retirement, exact terminal reuse without signing again, and no
+additional ordinary journal entry. This uses retained fixture lifecycle stores
+and real filesystem journals, not a process-kill or ambiguous file-write test.
+Evidence: `target/shared-expiry-owner-recovery-pvm.log`. The feature-off core test
+build and eight Shared host tests also pass (2.64 s); logs are
+`target/shared-expiry-owner-feature-off-{build,tests}.log`. No production-code
+change was needed for this recovery case. Formatting and diff checks pass.
+The existing production-file Install tests use `requested_expires_at = u64::MAX`;
+their staged issuer/finalization coverage must not be counted as expiry coverage.
+The expiry file test needs a bounded signed window and a controlled forward-only
+clock, plus the qualified runtime/Authority pair. Reuse the current staged-file
+fault hooks; do not add a new persistence protocol or relax replay admission.
 
 The internal bootstrap-owner Shared Install application helper replaces the
 physical fixture's hand-assembled
