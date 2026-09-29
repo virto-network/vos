@@ -249,7 +249,7 @@ pub trait CleanSystemAgentBootstrapStore {
 }
 
 /// Independently persisted clean Shared identity and both finality domains.
-/// `replicas` is the one-voter data-plane committee; `root` is the distinct
+/// `replicas` is the fixed data-plane committee; `root` is the distinct
 /// root authority committee and QC pin.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CleanSystemAgentPins {
@@ -271,14 +271,26 @@ impl CleanSystemAgentPins {
         root: RootAnchorPins,
         observed_slot: u64,
     ) -> Result<Self, CleanSystemAgentBootstrapRejection> {
-        let member = replicas
-            .members()
-            .first()
-            .ok_or(CleanSystemAgentBootstrapRejection::InvalidDescriptor)?;
+        let [member] = replicas.members() else {
+            return Err(CleanSystemAgentBootstrapRejection::InvalidDescriptor);
+        };
+        let node = NodeId(member.replica().node.0);
+        Self::new_for_node(descriptor, replicas, root, observed_slot, node)
+    }
+
+    /// Select a local journal identity without changing the root-bound roster.
+    /// The legacy constructor deliberately remains singleton-only.
+    pub fn new_for_node(
+        descriptor: AgentDescriptor,
+        replicas: AgentReplicaCommittee,
+        root: RootAnchorPins,
+        observed_slot: u64,
+        node: NodeId,
+    ) -> Result<Self, CleanSystemAgentBootstrapRejection> {
         let value = Self {
             space: descriptor.identity.space,
             agent: descriptor.identity.agent,
-            node: NodeId(member.replica().node.0),
+            node,
             authority: descriptor.authority,
             runtime_package: descriptor.runtime_package.clone(),
             descriptor,
@@ -325,19 +337,14 @@ impl CleanSystemAgentPins {
     }
 
     fn is_valid(&self) -> bool {
-        let [descriptor_replica] = self.descriptor.replicas.as_slice() else {
-            return false;
-        };
-        let [member] = self.replicas.members() else {
+        let Some(member) = self
+            .replicas
+            .member_by_node(crate::service::NodeId(self.node.0))
+        else {
             return false;
         };
         self.observed_slot != 0
-            && self.descriptor.validate().is_ok()
-            && self.descriptor.identity.profile == AgentProfile::Shared
-            && descriptor_replica.role == super::sdk::ReplicaRole::Voter
-            && self.replicas.validate().is_ok()
-            && self.replicas.profile() == super::AgentProfile::Shared
-            && self.replicas.voter_count() == 1
+            && fixed_system_roster_matches(&self.descriptor, &self.replicas)
             && self.root.validate().is_ok()
             && self.space == self.descriptor.identity.space
             && self.agent == self.descriptor.identity.agent
@@ -345,10 +352,7 @@ impl CleanSystemAgentPins {
             && self.runtime_package == self.descriptor.runtime_package
             && self.replicas.space().0 == self.space.0
             && self.replicas.agent().0 == self.agent.0
-            && member.replica().node.0 == descriptor_replica.node.0
-            && member.replica().principal.0 == descriptor_replica.principal.0
-            && member.replica().role == super::ReplicaRole::Voter
-            && self.node.0 == descriptor_replica.node.0
+            && super::bootstrap::descriptor_matches_root_replica(&self.descriptor, member.replica())
             && self.root.record().space().0 == self.space.0
             && self.root.record().system_agent().0 == self.agent.0
             && self.root.record().authority_binding().0 == self.authority.commitment().0
@@ -406,6 +410,22 @@ impl CleanSystemAgentPins {
         }
         Ok(value)
     }
+}
+
+fn fixed_system_roster_matches(
+    descriptor: &AgentDescriptor,
+    replicas: &AgentReplicaCommittee,
+) -> bool {
+    descriptor.validate().is_ok()
+        && matches!(descriptor.replicas.len(), 1 | 3)
+        && replicas.validate().is_ok()
+        && replicas.profile() == super::AgentProfile::Shared
+        && replicas.space().0 == descriptor.identity.space.0
+        && replicas.agent().0 == descriptor.identity.agent.0
+        && replicas.members().len() == descriptor.replicas.len()
+        && replicas.members().iter().all(|member| {
+            super::bootstrap::descriptor_matches_root_replica(descriptor, member.replica())
+        })
 }
 
 /// Exact root-authorized Create/authority-install material and the signed
@@ -538,6 +558,10 @@ impl AuthorizedCleanSystemAgentBootstrap {
             &catalog_request,
             &catalog_call,
         )?;
+        let local_node = NodeId(merge.node().0);
+        let member = replicas
+            .member_by_node(merge.node())
+            .ok_or_else(|| rejected(CleanSystemAgentBootstrapRejection::WrongScope))?;
         let root_certification = root_bootstrap_certification_commitment(
             &descriptor,
             &runtime_package_bytes,
@@ -592,11 +616,6 @@ impl AuthorizedCleanSystemAgentBootstrap {
                 &merge,
             )
             .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidDecision))?;
-        let [member] = replicas.members() else {
-            return Err(rejected(
-                CleanSystemAgentBootstrapRejection::InvalidDescriptor,
-            ));
-        };
         let prepared = LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_system_genesis(
             create,
             member.replica(),
@@ -645,6 +664,7 @@ impl AuthorizedCleanSystemAgentBootstrap {
             catalog_call,
             invocation_gas,
         )
+        .and_then(|plan| plan.for_node(local_node))
         .map_err(CleanSystemAgentBootstrapError::Rejected)?;
         Ok(PreparedCleanSystemAgentBootstrap {
             plan,
@@ -670,7 +690,15 @@ impl AuthorizedCleanSystemAgentBootstrap {
         invocation_gas: u64,
     ) -> Result<Self, CleanSystemAgentBootstrapRejection> {
         let value = Self {
-            pins: CleanSystemAgentPins::new(descriptor, replicas, root, observed_slot)?,
+            pins: CleanSystemAgentPins::new_for_node(
+                descriptor,
+                replicas,
+                root,
+                observed_slot,
+                catalog_call
+                    .authenticated_node
+                    .ok_or(CleanSystemAgentBootstrapRejection::InvalidDecision)?,
+            )?,
             runtime_package_bytes,
             create_decision,
             authority_package_bytes,
@@ -683,6 +711,22 @@ impl AuthorizedCleanSystemAgentBootstrap {
         };
         value.validate()?;
         Ok(value)
+    }
+
+    /// Preserve every shared signed input while selecting a member's local
+    /// ownership scope. Existing per-node stores still bind the full local plan.
+    pub fn for_node(&self, node: NodeId) -> Result<Self, CleanSystemAgentBootstrapRejection> {
+        self.validate()?;
+        let mut plan = self.clone();
+        plan.pins = CleanSystemAgentPins::new_for_node(
+            self.pins.descriptor.clone(),
+            self.pins.replicas.clone(),
+            self.pins.root.clone(),
+            self.pins.observed_slot,
+            node,
+        )?;
+        plan.validate()?;
+        Ok(plan)
     }
 
     pub const fn pins(&self) -> &CleanSystemAgentPins {
@@ -773,7 +817,12 @@ impl AuthorizedCleanSystemAgentBootstrap {
             || self.catalog_call.validate_shape().is_err()
             || self.catalog_call.authority != self.authority_target()
             || self.catalog_call.managed != self.managed_target()
-            || self.catalog_call.authenticated_node != Some(self.pins.node)
+            || !self.catalog_call.authenticated_node.is_some_and(|node| {
+                self.pins
+                    .replicas
+                    .member_by_node(crate::service::NodeId(node.0))
+                    .is_some()
+            })
             || self.catalog_call.request_sequence.get() != 1
             || self.catalog_call.requested_valid_from > self.pins.observed_slot
             || self.catalog_call.requested_expires_at < self.pins.observed_slot
@@ -912,30 +961,10 @@ fn validate_root_bootstrap_materials(
     catalog_request: &ManagementRequest,
     catalog_call: &AuthorityCredentialCall,
 ) -> Result<(), CleanSystemAgentBootstrapError> {
-    let [descriptor_replica] = descriptor.replicas.as_slice() else {
-        return Err(rejected(
-            CleanSystemAgentBootstrapRejection::InvalidDescriptor,
-        ));
-    };
-    let [member] = replicas.members() else {
-        return Err(rejected(
-            CleanSystemAgentBootstrapRejection::InvalidDescriptor,
-        ));
-    };
     if observed_slot == 0
         || invocation_gas == 0
         || invocation_gas > super::execution::MAX_EXECUTION_GAS
-        || descriptor.validate().is_err()
-        || descriptor.identity.profile != AgentProfile::Shared
-        || descriptor_replica.role != super::sdk::ReplicaRole::Voter
-        || replicas.validate().is_err()
-        || replicas.profile() != super::AgentProfile::Shared
-        || replicas.voter_count() != 1
-        || replicas.space().0 != descriptor.identity.space.0
-        || replicas.agent().0 != descriptor.identity.agent.0
-        || member.replica().node.0 != descriptor_replica.node.0
-        || member.replica().principal.0 != descriptor_replica.principal.0
-        || member.replica().role != super::ReplicaRole::Voter
+        || !fixed_system_roster_matches(descriptor, replicas)
         || runtime.exact_bytes().len() > MAX_PACKAGE_ENCODED_BYTES
         || runtime.package_ref() != &descriptor.runtime_package
         || runtime.deployment() != descriptor.identity.runtime_deployment
@@ -985,7 +1014,11 @@ fn validate_root_bootstrap_materials(
         || catalog_call.validate_shape().is_err()
         || catalog_call.authority != authority_target
         || catalog_call.managed != managed_target
-        || catalog_call.authenticated_node != Some(NodeId(member.replica().node.0))
+        || !catalog_call.authenticated_node.is_some_and(|node| {
+            replicas
+                .member_by_node(crate::service::NodeId(node.0))
+                .is_some()
+        })
         || catalog_call.request_sequence.get() != 1
         || catalog_call.requested_valid_from > observed_slot
         || catalog_call.requested_expires_at < observed_slot
@@ -2210,7 +2243,11 @@ where
             .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidDecision))?;
         let prepared = LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_system_genesis(
             create,
-            plan.pins.replicas.members()[0].replica(),
+            plan.pins
+                .replicas
+                .member_by_node(crate::service::NodeId(plan.pins.node.0))
+                .ok_or_else(|| rejected(CleanSystemAgentBootstrapRejection::WrongScope))?
+                .replica(),
             &supplied_catalog,
             Arc::clone(&trust),
             Arc::clone(&merge),
@@ -7628,6 +7665,9 @@ fn validate_plan_scope(
         return Err(rejected(CleanSystemAgentBootstrapRejection::WrongScope));
     };
     if expected_space != plan.pins.space
+        // Multi-node plan preparation is qualified separately. Coordinated
+        // system-actor installation and startup admission are not enabled yet.
+        || plan.pins.replicas.members().len() != 1
         || expected_node != plan.pins.node
         || merge.node().0 != expected_node.0
         || network.agent_node_id() != expected_node
@@ -11018,6 +11058,204 @@ mod tests {
             merge: Arc<dyn LocalMergeAuthenticator>,
             finality: Arc<dyn AgentGenesisFinalityVerifier>,
             logical_slot: Option<Arc<AtomicU64>>,
+        }
+
+        #[test]
+        fn fixed_system_bootstrap_plans_preserve_signed_origin_across_local_nodes() {
+            let runtime = test_runtime_package(true);
+            let receipt_key = SigningKey::from_bytes(&[RECEIPT_SEED; 32]);
+            let credential_key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
+            let space = SpaceId([0x31; 32]);
+            let owner = PrincipalId([0x32; 32]);
+            let nonce = Hash([0x33; 32]);
+            let agent = AgentId::derive(space, owner, nonce.as_bytes());
+            let mut identities = Vec::new();
+            let mut members = Vec::new();
+            for seed in [NODE_SEED, 0xd2, 0xd3] {
+                let key = SigningKey::from_bytes(&[seed; 32]);
+                let keypair = libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap();
+                let peer = keypair.public().to_peer_id().to_bytes();
+                let public = key.verifying_key().to_bytes();
+                let node = HostNodeId::of_authenticated_peer(&peer);
+                members.push(
+                    AgentReplicaMember::new(
+                        HostAgentReplica {
+                            node,
+                            principal: HostPrincipalId::of_public_key(&public),
+                            role: HostReplicaRole::Voter,
+                        },
+                        peer.clone(),
+                        public,
+                        Some(super::super::super::genesis::derive_replica_raft_slot(
+                            &peer,
+                        )),
+                    )
+                    .unwrap(),
+                );
+                identities.push((key, node));
+            }
+            members.sort_by_key(|member| member.replica().node);
+            let replicas = AgentReplicaCommittee::new(
+                HostSpaceId(space.0),
+                HostAgentId(agent.0),
+                HostAgentProfile::Shared,
+                members,
+            )
+            .unwrap();
+            let authority_package = raw_constructor_actor("system-authority", RECEIPT_SEED);
+            let catalog_package =
+                admitted_standard_actor_for_test("root-catalog", StateLane::Linear, 0xa5);
+            let authority = authority_binding(agent, &authority_package, &receipt_key);
+            let mut descriptor = descriptor(
+                &runtime,
+                space,
+                agent,
+                owner,
+                nonce,
+                &replicas.members()[0],
+                authority,
+            );
+            descriptor.replicas = replicas
+                .members()
+                .iter()
+                .map(|member| AgentReplica {
+                    node: NodeId(member.replica().node.0),
+                    principal: PrincipalId(member.replica().principal.0),
+                    role: ReplicaRole::Voter,
+                })
+                .collect();
+            let authority_request = install_request(agent, &authority_package, 0xa6, Some(vec![0]));
+            let catalog_request = install_request(agent, &catalog_package, 0xa8, None);
+            validate_actor_install(&descriptor, &authority_request, &authority_package).unwrap();
+            validate_actor_install(&descriptor, &catalog_request, &catalog_package).unwrap();
+            let (call, _) =
+                credential_call_and_approval(&descriptor, &catalog_request, &credential_key);
+            let trust: Arc<dyn AgentTrustProvider> = Arc::new(PhysicalTrust {
+                authority: host_authority_binding(&descriptor),
+                logical_slot: None,
+            });
+            assert!(!trust.use_native_clean_runtime_for_test());
+            let mut certification = None;
+            let mut plans = Vec::new();
+            for (key, node) in identities {
+                let merge: Arc<dyn LocalMergeAuthenticator> = Arc::new(SigningMerge { key, node });
+                let mut certifier = |commitment: Hash,
+                                     proposal: &SystemAgentGenesisProposal,
+                                     _catalog: &[RuntimeBlob]| {
+                    if certification.is_none() {
+                        certification = Some(
+                            root_provision(proposal.clone(), &descriptor, HostHash(commitment.0)).1,
+                        );
+                    }
+                    let first: &super::super::super::bootstrap::SystemAgentGenesisProvision =
+                        certification.as_ref().unwrap();
+                    assert_eq!(first.root().record().root_certification().0, commitment.0);
+                    Ok(
+                        super::super::super::bootstrap::SystemAgentGenesisProvision::new(
+                            proposal.clone(),
+                            first.root().clone(),
+                            first.evidence().clone(),
+                        )
+                        .unwrap(),
+                    )
+                };
+                let mut signer = CountingSigner::new();
+                let prepared = AuthorizedCleanSystemAgentBootstrap::prepare_root_authorized(
+                    descriptor.clone(),
+                    runtime.exact_bytes().to_vec(),
+                    replicas.clone(),
+                    LOGICAL_SLOT,
+                    authority_package.exact_bytes().to_vec(),
+                    authority_request.clone(),
+                    catalog_package.exact_bytes().to_vec(),
+                    catalog_request.clone(),
+                    call.clone(),
+                    10_000_000,
+                    &mut signer,
+                    &mut certifier,
+                    trust.clone(),
+                    merge.clone(),
+                )
+                .unwrap();
+                let plan = prepared.plan();
+                assert_eq!(plan.pins.node(), NodeId(node.0));
+                if node == node_material().3 {
+                    let network = network(NODE_SEED);
+                    // Plan preparation is not permission to start a cluster:
+                    // Authority's bootstrap directory is still singleton-only.
+                    assert!(matches!(
+                        validate_plan_scope(plan, space, NodeId(node.0), &trust, &merge, &network,),
+                        Err(CleanSystemAgentBootstrapError::Rejected(
+                            CleanSystemAgentBootstrapRejection::WrongScope
+                        ))
+                    ));
+                    stop_network(network);
+                }
+                assert_eq!(plan.catalog_call(), &call);
+                assert_eq!(prepared.provision().proposal().locator().node, node);
+                assert_eq!(
+                    CleanSystemAgentPins::decode(&plan.pins.encode()).unwrap(),
+                    plan.pins
+                );
+                let decoded =
+                    AuthorizedCleanSystemAgentBootstrap::decode(&plan.canonical_bytes()).unwrap();
+                assert_eq!(decoded.canonical_bytes(), plan.canonical_bytes());
+                assert!(plan.for_node(NodeId([0xff; 32])).is_err());
+                assert!(
+                    CleanSystemAgentPins::new(
+                        descriptor.clone(),
+                        replicas.clone(),
+                        plan.pins.root.clone(),
+                        LOGICAL_SLOT
+                    )
+                    .is_err()
+                );
+                plans.push(plan.clone());
+            }
+            for plan in &plans {
+                for other in &plans {
+                    assert_eq!(
+                        plan.for_node(other.pins.node).unwrap().canonical_bytes(),
+                        other.canonical_bytes()
+                    );
+                    let record = CleanSystemAgentBootstrapRecord::intent(plan);
+                    assert_eq!(
+                        record.matches_plan(other),
+                        plan.pins.node == other.pins.node
+                    );
+                    assert_eq!(plan.catalog_call.signature, other.catalog_call.signature);
+                }
+            }
+            // A transport-valid roster with a different principal is not the
+            // descriptor's signed roster, even if this node itself is intact.
+            let mut members = replicas.members().to_vec();
+            let member = &members[2];
+            let mut changed_replica = member.replica();
+            changed_replica.principal = HostPrincipalId([0xee; 32]);
+            members[2] = AgentReplicaMember::new(
+                changed_replica,
+                member.peer_id().to_vec(),
+                *member.ed25519_public_key(),
+                member.raft_slot(),
+            )
+            .unwrap();
+            let changed = AgentReplicaCommittee::new(
+                HostSpaceId(space.0),
+                HostAgentId(agent.0),
+                HostAgentProfile::Shared,
+                members,
+            )
+            .unwrap();
+            assert!(
+                CleanSystemAgentPins::new_for_node(
+                    descriptor,
+                    changed,
+                    plans[0].pins.root.clone(),
+                    LOGICAL_SLOT,
+                    plans[0].pins.node,
+                )
+                .is_err()
+            );
         }
 
         fn physical_fixture() -> PhysicalFixture {

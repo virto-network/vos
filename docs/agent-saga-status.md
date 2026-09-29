@@ -74,9 +74,34 @@ supervisor-adapter and issuer tests (45 compiler errors); this is not test
 coverage. Keep that feature-test gap for release cleanup. Logs:
 `target/fixed-system-genesis-std-{check,only}.log`.
 
-Bootstrap pins/owner and released startup remain singleton-only. Next separate
-shared bootstrap material from node-local locator selection and qualify their
-real file ownership, quorum/startup/restart before exposing configuration.
+Bootstrap pins and plans now select local ownership explicitly from the complete
+signed roster. Preparing each replica reuses the same root certificate and
+Catalog credential call; the call's authenticated origin is a roster member,
+not rewritten to whichever node opens the plan. Encode/decode and retargeting
+preserve signed inputs, while persisted bootstrap records remain node-local.
+The bundled-runtime plan test passes (1.72 s); its Authority/Catalog packages
+are preparation fixtures, not qualification of installed system actors.
+The original test attempt failed artifact preflight because its fixture omitted
+required constructor bytes; the fixture was corrected without relaxing validation.
+Evidence: `target/fixed-system-bootstrap-local-plan-fixed.log`.
+The final rerun also checks that a valid three-node plan is refused by owner
+startup (1.70 s): `target/fixed-system-bootstrap-local-plan-gate.log`.
+The `std`-only library check passes (2.87 s):
+`target/fixed-system-bootstrap-plan-std-check.log`.
+Singleton factory/exact restart passes (1.92 s), and both before/after-every-phase
+restart tests pass (7.60 s). These are existing singleton fixtures, not network
+quorum evidence.
+
+The owner and released startup remain explicitly singleton-only. The next
+concrete blocker is `SystemAuthorityConfiguration`: it encodes one bootstrap
+node/enrollment, and `root_managed_agent` seeds one replica. Extend that bounded,
+authenticated configuration and its directory projection to the common fixed
+roster, then qualify real actor installation, file ownership and
+quorum/startup/restart before exposing configuration.
+The Authority node-table header also retains only one bootstrap certificate;
+the roster change must cover that seed and its materialization/recovery, not
+merely add replica IDs to the managed-Agent row. Preserve singleton compatibility
+and reject incomplete or differently ordered rosters before signing admission.
 Preserve exact roster, credential-node, package and receipt checks; do not
 replace them with index-zero assumptions or permissive finality. Do not claim
 that node-independent replay commitments alone establish a deployable cluster.
