@@ -788,6 +788,19 @@ fn terminal_result_commitment(result: Result<&ManagementReply, ManagementError>)
     }
 }
 
+fn terminal_observation_slot_valid(receipt: &AuthorityReceipt, result: Hash, slot: u64) -> bool {
+    if result == management_error_commitment(ManagementError::ExpiredBeforeApplication) {
+        receipt.selector.operation == AuthorityOperationKind::InstallActor
+            && ManagementApplicationFailure::valid_failure_slot(
+                receipt,
+                ManagementError::ExpiredBeforeApplication,
+                slot,
+            )
+    } else {
+        receipt.selector.is_live_at(slot)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CleanManagementIssuerImage {
     binding: AgentAuthorityBinding,
@@ -1101,7 +1114,17 @@ impl CleanManagementIssuerImage {
             };
             if application.authority.binding != self.binding
                 || pending.acknowledgement_invocation != application.acknowledgement_invocation
-                || !receipt.selector.is_live_at(pending.applied_at)
+                || !terminal_observation_slot_valid(
+                    &receipt,
+                    pending.application,
+                    pending.applied_at,
+                )
+                || (pending.application
+                    == management_error_commitment(ManagementError::ExpiredBeforeApplication)
+                    && !matches!(
+                        application.managed.profile,
+                        AgentProfile::Local | AgentProfile::Shared
+                    ))
             {
                 return false;
             }
@@ -1797,7 +1820,7 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
             || application_route.acknowledgement_invocation
                 == application_route.authorization_invocation
             || reopened_state == Hash::ZERO
-            || !receipt.selector.is_live_at(applied_at)
+            || !terminal_observation_slot_valid(receipt, requested.application, applied_at)
         {
             return Err(CleanManagementIssuerError::Rejected(
                 CleanManagementIssuerRejection::InvalidObservation,
@@ -4502,12 +4525,19 @@ mod tests {
 
     #[test]
     fn rejected_local_install_uses_the_same_durable_pledge_and_exact_retry() {
-        check_rejected_install(AgentProfile::Local);
+        check_rejected_install(AgentProfile::Local, ManagementError::AlreadyExists);
     }
 
     #[test]
     fn rejected_shared_install_uses_the_same_durable_pledge_and_exact_retry() {
-        check_rejected_install(AgentProfile::Shared);
+        check_rejected_install(AgentProfile::Shared, ManagementError::AlreadyExists);
+    }
+
+    #[test]
+    fn expired_install_terminal_recovers_signer_failure_and_exact_retirement() {
+        for profile in [AgentProfile::Local, AgentProfile::Shared] {
+            check_rejected_install(profile, ManagementError::ExpiredBeforeApplication);
+        }
     }
 
     fn check_failure_intent_retirement(
@@ -4589,7 +4619,7 @@ mod tests {
         assert!(!retired.commit_failure_retirement(failure).unwrap());
     }
 
-    fn check_rejected_install(profile: AgentProfile) {
+    fn check_rejected_install(profile: AgentProfile, error: ManagementError) {
         let store = MemoryImageStore::default();
         let mut signer = CountingSigner::new(0x28);
         let fixture = fixture(&signer);
@@ -4607,12 +4637,16 @@ mod tests {
         let mut issuer = open(store.clone(), &fixture);
         let receipt = issuer.issue(&approved_decision, &mut signer).unwrap();
         let reopened_state = Hash([0xb2; 32]);
-        let failed_at = fixture.context.valid_from;
+        let failed_at = if error == ManagementError::ExpiredBeforeApplication {
+            receipt.selector.expires_at + 1
+        } else {
+            fixture.context.valid_from
+        };
         signer.fail_next = true;
         assert!(matches!(
             issuer.observe_durable_terminal(
                 &receipt,
-                Err(ManagementError::AlreadyExists),
+                Err(error),
                 reopened_state,
                 failed_at,
                 &mut signer,
@@ -4624,6 +4658,11 @@ mod tests {
 
         let mut issuer = open(store.clone(), &fixture);
         let before = store.image();
+        let divergent = if error == ManagementError::ExpiredBeforeApplication {
+            CleanManagementIssuerRejection::InvalidObservation
+        } else {
+            CleanManagementIssuerRejection::DivergentApplicationAck
+        };
         assert!(matches!(
             issuer.observe_durable_terminal(
                 &receipt,
@@ -4632,19 +4671,11 @@ mod tests {
                 failed_at,
                 &mut signer,
             ),
-            Err(CleanManagementIssuerError::Rejected(
-                CleanManagementIssuerRejection::DivergentApplicationAck
-            ))
+            Err(CleanManagementIssuerError::Rejected(reason)) if reason == divergent
         ));
         assert_eq!(store.image(), before);
         let SignedManagementTerminal::Rejected(failure) = issuer
-            .observe_durable_terminal(
-                &receipt,
-                Err(ManagementError::AlreadyExists),
-                reopened_state,
-                failed_at,
-                &mut signer,
-            )
+            .observe_durable_terminal(&receipt, Err(error), reopened_state, failed_at, &mut signer)
             .unwrap()
         else {
             panic!("the signed terminal result must be MAF1");
@@ -4665,13 +4696,7 @@ mod tests {
         let mut reopened = open(store.clone(), &fixture);
         let calls = signer.calls;
         let SignedManagementTerminal::Rejected(retried) = reopened
-            .observe_durable_terminal(
-                &receipt,
-                Err(ManagementError::AlreadyExists),
-                reopened_state,
-                failed_at,
-                &mut signer,
-            )
+            .observe_durable_terminal(&receipt, Err(error), reopened_state, failed_at, &mut signer)
             .unwrap()
         else {
             panic!("exact retry changed terminal kind");

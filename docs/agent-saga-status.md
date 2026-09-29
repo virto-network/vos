@@ -496,13 +496,18 @@ disposition, without running the Install mutation. Local and Shared runtime test
 cover forged signatures, unchanged actor state, durable replay and a later valid
 Install. Nine management tests and the SDK suite (251 passed, one ignored) pass,
 along with the default `vosx` build and formatting/diff checks.
+Candidate signed finality now admits this specific error strictly after receipt
+expiry, authenticating the unchanged receipt at its last valid slot; ordinary
+failures still require a live slot. Issuer recovery preserves the exact result
+and original timestamp across a failed signing attempt. Authority tests verify
+that Local and Shared expiry finalization removes the pending approval without
+installing an actor, rejects substituted signatures/profiles, and survives state
+reload. The issuer suite passes (21 tests), SDK suite passes (251, one ignored),
+Authority suite passes (78, two ignored), and default `vosx` check passes. These
+are native contract/recovery tests, not physical expiry qualification.
 This is not yet a production fix: host receipt admission still rejects expiry,
-MAF1 still requires a live failure slot and explicitly rejects the candidate
-expiry error, and bundled guests are unchanged. This prevents the new error from
-masquerading as an ordinary signed application failure during integration.
-Finish in order: admit only a proved expiry/non-execution outcome at the host and
-replay boundary; extend signed failure validation narrowly for this error without
-weakening ordinary failure windows; finalize/retire through Authority; reproduce
+and bundled guests are unchanged. Finish by admitting only a proved
+expiry/non-execution outcome at the host and replay boundary, then reproduce
 candidate artifacts and qualify expiry before application plus an already-applied
 retry after expiry through the locked filesystem owner. Keep generic errors and
 uncommitted previews ineligible for finality. Logs: `target/shared-install-expiry-*`

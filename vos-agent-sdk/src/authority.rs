@@ -2027,8 +2027,9 @@ impl ManagementApplicationAck {
 /// Distinct signed finality for a physically rejected Local or Shared Install.
 ///
 /// The ordinary MAA2 success wire remains byte-identical. MAF1 can only
-/// resolve an already-approved Install after the exact guest rejection and
-/// resulting state have been durably reopened. Its signature does not grant
+/// resolve an already-approved Install after the exact guest rejection (or
+/// ordered expiry/non-execution fence) and resulting state have been durably
+/// reopened. Its signature does not grant
 /// permission to skip physical replay or to cancel an ambiguous publication.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ManagementApplicationFailure {
@@ -2048,6 +2049,20 @@ pub struct ManagementApplicationFailure {
 }
 
 impl ManagementApplicationFailure {
+    /// Time rule for a replay-proved Install failure, not permission to execute.
+    /// Receipt shape, route and signatures must be authenticated separately.
+    pub fn valid_failure_slot(
+        receipt: &AuthorityReceipt,
+        error: ManagementError,
+        slot: u64,
+    ) -> bool {
+        if error == ManagementError::ExpiredBeforeApplication {
+            slot > receipt.selector.expires_at
+        } else {
+            receipt.selector.is_live_at(slot)
+        }
+    }
+
     pub fn signing_bytes(&self) -> Vec<u8> {
         crate::wire::management_application_failure_signing_bytes(self)
     }
@@ -2060,12 +2075,6 @@ impl ManagementApplicationFailure {
     }
 
     pub fn validate_shape(&self) -> Result<(), AuthorityActorProtocolError> {
-        // Candidate runtime fences are not yet admitted by the released MAF1
-        // finalization contract. Never label a live-window application failure
-        // as expiry while its ordered non-execution integration is incomplete.
-        if self.error == ManagementError::ExpiredBeforeApplication {
-            return Err(AuthorityActorProtocolError::InvalidApplication);
-        }
         if self.authorization_invocation == InvocationId::ZERO
             || self.acknowledgement_invocation == InvocationId::ZERO
             || self.authorization_invocation == self.acknowledgement_invocation
@@ -2094,7 +2103,7 @@ impl ManagementApplicationFailure {
             || selector.runtime_deployment != self.managed.runtime_deployment
             || selector.operation != AuthorityOperationKind::InstallActor
             || selector.request != self.request
-            || !selector.is_live_at(self.failed_at)
+            || !Self::valid_failure_slot(&self.receipt, self.error, self.failed_at)
         {
             return Err(AuthorityActorProtocolError::InvalidApplication);
         }
@@ -2111,8 +2120,15 @@ impl ManagementApplicationFailure {
         verifier: &V,
     ) -> Result<(), AuthorityActorProtocolError> {
         self.validate_shape()?;
+        // Expiry proves non-execution after the window, not renewed authority.
+        // Authenticate the unchanged receipt at its final valid slot.
+        let receipt_slot = if self.error == ManagementError::ExpiredBeforeApplication {
+            self.receipt.selector.expires_at
+        } else {
+            self.failed_at
+        };
         self.receipt
-            .verify_at(self.failed_at, verifier)
+            .verify_at(receipt_slot, verifier)
             .map_err(|_| AuthorityActorProtocolError::InvalidSignature)?;
         if !verifier.verify(
             &self.authority.binding.public_key,
@@ -3314,6 +3330,38 @@ mod tests {
             expired.validate_shape(),
             Err(AuthorityActorProtocolError::InvalidApplication)
         );
+        expired.error = ManagementError::ExpiredBeforeApplication;
+        expired.signature = test_signature(
+            &expired.authority.binding.public_key,
+            &expired.signing_bytes(),
+        );
+        assert_eq!(expired.verify_with(&TestCredentialVerifier), Ok(()));
+        assert!(expired.matches_pending(&call, &approval));
+        let mut boundary = expired.clone();
+        boundary.failed_at = boundary.receipt.selector.expires_at;
+        assert_eq!(
+            boundary.validate_shape(),
+            Err(AuthorityActorProtocolError::InvalidApplication)
+        );
+        let mut forged_expiry = expired.clone();
+        forged_expiry.receipt.signature[0] ^= 1;
+        forged_expiry.signature = test_signature(
+            &forged_expiry.authority.binding.public_key,
+            &forged_expiry.signing_bytes(),
+        );
+        assert_eq!(
+            forged_expiry.verify_with(&TestCredentialVerifier),
+            Err(AuthorityActorProtocolError::InvalidSignature)
+        );
+        for profile in [AgentProfile::Local, AgentProfile::Shared] {
+            let mut terminal = expired.clone();
+            terminal.managed.profile = profile;
+            terminal.signature = test_signature(
+                &terminal.authority.binding.public_key,
+                &terminal.signing_bytes(),
+            );
+            assert_eq!(terminal.verify_with(&TestCredentialVerifier), Ok(()));
+        }
     }
 
     #[test]

@@ -17137,15 +17137,22 @@ mod tests {
 
     #[test]
     fn signed_local_install_rejection_retires_pending_without_installing_and_restarts() {
-        check_signed_install_rejection(AgentProfile::Local);
+        check_signed_install_rejection(AgentProfile::Local, ManagementError::AlreadyExists);
     }
 
     #[test]
     fn signed_shared_install_rejection_retires_pending_without_installing_and_restarts() {
-        check_signed_install_rejection(AgentProfile::Shared);
+        check_signed_install_rejection(AgentProfile::Shared, ManagementError::AlreadyExists);
     }
 
-    fn check_signed_install_rejection(profile: AgentProfile) {
+    #[test]
+    fn signed_install_expiry_retires_without_installing_and_restarts() {
+        for profile in [AgentProfile::Local, AgentProfile::Shared] {
+            check_signed_install_rejection(profile, ManagementError::ExpiredBeforeApplication);
+        }
+    }
+
+    fn check_signed_install_rejection(profile: AgentProfile, error: ManagementError) {
         let config = configuration();
         let mut actor = actor();
         let descriptor = descriptor(config, ADMIN_PRINCIPAL, profile, 0xd1);
@@ -17175,9 +17182,13 @@ mod tests {
             authorization_sequence: success.authorization_sequence,
             request: success.request,
             receipt: success.receipt.clone(),
-            error: ManagementError::AlreadyExists,
+            error,
             reopened_state: Hash([0xd4; 32]),
-            failed_at: approval.valid_from,
+            failed_at: if error == ManagementError::ExpiredBeforeApplication {
+                approval.expires_at + 1
+            } else {
+                approval.valid_from
+            },
             signature: [1; 64],
         };
         failure.signature = signing(0x71).sign(&failure.signing_bytes()).to_bytes();
