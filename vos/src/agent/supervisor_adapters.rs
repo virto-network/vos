@@ -4481,6 +4481,7 @@ where
             .map_err(|_| AgentRouteError::Unavailable)?
             .invoke_authority_projection(query)
             .map_err(|error| {
+                tracing::debug!(?error, "System authority projection failed");
                 #[cfg(test)]
                 if std::env::var_os("VOS_TEST_INNER_DIAGNOSTICS").is_some() {
                     eprintln!("system projection host error: {error:?}");

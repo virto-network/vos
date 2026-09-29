@@ -33,6 +33,38 @@ integration gaps, not optional tuning. Keep Local image-based and public Shared
 management disabled until the corresponding recovery/admission path is proved.
 Measure the integrated Clerk path before spending the remaining tuning pass.
 
+Current integration blocker (after `6efd5e37`): all three filesystem owners
+recover, but initial public route reconciliation does not. The executable
+`candidate_fixed_roster_production_routes_start_from_common_bundle` is an
+explicitly ignored, currently failing release-gate reproducer, not passing
+coverage. It uses real owner stores and the public Node attachment method;
+it is not a three-process HTTP test. First failure was optional early
+compaction calling a singleton-only certificate collector on all three nodes
+(`fixed-system-production-routes-diagnostics.log`). Optional scheduling now
+skips unsupported multi-voter collection, without changing mandatory capacity
+or certificate checks. The rerun reaches projection admission: followers return
+`Unavailable` because reservation requires a local leader, then failed Node
+startup drops their owners and the leader's request also fails
+(`fixed-system-production-routes-no-early-checkpoint.log`, 34.60 s).
+
+Next implementation must keep consensus participants alive while initial
+reconciliation is unavailable, and provide authenticated leader-coordinated
+projection access on followers. Preserve signed query binding, fresh committed
+Authority state, pending-operation exclusion and no routes before validation;
+do not substitute stale local projections or unsigned responses. Reuse the
+existing clean peer transport and Raft read/admission primitives where possible.
+Quorum snapshot certificate collection remains required before sustained
+three-node operation reaches the existing replay limit. These are extensions
+of the current fixed-three-node gate, not new release scope. Keep production
+startup gated and resolve this reproducer before investing in operator CLI
+polish or presenting another deployment-ready checkpoint.
+The checkpoint policy regression and all eight Shared-network unit tests pass
+(`fixed-system-projection-checkpoint-policy.log`,
+`fixed-system-projection-network-tests.log`). Three-owner filesystem startup
+and reopen still pass (28.39 s),
+`fixed-system-production-routes-owner-regression.log`. The route-gate test's
+failure above is intentionally not counted as successful qualification.
+
 ### Fixed three-node bootstrap integration
 
 Direct fixed-roster genesis is the current implementation candidate, avoiding

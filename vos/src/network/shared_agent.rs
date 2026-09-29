@@ -69,9 +69,15 @@ const ORDERED_REPLY_WAIT: Duration = Duration::from_millis(1_800);
 // protocol capacity, snapshot authentication, or pending-operation exclusion.
 const SYSTEM_PROJECTION_CHECKPOINT_SUFFIX: u64 = 8;
 
-fn projection_checkpoint_due(remaining_slots: u64) -> bool {
-    (shared_raft::MAX_AGENT_RAFT_ORDERED_EVIDENCE_ENTRIES as u64).saturating_sub(remaining_slots)
-        >= SYSTEM_PROJECTION_CHECKPOINT_SUFFIX
+fn projection_checkpoint_due(remaining_slots: u64, committee_members: usize) -> bool {
+    // Automatic certificate collection currently supports only one voter.
+    // Do not turn optional early maintenance into a multi-voter serving gate.
+    // Mandatory admission/checkpoint paths still enforce capacity and require
+    // a valid complete certificate; this grants no extra replay headroom.
+    committee_members == 1
+        && (shared_raft::MAX_AGENT_RAFT_ORDERED_EVIDENCE_ENTRIES as u64)
+            .saturating_sub(remaining_slots)
+            >= SYSTEM_PROJECTION_CHECKPOINT_SUFFIX
 }
 
 fn system_promotion_barrier(
@@ -3520,7 +3526,9 @@ impl SharedAgentNetworkHost {
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?
             .capacity(agent)?;
-        if reservation_pending || !projection_checkpoint_due(remaining) {
+        if reservation_pending
+            || !projection_checkpoint_due(remaining, expected_committee.members().len())
+        {
             return Ok(false);
         }
         self.certified_checkpoint_for_admission_inner(
@@ -5163,10 +5171,14 @@ mod tests {
     #[test]
     fn opportunistic_projection_checkpoint_threshold_and_gate() {
         let maximum = shared_raft::MAX_AGENT_RAFT_ORDERED_EVIDENCE_ENTRIES as u64;
-        assert!(!projection_checkpoint_due(maximum));
-        assert!(!projection_checkpoint_due(maximum - 7));
-        assert!(projection_checkpoint_due(maximum - 8));
-        assert!(projection_checkpoint_due(0));
+        assert!(!projection_checkpoint_due(maximum, 1));
+        assert!(!projection_checkpoint_due(maximum - 7, 1));
+        assert!(projection_checkpoint_due(maximum - 8, 1));
+        assert!(projection_checkpoint_due(0, 1));
+        for members in [0, 2, 3] {
+            assert!(!projection_checkpoint_due(maximum - 8, members));
+            assert!(!projection_checkpoint_due(0, members));
+        }
         let key = ProjectionPairKey {
             invocation: crate::agent_sdk::InvocationId([1; 32]),
             work: Hash([2; 32]),
