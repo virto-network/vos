@@ -769,6 +769,9 @@ pub enum ManagementError {
     AuthoritySequenceConflict,
     AuthoritySlotRegressed,
     ResourceLimit,
+    /// A valid Install receipt expired before first application. The runtime
+    /// records a non-execution fence; it must not invoke or install the actor.
+    ExpiredBeforeApplication,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

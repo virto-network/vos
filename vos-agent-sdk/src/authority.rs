@@ -2060,6 +2060,12 @@ impl ManagementApplicationFailure {
     }
 
     pub fn validate_shape(&self) -> Result<(), AuthorityActorProtocolError> {
+        // Candidate runtime fences are not yet admitted by the released MAF1
+        // finalization contract. Never label a live-window application failure
+        // as expiry while its ordered non-execution integration is incomplete.
+        if self.error == ManagementError::ExpiredBeforeApplication {
+            return Err(AuthorityActorProtocolError::InvalidApplication);
+        }
         if self.authorization_invocation == InvocationId::ZERO
             || self.acknowledgement_invocation == InvocationId::ZERO
             || self.authorization_invocation == self.acknowledgement_invocation
@@ -3279,6 +3285,11 @@ mod tests {
         assert_ne!(failure.commitment(), success.commitment());
 
         let mut forged_error = failure.clone();
+        forged_error.error = ManagementError::ExpiredBeforeApplication;
+        assert_eq!(
+            forged_error.validate_shape(),
+            Err(AuthorityActorProtocolError::InvalidApplication)
+        );
         forged_error.error = ManagementError::ResourceLimit;
         assert_eq!(
             forged_error.verify_with(&TestCredentialVerifier),

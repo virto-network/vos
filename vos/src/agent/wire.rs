@@ -8502,6 +8502,86 @@ pub(crate) mod tests {
 
     #[cfg(feature = "pvm")]
     #[test]
+    fn clean_management_install_expiry_fences_without_actor_mutation_and_replays() {
+        use crate::agent_sdk::{
+            AgentProfile, LaneSet, ManagementError, ManagementRequest, RuntimeOutcome,
+        };
+        for profile in [AgentProfile::Local, AgentProfile::Shared] {
+            let (descriptor, created, _) = create_clean_management_state(profile);
+            let request = ManagementRequest::Install(Box::new(clean_install_request(
+                &descriptor,
+                "expired",
+                None,
+                0x71,
+                LaneSet::of(crate::agent_sdk::StateLane::Linear),
+            )));
+            let receipt =
+                clean_management_receipt_with_sequence(&descriptor, &request, 1, 2, 0, 2, 10);
+            let mut forged = receipt.clone();
+            forged.signature[0] ^= 1;
+            let rejected = apply_clean_management_test(
+                created.clone(),
+                &descriptor,
+                request.clone(),
+                Some(forged),
+                11,
+            );
+            assert_eq!(
+                rejected.outcome,
+                RuntimeOutcome::Management(Err(ManagementError::InvalidRequest))
+            );
+            assert_eq!(rejected.state, created);
+            let fenced = apply_clean_management_test(
+                created.clone(),
+                &descriptor,
+                request.clone(),
+                Some(receipt.clone()),
+                11,
+            );
+            assert_eq!(
+                fenced.outcome,
+                RuntimeOutcome::Management(Err(ManagementError::ExpiredBeforeApplication))
+            );
+            assert_ne!(fenced.state, created);
+            let before = decode_standard_runtime_state(&clean_state_to_legacy(&created)).unwrap();
+            let after =
+                decode_standard_runtime_state(&clean_state_to_legacy(&fenced.state)).unwrap();
+            assert_eq!(after.actors, before.actors);
+            assert_eq!(
+                after.clean_actor_installations,
+                before.clean_actor_installations
+            );
+            assert_eq!(after.clean_descriptor, before.clean_descriptor);
+            assert_eq!(
+                after.clean_management_dispositions.len(),
+                before.clean_management_dispositions.len() + 1
+            );
+            let reopened = legacy_state_to_clean(encode_standard_runtime_state(&after));
+            assert_eq!(reopened, fenced.state);
+            let retry = apply_clean_management_test(
+                reopened,
+                &descriptor,
+                request.clone(),
+                Some(receipt),
+                20,
+            );
+            assert_eq!(retry, fenced);
+            let next =
+                clean_management_receipt_with_sequence(&descriptor, &request, 1, 3, 2, 12, 30);
+            let installed =
+                apply_clean_management_test(retry.state, &descriptor, request, Some(next), 21);
+            assert!(matches!(
+                installed.outcome,
+                RuntimeOutcome::Management(Ok(_))
+            ));
+            let installed =
+                decode_standard_runtime_state(&clean_state_to_legacy(&installed.state)).unwrap();
+            assert_eq!(installed.actors.len(), before.actors.len() + 1);
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
     fn clean_management_full_journal_acknowledges_and_pruned_retries_fail_closed() {
         use crate::agent_sdk::{
             ManagementError, ManagementReply, ManagementRequest, RuntimeOutcome,

@@ -26436,7 +26436,13 @@ mod tests {
             fixture: PhysicalFixture,
             complete_publication: bool,
         ) {
-            check_shared_proposal_and_install_failure(fixture, complete_publication, false, false);
+            check_shared_proposal_and_install_failure(
+                fixture,
+                complete_publication,
+                false,
+                false,
+                false,
+            );
         }
 
         #[test]
@@ -26444,6 +26450,18 @@ mod tests {
             check_shared_proposal_and_install_failure(
                 native_bundled_authority_fixture(),
                 true,
+                false,
+                true,
+                false,
+            );
+        }
+
+        #[test]
+        fn native_shared_install_expiry_before_application_cannot_mint_terminal() {
+            check_shared_proposal_and_install_failure(
+                native_bundled_authority_fixture(),
+                true,
+                false,
                 false,
                 true,
             );
@@ -26462,6 +26480,7 @@ mod tests {
                 true,
                 true,
                 false,
+                false,
             );
         }
 
@@ -26470,6 +26489,7 @@ mod tests {
             complete_publication: bool,
             qualify_failure: bool,
             recover_install: bool,
+            expire_before_install: bool,
         ) {
             use crate::agent::clean_management_intent::{
                 CleanManagementIntent, CleanManagementIntentSlot,
@@ -28350,6 +28370,72 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .fetch_add(1, Ordering::AcqRel);
+            if expire_before_install {
+                // Characterize the safety boundary independently of application
+                // failure: a receipt which expires before first execution may
+                // not install, reissue approval, or mint a denial certificate.
+                let receipt = owner
+                    .issue_management_intent_with_admission(
+                        &mut install_intent,
+                        managed,
+                        &mut install_issuer,
+                        &mut install_signer,
+                        true,
+                    )
+                    .unwrap();
+                let clock = harness.fixture.logical_slot.as_ref().unwrap();
+                clock.store(
+                    receipt.selector.expires_at.checked_add(1).unwrap(),
+                    Ordering::Release,
+                );
+                let before = owner
+                    .host
+                    .lock()
+                    .unwrap()
+                    .journal_position(locator.agent)
+                    .unwrap();
+                let system_before = owner.ordered_index_for_test().unwrap();
+                let issuer_before = install_issuer_store.image.lock().unwrap().clone();
+                for _ in 0..2 {
+                    assert!(
+                        owner
+                            .complete_shared_install_from_management_intent(
+                                &mut install_intent,
+                                &ordinary_package,
+                                &mut install_issuer,
+                                &mut install_signer,
+                            )
+                            .is_err()
+                    );
+                    assert_eq!(
+                        owner
+                            .host
+                            .lock()
+                            .unwrap()
+                            .journal_position(locator.agent)
+                            .unwrap(),
+                        before
+                    );
+                    assert_eq!(owner.ordered_index_for_test().unwrap(), system_before);
+                    assert_eq!(*install_issuer_store.image.lock().unwrap(), issuer_before);
+                    assert!(!install_intent.denial_complete().unwrap());
+                    assert!(!install_intent.retirement_complete().unwrap());
+                    assert!(
+                        install_issuer
+                            .recover_observed_terminal(
+                                target,
+                                managed,
+                                install_intent.intent().unwrap().request(),
+                                install_intent.intent().unwrap().call(),
+                                &RawCredentialVerifier
+                            )
+                            .unwrap()
+                            .is_none()
+                    );
+                    clock.fetch_add(1, Ordering::AcqRel);
+                }
+                return;
+            }
             let installed = owner
                 .apply_shared_install_from_management_intent(
                     &mut install_intent,

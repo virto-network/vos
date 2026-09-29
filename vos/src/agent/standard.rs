@@ -6258,7 +6258,15 @@ impl StandardAgentRuntime {
             &authority,
             false,
         )?;
-        if !authority.selector.is_live_at(observed_slot) {
+        let expired_install = observed_slot > authority.selector.expires_at
+            && matches!(request, ManagementRequest::Install(_))
+            && self.clean_descriptor.as_ref().is_some_and(|descriptor| {
+                matches!(
+                    descriptor.identity.profile,
+                    crate::agent_sdk::AgentProfile::Local | crate::agent_sdk::AgentProfile::Shared
+                )
+            });
+        if !authority.selector.is_live_at(observed_slot) && !expired_install {
             return Err(ManagementError::InvalidRequest);
         }
         if self
@@ -6319,8 +6327,13 @@ impl StandardAgentRuntime {
         };
 
         *self = compacted.clone();
-        let result =
-            self.clean_management_mutation(&request, authority_id, observed_slot, pristine_input);
+        let result = if expired_install {
+            // Only the authenticated management disposition advances. No
+            // artifact, constructor, directory or actor state may be touched.
+            Err(ManagementError::ExpiredBeforeApplication)
+        } else {
+            self.clean_management_mutation(&request, authority_id, observed_slot, pristine_input)
+        };
         if result.is_err() {
             *self = compacted;
         }

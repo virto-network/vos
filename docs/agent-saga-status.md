@@ -482,6 +482,33 @@ continuations, remaining write/retirement interruption
 boundaries and roots already advanced by the old failing startup. Public Shared
 management remains disabled; bundled artifacts are unchanged.
 
+Receipt-expiry qualification now reproduces the unresolved admission gap:
+an approved Install whose receipt expires before first application fails repeated
+completion without changing either journal or the issuer, but has no terminal
+which can retire its reservation. The owner regression checks that it does not
+mint a policy denial, reissue the receipt or fabricate an application terminal
+(73.92 s with the fixture runtime; full outer-PVM expiry qualification is pending).
+Do not bypass the clock or widen the issued receipt's window to recover it.
+The candidate standard runtime now has `ExpiredBeforeApplication` (append-only
+management-error wire tag 14). After authenticating the receipt and enforcing
+sequence, epoch, clock and journal-capacity guards, it records only the management
+disposition, without running the Install mutation. Local and Shared runtime tests
+cover forged signatures, unchanged actor state, durable replay and a later valid
+Install. Nine management tests and the SDK suite (251 passed, one ignored) pass,
+along with the default `vosx` build and formatting/diff checks.
+This is not yet a production fix: host receipt admission still rejects expiry,
+MAF1 still requires a live failure slot and explicitly rejects the candidate
+expiry error, and bundled guests are unchanged. This prevents the new error from
+masquerading as an ordinary signed application failure during integration.
+Finish in order: admit only a proved expiry/non-execution outcome at the host and
+replay boundary; extend signed failure validation narrowly for this error without
+weakening ordinary failure windows; finalize/retire through Authority; reproduce
+candidate artifacts and qualify expiry before application plus an already-applied
+retry after expiry through the locked filesystem owner. Keep generic errors and
+uncommitted previews ineligible for finality. Logs: `target/shared-install-expiry-*`
+in the shared disk-backed build root. This remains inside the existing Shared
+lifecycle gate, not a general cancellation protocol.
+
 The internal bootstrap-owner Shared Install application helper replaces the
 physical fixture's hand-assembled
 authorization/application/signing sequence. It validates the signed target

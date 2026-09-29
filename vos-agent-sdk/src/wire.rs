@@ -4642,6 +4642,7 @@ fn encode_management_error(encoder: &mut Encoder<'_>, value: ManagementError) {
         ManagementError::AuthoritySequenceConflict => encoder.u8(11),
         ManagementError::AuthoritySlotRegressed => encoder.u8(12),
         ManagementError::ResourceLimit => encoder.u8(13),
+        ManagementError::ExpiredBeforeApplication => encoder.u8(14),
     }
 }
 
@@ -4661,6 +4662,7 @@ fn decode_management_error(decoder: &mut Decoder<'_>) -> Result<ManagementError,
         11 => Ok(ManagementError::AuthoritySequenceConflict),
         12 => Ok(ManagementError::AuthoritySlotRegressed),
         13 => Ok(ManagementError::ResourceLimit),
+        14 => Ok(ManagementError::ExpiredBeforeApplication),
         _ => Err(DecodeError::InvalidTag),
     }
 }
@@ -7908,6 +7910,24 @@ mod tests {
             observed_slot: 45,
         };
         assert_eq!(with_receipt.encode(), Err(WireError::InvalidValue));
+    }
+
+    #[test]
+    fn management_expiry_error_has_a_distinct_append_only_wire_tag() {
+        for (error, tag) in [
+            (ManagementError::InvalidRequest, 9),
+            (ManagementError::ResourceLimit, 13),
+            (ManagementError::ExpiredBeforeApplication, 14),
+        ] {
+            let mut bytes = Vec::new();
+            encode_management_error(&mut Encoder(&mut bytes), error);
+            assert_eq!(bytes, [tag]);
+            assert_eq!(
+                decode_management_error(&mut Decoder::new(&bytes)).unwrap(),
+                error
+            );
+        }
+        assert!(decode_management_error(&mut Decoder::new(&[15])).is_err());
     }
 
     #[test]
