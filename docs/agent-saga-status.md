@@ -496,8 +496,8 @@ exact observations and retries after expiry (1.08 s). The host admission test
 and 11 management tests also pass. The corrected owner regression passes
 (75.04 s): ordered expiry produces the exact signed failure, leaves the actor
 directory unchanged, and retries do not move either journal or issuer state.
-It deliberately stops before Authority finalization/retirement; full outer-PVM
-expiry qualification remains pending.
+It deliberately stops before Authority finalization/retirement; the separate
+candidate outer-PVM qualification below covers those phases.
 Do not bypass the clock or widen the issued receipt's window to recover it.
 The candidate standard runtime now has `ExpiredBeforeApplication` (append-only
 management-error wire tag 14). After authenticating the receipt and enforcing
@@ -515,13 +515,37 @@ installing an actor, rejects substituted signatures/profiles, and survives state
 reload. The issuer suite passes (21 tests), SDK suite passes (251, one ignored),
 Authority suite passes (78, two ignored), and default `vosx` check passes. These
 are native contract/recovery tests, not physical expiry qualification.
-This is not yet a production fix: bundled guests are unchanged. Reproduce
-candidate artifacts and qualify finalized/retired expiry before application plus an already-applied
-retry after expiry through the locked filesystem owner. Keep generic errors and
+This is not yet a production fix: bundled guests are unchanged. Remaining expiry
+gates are full lifecycle-owner restart with a pending expiry terminal, interruption
+of finalization/retirement writes, and release-artifact reproduction and cutover.
+Keep generic errors and
 uncommitted previews ineligible for finality. Logs: `target/shared-install-expiry-*`,
 `target/shared-expiry-finality-*` and `target/shared-expiry-host-*`
 in the shared disk-backed build root. This remains inside the existing Shared
 lifecycle gate, not a general cancellation protocol.
+
+Candidate expiry qualification passes with a freshly built image runtime
+and Authority guest (guest toolchain `nightly-2026-03-20`, offline/locked). The
+runtime is built without external-state host calls for this image-oriented Shared
+path; the Authority candidate includes `experimental-state-blocks`. The new
+ignored outer-PVM test passes (324.50 s), driving signed expiry through finalization
+and retirement, reopening intent/issuer stores before finalization and after
+retirement. It verifies reservation release, unchanged actor directory, and exact
+retries without additional ordinary/system journal writes. These are physical
+guest and in-process store-reopen checks, not full owner/process restart,
+power-loss or three-node qualification. Eight Shared host tests
+pass (2.59 s), including a new filesystem reopen case proving an Install applied
+before expiry still returns its original successful result after expiry without
+another ordered entry. Candidate identities:
+runtime ELF SHA-256 `cdfc987d302f82e8d87a66fbeb41a31049733c0c92232759fe64e58624ae2146`,
+Authority ELF SHA-256 `632d4bce81beb46c859ab9969316d6a51c82395f561f3e918556a558d7489690`,
+runtime PVM SHA-256 `6f1eda0e936f9e9796ecb3ba5c7cee0b073c488ac6117efc332a52e5f5d3c3d8`
+(program ID `20f5c801e966a6e6bc14cd1bdf00b721f2ffc5bc86bff699cc0708711568909a`).
+The passing physical log is `target/shared-expiry-outer-pvm-final.log`; other
+build/test logs use `target/shared-expiry-*` in the shared build root. Release pins
+and bundled files remain unchanged. An initial experimental-runtime conversion
+was rejected by the image-runtime host-call verifier; the first test attempt had
+no candidate PVM and failed before exercising expiry. Those are not test evidence.
 
 The internal bootstrap-owner Shared Install application helper replaces the
 physical fixture's hand-assembled

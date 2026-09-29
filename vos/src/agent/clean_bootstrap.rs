@@ -26484,6 +26484,24 @@ mod tests {
             );
         }
 
+        #[cfg(feature = "experimental-state-blocks")]
+        #[test]
+        #[ignore = "requires rebuilt candidate runtime and Authority with outer PVM execution"]
+        fn native_shared_candidate_install_expiry_finalizes_and_retires() {
+            assert!(std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some());
+            assert!(std::env::var_os("VOS_AGENT_RUNTIME_COST_CANDIDATE").is_some());
+            let target = std::env::var_os("CARGO_TARGET_DIR")
+                .map(std::path::PathBuf::from)
+                .expect("set CARGO_TARGET_DIR to the candidate guest build root");
+            check_shared_proposal_and_install_failure(
+                native_candidate_state_authority_fixture(&target),
+                true,
+                true,
+                false,
+                true,
+            );
+        }
+
         fn check_shared_proposal_and_install_failure(
             mut fixture: PhysicalFixture,
             complete_publication: bool,
@@ -28488,6 +28506,78 @@ mod tests {
                         Some((receipt.clone(), terminal.clone()))
                     );
                     clock.fetch_add(1, Ordering::AcqRel);
+                }
+                if qualify_failure {
+                    assert!(owner.management_admission_held().unwrap());
+                    drop(install_intent);
+                    drop(install_issuer);
+                    let mut install_intent =
+                        CleanManagementIntentSlot::open(install_intent_store.clone()).unwrap();
+                    let mut install_issuer = DurableCleanManagementIssuer::open(
+                        install_issuer_store.clone(),
+                        target.binding,
+                        managed.space,
+                        managed.agent,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        owner
+                            .complete_shared_install_from_management_intent(
+                                &mut install_intent,
+                                &ordinary_package,
+                                &mut install_issuer,
+                                &mut install_signer,
+                            )
+                            .unwrap(),
+                        terminal
+                    );
+                    assert!(install_intent.retirement_complete().unwrap());
+                    assert!(!install_intent.denial_complete().unwrap());
+                    assert!(!owner.management_admission_held().unwrap());
+                    assert!(install_issuer.failure_finalization_status(failure).unwrap());
+                    let finalized = owner.ordered_index_for_test().unwrap();
+                    assert!(finalized > system_before);
+                    drop(install_intent);
+                    drop(install_issuer);
+                    let mut install_intent =
+                        CleanManagementIntentSlot::open(install_intent_store.clone()).unwrap();
+                    let mut install_issuer = DurableCleanManagementIssuer::open(
+                        install_issuer_store.clone(),
+                        target.binding,
+                        managed.space,
+                        managed.agent,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        owner
+                            .complete_shared_install_from_management_intent(
+                                &mut install_intent,
+                                &ordinary_package,
+                                &mut install_issuer,
+                                &mut install_signer,
+                            )
+                            .unwrap(),
+                        terminal
+                    );
+                    assert_eq!(owner.ordered_index_for_test().unwrap(), finalized);
+                    assert_eq!(
+                        owner
+                            .host
+                            .lock()
+                            .unwrap()
+                            .journal_position(locator.agent)
+                            .unwrap(),
+                        fenced
+                    );
+                    assert_eq!(
+                        owner
+                            .host
+                            .lock()
+                            .unwrap()
+                            .inspect_clean_management(locator.agent, &inspect)
+                            .unwrap(),
+                        actors_before
+                    );
                 }
                 return;
             }
