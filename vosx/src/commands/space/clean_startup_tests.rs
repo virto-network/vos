@@ -453,7 +453,7 @@ fn candidate_fixed_roster_production_owners_start_from_common_bundle() {
 }
 
 #[test]
-#[ignore = "KNOWN RELEASE GAP: restart with a pending projection waits for promotion before route registration; requires AUTHORITY_CANDIDATE_ELF and loopback"]
+#[ignore = "requires AUTHORITY_CANDIDATE_ELF and loopback; production participants and leader route publication across reopen"]
 fn candidate_fixed_roster_production_retains_pending_participants() {
     check_fixed_roster_preparation(FixedRosterStage::Participants);
 }

@@ -33,8 +33,10 @@ integration gaps, not optional tuning. Keep Local image-based and public Shared
 management disabled until the corresponding recovery/admission path is proved.
 Measure the integrated Clerk path before spending the remaining tuning pass.
 
-Current integration blocker (after `6efd5e37`): all three filesystem owners
-recover, but initial public route reconciliation does not. The executable
+Current integration blocker: followers cannot obtain authenticated Authority
+projections through the leader. All three filesystem owners can now recover
+after projection activity, and a leader publishes verified routes, but this is
+not all-node serving readiness. The executable
 `candidate_fixed_roster_production_routes_start_from_common_bundle` is an
 explicitly ignored, currently failing release-gate reproducer, not passing
 coverage. It uses real owner stores and the public Node attachment method;
@@ -59,24 +61,27 @@ leader's verified routes published; it still fails the all-nodes-ready assertion
 because followers cannot query through the leader
 (`fixed-system-initial-projection-retained-participants.log`, 28.02 s).
 The extended `candidate_fixed_roster_production_retains_pending_participants`
-reproducer deliberately keeps the restart requirement: fresh attachment accepts
-all participants and publishes leader routes, but reopen after projection
-activity fails `Host(Unavailable)` (52.25 s; diagnostic rerun 40.58 s).
-Logs: `fixed-system-initial-projection-participants-restart{,-diagnostics}.log`.
-Two owners reopen; the retained-projection path uses
-`attach_recovering_projection`, whose promotion barrier runs before network
-route registration. Unlike the no-pending-work fixed-roster attachment, it
-still assumes a locally elected singleton. Keep this second test explicitly
-ignored as a known release failure, not successful restart qualification.
+test now passes startup, participant retention, owner drop/reopen and leader
+route publication (42.93 s), `fixed-system-pending-projection-attach-restart.log`.
+Its original failure was a retained projection waiting for local promotion
+before registering the route peers needed for election. Fixed-three-voter
+recovery now defers that wait: the exact committee must match durable routing,
+there must be one system generation and no membership transition, and all
+existing pending-work/capacity checks (including election headroom) still run
+before registration. The exact reservation is seeded before ordinary ingress
+or Merge pumping can run. Singleton promotion and mandatory checkpoint guards
+are unchanged. Singleton exact Invoke/ACK recovery and rival-reservation
+rejection pass (4.10 s), `fixed-system-pending-projection-singleton-recovery.log`;
+all eight network tests pass, `fixed-system-pending-projection-network-tests.log`.
+This remains a single-process loopback test; no full daemon restart, follower
+route publication, leadership-transfer pending-read recovery or HTTP claim.
 The CLI regression suite passes (298 passed, 44 ignored, 29.72 s),
-`fixed-system-initial-projection-cli-suite.log`; this does not cover the two
-ignored release-gate failures.
+`fixed-system-initial-projection-cli-suite.log` (before the deferred-attachment
+change); ignored physical cases are qualified separately above.
 
-Next implementation must defer pending-projection recovery promotion until
-authenticated consensus routes exist, retaining the exact reservation and
-capacity checks, and provide authenticated leader-coordinated projection
-access/recovery on followers. Treat these together: retaining a follower alone
-does not let it retire its pending read after leadership moves. Preserve signed query binding, fresh committed
+Next implementation must provide authenticated leader-coordinated projection
+access/recovery on followers. Retaining a follower alone does not let it retire
+its pending read after leadership moves. Preserve signed query binding, fresh committed
 Authority state, pending-operation exclusion and no routes before validation;
 do not substitute stale local projections or unsigned responses. Reuse the
 existing clean peer transport and Raft read/admission primitives where possible.

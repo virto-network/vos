@@ -2621,7 +2621,28 @@ impl SharedAgentNetworkHost {
         if crate::service::AgentId(work.agent.0) != agent || !authorization.matches_work(work) {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        Self::attach_internal(
+        let deferred_promotion = expected_committee.members().len() > 1;
+        if deferred_promotion {
+            let statuses = host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .list()?;
+            if expected_committee.members().len() != 3
+                || expected_committee.voter_count() != 3
+                || statuses.len() != 1
+                || statuses[0].generation.agent() != agent
+                || statuses[0].route.committee() != expected_committee.id()
+                || statuses[0].committee_transition.is_some()
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+        }
+        // Multi-voter election needs the route that attachment registers.
+        // Seed the same exact projection reservation and audit its capacity
+        // (including the election no-op) before registration, but defer the
+        // leader wait until the retained owner attempts execution. This is
+        // not ordinary admission and grants no follower execution authority.
+        let mut attachment = Self::attach_internal(
             host,
             network,
             Some(RecoveringProjectionAdmission {
@@ -2631,10 +2652,12 @@ impl SharedAgentNetworkHost {
                 expected_committee,
                 signer,
             }),
-            Some(agent),
+            (!deferred_promotion).then_some(agent),
             None,
             None,
-        )
+        )?;
+        attachment.system_agents.insert(agent);
+        Ok(attachment)
     }
 
     /// Restore an independently verified pending retirement before publishing
@@ -2751,8 +2774,7 @@ impl SharedAgentNetworkHost {
                     .as_ref()
                     .filter(|pending| pending.agent == status.generation.agent())
                     .map(|pending| pending);
-                let barrier =
-                    pending.is_some() || promotion_barrier == Some(status.generation.agent());
+                let barrier = promotion_barrier == Some(status.generation.agent());
                 attachment.attach_status(status, pending, barrier)?;
             }
         }
