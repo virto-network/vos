@@ -412,9 +412,24 @@ covering scope/signature/key substitution, valid foreign-owner enrollment,
 cardinality/duplicates, every planning-node position, input ordering, constructor
 round-trip and descriptor/operator mismatch. The real-file singleton/import/
 restart regression also passes (29.41 s), `target/fixed-system-roster-startup.log`.
-This verifies roster and constructor preparation, not a completed operator-facing
-bundle-generation command. Next reuse this builder in common-plan preparation
-and exercise it with all three production startup owners; retain the CLI guard.
+Startup and offline common-plan preparation now use the same
+`SystemBootstrapMaterials` builder for packages, descriptor, constructor requests
+and signed Catalog call. Plan signing happens only inside the fresh-plan factory,
+not during exact restart. The candidate preparation regression certifies once,
+exports one CBI1 bundle, then localizes/imports/reopens it through all three
+production archive owners while preserving the original certificate, Create and
+credential call. It passes (2.53 s), `target/fixed-system-material-preparation.log`.
+The final test also refuses a wrong operator signer before invoking the certifier
+or changing archive bytes (2.52 s), `target/fixed-system-material-preparation-final.log`.
+CLI test build, formatting and diff checks pass.
+The singleton production startup/import/restart regression passes (28.55 s),
+`target/fixed-system-material-preparation-startup.log`; roster tests still pass
+(2 tests, 0.26 s), `target/fixed-system-material-preparation-roster.log`.
+This uses candidate Authority material; the released bundles have not been
+repinned for SAC6. It qualifies preparation and archive import, not all three
+running system owners. The operator-facing preparation/publication command,
+integrated three-node startup and final artifact qualification remain open.
+Keep the CLI singleton guard until those startup requirements are proved.
 No three-node deployment or throughput claim follows from these singleton startup
 and separate fixed-roster admission tests.
 The current full Authority host suite passes: 81 passed, 2 ignored (30.76 s),

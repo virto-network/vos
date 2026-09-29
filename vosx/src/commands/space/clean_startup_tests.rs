@@ -441,6 +441,141 @@ fn candidate_authority_shared_create_reopens_production_stores() {
 }
 
 #[test]
+#[ignore = "requires AUTHORITY_CANDIDATE_ELF; prepares a common three-node bundle with production materials and root archive"]
+fn candidate_fixed_roster_materials_prepare_one_common_bundle() {
+    use vos::agent::bootstrap::SystemAgentGenesisLocator;
+    let scratch = Scratch::new();
+    let operator = Keypair::ed25519_from_bytes([0x71; 32]).unwrap();
+    let public = raw_public_key(&operator).unwrap();
+    let owner = PrincipalId::of_public_key(&public);
+    let space = SpaceId([0x73; 32]);
+    let daemons: Vec<_> = [0x72, 0x74, 0x75]
+        .into_iter()
+        .map(|seed| Keypair::ed25519_from_bytes([seed; 32]).unwrap())
+        .collect();
+    let enrollments: Vec<_> = daemons
+        .iter()
+        .map(|key| {
+            sign_node_encryption_enrollment(
+                key,
+                space,
+                owner,
+                derive_node_encryption_public(key, space).unwrap(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let inputs = candidate_authority_inputs(
+        &operator,
+        &PathBuf::from(std::env::var("AUTHORITY_CANDIDATE_ELF").unwrap()),
+    );
+    let make_materials = || {
+        SystemBootstrapMaterials::new(
+            space,
+            public,
+            enrollments[0].node,
+            inputs.runtime.clone(),
+            inputs.authority.clone(),
+            inputs.catalog.clone(),
+            &enrollments,
+        )
+        .unwrap()
+    };
+    let materials = make_materials();
+    let target = materials.authority_target();
+    assert_eq!(materials.descriptor.replicas.len(), 3);
+    let certificate_path = scratch.0.join("certification");
+    let open_archive = |path: &Path, node| {
+        let (_, _, _, file) = CleanSystemAgentFileStores::open_or_create(path)
+            .unwrap()
+            .into_production_parts();
+        CleanSystemAgentGenesisArchive::new(
+            file,
+            HostSpaceId(space.0),
+            HostAgentId(target.system_agent.0),
+            HostNodeId(node),
+            HostHash(target.binding.commitment().0),
+            operator.clone(),
+        )
+        .unwrap()
+    };
+    let archive = open_archive(&certificate_path, enrollments[0].node.0);
+    let slot = system_logical_slot().unwrap();
+    let trust = Arc::new(SystemAgentTrust::new(
+        slot,
+        HostSpaceId(space.0),
+        host_authority_binding(target.system_agent, target.binding),
+    ));
+    let merge = Arc::new(Ed25519NodeMergeAuthenticator::new(daemons[0].clone()).unwrap());
+    let mut certifications = 0;
+    let untouched = journal_files(&certificate_path);
+    let foreign = Keypair::ed25519_from_bytes([0x76; 32]).unwrap();
+    assert!(matches!(
+        make_materials().prepare(
+            &foreign,
+            slot,
+            &mut |root, proposal: &_, catalog: &_| {
+                certifications += 1;
+                archive.certify_fresh(root, proposal, catalog)
+            },
+            trust.clone(),
+            merge.clone()
+        ),
+        Err(CleanSystemAgentBootstrapError::Signer)
+    ));
+    assert_eq!(certifications, 0);
+    assert_eq!(journal_files(&certificate_path), untouched);
+    let prepared = materials
+        .prepare(
+            &operator,
+            slot,
+            &mut |root, proposal: &_, catalog: &_| {
+                certifications += 1;
+                archive.certify_fresh(root, proposal, catalog)
+            },
+            trust,
+            merge,
+        )
+        .unwrap();
+    assert_eq!(certifications, 1);
+    let published = journal_files(&certificate_path);
+    let bundle = scratch.0.join("common.bundle");
+    std::fs::write(&bundle, prepared.encode_import().unwrap()).unwrap();
+    for (index, daemon) in daemons.iter().enumerate() {
+        let local = read_certified_bootstrap_bundle(&bundle, space.0, &operator, daemon).unwrap();
+        assert_eq!(local.plan().pins().node(), enrollments[index].node);
+        assert_eq!(local.provision().root(), prepared.provision().root());
+        assert_eq!(
+            local.provision().evidence(),
+            prepared.provision().evidence()
+        );
+        assert_eq!(
+            local.provision().proposal().create(),
+            prepared.provision().proposal().create()
+        );
+        assert_eq!(local.plan().catalog_call(), prepared.plan().catalog_call());
+        let path = scratch.0.join(format!("member-{index}"));
+        let imported = open_archive(&path, enrollments[index].node.0);
+        assert_eq!(
+            imported
+                .import_certified(local.provision(), local.catalog())
+                .unwrap(),
+            *local.provision()
+        );
+        drop(imported);
+        let reopened = open_archive(&path, enrollments[index].node.0);
+        let locator = SystemAgentGenesisLocator {
+            space: HostSpaceId(space.0),
+            agent: HostAgentId(target.system_agent.0),
+            node: HostNodeId(enrollments[index].node.0),
+        };
+        assert_eq!(reopened.reproduce(locator).unwrap(), *local.provision());
+        assert_eq!(journal_files(&certificate_path), published);
+    }
+    assert_eq!(certifications, 1);
+}
+
+#[test]
 #[ignore = "requires AUTHORITY_CANDIDATE_ELF; exercises certified genesis import with production file owners"]
 fn candidate_certified_genesis_import_is_scoped_immutable_and_restartable() {
     use crate::commands::space::clean_store::ensure_private_directory;

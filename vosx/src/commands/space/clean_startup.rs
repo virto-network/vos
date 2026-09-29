@@ -245,6 +245,194 @@ impl SystemBootstrapRoster {
     }
 }
 
+/// One material builder for live singleton startup and offline common-roster
+/// preparation. Construction validates inputs but does not sign or publish.
+struct SystemBootstrapMaterials {
+    descriptor: AgentDescriptor,
+    runtime: vos::agent::package_admission::AdmittedRuntimePackage,
+    authority_package: AdmittedActorPackage,
+    catalog_package: AdmittedActorPackage,
+    authority_request: ManagementRequest,
+    catalog_request: ManagementRequest,
+    replicas: AgentReplicaCommittee,
+}
+
+impl SystemBootstrapMaterials {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        space: SpaceId,
+        operator_public: [u8; 32],
+        local_node: vos::agent::sdk::NodeId,
+        runtime: vos::agent::package_admission::AdmittedRuntimePackage,
+        authority_package: AdmittedActorPackage,
+        catalog_package: AdmittedActorPackage,
+        enrollments: &[vos::agent::sdk::private::NodeEncryptionEnrollment],
+    ) -> anyhow::Result<Self> {
+        authority_package.require_runtime(AgentProfile::Shared, &runtime)?;
+        catalog_package.require_runtime(AgentProfile::Shared, &runtime)?;
+        let (target, creation_nonce) =
+            derive_system_authority_target(space, operator_public, &runtime, &authority_package)?;
+        let owner = PrincipalId::of_public_key(&operator_public);
+        let roster = SystemBootstrapRoster::from_enrollments(
+            space,
+            target.system_agent,
+            owner,
+            local_node,
+            enrollments,
+        )?;
+        let transition_producer = ProducerId::of_public_key(&roster.primary.transport_public_key);
+        anyhow::ensure!(
+            transition_producer != ProducerId::of_public_key(&operator_public),
+            "system Agent requires distinct root and node signing identities"
+        );
+        let descriptor = AgentDescriptor {
+            identity: AgentIdentity {
+                space,
+                agent: target.system_agent,
+                owner,
+                profile: AgentProfile::Shared,
+                runtime_deployment: runtime.deployment(),
+                runtime_program: runtime.program(),
+                runtime_producer: runtime.producer(),
+                transition_producer,
+            },
+            creation_nonce,
+            authority: target.binding,
+            private_recovery: None,
+            runtime_package: runtime.package_ref().clone(),
+            runtime_contract: runtime.manifest().contract,
+            capabilities: runtime.capabilities(),
+            replicas: roster.descriptor_replicas(),
+        };
+        descriptor
+            .validate()
+            .map_err(|error| anyhow::anyhow!("invalid system-Agent descriptor: {error:?}"))?;
+        let authority_configuration =
+            roster.authority_configuration(&descriptor, operator_public)?;
+        let authority = target.binding;
+        let catalog_configuration = SystemCatalogConfiguration {
+            space: space.0,
+            system_agent: target.system_agent.0,
+            system_runtime_deployment: runtime.deployment().0,
+            actor: ActorId::top_level(target.system_agent, SYSTEM_CATALOG_NAME).0,
+            deployment: catalog_package.deployment().0,
+            program: catalog_package.program().0,
+            authority: CatalogAuthorityState {
+                policy: authority.policy.0,
+                issuer: CatalogIssuerState {
+                    principal: authority.issuer.principal.0,
+                    actor: authority.issuer.actor.0,
+                    deployment: authority.issuer.deployment.0,
+                    program: authority.issuer.program.0,
+                    producer: authority.issuer.producer.0,
+                },
+                public_key: authority.public_key,
+                initial_epoch: authority.initial_epoch,
+            },
+        };
+        anyhow::ensure!(
+            catalog_configuration.is_valid(),
+            "derived system-catalog configuration is invalid"
+        );
+        let authority_request = install_request(
+            target.system_agent,
+            &authority_package,
+            authority_configuration.encode(),
+            b"authority",
+        )?;
+        let catalog_request = install_request(
+            target.system_agent,
+            &catalog_package,
+            catalog_configuration.encode(),
+            b"catalog",
+        )?;
+        Ok(Self {
+            descriptor,
+            runtime,
+            authority_package,
+            catalog_package,
+            authority_request,
+            catalog_request,
+            replicas: roster.replicas,
+        })
+    }
+
+    fn authority_target(&self) -> AuthorityActorTarget {
+        AuthorityActorTarget {
+            space: self.descriptor.identity.space,
+            system_agent: self.descriptor.identity.agent,
+            system_runtime_deployment: self.descriptor.identity.runtime_deployment,
+            binding: self.descriptor.authority,
+        }
+    }
+
+    fn prepare<C: vos::agent::clean_bootstrap::CleanSystemAgentRootCertifier>(
+        self,
+        operator: &Keypair,
+        observed_slot: u64,
+        certifier: &mut C,
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+    ) -> Result<PreparedCleanSystemAgentBootstrap, CleanSystemAgentBootstrapError> {
+        let invalid = || {
+            CleanSystemAgentBootstrapError::Rejected(
+                vos::agent::clean_bootstrap::CleanSystemAgentBootstrapRejection::InvalidDecision,
+            )
+        };
+        let mut signer = CleanOperatorIdentitySigner::new(operator)
+            .map_err(|_| CleanSystemAgentBootstrapError::Signer)?;
+        let public = signer.raw_public_key();
+        if public != self.descriptor.authority.public_key {
+            return Err(CleanSystemAgentBootstrapError::Signer);
+        }
+        let identity = &self.descriptor.identity;
+        let mut call = AuthorityCredentialCall {
+            invocation: InvocationId::ZERO,
+            authority: self.authority_target(),
+            managed: ManagedAgentTarget {
+                space: identity.space,
+                agent: identity.agent,
+                owner: identity.owner,
+                profile: AgentProfile::Shared,
+                runtime_deployment: identity.runtime_deployment,
+                transition_producer: identity.transition_producer,
+            },
+            principal: identity.owner,
+            credential: CredentialId::of_public_key(&public),
+            request_sequence: NonZeroU64::new(1).expect("one is nonzero"),
+            credential_public_key: public,
+            authenticated_node: Some(vos::agent::sdk::NodeId(merge.node().0)),
+            requested_valid_from: observed_slot,
+            requested_expires_at: u64::MAX,
+            plan: self
+                .catalog_request
+                .authorization_plan()
+                .ok_or_else(invalid)?,
+            signature: [0; 64],
+        };
+        call.invocation = call.expected_invocation();
+        call.signature = sign_exact(operator, &call.signing_bytes())
+            .map_err(|_| CleanSystemAgentBootstrapError::Signer)?;
+        call.validate_shape().map_err(|_| invalid())?;
+        AuthorizedCleanSystemAgentBootstrap::prepare_root_authorized(
+            self.descriptor,
+            self.runtime.exact_bytes().to_vec(),
+            self.replicas,
+            observed_slot,
+            self.authority_package.exact_bytes().to_vec(),
+            self.authority_request,
+            self.catalog_package.exact_bytes().to_vec(),
+            self.catalog_request,
+            call,
+            vos::agent::execution::MAX_EXECUTION_GAS,
+            &mut signer,
+            certifier,
+            trust,
+            merge,
+        )
+    }
+}
+
 /// Shared immutable bootstrap derivation for startup and fresh CLI requests.
 /// This derives an expected target, not proof of the daemon's live state.
 pub(crate) fn derive_system_authority_target(
@@ -530,15 +718,6 @@ fn open_clean_system_lifecycle_with_inputs(
         }
         None => (runtime, authority_package, catalog_package),
     };
-    authority_package.require_runtime(AgentProfile::Shared, &runtime)?;
-    catalog_package.require_runtime(AgentProfile::Shared, &runtime)?;
-
-    let (authority_target, creation_nonce) =
-        derive_system_authority_target(space, operator_public, &runtime, &authority_package)?;
-    let system_agent = authority_target.system_agent;
-    let authority = authority_target.binding;
-    let catalog_actor = ActorId::top_level(system_agent, SYSTEM_CATALOG_NAME);
-
     let node_encryption_public = derive_node_encryption_public(daemon, space)?;
     let enrollment =
         sign_node_encryption_enrollment(daemon, space, operator_principal, node_encryption_public)?;
@@ -546,74 +725,18 @@ fn open_clean_system_lifecycle_with_inputs(
         anyhow::bail!("node enrollment does not bind the authenticated transport identity");
     }
 
-    let roster = SystemBootstrapRoster::from_enrollments(
+    let materials = SystemBootstrapMaterials::new(
         space,
-        system_agent,
-        operator_principal,
+        operator_public,
         clean_node,
+        runtime,
+        authority_package,
+        catalog_package,
         &[enrollment],
     )?;
-    let descriptor = AgentDescriptor {
-        identity: AgentIdentity {
-            space,
-            agent: system_agent,
-            owner: operator_principal,
-            profile: AgentProfile::Shared,
-            runtime_deployment: runtime.deployment(),
-            runtime_program: runtime.program(),
-            runtime_producer: runtime.producer(),
-            transition_producer,
-        },
-        creation_nonce,
-        authority,
-        private_recovery: None,
-        runtime_package: runtime.package_ref().clone(),
-        runtime_contract: runtime.manifest().contract,
-        capabilities: runtime.capabilities(),
-        replicas: roster.descriptor_replicas(),
-    };
-    descriptor
-        .validate()
-        .map_err(|error| anyhow::anyhow!("invalid system-Agent descriptor: {error:?}"))?;
-
-    let authority_configuration = roster.authority_configuration(&descriptor, operator_public)?;
-    let replicas = roster.replicas;
-    let catalog_configuration = SystemCatalogConfiguration {
-        space: space.0,
-        system_agent: system_agent.0,
-        system_runtime_deployment: runtime.deployment().0,
-        actor: catalog_actor.0,
-        deployment: catalog_package.deployment().0,
-        program: catalog_package.program().0,
-        authority: CatalogAuthorityState {
-            policy: authority.policy.0,
-            issuer: CatalogIssuerState {
-                principal: authority.issuer.principal.0,
-                actor: authority.issuer.actor.0,
-                deployment: authority.issuer.deployment.0,
-                program: authority.issuer.program.0,
-                producer: authority.issuer.producer.0,
-            },
-            public_key: authority.public_key,
-            initial_epoch: authority.initial_epoch,
-        },
-    };
-    if !catalog_configuration.is_valid() {
-        anyhow::bail!("derived system-catalog configuration is invalid");
-    }
-
-    let authority_request = install_request(
-        system_agent,
-        &authority_package,
-        authority_configuration.encode(),
-        b"authority",
-    )?;
-    let catalog_request = install_request(
-        system_agent,
-        &catalog_package,
-        catalog_configuration.encode(),
-        b"catalog",
-    )?;
+    let authority_target = materials.authority_target();
+    let system_agent = authority_target.system_agent;
+    let authority = authority_target.binding;
     report_phase("bootstrap_material");
 
     let archive = Arc::new(CleanSystemAgentGenesisArchive::new(
@@ -678,41 +801,6 @@ fn open_clean_system_lifecycle_with_inputs(
     let finality: Arc<dyn AgentGenesisFinalityVerifier> = Arc::new(UnavailableAgentFinality);
     let genesis: Arc<dyn SystemAgentGenesisProvider> = archive.clone();
     let mut owner_signer = CleanOperatorIdentitySigner::new(operator)?;
-    let mut planning_signer = CleanOperatorIdentitySigner::new(operator)?;
-    let mut catalog_call = AuthorityCredentialCall {
-        invocation: InvocationId::ZERO,
-        authority: AuthorityActorTarget {
-            space,
-            system_agent,
-            system_runtime_deployment: runtime.deployment(),
-            binding: authority,
-        },
-        managed: ManagedAgentTarget {
-            space,
-            agent: system_agent,
-            owner: operator_principal,
-            profile: AgentProfile::Shared,
-            runtime_deployment: runtime.deployment(),
-            transition_producer,
-        },
-        principal: operator_principal,
-        credential: CredentialId::of_public_key(&operator_public),
-        request_sequence: NonZeroU64::new(1).expect("one is nonzero"),
-        credential_public_key: operator_public,
-        authenticated_node: Some(clean_node),
-        requested_valid_from: observed_slot,
-        requested_expires_at: u64::MAX,
-        plan: catalog_request
-            .authorization_plan()
-            .ok_or_else(|| anyhow::anyhow!("catalog install has no authorization plan"))?,
-        signature: [0; 64],
-    };
-    catalog_call.invocation = catalog_call.expected_invocation();
-    catalog_call.signature = sign_exact(operator, &catalog_call.signing_bytes())?;
-    catalog_call
-        .validate_shape()
-        .map_err(|error| anyhow::anyhow!("invalid catalog authorization call: {error:?}"))?;
-
     let archive_for_certification = Arc::clone(&archive);
     let mut root_certifier = move |root, proposal: &_, catalog: &_| {
         archive_for_certification.certify_fresh(root, proposal, catalog)
@@ -723,23 +811,15 @@ fn open_clean_system_lifecycle_with_inputs(
         if let Some(inputs) = certified_inputs {
             return Ok(inputs.plan().clone());
         }
-        AuthorizedCleanSystemAgentBootstrap::prepare_root_authorized(
-            descriptor,
-            runtime.exact_bytes().to_vec(),
-            replicas,
-            observed_slot,
-            authority_package.exact_bytes().to_vec(),
-            authority_request,
-            catalog_package.exact_bytes().to_vec(),
-            catalog_request,
-            catalog_call,
-            vos::agent::execution::MAX_EXECUTION_GAS,
-            &mut planning_signer,
-            &mut root_certifier,
-            plan_trust,
-            plan_merge,
-        )
-        .map(|prepared| prepared.into_parts().0)
+        materials
+            .prepare(
+                operator,
+                observed_slot,
+                &mut root_certifier,
+                plan_trust,
+                plan_merge,
+            )
+            .map(|prepared| prepared.into_parts().0)
     };
     let mut lifecycle_stores = match local_storage {
         super::local_config::LocalAgentStorage::Image => {
