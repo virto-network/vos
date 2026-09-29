@@ -182,6 +182,12 @@ sharding the customer's ledger without approval.
 
 ## Batch 3 — Measure, recover and release
 
+User decision (2026-09-29): prepare reproducible deployment/load-test tooling;
+the three external test nodes will be provided later. Continue local three-process
+integration checks meanwhile. Tooling preparation and local results do not close
+the hardware, load or soak gates below; no remote deployment is authorized by
+this choice. The separate signed-read recovery-delegation decision remains open.
+
 - [ ] Run the exact release under the acceptance envelope below. Permit **at most
   two measured tuning passes after backend integration**. After two failed passes,
   stop for an evidence-backed scope/architecture decision; do not silently lower
