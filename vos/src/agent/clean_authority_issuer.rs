@@ -4071,6 +4071,34 @@ mod tests {
             .unwrap();
         slot.commit_denial(signature).unwrap();
         let certificate = slot.load_denial_certificate().unwrap().unwrap();
+        let ManagementRequest::Install(install) = previous.request() else {
+            unreachable!()
+        };
+        let denial = super::super::local_lifecycle::SharedInstallDenial::verify(
+            install,
+            previous.call(),
+            &certificate,
+        )
+        .unwrap();
+        assert_eq!(denial.exact_bytes(), certificate);
+        assert!(
+            super::super::local_lifecycle::SharedInstallDenial::verify(
+                install,
+                next.call(),
+                &certificate
+            )
+            .is_err()
+        );
+        let mut wrong_profile = previous.call().clone();
+        wrong_profile.managed.profile = AgentProfile::Local;
+        assert!(
+            super::super::local_lifecycle::SharedInstallDenial::verify(
+                install,
+                &wrong_profile,
+                &certificate
+            )
+            .is_err()
+        );
         let bare = SharedInstallHandoff::new(&previous, &next, &package).unwrap();
         let old_bytes = bare.encode();
         assert_eq!(

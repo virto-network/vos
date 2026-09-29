@@ -767,6 +767,61 @@ where
         Self::complete_retained_install(owner, recovery, signer)
     }
 
+    pub(crate) fn install_denial(
+        &mut self,
+        locator: super::super::genesis::AgentGenesisLocator,
+        install: &super::super::sdk::InstallActor,
+        call: &AuthorityCredentialCall,
+    ) -> Result<Option<super::super::local_lifecycle::SharedInstallDenial>, SharedAgentHostError>
+    where
+        I: super::super::clean_authority_issuer::CleanSharedManagementIntentStore,
+    {
+        if !self.recovered || call.authority != self.authority {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let (recovery, _) = self
+            .entries
+            .iter_mut()
+            .find(|(entry, _)| entry.locator == locator)
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let original = recovery
+            .intent
+            .intent()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let request = ManagementRequest::Install(Box::new(install.clone()));
+        CleanManagementIntent::new(
+            self.authority,
+            original.call().managed,
+            request.clone(),
+            call.clone(),
+            &RawCredentialVerifier,
+        )
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let Some(slot) = recovery.management_intent.as_mut() else {
+            return Ok(None);
+        };
+        let bytes = if slot
+            .intent()
+            .is_some_and(|intent| intent.request() == &request && intent.call() == call)
+        {
+            slot.load_denial_certificate()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+        } else {
+            slot.load_shared_install_handoff()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .filter(|record| {
+                    record.previous.request() == &request && record.previous.call() == call
+                })
+                .and_then(|record| record.denial.map(|(certificate, _)| certificate))
+        };
+        bytes
+            .map(|bytes| {
+                super::super::local_lifecycle::SharedInstallDenial::verify(install, call, &bytes)
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)
+            })
+            .transpose()
+    }
+
     /// Borrow every store until bootstrap has admitted its retained work.
     pub fn startup_admission<'a>(
         &'a mut self,

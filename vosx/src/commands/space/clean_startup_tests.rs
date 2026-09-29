@@ -633,6 +633,13 @@ fn check_shared_file_recovery(
             use std::fs;
             let issuer_path = lifecycle_root.join("shared-management.issuer");
             let issuer_before = fs::read(&issuer_path).unwrap();
+            let (denied_install, denied_call, _) = successor_input.as_ref().unwrap();
+            assert!(
+                lifecycle
+                    .shared_install_denial(locator, denied_install, denied_call)
+                    .unwrap()
+                    .is_none()
+            );
             let system_journal = data
                 .join(SHARED_AGENT_HOST_DIRECTORY)
                 .join(format!("{}.agent", hex::encode(authority.system_agent.0)));
@@ -676,6 +683,29 @@ fn check_shared_file_recovery(
             assert_eq!(journal_files(&journal), applied);
             assert_eq!(fs::read(&issuer_path).unwrap(), issuer_before);
             let denied_system = journal_files(&system_journal);
+            let certificate = lifecycle
+                .shared_install_denial(locator, denied_install, denied_call)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                vos::agent::local_lifecycle::SharedInstallDenial::verify(
+                    denied_install,
+                    denied_call,
+                    certificate.exact_bytes()
+                )
+                .unwrap(),
+                certificate
+            );
+            let mut forged_certificate = certificate.exact_bytes().to_vec();
+            *forged_certificate.last_mut().unwrap() ^= 1;
+            assert!(
+                vos::agent::local_lifecycle::SharedInstallDenial::verify(
+                    denied_install,
+                    denied_call,
+                    &forged_certificate
+                )
+                .is_err()
+            );
             assert_eq!(
                 lifecycle.complete_shared_install(locator),
                 Err(SharedAgentHostError::ScopeMismatch)
@@ -684,6 +714,12 @@ fn check_shared_file_recovery(
             drop(lifecycle);
             let (_, mut lifecycle) = open();
             let recovered_system = journal_files(&system_journal);
+            assert_eq!(
+                lifecycle
+                    .shared_install_denial(locator, denied_install, denied_call)
+                    .unwrap(),
+                Some(certificate.clone())
+            );
             assert_eq!(
                 lifecycle.complete_shared_install(locator),
                 Err(SharedAgentHostError::ScopeMismatch)
@@ -697,10 +733,18 @@ fn check_shared_file_recovery(
                 acknowledgement
             );
             if matches!(interrupt_install, InstallFault::DenialSuccessor) {
-                let (install, mut successor, package) = successor_input.unwrap();
+                let (install, mut successor, package) = successor_input.as_ref().unwrap().clone();
                 successor.request_sequence = NonZeroU64::new(3).unwrap();
                 successor.invocation = successor.expected_invocation();
                 successor.signature = sign_exact(&operator, &successor.signing_bytes()).unwrap();
+                assert!(
+                    vos::agent::local_lifecycle::SharedInstallDenial::verify(
+                        &install,
+                        &successor,
+                        certificate.exact_bytes()
+                    )
+                    .is_err()
+                );
                 let fault = SharedManagementStageFault::install_handoff(&lifecycle_root);
                 assert_eq!(
                     lifecycle.prepare_shared_install(install.clone(), successor.clone(), &package),
@@ -725,6 +769,18 @@ fn check_shared_file_recovery(
                 drop(lifecycle);
                 let (_, mut lifecycle) = open();
                 let system = journal_files(&system_journal);
+                assert_eq!(
+                    lifecycle
+                        .shared_install_denial(locator, denied_install, denied_call)
+                        .unwrap(),
+                    Some(certificate)
+                );
+                assert!(
+                    lifecycle
+                        .shared_install_denial(locator, denied_install, &successor)
+                        .unwrap()
+                        .is_none()
+                );
                 assert_eq!(
                     lifecycle.complete_shared_install(locator).unwrap(),
                     terminal

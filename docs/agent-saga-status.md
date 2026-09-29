@@ -550,7 +550,21 @@ one failed denial test passes in isolation, and the complete two-thread rerun
 passes all 26 tests (373.56 s).
 Do not count the unrestricted run as qualification or assume its cause without
 further evidence.
-Still open before ingress: return a distinct authenticated public denial response.
+The authenticated denial response API now exposes `SharedInstallDenial`, which
+verifies existing CND1 bytes against a caller-retained signed Install and Authority
+pins. The recovered owner exposes a read-only, request-bound certificate lookup,
+including a prior denial retained in the bounded successor handoff. It neither
+executes policy nor releases reservations; absence is not a terminal verdict.
+Clients must retain their received certificate rather than expect unbounded server
+history. Remaining public ingress work must transport this distinct denial result
+through the Shared HTTP/CLI workflow, not translate a generic ScopeMismatch into
+denial or conflate it with signed physical application failure.
+The physical file-owner successor test passes (244.84 s), including absence before
+completion, exact certificate retrieval before/after restart and after successor
+application, rejection of a forged certificate or different request, and unchanged
+system journal on lookup/retry. All 20 issuer tests pass, including the public
+verifier's profile/request binding, as do the default `vosx` build and formatting/
+diff checks. Logs: `target/shared-denial-response-*` in the shared build root.
 These are not release-qualified public management paths, and bundled artifacts
 remain unchanged.
 

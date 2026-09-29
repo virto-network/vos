@@ -181,6 +181,41 @@ pub struct LocalCreateDenial {
     bytes: Vec<u8>,
 }
 
+/// Authenticated retirement of one exact refused Shared Install. This is not
+/// an application failure, receipt, or proof that the actor is installed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedInstallDenial {
+    bytes: Vec<u8>,
+}
+
+impl SharedInstallDenial {
+    pub const MAX_BYTES: usize = super::clean_management_intent::MAX_INTENT_BYTES;
+
+    /// Verify against the caller's independently retained signed request and
+    /// Authority pins, never a request supplied by the response itself.
+    pub fn verify(
+        install: &super::sdk::InstallActor,
+        call: &AuthorityCredentialCall,
+        bytes: &[u8],
+    ) -> Result<Self, crate::service::wire::DecodeError> {
+        if call.managed.profile != AgentProfile::Shared {
+            return Err(crate::service::wire::DecodeError::NonCanonical);
+        }
+        super::clean_management_intent::verify_denial_record(
+            bytes,
+            &ManagementRequest::Install(Box::new(install.clone())),
+            call,
+        )?;
+        Ok(Self {
+            bytes: bytes.to_vec(),
+        })
+    }
+
+    pub fn exact_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 impl LocalCreateDenial {
     pub const MAX_BYTES: usize = super::clean_management_intent::MAX_INTENT_BYTES;
 
@@ -2507,6 +2542,13 @@ where
         signer: &mut S,
     ) -> Result<SignedManagementTerminal, SharedAgentHostError>;
 
+    fn install_denial(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+        install: &super::sdk::InstallActor,
+        call: &AuthorityCredentialCall,
+    ) -> Result<Option<SharedInstallDenial>, SharedAgentHostError>;
+
     fn reserve_create(
         &mut self,
         _: &AgentDescriptor,
@@ -2616,6 +2658,15 @@ where
         self.0.complete_install(owner, locator, signer)
     }
 
+    fn install_denial(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+        install: &super::sdk::InstallActor,
+        call: &AuthorityCredentialCall,
+    ) -> Result<Option<SharedInstallDenial>, SharedAgentHostError> {
+        self.0.install_denial(locator, install, call)
+    }
+
     fn reserve_create(
         &mut self,
         descriptor: &AgentDescriptor,
@@ -2714,6 +2765,17 @@ where
     ) -> Result<SignedManagementTerminal, SharedAgentHostError> {
         super::clean_bootstrap::NativeSharedGenesisController::complete_install(
             self, owner, locator, signer,
+        )
+    }
+
+    fn install_denial(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+        install: &super::sdk::InstallActor,
+        call: &AuthorityCredentialCall,
+    ) -> Result<Option<SharedInstallDenial>, SharedAgentHostError> {
+        super::clean_bootstrap::NativeSharedGenesisController::install_denial(
+            self, locator, install, call,
         )
     }
 }
@@ -3241,6 +3303,24 @@ where
             .as_mut()
             .ok_or(SharedAgentHostError::Conflict)?
             .complete_install(&mut system, locator, &mut self.signer)
+    }
+
+    /// Return a signed policy-denial certificate for this exact request, not
+    /// for whichever request currently occupies the Agent's management slot.
+    /// This read neither executes policy nor releases a reservation. One prior
+    /// denial may remain available in the bounded successor handoff; older
+    /// history is not promised. Public ingress remains separately gated.
+    /// `None` means no retained certificate; it is not a success or denial.
+    pub fn shared_install_denial(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+        install: &super::sdk::InstallActor,
+        call: &AuthorityCredentialCall,
+    ) -> Result<Option<SharedInstallDenial>, SharedAgentHostError> {
+        self.shared_genesis
+            .as_mut()
+            .ok_or(SharedAgentHostError::Conflict)?
+            .install_denial(locator, install, call)
     }
 
     /// Adopt the recovered admin stores for the full production-owner lifetime.
