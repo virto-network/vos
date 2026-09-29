@@ -153,8 +153,26 @@ Export with `AUTHORITY_FIXED_ROSTER_MUTATION_FIXTURE` and host test
 `compiled_authority_node_mutations_match_native_rows_and_retry --ignored`
 with that directory as `AUTHORITY_NODE_FIXTURE` and the candidate ELF above.
 This qualifies the guest's mutation and encoded-image recovery, not durable
-file publication. Candidate installation, filesystem recovery and multi-node
-quorum remain unqualified.
+file publication. A subsequent candidate-owner test installs the rebuilt
+program and matching schema through real singleton bootstrap, executes a signed
+credential query, drops the owner and reopens its file-backed runtime/Raft journal.
+The logical journal position, runtime commitment and routing identity are unchanged;
+a fresh signed query returns the same credential projection. Native outer runtime
+run passes (6.97 s): `fixed-roster-guest.ImAzBc/candidate-owner-fresh-query.log`.
+The bootstrap pins/record/issuer stores remain retained test-memory stores, and
+the Catalog is a fixture actor. This is not process-crash, full production-store
+or three-node qualification. The test deliberately accounts for Raft leader-no-op
+slot consumption and uses a fresh query nonce after the previous read is ACKed;
+initial attempts incorrectly expected identical physical slot counters and replay
+of an already retired read. The first attempted query used another fixture's
+credential and was correctly refused. No production checks were weakened.
+The same test also passes with the actual bundled outer PVM and the native clean
+shortcut disabled (17.66 s):
+`fixed-roster-guest.ImAzBc/candidate-owner-outer-pvm.log`, using
+`VOS_AGENT_PROFILE_REFINE_MACHINES=1`. This qualifies the candidate actor package
+inside the released runtime for this singleton file-journal path; it does not
+qualify three-node startup or the production bootstrap metadata stores.
+Full production-store recovery and multi-node quorum remain unqualified.
 The current full Authority host suite passes: 81 passed, 2 ignored (30.76 s),
 `fixed-roster-guest.ImAzBc/mutation-host-suite.log`.
 The candidate Authority node-table header now supports exactly one or three

@@ -14447,6 +14447,135 @@ mod tests {
         }
 
         #[test]
+        #[ignore = "requires AUTHORITY_CANDIDATE_ELF; executes candidate bootstrap and file-journal reopen"]
+        fn candidate_authority_real_bootstrap_reopens_file_journal() {
+            let elf = std::fs::read(std::env::var("AUTHORITY_CANDIDATE_ELF").unwrap()).unwrap();
+            let program = vos_pvm_compiler::link_elf_spi(&elf).unwrap();
+            let schema = crate::agent::schema::raw_section_from_elf(&elf).unwrap();
+            let mut package =
+                PackageEnvelope::decode(include_bytes!("../../../vosx/blobs/system_authority.vos"))
+                    .unwrap();
+            let PackageManifest::Actor(manifest) = &mut package.manifest else {
+                unreachable!()
+            };
+            let old_program =
+                core::mem::replace(&mut manifest.program, BlobRef::of_bytes(&program));
+            let old_schema =
+                core::mem::replace(&mut manifest.state_lane_schema, BlobRef::of_bytes(&schema));
+            package.artifacts.retain(|artifact| {
+                artifact.identity != old_program && artifact.identity != old_schema
+            });
+            for bytes in [program, schema] {
+                package.artifacts.push(PackageArtifact {
+                    identity: BlobRef::of_bytes(&bytes),
+                    bytes,
+                });
+            }
+            package
+                .artifacts
+                .sort_unstable_by(|a, b| a.identity.cmp(&b.identity));
+            // The fixture builder signs the complete new program/schema closure.
+            let fixture = native_authority_package_fixture(false, &package.encode().unwrap());
+            let directory = TestDirectory::new("candidate-authority-real-bootstrap");
+            let network = network(NODE_SEED);
+            let pins = BootstrapMemoryStore::default();
+            let record = BootstrapMemoryStore {
+                bootstrap_clock: Some(fixture.logical_slot.as_ref().unwrap().clone()),
+                ..BootstrapMemoryStore::default()
+            };
+            let issuer = IssuerMemoryStore::default();
+            let provider = Arc::new(MemoryProvider::new(fixture.provision.clone()));
+            let mut signer = CountingSigner::new();
+            let mut owner = open_owner(
+                &fixture,
+                &directory,
+                pins.clone(),
+                record.clone(),
+                issuer.clone(),
+                &mut signer,
+                provider.clone(),
+                network.clone(),
+            )
+            .unwrap();
+            let public = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32])
+                .verifying_key()
+                .to_bytes();
+            let (node_key, _, _, node) = node_material();
+            let mut query = AuthorityProjectionQuery {
+                authority: owner.authority_target(),
+                credential: CredentialId::of_public_key(&public),
+                nonce: Hash([0xdd; 32]),
+                selector: AuthorityProjectionSelector::Credential,
+                authentication: AuthorityIngressAuthentication::SshNodeAttestation {
+                    credential_public_key: public,
+                    node: NodeId(node.0),
+                    request_binding: Hash([0xde; 32]),
+                    signature: [1; 64],
+                },
+            };
+            let signature = node_key.sign(&query.signing_bytes()).to_bytes();
+            if let AuthorityIngressAuthentication::SshNodeAttestation {
+                signature: value, ..
+            } = &mut query.authentication
+            {
+                *value = signature;
+            }
+            let response = owner.invoke_authority_projection(query.clone()).unwrap();
+            AuthorityCredentialProjection::decode(&response)
+                .unwrap()
+                .validate_shape()
+                .unwrap();
+            let physical = native_owner_physical_state(&owner);
+            drop(owner);
+            let mut reopened = open_owner(
+                &fixture,
+                &directory,
+                pins,
+                record,
+                issuer,
+                &mut signer,
+                provider,
+                network.clone(),
+            )
+            .unwrap();
+            let (position, commitment, mut status) = native_owner_physical_state(&reopened);
+            assert_eq!(position, physical.0);
+            assert_eq!(commitment, physical.1);
+            // Reattaching Raft can append its leader no-op without publishing
+            // another runtime operation. Compare all durable identity/status
+            // fields while accounting for that physical slot consumption.
+            assert!(status.applied_slots >= physical.2.applied_slots);
+            assert_eq!(
+                status.applied_slots + status.remaining_slots,
+                physical.2.applied_slots + physical.2.remaining_slots
+            );
+            status.applied_slots = physical.2.applied_slots;
+            status.remaining_slots = physical.2.remaining_slots;
+            assert_eq!(status, physical.2);
+            // The first read's Invoke/ACK pair is already retired. A fresh
+            // inspection needs a fresh signed nonce, not that retired ID.
+            let original_query = query.clone();
+            query.nonce = Hash([0xdf; 32]);
+            let signature = node_key.sign(&query.signing_bytes()).to_bytes();
+            if let AuthorityIngressAuthentication::SshNodeAttestation {
+                signature: value, ..
+            } = &mut query.authentication
+            {
+                *value = signature;
+            }
+            let fresh = reopened.invoke_authority_projection(query).unwrap();
+            let mut projection = AuthorityCredentialProjection::decode(&fresh).unwrap();
+            projection.validate_shape().unwrap();
+            projection.query = original_query;
+            assert_eq!(
+                projection,
+                AuthorityCredentialProjection::decode(&response).unwrap()
+            );
+            drop(reopened);
+            stop_network(network);
+        }
+
+        #[test]
         fn native_bundled_authority_fresh_credential_query_retires_exact_pair() {
             check_bundled_authority_fresh_query(false);
         }
