@@ -4101,13 +4101,7 @@ impl ReplaySealedGenesis {
         else {
             return Err(ReplayError::InvalidRecord);
         };
-        let [replica] = descriptor.replicas.as_slice() else {
-            return Err(ReplayError::InvalidRecord);
-        };
-        if descriptor.identity.profile != crate::agent_sdk::AgentProfile::Shared
-            || !sdk_replica_matches_host(replica, prepared.replica)
-            || prepared.replica.role != super::ReplicaRole::Voter
-        {
+        if !super::bootstrap::descriptor_matches_root_replica(descriptor, prepared.replica) {
             return Err(ReplayError::InvalidRecord);
         }
         let authority_binding = Hash(descriptor.authority.commitment().0);
@@ -4297,13 +4291,8 @@ impl ReplaySealedOrdinaryGenesis for ReplaySealedGenesis {
         else {
             return false;
         };
-        let [replica] = descriptor.replicas.as_slice() else {
-            return false;
-        };
         !self.post_create.is_empty()
-            && descriptor.identity.profile == crate::agent_sdk::AgentProfile::Shared
-            && sdk_replica_matches_host(replica, self.replica)
-            && self.replica.role == super::ReplicaRole::Voter
+            && super::bootstrap::descriptor_matches_root_replica(descriptor, self.replica)
     }
 
     fn admission_record(&self) -> Option<&AgentGenesisAdmissionRecord> {

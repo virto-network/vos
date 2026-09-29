@@ -58,7 +58,7 @@ pub const MAX_SYSTEM_AGENT_GENESIS_PROVISION_BYTES: usize = SERVICE_WIRE_HEADER_
     + MAX_SYSTEM_GENESIS_EVIDENCE_BYTES;
 
 /// Stable out-of-band archive key for one clean system-Agent genesis. The
-/// node is the exact physical replica selected by the one-voter Shared root.
+/// node is the exact physical replica selected from the root-bound Shared roster.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SystemAgentGenesisLocator {
     pub space: SpaceId,
@@ -432,7 +432,6 @@ pub(crate) fn validate_prepared_system_agent_genesis_root(
     let (descriptor, _, _) = system_create(prepared.create())
         .ok_or(SystemAgentGenesisBootstrapError::InvalidPreparedSeal)?;
     if descriptor.identity.profile != crate::agent_sdk::AgentProfile::Shared
-        || descriptor.replicas.len() != 1
         || !descriptor_matches_root_replica(descriptor, prepared.replica())
         || configured_root.record().space() != SpaceId(descriptor.identity.space.0)
         || configured_root.record().system_agent() != AgentId(descriptor.identity.agent.0)
@@ -489,23 +488,23 @@ fn system_create(
     Some((descriptor, request, authority.selector.decision_sequence))
 }
 
-fn descriptor_matches_root_replica(
+/// Common fixed-roster predicate for proposal admission and journal sealing.
+/// The signed Create binds the complete roster; local selection cannot alter it.
+pub(crate) fn descriptor_matches_root_replica(
     descriptor: &crate::agent_sdk::AgentDescriptor,
     replica: AgentReplica,
 ) -> bool {
-    let [candidate] = descriptor.replicas.as_slice() else {
-        return false;
-    };
-    descriptor.identity.profile == crate::agent_sdk::AgentProfile::Shared
-        && candidate.node.0 == replica.node.0
-        && candidate.principal.0 == replica.principal.0
-        && matches!(
-            (candidate.role, replica.role),
-            (
-                crate::agent_sdk::ReplicaRole::Voter,
-                super::ReplicaRole::Voter
-            )
-        )
+    descriptor.validate().is_ok()
+        && descriptor.identity.profile == crate::agent_sdk::AgentProfile::Shared
+        && matches!(descriptor.replicas.len(), 1 | 3)
+        && descriptor
+            .replicas
+            .iter()
+            .all(|candidate| candidate.role == crate::agent_sdk::ReplicaRole::Voter)
+        && replica.role == super::ReplicaRole::Voter
+        && descriptor.replicas.iter().any(|candidate| {
+            candidate.node.0 == replica.node.0 && candidate.principal.0 == replica.principal.0
+        })
 }
 
 fn encode_replica(encoder: &mut Encoder<'_>, replica: AgentReplica) {

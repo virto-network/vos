@@ -2536,22 +2536,10 @@ fn validate_sealed_genesis_shape(
     else {
         return Err(JournalStoreError::NonCanonical);
     };
-    let [replica] = descriptor.replicas.as_slice() else {
-        return Err(JournalStoreError::NonCanonical);
-    };
     if post_create.is_empty()
-        || descriptor.identity.profile != crate::agent_sdk::AgentProfile::Shared
         || descriptor.identity.agent.0 != agent.0
         || sealed.replica().node != node
-        || replica.node.0 != sealed.replica().node.0
-        || replica.principal.0 != sealed.replica().principal.0
-        || !matches!(
-            (replica.role, sealed.replica().role),
-            (
-                crate::agent_sdk::ReplicaRole::Voter,
-                super::ReplicaRole::Voter
-            )
-        )
+        || !super::bootstrap::descriptor_matches_root_replica(descriptor, sealed.replica())
     {
         return Err(JournalStoreError::ScopeMismatch);
     }

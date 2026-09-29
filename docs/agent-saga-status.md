@@ -50,11 +50,33 @@ bootstrap/exact-restart factory regression passes (2.05 s). Logs:
 `target/fixed-system-genesis-singleton-restart.log`. Formatting and diff checks
 pass. Bundled artifacts and the reviewer checkpoint are unchanged.
 
-Only the internal input/replay preparation boundary currently admits three
-voters. Root proposal/sealing, bootstrap pins/owner and released startup remain
-singleton-only. Next separate shared bootstrap material from node-local locator
-selection, bind all three replicas to the same independently certified root,
-and qualify their real quorum/startup/restart before exposing configuration.
+Root proposal validation, replay sealing and journal initialization now share
+one fixed-roster predicate. The expanded physical test signs one independent
+root certificate and reuses it across all three node-specific provisions. It
+requires one genesis ID and distinct local heads; it initializes each memory
+journal idempotently and rejects a wrong-node destination, another node's
+provision and a newly signed Create with an altered roster. The complete
+initialization case passes (1.25 s) in
+`target/fixed-system-genesis-sealed-initialization.log`. Its first run found an
+additional singleton-only persistence guard; that guard now uses the same
+roster predicate, without removing scope or certificate validation.
+The root signer committee is separate from the three data-plane voters: this
+test qualifies certificate reuse, not a three-node network quorum.
+All 58 replay tests and 97 journal-store tests pass (3.21 s / 15.48 s), in
+`target/fixed-system-genesis-sealed-replay-final.log` and
+`target/fixed-system-genesis-store-regressions.log`. The final driver suite passes
+all 34 tests (35.59 s), and the singleton factory/restart regression passes
+(2.08 s), in `target/fixed-system-genesis-sealed-driver-final.log` and
+`target/fixed-system-genesis-sealed-singleton-restart.log`.
+The `std`-only library check
+passes, but its unit-test build fails on feature-gated references in the existing
+supervisor-adapter and issuer tests (45 compiler errors); this is not test
+coverage. Keep that feature-test gap for release cleanup. Logs:
+`target/fixed-system-genesis-std-{check,only}.log`.
+
+Bootstrap pins/owner and released startup remain singleton-only. Next separate
+shared bootstrap material from node-local locator selection and qualify their
+real file ownership, quorum/startup/restart before exposing configuration.
 Preserve exact roster, credential-node, package and receipt checks; do not
 replace them with index-zero assumptions or permissive finality. Do not claim
 that node-independent replay commitments alone establish a deployable cluster.

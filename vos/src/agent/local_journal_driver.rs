@@ -4682,7 +4682,7 @@ where
     /// input still has to pass [`Self::prepare_system_genesis`] and the root
     /// seal before any Shared journal bytes may be initialized. Preparation
     /// accepts the existing singleton and a fixed three-voter roster; this
-    /// does not enable multi-node root certification or startup.
+    /// does not enable multi-node startup.
     pub(crate) fn clean_shared_system_genesis_input(
         descriptor: crate::agent_sdk::AgentDescriptor,
         runtime_package: &super::package_admission::AdmittedRuntimePackage,
@@ -4803,18 +4803,7 @@ where
         else {
             return Err(LocalReplayExecutorError::InvalidRequest.into());
         };
-        if descriptor.validate().is_err()
-            || descriptor.identity.profile != crate::agent_sdk::AgentProfile::Shared
-            || !matches!(descriptor.replicas.len(), 1 | 3)
-            || descriptor
-                .replicas
-                .iter()
-                .any(|entry| entry.role != crate::agent_sdk::ReplicaRole::Voter)
-            || !descriptor.replicas.iter().any(|entry| {
-                entry.node.0 == replica.node.0 && entry.principal.0 == replica.principal.0
-            })
-            || replica.role != super::ReplicaRole::Voter
-        {
+        if !super::bootstrap::descriptor_matches_root_replica(descriptor, replica) {
             return Err(LocalReplayExecutorError::InvalidRequest.into());
         }
         let supplied = SuppliedCatalogBlobResolver::from_catalog(catalog)?;
@@ -7683,8 +7672,18 @@ mod tests {
 
     #[test]
     fn fixed_system_genesis_preparation_is_replica_independent() {
+        use super::super::bootstrap::{
+            SystemAgentGenesisLocator, SystemAgentGenesisProposal, SystemAgentGenesisProvision,
+            seal_prepared_system_agent_genesis,
+        };
+        use super::super::committee::{
+            AuthorityCommittee, AuthorityCommitteeMember, AuthorityMemberRole,
+            AuthorityQuorumCertificate, AuthoritySignature, AuthoritySignerId, RootAnchorPins,
+            RootAnchorRecord, SystemAgentGenesisClaim, SystemAgentGenesisEvidence,
+        };
+        use super::super::replay::ReplaySealedOrdinaryGenesis;
         use crate::agent_sdk as sdk;
-        type Driver = LocalJournalAgentDriver<FileAgentJournalStore>;
+        type Driver = LocalJournalAgentDriver<MemoryAgentJournalStore>;
         let runtime = super::super::package_admission::admitted_standard_runtime_for_test(
             "fixed-system-genesis",
             0x42,
@@ -7710,6 +7709,10 @@ mod tests {
         });
         assert!(!trust.use_native_clean_runtime_for_test());
         let mut expected = None;
+        let mut certification: Option<(RootAnchorPins, SystemAgentGenesisEvidence)> = None;
+        let mut genesis = None;
+        let mut first_provision = None;
+        let mut local_heads = Vec::new();
         for entry in &descriptor.replicas {
             let merge: Arc<dyn LocalMergeAuthenticator> =
                 Arc::new(StaticMerge(NodeId(entry.node.0)));
@@ -7746,6 +7749,133 @@ mod tests {
             } else {
                 expected = Some(commitments);
             }
+            if certification.is_none() {
+                // One independently configured root certifies the shared
+                // commitments once, not a new genesis per local node.
+                let root_key = SigningKey::from_bytes(&[0x81; 32]);
+                let committee = AuthorityCommittee::new(
+                    SpaceId(descriptor.identity.space.0),
+                    Hash(descriptor.authority.commitment().0),
+                    1,
+                    None,
+                    vec![
+                        AuthorityCommitteeMember::new(
+                            NodeId([0x82; 32]),
+                            root_key.verifying_key().to_bytes(),
+                            AuthorityMemberRole::Voter,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap();
+                let record = RootAnchorRecord::new(
+                    1,
+                    SpaceId(descriptor.identity.space.0),
+                    crate::service::AgentId(descriptor.identity.agent.0),
+                    Hash(descriptor.authority.commitment().0),
+                    Hash([0x83; 32]),
+                    committee.clone(),
+                )
+                .unwrap();
+                let claim = SystemAgentGenesisClaim::new(&record, prepared.expectations()).unwrap();
+                let message = AuthorityQuorumCertificate::signing_message(
+                    committee.authority_binding(),
+                    committee.epoch(),
+                    committee.commitment(),
+                    claim.authority_claim(),
+                );
+                let certificate = AuthorityQuorumCertificate::new(
+                    &committee,
+                    claim.authority_claim(),
+                    vec![
+                        AuthoritySignature::new(
+                            AuthoritySignerId::of_raw_ed25519(&root_key.verifying_key().to_bytes()),
+                            root_key.sign(&message.0).to_bytes(),
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap();
+                let pins = RootAnchorPins::new(
+                    record.clone(),
+                    record.config_version(),
+                    record.id(),
+                    record.config_commitment(),
+                    claim.authority_claim(),
+                )
+                .unwrap();
+                certification = Some((
+                    pins,
+                    SystemAgentGenesisEvidence::new(claim, certificate).unwrap(),
+                ));
+            }
+            let (pins, evidence) = certification.as_ref().unwrap();
+            let proposal = SystemAgentGenesisProposal::from_prepared(
+                SystemAgentGenesisLocator {
+                    space: SpaceId(descriptor.identity.space.0),
+                    agent: crate::service::AgentId(descriptor.identity.agent.0),
+                    node: replica.node,
+                },
+                &prepared,
+            )
+            .unwrap();
+            let provision =
+                SystemAgentGenesisProvision::new(proposal, pins.clone(), evidence.clone()).unwrap();
+            if let Some(first) = &first_provision {
+                let wrong_local_prepared = Driver::prepare_system_genesis(
+                    input.clone(),
+                    replica,
+                    &catalog,
+                    trust.clone(),
+                    merge.clone(),
+                )
+                .unwrap();
+                assert!(
+                    seal_prepared_system_agent_genesis(wrong_local_prepared, pins, first).is_err()
+                );
+            } else {
+                first_provision = Some(provision.clone());
+            }
+            let sealed = seal_prepared_system_agent_genesis(prepared, pins, &provision).unwrap();
+            assert_eq!(sealed.replica(), replica);
+            if let Some(genesis) = genesis {
+                assert_eq!(sealed.genesis().id(), genesis);
+            } else {
+                genesis = Some(sealed.genesis().id());
+            }
+            assert!(ReplaySealedOrdinaryGenesis::validates_post_create_state(
+                &sealed
+            ));
+            assert!(ReplaySealedOrdinaryGenesis::validate_seal(&sealed).is_ok());
+            assert!(!local_heads.contains(&sealed.initial_heads()));
+            local_heads.push(sealed.initial_heads());
+            let mut store =
+                MemoryAgentJournalStore::new(sealed.genesis().runtime().agent, replica.node)
+                    .unwrap();
+            for blob in &catalog {
+                store
+                    .put_blob(
+                        JournalBlobClass::CatalogArtifact,
+                        &blob.reference,
+                        &blob.bytes,
+                    )
+                    .unwrap();
+            }
+            assert!(store.initialize(&sealed).unwrap());
+            assert!(!store.initialize(&sealed).unwrap());
+            assert_eq!(store.genesis().unwrap().as_ref(), Some(sealed.genesis()));
+            assert_eq!(
+                store.heads().unwrap().as_ref(),
+                Some(&sealed.initial_heads())
+            );
+            let mut wrong_node_store =
+                MemoryAgentJournalStore::new(sealed.genesis().runtime().agent, NodeId([0x7f; 32]))
+                    .unwrap();
+            assert_eq!(
+                wrong_node_store.initialize(&sealed),
+                Err(JournalStoreError::ScopeMismatch)
+            );
+            assert!(wrong_node_store.genesis().unwrap().is_none());
             let mut wrong_principal = replica;
             wrong_principal.principal = crate::service::PrincipalId([0x7f; 32]);
             assert!(
@@ -7759,6 +7889,33 @@ mod tests {
                 .is_err()
             );
         }
+        // A newly signed Create with a changed roster is still not authorized
+        // by the independently pinned original genesis certificate.
+        let mut changed = descriptor.clone();
+        changed.replicas[2].principal = sdk::PrincipalId([0x7e; 32]);
+        let request = sdk::ManagementRequest::Create(Box::new(changed.clone()));
+        let changed_receipt = clean_test_receipt(&changed, &request, 1, &key);
+        let merge: Arc<dyn LocalMergeAuthenticator> = Arc::new(StaticMerge(nodes[0]));
+        let (input, catalog) = Driver::clean_shared_system_genesis_input(
+            changed,
+            &runtime,
+            changed_receipt,
+            10,
+            &trust,
+            &merge,
+        )
+        .unwrap();
+        let replica = first_provision.as_ref().unwrap().proposal().replica();
+        let prepared =
+            Driver::prepare_system_genesis(input, replica, &catalog, trust.clone(), merge).unwrap();
+        assert!(
+            seal_prepared_system_agent_genesis(
+                prepared,
+                &certification.as_ref().unwrap().0,
+                first_provision.as_ref().unwrap(),
+            )
+            .is_err()
+        );
         let outsider: Arc<dyn LocalMergeAuthenticator> = Arc::new(StaticMerge(NodeId([0x7f; 32])));
         assert!(
             Driver::clean_shared_system_genesis_input(
