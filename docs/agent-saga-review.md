@@ -1,5 +1,44 @@
 # Agent saga: fixed three-node startup and projection recovery
 
+## Review follow-up: certificate binding and early roster rejection
+
+The follow-up to `310ef841` addresses both findings in
+`target/review-fixed-startup.1vfXXQ/REVIEW.md` (shared build root).
+
+- P1: `AuthorizedCleanSystemAgentBootstrap::validate` recomputes the full root
+  certification and checks the exact derived Create and Authority-install
+  decisions. This covers construction, imported plan decoding and durable reopen,
+  while preserving replica-independent certification and local roster selection.
+  Twelve mutation cases exercise rejection through validation, decode, stored
+  records and both import modes. The reviewer's unchanged public gas-mutation
+  reproducer now rejects the altered bundle; the original bundle remains valid.
+- P2: unsupported incoming rosters fail before control-store creation/import;
+  unsupported stored plans fail before import or bootstrap-owner initialization.
+  Tests explicitly select the production policy in the shared startup function;
+  candidate-only three-node fixtures retain their existing opt-in test policy.
+  The fresh-root physical test proves no files are left and singleton retry on
+  that root succeeds. This is not a non-test daemon subprocess qualification.
+
+Evidence in the shared target, prefix `fixed-startup-review-fixes-`:
+`binding-tests.log` (12 mutations in one passing test), `certified-tests.log`
+(4 passing tests, including valid common-roster localization),
+`public-reproducer.log` (unchanged reviewer reproducer passes),
+`production-gate.log` (fresh-root rejection and singleton retry pass),
+`cli-suite.log` (298 passed, 45 ignored), and `production-build.log`
+(non-test CLI builds). `stored-roster-final.log` passes three physical owners'
+startup/reopen and stored-plan rejection without file changes (34.20 s).
+`std-check-final.log`, formatting and diff checks pass. The first stored-roster
+test attempted inspection while the live owner held the control-store lock;
+its `Busy` failure is retained in `stored-roster.log`, superseded by the test
+at the actual closed-owner restart boundary. No artifact pins, VM backend or
+release gates changed.
+
+The [live plan](agent-saga-status.md) now puts bounded interpreter/recompiler
+measurement ahead of further tuning, without dropping the remaining recovery,
+Shared workflow, Clerk, capacity or operational release gates.
+
+## Original reviewed checkpoint
+
 Candidate code checkpoint: `310ef841`. Review `f1bfa1bd..310ef841` as one
 integration batch, grouped into the three areas below. It contains 30 commits
 across 21 files; individual commits are implementation history, not separate

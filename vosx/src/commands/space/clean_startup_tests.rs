@@ -470,6 +470,13 @@ enum FixedRosterStage {
     Owners,
     Participants,
     Routes,
+    ProductionGate,
+}
+
+#[test]
+#[ignore = "requires AUTHORITY_CANDIDATE_ELF; production roster rejection before writes and singleton retry"]
+fn candidate_production_roster_gate_preserves_fresh_root_for_singleton_retry() {
+    check_fixed_roster_preparation(FixedRosterStage::ProductionGate);
 }
 
 fn check_fixed_roster_preparation(stage: FixedRosterStage) {
@@ -577,6 +584,58 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
     let published = journal_files(&certificate_path);
     let bundle = scratch.0.join("common.bundle");
     std::fs::write(&bundle, prepared.encode_import().unwrap()).unwrap();
+    if stage == FixedRosterStage::ProductionGate {
+        let data = scratch.0.join("rejected-import");
+        drop(crate::commands::space::clean_store::ensure_private_directory(&data).unwrap());
+        let daemon = &daemons[0];
+        let peer = daemon.public().to_peer_id();
+        let network = Arc::new(Network::start(NetworkConfig {
+            keypair: daemon.clone(),
+            local_prefix: derive_node_prefix(&peer),
+            listen: vec![],
+            bootstrap: vec![],
+            auto_dial_mdns: false,
+        }));
+        let local = read_certified_bootstrap_bundle(&bundle, space.0, &operator, daemon).unwrap();
+        let before = journal_files(&data);
+        let error = open_clean_system_lifecycle_with_roster_policy(
+            network.clone(),
+            &data,
+            space.0,
+            &operator,
+            daemon,
+            crate::commands::space::local_config::LocalAgentStorage::Image,
+            &data.join("host.lock"),
+            Some(&local),
+            false,
+            Some(&inputs),
+        )
+        .err()
+        .expect("production must reject a three-node import");
+        assert!(
+            error.to_string().contains("requires singleton bootstrap"),
+            "{error:#}"
+        );
+        assert_eq!(journal_files(&data), before);
+        assert_eq!(std::fs::read_dir(&data).unwrap().count(), 0);
+        // Removing the bundle is enough: the rejected input left no plan,
+        // archive, issuer, journal or host lock to poison supported startup.
+        let (_, owner) = open_clean_system_lifecycle_with_roster_policy(
+            network,
+            &data,
+            space.0,
+            &operator,
+            daemon,
+            crate::commands::space::local_config::LocalAgentStorage::Image,
+            &data.join("host.lock"),
+            None,
+            false,
+            Some(&inputs),
+        )
+        .unwrap();
+        drop(owner);
+        return;
+    }
     for (index, daemon) in daemons.iter().enumerate() {
         let local = read_certified_bootstrap_bundle(&bundle, space.0, &operator, daemon).unwrap();
         assert_eq!(local.plan().pins().node(), enrollments[index].node);
@@ -758,6 +817,30 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
                 drop(nodes);
             } else {
                 drop(owners);
+            }
+            // At the restart boundary, production must reject the stored
+            // roster without importing or initializing another owner.
+            for (index, data) in data.iter().enumerate() {
+                let before = journal_files(data);
+                let error = open_clean_system_lifecycle_with_roster_policy(
+                    networks[index].clone(),
+                    data,
+                    space.0,
+                    &operator,
+                    &daemons[index],
+                    crate::commands::space::local_config::LocalAgentStorage::Image,
+                    &data.join("host.lock"),
+                    None,
+                    false,
+                    Some(&inputs),
+                )
+                .err()
+                .expect("production must reject the persisted roster");
+                assert!(
+                    error.to_string().contains("requires singleton bootstrap"),
+                    "{error:#}"
+                );
+                assert_eq!(journal_files(data), before);
             }
         }
     }

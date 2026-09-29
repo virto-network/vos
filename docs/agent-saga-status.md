@@ -5,7 +5,42 @@ supersedes the previous all-capabilities release mandate. A review checkpoint
 is not a release. Full-saga ambitions remain a deferred backlog, not permission
 to expand these batches.
 
-## Immediate integration checkpoint
+## Current priority after the startup review
+
+The `f1bfa1bd..310ef841` review found two admission/startup issues. The
+implementation follow-up recomputes the complete root certification and both
+root-derived management decisions during plan validation, including decode and
+reopen. It also rejects unsupported incoming rosters before opening control
+stores and rejects stored rosters before import or owner initialization.
+No runtime/backend, artifact pin or production release gate changes in this fix.
+
+Remaining work, in execution order:
+
+1. Qualify and review those two fixes as one scoped follow-up.
+2. Bound the interpreter/recompiler investigation: measure cold/warm Authority
+   query/ACK and actor execution with preparation, VM, persistence and quorum
+   separated. Then propose the smallest Refine recompiler integration with
+   differential gas, exit/fault, state and recovery tests. Existing JIT support
+   is not wired into Agent Refine execution. Synthetic interpreter/JIT speedups
+   are not customer-workflow or capacity evidence. Backend implementation is
+   not part of the review-fix batch.
+3. Finish fixed-three-node correctness: pre-Invoke-commit leader loss, remaining
+   ACK/metadata-clear crash boundaries, and quorum checkpoint certificates before
+   replay capacity is exhausted. Qualify actual daemon startup/restart and HTTP.
+4. Complete the supported public Shared Create/Install/Invoke workflow and
+   external-state Shared Clerk publication/replay, including retained-data growth.
+5. Measure the integrated release: latency/load/overload, failover, backup/restore,
+   and reproducible bundled artifacts. The provisional 300-active-client and
+   100,000-retained-transfer gates below remain unproven, not silently deferred.
+
+The recompiler investigation changes priority, not approved release scope. Local
+stays image-based for v1; public external Local, broader profile unification and
+thousands-concurrent qualification stay deferred. Stop speculative optimization
+once the agreed workflow meets its measured acceptance gates. This is still
+release-critical integration, not final deployment hardening; no release date
+or completion percentage is established.
+
+## Reviewed integration checkpoint (historical baseline)
 
 Frozen candidate code is `310ef841` on `wip/ch08-runtime-directory`.
 `saga/agents` remains at the previous review checkpoint `f1bfa1bd`.
@@ -13,7 +48,8 @@ The [review guide](agent-saga-review.md) now covers the candidate range
 `f1bfa1bd..310ef841` in three areas: authenticated common genesis,
 replicated startup/recovery, and follower route/projection readiness.
 This is 30 implementation commits across 21 files, not 30 review assignments.
-No new implementation workstream starts before this catch-up/review boundary.
+That batch has now been reviewed; the two follow-up fixes above take precedence
+over the historical next-step wording below.
 
 Final checks against `310ef841`: CLI build passes (39.40 s), CLI suite passes
 (298 passed, 44 ignored, 41.19 s), and all-three-node fresh startup plus
@@ -30,8 +66,8 @@ Released artifact pins are unchanged by this candidate; SAC6 Authority remains
 an explicitly selected candidate. Detailed entries below are historical evidence
 unless they describe an open gate; current artifact pins are listed at the end.
 
-After qualification, the next implementation milestone is the authenticated
-Shared customer workflow, not another performance cache or storage format:
+After the bounded backend assessment and correctness qualification above, the
+next integration milestone is the authenticated Shared customer workflow:
 resolve the fixed three-node system bootstrap/join path, carry Shared lifecycle
 orchestration through the production owner and public CLI, and attach the
 external-state executor to Shared Clerk publication/replay. These are required
@@ -83,8 +119,8 @@ outer-PVM inventory (19.59 s), and candidate bootstrap/replay recovery (86.78 s)
 in `fixed-system-projection-local-evidence-{test,bundled,bootstrap-regression}.log`.
 Those earlier tests retain their documented fixture limitations.
 
-Pending-read recovery across **forced leadership transfer** remains the next
-gate. Its successor-side authorization prerequisite is now implemented: an
+Pending-read recovery across **forced leadership transfer** was qualified in
+the later fixture below. Its successor-side authorization prerequisite is an
 exact locally applied, terminal and unacknowledged Query can supply its original
 PublicPreflight authorization to the existing durable admission path. Mismatched
 work is rejected; unknown or acknowledged work cannot supply an authorization.

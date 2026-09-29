@@ -631,6 +631,17 @@ struct StartupTestInputs {
     clock: Arc<AtomicU64>,
 }
 
+fn validate_production_bootstrap_roster(
+    plan: &vos::agent::clean_bootstrap::AuthorizedCleanSystemAgentBootstrap,
+    allow_candidate_roster: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        allow_candidate_roster || plan.pins().replicas().members().len() == 1,
+        "public startup requires singleton bootstrap until signed cluster configuration is integrated"
+    );
+    Ok(())
+}
+
 fn open_clean_system_lifecycle_with_inputs(
     network: Arc<vos::network::Network>,
     data_dir: &Path,
@@ -642,6 +653,38 @@ fn open_clean_system_lifecycle_with_inputs(
     certified_inputs: Option<&PreparedCleanSystemAgentBootstrap>,
     #[cfg(test)] test_inputs: Option<&StartupTestInputs>,
 ) -> anyhow::Result<(vos::agent::sdk::NodeId, CleanProductionLifecycle)> {
+    open_clean_system_lifecycle_with_roster_policy(
+        network,
+        data_dir,
+        space_bytes,
+        operator,
+        daemon,
+        local_storage,
+        host_lock,
+        certified_inputs,
+        cfg!(test),
+        #[cfg(test)]
+        test_inputs,
+    )
+}
+
+fn open_clean_system_lifecycle_with_roster_policy(
+    network: Arc<vos::network::Network>,
+    data_dir: &Path,
+    space_bytes: [u8; 32],
+    operator: &Keypair,
+    daemon: &Keypair,
+    local_storage: super::local_config::LocalAgentStorage,
+    host_lock: &Path,
+    certified_inputs: Option<&PreparedCleanSystemAgentBootstrap>,
+    allow_candidate_roster: bool,
+    #[cfg(test)] test_inputs: Option<&StartupTestInputs>,
+) -> anyhow::Result<(vos::agent::sdk::NodeId, CleanProductionLifecycle)> {
+    // Reject unsupported incoming placement before even creating control
+    // stores. Candidate multi-voter fixtures opt into a different test build.
+    if let Some(inputs) = certified_inputs {
+        validate_production_bootstrap_roster(inputs.plan(), allow_candidate_roster)?;
+    }
     super::local_config::validate_local_storage_roots(data_dir, local_storage)?;
     #[cfg(not(feature = "experimental-state-blocks"))]
     anyhow::ensure!(
@@ -683,6 +726,9 @@ fn open_clean_system_lifecycle_with_inputs(
                 .map_err(|error| anyhow::anyhow!("invalid persisted bootstrap plan: {error:?}"))
         })
         .transpose()?;
+    if let Some(plan) = &stored_plan {
+        validate_production_bootstrap_roster(plan, allow_candidate_roster)?;
+    }
 
     let runtime = crate::bundled::root_signed_agent_runtime_package(operator)?;
     let authority_package = crate::bundled::root_signed_actor_package(
@@ -964,13 +1010,6 @@ fn open_clean_system_lifecycle_with_inputs(
             "stored bootstrap differs from supplied certified inputs"
         );
     }
-    // The unit-test binary exercises fixed-roster integration before this
-    // release gate can be removed. Production startup remains singleton-only.
-    #[cfg(not(test))]
-    anyhow::ensure!(
-        pending.pins().replicas().members().len() == 1,
-        "public startup requires singleton bootstrap until signed cluster configuration is integrated"
-    );
     let retry_started = std::time::Instant::now();
     let mut owner = loop {
         match pending.try_complete(&mut owner_signer) {

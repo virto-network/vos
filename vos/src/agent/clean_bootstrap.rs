@@ -972,6 +972,46 @@ impl AuthorizedCleanSystemAgentBootstrap {
         {
             return Err(CleanSystemAgentBootstrapRejection::InvalidDescriptor);
         }
+        // Authenticate the complete plan on every construction/decode/import,
+        // not merely its signed Create. Local replica selection is deliberately
+        // outside this replica-independent certified material.
+        let certified = root_bootstrap_certification_commitment(
+            &self.pins.descriptor,
+            &self.runtime_package_bytes,
+            &self.pins.replicas,
+            self.pins.observed_slot,
+            &self.authority_package_bytes,
+            &self.authority_request,
+            &self.catalog_package_bytes,
+            &self.catalog_request,
+            &self.catalog_call,
+            self.invocation_gas,
+        )
+        .map_err(|_| CleanSystemAgentBootstrapRejection::InvalidDecision)?;
+        if certified.0 != self.pins.root.record().root_certification().0 {
+            return Err(CleanSystemAgentBootstrapRejection::InvalidDecision);
+        }
+        for (id, request, actual) in [
+            (
+                1,
+                ManagementRequest::Create(Box::new(self.pins.descriptor.clone())),
+                &self.create_decision,
+            ),
+            (2, self.authority_request.clone(), &self.authority_decision),
+        ] {
+            let expected = AuthorizedCleanManagementDecision::from_root_bootstrap(
+                core::num::NonZeroU64::new(id).unwrap(),
+                &self.pins.descriptor,
+                &request,
+                certified,
+                self.catalog_call.requested_valid_from,
+                self.catalog_call.requested_expires_at,
+            )
+            .map_err(|_| CleanSystemAgentBootstrapRejection::InvalidDecision)?;
+            if actual != &expected {
+                return Err(CleanSystemAgentBootstrapRejection::InvalidDecision);
+            }
+        }
         let runtime = self.runtime()?;
         if !runtime_matches_pins(&runtime, &self.pins)
             || !self
@@ -1226,7 +1266,6 @@ fn validate_root_bootstrap_materials(
     Ok(())
 }
 
-#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 #[allow(clippy::too_many_arguments)]
 fn root_bootstrap_certification_commitment(
     descriptor: &AgentDescriptor,
@@ -8338,7 +8377,6 @@ where
     }
 }
 
-#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 fn rejected(value: CleanSystemAgentBootstrapRejection) -> CleanSystemAgentBootstrapError {
     CleanSystemAgentBootstrapError::Rejected(value)
 }
@@ -11988,6 +12026,101 @@ mod tests {
                 )
                 .is_err()
             );
+        }
+
+        #[test]
+        fn certified_plan_rejects_changed_material_and_root_decisions_on_import_and_reopen() {
+            let fixtures = fixed_system_bootstrap_fixtures();
+            let source = &fixtures[0];
+            for field in 0..12 {
+                let mut changed = source.plan.clone();
+                match field {
+                    0 => changed.invocation_gas = 1,
+                    1 => changed.pins.observed_slot += 1,
+                    2 => changed.runtime_package_bytes.push(0),
+                    3 => changed.authority_package_bytes.push(0),
+                    4 => changed.catalog_package_bytes.push(0),
+                    5 => {
+                        let ManagementRequest::Install(request) = &mut changed.authority_request
+                        else {
+                            unreachable!()
+                        };
+                        request.entry.name.push('x');
+                    }
+                    6 => {
+                        let ManagementRequest::Install(request) = &mut changed.catalog_request
+                        else {
+                            unreachable!()
+                        };
+                        request.entry.name.push('x');
+                    }
+                    7 => changed.catalog_call.signature[0] ^= 1,
+                    8 => changed.pins.descriptor.authority.initial_epoch += 1,
+                    9 => {
+                        changed.catalog_call.requested_expires_at += 1;
+                        changed.catalog_call.invocation =
+                            changed.catalog_call.expected_invocation();
+                    }
+                    10 | 11 => {
+                        let (id, request) = if field == 10 {
+                            (
+                                1,
+                                ManagementRequest::Create(Box::new(
+                                    changed.pins.descriptor.clone(),
+                                )),
+                            )
+                        } else {
+                            (2, changed.authority_request.clone())
+                        };
+                        let decision = AuthorizedCleanManagementDecision::from_root_bootstrap(
+                            core::num::NonZeroU64::new(id).unwrap(),
+                            &changed.pins.descriptor,
+                            &request,
+                            Hash([0xfa; 32]),
+                            changed.catalog_call.requested_valid_from,
+                            changed.catalog_call.requested_expires_at,
+                        )
+                        .unwrap();
+                        if field == 10 {
+                            changed.create_decision = decision;
+                        } else {
+                            changed.authority_decision = decision;
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    changed.catalog_call.encode().is_ok(),
+                    "mutation {field} must remain encodable"
+                );
+                assert_ne!(changed.commitment(), source.plan.commitment());
+                assert_eq!(changed.pins.root, source.plan.pins.root);
+                assert!(changed.validate().is_err(), "field {field}");
+                assert!(
+                    AuthorizedCleanSystemAgentBootstrap::decode(&changed.canonical_bytes())
+                        .is_err(),
+                    "decode field {field}"
+                );
+                let record = CleanSystemAgentBootstrapRecord::intent(&changed);
+                assert!(
+                    CleanSystemAgentBootstrapRecord::authorized_plan(&record.encode()).is_err(),
+                    "reopen field {field}"
+                );
+                for common in [false, true] {
+                    assert!(
+                        PreparedCleanSystemAgentBootstrap::admit_certified_parts(
+                            changed.clone(),
+                            source.provision.clone(),
+                            source.catalog.clone(),
+                            source.trust.clone(),
+                            source.merge.clone(),
+                            common,
+                        )
+                        .is_err(),
+                        "import field {field}, common={common}"
+                    );
+                }
+            }
         }
 
         #[test]
