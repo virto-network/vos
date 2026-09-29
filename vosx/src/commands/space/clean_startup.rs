@@ -964,6 +964,9 @@ fn open_clean_system_lifecycle_with_inputs(
             "stored bootstrap differs from supplied certified inputs"
         );
     }
+    // The unit-test binary exercises fixed-roster integration before this
+    // release gate can be removed. Production startup remains singleton-only.
+    #[cfg(not(test))]
     anyhow::ensure!(
         pending.pins().replicas().members().len() == 1,
         "public startup requires singleton bootstrap until signed cluster configuration is integrated"

@@ -425,13 +425,26 @@ CLI test build, formatting and diff checks pass.
 The singleton production startup/import/restart regression passes (28.55 s),
 `target/fixed-system-material-preparation-startup.log`; roster tests still pass
 (2 tests, 0.26 s), `target/fixed-system-material-preparation-roster.log`.
-This uses candidate Authority material; the released bundles have not been
-repinned for SAC6. It qualifies preparation and archive import, not all three
-running system owners. The operator-facing preparation/publication command,
-integrated three-node startup and final artifact qualification remain open.
-Keep the CLI singleton guard until those startup requirements are proved.
-No three-node deployment or throughput claim follows from these singleton startup
-and separate fixed-roster admission tests.
+The integrated CLI fixture now opens all three lifecycle owners concurrently
+through `open_clean_system_lifecycle`, using one common bundle, authenticated
+loopback networks and real filesystem bootstrap, issuer, archive and lifecycle
+stores. It drops every lifecycle owner, then reopens all three without the
+bundle, recovering package identities and plans from durable state. This passes
+(29.59 s), `target/fixed-system-production-owners-restart.log`; the initial
+fresh-start-only run passed in 21.06 s,
+`target/fixed-system-production-owners.log`.
+Only the CLI unit-test build bypasses the singleton startup gate; the production
+binary still rejects three-node startup. This uses candidate Authority material;
+released bundles have not been repinned for SAC6. Networking remains alive
+during owner reopen, and this fixture does not attach public Node routes or run
+three daemon processes. Operator-facing preparation/publication, full daemon
+restart and route qualification, and final artifacts remain open before removing
+the production gate. This is not deployment or throughput qualification.
+The existing singleton import/restart/safety regression passes (39.68 s),
+`target/fixed-system-production-owners-singleton.log`. The default CLI suite
+passes with loopback access: 298 passed, 42 ignored (26.66 s),
+`target/fixed-system-production-owners-vosx.log`. CLI test compilation,
+formatting and diff checks pass. The reviewer branch remains at `f1bfa1bd`.
 The current full Authority host suite passes: 81 passed, 2 ignored (30.76 s),
 `fixed-roster-guest.ImAzBc/mutation-host-suite.log`.
 The candidate Authority node-table header now supports exactly one or three

@@ -443,6 +443,16 @@ fn candidate_authority_shared_create_reopens_production_stores() {
 #[test]
 #[ignore = "requires AUTHORITY_CANDIDATE_ELF; prepares a common three-node bundle with production materials and root archive"]
 fn candidate_fixed_roster_materials_prepare_one_common_bundle() {
+    check_fixed_roster_preparation(false);
+}
+
+#[test]
+#[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback networks; production lifecycle file owners"]
+fn candidate_fixed_roster_production_owners_start_from_common_bundle() {
+    check_fixed_roster_preparation(true);
+}
+
+fn check_fixed_roster_preparation(start_owners: bool) {
     use vos::agent::bootstrap::SystemAgentGenesisLocator;
     let scratch = Scratch::new();
     let operator = Keypair::ed25519_from_bytes([0x71; 32]).unwrap();
@@ -573,6 +583,95 @@ fn candidate_fixed_roster_materials_prepare_one_common_bundle() {
         assert_eq!(journal_files(&certificate_path), published);
     }
     assert_eq!(certifications, 1);
+    if start_owners {
+        let networks: Vec<_> = daemons
+            .iter()
+            .map(|key| {
+                let peer = key.public().to_peer_id();
+                Arc::new(Network::start(NetworkConfig {
+                    keypair: key.clone(),
+                    local_prefix: derive_node_prefix(&peer),
+                    listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+                    bootstrap: vec![],
+                    auto_dial_mdns: false,
+                }))
+            })
+            .collect();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while networks
+            .iter()
+            .any(|network| network.listen_addrs().is_empty())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "listeners did not start"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        while networks
+            .iter()
+            .any(|network| network.connected_peers().len() != 2)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "authenticated mesh did not connect"
+            );
+            for (index, network) in networks.iter().enumerate() {
+                for other in networks.iter().skip(index + 1) {
+                    network.connect(other.listen_addrs()[0].clone());
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let data: Vec<_> = (0..3)
+            .map(|index| {
+                let path = scratch.0.join(format!("startup-{index}"));
+                drop(crate::commands::space::clean_store::ensure_private_directory(&path).unwrap());
+                path
+            })
+            .collect();
+        // Drop every lifecycle/file owner, then recover solely from persisted
+        // plans. The networking processes stay alive; this is not a daemon
+        // crash or public-route qualification.
+        for restart in [false, true] {
+            let owners = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..3)
+                    .map(|index| {
+                        let network = networks[index].clone();
+                        let data = &data[index];
+                        let daemon = &daemons[index];
+                        let operator = &operator;
+                        let bundle = &bundle;
+                        scope.spawn(move || {
+                            open_clean_system_lifecycle(
+                                network,
+                                data,
+                                space.0,
+                                operator,
+                                daemon,
+                                crate::commands::space::local_config::LocalAgentStorage::Image,
+                                &data.join("host.lock"),
+                                (!restart).then_some(bundle.as_path()),
+                            )
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, handle)| {
+                        handle.join().unwrap().unwrap_or_else(|error| {
+                            panic!("replica {index} startup (restart={restart}) failed: {error:#}")
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
+            for (index, (node, _)) in owners.iter().enumerate() {
+                assert_eq!(*node, enrollments[index].node);
+            }
+            drop(owners);
+        }
+    }
 }
 
 #[test]
