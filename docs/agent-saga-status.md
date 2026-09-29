@@ -9,7 +9,8 @@ to expand these batches.
 
 Implementation checkpoint `fdb6ad2d` bundles the reproduced signed-expiry
 runtime/Authority set and fixes runtime authentication before directory execution.
-`saga/agents` is still at `65f35760`; it has not received this implementation batch.
+The review batch after `65f35760` is described in
+[the review guide](agent-saga-review.md) for publication on `saga/agents`.
 Pinned-source reproduction, 18 release-verifier tests, 35 driver tests and the
 bundled staged-expiry recovery test pass. All 21 Local-host regressions pass
 (40.85 s). The default CLI unit suite passes with loopback access: 295 passed,
@@ -17,9 +18,9 @@ bundled staged-expiry recovery test pass. All 21 Local-host regressions pass
 not passing network evidence. Logs in the shared build root:
 `target/shared-expiry-repinned-local-host.log` and
 `target/shared-expiry-repinned-vosx-loopback.log`.
-Bundled mixed-generation recovery is running in
-`target/shared-expiry-bundled-mixed.log`; do not count its earlier candidate result
-as this run. The detailed entries below are historical evidence unless they
+Bundled mixed-generation recovery passes both Agent-ID orderings (one test,
+552.55 s) in `target/shared-expiry-bundled-mixed.log`. This run uses the default
+bundles, not candidate overrides. The detailed entries below are historical evidence unless they
 explicitly describe an open gate; current artifact pins are listed at the end.
 
 After qualification, the next implementation milestone is the authenticated
@@ -668,8 +669,9 @@ runtime first; audit records reuse that check under the immutable driver borrow.
 All 35 driver tests pass (0.97 s), including explicit no-directory-execution
 assertions for substituted bytes on both paths, in
 `target/shared-expiry-repinned-driver-final.log`. Formatting and diff checks pass.
-Bundled mixed-generation recovery still needs a rerun; its earlier passing
-candidate evidence is retained above and must not be counted as this new run.
+Bundled mixed-generation recovery now passes both Agent-ID orderings (552.55 s)
+in `target/shared-expiry-bundled-mixed.log`; the earlier candidate evidence above
+remains separate. This covers one pending Install beside a retired Create.
 Existing-deployment migration is not established by fresh-root recovery tests.
 Public Shared management remains disabled and the three-node customer workflow
 and load/recovery gates above remain open.
@@ -2515,31 +2517,20 @@ backup or long-running retention tests.
 
 ## Branch boundary
 
-- Reviewer: `saga/agents` carries code checkpoint `9a003d58`, the opt-in Clerk
-  external-Local signed-transfer/root slice described in
-  [the review guide](agent-saga-review.md), relative to `a3d7c295`. It is not
-  production release evidence.
-- Implementation continues on `wip/ch08-runtime-directory`. Fresh-root
-  Create/restart and internal physical Install/Invoke/ACK recovery are
-  qualified, including one Clerk note write/read and one signed transfer/root
-  comparison through the physical PVM and owner reopen. Public external
-  Install, publicly routed actor Invoke/ACK, retained growth and three-node
-  Shared remain batch-1 gates. No production deployment is claimed.
-- The focused Clerk checks are in the review guide. The complete
-  `just test-agent-state-prototype` gate and offline/locked `vosx --tests`
-  check passed at `a3d7c295`; the later Agent/legacy Clerk suites and
-  canonical-package physical transfer/reopen fixture passed at `9a003d58`.
-  The `vosx` fresh-root non-migration test also passed. Final
-  release-binary/workspace qualification remains open.
+- Reviewer target is `saga/agents`, with the combined checkpoint after
+  `65f35760`. Implementation continues on `wip/ch08-runtime-directory`.
+- [The review guide](agent-saga-review.md) now describes the combined changes
+  after `65f35760`: retained Shared Install recovery, signed denial/expiry
+  handling, and bundle integration. Historical Clerk review guidance remains
+  available in Git; it is not the current review boundary.
 - Review read-only and apply findings on the implementation branch to avoid
-  conflicting fixes.
-- Historical bounded-state checkpoint gate passed at
-  `task-tmp/state-review-checkpoint-prototype.log`: SDK 247/1 ignored,
-  replay 69, physical PVM 16, journal-store 105 and feature-disabled groups.
-  `cargo fmt --all -- --check`, `git diff --check`, and offline/locked
-  `cargo check -p vosx --tests` passed. This is not the release/workspace gate.
-- Detailed integration chronology: `42928ddc:docs/agent-saga-status.md`.
-  Its pending-run statements are historical, not additional live tasks.
+  conflicting fixes. Moving a review checkpoint does not enable public Shared
+  management or establish production readiness.
+- Production Local remains image-based. Public external Local ingress is
+  deferred, not a release gate. Three-node Shared, external-state Shared Clerk,
+  customer load and backup/recovery remain required as specified above.
+- Historical bounded-state/Clerk test evidence below is source-specific and
+  does not replace final release-binary/workspace qualification.
 
 ## Reviewed baseline and qualification
 
