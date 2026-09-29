@@ -1,9 +1,10 @@
 //! Durable local root archive for the first clean system Agent.
 //!
 //! The archive owns one exact proposal/provision/catalog tuple.  A fresh
-//! proposal is certified by the explicitly supplied one-voter root key and
-//! published as one crash-safe whole image before it is returned to the host.
-//! Reopen is read-only and never re-signs already published evidence.
+//! proposal is certified by the explicitly supplied one-voter root key, or an
+//! existing certificate is imported after verifying that same operator key.
+//! Both publish one crash-safe whole image before returning to the host.
+//! Import and reopen never re-sign already certified evidence.
 
 use std::sync::Mutex;
 
@@ -152,12 +153,50 @@ impl CleanSystemAgentGenesisArchive {
             claim.authority_claim(),
         )
         .map_err(|_| SystemAgentGenesisProviderError::Corrupt)?;
-        let candidate = ArchiveImage {
-            provision: SystemAgentGenesisProvision::new(proposal.clone(), pins, evidence)
-                .map_err(|_| SystemAgentGenesisProviderError::Corrupt)?,
-            catalog: catalog.to_vec(),
+        let provision = SystemAgentGenesisProvision::new(proposal.clone(), pins, evidence)
+            .map_err(|_| SystemAgentGenesisProviderError::Corrupt)?;
+        self.import_certified(&provision, catalog)
+    }
+
+    /// Persist externally prepared common genesis evidence without signing a
+    /// replacement root. The root signer is the configured Space operator; its
+    /// committee node need not be this data-plane replica. The proposal itself
+    /// must select this exact local node. Re-import is exact and immutable.
+    pub(crate) fn import_certified(
+        &self,
+        provision: &SystemAgentGenesisProvision,
+        catalog: &[RuntimeBlob],
+    ) -> Result<SystemAgentGenesisProvision, SystemAgentGenesisProviderError> {
+        provision
+            .validate()
+            .map_err(|_| SystemAgentGenesisProviderError::Corrupt)?;
+        validate_system_agent_genesis_catalog(provision.proposal(), catalog)
+            .map_err(|_| SystemAgentGenesisProviderError::Corrupt)?;
+        let locator = provision.proposal().locator();
+        let root = provision.root().record();
+        let public_key = self
+            .signer
+            .public()
+            .try_into_ed25519()
+            .map_err(|_| SystemAgentGenesisProviderError::Refused)?
+            .to_bytes();
+        let [root_signer] = root.initial_committee().members() else {
+            return Err(SystemAgentGenesisProviderError::Refused);
         };
-        self.publish_candidate(candidate)
+        if locator.space != self.space
+            || locator.agent != self.agent
+            || locator.node != self.node
+            || provision.proposal().replica().node != self.node
+            || root.authority_binding() != self.authority_binding
+            || root_signer.public_key() != &public_key
+            || root_signer.role() != AuthorityMemberRole::Voter
+        {
+            return Err(SystemAgentGenesisProviderError::Refused);
+        }
+        self.publish_candidate(ArchiveImage {
+            provision: provision.clone(),
+            catalog: catalog.to_vec(),
+        })
     }
 
     /// Recover the exact logical slot which already crossed the root archive

@@ -255,6 +255,248 @@ fn candidate_authority_shared_create_reopens_production_stores() {
     check_shared_file_recovery_with_candidate(false, false, InstallFault::None, Some(&elf));
 }
 
+#[test]
+#[ignore = "requires AUTHORITY_CANDIDATE_ELF; exercises certified genesis import with production file owners"]
+fn candidate_certified_genesis_import_is_scoped_immutable_and_restartable() {
+    use crate::commands::space::clean_store::ensure_private_directory;
+    use vos::agent::bootstrap::{SystemAgentGenesisLocator, SystemAgentGenesisProviderError};
+    use vos::agent::execution::RuntimeBlob;
+
+    let scratch = Scratch::new();
+    let data = scratch.0.join("source");
+    drop(ensure_private_directory(&data).unwrap());
+    let operator = Keypair::ed25519_from_bytes([0x71; 32]).unwrap();
+    let daemon = Keypair::ed25519_from_bytes([0x72; 32]).unwrap();
+    let peer = daemon.public().to_peer_id();
+    let network = Arc::new(Network::start(NetworkConfig {
+        keypair: daemon.clone(),
+        local_prefix: derive_node_prefix(&peer),
+        listen: vec![],
+        bootstrap: vec![],
+        auto_dial_mdns: false,
+    }));
+    let space = SpaceId([0x73; 32]);
+    let inputs = candidate_authority_inputs(
+        &operator,
+        &PathBuf::from(std::env::var("AUTHORITY_CANDIDATE_ELF").unwrap()),
+    );
+    let (node, lifecycle) = open_clean_system_lifecycle_with_inputs(
+        network.clone(),
+        &data,
+        space.0,
+        &operator,
+        &daemon,
+        crate::commands::space::local_config::LocalAgentStorage::Image,
+        &scratch.0.join("source-host.lock"),
+        Some(&inputs),
+    )
+    .unwrap();
+    drop(lifecycle);
+    let (authority, _) = derive_system_authority_target(
+        space,
+        raw_public_key(&operator).unwrap(),
+        &inputs.runtime,
+        &inputs.authority,
+    )
+    .unwrap();
+    let agent = HostAgentId(authority.system_agent.0);
+    let node = HostNodeId(node.0);
+    let space = HostSpaceId(space.0);
+    let binding = HostHash(authority.binding.commitment().0);
+    let make_archive = |path: &Path, space, agent, node, binding, signer| {
+        let (_, _, _, store) = CleanSystemAgentFileStores::open_or_create(path)
+            .unwrap()
+            .into_production_parts();
+        CleanSystemAgentGenesisArchive::new(store, space, agent, node, binding, signer).unwrap()
+    };
+    let source = make_archive(
+        &data.join(SYSTEM_AGENT_CONTROL_DIRECTORY),
+        space,
+        agent,
+        node,
+        binding,
+        operator.clone(),
+    );
+    let locator = SystemAgentGenesisLocator { space, agent, node };
+    let provision = source.reproduce(locator).unwrap();
+    let catalog: Vec<_> = provision
+        .proposal()
+        .catalog()
+        .iter()
+        .map(|reference| RuntimeBlob {
+            reference: reference.clone(),
+            bytes: source.load_catalog(locator, reference).unwrap().unwrap(),
+        })
+        .collect();
+    for (label, scoped_space, scoped_agent, scoped_node, scoped_binding, key) in [
+        (
+            "space",
+            HostSpaceId([0x91; 32]),
+            agent,
+            node,
+            binding,
+            operator.clone(),
+        ),
+        (
+            "agent",
+            space,
+            HostAgentId([0x91; 32]),
+            node,
+            binding,
+            operator.clone(),
+        ),
+        (
+            "node",
+            space,
+            agent,
+            HostNodeId([0x91; 32]),
+            binding,
+            operator.clone(),
+        ),
+        (
+            "binding",
+            space,
+            agent,
+            node,
+            HostHash([0x91; 32]),
+            operator.clone(),
+        ),
+        (
+            "signer",
+            space,
+            agent,
+            node,
+            binding,
+            Keypair::ed25519_from_bytes([0x91; 32]).unwrap(),
+        ),
+    ] {
+        let path = scratch.0.join(label);
+        let archive = make_archive(
+            &path,
+            scoped_space,
+            scoped_agent,
+            scoped_node,
+            scoped_binding,
+            key,
+        );
+        let before = journal_files(&path);
+        assert!(
+            matches!(
+                archive.import_certified(&provision, &catalog),
+                Err(SystemAgentGenesisProviderError::Refused)
+            ),
+            "{label}"
+        );
+        assert_eq!(journal_files(&path), before, "{label}");
+    }
+    let path = scratch.0.join("imported");
+    let archive = make_archive(&path, space, agent, node, binding, operator.clone());
+    let before = journal_files(&path);
+    let mut corrupted = catalog.clone();
+    corrupted[0].bytes[0] ^= 1;
+    assert!(archive.import_certified(&provision, &corrupted).is_err());
+    assert_eq!(journal_files(&path), before);
+    assert_eq!(
+        archive.import_certified(&provision, &catalog).unwrap(),
+        provision
+    );
+    let published = journal_files(&path);
+    assert_eq!(
+        archive.import_certified(&provision, &catalog).unwrap(),
+        provision
+    );
+    assert_eq!(journal_files(&path), published);
+    assert!(matches!(
+        archive.certify_fresh(Hash([0x92; 32]), provision.proposal(), &catalog),
+        Err(SystemAgentGenesisProviderError::Conflict)
+    ));
+    assert_eq!(journal_files(&path), published);
+    drop(archive);
+    let reopened = make_archive(&path, space, agent, node, binding, operator.clone());
+    assert_eq!(reopened.reproduce(locator).unwrap(), provision);
+    assert_eq!(
+        reopened.import_certified(&provision, &catalog).unwrap(),
+        provision
+    );
+    assert_eq!(journal_files(&path), published);
+    for blob in &catalog {
+        assert_eq!(
+            reopened.load_catalog(locator, &blob.reference).unwrap(),
+            Some(blob.bytes.clone())
+        );
+    }
+    // The root committee's node is not the selected data-plane replica.
+    // Build independently signed evidence for that topology; importing must
+    // retain it exactly, never replace it with a locally certified root.
+    use vos::agent::committee::{
+        AuthorityCommittee, AuthorityCommitteeMember, AuthorityMemberRole,
+        AuthorityQuorumCertificate, AuthoritySignature, RootAnchorPins, RootAnchorRecord,
+        SystemAgentGenesisClaim, SystemAgentGenesisEvidence,
+    };
+    let public = raw_public_key(&operator).unwrap();
+    let root_node = HostNodeId([0x93; 32]);
+    assert_ne!(root_node, node);
+    let committee = AuthorityCommittee::new(
+        space,
+        binding,
+        1,
+        None,
+        vec![AuthorityCommitteeMember::new(root_node, public, AuthorityMemberRole::Voter).unwrap()],
+    )
+    .unwrap();
+    let root = RootAnchorRecord::new(
+        1,
+        space,
+        agent,
+        binding,
+        provision.root().record().root_certification(),
+        committee,
+    )
+    .unwrap();
+    let claim = SystemAgentGenesisClaim::new(&root, provision.proposal().expectations()).unwrap();
+    let committee = root.initial_committee();
+    let message = AuthorityQuorumCertificate::signing_message(
+        committee.authority_binding(),
+        committee.epoch(),
+        committee.commitment(),
+        claim.authority_claim(),
+    );
+    let signature = AuthoritySignature::new(
+        AuthoritySignerId::of_raw_ed25519(&public),
+        operator.sign(&message.0).unwrap().try_into().unwrap(),
+    )
+    .unwrap();
+    let evidence = SystemAgentGenesisEvidence::new(
+        claim.clone(),
+        AuthorityQuorumCertificate::new(committee, claim.authority_claim(), vec![signature])
+            .unwrap(),
+    )
+    .unwrap();
+    let pins = RootAnchorPins::new(
+        root.clone(),
+        1,
+        root.id(),
+        root.config_commitment(),
+        claim.authority_claim(),
+    )
+    .unwrap();
+    let remote = vos::agent::bootstrap::SystemAgentGenesisProvision::new(
+        provision.proposal().clone(),
+        pins,
+        evidence,
+    )
+    .unwrap();
+    let remote_path = scratch.0.join("remote-root");
+    let imported = make_archive(&remote_path, space, agent, node, binding, operator.clone());
+    assert_eq!(
+        imported.import_certified(&remote, &catalog).unwrap(),
+        remote
+    );
+    drop(imported);
+    let imported = make_archive(&remote_path, space, agent, node, binding, operator);
+    assert_eq!(imported.reproduce(locator).unwrap(), remote);
+}
+
 fn candidate_authority_inputs(operator: &Keypair, path: &Path) -> StartupTestInputs {
     use vos::agent::sdk::package::{
         PackageArtifact, PackageEnvelope, PackageManifest, PackageSigning,

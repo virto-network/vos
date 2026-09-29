@@ -322,6 +322,25 @@ Next connect common signed inputs to `clean_startup.rs` and
 bootstrap evidence and select its own authenticated replica, rather than certify
 independent local roots. Qualify this with the production file stores before
 removing the CLI singleton guard. Keep singleton behavior and image Local intact.
+The production genesis archive now accepts an already-certified provision and
+catalog without signing replacement evidence. Import verifies the configured
+operator root key, exact Space/Agent/local-node/authority scope, certificate and
+catalog before using the existing immutable publication path. Fresh local
+certification delegates to the same checks. No new storage format is introduced.
+The candidate-bootstrap import regression passes (8.31 s),
+`target/fixed-system-certified-import.log`: wrong scope/key and altered catalog
+leave destination bytes unchanged; exact import/re-import and file-owner reopen
+preserve the provision and catalog; a replacement certified root is refused.
+The extended regression also imports/reopens independently signed evidence whose
+root-committee node differs from the selected local replica (8.70 s),
+`target/fixed-system-certified-import-remote-root.log`. This verifies the root/
+replica identity separation without granting authority to a foreign operator key.
+The final rerun after removing a redundant catalog copy passes (8.64 s),
+`target/fixed-system-certified-import-final.log`; CLI test build, formatting and
+diff checks pass. No bundled artifacts or reviewer branch were changed.
+This is archive-boundary qualification, not imported-plan startup or three-node
+deployment. Operator configuration still needs to supply the common plan and
+per-node provision together, with cross-validation before publication/startup.
 The current full Authority host suite passes: 81 passed, 2 ignored (30.76 s),
 `fixed-roster-guest.ImAzBc/mutation-host-suite.log`.
 The candidate Authority node-table header now supports exactly one or three
