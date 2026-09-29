@@ -1,113 +1,116 @@
-# Agent saga: Shared Install recovery and bundled expiry checkpoint
+# Agent saga: fixed three-node startup and projection recovery
 
-Review the combined implementation changes after `65f35760`. The
-[live plan](agent-saga-status.md) records whether the checkpoint has reached
-`saga/agents` and is authoritative for release scope. Review read-only; return
-findings for application on the latest implementation branch.
+Candidate code checkpoint: `310ef841`. Review `f1bfa1bd..310ef841` as one
+integration batch, grouped into the three areas below. It contains 30 commits
+across 21 files; individual commits are implementation history, not separate
+review assignments. Later handoff-only commits do not change that code range.
 
-This is an internal lifecycle/recovery checkpoint, not public Shared ingress,
-three-node qualification or a release. It combines the intermediate commits into
-three review areas rather than requiring a separate review for every commit.
+At preparation time `saga/agents` remains at `f1bfa1bd`; the candidate is on
+`wip/ch08-runtime-directory`. Verify the head before reviewing. Review read-only
+and return findings for application on the implementation branch. The
+[live plan](agent-saga-status.md) owns release scope and evidence. The previous
+guide is preserved in Git at `f1bfa1bd`.
 
-## 1. Retained Shared lifecycle and file recovery
+This is not a release. Local remains image-based. Production multi-node startup
+and public Shared management remain gated. Candidate Authority is not repinned.
 
-Primary files: `clean_genesis_recovery.rs`, `clean_bootstrap.rs`,
-`clean_management_intent.rs`, `local_lifecycle.rs`, and CLI
-`clean_store.rs` / `clean_startup.rs`.
+## 1. One authenticated system lineage
 
-The production lifecycle owner carries Create completion into successive signed
-Install requests without reopening its own leases. Recovery restores retained
-authorization/finalization before unrelated fresh Authority reads. Staged
-handoffs retain exact predecessor/successor requests, packages and issuer state.
-Policy denials retire with request-bound signed evidence and permit a subsequent
-request without replaying the denied one.
+Primary files: Authority `lib.rs` / `node_storage.rs`; host `bootstrap.rs` /
+`clean_bootstrap.rs`; CLI `clean_genesis_archive.rs`, `clean_startup.rs` and
+`local_config.rs`.
 
-Review capacity and ownership at every allocation; exact retry after ordinary
-serving advances the journal; staged intent/issuer/actor-package replacement;
-pending admission restoration; and route nonexposure before finality. Missing
-or substituted data must not become a successful retry. An issuer archive alone
-is not physical finality.
+One certified bundle localizes to signed roster members without resigning
+genesis or replacing root evidence. Fixed-roster configuration is bound to the
+certified descriptor. Import is bounded, scoped and immutable; reopen uses
+durable package identities. Preparation shares startup's validated construction.
 
-## 2. Signed Install failure and expiry
+Review wrong Space/operator/node rejection, canonical membership, replica-
+independent commitments, physical admission and rejection before writes.
+Resupplying a bundle must not repair missing/substituted completed root evidence.
+Fresh import is not migration or an operator-facing enrollment CLI.
 
-Primary files: SDK `authority.rs`, `runtime.rs`, `wire.rs`; host
-`clean_authority_issuer.rs`, `standard.rs`, `wire.rs`,
-`local_journal_driver.rs`, `shared_journal_driver.rs`, `shared_host.rs`;
-and the system Authority actor.
+## 2. Replicated bootstrap and filesystem ownership
 
-Shared Install supports signed terminal application failures. Expired approved
-Install has a distinct non-execution fence, not a renewed approval. Receipt
-binding/signatures are unchanged; the expiry failure is valid only strictly
-after the original deadline. Journal preview/replay require the exact expiry
-outcome and changed durable state. The actor must not be installed. A success
-already committed before expiry keeps its original result on later retry.
+Primary files: `clean_bootstrap.rs`, `execution.rs`, `replay.rs`,
+`{local,shared}_journal_driver.rs`, `shared_host.rs`, `network/shared_agent.rs`,
+and CLI `clean_startup{,_tests}.rs`.
 
-Review the distinction between policy denial, transient failure and signed
-application failure; original receipt binding; durable observation before
-signing; and exact timestamps/results across reopen. Verify that expired success,
-unchanged fake fences and unauthenticated preview results cannot obtain finality.
-Image-path receipt admission remains strict; this is not generic cancellation.
+Bootstrap retains peers/owners while awaiting election. Followers recover exact
+completed results from authenticated journal evidence, including original
+authorization and management seals. Three startup file owners consume one
+common bundle and reopen without resupplying it.
 
-## 3. Bundles, validation ordering and qualification
+Review leader-no-op replication, replay/materialization, lagging metadata,
+failure ownership and capacity headroom. Deferred promotion is restricted to
+the matching fixed committee and retained work, without early route publication.
+Optional multi-voter checkpoint scheduling skips the unavailable quorum
+collector; mandatory capacity/certificate guards must still fail closed.
 
-Runtime, Authority and Catalog bundles now use immutable source/builder revision
-`7316e52ddd98b083941ead6dd3ca5ba18b2e1a2c`. Program identity, build-time digests
-and provenance move together. The reproduction script rebuilt all three blobs
-byte-for-byte using the pinned builder. Catalog actor source is unchanged;
-its compiled dependency closure changed. The earlier old/new contract comparison
-covered normalized manifests and non-program artifacts, not behavioral equivalence.
+## 3. Route readiness and projection recovery
 
-Expiry file fixtures now use the bundled packages directly, with no candidate
-environment override. Their test-only clock catches up to wall time and preserves
-explicit forward jumps. One initial run failed Create preparation; an unchanged
-diagnostic rerun passed, so that failure is not conclusively attributed.
+Primary files: `production_owner.rs`, `supervisor_adapters.rs`,
+`clean_bootstrap.rs`, `shared_{host,journal_driver}.rs`, and network
+`agent_protocol.rs`, `agent_network.rs`, `shared_agent.rs`.
 
-Physical Local lookup and audit-directory construction now authenticate runtime
-package/program consistency before directory execution. Borrowed directory
-records reuse that check. Review the immutable-borrow/ownership boundary; the
-regression requires rejection of substituted process bytes without a VM query.
+Initial temporary unavailability retains unpublished participants. Followers
+enqueue signed queries on the leader's bounded worker; acceptance proves only
+admission. Results require locally applied exact Invoke and positive ACK
+evidence. No VM work runs in the peer handler.
 
-## Evidence and reproduction
+Recovery-only relay is distinct from fresh admission: it may carry another
+node's attested query, but cannot create work absent from the leader's own
+authenticated journal. The successor preserves original authorization. The
+former leader retains its reservation until exact local ACK evidence permits
+durable cleanup. Fresh sender/attestor binding is unchanged.
 
-Latest completed default-path checks:
+Prioritize unknown/mutated query rejection, fresh-versus-recovery dispatch,
+original-clock binding, queue bounds, retired-handle ownership, stale-generation
+races and reservation retention through failed cleanup. Missing/pruned history
+is unavailable, never permission to fabricate results.
 
-- Immutable-source runtime/Authority/Catalog reproduction: passed.
-- Release verifier: 18 passed, one ignored.
-- Driver tests: 35 passed; Local host tests: 21 passed.
-- CLI unit suite with loopback access: 295 passed, 38 ignored.
-- Bundled staged-expiry file recovery: one passed, 206.21 seconds.
-- Bundled mixed expiry/retired-generation recovery: one passed, 552.55 seconds,
-  exercising both Agent-ID orderings with default bundled packages.
+## Evidence and reproduction boundaries
 
-Logs are under `.worktrees/ch08-c2-native/target/shared-expiry-*`. The default
-CLI sandbox attempt had 16 socket-bind permission failures; the loopback-enabled
-rerun passed. Ignored and zero-selected tests are not coverage.
+Use offline/locked Cargo, host toolchain `nightly-2025-05-09`, and absolute
+disk-backed `CARGO_TARGET_DIR` / `TMPDIR` under
+`.worktrees/ch08-c2-native/target`. Do not use RAM-backed `/tmp`.
+Core tests require features `agent-runtime storage network http-ingress`;
+CLI uses `-p vosx --bin vosx`. Physical tests use `RUST_MIN_STACK=16777216`
+and `VOS_AGENT_DISABLE_REFINE_ATTRIBUTION=1`. Loopback permission is required.
+Candidate tests need `AUTHORITY_CANDIDATE_ELF` pointing to the qualified
+`riscv64em-vos/release/system_authority.elf` in the shared target.
 
-Set absolute disk-backed `CARGO_TARGET_DIR` and `TMPDIR`; do not use RAM-backed
-`/tmp`. Representative commands from the implementation worktree:
+- CLI `candidate_fixed_roster_production_routes_start_from_common_bundle`
+  with `--ignored --nocapture`: all three Nodes publish routes at startup and
+  filesystem-owner reopen. Final code-checkpoint rerun passed: 130.16 s.
+  This ran alongside the CLI suite; duration is whole-fixture time, not a
+  latency benchmark. The earlier 71.07 s run is historical evidence only.
+- Core `candidate_projection_recovers_after_leader_loss_and_former_leader_reopen`
+  with `--ignored --nocapture`: leader loss after Invoke/before ACK, election,
+  former-leader follower reopen, cross-node attestation relay and reservation
+  release. Passed at this code checkpoint: 67.62 s. Real Raft and filesystem
+  journals with physical runtime, but memory bootstrap/issuer metadata and a
+  scripted bootstrap Catalog. Not three-daemon or HTTP qualification.
+- Latest relay regressions: 26 protocol/network tests, 33 adapter tests,
+  singleton pending-read recovery, std library build, formatting and diff checks.
+- Earlier original-authorization tests include bundled Authority outer-PVM
+  execution. Final code-checkpoint CLI suite: 298 passed, 44 ignored (41.19 s).
+  CLI build passed (39.40 s). This does not include ignored physical cases
+  except where explicitly listed above.
 
-```sh
-CARGO_NET_OFFLINE=true bash scripts/build-agent-release-artifacts.sh all
-cargo +nightly-2025-05-09 test --offline --locked -p vosx --bin vosx -- --test-threads=2
-RUST_MIN_STACK=16777216 VOS_AGENT_DISABLE_REFINE_ATTRIBUTION=1 \
-  cargo +nightly-2025-05-09 test --offline --locked -p vosx \
-  shared_install_file_owner_recovers_expiry_beside_retired_generation \
-  -- --ignored --nocapture
-```
+Shared-target logs use prefixes `fixed-system-projection-recovery-`,
+`fixed-system-projection-original-authorization-` and
+`fixed-system-review-checkpoint-`. Ignored, zero-selected and socket-permission
+failures are not passing evidence. No independent artifact reproduction or
+production-capacity claim follows from this batch.
 
-The physical tests use production file owners, journals and synchronized staging
-faults with owner drop/reopen, not process kills, power loss or multiple nodes.
-Mixed coverage is one pending Install beside a retired Create, both Agent-ID
-orderings; it is not arbitrary concurrent pending continuations.
+## Explicitly open release gates
 
-## Explicitly not signed off
+Leader loss before Invoke commits; remaining ACK/metadata-clear failure cases;
+quorum checkpoint collection; actual three-daemon/HTTP startup/recovery;
+operator CLI orchestration; public Shared Create/Install with finality; Shared
+external-state Clerk and retained-data growth; 300-active-client load, overload,
+backup/restore and final reproducible release artifacts.
 
-Public Shared Create/Install and endorsement collection; common three-node
-system lineage; Shared external-state Clerk integration and retained growth;
-backend-credential load/overload; failover/partition/backup/restore; full
-workspace and release-binary qualification. Existing-deployment migration and
-downgrade compatibility are not established by fresh-root tests. Production
-Local remains image-based; external Local ingress stays deferred.
-
-Report severity, location, violated invariant, a concrete failure scenario and
-a regression. Distinguish demonstrated defects from unqualified release gates.
+Report severity, location, violated invariant, concrete failure scenario and
+regression. Distinguish demonstrated defects from unqualified release gates.

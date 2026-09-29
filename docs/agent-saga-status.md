@@ -7,22 +7,28 @@ to expand these batches.
 
 ## Immediate integration checkpoint
 
-Implementation checkpoint `fdb6ad2d` bundles the reproduced signed-expiry
-runtime/Authority set and fixes runtime authentication before directory execution.
-The review batch after `65f35760` is now on `saga/agents` at `f1bfa1bd` and
-described in [the review guide](agent-saga-review.md). Subsequent implementation
-stays on `wip/ch08-runtime-directory` while that checkpoint is reviewed.
-Pinned-source reproduction, 18 release-verifier tests, 35 driver tests and the
-bundled staged-expiry recovery test pass. All 21 Local-host regressions pass
-(40.85 s). The default CLI unit suite passes with loopback access: 295 passed,
-38 ignored (53.31 s); the sandboxed attempt had 16 socket-permission failures,
-not passing network evidence. Logs in the shared build root:
-`target/shared-expiry-repinned-local-host.log` and
-`target/shared-expiry-repinned-vosx-loopback.log`.
-Bundled mixed-generation recovery passes both Agent-ID orderings (one test,
-552.55 s) in `target/shared-expiry-bundled-mixed.log`. This run uses the default
-bundles, not candidate overrides. The detailed entries below are historical evidence unless they
-explicitly describe an open gate; current artifact pins are listed at the end.
+Frozen candidate code is `310ef841` on `wip/ch08-runtime-directory`.
+`saga/agents` remains at the previous review checkpoint `f1bfa1bd`.
+The [review guide](agent-saga-review.md) now covers the candidate range
+`f1bfa1bd..310ef841` in three areas: authenticated common genesis,
+replicated startup/recovery, and follower route/projection readiness.
+This is 30 implementation commits across 21 files, not 30 review assignments.
+No new implementation workstream starts before this catch-up/review boundary.
+
+Final checks against `310ef841`: CLI build passes (39.40 s), CLI suite passes
+(298 passed, 44 ignored, 41.19 s), and all-three-node fresh startup plus
+filesystem-owner reopen passes (130.16 s). Logs in the shared build root:
+`fixed-system-review-checkpoint-{cli-build,cli-suite,routes}.log`.
+These ran with loopback access; the two test jobs overlapped. Whole-fixture
+duration is not request latency or production-capacity evidence. This rerun
+supersedes the pre-relay route result below for the final code checkpoint;
+it does not remove the listed fixture, artifact or release limitations.
+
+The prior signed-expiry review and its bundle reproduction evidence remain
+available in Git at `f1bfa1bd` and the shared-target `shared-expiry-*` logs.
+Released artifact pins are unchanged by this candidate; SAC6 Authority remains
+an explicitly selected candidate. Detailed entries below are historical evidence
+unless they describe an open gate; current artifact pins are listed at the end.
 
 After qualification, the next implementation milestone is the authenticated
 Shared customer workflow, not another performance cache or storage format:
