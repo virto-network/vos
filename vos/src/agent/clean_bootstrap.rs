@@ -2272,6 +2272,14 @@ pub struct AuthorizedSharedGenesisProposal {
 }
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+#[derive(Clone, Copy)]
+enum SharedGenesisRuntime<'a> {
+    Image(&'a AdmittedRuntimePackage),
+    #[cfg(feature = "experimental-state-blocks")]
+    External(&'a super::package_admission::AdmittedStateRuntimePackage),
+}
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 impl AuthorizedSharedGenesisProposal {
     pub fn proposal(&self) -> &super::genesis::AgentGenesisProposal {
         &self.proposal
@@ -4252,6 +4260,58 @@ where
         J: CleanManagementIssuerStore,
         S: CleanManagementReceiptSigner,
     {
+        self.prepare_shared_with_runtime(
+            slot,
+            managed,
+            SharedGenesisRuntime::Image(runtime),
+            committee,
+            issuer,
+            signer,
+        )
+    }
+
+    /// Internal external-state counterpart. This retains the same Authority
+    /// admission and exact publication contract; it neither provisions a
+    /// generation nor enables external Shared startup or public management.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn prepare_external_shared_from_management_intent<B, J, S>(
+        &mut self,
+        slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
+        managed: ManagedAgentTarget,
+        runtime: &super::package_admission::AdmittedStateRuntimePackage,
+        committee: &AgentReplicaCommittee,
+        issuer: &mut DurableCleanManagementIssuer<J>,
+        signer: &mut S,
+    ) -> Result<AuthorizedSharedGenesisProposal, SharedAgentHostError>
+    where
+        B: super::clean_authority_issuer::CleanManagementRuntimeStore,
+        J: CleanManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+    {
+        self.prepare_shared_with_runtime(
+            slot,
+            managed,
+            SharedGenesisRuntime::External(runtime),
+            committee,
+            issuer,
+            signer,
+        )
+    }
+
+    fn prepare_shared_with_runtime<B, J, S>(
+        &mut self,
+        slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
+        managed: ManagedAgentTarget,
+        runtime: SharedGenesisRuntime<'_>,
+        committee: &AgentReplicaCommittee,
+        issuer: &mut DurableCleanManagementIssuer<J>,
+        signer: &mut S,
+    ) -> Result<AuthorizedSharedGenesisProposal, SharedAgentHostError>
+    where
+        B: super::clean_authority_issuer::CleanManagementRuntimeStore,
+        J: CleanManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+    {
         let Some(ManagementRequest::Create(descriptor)) =
             slot.intent().map(|intent| intent.request())
         else {
@@ -4269,21 +4329,40 @@ where
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        super::driver::verify_clean_runtime_package_binding(&descriptor, runtime)
-            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let exact_runtime = match runtime {
+            SharedGenesisRuntime::Image(runtime) => {
+                super::driver::verify_clean_runtime_package_binding(&descriptor, runtime)
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                runtime.exact_bytes()
+            }
+            #[cfg(feature = "experimental-state-blocks")]
+            SharedGenesisRuntime::External(runtime) => {
+                if descriptor.runtime_package != *runtime.package_ref()
+                    || descriptor.identity.runtime_deployment != runtime.deployment()
+                    || descriptor.identity.runtime_program != runtime.program()
+                    || descriptor.identity.runtime_producer != runtime.manifest().signing.producer
+                    || descriptor.runtime_contract != runtime.manifest().contract
+                    || descriptor.capabilities != runtime.manifest().capabilities
+                    || !super::replay::external_shared_descriptor_supported(&descriptor)
+                {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                runtime.exact_bytes()
+            }
+        };
         // Recovery must not depend on the original caller supplying the package
         // again after Authority has consumed the signed Create sequence.
         slot.intent()
             .ok_or(SharedAgentHostError::ScopeMismatch)?
             .verify(self.authority_target(), managed, &RawCredentialVerifier)
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-        slot.retain_runtime(runtime.exact_bytes())
+        slot.retain_runtime(exact_runtime)
             .map_err(|_| SharedAgentHostError::Unavailable)?;
         if slot
             .load_runtime()
             .map_err(|_| SharedAgentHostError::Unavailable)?
             .as_deref()
-            != Some(runtime.exact_bytes())
+            != Some(exact_runtime)
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
@@ -4296,17 +4375,30 @@ where
             return Err(SharedAgentHostError::ScopeMismatch);
         };
         let observed_slot = (*observed_slot).max(receipt.selector.valid_from);
-        let (proposal, catalog) = self
-            .host
-            .lock()
-            .map_err(|_| SharedAgentHostError::Unavailable)?
-            .prepare_clean_genesis_proposal(
-                descriptor,
-                runtime,
-                receipt,
-                observed_slot,
-                committee,
-            )?;
+        let (proposal, catalog) = {
+            let mut host = self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            match runtime {
+                SharedGenesisRuntime::Image(runtime) => host.prepare_clean_genesis_proposal(
+                    descriptor,
+                    runtime,
+                    receipt,
+                    observed_slot,
+                    committee,
+                )?,
+                #[cfg(feature = "experimental-state-blocks")]
+                SharedGenesisRuntime::External(runtime) => host
+                    .prepare_clean_external_genesis_proposal(
+                        descriptor,
+                        runtime,
+                        receipt,
+                        observed_slot,
+                        committee,
+                    )?,
+            }
+        };
         // issue_management_intent_with_admission reauthenticated this retained
         // anchor against the independently opened system generation before
         // accepting its approval. Never take this lineage from caller input.
@@ -4617,10 +4709,37 @@ where
     {
         let (candidate, committee) =
             self.resume_shared_genesis_preparation(recovery, replicas, receipt_signer)?;
-        let pending = genesis_issuance::RetainedGenesisPublication::load(
-            &mut recovery.publication,
+        self.verify_authorized_shared_genesis_publication(
             &candidate,
             &committee,
+            record,
+            &mut recovery.query,
+            &mut recovery.publication,
+            &mut recovery.publication_reply,
+        )
+    }
+
+    /// Common finality boundary for image and external proposals. The caller
+    /// must possess an owner-issued candidate; publication bytes, a valid QC
+    /// or a supplied archive alone cannot manufacture this replay attestation.
+    pub(crate) fn verify_authorized_shared_genesis_publication<Q, W, PubReply>(
+        &mut self,
+        candidate: &AuthorizedSharedGenesisProposal,
+        committee: &super::committee::AuthorityCommittee,
+        record: &super::genesis::AgentGenesisArchiveRecord,
+        query: &mut Q,
+        publication: &mut W,
+        publication_reply: &mut PubReply,
+    ) -> Result<ReplayVerifiedAgentGenesisFinality, SharedAgentHostError>
+    where
+        Q: CleanManagementIssuerStore,
+        W: CleanManagementIssuerStore,
+        PubReply: CleanManagementIssuerStore,
+    {
+        let pending = genesis_issuance::RetainedGenesisPublication::load(
+            publication,
+            candidate,
+            committee,
             record,
             &self.authority_target(),
         )
@@ -4646,12 +4765,12 @@ where
         // execute_genesis_publication checks the exact installed physical
         // material and, because ACK exists, replays rather than redispatches.
         self.execute_genesis_publication(
-            &candidate,
-            &committee,
+            candidate,
+            committee,
             record,
-            &mut recovery.query,
-            &mut recovery.publication,
-            &mut recovery.publication_reply,
+            query,
+            publication,
+            publication_reply,
         )?;
         Ok(ReplayVerifiedAgentGenesisFinality(
             record.provision().clone(),
@@ -9276,6 +9395,9 @@ mod tests {
         target_os = "linux"
     ))]
     mod physical {
+        #[cfg(feature = "experimental-state-blocks")]
+        mod external_shared;
+
         use alloc::boxed::Box;
         use core::num::NonZeroU64;
         use std::cell::Cell;
@@ -12436,22 +12558,67 @@ mod tests {
         #[test]
         #[ignore = "uses three authenticated loopback transports and real Raft election"]
         fn fixed_system_pending_attachments_survive_election_without_exposing_owners() {
-            check_fixed_system_pending_cluster(false, false);
+            check_fixed_system_pending_cluster(false, None, false);
         }
 
         #[test]
         #[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
         fn candidate_authority_fixed_system_leader_bootstrap_replicates_to_followers() {
-            check_fixed_system_pending_cluster(true, false);
+            check_fixed_system_pending_cluster(true, None, false);
         }
 
         #[test]
         #[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
         fn candidate_projection_recovers_after_leader_loss_and_former_leader_reopen() {
-            check_fixed_system_pending_cluster(true, true);
+            check_fixed_system_pending_cluster(
+                true,
+                Some(ProjectionCrashStage::AfterInvoke),
+                false,
+            );
         }
 
-        fn check_fixed_system_pending_cluster(complete_leader: bool, projection_failover: bool) {
+        #[test]
+        #[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
+        fn candidate_projection_successor_retires_before_former_leader_reopen() {
+            check_fixed_system_pending_cluster(true, Some(ProjectionCrashStage::AfterInvoke), true);
+        }
+
+        #[test]
+        #[ignore = "known pre-Invoke failover release gate: PAP2 has no authority to readmit unseen work; requires AUTHORITY_CANDIDATE_ELF and loopback"]
+        fn candidate_projection_recovers_before_invoke_and_former_leader_reopen() {
+            // This deliberately remains a desired-success regression, not an
+            // assertion that permanently accepts the current Unavailable loop.
+            // Resolving it needs explicit recovery/readmission authority; do
+            // not weaken the successor's committed-only recovery guard.
+            check_fixed_system_pending_cluster(
+                true,
+                Some(ProjectionCrashStage::BeforeInvoke),
+                false,
+            );
+        }
+
+        #[test]
+        #[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
+        fn candidate_projection_recovers_after_ack_and_former_leader_reopen() {
+            check_fixed_system_pending_cluster(
+                true,
+                Some(ProjectionCrashStage::AfterAckBeforeMetadataClear),
+                false,
+            );
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum ProjectionCrashStage {
+            BeforeInvoke,
+            AfterInvoke,
+            AfterAckBeforeMetadataClear,
+        }
+
+        fn check_fixed_system_pending_cluster(
+            complete_leader: bool,
+            projection_failover: Option<ProjectionCrashStage>,
+            successor_finishes_first: bool,
+        ) {
             if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
                 let _ = tracing_subscriber::fmt()
                     .with_env_filter(
@@ -12680,7 +12847,7 @@ mod tests {
                         .unwrap()
                         == expected));
                 }
-                if projection_failover {
+                if let Some(crash_stage) = projection_failover {
                     let mut owners: Vec<Option<MemoryBootstrapOwner>> =
                         (0..3).map(|_| None).collect();
                     owners[leader] = Some(completed);
@@ -12735,27 +12902,59 @@ mod tests {
                         .unwrap();
                     owner.record.pending_projection = Some(retained.clone());
                     commit_bootstrap_record(&mut owner.record_store, &owner.record).unwrap();
-                    let identity = owner
-                        .pending_authority_projection_identity(&retained, true)
-                        .unwrap();
-                    let outcome = owner
-                        .supervisor_invoke_terminal_reserved(
-                            identity,
-                            work.clone(),
-                            authorization.clone(),
-                        )
-                        .unwrap();
-                    assert!(matches!(outcome, RuntimeOutcome::Completed(Ok(_))));
-                    for other in owners.iter().flatten() {
-                        assert!(wait_until(std::time::Duration::from_secs(30), || other
-                            .host
-                            .lock()
-                            .unwrap()
-                            .retained_terminal_projection_invoke(agent, &work, &authorization)
-                            .unwrap()));
+                    let mut invoked = None;
+                    if crash_stage != ProjectionCrashStage::BeforeInvoke {
+                        let identity = owner
+                            .pending_authority_projection_identity(&retained, true)
+                            .unwrap();
+                        let outcome = owner
+                            .supervisor_invoke_terminal_reserved(
+                                identity,
+                                work.clone(),
+                                authorization.clone(),
+                            )
+                            .unwrap();
+                        assert!(matches!(outcome, RuntimeOutcome::Completed(Ok(_))));
+                        invoked = Some(outcome);
+                        if crash_stage == ProjectionCrashStage::AfterAckBeforeMetadataClear {
+                            let acknowledgement = owner
+                                .supervisor_acknowledge_reserved(
+                                    identity,
+                                    work.clone(),
+                                    authorization.clone(),
+                                )
+                                .unwrap();
+                            let RuntimeOutcome::Acknowledged(Ok(acknowledged)) = acknowledgement
+                            else {
+                                panic!("expected exact positive projection ACK");
+                            };
+                            assert_eq!(acknowledged.invocation, work.invocation);
+                            assert_eq!(acknowledged.work, work.commitment());
+                            assert_eq!(acknowledged.authorization, authorization.commitment());
+                        }
                     }
-                    // Lose the leader between Invoke and ACK. Two surviving
-                    // voters must elect a successor without its local record.
+                    for other in owners.iter().flatten() {
+                        assert!(wait_until(std::time::Duration::from_secs(30), || {
+                            let host = other.host.lock().unwrap();
+                            let invoked = host
+                                .retained_terminal_projection_invoke(agent, &work, &authorization)
+                                .unwrap();
+                            let acknowledged = host
+                                .retained_positive_clean_acknowledgement(
+                                    agent,
+                                    &work,
+                                    &authorization,
+                                )
+                                .unwrap();
+                            invoked == (crash_stage == ProjectionCrashStage::AfterInvoke)
+                                && acknowledged
+                                    == (crash_stage
+                                        == ProjectionCrashStage::AfterAckBeforeMetadataClear)
+                        }));
+                    }
+                    // Lose the leader at the selected durable boundary. Two
+                    // surviving voters elect a successor without its local
+                    // pending record; none may weaken the exact pair guard.
                     drop(owners[leader].take());
                     assert!(wait_until(std::time::Duration::from_secs(15), || owners
                         .iter()
@@ -12764,6 +12963,26 @@ mod tests {
                             ._network_host
                             .bootstrap_is_local_leader(agent)
                             .unwrap_or(false))));
+                    if successor_finishes_first {
+                        let successor = owners
+                            .iter_mut()
+                            .flatten()
+                            .find(|owner| {
+                                owner
+                                    ._network_host
+                                    .bootstrap_is_local_leader(agent)
+                                    .unwrap()
+                            })
+                            .unwrap();
+                        let response = successor
+                            .invoke_peer_authority_projection(query.clone(), true)
+                            .unwrap();
+                        assert_eq!(
+                            successor.committed_projection_response(&work).unwrap(),
+                            Some(response)
+                        );
+                        assert!(successor.record.pending_projection.is_none());
+                    }
                     let mut serving = Vec::new();
                     let mut attachments = Vec::new();
                     for owner in owners.into_iter().flatten() {
@@ -12810,26 +13029,57 @@ mod tests {
                             ),
                         }
                     };
-                    // Bootstrap returns the retained owner; production route
-                    // reconciliation explicitly drains its pending read before
-                    // fetching inventory or exposing routes.
-                    assert!(reopened.record.pending_projection.is_some());
+                    // An ACK already in the former leader's local journal is
+                    // cleaned during open. Otherwise route reconciliation must
+                    // explicitly drain its pending read before serving routes.
+                    assert_eq!(
+                        reopened.record.pending_projection.is_some(),
+                        crash_stage != ProjectionCrashStage::AfterAckBeforeMetadataClear
+                    );
                     assert!(
                         !reopened
                             ._network_host
                             .bootstrap_is_local_leader(agent)
                             .unwrap()
                     );
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-                    loop {
-                        match reopened.recover_pending_authority_projection() {
-                            Ok(true) => break,
-                            Err(SharedAgentHostError::Unavailable)
-                                if std::time::Instant::now() < deadline =>
-                            {
-                                std::thread::sleep(std::time::Duration::from_millis(50))
+                    if crash_stage == ProjectionCrashStage::AfterAckBeforeMetadataClear {
+                        assert_eq!(reopened.recover_pending_authority_projection(), Ok(false));
+                    } else {
+                        let InvocationAuthorization::PublicPreflight(original_preflight) =
+                            &authorization
+                        else {
+                            unreachable!()
+                        };
+                        let changed_authorization = InvocationAuthorization::PublicPreflight(
+                            crate::agent::sdk::PublicPreflight::for_work(
+                                &work,
+                                original_preflight.observed_slot + 1,
+                            ),
+                        );
+                        assert_eq!(
+                            reopened._network_host.reserve_projection_pair(
+                                agent,
+                                &work,
+                                &changed_authorization,
+                                false,
+                            ),
+                            Err(SharedAgentHostError::Conflict),
+                            "reopened pending record must exclude a changed preflight clock"
+                        );
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(60);
+                        loop {
+                            match reopened.recover_pending_authority_projection() {
+                                Ok(true) => break,
+                                Err(SharedAgentHostError::Unavailable)
+                                    if std::time::Instant::now() < deadline =>
+                                {
+                                    std::thread::sleep(std::time::Duration::from_millis(50))
+                                }
+                                other => {
+                                    panic!("former leader pending read did not retire: {other:?}")
+                                }
                             }
-                            other => panic!("former leader pending read did not retire: {other:?}"),
                         }
                     }
                     assert!(reopened.record.pending_projection.is_none());
@@ -12860,6 +13110,31 @@ mod tests {
                             .unwrap()
                             .retained_positive_clean_acknowledgement(agent, &work, &authorization)
                             .unwrap()));
+                    }
+                    let recovered_response = reopened
+                        .committed_projection_response(&work)
+                        .unwrap()
+                        .expect("exact committed response remains available after ACK");
+                    if let Some(RuntimeOutcome::Completed(Ok(reply))) = invoked {
+                        use crate::actors::codec::Decode as _;
+                        assert_eq!(
+                            crate::actors::value::Value::try_decode(&reply.reply),
+                            Some(crate::actors::value::Value::Bytes(
+                                recovered_response.clone()
+                            )),
+                            "recovery must not substitute or re-execute a different response"
+                        );
+                    }
+                    for owner in &serving {
+                        assert_eq!(
+                            owner
+                                .lock()
+                                .unwrap()
+                                .committed_projection_response(&work)
+                                .unwrap(),
+                            Some(recovered_response.clone()),
+                            "all replicas retain the same exact acknowledged response"
+                        );
                     }
                     for attachment in attachments {
                         attachment.retire().unwrap();

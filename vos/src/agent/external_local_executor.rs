@@ -924,6 +924,28 @@ impl<R: CatalogBlobResolver> ExternalLocalReplayExecutor<R> {
         descriptor: AgentDescriptor,
         resolver: R,
     ) -> Result<Self, LocalReplayExecutorError> {
+        if descriptor.identity.profile != AgentProfile::Local || descriptor.replicas.len() != 1 {
+            return Err(LocalReplayExecutorError::InvalidState);
+        }
+        Self::new_admitted(runtime, descriptor, resolver)
+    }
+
+    pub(crate) fn new_shared(
+        runtime: AdmittedStateRuntimePackage,
+        descriptor: AgentDescriptor,
+        resolver: R,
+    ) -> Result<Self, LocalReplayExecutorError> {
+        if !super::replay::external_shared_descriptor_supported(&descriptor) {
+            return Err(LocalReplayExecutorError::InvalidState);
+        }
+        Self::new_admitted(runtime, descriptor, resolver)
+    }
+
+    fn new_admitted(
+        runtime: AdmittedStateRuntimePackage,
+        descriptor: AgentDescriptor,
+        resolver: R,
+    ) -> Result<Self, LocalReplayExecutorError> {
         let binding = runtime
             .binding(
                 SpaceId(descriptor.identity.space.0),
@@ -931,8 +953,6 @@ impl<R: CatalogBlobResolver> ExternalLocalReplayExecutor<R> {
             )
             .map_err(|_| LocalReplayExecutorError::InvalidState)?;
         if descriptor.validate().is_err()
-            || descriptor.identity.profile != AgentProfile::Local
-            || descriptor.replicas.len() != 1
             || descriptor.identity.runtime_deployment != runtime.deployment()
             || descriptor.identity.runtime_program != runtime.program()
             || descriptor.identity.runtime_producer != runtime.manifest().signing.producer
@@ -1027,6 +1047,14 @@ impl<R: CatalogBlobResolver> ExternalLocalReplayExecutor<R> {
             .map_err(|_| LocalReplayExecutorError::InvalidState)
     }
 
+    pub(crate) fn runtime(&self) -> &AdmittedStateRuntimePackage {
+        &self.runtime
+    }
+
+    pub(crate) fn descriptor(&self) -> &AgentDescriptor {
+        &self.descriptor
+    }
+
     fn load(&self, reference: &BlobRef) -> Result<Vec<u8>, LocalReplayExecutorError> {
         let bytes = self
             .resolver
@@ -1104,7 +1132,7 @@ impl<R: CatalogBlobResolver> ExternalLocalReplayExecutor<R> {
         Ok(())
     }
 
-    fn gas(&self, operation: &ReplayOperation) -> Result<u64, LocalReplayExecutorError> {
+    pub(crate) fn gas(&self, operation: &ReplayOperation) -> Result<u64, LocalReplayExecutorError> {
         let actor = match operation {
             ReplayOperation::CleanInvoke { work, .. }
             | ReplayOperation::CleanResume { work, .. } => {
@@ -1188,14 +1216,26 @@ impl<R: CatalogBlobResolver> ReplayExecutor for ExternalLocalReplayExecutor<R> {
                 observed_slot,
             } => {
                 self.check_install(request)?;
-                super::driver::verify_clean_management_receipt(
-                    &self.descriptor,
-                    request,
-                    authority,
-                    *observed_slot,
-                    false,
-                )
-                .map_err(|_| LocalReplayExecutorError::InvalidAuthority)?;
+                let verify =
+                    if self.descriptor.identity.profile == crate::agent_sdk::AgentProfile::Shared {
+                        super::driver::verify_clean_management_journal_receipt(
+                            &self.descriptor,
+                            request,
+                            authority,
+                            *observed_slot,
+                            false,
+                        )
+                        .map(|_| ())
+                    } else {
+                        super::driver::verify_clean_management_receipt(
+                            &self.descriptor,
+                            request,
+                            authority,
+                            *observed_slot,
+                            false,
+                        )
+                    };
+                verify.map_err(|_| LocalReplayExecutorError::InvalidAuthority)?;
             }
             ReplayOperation::CleanInvoke {
                 work,
@@ -1276,14 +1316,29 @@ impl<R: CatalogBlobResolver> ReplayExecutor for ExternalLocalReplayExecutor<R> {
             }
             _ => LocalReplayExecutorError::RuntimeOutput,
         })?;
-        if let ReplayOperation::CleanManage { request, .. } = &input.operation
-            && !super::driver::sdk_management_reply_matches(
+        if let ReplayOperation::CleanManage {
+            request,
+            authority,
+            observed_slot,
+        } = &input.operation
+        {
+            let returned = execution.output().transition();
+            if *observed_slot > authority.selector.expires_at
+                && (returned.outcome
+                    != RuntimeOutcome::Management(Err(
+                        crate::agent_sdk::ManagementError::ExpiredBeforeApplication,
+                    ))
+                    || returned.state == super::replay::sdk_runtime_state(before))
+            {
+                return Err(LocalReplayExecutorError::InvalidState);
+            }
+            if !super::driver::sdk_management_reply_matches(
                 &self.descriptor,
                 request,
-                &execution.output().transition().outcome,
-            )
-        {
-            return Err(LocalReplayExecutorError::InvalidState);
+                &returned.outcome,
+            ) {
+                return Err(LocalReplayExecutorError::InvalidState);
+            }
         }
         let transition = execution.transition().clone();
         if matches!(

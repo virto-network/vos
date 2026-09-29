@@ -576,7 +576,7 @@ fn validated_clean_management_result<E: ReplayExecutor, SourceError>(
     Ok(Some(result))
 }
 
-fn sdk_runtime_state(state: &RuntimeState) -> crate::agent_sdk::RuntimeState {
+pub(crate) fn sdk_runtime_state(state: &RuntimeState) -> crate::agent_sdk::RuntimeState {
     crate::agent_sdk::RuntimeState {
         control: state.control.clone(),
         linear: state.linear.clone(),
@@ -2757,10 +2757,9 @@ impl ReplayPreparedExternalGenesis {
         self.prepared.artifacts()
     }
 
-    /// Local proposal material only; neither finality nor permission to initialize.
-    /// Shared admission needs a common commitment independent of each replica's
-    /// node-bound Local roots. Do not submit this full per-replica state as one
-    /// Shared quorum proposal until that projection is defined and checked.
+    /// Proposal material only; neither finality nor permission to initialize.
+    /// Shared's signed Linear-only contract has no node-bound Local root, so
+    /// it retains the existing full-state commitment domain without normalization.
     pub(crate) fn ordinary_proposal(
         &self,
     ) -> Result<super::genesis::AgentGenesisProposal, super::genesis::AgentGenesisError> {
@@ -2769,11 +2768,34 @@ impl ReplayPreparedExternalGenesis {
             ReplayOperation::CleanManage {
                 request: crate::agent_sdk::ManagementRequest::Create(descriptor), ..
             } if descriptor.identity.profile == crate::agent_sdk::AgentProfile::Local
+                || (external_shared_descriptor_supported(descriptor)
+                    && self.prepared.post_create.merge.is_empty()
+                    && self.prepared.post_create.local.is_empty())
         ) {
             return Err(super::genesis::AgentGenesisError::InvalidProposal);
         }
         self.prepared.ordinary_proposal()
     }
+}
+
+/// The first external Shared contract is intentionally narrower than generic
+/// SDK Shared capability. The limitation is signed in the runtime package;
+/// unsupported actors fail admission instead of being assigned another lane.
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+pub(crate) fn external_shared_descriptor_supported(
+    descriptor: &crate::agent_sdk::AgentDescriptor,
+) -> bool {
+    descriptor.validate().is_ok()
+        && descriptor.identity.profile == crate::agent_sdk::AgentProfile::Shared
+        && descriptor.capabilities.lanes
+            == crate::agent_sdk::LaneSet::of(crate::agent_sdk::StateLane::Linear)
+        && !descriptor.capabilities.scheduling
+        && descriptor.capabilities.proof_systems == crate::agent_sdk::ProofSystemSet::EMPTY
+        && descriptor.replicas.len() == 3
+        && descriptor
+            .replicas
+            .iter()
+            .all(|replica| replica.role == crate::agent_sdk::ReplicaRole::Voter)
 }
 
 /// Receipt-authenticated admission for one ordinary Local Agent genesis.
@@ -3093,18 +3115,71 @@ pub(crate) fn clean_create_management_evidence(
     })
 }
 
-/// Local admission retaining its physical initial roots and candidate blocks.
+/// Independently admitted genesis retaining physical initial roots and blocks.
 /// Ordinary initialization has no external-block availability contract and
 /// rejects its genesis checkpoint. Only a dedicated
 /// initialization owner may consume this seal after staging its full closure.
 #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
-pub(crate) struct ReplaySealedExternalLocalGenesis {
-    local: ReplaySealedLocalGenesis,
+pub(crate) struct ReplaySealedExternalGenesis {
+    admission: ExternalGenesisAdmission,
     execution: super::state_block_pvm::ExternalCreateExecution,
 }
 
+/// Retained internal name for the experimental Local owner. `from_prepared`
+/// remains Local-only; Shared construction requires independent finality.
 #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
-impl ReplaySealedExternalLocalGenesis {
+pub(crate) type ReplaySealedExternalLocalGenesis = ReplaySealedExternalGenesis;
+
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+enum ExternalGenesisAdmission {
+    Local(ReplaySealedLocalGenesis),
+    Shared(ReplaySealedSharedGenesis),
+}
+
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+impl ReplaySealedExternalGenesis {
+    fn ordinary(&self) -> &dyn ReplaySealedOrdinaryGenesis {
+        match &self.admission {
+            ExternalGenesisAdmission::Local(seal) => seal,
+            ExternalGenesisAdmission::Shared(seal) => seal,
+        }
+    }
+
+    pub(crate) fn is_shared(&self) -> bool {
+        matches!(self.admission, ExternalGenesisAdmission::Shared(_))
+    }
+
+    pub(crate) fn from_prepared_shared(
+        verified: &VerifiedAgentGenesisProvision,
+        prepared: ReplayPreparedExternalGenesis,
+    ) -> Result<Self, ReplayValidationError> {
+        let ReplayPreparedExternalGenesis {
+            prepared,
+            execution,
+        } = prepared;
+        let ReplayOperation::CleanManage {
+            request: crate::agent_sdk::ManagementRequest::Create(descriptor),
+            ..
+        } = &prepared.create.operation
+        else {
+            return Err(ReplayError::InvalidRecord);
+        };
+        if !external_shared_descriptor_supported(descriptor)
+            || !prepared.post_create.merge.is_empty()
+            || !prepared.post_create.local.is_empty()
+        {
+            return Err(ReplayError::ScopeMismatch);
+        }
+        let sealed = Self {
+            admission: ExternalGenesisAdmission::Shared(
+                ReplaySealedSharedGenesis::from_prepared_verified(verified, prepared)?,
+            ),
+            execution,
+        };
+        sealed.validate()?;
+        Ok(sealed)
+    }
+
     pub(crate) fn from_prepared(
         prepared: ReplayPreparedExternalGenesis,
     ) -> Result<Self, ReplayValidationError> {
@@ -3116,7 +3191,9 @@ impl ReplaySealedExternalLocalGenesis {
         // exact Create receipt, replica and artifact closure. The root wrapper
         // must retain execution evidence rather than expose that opaque seal.
         let sealed = Self {
-            local: ReplaySealedLocalGenesis::from_prepared_inner(prepared)?,
+            admission: ExternalGenesisAdmission::Local(
+                ReplaySealedLocalGenesis::from_prepared_inner(prepared)?,
+            ),
             execution,
         };
         sealed.validate()?;
@@ -3124,7 +3201,7 @@ impl ReplaySealedExternalLocalGenesis {
     }
 
     pub(crate) fn genesis(&self) -> &AgentJournalGenesis {
-        self.local.genesis()
+        self.ordinary().genesis()
     }
 
     pub(crate) fn execution(&self) -> &super::state_block_pvm::ExternalCreateExecution {
@@ -3136,7 +3213,7 @@ impl ReplaySealedExternalLocalGenesis {
     /// it alone would leave these roots undiscoverable to recovery/collection.
     /// Construction is not storage publication or an availability certificate.
     pub(crate) fn initial_checkpoint(&self) -> Result<CheckpointManifest, ReplayValidationError> {
-        let heads = self.local.initial_heads();
+        let heads = self.ordinary().initial_heads();
         let lanes = [
             PersistedLane::Control,
             PersistedLane::Linear,
@@ -3164,7 +3241,7 @@ impl ReplaySealedExternalLocalGenesis {
             heads.merge_invocations,
             heads.transition_proofs,
             lanes,
-            self.local.artifacts().id(),
+            self.ordinary().artifacts().id(),
             clean_create_management_evidence(&self.genesis().create),
         )
     }
@@ -3173,7 +3250,7 @@ impl ReplaySealedExternalLocalGenesis {
     /// the usable external-state head. Initialization must persist it before
     /// installing the checkpoint-bearing successor below.
     pub(crate) fn initial_predecessor_heads(&self) -> JournalHeads {
-        self.local.initial_heads()
+        self.ordinary().initial_heads()
     }
 
     pub(crate) fn initial_heads(&self) -> Result<JournalHeads, ReplayValidationError> {
@@ -3189,22 +3266,22 @@ impl ReplaySealedExternalLocalGenesis {
     }
 
     pub(crate) fn post_create(&self) -> &RuntimeState {
-        self.local.post_create()
+        self.ordinary().post_create()
     }
     pub(crate) fn artifacts(&self) -> &ArtifactClosure {
-        self.local.artifacts()
+        self.ordinary().artifacts()
     }
     pub(crate) fn empty_frontier(&self) -> &MergeFrontier {
-        self.local.empty_frontier()
+        self.ordinary().empty_frontier()
     }
     pub(crate) fn ordered_invocations(&self) -> &InvocationIndexManifest {
-        self.local.ordered_invocations()
+        self.ordinary().ordered_invocations()
     }
     pub(crate) fn merge_invocations(&self) -> &InvocationIndexManifest {
-        self.local.merge_invocations()
+        self.ordinary().merge_invocations()
     }
     pub(crate) fn local_invocations(&self) -> &InvocationIndexManifest {
-        self.local.local_invocations()
+        self.ordinary().local_invocations()
     }
 
     /// Verify/stage all initial roots under one exclusive store borrow and one
@@ -3324,10 +3401,10 @@ impl ReplaySealedExternalLocalGenesis {
         if store.genesis()?.as_ref() != Some(self.genesis())
             || heads.genesis != self.genesis().id()
             || heads.admission != self.genesis().admission
-            || heads.node != self.local.replica().node
+            || heads.node != self.ordinary().replica().node
             || heads.runtime != *self.genesis().runtime()
             || heads.checkpoint.is_none()
-            || heads.merge_frontier != self.local.empty_frontier().id()
+            || heads.merge_frontier != self.ordinary().empty_frontier().id()
         {
             return Err(JournalStoreError::ScopeMismatch);
         }
@@ -3382,7 +3459,7 @@ impl ReplaySealedExternalLocalGenesis {
     }
 
     pub(crate) fn lane_manifest(&self, lane: PersistedLane) -> LaneStateManifest {
-        let mut manifest = self.local.lane_manifest(lane);
+        let mut manifest = self.ordinary().lane_manifest(lane);
         let sdk_lane = match lane {
             PersistedLane::Control => return manifest,
             PersistedLane::Linear => crate::agent_sdk::StateLane::Linear,
@@ -3413,7 +3490,7 @@ impl ReplaySealedExternalLocalGenesis {
     }
 
     fn validate(&self) -> Result<(), ReplayValidationError> {
-        self.local.validate()?;
+        self.ordinary().validate_seal()?;
         let crate::agent_sdk::RuntimeWork::Manage { request, .. } = self.execution.work().work()
         else {
             return Err(ReplayError::InvalidRecord);
@@ -3421,13 +3498,27 @@ impl ReplaySealedExternalLocalGenesis {
         let crate::agent_sdk::ManagementRequest::Create(descriptor) = request.as_ref() else {
             return Err(ReplayError::InvalidRecord);
         };
-        let [replica] = descriptor.replicas.as_slice() else {
+        let replica = descriptor
+            .replicas
+            .iter()
+            .find(|replica| sdk_replica_matches_host(replica, self.ordinary().replica()))
+            .ok_or(ReplayError::ScopeMismatch)?;
+        if self.is_shared() {
+            if !external_shared_descriptor_supported(descriptor)
+                || !self.post_create().merge.is_empty()
+                || !self.post_create().local.is_empty()
+                || self.execution.work().lanes().len() != 1
+            {
+                return Err(ReplayError::ScopeMismatch);
+            }
+        } else if descriptor.replicas.len() != 1
+            || descriptor.identity.profile != crate::agent_sdk::AgentProfile::Local
+        {
             return Err(ReplayError::ScopeMismatch);
-        };
+        }
         if !self.execution.matches(&self.genesis().create, *replica)
-            || !sdk_replica_matches_host(replica, self.local.replica())
             || !self.genesis().runtime().is_external_state()
-            || sdk_runtime_state(self.local.post_create())
+            || sdk_runtime_state(self.ordinary().post_create())
                 != self.execution.output().transition().state
         {
             return Err(ReplayError::ScopeMismatch);
@@ -3447,12 +3538,13 @@ impl ReplaySealedExternalLocalGenesis {
                     self.genesis(),
                     &manifest.runtime,
                     lane,
-                    (lane == PersistedLane::Local).then_some(self.local.replica().node),
+                    (lane == PersistedLane::Local).then_some(self.ordinary().replica().node),
                     &manifest.cursor,
                 )
                 .map_err(|_| ReplayError::ScopeMismatch)?;
                 if root.descriptor.context() != expected
-                    || root.descriptor.encode() != state_component(self.local.post_create(), lane)
+                    || root.descriptor.encode()
+                        != state_component(self.ordinary().post_create(), lane)
                 {
                     return Err(ReplayError::ScopeMismatch);
                 }
@@ -3763,7 +3855,7 @@ pub(crate) trait ReplaySealedOrdinaryGenesis {
 }
 
 #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
-impl ReplaySealedOrdinaryGenesis for ReplaySealedExternalLocalGenesis {
+impl ReplaySealedOrdinaryGenesis for ReplaySealedExternalGenesis {
     fn genesis(&self) -> &AgentJournalGenesis {
         self.genesis()
     }
@@ -3786,10 +3878,10 @@ impl ReplaySealedOrdinaryGenesis for ReplaySealedExternalLocalGenesis {
         self.artifacts()
     }
     fn replica(&self) -> AgentReplica {
-        self.local.replica()
+        self.ordinary().replica()
     }
     fn admission_commitment(&self) -> Hash {
-        self.local.admission_commitment()
+        self.ordinary().admission_commitment()
     }
     fn lane_manifest(&self, lane: PersistedLane) -> LaneStateManifest {
         self.lane_manifest(lane)
@@ -3799,10 +3891,10 @@ impl ReplaySealedOrdinaryGenesis for ReplaySealedExternalLocalGenesis {
             .expect("validated immutable genesis seal")
     }
     fn validates_post_create_state(&self) -> bool {
-        self.local.validates_post_create_state()
+        self.ordinary().validates_post_create_state()
     }
     fn admission_record(&self) -> Option<&AgentGenesisAdmissionRecord> {
-        None
+        self.ordinary().admission_record()
     }
     fn validate_seal(&self) -> Result<(), ReplayValidationError> {
         self.validate()
@@ -5973,8 +6065,26 @@ impl ExternalCheckpointValidation<'_> {
             && self.successor == publication.next.id()
             && self.predecessor_checkpoint == Some(self.successor_checkpoint)
             && publication.next.checkpoint == Some(self.successor_checkpoint)
-            && publication.mode == ReplayPublicationMode::Canonical
-            && publication.shared_ordered_commit.is_none()
+            && ((publication.mode == ReplayPublicationMode::Canonical
+                && publication.shared_ordered_commit.is_none())
+                || (matches!(
+                    publication.mode,
+                    ReplayPublicationMode::SharedOrderedPreserveMerge
+                        | ReplayPublicationMode::SharedOrderedInstallFence
+                ) && publication
+                    .shared_ordered_commit
+                    .as_ref()
+                    .is_some_and(|binding| {
+                        binding.journal_store == store
+                            && binding.claim.runtime().is_external_state()
+                            && publication.next.local_revision == 0
+                            && publication.next.local_head.is_none()
+                            && publication.external_execution().is_none_or(|execution| {
+                                execution.lanes().len() == 1
+                                    && execution.lanes()[0].base.context().scope().lane()
+                                        == crate::agent_sdk::StateLane::Linear
+                            })
+                    })))
             && publication.system_authority_write.is_none()
             && match &publication.anchor {
                 ReplayPublicationAnchor::Local(_) => true,
@@ -6738,6 +6848,57 @@ impl PreparedSharedCheckpoint {
 pub(crate) struct PreparedSharedOrderedPublication<'store, S: AgentJournalStore> {
     inner: ReplayPreparedPublication<'store, S>,
     authority: CommittedSharedOrdered,
+    #[cfg(feature = "experimental-state-blocks")]
+    external: Option<SharedExternalPublication<'store>>,
+}
+
+/// Availability retained by the exclusive Shared journal owner after full
+/// authenticated recovery. It is not a transferable import/root certificate.
+/// The owner must not expose mutable storage or run GC while this pin is live.
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+pub(crate) struct SharedExternalAvailability {
+    store: JournalStoreInstanceId,
+    epoch: u64,
+    heads: JournalHeadsId,
+    checkpoint_lanes: BTreeSet<LaneStateId>,
+    poisoned: bool,
+    invalidated: core::sync::atomic::AtomicBool,
+}
+
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+impl SharedExternalAvailability {
+    /// A failed read after admission revokes every historical availability
+    /// assertion until a fresh owner independently audits the durable store.
+    pub(crate) fn invalidate(&self) {
+        self.invalidated
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn is_poisoned(&self) -> bool {
+        self.poisoned || self.invalidated.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn require_current<S: AgentJournalStore>(
+        &self,
+        store: &S,
+        materialization: &ReplayMaterialization,
+    ) -> Result<(), JournalStoreError> {
+        if self.is_poisoned()
+            || self.store != store.instance_id()
+            || self.epoch != store.validation_epoch()
+            || self.heads != materialization.heads_id()
+            || store.heads()?.as_ref() != Some(materialization.heads())
+        {
+            return Err(JournalStoreError::Unavailable);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+struct SharedExternalPublication<'a> {
+    availability: &'a mut SharedExternalAvailability,
+    budget: crate::agent_sdk::state_blocks::ReadBudget,
 }
 
 #[cfg(feature = "std")]
@@ -6788,7 +6949,13 @@ impl<'store, S: AgentJournalStore> PreparedSharedOrderedPublication<'store, S> {
         ),
         JournalStoreError,
     > {
-        let Self { inner, authority } = self;
+        #[cfg(feature = "experimental-state-blocks")]
+        if self.external.is_some() {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        let Self {
+            inner, authority, ..
+        } = self;
         if !matches!(
             inner.sealed.mode,
             ReplayPublicationMode::SharedOrderedPreserveMerge
@@ -6809,6 +6976,103 @@ impl<'store, S: AgentJournalStore> PreparedSharedOrderedPublication<'store, S> {
         let successor = inner.successor.heads_id;
         let publication = inner.store.publish(&inner.sealed)?;
         let receipt = PublishedSharedOrdered::from_binding(&binding, successor, authority)?;
+        Ok((publication, inner.successor, inner.executions, receipt))
+    }
+}
+
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+impl<'store, S: AgentJournalStore> PreparedSharedOrderedPublication<'store, S> {
+    /// Complete block durability precedes the existing Shared binding/CAS and
+    /// receipt. Failure poisons the serving availability pin until read-only
+    /// authenticated reopen; replay may never repair missing committed blocks.
+    pub(crate) fn publish_external_shared(
+        self,
+    ) -> Result<
+        (
+            JournalPublication,
+            ReplayMaterialization,
+            Vec<ReplayExecutionResult>,
+            PublishedSharedOrdered,
+        ),
+        JournalStoreError,
+    > {
+        let Self {
+            inner,
+            authority,
+            external,
+        } = self;
+        let SharedExternalPublication {
+            availability: pin,
+            mut budget,
+        } = external.ok_or(JournalStoreError::NonCanonical)?;
+        if pin.is_poisoned()
+            || pin.store != inner.store.instance_id()
+            || pin.epoch != inner.store.validation_epoch()
+            || pin.heads != inner.sealed.expected
+            || inner.store.heads()?.map(|heads| heads.id()) != Some(pin.heads)
+            || inner.store.instance_id() != authority.journal_store
+        {
+            return Err(JournalStoreError::Conflict);
+        }
+        let checkpoint = inner
+            .sealed
+            .next
+            .checkpoint
+            .ok_or(JournalStoreError::NonCanonical)?;
+        let mut validation = ExternalCheckpointValidation {
+            mutation: Some((&inner.sealed, false)),
+            store: pin.store,
+            predecessor: pin.heads,
+            successor: inner.sealed.next.id(),
+            predecessor_checkpoint: Some(checkpoint),
+            successor_checkpoint: checkpoint,
+            predecessor_lanes: &pin.checkpoint_lanes,
+            successor_lanes: &pin.checkpoint_lanes,
+        };
+        if !validation.permits_pinned_base(pin.store, &inner.sealed) {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        // No availability is lent after any ambiguous write, including a
+        // durable-success/error return from the underlying journal CAS.
+        pin.poisoned = true;
+        if let Some(execution) = inner.sealed.external_execution() {
+            if execution.owning_lane().is_some() {
+                let mut staging =
+                    super::state_block_store::StateBlockStaging::from_pinned_publication(
+                        inner.store,
+                        &inner.sealed,
+                        &validation,
+                    )?;
+                staging.stage_execution(execution, &mut budget)?;
+                if inner
+                    .successor
+                    .external_roots
+                    .get(&PersistedLane::Linear)
+                    .map(|root| root.descriptor)
+                    != Some(staging.available())
+                {
+                    return Err(JournalStoreError::NonCanonical);
+                }
+            } else if !execution.output().changes().is_empty()
+                || !execution.matches_roots(&inner.successor.external_roots)
+            {
+                return Err(JournalStoreError::NonCanonical);
+            }
+        }
+        validation.mutation = Some((&inner.sealed, true));
+        let binding = inner
+            .sealed
+            .shared_ordered_commit
+            .as_ref()
+            .ok_or(JournalStoreError::NonCanonical)?
+            .clone();
+        let successor = inner.successor.heads_id;
+        let publication = inner
+            .store
+            .publish_available_shared(&inner.sealed, &validation)?;
+        let receipt = PublishedSharedOrdered::from_binding(&binding, successor, authority)?;
+        pin.heads = successor;
+        pin.poisoned = false;
         Ok((publication, inner.successor, inner.executions, receipt))
     }
 }
@@ -11590,6 +11854,10 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         mode: ReplayPublicationMode,
     ) -> Result<ReplaySealedPublication, ReplayValidationError> {
         validate_publication_envelope(self.genesis, current, &next)?;
+        #[cfg(feature = "experimental-state-blocks")]
+        let external_execution =
+            capture_publication_state_products(&entry.input, step, materialization)?;
+        #[cfg(not(feature = "experimental-state-blocks"))]
         validate_step_side_products(&entry.input, step)?;
         let id = entry.id();
         let installing_fence = mode == ReplayPublicationMode::SharedOrderedInstallFence;
@@ -11794,7 +12062,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         let fence_ancestry = successor_fence_ancestry(materialization, &next, false, Some(entry))?;
         let mut sealed = ReplaySealedPublication {
             #[cfg(feature = "experimental-state-blocks")]
-            external_execution: None,
+            external_execution,
             expected: current.id(),
             next,
             anchor: ReplayPublicationAnchor::Ordered(entry.clone()),
@@ -14641,9 +14909,15 @@ mod aggregate {
         state: &RuntimeState,
         frontier: MergeFrontierId,
         ancestry: &BTreeSet<MergeEventId>,
+        #[cfg(feature = "experimental-state-blocks")] external_merge: Option<
+            &super::super::journal::ExternalStateRoot,
+        >,
     ) -> Result<MergeFence, MaterializeError<ResolverError, ExecutorError>> {
         #[cfg(feature = "experimental-state-blocks")]
-        if dependency.state.external_root.is_some() != entry.input.runtime.is_external_state() {
+        if dependency.state.external_root.as_ref() != external_merge {
+            // Bind the fence to the authenticated declared Merge projection,
+            // not to the runtime ABI: a signed Linear-only external runtime
+            // has no Merge root, while an all-lane runtime must retain it.
             return Err(ReplayError::InvalidFence);
         }
         let parent = OrderedBase {
@@ -15374,6 +15648,8 @@ mod aggregate {
                             &state,
                             current_frontier,
                             &current_ancestry,
+                            #[cfg(feature = "experimental-state-blocks")]
+                            external_roots.get(&PersistedLane::Merge),
                         )?),
                         None if entry.merge_seal.is_none() => None,
                         None => return Err(ReplayError::InvalidFence),
@@ -15714,6 +15990,47 @@ mod aggregate {
         store: JournalStoreInstanceId,
         validation_epoch: u64,
         materialization: ReplayMaterialization,
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    impl ValidatedExternalHead {
+        pub(crate) fn into_shared_availability<S: AgentJournalStore>(
+            self,
+            store: &S,
+            seal: &ReplaySealedExternalGenesis,
+        ) -> Result<(ReplayMaterialization, SharedExternalAvailability), JournalStoreError>
+        {
+            if !seal.is_shared()
+                || store.instance_id() != self.store
+                || store.validation_epoch() != self.validation_epoch
+                || store.heads()?.as_ref() != Some(self.materialization.heads())
+                || self.materialization.heads.genesis != seal.genesis().id()
+                || self.materialization.heads.checkpoint
+                    != Some(
+                        seal.initial_checkpoint()
+                            .map_err(|_| JournalStoreError::ScopeMismatch)?
+                            .id(),
+                    )
+                || self.materialization.external_roots.len() != 1
+                || !self
+                    .materialization
+                    .external_roots
+                    .contains_key(&PersistedLane::Linear)
+                || !self.materialization.state.merge.is_empty()
+                || !self.materialization.state.local.is_empty()
+            {
+                return Err(JournalStoreError::ScopeMismatch);
+            }
+            let pin = SharedExternalAvailability {
+                store: self.store,
+                epoch: self.validation_epoch,
+                heads: self.materialization.heads.id(),
+                checkpoint_lanes: external_checkpoint_lanes(store, self.materialization.heads())?,
+                poisoned: false,
+                invalidated: core::sync::atomic::AtomicBool::new(false),
+            };
+            Ok((self.materialization, pin))
+        }
     }
 
     /// Validate a head selected by the locked filesystem opener, including a
@@ -18257,6 +18574,8 @@ mod aggregate {
                 &materialization.state,
                 current.merge_frontier,
                 &materialization.merge_ancestry,
+                #[cfg(feature = "experimental-state-blocks")]
+                materialization.external_roots.get(&PersistedLane::Merge),
             )?),
             None if entry.merge_seal.is_none() => None,
             None => return Err(ReplayError::InvalidFence),
@@ -18473,6 +18792,75 @@ mod aggregate {
         resolver: &R,
         materialization: &ReplayMaterialization,
         committed: CommittedSharedOrdered,
+    ) -> Result<SharedReplayPreparation<'store, S>, MaterializeError<R::Error, E::Error>>
+    where
+        S: AgentJournalStore + SharedOrderedCommitStore + ReplaySource<Error = JournalStoreError>,
+        E: ReplayExecutor,
+        R: OrderedBaseResolver,
+    {
+        prepare_shared_ordered_inner(
+            store,
+            executor,
+            resolver,
+            materialization,
+            committed,
+            #[cfg(feature = "experimental-state-blocks")]
+            None,
+        )
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn prepare_external_shared_ordered<'store, S, E, R>(
+        store: &'store mut S,
+        executor: &mut E,
+        resolver: &R,
+        materialization: &ReplayMaterialization,
+        committed: CommittedSharedOrdered,
+        availability: &'store mut SharedExternalAvailability,
+        budget: crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<SharedReplayPreparation<'store, S>, MaterializeError<R::Error, E::Error>>
+    where
+        S: AgentJournalStore + SharedOrderedCommitStore + ReplaySource<Error = JournalStoreError>,
+        E: ReplayExecutor,
+        R: OrderedBaseResolver,
+    {
+        if availability.is_poisoned()
+            || availability.store != store.instance_id()
+            || availability.epoch != store.validation_epoch()
+            || availability.heads != materialization.heads.id()
+            || materialization.external_roots.len() != 1
+            || !materialization
+                .external_roots
+                .contains_key(&PersistedLane::Linear)
+            || !materialization.state.merge.is_empty()
+            || !materialization.state.local.is_empty()
+            || !materialization.merge_roots.is_empty()
+            || !materialization.merge_boundary_roots.is_empty()
+        {
+            return Err(journal(JournalStoreError::Unavailable));
+        }
+        prepare_shared_ordered_inner(
+            store,
+            executor,
+            resolver,
+            materialization,
+            committed,
+            Some(SharedExternalPublication {
+                availability,
+                budget,
+            }),
+        )
+    }
+
+    fn prepare_shared_ordered_inner<'store, S, E, R>(
+        store: &'store mut S,
+        executor: &mut E,
+        resolver: &R,
+        materialization: &ReplayMaterialization,
+        committed: CommittedSharedOrdered,
+        #[cfg(feature = "experimental-state-blocks")] mut external: Option<
+            SharedExternalPublication<'store>,
+        >,
     ) -> Result<SharedReplayPreparation<'store, S>, MaterializeError<R::Error, E::Error>>
     where
         S: AgentJournalStore + SharedOrderedCommitStore + ReplaySource<Error = JournalStoreError>,
@@ -19020,6 +19408,8 @@ mod aggregate {
                     &pinned_state,
                     entry.merge_frontier,
                     &pinned_ancestry,
+                    #[cfg(feature = "experimental-state-blocks")]
+                    materialization.external_roots.get(&PersistedLane::Merge),
                 )?)
             }
             None if entry.merge_seal.is_none() => None,
@@ -19038,6 +19428,37 @@ mod aggregate {
         };
         machine.reset_transition_proof_shadows(proof_projection);
         let execution_before = pinned_state.clone();
+        #[cfg(feature = "experimental-state-blocks")]
+        let mut step = if let (Some(genesis), Some(session)) =
+            (external_genesis.as_ref(), external.as_mut())
+        {
+            apply_recovery_step::<_, _, R::Error>(
+                &mut machine,
+                executor,
+                &entry.input,
+                &execution_before,
+                position,
+                Some(unseen_capacity),
+                ReplayTransitionProofAccess::PrepareAllowed,
+                Some((
+                    genesis,
+                    &materialization.external_roots,
+                    LaneCursor::Ordered {
+                        base: materialization.ordered_base(),
+                    },
+                    &mut session.budget,
+                )),
+            )?
+        } else {
+            machine.apply_with_unseen_capacity::<_, ReplayMaterializationSourceError<R::Error>>(
+                executor,
+                &entry.input,
+                &execution_before,
+                position,
+                Some(unseen_capacity),
+            )?
+        };
+        #[cfg(not(feature = "experimental-state-blocks"))]
         let mut step = machine
             .apply_with_unseen_capacity::<_, ReplayMaterializationSourceError<R::Error>>(
                 executor,
@@ -19271,6 +19692,8 @@ mod aggregate {
         executions.extend(finalized_executions);
         Ok(SharedReplayPreparation::Ready(
             PreparedSharedOrderedPublication {
+                #[cfg(feature = "experimental-state-blocks")]
+                external,
                 inner: ReplayPreparedPublication {
                     store,
                     sealed,
@@ -20704,7 +21127,9 @@ pub(crate) use aggregate::materialize_external_genesis;
 #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
 pub(crate) use aggregate::{ExternalJournalCommit, ExternalJournalEntry, RecoveryError};
 #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
-pub(crate) use aggregate::{ValidatedExternalHead, validate_external_genesis_head};
+pub(crate) use aggregate::{
+    ValidatedExternalHead, prepare_external_shared_ordered, validate_external_genesis_head,
+};
 
 #[cfg(all(feature = "std", feature = "storage"))]
 #[allow(unused_imports)]
@@ -25287,16 +25712,22 @@ pub(crate) mod tests {
             assert_eq!(root.cursor, manifest.cursor);
             assert_eq!(
                 root.descriptor.encode(),
-                state_component(sealed.local.post_create(), lane)
+                state_component(sealed.post_create(), lane)
             );
             assert_eq!(
                 LaneStateManifest::decode(&manifest.encode()).unwrap(),
                 manifest
             );
         }
-        sealed.local.replica.node.0[0] ^= 1;
+        let ExternalGenesisAdmission::Local(local) = &mut sealed.admission else {
+            unreachable!()
+        };
+        local.replica.node.0[0] ^= 1;
         assert!(matches!(sealed.validate(), Err(ReplayError::ScopeMismatch)));
-        sealed.local.replica.node.0[0] ^= 1;
+        let ExternalGenesisAdmission::Local(local) = &mut sealed.admission else {
+            unreachable!()
+        };
+        local.replica.node.0[0] ^= 1;
         sealed.validate().unwrap();
         let initial_merge = sealed.lane_manifest(PersistedLane::Merge);
         assert!(!supported_external_checkpoint_lane(&initial_merge, None));
@@ -25335,7 +25766,7 @@ pub(crate) mod tests {
             predecessor.publication_revision
         );
         assert_eq!(initial_checkpoint.genesis, sealed.genesis().id());
-        assert_eq!(initial_checkpoint.artifacts, sealed.local.artifacts().id());
+        assert_eq!(initial_checkpoint.artifacts, sealed.artifacts().id());
         assert_eq!(initial_checkpoint.lanes.len(), 4);
         for lane in &initial_checkpoint.lanes {
             assert_eq!(lane.state, sealed.lane_manifest(lane.lane).id());
@@ -28161,15 +28592,74 @@ pub(crate) mod tests {
                 host.execute_journal(&[], genesis, &input, &before, wrong_position, &lanes, 0),
                 Err(BlockPvmError::InvalidRequest)
             ));
-            // Framing permits opaque Control changes; ordinary replay must not
-            // permit one on a Linear invocation.
-            let mut cross_lane = returned.clone();
-            cross_lane.state.control.push(1);
-            let cross_lane = StateExecutionOutput::new(&work, cross_lane, vec![change]).unwrap();
-            assert!(matches!(
-                external_state_replay_transition(&input, &before, position, &work, &cross_lane),
-                Err(ReplayError::CrossLaneMutation)
-            ));
+            // A well-framed physical Completed output is not necessarily a
+            // legal journal transition. Admission must use the same full
+            // handoff as committed replay, including gas, lane and opaque
+            // Control ownership, rather than accepting the outer shape alone.
+            let ReplayOperation::CleanInvoke {
+                work: invocation, ..
+            } = &input.operation
+            else {
+                unreachable!()
+            };
+            for case in 0..4 {
+                let mut transition = returned.clone();
+                transition.outcome = crate::agent_sdk::RuntimeOutcome::Completed(Ok(
+                    crate::agent_sdk::InvocationReply {
+                        invocation: invocation.invocation,
+                        actor: invocation.actor,
+                        incarnation: invocation.incarnation,
+                        deployment: invocation.deployment,
+                        mode: invocation.mode,
+                        lane: if case == 2 {
+                            Some(crate::agent_sdk::StateLane::Merge)
+                        } else {
+                            invocation.mode.write_lane()
+                        },
+                        status: crate::agent_sdk::InvocationStatus::Done,
+                        reply: vec![],
+                        gas_remaining: invocation.gas + u64::from(case == 1),
+                        observation: Default::default(),
+                    },
+                ));
+                if case == 3 {
+                    transition.state.control.push(1);
+                }
+                let framed = StateExecutionOutput::new(&work, transition, vec![change.clone()])
+                    .expect("framing alone permits these journal-semantic violations");
+                let bytes = framed.encode().unwrap();
+                let mut asm = Assembler::new();
+                asm.set_rw_data(bytes.clone());
+                asm.load_imm_64(Reg::A0, 2 * vos_pvm::PVM_ZONE_SIZE as u64)
+                    .load_imm_64(Reg::A1, bytes.len() as u64)
+                    .jump_ind(Reg::RA, 0);
+                let response = host.execute_state(&asm.build_standard(), &work, 1_000_000);
+                if case == 2 {
+                    // The Rust output builder permits this shape, but the
+                    // canonical reply decoder already rejects mode/lane
+                    // disagreement before the full journal handoff.
+                    assert!(matches!(response, Err(BlockPvmError::Output)));
+                    assert!(matches!(
+                        ReplayExternalExecution::from_physical_response(
+                            &input, &before, position, &work, framed,
+                        ),
+                        Err(ReplayError::InvalidRecord)
+                    ));
+                    continue;
+                }
+                let response = response.unwrap_or_else(|error| {
+                    panic!("raw physical case {case} failed before journal handoff: {error:?}")
+                });
+                let captured = ReplayExternalExecution::from_physical_response(
+                    &input, &before, position, &work, response,
+                );
+                match case {
+                    0 => assert!(captured.is_ok(), "valid physical control case"),
+                    1 | 2 => assert!(matches!(captured, Err(ReplayError::InvalidRecord))),
+                    3 => assert!(matches!(captured, Err(ReplayError::CrossLaneMutation))),
+                    _ => unreachable!(),
+                }
+            }
         }
         assert_eq!(
             work.lanes()[0].next,

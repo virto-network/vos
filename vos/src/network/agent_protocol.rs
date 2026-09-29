@@ -66,6 +66,8 @@ const TAG_INVOKE_REDIRECT: u8 = 0x12;
 const TAG_PROJECTION_REQUEST: u8 = 0x13;
 const TAG_PROJECTION_ACCEPTED: u8 = 0x14;
 const TAG_PROJECTION_RECOVERY_REQUEST: u8 = 0x15;
+const TAG_APPLIED_AVAILABILITY_REQUEST: u8 = 0x16;
+const TAG_APPLIED_AVAILABILITY_REPLY: u8 = 0x17;
 const TAG_RAFT_APPEND_REQUEST: u8 = 0x20;
 const TAG_RAFT_APPEND_REPLY: u8 = 0x21;
 const TAG_RAFT_VOTE_REQUEST: u8 = 0x22;
@@ -200,6 +202,23 @@ pub(crate) struct InvocationReply {
 pub(crate) struct InvocationRedirect {
     pub(crate) request: Hash,
     pub(crate) leader: NodeId,
+}
+
+/// Exact already-published Ordered application whose durable closure a voter
+/// is asked to verify. The claim commitment binds the complete genesis,
+/// admission, committee, index/term and logical result; the frame binds the live route.
+/// This is neither a Raft append acknowledgement nor execution authorization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AppliedAvailabilityRequest {
+    pub(crate) raft_index: u64,
+    pub(crate) raft_term: u64,
+    pub(crate) claim: Hash,
+}
+
+impl AppliedAvailabilityRequest {
+    fn is_valid(self) -> bool {
+        self.raft_index != 0 && self.raft_term != 0 && self.claim != Hash::ZERO
+    }
 }
 
 pub(crate) fn invocation_request_correlation(request: &InvocationRequest) -> Hash {
@@ -379,6 +398,11 @@ pub(crate) enum AgentMessage {
         request: Hash,
         accepted: bool,
     },
+    AppliedAvailabilityRequest(AppliedAvailabilityRequest),
+    AppliedAvailabilityReply {
+        request: AppliedAvailabilityRequest,
+        available: bool,
+    },
     Raft(RaftMessage),
     Merge(MergeMessage),
 }
@@ -546,6 +570,8 @@ fn message_is_valid(message: &AgentMessage, route: AgentGenerationRoute, sender:
                     || query.attesting_node().is_none_or(|node| node == sender))
         }
         AgentMessage::ProjectionAccepted { request, .. } => *request != Hash::ZERO,
+        AgentMessage::AppliedAvailabilityRequest(request)
+        | AgentMessage::AppliedAvailabilityReply { request, .. } => request.is_valid(),
         AgentMessage::InvokeRequest(request) => {
             request.work.validate()
                 && request.work.space == route.space
@@ -725,6 +751,15 @@ fn encode_message(
             encoder.fixed(request.as_bytes());
             encoder.bool(*accepted);
         }
+        AgentMessage::AppliedAvailabilityRequest(request) => {
+            encoder.u8(TAG_APPLIED_AVAILABILITY_REQUEST);
+            encode_applied_availability_request(encoder, request);
+        }
+        AgentMessage::AppliedAvailabilityReply { request, available } => {
+            encoder.u8(TAG_APPLIED_AVAILABILITY_REPLY);
+            encode_applied_availability_request(encoder, request);
+            encoder.bool(*available);
+        }
         AgentMessage::InvokeRequest(request) => {
             encoder.u8(TAG_INVOKE_REQUEST);
             encode_invocation_work(encoder, &request.work);
@@ -751,6 +786,25 @@ fn encode_message(
         AgentMessage::Merge(message) => encode_merge_message(encoder, message),
     }
     Ok(())
+}
+
+fn encode_applied_availability_request(
+    encoder: &mut Encoder<'_>,
+    request: &AppliedAvailabilityRequest,
+) {
+    encoder.u64(request.raft_index);
+    encoder.u64(request.raft_term);
+    encoder.fixed(request.claim.as_bytes());
+}
+
+fn decode_applied_availability_request(
+    decoder: &mut Decoder<'_>,
+) -> Result<AppliedAvailabilityRequest, DecodeError> {
+    Ok(AppliedAvailabilityRequest {
+        raft_index: decoder.u64()?,
+        raft_term: decoder.u64()?,
+        claim: Hash(decoder.fixed()?),
+    })
 }
 
 fn encode_invocation_work(encoder: &mut Encoder<'_>, work: &InvocationWork) {
@@ -986,6 +1040,13 @@ fn decode_message(decoder: &mut Decoder<'_>) -> Result<AgentMessage, AgentProtoc
         TAG_PROJECTION_ACCEPTED => Ok(AgentMessage::ProjectionAccepted {
             request: Hash(decoder.fixed()?),
             accepted: decoder.bool()?,
+        }),
+        TAG_APPLIED_AVAILABILITY_REQUEST => Ok(AgentMessage::AppliedAvailabilityRequest(
+            decode_applied_availability_request(decoder)?,
+        )),
+        TAG_APPLIED_AVAILABILITY_REPLY => Ok(AgentMessage::AppliedAvailabilityReply {
+            request: decode_applied_availability_request(decoder)?,
+            available: decoder.bool()?,
         }),
         TAG_INVOKE_REQUEST => {
             let work = decode_invocation_work(decoder)?;
@@ -1429,6 +1490,100 @@ mod tests {
 
     fn node(peer: &PeerId) -> NodeId {
         NodeId::of_authenticated_peer(&peer.to_bytes())
+    }
+
+    #[test]
+    fn applied_availability_frames_are_exact_bounded_and_canonical() {
+        let request = AppliedAvailabilityRequest {
+            raft_index: u64::MAX,
+            raft_term: u64::MAX,
+            claim: Hash(id::<4>()),
+        };
+        let sender = node(&peer(80));
+        let frame = AgentFrame {
+            route: route(),
+            sender,
+            message: AgentMessage::AppliedAvailabilityRequest(request),
+        };
+        // Fixed-width fields only: magic/version, full route/sender, tag,
+        // index/term and full OrderedClaim commitment. No opaque payload.
+        let field_offset = 4 + 2 + 4 * 32 + 1;
+        let encoded = frame.encode().unwrap();
+        assert_eq!(encoded.len(), field_offset + 8 + 8 + 32);
+        assert_eq!(AgentFrame::decode(&encoded).unwrap(), frame);
+        for available in [false, true] {
+            let reply = AgentFrame {
+                message: AgentMessage::AppliedAvailabilityReply { request, available },
+                ..frame.clone()
+            };
+            let bytes = reply.encode().unwrap();
+            assert_eq!(bytes.len(), encoded.len() + 1);
+            assert_eq!(AgentFrame::decode(&bytes).unwrap(), reply);
+            for end in 0..bytes.len() {
+                assert!(AgentFrame::decode(&bytes[..end]).is_err());
+            }
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            assert_eq!(
+                AgentFrame::decode(&trailing),
+                Err(AgentProtocolError::TrailingBytes)
+            );
+            let mut noncanonical = bytes;
+            *noncanonical.last_mut().unwrap() = 2;
+            assert!(AgentFrame::decode(&noncanonical).is_err());
+        }
+        for (offset, length) in [(0, 8), (8, 8), (16, 32)] {
+            let mut bytes = encoded.clone();
+            bytes[field_offset + offset..field_offset + offset + length].fill(0);
+            assert_eq!(
+                AgentFrame::decode(&bytes),
+                Err(AgentProtocolError::InvalidValue)
+            );
+        }
+        for invalid in [
+            AppliedAvailabilityRequest {
+                raft_index: 0,
+                ..request
+            },
+            AppliedAvailabilityRequest {
+                raft_term: 0,
+                ..request
+            },
+            AppliedAvailabilityRequest {
+                claim: Hash::ZERO,
+                ..request
+            },
+        ] {
+            for message in [
+                AgentMessage::AppliedAvailabilityRequest(invalid),
+                AgentMessage::AppliedAvailabilityReply {
+                    request: invalid,
+                    available: true,
+                },
+            ] {
+                assert_eq!(
+                    AgentFrame {
+                        message,
+                        ..frame.clone()
+                    }
+                    .encode(),
+                    Err(AgentProtocolError::InvalidValue)
+                );
+            }
+        }
+        let mut missing_generation = frame.clone();
+        missing_generation.route.generation = Hash::ZERO;
+        assert!(missing_generation.encode().is_err());
+        let mut unknown = encoded;
+        unknown[field_offset - 1] = 0xff;
+        assert_eq!(
+            AgentFrame::decode(&unknown),
+            Err(AgentProtocolError::UnknownMessage(0xff))
+        );
+        assert_eq!(
+            AgentFrame::decode(&vec![0; MAX_FRAME_BYTES + 1]),
+            Err(AgentProtocolError::LimitExceeded)
+        );
     }
 
     #[test]

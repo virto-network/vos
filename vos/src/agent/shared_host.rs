@@ -1300,6 +1300,57 @@ impl SharedAgentHost {
         Ok((proposal, catalog))
     }
 
+    /// Internal proposal-only path for the signed Linear-only external Shared
+    /// contract. It does not publish a store, establish finality, or enable
+    /// production startup. The ordinary Authority admission remains required.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn prepare_clean_external_genesis_proposal(
+        &mut self,
+        descriptor: crate::agent_sdk::AgentDescriptor,
+        runtime: &super::package_admission::AdmittedStateRuntimePackage,
+        authority: crate::agent_sdk::authority::AuthorityReceipt,
+        observed_slot: u64,
+        committee: &AgentReplicaCommittee,
+    ) -> Result<(super::genesis::AgentGenesisProposal, Vec<RuntimeBlob>), SharedAgentHostError>
+    {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        let scope = self.scope();
+        if descriptor.identity.space.0 != scope.space.0 || committee.space() != scope.space {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let replica = committee
+            .member_by_node(scope.node)
+            .ok_or(SharedAgentHostError::ScopeMismatch)?
+            .replica();
+        let binding = runtime
+            .binding(
+                scope.space,
+                crate::service::AgentId(descriptor.identity.agent.0),
+            )
+            .map_err(|_| SharedAgentHostError::InvalidProvision)?;
+        let bytes = runtime.exact_bytes().to_vec();
+        let catalog = vec![RuntimeBlob {
+            reference: crate::service::BlobRef::of_bytes(&bytes),
+            bytes,
+        }];
+        let create = super::journal::ReplayInput {
+            runtime: binding,
+            operation: super::journal::ReplayOperation::CleanManage {
+                request: crate::agent_sdk::ManagementRequest::Create(Box::new(descriptor)),
+                authority,
+                observed_slot,
+            },
+        };
+        let prepared = LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_external_shared_genesis_candidate(
+            create, replica, committee, &catalog, &self.trust, scope.node,
+        ).map_err(|_| SharedAgentHostError::InvalidProvision)?;
+        let proposal = prepared
+            .ordinary_proposal()
+            .map_err(|_| SharedAgentHostError::InvalidProvision)?;
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        Ok((proposal, catalog))
+    }
+
     /// Provision an exact finalized generation, or return its current status
     /// for an exact retry. Finality, catalog shape, package trust, and Create
     /// replay all complete before the first intent byte is written.
@@ -2352,6 +2403,29 @@ impl SharedAgentHost {
             .map_err(map_driver_error)
     }
 
+    pub(crate) fn retained_acknowledged_projection_with_input(
+        &mut self,
+        agent: AgentId,
+        work: &crate::agent_sdk::InvocationWork,
+    ) -> Result<
+        Option<(
+            super::journal::ReplayInputId,
+            crate::agent_sdk::RuntimeOutcome,
+        )>,
+        SharedAgentHostError,
+    > {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        if work.agent.0 != agent.0 {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .retained_acknowledged_projection_with_input(work)
+            .map_err(map_driver_error)
+    }
+
     pub(crate) fn prepare_clean_ordered_operation(
         &self,
         agent: AgentId,
@@ -2699,6 +2773,54 @@ impl SharedAgentHost {
             .ok_or(SharedAgentHostError::AgentNotFound)?
             .driver
             .try_take_clean_ordered_result(input)
+            .map_err(map_driver_error)
+    }
+
+    /// Keep singleton image retry compatibility without extending that rule
+    /// to external block storage. This also validates the live owner lease.
+    pub(crate) fn uses_external_state(
+        &mut self,
+        agent: AgentId,
+    ) -> Result<bool, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)
+            .map(|entry| entry.driver.uses_external_state())
+    }
+
+    /// Exact locally anchored publication whose durable state must be
+    /// available on a voter majority before this input's result is delivered.
+    pub(crate) fn available_ordered_claim(
+        &mut self,
+        agent: AgentId,
+        input: super::journal::ReplayInputId,
+    ) -> Result<super::shared_commit::OrderedCommitClaim, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .available_ordered_claim(input)
+            .map_err(map_driver_error)
+    }
+
+    /// Authenticate local availability, never just receipt of a Raft entry.
+    /// The opaque driver proof is consumed while the host owner is borrowed.
+    pub(crate) fn verify_ordered_availability(
+        &mut self,
+        agent: AgentId,
+        index: u64,
+        term: u64,
+        claim: crate::service::Hash,
+    ) -> Result<(), SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .verify_ordered_availability(index, term, claim)
+            .map(|_available| ())
             .map_err(map_driver_error)
     }
 
@@ -6629,6 +6751,140 @@ mod tests {
 
     #[cfg(feature = "pvm")]
     #[test]
+    fn clean_shared_applied_availability_binds_exact_retained_publication_and_reopen() {
+        let directory = TempDirectory::new("clean_applied_availability");
+        let fixture = clean_fixture(0x69);
+        let slot = Arc::new(AtomicU64::new(20));
+        let mut host = open_clean_host(&directory, &fixture, Arc::clone(&slot));
+        host.provision(
+            fixture.shared.provision.clone(),
+            fixture.shared.catalog.clone(),
+            fixture.shared.committee_authority,
+        )
+        .unwrap();
+        let target = &fixture.upgrade_runtime;
+        let request = crate::agent_sdk::ManagementRequest::UpgradeRuntime(Box::new(
+            crate::agent_sdk::RuntimeUpgrade {
+                from_deployment: fixture.descriptor.identity.runtime_deployment,
+                to_deployment: target.deployment(),
+                to_program: target.program(),
+                producer: target.producer(),
+                package: target.package_ref().clone(),
+                contract: target.manifest().contract,
+                capabilities: target.capabilities(),
+            },
+        ));
+        let receipt =
+            clean_management_receipt(&fixture.descriptor, &request, 2, &fixture.authority_key);
+        slot.store(21, Ordering::SeqCst);
+        let prepared = host
+            .prepare_clean_management(
+                fixture.shared.agent,
+                request.clone(),
+                receipt.clone(),
+                SdkManagementArtifacts::Runtime(target),
+            )
+            .unwrap();
+        let input = prepared.input().unwrap();
+        assert!(
+            host.available_ordered_claim(fixture.shared.agent, input)
+                .is_err()
+        );
+        let commands = prepared.into_commands();
+        for payload in commands {
+            let index = host.agents[&fixture.shared.agent]
+                .driver
+                .ledger()
+                .append_committed_for_test(7, &EntryKind::Data { payload })
+                .unwrap();
+            assert!(
+                host.available_ordered_claim(fixture.shared.agent, input)
+                    .is_err(),
+                "committed bytes alone are not an available applied result"
+            );
+            assert_eq!(
+                host.apply_next(fixture.shared.agent).unwrap(),
+                SharedAgentApplyOutcome::Applied { index }
+            );
+        }
+        let claim = host
+            .available_ordered_claim(fixture.shared.agent, input)
+            .unwrap();
+        host.verify_ordered_availability(
+            fixture.shared.agent,
+            claim.raft_index(),
+            claim.raft_term(),
+            claim.commitment(),
+        )
+        .unwrap();
+        for (index, term, hash) in [
+            (0, claim.raft_term(), claim.commitment()),
+            (
+                claim.raft_index() + 1,
+                claim.raft_term(),
+                claim.commitment(),
+            ),
+            (
+                claim.raft_index(),
+                claim.raft_term() + 1,
+                claim.commitment(),
+            ),
+            (
+                claim.raft_index(),
+                claim.raft_term(),
+                crate::service::Hash::ZERO,
+            ),
+            (
+                claim.raft_index(),
+                claim.raft_term(),
+                crate::service::Hash([0x91; 32]),
+            ),
+        ] {
+            assert!(
+                host.verify_ordered_availability(fixture.shared.agent, index, term, hash)
+                    .is_err()
+            );
+        }
+        let outcome = host
+            .take_clean_ordered_result(fixture.shared.agent, input)
+            .unwrap();
+        let retry = host
+            .prepare_clean_management(
+                fixture.shared.agent,
+                request.clone(),
+                receipt.clone(),
+                SdkManagementArtifacts::None,
+            )
+            .unwrap();
+        assert_eq!(retry.input(), Some(input));
+        assert_eq!(retry.retained(), Some(&outcome));
+        assert_eq!(
+            host.available_ordered_claim(fixture.shared.agent, input)
+                .unwrap(),
+            claim
+        );
+        drop(host);
+        let mut reopened = open_clean_host(&directory, &fixture, slot);
+        assert_eq!(
+            reopened
+                .available_ordered_claim(fixture.shared.agent, input)
+                .unwrap(),
+            claim
+        );
+        let retry = reopened
+            .prepare_clean_management(
+                fixture.shared.agent,
+                request,
+                receipt,
+                SdkManagementArtifacts::None,
+            )
+            .unwrap();
+        assert_eq!(retry.input(), Some(input));
+        assert_eq!(retry.retained(), Some(&outcome));
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
     fn clean_shared_upgrade_rejects_ordered_command_without_its_exact_artifact_batch() {
         use super::super::shared_raft::AgentRaftCommand;
 
@@ -8141,6 +8397,17 @@ mod tests {
     #[cfg(feature = "pvm")]
     #[test]
     fn terminal_projection_invoke_at_authenticated_boundary_reopens_without_replacement() {
+        check_terminal_projection_at_authenticated_boundary(false);
+    }
+
+    #[cfg(all(feature = "pvm", feature = "network"))]
+    #[test]
+    fn singleton_image_routes_exact_snapshot_retained_projection() {
+        check_terminal_projection_at_authenticated_boundary(true);
+    }
+
+    #[cfg(feature = "pvm")]
+    fn check_terminal_projection_at_authenticated_boundary(routed: bool) {
         use super::super::shared_journal_driver::{
             CleanInvocationReplayRequest, PreparedCleanOrdered,
         };
@@ -8332,6 +8599,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(retry.input(), invoke_input);
+        let _retained_outcome = retry.retained().unwrap().clone();
         assert!(matches!(
             retry,
             PreparedCleanOrdered::Retained {
@@ -8384,6 +8652,73 @@ mod tests {
             host.journal_position(fixture.agent).unwrap(),
             before_divergent
         );
+
+        if routed {
+            #[cfg(feature = "network")]
+            {
+                assert!(
+                    host.available_ordered_claim(fixture.agent, invoke_input)
+                        .is_err(),
+                    "the compacted slot must not masquerade as a retained exact anchor"
+                );
+                assert!(!host.uses_external_state(fixture.agent).unwrap());
+                let host = Arc::new(Mutex::new(host));
+                let network = live_network(0x31, Vec::new());
+                let signer = SigningMerge(fixture.replica_keys[0].clone());
+                let attachment =
+                    crate::network::SharedAgentNetworkHost::attach_recovering_projection(
+                        Arc::clone(&host),
+                        Arc::clone(&network),
+                        fixture.agent,
+                        &work,
+                        &authorization,
+                        fixture.provision.replicas(),
+                        &signer,
+                    )
+                    .unwrap();
+                let identity = super::super::supervisor::AgentRouteIdentity::new(
+                    super::super::supervisor::AgentRouteKey::new(
+                        work.space, work.agent, work.actor,
+                    )
+                    .unwrap(),
+                    work.incarnation,
+                    work.runtime_deployment,
+                    work.deployment,
+                    work.program,
+                    crate::agent_sdk::AgentProfile::Shared,
+                )
+                .unwrap();
+                let before = host
+                    .lock()
+                    .unwrap()
+                    .journal_position(fixture.agent)
+                    .unwrap();
+                assert_eq!(
+                    attachment
+                        .supervisor_invoke_terminal_reserved(
+                            identity,
+                            work.clone(),
+                            authorization.clone(),
+                        )
+                        .unwrap(),
+                    _retained_outcome
+                );
+                assert_eq!(
+                    host.lock()
+                        .unwrap()
+                        .journal_position(fixture.agent)
+                        .unwrap(),
+                    before,
+                    "serving the snapshot-retained result must not propose another Invoke"
+                );
+                drop(attachment);
+                drop(host);
+                join_live_network(network);
+                return;
+            }
+            #[cfg(not(feature = "network"))]
+            panic!("routed fixture requires network");
+        }
 
         let acknowledgement = host.agents[&fixture.agent]
             .driver

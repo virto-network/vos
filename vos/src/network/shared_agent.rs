@@ -45,9 +45,9 @@ use crate::service::wire::ServiceWire;
 use super::Network;
 use super::agent_network::{AGENT_REQUEST_TIMEOUT, AgentHandlerError, AgentRouteHandler};
 use super::agent_protocol::{
-    AgentGenerationRoute, AgentMessage, AuthenticatedAgentFrame, InvocationRedirect,
-    InvocationReply, MergeMessage, RaftLogEntryKind, RaftMessage, RaftRole, RaftStatus,
-    RaftVotePhase, invocation_request_correlation,
+    AgentGenerationRoute, AgentMessage, AppliedAvailabilityRequest, AuthenticatedAgentFrame,
+    InvocationRedirect, InvocationReply, MergeMessage, RaftLogEntryKind, RaftMessage, RaftRole,
+    RaftStatus, RaftVotePhase, invocation_request_correlation,
 };
 use super::agent_raft_transport::AgentRaftTransport;
 
@@ -548,6 +548,16 @@ fn reply_for_outcome(request: Hash, outcome: RuntimeOutcome) -> AgentMessage {
     AgentMessage::InvokeReply(InvocationReply { request, outcome })
 }
 
+fn has_applied_availability_quorum(voters: &[NodeId], available: &BTreeSet<NodeId>) -> bool {
+    matches!(voters.len(), 1 | 3)
+        && valid_nodes(voters)
+        && voters
+            .iter()
+            .filter(|voter| available.contains(voter))
+            .count()
+            > voters.len() / 2
+}
+
 enum OrderedReplyState {
     Waiting,
     Ready(RuntimeOutcome),
@@ -998,6 +1008,116 @@ pub(crate) enum CleanManagementSubmission {
 }
 
 impl SharedRouteHandler {
+    /// Result delivery requires applied *state* on a majority, not merely a
+    /// committed Raft command on a majority. This evidence is ephemeral and
+    /// recollected after restart; it is not snapshot/compaction authority.
+    fn require_ordered_availability(
+        &self,
+        input: ReplayInputId,
+    ) -> Result<(), SharedAgentHostError> {
+        let started = Instant::now();
+        let (fingerprint, local, request) = {
+            let mut host = self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            let status = host
+                .supervisor_attachment_status(self.agent)?
+                .ok_or(SharedAgentHostError::AgentNotFound)?;
+            let fingerprint = AttachmentFingerprint::from_attachment_status(&status)?;
+            if fingerprint.protocol_route != self.route
+                || fingerprint.next_committee.is_some()
+                || fingerprint.joint_old.is_some()
+                || !matches!(fingerprint.voters.len(), 1 | 3)
+            {
+                return Err(SharedAgentHostError::Unavailable);
+            }
+            let local = NodeId(host.scope().node.0);
+            if fingerprint.voters.binary_search(&local).is_err() {
+                return Err(SharedAgentHostError::Unavailable);
+            }
+            // Callers already obtained this exact result from a durable
+            // application or verified retained-result path. For an image
+            // singleton that is its entire quorum, including results now
+            // retained in an authenticated snapshot whose old anchor was
+            // compacted. Preserve that existing path; external generations
+            // still require exact block-availability evidence below.
+            if fingerprint.voters.len() == 1 && !host.uses_external_state(self.agent)? {
+                return Ok(());
+            }
+            let claim = host.available_ordered_claim(self.agent, input)?;
+            if claim.committee() != fingerprint.durable_route.committee() {
+                return Err(SharedAgentHostError::Unavailable);
+            }
+            let request = AppliedAvailabilityRequest {
+                raft_index: claim.raft_index(),
+                raft_term: claim.raft_term(),
+                claim: Hash(claim.commitment().0),
+            };
+            (fingerprint, local, request)
+        };
+        // No host/proposal mutex may cross peer I/O: each voter needs its
+        // independent apply handler to reach and attest this exact state.
+        let mut available = BTreeSet::from([local]);
+        let deadline = started + ORDERED_REPLY_WAIT;
+        let mut pending = BTreeMap::new();
+        while !has_applied_availability_quorum(&fingerprint.voters, &available) {
+            if Instant::now() >= deadline {
+                return Err(SharedAgentHostError::Unavailable);
+            }
+            for &voter in &fingerprint.voters {
+                if !available.contains(&voter) && !pending.contains_key(&voter) {
+                    pending.insert(
+                        voter,
+                        self.network
+                            .send_agent_applied_availability(voter, self.route, request),
+                    );
+                }
+            }
+            let mut finished = Vec::new();
+            for (&voter, response) in &pending {
+                match response.try_recv() {
+                    Ok(Ok(true)) => {
+                        available.insert(voter);
+                        finished.push(voter);
+                    }
+                    Ok(_) | Err(std_mpsc::TryRecvError::Disconnected) => finished.push(voter),
+                    Err(std_mpsc::TryRecvError::Empty) => {}
+                }
+            }
+            for voter in finished {
+                pending.remove(&voter);
+            }
+            if !has_applied_availability_quorum(&fingerprint.voters, &available) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        // A committee/attachment change during collection invalidates these
+        // votes. Missing local data cannot be hidden by two remote replies.
+        let mut host = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let status = host
+            .supervisor_attachment_status(self.agent)?
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        if AttachmentFingerprint::from_attachment_status(&status)? != fingerprint {
+            return Err(SharedAgentHostError::Unavailable);
+        }
+        host.verify_ordered_availability(
+            self.agent,
+            request.raft_index,
+            request.raft_term,
+            crate::service::Hash(request.claim.0),
+        )?;
+        tracing::debug!(
+            agent = ?self.agent, input = ?input, voters = available.len(),
+            elapsed_us = started.elapsed().as_micros(),
+            "Shared result applied-availability quorum"
+        );
+        Ok(())
+    }
+
     fn has_local_proposer(&self, worker: &vos_raft::WorkerHandle<NodeId>) -> bool {
         if worker.role() == vos_raft::Role::Leader {
             return true;
@@ -1719,6 +1839,9 @@ impl SharedRouteHandler {
                 }
             }
             if let Some(outcome) = prepared.retained().cloned() {
+                drop(host);
+                drop(proposal);
+                self.require_ordered_availability(input)?;
                 return Ok(CleanOrderedSubmission {
                     input,
                     outcome,
@@ -1748,6 +1871,8 @@ impl SharedRouteHandler {
             tracing::debug!("clean ordered committed-result wait failed");
             SharedAgentHostError::Unavailable
         })?;
+        drop(proposal);
+        self.require_ordered_availability(input)?;
         Ok(CleanOrderedSubmission {
             input,
             outcome,
@@ -1791,6 +1916,10 @@ impl SharedRouteHandler {
                 });
             }
             if let Some(outcome) = prepared.retained().cloned() {
+                let input = prepared.input().ok_or(SharedAgentHostError::Conflict)?;
+                drop(host);
+                drop(proposal);
+                self.require_ordered_availability(input)?;
                 return Ok(CleanManagementSubmission::Applied {
                     outcome,
                     observed_slot,
@@ -1823,6 +1952,8 @@ impl SharedRouteHandler {
             .ordered_replies
             .wait(input.0)
             .map_err(|_| SharedAgentHostError::Unavailable)?;
+        drop(proposal);
+        self.require_ordered_availability(input.0)?;
         Ok(CleanManagementSubmission::Applied {
             outcome,
             observed_slot: input.1,
@@ -1914,6 +2045,10 @@ impl SharedRouteHandler {
                         .prepare_clean_ordered(self.agent, work.clone(), authorization)
                         .map_err(|_| AgentHandlerError)?;
                     if let Some(outcome) = prepared.retained().cloned() {
+                        let input = prepared.input();
+                        drop(host);
+                        drop(proposal);
+                        self.require_ordered_availability(input).map_err(|_| AgentHandlerError)?;
                         return Ok(reply_for_outcome(correlation, outcome));
                     }
                     let input = prepared.input();
@@ -1932,6 +2067,8 @@ impl SharedRouteHandler {
                     .map_err(|_| AgentHandlerError)?;
                 drop(host);
                 let outcome = self.ordered_replies.wait(input)?;
+                drop(proposal);
+                self.require_ordered_availability(input).map_err(|_| AgentHandlerError)?;
                 Ok(reply_for_outcome(correlation, outcome))
             }
             MethodMode::Merge => {
@@ -2295,6 +2432,25 @@ impl AgentRouteHandler for SharedRouteHandler {
         }
         let recovering = matches!(&frame.message, AgentMessage::ProjectionRecoveryRequest(_));
         match frame.message {
+            AgentMessage::AppliedAvailabilityRequest(request) => {
+                let mut host = self.host.lock().map_err(|_| AgentHandlerError)?;
+                let status = host.supervisor_attachment_status(self.agent)
+                    .map_err(|_| AgentHandlerError)?.ok_or(AgentHandlerError)?;
+                let fingerprint = AttachmentFingerprint::from_attachment_status(&status)
+                    .map_err(|_| AgentHandlerError)?;
+                let local = NodeId(host.scope().node.0);
+                let available = fingerprint.protocol_route == self.route
+                    && fingerprint.next_committee.is_none()
+                    && fingerprint.joint_old.is_none()
+                    && matches!(fingerprint.voters.len(), 1 | 3)
+                    && fingerprint.voters.binary_search(&sender).is_ok()
+                    && fingerprint.voters.binary_search(&local).is_ok()
+                    && host.verify_ordered_availability(
+                        self.agent, request.raft_index, request.raft_term,
+                        crate::service::Hash(request.claim.0),
+                    ).is_ok();
+                Ok(AgentMessage::AppliedAvailabilityReply { request, available })
+            }
             AgentMessage::ProjectionRequest(query)
             | AgentMessage::ProjectionRecoveryRequest(query) => {
                 let request = query.commitment();
@@ -2650,7 +2806,13 @@ impl SharedAgentNetworkHost {
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
         drain_committed(&mut host, agent, &attached.coordinator.ordered_replies)?;
-        host.retained_acknowledged_projection(agent, work)
+        let retained = host.retained_acknowledged_projection_with_input(agent, work)?;
+        drop(host);
+        let Some((input, outcome)) = retained else {
+            return Ok(None);
+        };
+        attached.coordinator.require_ordered_availability(input)?;
+        Ok(Some(outcome))
     }
 
     pub(crate) fn projection_acknowledged(
@@ -5317,6 +5479,32 @@ mod tests {
 
     use super::*;
     use crate::raft::RAFT_LOG;
+
+    #[test]
+    fn applied_availability_counts_only_distinct_admitted_voters() {
+        let voters = [NodeId([1; 32]), NodeId([2; 32]), NodeId([3; 32])];
+        let observer = NodeId([4; 32]);
+        let mut available = BTreeSet::new();
+        assert!(!has_applied_availability_quorum(&voters, &available));
+        available.insert(voters[0]);
+        assert!(!has_applied_availability_quorum(&voters, &available));
+        available.insert(voters[0]);
+        available.insert(observer);
+        assert!(!has_applied_availability_quorum(&voters, &available));
+        available.insert(voters[2]);
+        assert!(has_applied_availability_quorum(&voters, &available));
+        assert!(has_applied_availability_quorum(&voters[..1], &available));
+        assert!(!has_applied_availability_quorum(&[], &available));
+        assert!(!has_applied_availability_quorum(&voters[..2], &available));
+        assert!(!has_applied_availability_quorum(
+            &[voters[0]; 3],
+            &available
+        ));
+        assert!(!has_applied_availability_quorum(
+            &[NodeId::ZERO],
+            &available
+        ));
+    }
 
     #[test]
     fn opportunistic_projection_checkpoint_threshold_and_gate() {

@@ -461,6 +461,157 @@ pub(crate) fn compiled_install_fixture(
 }
 
 #[test]
+#[ignore = "requires compiled state guest and CLERK_AGENT_PACKAGE"]
+fn compiled_linear_only_shared_create_and_clerk_install_are_replica_independent() {
+    use crate::agent::package_admission::{
+        admit_actor_package, tests::admitted_state_fixture_limits,
+    };
+
+    let elf = std::fs::read(
+        target().join("agent-state-standard/riscv64em-vos/release/agent_runtime.elf"),
+    )
+    .unwrap();
+    let runtime = admitted_state_fixture_limits(
+        vos_pvm_compiler::link_elf_spi(&elf).unwrap(),
+        sdk::LaneSet::of(sdk::StateLane::Linear),
+        sdk::state_execution::MAX_ADMITTED_EXTERNAL_RUNTIME_STATE_BYTES as u32,
+    );
+    let clerk = admit_actor_package(
+        &std::fs::read(std::env::var_os("CLERK_AGENT_PACKAGE").expect("Clerk package required"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(clerk.manifest().name.as_str(), "clerk-ledger");
+    let schema = sdk::schema::decode(clerk.state_lane_schema_bytes()).unwrap();
+    let linear = sdk::LaneSet::of(sdk::StateLane::Linear);
+    assert_eq!(schema.lanes(), linear);
+    assert_eq!(clerk.requirements().lanes, linear);
+    assert!(
+        runtime
+            .manifest()
+            .capabilities
+            .satisfies(clerk.requirements())
+    );
+    let (mut create, _, _) = crate::agent::replay::tests::external_create_fixture(&runtime);
+    let ReplayOperation::CleanManage {
+        request: sdk::ManagementRequest::Create(descriptor),
+        ..
+    } = &create.operation
+    else {
+        unreachable!()
+    };
+    let mut descriptor = descriptor.as_ref().clone();
+    descriptor.identity.profile = sdk::AgentProfile::Shared;
+    descriptor.replicas = [0x35, 0x45, 0x55]
+        .into_iter()
+        .map(|node| sdk::AgentReplica {
+            node: sdk::NodeId([node; 32]),
+            principal: sdk::PrincipalId([node + 1; 32]),
+            role: sdk::ReplicaRole::Voter,
+        })
+        .collect();
+    descriptor.validate().unwrap();
+    let signing = SigningKey::from_bytes(&[0x31; 32]);
+    let request = sdk::ManagementRequest::Create(Box::new(descriptor.clone()));
+    let authority = crate::agent::replay::tests::signed_opaque_clean_receipt(
+        &descriptor,
+        &request,
+        runtime.deployment(),
+        1,
+        &signing,
+    );
+    create.operation = ReplayOperation::CleanManage {
+        request,
+        authority,
+        observed_slot: 10,
+    };
+    let mut expected_create = None;
+    let mut expected_install = None;
+    for replica in &descriptor.replicas {
+        let work = journal_create_state_work(&runtime, &create, *replica).unwrap();
+        assert_eq!(work.lanes().len(), 1);
+        let store = MemoryAgentJournalStore::new(
+            create.runtime.agent,
+            crate::service::NodeId(replica.node.0),
+        )
+        .unwrap();
+        let capture = MultiLaneStateBlockHost {
+            store: &store,
+            budget: &mut ReadBudget::new(0, 0),
+        }
+        .execute_admitted_create(&runtime, &create, *replica, 1_000_000_000)
+        .unwrap();
+        assert!(capture.output().transition().state.merge.is_empty());
+        assert!(capture.output().transition().state.local.is_empty());
+        let encoded = capture.output().encode().unwrap();
+        if let Some(expected) = &expected_create {
+            assert_eq!(expected, &encoded);
+        } else {
+            expected_create = Some(encoded);
+        }
+        let mut fixture = Fixture {
+            runtime: runtime.clone(),
+            descriptor: descriptor.clone(),
+            store,
+            state: sdk::RuntimeState::default(),
+            roots: work.lanes().iter().map(|lane| lane.base).collect(),
+            revision: 1,
+        };
+        fixture.stage(&work, capture.output());
+        let mut install = crate::agent::wire::tests::clean_install_request(
+            &descriptor,
+            "clerk-ledger",
+            None,
+            0x71,
+            linear,
+        );
+        install.entry.program = clerk.program();
+        install.entry.deployment = clerk.deployment();
+        install.entry.package = clerk.package_ref().clone();
+        install.producer = clerk.producer();
+        install.package = clerk.package_ref().clone();
+        install.contract = clerk.manifest().contract;
+        install.requirements = clerk.requirements();
+        install.entry.agent_schema = clerk.manifest().state_lane_schema.clone();
+        install.agent_schema = install.entry.agent_schema.clone();
+        install.entry.method_policy = clerk.manifest().method_policy.clone();
+        install.method_policy = install.entry.method_policy.clone();
+        install.entry.constructor_abi = schema.constructor_abi().unwrap();
+        install.constructor_abi = install.entry.constructor_abi;
+        install.entry.state_layout = schema.state_layout_hash().unwrap();
+        install.state_layout = install.entry.state_layout;
+        assert!(!schema.requires_installation_data());
+        install.entry.installation_data = None;
+        install.installation_data = None;
+        let request = sdk::ManagementRequest::Install(Box::new(install));
+        crate::agent::driver::validate_sdk_management_artifacts(
+            &descriptor,
+            &request,
+            crate::agent::driver::SdkManagementArtifacts::Actor(&clerk),
+        )
+        .unwrap();
+        let authority = crate::agent::replay::tests::signed_opaque_clean_receipt(
+            &descriptor,
+            &request,
+            runtime.deployment(),
+            2,
+            &signing,
+        );
+        let installed = fixture.manage(request, Some(authority), 11);
+        assert!(matches!(
+            installed.transition().outcome,
+            sdk::RuntimeOutcome::Management(Ok(sdk::ManagementReply::Installed(_)))
+        ));
+        let encoded = installed.encode().unwrap();
+        if let Some(expected) = &expected_install {
+            assert_eq!(expected, &encoded);
+        } else {
+            expected_install = Some(encoded);
+        }
+    }
+}
+
+#[test]
 #[ignore = "requires just build-agent-standard-state-guest and just build-agent-state-actor"]
 fn compiled_create_install_constructor_invoke_retry_and_ack() {
     let mut fixture = Fixture::create();

@@ -6767,6 +6767,81 @@ mod application_ledger_v2 {
             ))
         }
 
+        /// Read one retained applied Ordered slot without rerunning a full
+        /// recovery audit. Open/recovery validates the complete contiguous
+        /// ledger; normal availability checks validate only their exact row
+        /// and its committed physical preimage in one database snapshot.
+        pub(crate) fn ordered_anchor(
+            &self,
+            index: u64,
+        ) -> Result<Option<AgentRaftOrderedJournalAnchorV2>, AgentRaftApplicationErrorV2> {
+            let _guard = self
+                .writes
+                .lock()
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            let transaction = self.database.begin_read()?;
+            let raft = crate::raft::RaftMeta::load_from_read_transaction(&transaction)?;
+            let key = generation_storage_key(self.generation);
+            let meta_table = transaction.open_table(APPLY_META_TABLE_V2)?;
+            let meta_bytes = meta_table
+                .get(key.as_slice())?
+                .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+            let meta = AgentRaftApplyMetaV2::decode(meta_bytes.value())
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            validate_bound_meta(&meta, self.generation, self.journal_store)?;
+            if meta.encode() != meta_bytes.value() || raft.last_applied != meta.applied_index {
+                return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+            }
+            if index == 0 || index <= raft.snap_last_index || index > meta.applied_index {
+                return Ok(None);
+            }
+            let audit_key = audit_storage_key(self.generation, index);
+            let table = transaction.open_table(APPLY_AUDIT_TABLE_V2)?;
+            let bytes = table
+                .get(audit_key.as_slice())?
+                .ok_or(AgentRaftApplicationErrorV2::MissingAuditRecord(index))?;
+            let record = AgentRaftApplyAuditRecordV2::decode(bytes.value())
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            if record.generation != self.generation
+                || record.index != index
+                || record.encode() != bytes.value()
+            {
+                return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+            }
+            let AgentRaftApplyDispositionV2::Command(AgentRaftAuditDisposition::OrderedApplied {
+                entry,
+                claim,
+                successor,
+            }) = record.disposition
+            else {
+                return Ok(None);
+            };
+            let physical = verify_audited_physical_row_in_read(&transaction, &raft, &record)?;
+            let command = physical
+                .command
+                .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+            let AgentRaftCommand::Ordered {
+                route,
+                entry: physical_entry,
+                ..
+            } = &command
+            else {
+                return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+            };
+            if route.generation() != self.generation || physical_entry.id() != entry {
+                return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+            }
+            Ok(Some(AgentRaftOrderedJournalAnchorV2 {
+                route: *route,
+                index,
+                term: record.term,
+                command_commitment: command.commitment(),
+                entry,
+                claim,
+                successor,
+            }))
+        }
+
         /// Project the exact retained Ordered suffix so the host can reconcile
         /// it with the independently durable journal binding namespace. The
         /// remaining count is the hard capacity relative to the latest
@@ -9274,6 +9349,95 @@ mod tests {
 
     #[cfg(feature = "storage")]
     #[test]
+    fn v2_ordered_anchor_lookup_requires_exact_applied_physical_row() {
+        let directory = TempDirectory::new("v2_targeted_ordered_anchor");
+        let database = Arc::new(Database::create(directory.database()).unwrap());
+        let committee = committee(&[key(1)], &[]);
+        let route = route(&committee);
+        let store = journal_store(0xad);
+        let ledger =
+            open_foundation_ledger(Arc::clone(&database), route.generation(), store).unwrap();
+        ledger
+            .append_committed_for_test(
+                7,
+                &EntryKind::Data {
+                    payload: Vec::new(),
+                },
+            )
+            .unwrap();
+        let noop = ledger.next_committed_slot().unwrap().unwrap();
+        ledger.apply_foundation_slot(&noop).unwrap();
+        assert!(ledger.ordered_anchor(0).unwrap().is_none());
+        assert!(ledger.ordered_anchor(1).unwrap().is_none());
+        assert!(ledger.ordered_anchor(2).unwrap().is_none());
+        let entry = ordered_entry(route);
+        let command = AgentRaftCommand::Ordered {
+            route,
+            artifact_batch: None,
+            entry: entry.clone(),
+        };
+        ledger
+            .append_committed_for_test(
+                7,
+                &EntryKind::Data {
+                    payload: command.encode(),
+                },
+            )
+            .unwrap();
+        assert!(
+            ledger.ordered_anchor(2).unwrap().is_none(),
+            "Raft commit is not application"
+        );
+        let CommittedSharedRaftSlot::Command(slot) = ledger.next_committed_slot().unwrap().unwrap()
+        else {
+            panic!("expected Ordered command");
+        };
+        ledger.reserve_command_application(&slot).unwrap();
+        assert!(
+            ledger.ordered_anchor(2).unwrap().is_none(),
+            "reservation is not publication"
+        );
+        let claim = claim(route, &entry, 2, 7, b"targeted-anchor-state");
+        ledger
+            .anchor_ordered_for_test(&slot, &claim, successor(0xae))
+            .unwrap();
+        let expected = ledger.journal_audit().unwrap().ordered.pop().unwrap();
+        assert_eq!(ledger.ordered_anchor(2).unwrap(), Some(expected.clone()));
+        assert!(ledger.ordered_anchor(3).unwrap().is_none());
+        drop(ledger);
+        let reopened =
+            open_foundation_ledger(Arc::clone(&database), route.generation(), store).unwrap();
+        assert_eq!(reopened.ordered_anchor(2).unwrap(), Some(expected));
+
+        // A retained application row alone must never certify a changed or
+        // missing physical preimage, even after a successful startup audit.
+        let transaction = database.begin_write().unwrap();
+        {
+            let mut table = transaction.open_table(crate::raft::RAFT_LOG).unwrap();
+            let mut bytes = table.get(2).unwrap().unwrap().value().to_vec();
+            bytes[..8].copy_from_slice(&8_u64.to_le_bytes());
+            table.insert(2, bytes.as_slice()).unwrap();
+        }
+        transaction.commit().unwrap();
+        assert!(matches!(
+            reopened.ordered_anchor(2),
+            Err(AgentRaftApplicationErrorV2::SlotDatabaseMismatch(2))
+        ));
+        let transaction = database.begin_write().unwrap();
+        transaction
+            .open_table(crate::raft::RAFT_LOG)
+            .unwrap()
+            .remove(2)
+            .unwrap();
+        transaction.commit().unwrap();
+        assert!(matches!(
+            reopened.ordered_anchor(2),
+            Err(AgentRaftApplicationErrorV2::MissingCommittedSlot)
+        ));
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
     fn v2_noop_apply_is_atomic_restartable_and_duplicate_exact() {
         let directory = TempDirectory::new("v2_restart_duplicate");
         let path = directory.database();
@@ -9927,6 +10091,10 @@ mod tests {
             let audit = ledger.journal_audit().unwrap();
             assert_capacity_matches_full_audit(&ledger);
             assert!(audit.ordered.is_empty());
+            assert!(
+                ledger.ordered_anchor(4).unwrap().is_none(),
+                "pruned rows need snapshot authority, not a raw applied index"
+            );
             assert_eq!(
                 audit
                     .snapshot

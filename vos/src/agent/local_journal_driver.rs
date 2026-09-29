@@ -1188,6 +1188,10 @@ pub(crate) enum LocalSettledAcknowledgementResult {
 /// resolver snapshot.
 pub(crate) struct StandardLocalReplayExecutor<R> {
     resolver: R,
+    #[cfg(feature = "experimental-state-blocks")]
+    external: Option<super::external_local_executor::ExternalLocalReplayExecutor<R>>,
+    #[cfg(feature = "experimental-state-blocks")]
+    external_execution: Option<super::replay::ReplayExternalExecution>,
     trust: Arc<dyn AgentTrustProvider>,
     merge: Arc<dyn LocalMergeAuthenticator>,
     profile: AgentProfile,
@@ -1495,10 +1499,23 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         self.clean_genesis_descriptor.as_ref()
     }
 
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn external_runtime(
+        &self,
+    ) -> Option<&super::package_admission::AdmittedStateRuntimePackage> {
+        self.external.as_ref().map(|executor| executor.runtime())
+    }
+
     pub(crate) fn trusted_current_clean_descriptor(
         &self,
         binding: &RuntimeBinding,
     ) -> Result<crate::agent_sdk::AgentDescriptor, LocalReplayExecutorError> {
+        #[cfg(feature = "experimental-state-blocks")]
+        if let Some(external) = &self.external {
+            return external
+                .trusted_clean_descriptor(binding)?
+                .ok_or(LocalReplayExecutorError::InvalidState);
+        }
         let genesis = self
             .clean_genesis_descriptor
             .as_ref()
@@ -2091,6 +2108,10 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
     ) -> Self {
         Self {
             resolver,
+            #[cfg(feature = "experimental-state-blocks")]
+            external: None,
+            #[cfg(feature = "experimental-state-blocks")]
+            external_execution: None,
             trust,
             merge,
             profile: AgentProfile::Local,
@@ -2125,6 +2146,10 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             .collect();
         Self {
             resolver,
+            #[cfg(feature = "experimental-state-blocks")]
+            external: None,
+            #[cfg(feature = "experimental-state-blocks")]
+            external_execution: None,
             trust,
             merge,
             profile: AgentProfile::Shared,
@@ -2185,6 +2210,10 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
     }
 
     pub(crate) fn replace_resolver(&mut self, resolver: R) {
+        #[cfg(feature = "experimental-state-blocks")]
+        if let Some(external) = &mut self.external {
+            external.replace_resolver(resolver.clone());
+        }
         self.resolver = resolver;
         self.authenticated_execution = None;
         self.allow_attested_preparation = false;
@@ -2266,6 +2295,29 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         state: &RuntimeState,
         binding: &RuntimeBinding,
     ) -> Result<(), LocalReplayExecutorError> {
+        #[cfg(feature = "experimental-state-blocks")]
+        if let Some(external) = &self.external {
+            // Shared admission must not commit a command the selected
+            // physical executor will reject solely for its static gas bound.
+            external.gas(operation)?;
+            // The sealed external publication path is currently qualified
+            // for direct Invoke/ACK only. Generic image/SDK Resume and
+            // Attested execution retain their existing independent paths.
+            if operation.persisted_lane() != PersistedLane::Linear
+                || !matches!(
+                    operation,
+                    ReplayOperation::CleanInvoke {
+                        context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                        ..
+                    } | ReplayOperation::CleanAcknowledge {
+                        context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                        ..
+                    }
+                )
+            {
+                return Err(LocalReplayExecutorError::InvalidRequest);
+            }
+        }
         match operation {
             ReplayOperation::CleanInvoke {
                 work,
@@ -3442,6 +3494,46 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
 impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
     type Error = LocalReplayExecutorError;
 
+    #[cfg(feature = "experimental-state-blocks")]
+    fn execute_with_external_state(
+        &mut self,
+        input: &ReplayInput,
+        before: &RuntimeState,
+        position: ReplayPosition,
+        genesis: &super::journal::AgentJournalGenesis,
+        lanes: &[(
+            super::journal::LaneStateManifest,
+            super::journal::LaneCursor,
+        )],
+        reader: &dyn super::replay::ScopedBlockReader,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<ReplayTransition, Self::Error> {
+        let external = self
+            .external
+            .as_mut()
+            .ok_or(LocalReplayExecutorError::InvalidState)?;
+        let transition = external
+            .execute_with_external_state(input, before, position, genesis, lanes, reader, budget)?;
+        let execution = external
+            .take_external_execution()?
+            .ok_or(LocalReplayExecutorError::InvalidState)?;
+        let outcome = execution.output().transition().outcome.clone();
+        if let crate::agent_sdk::RuntimeOutcome::Management(_) = outcome {
+            self.record_clean_management_result(input.id(), outcome);
+        } else {
+            self.record_clean_invocation_result(input.id(), outcome);
+        }
+        self.external_execution = Some(execution);
+        Ok(transition)
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    fn take_external_execution(
+        &mut self,
+    ) -> Result<Option<super::replay::ReplayExternalExecution>, Self::Error> {
+        Ok(self.external_execution.take())
+    }
+
     fn trusted_clean_descriptor(
         &self,
         runtime: &RuntimeBinding,
@@ -3531,6 +3623,24 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
                     return Err(LocalReplayExecutorError::InvalidState);
                 }
                 self.clean_genesis_descriptor = Some((**descriptor).clone());
+                #[cfg(feature = "experimental-state-blocks")]
+                if genesis.runtime().is_external_state() {
+                    if self.profile != AgentProfile::Shared {
+                        return Err(LocalReplayExecutorError::InvalidState);
+                    }
+                    let runtime = super::package_admission::admit_state_runtime_package(
+                        &self.load(&genesis.runtime().package)?,
+                    )
+                    .map_err(|_| LocalReplayExecutorError::InvalidState)?;
+                    let mut external =
+                        super::external_local_executor::ExternalLocalReplayExecutor::new_shared(
+                            runtime,
+                            (**descriptor).clone(),
+                            self.resolver.clone(),
+                        )?;
+                    external.seed_genesis(genesis)?;
+                    self.external = Some(external);
+                }
             }
             ReplayOperation::Management { .. } => {
                 if self.clean_genesis_descriptor.is_some() {
@@ -3574,6 +3684,11 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
         before: &RuntimeState,
         position: ReplayPosition,
     ) -> Result<(), Self::Error> {
+        #[cfg(feature = "experimental-state-blocks")]
+        if let Some(external) = &mut self.external {
+            self.external_execution = None;
+            return external.authenticate(input, before, position);
+        }
         // Authentication mints a one-shot execution capability. Invalidate a
         // prior capability first so every error path fails closed.
         self.authenticated_execution = None;
@@ -4917,6 +5032,93 @@ where
         catalog: &[RuntimeBlob],
         expected_node: NodeId,
     ) -> Result<super::replay::ReplaySealedExternalLocalGenesis, LocalJournalDriverError> {
+        let prepared = Self::prepare_external_genesis_candidate(
+            create,
+            replica,
+            catalog,
+            expected_node,
+            crate::agent_sdk::AgentProfile::Local,
+        )?;
+        super::replay::ReplaySealedExternalLocalGenesis::from_prepared(prepared).map_err(|error| {
+            LocalJournalDriverError::Replay(
+                error
+                    .map_source(|never| match never {})
+                    .map_executor(|never| match never {}),
+            )
+        })
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn prepare_external_shared_genesis_candidate(
+        create: ReplayInput,
+        replica: AgentReplica,
+        committee: &AgentReplicaCommittee,
+        catalog: &[RuntimeBlob],
+        trust: &Arc<dyn AgentTrustProvider>,
+        expected_node: NodeId,
+    ) -> Result<super::replay::ReplayPreparedExternalGenesis, LocalJournalDriverError> {
+        if committee.validate().is_err()
+            || committee
+                .member_by_node(replica.node)
+                .map(|member| member.replica())
+                != Some(replica)
+            || !super::replay::validates_shared_create_committee(&create, committee)
+        {
+            return Err(LocalReplayExecutorError::WrongReplica.into());
+        }
+        let ReplayOperation::CleanManage { observed_slot, .. } = &create.operation else {
+            return Err(LocalReplayExecutorError::InvalidRequest.into());
+        };
+        if trust
+            .current_logical_slot()
+            .is_none_or(|slot| slot < *observed_slot)
+        {
+            return Err(LocalReplayExecutorError::TrustUnavailable.into());
+        }
+        Self::prepare_external_genesis_candidate(
+            create,
+            replica,
+            catalog,
+            expected_node,
+            crate::agent_sdk::AgentProfile::Shared,
+        )
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn prepare_external_shared_genesis(
+        verified: &VerifiedAgentGenesisProvision,
+        replica: AgentReplica,
+        catalog: &[RuntimeBlob],
+        trust: &Arc<dyn AgentTrustProvider>,
+        expected_node: NodeId,
+    ) -> Result<super::replay::ReplaySealedExternalGenesis, LocalJournalDriverError> {
+        let provision = verified.provision();
+        let prepared = Self::prepare_external_shared_genesis_candidate(
+            provision.proposal().create().clone(),
+            replica,
+            provision.replicas(),
+            catalog,
+            trust,
+            expected_node,
+        )?;
+        super::replay::ReplaySealedExternalGenesis::from_prepared_shared(verified, prepared)
+            .map_err(|error| {
+                LocalJournalDriverError::Replay(
+                    error
+                        .map_source(|never| match never {})
+                        .map_executor(|never| match never {}),
+                )
+            })
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    fn prepare_external_genesis_candidate(
+        create: ReplayInput,
+        replica: AgentReplica,
+        catalog: &[RuntimeBlob],
+        expected_node: NodeId,
+        profile: crate::agent_sdk::AgentProfile,
+    ) -> Result<super::replay::ReplayPreparedExternalGenesis, LocalJournalDriverError> {
         use super::replay::{
             ExternalGenesisExecutor, ReplayPreparedExternalGenesis, ScopedBlockReader,
         };
@@ -4940,6 +5142,7 @@ where
         struct Executor {
             admitted: super::package_admission::AdmittedStateRuntimePackage,
             replica: AgentReplica,
+            profile: crate::agent_sdk::AgentProfile,
             authenticated: Option<ReplayInputId>,
         }
         impl ReplayExecutor for Executor {
@@ -4972,11 +5175,16 @@ where
                     || position != ReplayPosition::Genesis
                     || input.runtime != expected
                     || descriptor.validate().is_err()
-                    || descriptor.identity.profile != crate::agent_sdk::AgentProfile::Local
-                    || descriptor.replicas.len() != 1
-                    || descriptor.replicas[0].node.0 != self.replica.node.0
-                    || descriptor.replicas[0].principal.0 != self.replica.principal.0
-                    || descriptor.replicas[0].role != crate::agent_sdk::ReplicaRole::Voter
+                    || descriptor.identity.profile != self.profile
+                    || (self.profile == crate::agent_sdk::AgentProfile::Local
+                        && descriptor.replicas.len() != 1)
+                    || (self.profile == crate::agent_sdk::AgentProfile::Shared
+                        && !super::replay::external_shared_descriptor_supported(descriptor))
+                    || !descriptor.replicas.iter().any(|replica| {
+                        replica.node.0 == self.replica.node.0
+                            && replica.principal.0 == self.replica.principal.0
+                            && replica.role == crate::agent_sdk::ReplicaRole::Voter
+                    })
                     || descriptor.identity.runtime_deployment != self.admitted.deployment()
                     || descriptor.identity.runtime_program != self.admitted.program()
                     || descriptor.identity.runtime_producer
@@ -5064,6 +5272,7 @@ where
         let mut executor = Executor {
             admitted,
             replica,
+            profile,
             authenticated: None,
         };
         let prepared = ReplayPreparedExternalGenesis::prepare(create, replica, &mut executor)
@@ -5078,13 +5287,7 @@ where
         {
             return Err(LocalJournalDriverError::InvalidResult);
         }
-        super::replay::ReplaySealedExternalLocalGenesis::from_prepared(prepared).map_err(|error| {
-            LocalJournalDriverError::Replay(
-                error
-                    .map_source(|never| match never {})
-                    .map_executor(|never| match never {}),
-            )
-        })
+        Ok(prepared)
     }
 
     /// Re-execute one independently finalized Shared provision for the exact

@@ -58,6 +58,43 @@ use crate::service::{BlobRef, Hash, NodeId};
 
 type SharedReplayError = MaterializeError<core::convert::Infallible, LocalReplayExecutorError>;
 
+#[cfg(feature = "experimental-state-blocks")]
+const EXTERNAL_OPERATION_FETCHES: u32 = 10_000;
+#[cfg(feature = "experimental-state-blocks")]
+const EXTERNAL_OPERATION_BYTES: u64 = 10_000_000;
+
+#[cfg(feature = "experimental-state-blocks")]
+fn external_recovery_limits() -> (u32, u64) {
+    use crate::agent_sdk::{state_blocks, state_change, state_tree};
+    let blocks = state_change::MAX_STATE_CHANGE_BLOCKS as u32;
+    let bytes = state_change::MAX_STATE_CHANGE_BYTES as u64;
+    let entries = super::journal::MAX_REPLAY_SUFFIX_ENTRIES as u32;
+    // Genesis starts from empty roots, so every tree node is emitted in one
+    // bounded change. Chunk references may repeat across leaves, requiring up
+    // to a full maximum value read per emitted node. Reserve two base audits.
+    // Shared external compaction/import is closed and the pin requires this
+    // exact genesis checkpoint, never a later arbitrary root.
+    let chunks =
+        state_tree::MAX_TREE_VALUE_BYTES.div_ceil(state_blocks::MAX_STATE_BLOCK_BYTES) as u32;
+    let genesis_fetches = 2 * blocks * (1 + chunks);
+    let genesis_bytes = 2 * (bytes + u64::from(blocks) * state_tree::MAX_TREE_VALUE_BYTES as u64);
+    // Recovery repeats live execution+reuse checks, and additionally fetches
+    // every newly emitted block. The entire maximum legal suffix must reopen,
+    // not merely the first operations that fit an unrelated aggregate cap.
+    (
+        genesis_fetches + entries * (EXTERNAL_OPERATION_FETCHES + blocks),
+        genesis_bytes + u64::from(entries) * (EXTERNAL_OPERATION_BYTES + bytes),
+    )
+}
+
+/// Non-transferable evidence from the exclusive physical journal owner. This
+/// is local applied availability, not a quorum certificate or an import seal.
+pub(crate) struct VerifiedSharedOrderedAvailability {
+    _store: super::shared_raft::JournalStoreInstanceId,
+    _epoch: u64,
+    _claim: OrderedCommitClaim,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SharedArtifactStagerError {
     Unavailable,
@@ -846,6 +883,7 @@ pub(crate) enum PreparedCleanManagement {
         observed_slot: u64,
     },
     Retained {
+        input: ReplayInputId,
         outcome: crate::agent_sdk::RuntimeOutcome,
         observed_slot: u64,
     },
@@ -890,8 +928,8 @@ impl SharedInstallObservation {
 impl PreparedCleanManagement {
     pub(crate) const fn input(&self) -> Option<ReplayInputId> {
         match self {
-            Self::Denied { .. } | Self::Retained { .. } => None,
-            Self::Proposal { input, .. } => Some(*input),
+            Self::Denied { .. } => None,
+            Self::Retained { input, .. } | Self::Proposal { input, .. } => Some(*input),
         }
     }
 
@@ -945,6 +983,14 @@ where
     local_node: NodeId,
     replay_trust: Arc<dyn AgentTrustProvider>,
     replay_merge: Arc<dyn LocalMergeAuthenticator>,
+    #[cfg(feature = "experimental-state-blocks")]
+    external: Option<SharedExternalOwner>,
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+struct SharedExternalOwner {
+    genesis: Arc<super::replay::ReplaySealedExternalGenesis>,
+    availability: super::replay::SharedExternalAvailability,
 }
 
 impl<S, A> SharedJournalAgentDriver<S, A>
@@ -966,7 +1012,39 @@ where
         merge: Arc<dyn LocalMergeAuthenticator>,
     ) -> Result<Self, SharedJournalDriverError> {
         Self::open_with_optional_attested_transition_provider(
-            store, artifacts, ledger, trust, merge, None,
+            store,
+            artifacts,
+            ledger,
+            trust,
+            merge,
+            None,
+            #[cfg(feature = "experimental-state-blocks")]
+            None,
+        )
+    }
+
+    /// Explicit internal selection from independently certified genesis.
+    /// Ordinary image opens never reinterpret external descriptor bytes.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn open_external(
+        store: S,
+        artifacts: A,
+        ledger: AgentRaftApplicationLedgerV2,
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+        genesis: Arc<super::replay::ReplaySealedExternalGenesis>,
+    ) -> Result<Self, SharedJournalDriverError> {
+        if !genesis.is_shared() {
+            return Err(SharedJournalDriverError::InvalidProfile);
+        }
+        Self::open_with_optional_attested_transition_provider(
+            store,
+            artifacts,
+            ledger,
+            trust,
+            merge,
+            None,
+            Some(genesis),
         )
     }
 
@@ -987,6 +1065,8 @@ where
             trust,
             merge,
             Some(provider),
+            #[cfg(feature = "experimental-state-blocks")]
+            None,
         )
     }
 
@@ -997,6 +1077,9 @@ where
         trust: Arc<dyn AgentTrustProvider>,
         merge: Arc<dyn LocalMergeAuthenticator>,
         provider: Option<Box<dyn AttestedReplayTransitionProvider>>,
+        #[cfg(feature = "experimental-state-blocks")] external_genesis: Option<
+            Arc<super::replay::ReplaySealedExternalGenesis>,
+        >,
     ) -> Result<Self, SharedJournalDriverError> {
         let started = std::time::Instant::now();
         let report_phase = |phase: &'static str| {
@@ -1025,6 +1108,33 @@ where
             executor.replace_attested_transition_provider(provider);
         }
         report_phase("executor_setup");
+        #[cfg(feature = "experimental-state-blocks")]
+        let (materialization, external) = if let Some(genesis) = external_genesis {
+            let heads = store.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+            let validated = super::replay::validate_external_genesis_head(
+                &mut store,
+                &genesis,
+                &heads,
+                &mut executor,
+                &NoPrunedOrderedBases,
+                &mut Self::external_recovery_budget(),
+            )?;
+            let (materialization, availability) =
+                validated.into_shared_availability(&store, &genesis)?;
+            (
+                materialization,
+                Some(SharedExternalOwner {
+                    genesis,
+                    availability,
+                }),
+            )
+        } else {
+            (
+                materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases)?,
+                None,
+            )
+        };
+        #[cfg(not(feature = "experimental-state-blocks"))]
         let materialization =
             materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases)?;
         report_phase("materialize_current");
@@ -1097,7 +1207,23 @@ where
             local_node,
             replay_trust: trust,
             replay_merge: merge,
+            #[cfg(feature = "experimental-state-blocks")]
+            external,
         })
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    fn external_recovery_budget() -> crate::agent_sdk::state_blocks::ReadBudget {
+        let (fetches, bytes) = external_recovery_limits();
+        crate::agent_sdk::state_blocks::ReadBudget::new(fetches, bytes)
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    fn external_operation_budget() -> crate::agent_sdk::state_blocks::ReadBudget {
+        crate::agent_sdk::state_blocks::ReadBudget::new(
+            EXTERNAL_OPERATION_FETCHES,
+            EXTERNAL_OPERATION_BYTES,
+        )
     }
 
     /// Re-materialize the durable journal using a fresh verifier/result cache
@@ -1191,6 +1317,39 @@ where
         );
         let setup_us = started.elapsed().as_micros() as u64;
         let materialize_started = std::time::Instant::now();
+        #[cfg(feature = "experimental-state-blocks")]
+        let recovered = if let Some(external) = &self.external {
+            let heads = self
+                .store
+                .heads()?
+                .ok_or(JournalStoreError::NotInitialized)?;
+            super::replay::validate_external_genesis_head(
+                &mut self.store,
+                &external.genesis,
+                &heads,
+                &mut executor,
+                &NoPrunedOrderedBases,
+                &mut Self::external_recovery_budget(),
+            )
+            .map_err(|error| {
+                MaterializeError::Source(super::replay::ReplayMaterializationSourceError::Journal(
+                    error,
+                ))
+            })
+            .and_then(|validated| {
+                validated
+                    .into_shared_availability(&self.store, &external.genesis)
+                    .map(|(recovered, _)| recovered)
+                    .map_err(|error| {
+                        MaterializeError::Source(
+                            super::replay::ReplayMaterializationSourceError::Journal(error),
+                        )
+                    })
+            })
+        } else {
+            materialize_current(&mut self.store, &mut executor, &NoPrunedOrderedBases)
+        };
+        #[cfg(not(feature = "experimental-state-blocks"))]
         let recovered = materialize_current(&mut self.store, &mut executor, &NoPrunedOrderedBases);
         tracing::debug!(
             setup_us,
@@ -1198,7 +1357,13 @@ where
             succeeded = recovered.is_ok(),
             "durable terminal materialization complete"
         );
-        let recovered = recovered?;
+        let recovered = recovered.map_err(|error| {
+            #[cfg(feature = "experimental-state-blocks")]
+            if let Some(external) = &self.external {
+                external.availability.invalidate();
+            }
+            error
+        })?;
         let audit = self.ledger.journal_audit()?;
         if let Some(snapshot) = &audit.snapshot {
             validate_published_shared_checkpoint(&self.store, &recovered, &snapshot.claim)
@@ -1529,6 +1694,10 @@ where
     }
 
     pub(crate) fn engine_lanes(&self) -> Result<super::LaneSet, SharedJournalDriverError> {
+        #[cfg(feature = "experimental-state-blocks")]
+        if self.external.is_some() {
+            return Ok(super::LaneSet::of(super::StateLane::Linear));
+        }
         if self.executor.seeded_clean_descriptor().is_some() {
             return self
                 .executor
@@ -2479,10 +2648,13 @@ where
         self.stage_current_merge_seal_matching(None)
     }
 
-    fn stage_current_merge_seal_matching(
-        &mut self,
-        expected: Option<super::journal::MergeSealId>,
-    ) -> Result<super::journal::MergeSealId, SharedJournalDriverError> {
+    fn current_merge_seal(
+        &self,
+    ) -> (
+        super::journal::MergeSeal,
+        super::journal::LaneStateManifest,
+        Vec<u8>,
+    ) {
         let heads = self.materialization.heads().clone();
         let merge_state = self.materialization.state().merge.clone();
         let state = BlobRef::of_bytes(&merge_state);
@@ -2506,6 +2678,14 @@ where
             },
             merge_state: manifest.id(),
         };
+        (seal, manifest, merge_state)
+    }
+
+    fn stage_current_merge_seal_matching(
+        &mut self,
+        expected: Option<super::journal::MergeSealId>,
+    ) -> Result<super::journal::MergeSealId, SharedJournalDriverError> {
+        let (seal, manifest, merge_state) = self.current_merge_seal();
         // A follower can derive this dependency from authenticated local state
         // only when it exactly matches the committed content address. Never
         // substitute a newer local Merge frontier or publish mismatched bytes.
@@ -2513,7 +2693,7 @@ where
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
         self.store
-            .put_blob(JournalBlobClass::LaneState, &state, &merge_state)?;
+            .put_blob(JournalBlobClass::LaneState, &manifest.state, &merge_state)?;
         self.store.put(&manifest)?;
         self.store.put(&seal)?;
         Ok(seal.id())
@@ -2530,6 +2710,15 @@ where
         authority: crate::agent_sdk::authority::AuthorityReceipt,
         artifacts: SdkManagementArtifacts<'_>,
     ) -> Result<PreparedCleanManagement, SharedJournalDriverError> {
+        #[cfg(feature = "experimental-state-blocks")]
+        if let Some(external) = &self.external {
+            external
+                .availability
+                .require_current(&self.store, &self.materialization)?;
+            if !matches!(request, crate::agent_sdk::ManagementRequest::Install(_)) {
+                return Err(SharedJournalDriverError::InvalidProfile);
+            }
+        }
         if matches!(
             request,
             crate::agent_sdk::ManagementRequest::Create(_)
@@ -2555,6 +2744,7 @@ where
                 .clean_management_result(input)
                 .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
             return Ok(PreparedCleanManagement::Retained {
+                input,
                 outcome,
                 observed_slot,
             });
@@ -2571,6 +2761,67 @@ where
         input
             .validate()
             .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        let heads = self.materialization.heads();
+        let candidate = OrderedEntry {
+            genesis: heads.genesis,
+            index: heads
+                .ordered_index
+                .checked_add(1)
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?,
+            parent: heads.ordered_head,
+            merge_frontier: heads.merge_frontier,
+            merge_seal: Some(self.current_merge_seal().0.id()),
+            input: input.clone(),
+        };
+        #[cfg(feature = "experimental-state-blocks")]
+        let preview = if self.external.is_some() {
+            let expiry = super::driver::verify_clean_management_journal_receipt(
+                &descriptor,
+                &request,
+                &authority,
+                observed_slot,
+                true,
+            )
+            .map_err(|_| {
+                SharedJournalDriverError::Executor(LocalReplayExecutorError::InvalidAuthority)
+            })?;
+            let returned = self.execute_external_work_at(
+                crate::agent_sdk::RuntimeWork::Manage {
+                    context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                    space: descriptor.identity.space,
+                    agent: descriptor.identity.agent,
+                    runtime_deployment: descriptor.identity.runtime_deployment,
+                    state: super::replay::sdk_runtime_state(self.materialization.state()),
+                    request: Box::new(request.clone()),
+                    authority: Some(Box::new(authority.clone())),
+                    observed_slot,
+                },
+                Some(&candidate),
+            )?;
+            if expiry
+                && (returned.outcome
+                    != crate::agent_sdk::RuntimeOutcome::Management(Err(
+                        crate::agent_sdk::ManagementError::ExpiredBeforeApplication,
+                    ))
+                    || returned.state
+                        == super::replay::sdk_runtime_state(self.materialization.state()))
+            {
+                return Err(SharedJournalDriverError::Executor(
+                    LocalReplayExecutorError::InvalidState,
+                ));
+            }
+            returned
+        } else {
+            self.executor.preview_clean_management(
+                &runtime,
+                self.materialization.state(),
+                &request,
+                &authority,
+                observed_slot,
+                false,
+            )?
+        };
+        #[cfg(not(feature = "experimental-state-blocks"))]
         let preview = self.executor.preview_clean_management(
             &runtime,
             self.materialization.state(),
@@ -2630,19 +2881,8 @@ where
             }
             Some(batch)
         };
-        let merge_seal = self.stage_current_merge_seal()?;
-        let heads = self.materialization.heads();
-        let entry = OrderedEntry {
-            genesis: heads.genesis,
-            index: heads
-                .ordered_index
-                .checked_add(1)
-                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?,
-            parent: heads.ordered_head,
-            merge_frontier: heads.merge_frontier,
-            merge_seal: Some(merge_seal),
-            input,
-        };
+        self.stage_current_merge_seal_matching(candidate.merge_seal)?;
+        let entry = candidate;
         let ordered = AgentRaftCommand::Ordered {
             route,
             artifact_batch,
@@ -2663,6 +2903,30 @@ where
         &self,
         request: &crate::agent_sdk::ManagementRequest,
     ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedJournalDriverError> {
+        #[cfg(feature = "experimental-state-blocks")]
+        if self.external.is_some() {
+            if !matches!(
+                request,
+                crate::agent_sdk::ManagementRequest::InspectActors { .. }
+                    | crate::agent_sdk::ManagementRequest::InspectResources
+                    | crate::agent_sdk::ManagementRequest::InspectManagementHistory
+            ) {
+                return Err(SharedJournalDriverError::InvalidProfile);
+            }
+            let descriptor = self.clean_descriptor()?;
+            return self
+                .execute_external_work(crate::agent_sdk::RuntimeWork::Manage {
+                    context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                    space: descriptor.identity.space,
+                    agent: descriptor.identity.agent,
+                    runtime_deployment: descriptor.identity.runtime_deployment,
+                    state: super::replay::sdk_runtime_state(self.materialization.state()),
+                    request: Box::new(request.clone()),
+                    authority: None,
+                    observed_slot: self.executor.current_logical_slot()?,
+                })
+                .map(|transition| transition.outcome);
+        }
         self.executor
             .inspect_clean_management(
                 self.materialization.runtime(),
@@ -2670,6 +2934,160 @@ where
                 request,
             )
             .map_err(Into::into)
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    fn execute_external_work(
+        &self,
+        work: crate::agent_sdk::RuntimeWork,
+    ) -> Result<crate::agent_sdk::RuntimeTransition, SharedJournalDriverError> {
+        self.execute_external_work_at(work, None)
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    fn execute_external_work_at(
+        &self,
+        work: crate::agent_sdk::RuntimeWork,
+        candidate: Option<&OrderedEntry>,
+    ) -> Result<crate::agent_sdk::RuntimeTransition, SharedJournalDriverError> {
+        let owner = self
+            .external
+            .as_ref()
+            .ok_or(SharedJournalDriverError::InvalidProfile)?;
+        owner
+            .availability
+            .require_current(&self.store, &self.materialization)?;
+        let runtime = self
+            .executor
+            .external_runtime()
+            .ok_or(SharedJournalDriverError::InvalidProfile)?;
+        let invocation_gas = match &work {
+            crate::agent_sdk::RuntimeWork::Invoke { invocation, .. } => {
+                if invocation.gas > super::execution::MAX_EXECUTION_GAS {
+                    return Err(SharedJournalDriverError::Executor(
+                        LocalReplayExecutorError::InvalidRequest,
+                    ));
+                }
+                invocation.gas
+            }
+            crate::agent_sdk::RuntimeWork::Resume { .. } => {
+                return Err(SharedJournalDriverError::Executor(
+                    LocalReplayExecutorError::InvalidRequest,
+                ));
+            }
+            _ => 0,
+        };
+        let gas = super::driver::DEFAULT_MANAGEMENT_GAS
+            .checked_add(invocation_gas)
+            .ok_or(SharedJournalDriverError::Executor(
+                LocalReplayExecutorError::InvalidRequest,
+            ))?;
+        let mut lanes = self.materialization.external_inspection_lanes()?;
+        if let Some(entry) = candidate
+            && entry.input.persisted_lane() == PersistedLane::Linear
+        {
+            // The preview sees the exact proposed root revision, not an
+            // inspection-only cursor. Replay independently revalidates this
+            // same predecessor-bound entry after physical Raft commitment.
+            let lane = lanes
+                .iter_mut()
+                .find(|lane| {
+                    lane.base.context().scope().lane() == crate::agent_sdk::StateLane::Linear
+                })
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+            lane.next = super::state_block_store::journal_root_context(
+                owner.genesis.genesis(),
+                self.materialization.runtime(),
+                PersistedLane::Linear,
+                None,
+                &super::journal::LaneCursor::Ordered {
+                    base: OrderedBase {
+                        index: entry.index,
+                        head: Some(entry.id()),
+                    },
+                },
+            )
+            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        }
+        let work = crate::agent_sdk::state_execution::StateExecutionWork::new(
+            work,
+            lanes,
+            runtime.external_state_limits(),
+        )
+        .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        let map_error = |error| {
+            use super::state_block_pvm::BlockPvmError;
+            use crate::agent_sdk::{state_blocks::BlockError, state_tree::TreeError};
+            if matches!(
+                error,
+                BlockPvmError::Block(
+                    TreeError::Storage
+                        | TreeError::Block(BlockError::Unavailable | BlockError::HashMismatch)
+                )
+            ) {
+                owner.availability.invalidate();
+            }
+            // A deterministic unsupported/trapping candidate is not a durable
+            // terminal result, but also does not revoke an otherwise healthy
+            // historical closure pin merely because admission refused it.
+            SharedJournalDriverError::Executor(match error {
+                BlockPvmError::Backend => LocalReplayExecutorError::RuntimeBackend,
+                BlockPvmError::Exit { reason, pc } => {
+                    LocalReplayExecutorError::RuntimeExit { reason, pc }
+                }
+                BlockPvmError::InvalidRequest | BlockPvmError::ProgramMismatch => {
+                    LocalReplayExecutorError::InvalidRequest
+                }
+                _ => LocalReplayExecutorError::RuntimeOutput,
+            })
+        };
+        let mut budget = Self::external_operation_budget();
+        let output = super::state_block_pvm::MultiLaneStateBlockHost {
+            store: &self.store,
+            budget: &mut budget,
+        }
+        .execute_admitted_work(runtime, &work, gas)
+        .map_err(&map_error)?;
+        // Publication performs reuse verification after guest execution under
+        // this same live read budget. Admission must prove that complete cost
+        // fits before allocating a Raft slot; this pass writes no block or head.
+        for change in output.changes() {
+            let lane = work
+                .lanes()
+                .iter()
+                .find(|lane| lane.base.context().scope() == change.next().context().scope())
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+            change
+                .verify_reuse(
+                    lane.base,
+                    lane.next,
+                    &mut super::state_block_store::JournalBlockReader {
+                        store: &self.store,
+                        scope: lane.base.context().scope(),
+                    },
+                    &mut budget,
+                )
+                .map_err(|error| map_error(super::state_block_pvm::BlockPvmError::Block(error)))?;
+        }
+        if let Some(entry) = candidate {
+            let captured = super::replay::ReplayExternalExecution::from_physical_response(
+                &entry.input,
+                self.materialization.state(),
+                super::replay::ReplayPosition::Ordered {
+                    id: entry.id(),
+                    index: entry.index,
+                    merge_frontier: entry.merge_frontier,
+                    merge_seal: entry.merge_seal,
+                },
+                &work,
+                output,
+            )
+            .map_err(|_| {
+                SharedJournalDriverError::Executor(LocalReplayExecutorError::RuntimeOutput)
+            })?;
+            return Ok(captured.output().transition().clone());
+        }
+        Ok(output.transition().clone())
     }
 
     pub(crate) fn clean_state_commitment(
@@ -2693,6 +3111,12 @@ where
         request: CleanInvocationReplayRequest,
         observed_slot: u64,
     ) -> Result<ReplayInput, SharedJournalDriverError> {
+        #[cfg(feature = "experimental-state-blocks")]
+        if let Some(external) = &self.external {
+            external
+                .availability
+                .require_current(&self.store, &self.materialization)?;
+        }
         let heads = self.materialization.heads();
         let input = ReplayInput {
             runtime: heads.runtime.clone(),
@@ -2867,6 +3291,15 @@ where
         &self,
         expected: &crate::agent_sdk::InvocationWork,
     ) -> Result<Option<crate::agent_sdk::RuntimeOutcome>, SharedJournalDriverError> {
+        self.retained_acknowledged_projection_with_input(expected)
+            .map(|retained| retained.map(|(_, outcome)| outcome))
+    }
+
+    pub(crate) fn retained_acknowledged_projection_with_input(
+        &self,
+        expected: &crate::agent_sdk::InvocationWork,
+    ) -> Result<Option<(ReplayInputId, crate::agent_sdk::RuntimeOutcome)>, SharedJournalDriverError>
+    {
         if expected.mode != crate::agent_sdk::MethodMode::Query || !expected.validate() {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
@@ -2891,7 +3324,7 @@ where
         if !matches!(outcome, crate::agent_sdk::RuntimeOutcome::Completed(_)) {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
-        Ok(Some(outcome))
+        Ok(Some((input, outcome)))
     }
 
     fn retained_public_invocation(
@@ -3053,15 +3486,6 @@ where
         ) {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
-        if terminal_only
-            && !self.executor.clean_invocation_is_terminal(
-                &input.operation,
-                self.materialization.state(),
-                &input.runtime,
-            )?
-        {
-            return Err(SharedJournalDriverError::CrossStoreMismatch);
-        }
         let heads = self.materialization.heads();
         let entry = OrderedEntry {
             genesis: heads.genesis,
@@ -3077,6 +3501,47 @@ where
         entry
             .validate()
             .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        let input = &entry.input;
+        #[cfg(feature = "experimental-state-blocks")]
+        let require_terminal = terminal_only || self.external.is_some();
+        #[cfg(not(feature = "experimental-state-blocks"))]
+        let require_terminal = terminal_only;
+        if require_terminal {
+            #[cfg(feature = "experimental-state-blocks")]
+            let terminal = if self.external.is_some() {
+                let work = super::replay::canonical_clean_runtime_work(
+                    input,
+                    self.materialization.state(),
+                )
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+                let outcome = self.execute_external_work_at(work, Some(&entry))?.outcome;
+                matches!(
+                    (&input.operation, outcome),
+                    (
+                        ReplayOperation::CleanInvoke { .. },
+                        crate::agent_sdk::RuntimeOutcome::Completed(_)
+                    ) | (
+                        ReplayOperation::CleanAcknowledge { .. },
+                        crate::agent_sdk::RuntimeOutcome::Acknowledged(_)
+                    )
+                )
+            } else {
+                self.executor.clean_invocation_is_terminal(
+                    &input.operation,
+                    self.materialization.state(),
+                    &input.runtime,
+                )?
+            };
+            #[cfg(not(feature = "experimental-state-blocks"))]
+            let terminal = self.executor.clean_invocation_is_terminal(
+                &input.operation,
+                self.materialization.state(),
+                &input.runtime,
+            )?;
+            if !terminal {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+        }
         let input = entry.input.id();
         let payload = AgentRaftCommand::Ordered {
             route: self.active_route()?,
@@ -3108,6 +3573,10 @@ where
         &mut self,
         request: CleanInvocationReplayRequest,
     ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedJournalDriverError> {
+        #[cfg(feature = "experimental-state-blocks")]
+        if self.external.is_some() {
+            return Err(SharedJournalDriverError::InvalidProfile);
+        }
         let retry = request.clone().into_operation(0);
         if let Some(input) =
             recent_clean_local_operation(&self.store, &self.materialization, &retry)?
@@ -3176,6 +3645,10 @@ where
         &mut self,
         request: CleanInvocationReplayRequest,
     ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedJournalDriverError> {
+        #[cfg(feature = "experimental-state-blocks")]
+        if self.external.is_some() {
+            return Err(SharedJournalDriverError::InvalidProfile);
+        }
         let retry = request.clone().into_operation(0);
         if let Some(input) =
             recent_clean_merge_operation(&self.store, &self.materialization, &retry)?
@@ -3339,6 +3812,19 @@ where
     /// the physical Raft log. Test-only because production log admission is
     /// owned by the not-yet-attached Agent transport coordinator.
     #[cfg(test)]
+    pub(crate) fn append_command_for_test(
+        &self,
+        term: u64,
+        payload: Vec<u8>,
+    ) -> Result<u64, SharedJournalDriverError> {
+        AgentRaftCommand::decode(&payload)
+            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        self.ledger
+            .append_committed_for_test(term, &vos_raft::EntryKind::Data { payload })
+            .map_err(Into::into)
+    }
+
+    #[cfg(test)]
     pub(crate) fn append_ordered_for_test(
         &mut self,
         term: u64,
@@ -3404,6 +3890,112 @@ where
         self.ledger.capacity().map_err(Into::into)
     }
 
+    pub(crate) fn uses_external_state(&self) -> bool {
+        #[cfg(feature = "experimental-state-blocks")]
+        {
+            self.external.is_some()
+        }
+        #[cfg(not(feature = "experimental-state-blocks"))]
+        {
+            false
+        }
+    }
+
+    /// Find only this input's exact retained anchored publication. A current
+    /// state root cannot stand in for a missing historical result binding.
+    pub(crate) fn available_ordered_claim(
+        &self,
+        input: ReplayInputId,
+    ) -> Result<OrderedCommitClaim, SharedJournalDriverError> {
+        let mut next = self.materialization.heads().ordered_head;
+        let mut expected_index = self.materialization.heads().ordered_index;
+        for _ in 0..super::journal::MAX_REPLAY_SUFFIX_ENTRIES {
+            let Some(id) = next else {
+                break;
+            };
+            if Some(id) == self.materialization.replay_boundary().head {
+                break;
+            }
+            let entry = self
+                .store
+                .get::<OrderedEntry>(id)?
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+            if entry.id() != id
+                || entry.genesis != self.materialization.heads().genesis
+                || entry.index != expected_index
+            {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+            if entry.input.id() == input {
+                let binding = self
+                    .store
+                    .shared_ordered_commit(id)?
+                    .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+                let claim = binding.claim().clone();
+                self.verify_ordered_availability(
+                    claim.raft_index(),
+                    claim.raft_term(),
+                    claim.commitment(),
+                )?;
+                return Ok(claim);
+            }
+            next = entry.parent;
+            expected_index = expected_index
+                .checked_sub(1)
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        }
+        Err(JournalStoreError::Unavailable.into())
+    }
+
+    /// Acknowledge only an exact V2 anchor from this generation and physical
+    /// store. External state additionally requires the per-open audited pin;
+    /// every later publication extends it only after durable closure writes.
+    pub(crate) fn verify_ordered_availability(
+        &self,
+        index: u64,
+        term: u64,
+        claim: Hash,
+    ) -> Result<VerifiedSharedOrderedAvailability, SharedJournalDriverError> {
+        if index == 0 || term == 0 || claim == Hash::ZERO {
+            return Err(JournalStoreError::Unavailable.into());
+        }
+        #[cfg(feature = "experimental-state-blocks")]
+        if let Some(external) = &self.external {
+            external
+                .availability
+                .require_current(&self.store, &self.materialization)?;
+        }
+        let anchor = self
+            .ledger
+            .ordered_anchor(index)?
+            .filter(|anchor| anchor.term == term && anchor.claim == claim)
+            .ok_or(JournalStoreError::Unavailable)?;
+        let entry = self
+            .store
+            .get::<OrderedEntry>(anchor.entry)?
+            .ok_or(JournalStoreError::Unavailable)?;
+        let mut chain = BTreeMap::new();
+        chain.insert(anchor.entry, entry);
+        validate_ordered_anchor(&self.store, &chain, self.ledger.journal_store(), &anchor)?;
+        let binding = self
+            .store
+            .shared_ordered_commit(anchor.entry)?
+            .ok_or(JournalStoreError::Unavailable)?;
+        let bound = binding.claim();
+        let heads = self.materialization.heads();
+        if bound.genesis() != heads.genesis
+            || bound.admission() != heads.admission
+            || bound.ordered().index > heads.ordered_index
+        {
+            return Err(JournalStoreError::Unavailable.into());
+        }
+        Ok(VerifiedSharedOrderedAvailability {
+            _store: self.store.instance_id(),
+            _epoch: self.store.validation_epoch(),
+            _claim: bound.clone(),
+        })
+    }
+
     fn snapshot_boundary_claim(&self) -> Result<OrderedCommitClaim, SharedJournalDriverError> {
         let heads = self.materialization.heads();
         let entry = heads.ordered_head.ok_or(SharedJournalDriverError::Ledger(
@@ -3445,6 +4037,12 @@ where
         ),
         SharedJournalDriverError,
     > {
+        // Historical external availability currently pins the entire verified
+        // suffix. Compaction requires a separate complete root pinning proof.
+        #[cfg(feature = "experimental-state-blocks")]
+        if self.external.is_some() {
+            return Err(JournalStoreError::Unavailable.into());
+        }
         let ordered = self.snapshot_boundary_claim()?;
         let context = self.ledger.snapshot_context(&ordered)?;
         let plan = prepare_shared_checkpoint(&mut self.store, &self.materialization)
@@ -3496,6 +4094,10 @@ where
         &mut self,
         certificate: &SharedAgentSnapshotCertificate,
     ) -> Result<InstalledAgentRaftSnapshotV2, SharedJournalDriverError> {
+        #[cfg(feature = "experimental-state-blocks")]
+        if self.external.is_some() {
+            return Err(JournalStoreError::Unavailable.into());
+        }
         if let Some(installed) = self.ledger.current_snapshot()? {
             if installed.certificate_commitment == certificate.commitment() {
                 if installed.claim != *certificate.claim() {
@@ -3573,6 +4175,10 @@ where
         maximum_binding_unlinks: usize,
         gc_limits: GcLimits,
     ) -> Result<SharedSnapshotCompactionOutcome, SharedJournalDriverError> {
+        #[cfg(feature = "experimental-state-blocks")]
+        if self.external.is_some() {
+            return Err(JournalStoreError::Unavailable.into());
+        }
         if maximum_binding_unlinks == 0 {
             return Err(JournalStoreError::LimitExceeded.into());
         }
@@ -3612,6 +4218,10 @@ where
         &mut self,
         event: &MergeEvent,
     ) -> Result<SharedPhysicalApplyOutcome, SharedJournalDriverError> {
+        #[cfg(feature = "experimental-state-blocks")]
+        if self.external.is_some() {
+            return Err(SharedJournalDriverError::InvalidProfile);
+        }
         let active = self.ledger.active_committee()?;
         if event.committee != Some(active.id()) || active.member_by_node(event.author).is_none() {
             return Err(SharedJournalDriverError::WrongReplica);
@@ -3702,6 +4312,17 @@ where
     pub(crate) fn apply_next(
         &mut self,
     ) -> Result<SharedPhysicalApplyOutcome, SharedJournalDriverError> {
+        let result = self.apply_next_inner();
+        #[cfg(feature = "experimental-state-blocks")]
+        if result.is_err()
+            && let Some(external) = &self.external
+        {
+            external.availability.invalidate();
+        }
+        result
+    }
+
+    fn apply_next_inner(&mut self) -> Result<SharedPhysicalApplyOutcome, SharedJournalDriverError> {
         let Some(slot) = self.ledger.next_committed_slot()? else {
             return Ok(SharedPhysicalApplyOutcome::Idle);
         };
@@ -3842,14 +4463,45 @@ where
                                     .map_executor(|never| match never {}),
                             )
                         })?;
-                        let published = match prepare_shared_ordered(
+                        #[cfg(feature = "experimental-state-blocks")]
+                        let external_publication = self.external.is_some();
+                        #[cfg(feature = "experimental-state-blocks")]
+                        let preparation = if let Some(external) = &mut self.external {
+                            super::replay::prepare_external_shared_ordered(
+                                &mut self.store,
+                                &mut self.executor,
+                                &NoPrunedOrderedBases,
+                                &self.materialization,
+                                committed,
+                                &mut external.availability,
+                                Self::external_operation_budget(),
+                            )?
+                        } else {
+                            prepare_shared_ordered(
+                                &mut self.store,
+                                &mut self.executor,
+                                &NoPrunedOrderedBases,
+                                &self.materialization,
+                                committed,
+                            )?
+                        };
+                        #[cfg(not(feature = "experimental-state-blocks"))]
+                        let preparation = prepare_shared_ordered(
                             &mut self.store,
                             &mut self.executor,
                             &NoPrunedOrderedBases,
                             &self.materialization,
                             committed,
-                        )? {
+                        )?;
+                        let published = match preparation {
                             SharedReplayPreparation::Ready(prepared) => {
+                                #[cfg(feature = "experimental-state-blocks")]
+                                let (_, successor, _, publication) = if external_publication {
+                                    prepared.publish_external_shared()?
+                                } else {
+                                    prepared.publish_shared()?
+                                };
+                                #[cfg(not(feature = "experimental-state-blocks"))]
                                 let (_, successor, _, publication) = prepared.publish_shared()?;
                                 self.materialization = successor;
                                 publication
@@ -3880,6 +4532,10 @@ impl
         &self,
         limits: PortableJournalLimits,
     ) -> Result<PortableJournalCheckpoint, SharedJournalDriverError> {
+        #[cfg(feature = "experimental-state-blocks")]
+        if self.external.is_some() {
+            return Err(JournalStoreError::Unavailable.into());
+        }
         export_portable_journal_checkpoint(&self.store, limits).map_err(Into::into)
     }
 
@@ -3937,6 +4593,10 @@ impl
         certificate: &SharedAgentPortableSnapshotCertificate,
         verified: &VerifiedSharedAgentPortableSnapshot,
     ) -> Result<(), SharedJournalDriverError> {
+        #[cfg(feature = "experimental-state-blocks")]
+        if self.external.is_some() {
+            return Err(JournalStoreError::Unavailable.into());
+        }
         if verified.claim() != certificate.claim()
             || verified.certificate_commitment() != certificate.commitment()
             || image.commitment() != certificate.claim().journal_image()
@@ -4439,6 +5099,44 @@ fn validate_pending_binding(
 #[cfg(test)]
 mod keyed_actor_cursor_tests {
     use super::exclusive_actor_predecessor;
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn external_recovery_budget_covers_every_legal_live_suffix() {
+        use crate::agent_sdk::{state_blocks, state_change, state_tree};
+        let (fetches, bytes) = super::external_recovery_limits();
+        let mut budget = state_blocks::ReadBudget::new(fetches, bytes);
+        let scope = state_blocks::BlockScope::new(
+            crate::agent_sdk::SpaceId([1; 32]),
+            crate::agent_sdk::AgentId([2; 32]),
+            crate::agent_sdk::Hash([3; 32]),
+            crate::agent_sdk::StateLane::Linear,
+        )
+        .unwrap();
+        let (reference, _) = scope.encode_block(&[0]).unwrap();
+        // A finite exact accounting assertion, including maximum persisted
+        // emitted-block reads and worst-case repeated genesis chunks.
+        let suffix_fetches = super::super::journal::MAX_REPLAY_SUFFIX_ENTRIES as u32
+            * (super::EXTERNAL_OPERATION_FETCHES + state_change::MAX_STATE_CHANGE_BLOCKS as u32);
+        let suffix_bytes = super::super::journal::MAX_REPLAY_SUFFIX_ENTRIES as u64
+            * (super::EXTERNAL_OPERATION_BYTES + state_change::MAX_STATE_CHANGE_BYTES as u64);
+        assert!(fetches > suffix_fetches);
+        assert!(bytes > suffix_bytes);
+        assert_eq!(
+            fetches - suffix_fetches,
+            2 * state_change::MAX_STATE_CHANGE_BLOCKS as u32
+                * (1 + state_tree::MAX_TREE_VALUE_BYTES
+                    .div_ceil(state_blocks::MAX_STATE_BLOCK_BYTES) as u32)
+        );
+        assert_eq!(
+            bytes - suffix_bytes,
+            2 * (state_change::MAX_STATE_CHANGE_BYTES as u64
+                + state_change::MAX_STATE_CHANGE_BLOCKS as u64
+                    * state_tree::MAX_TREE_VALUE_BYTES as u64)
+        );
+        let _permit = budget.begin_fetch(scope, reference).unwrap();
+        assert_eq!(budget.remaining(), (fetches - 1, bytes - 1));
+    }
 
     #[test]
     fn actor_predecessor_is_exact_across_borrows_and_refuses_zero() {

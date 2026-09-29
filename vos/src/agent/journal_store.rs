@@ -1009,6 +1009,17 @@ pub trait AgentJournalStore:
         &mut self,
         publication: &ReplaySealedPublication,
     ) -> Result<JournalPublication, JournalStoreError>;
+
+    /// Shared root publication requires the same exact borrowed availability
+    /// seal as external Local mutation. Other store adapters stay fail-closed.
+    #[cfg(feature = "experimental-state-blocks")]
+    fn publish_available_shared(
+        &mut self,
+        _publication: &ReplaySealedPublication,
+        _availability: &ExternalCheckpointValidation<'_>,
+    ) -> Result<JournalPublication, JournalStoreError> {
+        Err(JournalStoreError::Unavailable)
+    }
 }
 
 /// Unforgeable authority to remove one catalog blob created while journal
@@ -8033,6 +8044,9 @@ impl MemoryAgentJournalStore {
         let created = self.genesis.is_none() || self.heads.is_none();
         let mut candidate = self.candidate_clone();
         sealed.with_staged_roots(&mut candidate, budget, |candidate, availability| {
+            if let Some(admission) = sealed.admission_record() {
+                candidate.persist_authority(admission)?;
+            }
             candidate.put(sealed.empty_frontier())?;
             candidate.put(sealed.ordered_invocations())?;
             candidate.put(sealed.merge_invocations())?;
@@ -8728,6 +8742,14 @@ impl MemoryAgentJournalStore {
 }
 
 impl AgentJournalStore for MemoryAgentJournalStore {
+    #[cfg(feature = "experimental-state-blocks")]
+    fn publish_available_shared(
+        &mut self,
+        publication: &ReplaySealedPublication,
+        availability: &ExternalCheckpointValidation<'_>,
+    ) -> Result<JournalPublication, JournalStoreError> {
+        ExternalMutationStore::publish_external_mutation(self, publication, availability)
+    }
     fn instance_id(&self) -> JournalStoreInstanceId {
         self.instance_id
     }
@@ -12178,6 +12200,9 @@ impl FileAgentJournalStore {
             }
         }
         sealed.with_staged_roots(self, budget, |store, availability| {
+            if let Some(admission) = sealed.admission_record() {
+                store.persist_authority(admission)?;
+            }
             store.persist_admission(genesis.admission.as_hash())?;
             store.persist_object(sealed.empty_frontier())?;
             store.persist_object(sealed.ordered_invocations())?;
@@ -15428,6 +15453,22 @@ impl InvocationHistoryStore for FileAgentJournalStore {
 }
 
 impl AgentJournalStore for FileAgentJournalStore {
+    #[cfg(feature = "experimental-state-blocks")]
+    fn publish_available_shared(
+        &mut self,
+        publication: &ReplaySealedPublication,
+        availability: &ExternalCheckpointValidation<'_>,
+    ) -> Result<JournalPublication, JournalStoreError> {
+        #[cfg(target_os = "linux")]
+        {
+            ExternalMutationStore::publish_external_mutation(self, publication, availability)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (publication, availability);
+            Err(JournalStoreError::Unavailable)
+        }
+    }
     fn instance_id(&self) -> JournalStoreInstanceId {
         self.instance_id
     }
