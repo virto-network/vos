@@ -475,10 +475,16 @@ impl SharedGenesisIntent {
                     || committee.profile() != AgentProfile::Shared
                     || committee.space().0 != descriptor.identity.space.0
                     || committee.agent().0 != descriptor.identity.agent.0
-                    || committee.members().len() != 1
-                    || committee.voter_count() != 1
+                    || !matches!(committee.members().len(), 1 | 3)
+                    || committee.members().len() != descriptor.replicas.len()
+                    || !committee.members().iter().all(|member| {
+                        super::bootstrap::descriptor_matches_root_replica(
+                            descriptor,
+                            member.replica(),
+                        )
+                    })
                     || committee
-                        .member_by_node(NodeId(descriptor.replicas[0].node.0))
+                        .member_by_node(provision.proposal().replica().node)
                         .map(|member| member.replica())
                         != Some(provision.proposal().replica())
                 {

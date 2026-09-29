@@ -1721,6 +1721,16 @@ where
         let Some(owner) = self.owner.as_mut() else {
             return Ok(None);
         };
+        if owner.pins.replicas.members().len() > 1
+            && !owner
+                ._network_host
+                .bootstrap_is_local_leader(crate::service::AgentId(owner.pins.agent.0))
+                .map_err(CleanSystemAgentBootstrapError::Host)?
+        {
+            return Err(CleanSystemAgentBootstrapError::Host(
+                SharedAgentHostError::Unavailable,
+            ));
+        }
         if let Err(error) = owner.advance_attached_bootstrap(&self.plan, signer) {
             // A store failure can leave an ambiguous commit. Reopen and
             // authenticate durable state instead of retrying volatile progress.
@@ -2146,6 +2156,14 @@ where
         lifecycle: Option<&super::local_lifecycle::LocalLifecycleStartupAdmission>,
         operations: Option<&NativeAuthorityOperationStartupAdmission<'_>>,
     ) -> Result<Self, CleanSystemAgentBootstrapError> {
+        validate_plan_scope(
+            plan,
+            expected_space,
+            expected_node,
+            &trust,
+            &merge,
+            &network,
+        )?;
         let mut pending = Self::attach_bootstrap_with_admission(
             pins_store,
             record_store,
@@ -2203,7 +2221,7 @@ where
         {
             return Err(rejected(CleanSystemAgentBootstrapRejection::WrongAuthority));
         }
-        let current_slot = validate_plan_scope(
+        let current_slot = validate_attachment_scope(
             plan,
             expected_space,
             expected_node,
@@ -2529,6 +2547,12 @@ where
                 authorization,
                 &plan.pins.replicas,
                 merge.as_ref(),
+            )
+        } else if plan.pins.replicas.members().len() > 1 {
+            SharedAgentNetworkHost::attach_pending_system(
+                Arc::clone(&host),
+                network,
+                crate::service::AgentId(plan.pins.agent.0),
             )
         } else {
             SharedAgentNetworkHost::attach_system(
@@ -7774,13 +7798,26 @@ fn validate_plan_scope(
     merge: &Arc<dyn LocalMergeAuthenticator>,
     network: &Arc<Network>,
 ) -> Result<u64, CleanSystemAgentBootstrapError> {
+    // Public synchronous startup is not yet a multi-node coordinator.
+    if plan.pins.replicas.members().len() != 1 {
+        return Err(rejected(CleanSystemAgentBootstrapRejection::WrongScope));
+    }
+    validate_attachment_scope(plan, expected_space, expected_node, trust, merge, network)
+}
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+fn validate_attachment_scope(
+    plan: &AuthorizedCleanSystemAgentBootstrap,
+    expected_space: SpaceId,
+    expected_node: NodeId,
+    trust: &Arc<dyn AgentTrustProvider>,
+    merge: &Arc<dyn LocalMergeAuthenticator>,
+    network: &Arc<Network>,
+) -> Result<u64, CleanSystemAgentBootstrapError> {
     let Some(current_slot) = trust.current_logical_slot() else {
         return Err(rejected(CleanSystemAgentBootstrapRejection::WrongScope));
     };
     if expected_space != plan.pins.space
-        // Multi-node plan preparation is qualified separately. Coordinated
-        // system-actor installation and startup admission are not enabled yet.
-        || plan.pins.replicas.members().len() != 1
         || expected_node != plan.pins.node
         || merge.node().0 != expected_node.0
         || network.agent_node_id() != expected_node
@@ -11175,6 +11212,10 @@ mod tests {
 
         #[test]
         fn fixed_system_bootstrap_plans_preserve_signed_origin_across_local_nodes() {
+            let _ = fixed_system_bootstrap_fixtures();
+        }
+
+        fn fixed_system_bootstrap_fixtures() -> Vec<PhysicalFixture> {
             let runtime = test_runtime_package(true);
             let receipt_key = SigningKey::from_bytes(&[RECEIPT_SEED; 32]);
             let credential_key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
@@ -11250,6 +11291,7 @@ mod tests {
             assert!(!trust.use_native_clean_runtime_for_test());
             let mut certification = None;
             let mut plans = Vec::new();
+            let mut fixtures = Vec::new();
             for (key, node) in identities {
                 let merge: Arc<dyn LocalMergeAuthenticator> = Arc::new(SigningMerge { key, node });
                 let mut certifier = |commitment: Hash,
@@ -11295,7 +11337,7 @@ mod tests {
                 if node == node_material().3 {
                     let network = network(NODE_SEED);
                     // Plan preparation is not permission to start a cluster:
-                    // Authority's bootstrap directory is still singleton-only.
+                    // Public startup still lacks multi-node coordination.
                     assert!(matches!(
                         validate_plan_scope(plan, space, NodeId(node.0), &trust, &merge, &network,),
                         Err(CleanSystemAgentBootstrapError::Rejected(
@@ -11324,6 +11366,16 @@ mod tests {
                     .is_err()
                 );
                 plans.push(plan.clone());
+                let (plan, provision, catalog) = prepared.into_parts();
+                fixtures.push(PhysicalFixture {
+                    plan,
+                    provision,
+                    catalog,
+                    trust: trust.clone(),
+                    merge,
+                    finality: Arc::new(AcceptFinality),
+                    logical_slot: None,
+                });
             }
             for plan in &plans {
                 for other in &plans {
@@ -11369,6 +11421,158 @@ mod tests {
                 )
                 .is_err()
             );
+            fixtures
+        }
+
+        #[test]
+        #[ignore = "uses three authenticated loopback transports and real Raft election"]
+        fn fixed_system_pending_attachments_survive_election_without_exposing_owners() {
+            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                let _ = tracing_subscriber::fmt()
+                    .with_env_filter(
+                        "vos::agent::clean_bootstrap=debug,vos::network=debug,vos_raft=debug",
+                    )
+                    .try_init();
+            }
+            let fixtures = fixed_system_bootstrap_fixtures();
+            let mut networks = Vec::new();
+            let mut directories = Vec::new();
+            let mut pending = Vec::new();
+            let mut signer = CountingSigner::new();
+            for (fixture, seed) in fixtures.iter().zip([NODE_SEED, 0xd2, 0xd3]) {
+                let keypair = libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap();
+                let peer = keypair.public().to_peer_id();
+                let network = Arc::new(Network::start(NetworkConfig {
+                    keypair,
+                    local_prefix: crate::network::derive_node_prefix(&peer),
+                    listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+                    bootstrap: vec![],
+                    auto_dial_mdns: false,
+                }));
+                assert!(wait_until(std::time::Duration::from_secs(5), || !network
+                    .listen_addrs()
+                    .is_empty()));
+                let directory = TestDirectory::new("fixed-system-pending-election");
+                let mut attached = CleanSystemAgentBootstrapOwner::attach_bootstrap_with_admission(
+                    BootstrapMemoryStore::default(),
+                    BootstrapMemoryStore::default(),
+                    IssuerMemoryStore::default(),
+                    &mut signer,
+                    &fixture.plan,
+                    directory.host(),
+                    directory.lock(),
+                    fixture.plan.pins.space,
+                    fixture.plan.pins.node,
+                    fixture.trust.clone(),
+                    fixture.merge.clone(),
+                    fixture.finality.clone(),
+                    Arc::new(MemoryProvider::new(fixture.provision.clone())),
+                    network.clone(),
+                    None,
+                    None,
+                )
+                .unwrap();
+                for _ in 0..3 {
+                    assert!(matches!(
+                        attached.try_complete(&mut signer),
+                        Err(CleanSystemAgentBootstrapError::Host(
+                            SharedAgentHostError::Unavailable
+                        ))
+                    ));
+                    assert!(!attached.failed);
+                    let owner = attached.owner.as_ref().unwrap();
+                    assert_eq!(
+                        owner.record.phase(),
+                        CleanSystemAgentBootstrapPhase::CreateReceiptIssued
+                    );
+                    assert_eq!(owner.issuer.sequence_high_water(), 1);
+                }
+                directories.push(directory);
+                networks.push(network);
+                pending.push(attached);
+            }
+            // Raft may already have an unsuccessful discovery dial in flight.
+            // Retry explicit loopback addresses until every authenticated peer
+            // is connected; one initial dial is not a connectivity guarantee.
+            let mut last_dial = None;
+            assert!(
+                wait_until(std::time::Duration::from_secs(15), || {
+                    if networks
+                        .iter()
+                        .all(|network| network.connected_peers().len() == 2)
+                    {
+                        return true;
+                    }
+                    if last_dial.is_none_or(|last: std::time::Instant| {
+                        last.elapsed() >= std::time::Duration::from_millis(250)
+                    }) {
+                        for (index, network) in networks.iter().enumerate() {
+                            for (other, target) in networks.iter().enumerate() {
+                                if index < other {
+                                    network.connect(target.listen_addrs()[0].clone());
+                                }
+                            }
+                        }
+                        last_dial = Some(std::time::Instant::now());
+                    }
+                    false
+                }),
+                "authenticated loopback mesh did not connect"
+            );
+            let is_leader = |attached: &PendingCleanSystemAgentBootstrap<
+                BootstrapMemoryStore,
+                BootstrapMemoryStore,
+                IssuerMemoryStore,
+            >| {
+                let owner = attached.owner.as_ref().unwrap();
+                owner
+                    ._network_host
+                    .bootstrap_is_local_leader(HostAgentId(owner.pins.agent.0))
+                    .unwrap()
+            };
+            assert!(wait_until(std::time::Duration::from_secs(15), || pending
+                .iter()
+                .filter(|attached| is_leader(attached))
+                .count()
+                == 1
+                && networks
+                    .iter()
+                    .all(|network| network.connected_peers().len() == 2)));
+            assert!(
+                networks
+                    .iter()
+                    .all(|network| network.connected_peers().len() == 2)
+            );
+            for attached in &mut pending {
+                if !is_leader(attached) {
+                    assert!(matches!(
+                        attached.try_complete(&mut signer),
+                        Err(CleanSystemAgentBootstrapError::Host(
+                            SharedAgentHostError::Unavailable
+                        ))
+                    ));
+                    assert!(!attached.failed);
+                }
+            }
+            // Election alone must not mint another receipt or install actors.
+            for attached in &pending {
+                let owner = attached.owner.as_ref().unwrap();
+                assert_eq!(owner.issuer.sequence_high_water(), 1);
+                assert!(
+                    inspect_actor(
+                        &owner.host,
+                        &attached.plan,
+                        owner.pins.authority.issuer.actor
+                    )
+                    .unwrap()
+                    .is_none()
+                );
+            }
+            drop(pending);
+            for network in networks {
+                stop_network(network);
+            }
+            drop(directories);
         }
 
         fn physical_fixture() -> PhysicalFixture {

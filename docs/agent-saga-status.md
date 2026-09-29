@@ -205,6 +205,33 @@ Logs: `target/pending-system-bootstrap-{lifetime,restarts}.log`.
 The candidate installation/file-journal reopen test still passes with the actual
 outer PVM (18.08 s), `target/pending-system-bootstrap-outer-pvm.log`; the `std`-only
 library check passes (2.91 s), `target/pending-system-bootstrap-std-check.log`.
+The internal pending path now retains three authenticated file-journal replicas
+through loopback connection and leader election. Public startup remains gated.
+System-genesis host admission checks the exact one/three-voter signed descriptor
+instead of assuming the local replica is the first singleton member. Pending
+attachment registers consensus transport before waiting for promotion; completion
+still requires a leader snapshot with the entire tail committed and drained.
+The network regression exposed a separate blocker: the Agent codec rejected the
+empty Data entry emitted by Raft leader promotion. It now transports that entry;
+the existing journal decoder classifies it as a leader no-op, not an actor command.
+Index, sender, term, frame-size and membership checks remain in force.
+All 13 protocol tests and nine no-op/journal regressions pass. The three-node
+attachment/election regression passes once plus three repeated runs (about six
+seconds each), with no extra receipt issuance, actor installation or serving-owner
+transfer. Evidence in the shared build root:
+`target/fixed-system-noop-{protocol,journal}.log` and
+`target/fixed-system-pending-election-{noop,repeat-1,repeat-2,repeat-3}.log`.
+The singleton pending-owner lifetime/store-failure regression and both
+before/after-every-phase restart regressions also pass; logs:
+`target/fixed-system-pending-{lifetime-regression,restart-regressions}.log`.
+Earlier red diagnostics are retained under `fixed-system-pending-election-*`;
+they are not qualification. Explicit loopback mesh retry separates connection
+failure from election failure. These tests use the bundled outer runtime but
+scripted Authority/Catalog packages, not the complete candidate system actors.
+Next: execute ordered bootstrap on the elected leader and authenticate follower
+catch-up/restart without duplicate policy mutations. Public orchestration, real
+three-node actor bootstrap, production-store crash recovery and backup remain
+open; this attachment test does not establish any of those gates or throughput.
 The current full Authority host suite passes: 81 passed, 2 ignored (30.76 s),
 `fixed-roster-guest.ImAzBc/mutation-host-suite.log`.
 The candidate Authority node-table header now supports exactly one or three

@@ -627,7 +627,9 @@ fn raft_entry_is_valid(entry: &RaftLogEntry) -> bool {
     }
     match &entry.kind {
         RaftLogEntryKind::Command(command) => {
-            !command.is_empty() && command.len() <= MAX_RAFT_COMMAND_BYTES
+            // Raft leader promotion emits an empty Data entry. The journal
+            // applies it as a no-op, never as an authenticated actor command.
+            command.len() <= MAX_RAFT_COMMAND_BYTES
         }
         RaftLogEntryKind::Configuration { members, joint_old } => {
             valid_members(members)
@@ -2084,6 +2086,40 @@ mod tests {
         noncanonical_wire[first_member + 32..first_member + 64].copy_from_slice(node_b.as_bytes());
         assert_eq!(
             AgentFrame::decode(&noncanonical_wire),
+            Err(AgentProtocolError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn raft_leader_noop_round_trips_without_relaxing_index_or_sender_checks() {
+        let sender = node(&peer(12));
+        let frame = |index, leader| AgentFrame {
+            route: route(),
+            sender,
+            message: AgentMessage::Raft(RaftMessage::AppendRequest {
+                term: 1,
+                leader,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![RaftLogEntry {
+                    term: 1,
+                    index,
+                    kind: RaftLogEntryKind::Command(Vec::new()),
+                }],
+                leader_commit: 0,
+            }),
+        };
+        round_trip(frame(1, sender));
+        assert_eq!(
+            frame(0, sender).encode(),
+            Err(AgentProtocolError::InvalidValue)
+        );
+        assert_eq!(
+            frame(2, sender).encode(),
+            Err(AgentProtocolError::InvalidValue)
+        );
+        assert_eq!(
+            frame(1, node(&peer(13))).encode(),
             Err(AgentProtocolError::InvalidValue)
         );
     }

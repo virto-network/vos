@@ -2551,6 +2551,28 @@ impl SharedAgentNetworkHost {
         Self::attach_internal(host, network, None, None, None, None)
     }
 
+    /// Retain consensus transport while a fixed-roster system bootstrap waits
+    /// for election. No serving owner exists at this stage. Ordinary recovered
+    /// generations must continue through their admission-aware attachment path.
+    pub(crate) fn attach_pending_system(
+        host: Arc<Mutex<SharedAgentHost>>,
+        network: Arc<Network>,
+        agent: crate::service::AgentId,
+    ) -> Result<Self, SharedAgentHostError> {
+        let statuses = host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .list()?;
+        if statuses.len() != 1 || statuses[0].generation.agent() != agent {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        // The synchronous promotion barrier cannot run until peers can reach
+        // our registered route. Pending completion checks it after attachment.
+        let mut attachment = Self::attach_internal(host, network, None, None, None, None)?;
+        attachment.system_agents.insert(agent);
+        Ok(attachment)
+    }
+
     /// Attach the one-voter clean system Agent. With no durable pending
     /// projection, checkpoint before a mandatory leader no-op could combine
     /// with one retained uncommitted physical row and overrun the evidence
@@ -4935,6 +4957,49 @@ impl SharedAgentNetworkHost {
                 None,
                 InvocationClock::Bootstrap,
             )
+    }
+
+    /// Observe startup readiness without waiting for election. This does wait
+    /// for the worker snapshot and committed-state drain, but grants no command
+    /// publication permission on its own.
+    /// Submission still rechecks leadership and all ordinary admission guards.
+    pub(crate) fn bootstrap_is_local_leader(
+        &self,
+        agent: crate::service::AgentId,
+    ) -> Result<bool, SharedAgentHostError> {
+        let attached = self
+            .generations
+            .get(&agent)
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        if attached.stale.load(Ordering::Acquire) {
+            return Err(SharedAgentHostError::TransportNotAttached);
+        }
+        let worker = attached
+            .coordinator
+            .worker
+            .as_ref()
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        #[cfg(test)]
+        tracing::debug!(snapshot = ?worker.cached_snapshot(), "pending system bootstrap election observation");
+        if worker.role() != vos_raft::Role::Leader {
+            return Ok(false);
+        }
+        let snapshot = futures_executor::block_on(worker.snapshot())
+            .ok_or(SharedAgentHostError::Unavailable)?;
+        if snapshot.role != vos_raft::Role::Leader
+            || snapshot.commit_index != snapshot.last_log_index
+        {
+            return Ok(false);
+        }
+        let mut host = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        drain_committed(&mut host, agent, &attached.coordinator.ordered_replies)?;
+        if host.capacity(agent)?.0 != snapshot.commit_index {
+            return Err(SharedAgentHostError::CorruptResidue);
+        }
+        Ok(true)
     }
 
     /// Submit an exact clean management request, including any deterministic
