@@ -65,6 +65,7 @@ const TAG_INVOKE_REPLY: u8 = 0x11;
 const TAG_INVOKE_REDIRECT: u8 = 0x12;
 const TAG_PROJECTION_REQUEST: u8 = 0x13;
 const TAG_PROJECTION_ACCEPTED: u8 = 0x14;
+const TAG_PROJECTION_RECOVERY_REQUEST: u8 = 0x15;
 const TAG_RAFT_APPEND_REQUEST: u8 = 0x20;
 const TAG_RAFT_APPEND_REPLY: u8 = 0x21;
 const TAG_RAFT_VOTE_REQUEST: u8 = 0x22;
@@ -371,6 +372,9 @@ pub(crate) enum AgentMessage {
     InvokeRedirect(InvocationRedirect),
     /// Queue admission only. No peer-supplied projection result is trusted.
     ProjectionRequest(AuthorityProjectionQuery),
+    /// Relay only for an already committed Invoke. The receiving owner must
+    /// prove that exact local evidence before admitting recovery.
+    ProjectionRecoveryRequest(AuthorityProjectionQuery),
     ProjectionAccepted {
         request: Hash,
         accepted: bool,
@@ -534,11 +538,12 @@ fn decode_route(decoder: &mut Decoder<'_>) -> Result<AgentGenerationRoute, Agent
 
 fn message_is_valid(message: &AgentMessage, route: AgentGenerationRoute, sender: NodeId) -> bool {
     match message {
-        AgentMessage::ProjectionRequest(query) => {
+        AgentMessage::ProjectionRequest(query) | AgentMessage::ProjectionRecoveryRequest(query) => {
             query.validate_shape().is_ok()
                 && query.authority.space == route.space
                 && query.authority.system_agent == route.agent
-                && query.attesting_node().is_none_or(|node| node == sender)
+                && (matches!(message, AgentMessage::ProjectionRecoveryRequest(_))
+                    || query.attesting_node().is_none_or(|node| node == sender))
         }
         AgentMessage::ProjectionAccepted { request, .. } => *request != Hash::ZERO,
         AgentMessage::InvokeRequest(request) => {
@@ -709,6 +714,10 @@ fn encode_message(
     match message {
         AgentMessage::ProjectionRequest(query) => {
             encoder.u8(TAG_PROJECTION_REQUEST);
+            encoder.bytes(&query.encode()?);
+        }
+        AgentMessage::ProjectionRecoveryRequest(query) => {
+            encoder.u8(TAG_PROJECTION_RECOVERY_REQUEST);
             encoder.bytes(&query.encode()?);
         }
         AgentMessage::ProjectionAccepted { request, accepted } => {
@@ -965,6 +974,11 @@ fn decode_message(decoder: &mut Decoder<'_>) -> Result<AgentMessage, AgentProtoc
     let tag = decoder.u8()?;
     match tag {
         TAG_PROJECTION_REQUEST => Ok(AgentMessage::ProjectionRequest(
+            AuthorityProjectionQuery::decode(decoder.bytes_ref_bounded(
+                vos_agent_sdk::wire::MAX_AUTHORITY_PROJECTION_QUERY_WIRE_BYTES,
+            )?)?,
+        )),
+        TAG_PROJECTION_RECOVERY_REQUEST => Ok(AgentMessage::ProjectionRecoveryRequest(
             AuthorityProjectionQuery::decode(decoder.bytes_ref_bounded(
                 vos_agent_sdk::wire::MAX_AUTHORITY_PROJECTION_QUERY_WIRE_BYTES,
             )?)?,
@@ -1473,6 +1487,17 @@ mod tests {
         assert!(wrong.encode().is_err());
         wrong = frame.clone();
         wrong.sender = NodeId([94; 32]);
+        assert!(wrong.encode().is_err());
+        // Only the recovery-only message can relay another node's signed
+        // query. The receiving owner must additionally prove local Invoke
+        // evidence; this codec check is not execution authorization.
+        wrong.message = AgentMessage::ProjectionRecoveryRequest(query.clone());
+        let recovery_bytes = wrong.encode().unwrap();
+        assert_eq!(AgentFrame::decode(&recovery_bytes).unwrap(), wrong);
+        for end in 0..recovery_bytes.len() {
+            assert!(AgentFrame::decode(&recovery_bytes[..end]).is_err());
+        }
+        wrong.route.agent = AgentId([93; 32]);
         assert!(wrong.encode().is_err());
         for accepted in [false, true] {
             let reply = AgentFrame {

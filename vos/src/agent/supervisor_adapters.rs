@@ -2262,6 +2262,7 @@ trait CleanAgentRouteBackend: Send + 'static {
     fn peer_authority_projection(
         &mut self,
         _query: AuthorityProjectionQuery,
+        _recovering: bool,
     ) -> Result<(), AgentRouteError> {
         Err(AgentRouteError::Rejected)
     }
@@ -2311,7 +2312,7 @@ enum RouteHostCommand {
     #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
     RecoverAuthorityProjection(SyncSender<Result<bool, AgentRouteError>>),
     #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
-    PeerAuthorityProjection(AuthorityProjectionQuery),
+    PeerAuthorityProjection(AuthorityProjectionQuery, bool),
     Retire(SyncSender<Result<(), AgentRouteWorkerError>>),
 }
 
@@ -2873,8 +2874,9 @@ impl AgentRouteHostHandle {
     fn enqueue_peer_projection(
         &self,
         query: AuthorityProjectionQuery,
+        recovering: bool,
     ) -> Result<(), AgentRouteError> {
-        self.send(RouteHostCommand::PeerAuthorityProjection(query))
+        self.send(RouteHostCommand::PeerAuthorityProjection(query, recovering))
     }
 
     fn send(&self, command: RouteHostCommand) -> Result<(), AgentRouteError> {
@@ -3245,8 +3247,8 @@ fn execute_route_host_command(
             let _ = reply.send(backend.recover_authority_projection());
         }
         #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
-        RouteHostCommand::PeerAuthorityProjection(query) => {
-            let _ = backend.peer_authority_projection(query);
+        RouteHostCommand::PeerAuthorityProjection(query, recovering) => {
+            let _ = backend.peer_authority_projection(query, recovering);
         }
         RouteHostCommand::Retire(reply) => {
             let retired = backend.retire();
@@ -4523,11 +4525,12 @@ where
     fn peer_authority_projection(
         &mut self,
         query: AuthorityProjectionQuery,
+        recovering: bool,
     ) -> Result<(), AgentRouteError> {
         self.owner
             .lock()
             .map_err(|_| AgentRouteError::Unavailable)?
-            .invoke_peer_authority_projection(query)
+            .invoke_peer_authority_projection(query, recovering)
             .map(|_| ())
             .map_err(map_authority_read_error)
     }
@@ -4577,8 +4580,8 @@ where
     owner
         .lock()
         .map_err(|_| AgentRouteAdapterError::Route(AgentRouteError::Unavailable))?
-        .install_projection_dispatch(Arc::new(move |query| {
-            handle.enqueue_peer_projection(query).is_ok()
+        .install_projection_dispatch(Arc::new(move |query, recovering| {
+            handle.enqueue_peer_projection(query, recovering).is_ok()
         }))
         .map_err(|error| AgentRouteAdapterError::Route(map_shared_host_error(error)))?;
     Ok(attachment)
@@ -7389,9 +7392,9 @@ mod tests {
             .unwrap();
         // Acceptance means admission only: the worker is blocked and the
         // default backend will reject these queries when it drains them.
-        let first = handle.enqueue_peer_projection(query.clone());
-        let second = handle.enqueue_peer_projection(query.clone());
-        let full = handle.enqueue_peer_projection(query.clone());
+        let first = handle.enqueue_peer_projection(query.clone(), false);
+        let second = handle.enqueue_peer_projection(query.clone(), true);
+        let full = handle.enqueue_peer_projection(query.clone(), true);
         release.send(()).unwrap();
         operation.join().unwrap().unwrap();
         attachment.retire().unwrap();
@@ -7401,7 +7404,7 @@ mod tests {
         assert!(retired.load(Ordering::Acquire));
         assert!(lifetime.upgrade().is_none());
         assert_eq!(
-            handle.enqueue_peer_projection(query),
+            handle.enqueue_peer_projection(query, true),
             Err(AgentRouteError::Unavailable)
         );
     }

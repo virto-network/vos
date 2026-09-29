@@ -7612,6 +7612,40 @@ where
             &self.pins.replicas,
             self.snapshot_signer.as_ref(),
         )?;
+        let agent = crate::service::AgentId(self.pins.agent.0);
+        if self.pins.replicas.members().len() > 1
+            && !self._network_host.bootstrap_is_local_leader(agent)?
+        {
+            if self
+                ._network_host
+                .projection_acknowledged(agent, &work, &authorization)?
+            {
+                self.complete_pending_authority_projection(&work, &authorization)?;
+                return Ok(true);
+            }
+            let AuthorityReadRequest::Projection(query) = pending.query else {
+                return Err(SharedAgentHostError::Unavailable);
+            };
+            // Retain the former leader's exact reservation while the current
+            // leader completes only work already proven in its own journal.
+            if !self._network_host.forward_projection(agent, query, true)? {
+                return Err(SharedAgentHostError::Unavailable);
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if self
+                    ._network_host
+                    .projection_acknowledged(agent, &work, &authorization)?
+                {
+                    self.complete_pending_authority_projection(&work, &authorization)?;
+                    return Ok(true);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(SharedAgentHostError::Unavailable);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
         self.execute_pending_authority_projection().map(|_| true)
     }
 
@@ -7639,10 +7673,11 @@ where
         if let Some(bytes) = self.committed_projection_response(work)? {
             return Ok(bytes);
         }
-        if !self
-            ._network_host
-            .forward_projection(crate::service::AgentId(self.pins.agent.0), query)?
-        {
+        if !self._network_host.forward_projection(
+            crate::service::AgentId(self.pins.agent.0),
+            query,
+            false,
+        )? {
             return Err(SharedAgentHostError::Unavailable);
         }
         // The peer's queue acknowledgement is not result evidence. Wait only
@@ -7661,7 +7696,7 @@ where
 
     pub(crate) fn install_projection_dispatch(
         &mut self,
-        dispatch: Arc<dyn Fn(AuthorityProjectionQuery) -> bool + Send + Sync>,
+        dispatch: Arc<dyn Fn(AuthorityProjectionQuery, bool) -> bool + Send + Sync>,
     ) -> Result<(), SharedAgentHostError> {
         self._network_host.install_projection_dispatch(dispatch)
     }
@@ -7669,6 +7704,7 @@ where
     pub(crate) fn invoke_peer_authority_projection(
         &mut self,
         query: AuthorityProjectionQuery,
+        recovering: bool,
     ) -> Result<Vec<u8>, SharedAgentHostError> {
         if !self
             ._network_host
@@ -7676,13 +7712,29 @@ where
         {
             return Err(SharedAgentHostError::Unavailable);
         }
+        if recovering {
+            let mut pending = self.prepare_authority_projection(query.clone())?;
+            let (work, _) = pending
+                .invocation()
+                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            if let Some(bytes) = self.committed_projection_response(work)? {
+                return Ok(bytes);
+            }
+            // Recovery relays may originate from a different node than the
+            // signed query. They cannot create work: require the exact Invoke
+            // and its original authorization in our own applied journal first.
+            if !self.restore_committed_projection_authorization(&mut pending)? {
+                return Err(SharedAgentHostError::Unavailable);
+            }
+        }
         self.recover_pending_authority_projection()?;
-        self.invoke_local_authority_projection(query)
+        self.invoke_local_authority_projection(query, recovering)
     }
 
     fn invoke_local_authority_projection(
         &mut self,
         query: AuthorityProjectionQuery,
+        require_committed: bool,
     ) -> Result<Vec<u8>, SharedAgentHostError> {
         let pending = self.prepare_authority_projection(query.clone())?;
         let (work, _) = pending
@@ -7691,7 +7743,7 @@ where
         if let Some(bytes) = self.committed_projection_response(work)? {
             return Ok(bytes);
         }
-        self.invoke_authority_read(AuthorityReadRequest::Projection(query))
+        self.invoke_authority_read_inner(AuthorityReadRequest::Projection(query), require_committed)
     }
 
     fn committed_projection_response(
@@ -7770,6 +7822,14 @@ where
         &mut self,
         query: AuthorityReadRequest,
     ) -> Result<Vec<u8>, SharedAgentHostError> {
+        self.invoke_authority_read_inner(query, false)
+    }
+
+    fn invoke_authority_read_inner(
+        &mut self,
+        query: AuthorityReadRequest,
+        require_committed: bool,
+    ) -> Result<Vec<u8>, SharedAgentHostError> {
         let started = std::time::Instant::now();
         if !query.is_valid() || query.authority() != self.authority_target() {
             return Err(SharedAgentHostError::ScopeMismatch);
@@ -7800,6 +7860,9 @@ where
         // former leader's local pending record. Recover only the authorization
         // of that exact locally applied Query; never mint a new clock for it.
         let recovering = self.restore_committed_projection_authorization(&mut pending)?;
+        if require_committed && !recovering {
+            return Err(SharedAgentHostError::Unavailable);
+        }
         tracing::debug!(
             elapsed_ms = started.elapsed().as_millis() as u64,
             phase = "prepare",
@@ -12240,16 +12303,22 @@ mod tests {
         #[test]
         #[ignore = "uses three authenticated loopback transports and real Raft election"]
         fn fixed_system_pending_attachments_survive_election_without_exposing_owners() {
-            check_fixed_system_pending_cluster(false);
+            check_fixed_system_pending_cluster(false, false);
         }
 
         #[test]
         #[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
         fn candidate_authority_fixed_system_leader_bootstrap_replicates_to_followers() {
-            check_fixed_system_pending_cluster(true);
+            check_fixed_system_pending_cluster(true, false);
         }
 
-        fn check_fixed_system_pending_cluster(complete_leader: bool) {
+        #[test]
+        #[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
+        fn candidate_projection_recovers_after_leader_loss_and_former_leader_reopen() {
+            check_fixed_system_pending_cluster(true, true);
+        }
+
+        fn check_fixed_system_pending_cluster(complete_leader: bool, projection_failover: bool) {
             if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
                 let _ = tracing_subscriber::fmt()
                     .with_env_filter(
@@ -12477,6 +12546,194 @@ mod tests {
                         .clean_state_commitment(agent)
                         .unwrap()
                         == expected));
+                }
+                if projection_failover {
+                    let mut owners: Vec<Option<MemoryBootstrapOwner>> =
+                        (0..3).map(|_| None).collect();
+                    owners[leader] = Some(completed);
+                    for (index, attached) in pending.iter_mut().enumerate() {
+                        if index != leader {
+                            owners[index] =
+                                Some(attached.try_complete(&mut signer).unwrap().unwrap());
+                        }
+                    }
+                    let attestor = (leader + 1) % 3;
+                    let node_key = SigningKey::from_bytes(&[[NODE_SEED, 0xd2, 0xd3][attestor]; 32]);
+                    let credential_public_key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32])
+                        .verifying_key()
+                        .to_bytes();
+                    let owner = owners[leader].as_mut().unwrap();
+                    let mut query = AuthorityProjectionQuery {
+                        authority: owner.authority_target(),
+                        credential: CredentialId::of_public_key(&credential_public_key),
+                        nonce: Hash([0xe7; 32]),
+                        selector: AuthorityProjectionSelector::Credential,
+                        authentication: AuthorityIngressAuthentication::SshNodeAttestation {
+                            credential_public_key,
+                            node: fixtures[attestor].plan.pins.node,
+                            request_binding: Hash([0xe8; 32]),
+                            signature: [1; 64],
+                        },
+                    };
+                    let signature = node_key.sign(&query.signing_bytes()).to_bytes();
+                    let AuthorityIngressAuthentication::SshNodeAttestation {
+                        signature: slot, ..
+                    } = &mut query.authentication
+                    else {
+                        unreachable!()
+                    };
+                    *slot = signature;
+                    // Recovery-only admission must not create even validly
+                    // signed work that is absent from the local journal.
+                    let before = owner.ordered_index_for_test().unwrap();
+                    assert_eq!(
+                        owner.invoke_peer_authority_projection(query.clone(), true),
+                        Err(SharedAgentHostError::Unavailable)
+                    );
+                    assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+                    assert!(owner.record.pending_projection.is_none());
+                    let retained = owner.prepare_authority_projection(query.clone()).unwrap();
+                    let (work, authorization) = retained.invocation().unwrap();
+                    let work = work.clone();
+                    let authorization = authorization.clone();
+                    owner
+                        ._network_host
+                        .reserve_projection_pair(agent, &work, &authorization, false)
+                        .unwrap();
+                    owner.record.pending_projection = Some(retained.clone());
+                    commit_bootstrap_record(&mut owner.record_store, &owner.record).unwrap();
+                    let identity = owner
+                        .pending_authority_projection_identity(&retained, true)
+                        .unwrap();
+                    let outcome = owner
+                        .supervisor_invoke_terminal_reserved(
+                            identity,
+                            work.clone(),
+                            authorization.clone(),
+                        )
+                        .unwrap();
+                    assert!(matches!(outcome, RuntimeOutcome::Completed(Ok(_))));
+                    for other in owners.iter().flatten() {
+                        assert!(wait_until(std::time::Duration::from_secs(30), || other
+                            .host
+                            .lock()
+                            .unwrap()
+                            .retained_terminal_projection_invoke(agent, &work, &authorization)
+                            .unwrap()));
+                    }
+                    // Lose the leader between Invoke and ACK. Two surviving
+                    // voters must elect a successor without its local record.
+                    drop(owners[leader].take());
+                    assert!(wait_until(std::time::Duration::from_secs(15), || owners
+                        .iter()
+                        .flatten()
+                        .any(|owner| owner
+                            ._network_host
+                            .bootstrap_is_local_leader(agent)
+                            .unwrap_or(false))));
+                    let mut serving = Vec::new();
+                    let mut attachments = Vec::new();
+                    for owner in owners.into_iter().flatten() {
+                        assert!(owner.record.pending_projection.is_none());
+                        let owner = Arc::new(Mutex::new(owner));
+                        attachments.push(crate::agent::supervisor_adapters::system_agent_supervisor_attachment_shared(
+                            owner.clone(), 8).unwrap());
+                        serving.push(owner);
+                    }
+                    let fixture = &fixtures[leader];
+                    let stores = &bootstrap_stores[leader];
+                    let mut reopening =
+                        PendingCleanSystemAgentBootstrap::open_with_operation_admission(
+                            stores.0.clone(),
+                            stores.1.clone(),
+                            stores.2.clone(),
+                            &mut signer,
+                            || panic!("reopen must use durable plan"),
+                            directories[leader].host(),
+                            directories[leader].lock(),
+                            fixture.plan.pins.space,
+                            fixture.plan.pins.node,
+                            fixture.trust.clone(),
+                            fixture.merge.clone(),
+                            fixture.finality.clone(),
+                            genesis_providers[leader].clone(),
+                            networks[leader].clone(),
+                            None,
+                            None,
+                        )
+                        .unwrap();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                    let mut reopened = loop {
+                        match reopening.try_complete(&mut signer) {
+                            Ok(Some(owner)) => break owner,
+                            Err(CleanSystemAgentBootstrapError::Host(
+                                SharedAgentHostError::Unavailable,
+                            )) if std::time::Instant::now() < deadline => {
+                                std::thread::sleep(std::time::Duration::from_millis(50))
+                            }
+                            other => panic!(
+                                "former leader projection recovery failed: {:?}",
+                                other.err()
+                            ),
+                        }
+                    };
+                    // Bootstrap returns the retained owner; production route
+                    // reconciliation explicitly drains its pending read before
+                    // fetching inventory or exposing routes.
+                    assert!(reopened.record.pending_projection.is_some());
+                    assert!(
+                        !reopened
+                            ._network_host
+                            .bootstrap_is_local_leader(agent)
+                            .unwrap()
+                    );
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                    loop {
+                        match reopened.recover_pending_authority_projection() {
+                            Ok(true) => break,
+                            Err(SharedAgentHostError::Unavailable)
+                                if std::time::Instant::now() < deadline =>
+                            {
+                                std::thread::sleep(std::time::Duration::from_millis(50))
+                            }
+                            other => panic!("former leader pending read did not retire: {other:?}"),
+                        }
+                    }
+                    assert!(reopened.record.pending_projection.is_none());
+                    assert!(
+                        reopened
+                            .host
+                            .lock()
+                            .unwrap()
+                            .retained_positive_clean_acknowledgement(agent, &work, &authorization)
+                            .unwrap()
+                    );
+                    assert_eq!(
+                        reopened._network_host.complete_projection_pair(
+                            agent,
+                            &work,
+                            &authorization,
+                            || Ok(())
+                        ),
+                        Err(SharedAgentHostError::Conflict),
+                        "completed recovery must release its exact reservation",
+                    );
+                    for owner in &serving {
+                        assert!(wait_until(std::time::Duration::from_secs(30), || owner
+                            .lock()
+                            .unwrap()
+                            .host
+                            .lock()
+                            .unwrap()
+                            .retained_positive_clean_acknowledgement(agent, &work, &authorization)
+                            .unwrap()));
+                    }
+                    for attachment in attachments {
+                        attachment.retire().unwrap();
+                    }
+                    drop(serving);
+                    drop(reopened);
+                    return;
                 }
                 // The surviving replicas have applied bootstrap but neither
                 // has advanced its own metadata. The new leader must recover

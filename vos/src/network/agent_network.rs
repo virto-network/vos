@@ -846,6 +846,7 @@ impl Network {
         target: NodeId,
         route: AgentGenerationRoute,
         query: vos_agent_sdk::authority::AuthorityProjectionQuery,
+        recovering: bool,
     ) -> std_mpsc::Receiver<Result<bool, AgentNetworkError>> {
         let (reply, receiver) = std_mpsc::channel();
         let request = query.commitment();
@@ -856,7 +857,12 @@ impl Network {
                 return receiver;
             }
         };
-        match self.prepare_agent_request(target, route, AgentMessage::ProjectionRequest(query)) {
+        let message = if recovering {
+            AgentMessage::ProjectionRecoveryRequest(query)
+        } else {
+            AgentMessage::ProjectionRequest(query)
+        };
+        match self.prepare_agent_request(target, route, message) {
             Ok((peer, frame)) => self.queue_agent_request(AgentOutboundRequest {
                 peer,
                 frame,
@@ -1168,6 +1174,7 @@ fn is_request(message: &AgentMessage) -> bool {
         message,
         AgentMessage::InvokeRequest(_)
             | AgentMessage::ProjectionRequest(_)
+            | AgentMessage::ProjectionRecoveryRequest(_)
             | AgentMessage::Raft(RaftMessage::AppendRequest { .. })
             | AgentMessage::Raft(RaftMessage::VoteRequest { .. })
             | AgentMessage::Raft(RaftMessage::InstallSnapshotRequest { .. })
@@ -1181,7 +1188,7 @@ fn is_request(message: &AgentMessage) -> bool {
 fn response_matches_request(request: &AgentMessage, response: &AgentMessage) -> bool {
     match (request, response) {
         (
-            AgentMessage::ProjectionRequest(query),
+            AgentMessage::ProjectionRequest(query) | AgentMessage::ProjectionRecoveryRequest(query),
             AgentMessage::ProjectionAccepted { request, .. },
         ) => query.commitment() == *request,
         (AgentMessage::InvokeRequest(request), AgentMessage::InvokeReply(response)) => {

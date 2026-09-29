@@ -2293,8 +2293,10 @@ impl AgentRouteHandler for SharedRouteHandler {
         if frame.route != self.route {
             return Err(AgentHandlerError);
         }
+        let recovering = matches!(&frame.message, AgentMessage::ProjectionRecoveryRequest(_));
         match frame.message {
-            AgentMessage::ProjectionRequest(query) => {
+            AgentMessage::ProjectionRequest(query)
+            | AgentMessage::ProjectionRecoveryRequest(query) => {
                 let request = query.commitment();
                 let accepted = self
                     .worker
@@ -2305,7 +2307,7 @@ impl AgentRouteHandler for SharedRouteHandler {
                         .lock()
                         .map_err(|_| AgentHandlerError)?
                         .as_ref()
-                        .is_some_and(|dispatch| dispatch(query));
+                        .is_some_and(|dispatch| dispatch(query, recovering));
                 Ok(AgentMessage::ProjectionAccepted { request, accepted })
             }
             AgentMessage::InvokeRequest(request) => self.handle_invocation(sender, request),
@@ -2523,7 +2525,7 @@ pub struct SharedAgentNetworkHost {
 }
 
 pub(crate) type ProjectionDispatch =
-    Arc<dyn Fn(crate::agent_sdk::authority::AuthorityProjectionQuery) -> bool + Send + Sync>;
+    Arc<dyn Fn(crate::agent_sdk::authority::AuthorityProjectionQuery, bool) -> bool + Send + Sync>;
 
 /// Reserves the host's storage boundary before any worker database handle,
 /// route, or background thread is created. Failed setup releases the
@@ -2589,6 +2591,7 @@ impl SharedAgentNetworkHost {
         &self,
         agent: crate::service::AgentId,
         query: crate::agent_sdk::authority::AuthorityProjectionQuery,
+        recovering: bool,
     ) -> Result<bool, SharedAgentHostError> {
         let attached = self
             .generations
@@ -2615,7 +2618,12 @@ impl SharedAgentNetworkHost {
             })
             .ok_or(SharedAgentHostError::Unavailable)?;
         self.network
-            .send_agent_projection(leader, attached.fingerprint.protocol_route, query)
+            .send_agent_projection(
+                leader,
+                attached.fingerprint.protocol_route,
+                query,
+                recovering,
+            )
             .recv_timeout(ORDERED_REPLY_WAIT)
             .map_err(|_| SharedAgentHostError::Unavailable)?
             .map_err(|_| SharedAgentHostError::Unavailable)
@@ -2643,6 +2651,31 @@ impl SharedAgentNetworkHost {
             .map_err(|_| SharedAgentHostError::Unavailable)?;
         drain_committed(&mut host, agent, &attached.coordinator.ordered_replies)?;
         host.retained_acknowledged_projection(agent, work)
+    }
+
+    pub(crate) fn projection_acknowledged(
+        &self,
+        agent: crate::service::AgentId,
+        work: &InvocationWork,
+        authorization: &InvocationAuthorization,
+    ) -> Result<bool, SharedAgentHostError> {
+        let attached = self
+            .generations
+            .get(&agent)
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        let live = attached
+            .lifecycle
+            .read()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if !*live || attached.stale.load(Ordering::Acquire) {
+            return Err(SharedAgentHostError::TransportNotAttached);
+        }
+        let mut host = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        drain_committed(&mut host, agent, &attached.coordinator.ordered_replies)?;
+        host.retained_positive_clean_acknowledgement(agent, work, authorization)
     }
     pub fn attach(
         host: Arc<Mutex<SharedAgentHost>>,

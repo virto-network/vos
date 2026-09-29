@@ -97,16 +97,47 @@ The real three-owner all-nodes-ready startup/reopen regression also passes
 (71.07 s), `fixed-system-projection-original-authorization-routes.log`; its
 single-process/candidate-artifact limitations still apply.
 
-A former leader's durable reservation still needs end-to-end retirement against
-exact committed evidence, including relay of a query originally attested by a
-different node without weakening ingress identity checks. Forced election,
-incomplete Invoke/ACK and restart must be tested together. Do not backdate
+Recovery relay now has a distinct peer message: unlike fresh admission, it can
+carry a query attested by another node, but the receiving leader must prove the
+exact already-committed terminal Invoke from its own journal before execution.
+Unknown work is refused without a journal append. The former leader retains its
+exact reservation while waiting for a locally applied positive ACK under the
+original authorization, then durably clears the pending record before release.
+Fresh query sender/attestor binding is unchanged.
+
+The new candidate test loses the leader between Invoke and ACK, elects a
+successor, reopens the former leader as a follower, and explicitly runs pending
+read recovery before any inventory publication. It passes (67.62 s), including
+a different attesting node and exact reservation release:
+`fixed-system-projection-recovery-leader-loss-final.log`. Its first run asserted
+cleanup at the bootstrap-return boundary, before the separate production
+reconciliation recovery step; that harness failure is retained in
+`fixed-system-projection-recovery-leader-loss.log`. This uses three real Raft
+transports and filesystem journals, candidate Authority and physical runtime,
+but retained-memory bootstrap/issuer stores and a scripted bootstrap Catalog.
+It is not a three-daemon crash or released HTTP qualification.
+Peer protocol/network tests (26, 3.67 s), route-adapter tests (33, 0.10 s),
+singleton pending-read recovery (6.73 s), `std` library check (4.09 s), formatting
+and diff checks pass; logs use `fixed-system-projection-recovery-relay-*`.
+
+Still open: leader loss **before** Invoke commits (recovery relay deliberately
+cannot manufacture that missing evidence), the full failure matrix around ACK
+and metadata clear, and three-daemon restart/HTTP qualification. Do not backdate
 authorization from peer input or bypass fresh Authority and reservation guards.
 Quorum snapshot certificate collection
 also remains required before sustained three-node operation reaches its replay
 limit. Keep production startup and public Shared management gated until these
 paths and real daemon/HTTP startup/restart are qualified. These are existing
 fixed-three-node release gates, not new scope; CLI polish and load claims wait.
+
+Catch-up boundary: freeze this implementation batch for review before starting
+another workstream. Relative to the `f1bfa1bd` reviewer checkpoint, its three
+review areas are (1) common certified genesis, signed fixed roster and scoped
+immutable import; (2) replicated bootstrap/follower replay through real file
+owners; (3) route readiness and leader-coordinated projection/recovery. These
+are prerequisites for the agreed three-node release, not completion of public
+Shared management, Shared Clerk, load, backup or reproducible release bundles.
+The reviewer branch remains unchanged until the next checkpoint is selected.
 
 ### Fixed three-node bootstrap integration
 
