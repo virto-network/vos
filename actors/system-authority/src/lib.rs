@@ -304,6 +304,38 @@ impl Default for SystemAuthorityConfiguration {
 }
 
 impl SystemAuthorityConfiguration {
+    /// Bind installation data to the descriptor certified for system genesis.
+    /// The transport-authenticated replica principals are not the founding owner.
+    pub fn matches_system_descriptor(&self, descriptor: &vos::agent_sdk::AgentDescriptor) -> bool {
+        self.is_valid()
+            && descriptor.validate().is_ok()
+            && descriptor.identity.space.0 == self.space
+            && descriptor.identity.agent.0 == self.system_agent
+            && descriptor.identity.owner.0 == self.bootstrap_principal
+            && descriptor.identity.profile == AgentProfile::Shared
+            && descriptor.identity.runtime_deployment.0 == self.system_runtime_deployment
+            && descriptor.identity.runtime_program.0 == self.system_runtime_program
+            && descriptor.identity.runtime_producer.0 == self.system_runtime_producer
+            && descriptor.identity.transition_producer.0 == self.system_transition_producer
+            && descriptor.authority == self.binding.sdk()
+            && descriptor.creation_nonce.0 == self.bootstrap_system_agent_creation_nonce
+            && descriptor.runtime_package.hash.0 == self.system_runtime_package.hash
+            && descriptor.runtime_package.len == self.system_runtime_package.len
+            && descriptor.runtime_contract == RuntimePackageContract::canonical()
+            && descriptor.capabilities == RuntimeCapabilities::standard()
+            && descriptor.private_recovery.is_none()
+            && descriptor.replicas
+                == self
+                    .bootstrap_enrollments()
+                    .iter()
+                    .map(|node| AgentReplica {
+                        node: node.node,
+                        principal: PrincipalId::of_public_key(&node.transport_public_key),
+                        role: ReplicaRole::Voter,
+                    })
+                    .collect::<Vec<_>>()
+    }
+
     fn founding_replica_principal(&self, node: [u8; 32]) -> Option<[u8; 32]> {
         if node == self.bootstrap_node {
             return Some(self.bootstrap_replica_principal);
@@ -10636,6 +10668,33 @@ mod tests {
         assert!(authority_state_is_valid(&config, &actor.state));
         assert_eq!(actor.state.managed_agents[0].replicas.len(), 3);
         assert_eq!(actor.state.nodes.len(), 3);
+        let mut descriptor = descriptor(config, ADMIN_PRINCIPAL, AgentProfile::Shared, 0x12);
+        descriptor.identity.runtime_deployment = DeploymentId(config.system_runtime_deployment);
+        descriptor.identity.runtime_program = ProgramId(config.system_runtime_program);
+        descriptor.identity.runtime_producer = ProducerId(config.system_runtime_producer);
+        descriptor.identity.transition_producer = ProducerId(config.system_transition_producer);
+        descriptor.runtime_package = BlobRef {
+            hash: Hash(config.system_runtime_package.hash),
+            len: config.system_runtime_package.len,
+        };
+        descriptor.replicas = actor.state.managed_agents[0]
+            .replicas
+            .iter()
+            .map(|row| row.sdk().unwrap())
+            .collect();
+        assert!(config.matches_system_descriptor(&descriptor));
+        let mut different = descriptor.clone();
+        different.replicas.pop();
+        assert!(!config.matches_system_descriptor(&different));
+        different = descriptor.clone();
+        different.replicas[1].principal = PrincipalId([0xee; 32]);
+        assert!(!config.matches_system_descriptor(&different));
+        different = descriptor.clone();
+        different.runtime_package.hash = Hash([0xee; 32]);
+        assert!(!config.matches_system_descriptor(&different));
+        different = descriptor;
+        different.authority.policy = Hash([0xee; 32]);
+        assert!(!config.matches_system_descriptor(&different));
         for index in 0..3 {
             let mut changed = actor.state.managed_agents[0].clone();
             changed.replicas[index].principal = [0xee; 32];

@@ -15521,6 +15521,7 @@ mod tests {
                     bootstrap_node_transport_signature: enrollment.transport_signature,
                     bootstrap_additional_nodes: None,
                 };
+                assert!(config.matches_system_descriptor(descriptor));
                 assert!(config.is_valid());
                 config.encode()
             }

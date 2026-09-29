@@ -373,8 +373,8 @@ fn open_clean_system_lifecycle_with_inputs(
         bootstrap_node_transport_signature: enrollment.transport_signature,
         bootstrap_additional_nodes: None,
     };
-    if !authority_configuration.is_valid() {
-        anyhow::bail!("derived system-authority configuration is invalid");
+    if !authority_configuration.matches_system_descriptor(&descriptor) {
+        anyhow::bail!("derived system-authority configuration does not match its system descriptor");
     }
     let catalog_configuration = SystemCatalogConfiguration {
         space: space.0,

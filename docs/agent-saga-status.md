@@ -104,10 +104,26 @@ distinction for every founding replica. The generated host actor loader initiali
 all three rows and restores the same state. The full host suite passes: 80 passed,
 2 ignored (31.38 s), `target/authority-sac6-host-suite.log`; default `vosx` check
 passes (19.86 s), `target/authority-sac6-vosx-check.log`.
-Next bind this constructor roster to the root-certified descriptor in startup
-orchestration, then qualify real actor installation, file ownership and
+Candidate configuration now exposes one exact system-descriptor check, used by
+released singleton preparation and the physical Authority fixture before encoding
+installation data. It binds owner, nonce, runtime/package, Authority, contract and
+the entire voter roster; the three-node host regression rejects missing voters,
+substituted principals/packages and a different Authority policy (0.10 s),
+`target/authority-sac6-descriptor.log`. This does not enable three-node input
+orchestration or replace the generic host's root-certificate verification.
+Next qualify real candidate actor installation, file ownership and
 quorum/startup/restart before exposing configuration. Host tests do not prove
 candidate guest execution or its stack/resource bounds.
+The candidate Authority guest builds offline/locked with `nightly-2026-03-20`
+(12.43 s), `target/authority-sac6-guest-build-final.log`; ELF BLAKE2b-256:
+`4fc09d244774ea7ea8257faa359a10237aa67939481b0b497104bad4de25135e`.
+This is build evidence only. The `vosx clean_startup` filter compiles but runs
+only the clock test (1 passed, 17 physical tests ignored); do not count it as
+startup/recovery qualification. Log: `target/authority-descriptor-startup-tests.log`.
+The focused bundled singleton Authority credential-query/ACK test passes with
+the new descriptor check (3.53 s),
+`target/authority-descriptor-singleton-physical.log`. It uses the existing bundled
+Authority with the fixture's native outer runtime, not the SAC6 candidate guest.
 The candidate Authority node-table header now supports exactly one or three
 bootstrap certificates in canonical node order. Materialization writes the whole
 seed inside the existing row transaction; an occupied namespace refuses it, and
