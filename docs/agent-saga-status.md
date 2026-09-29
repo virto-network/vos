@@ -77,11 +77,32 @@ outer-PVM inventory (19.59 s), and candidate bootstrap/replay recovery (86.78 s)
 in `fixed-system-projection-local-evidence-{test,bundled,bootstrap-regression}.log`.
 Those earlier tests retain their documented fixture limitations.
 
-Next bounded work is pending-read recovery across **forced leadership transfer**:
-a former leader's durable reservation must retire against exact committed
-evidence, and a successor must preserve the original authorization for an
-unacknowledged Invoke. Do not backdate authorization from peer input or bypass
-fresh Authority and reservation guards. Quorum snapshot certificate collection
+Pending-read recovery across **forced leadership transfer** remains the next
+gate. Its successor-side authorization prerequisite is now implemented: an
+exact locally applied, terminal and unacknowledged Query can supply its original
+PublicPreflight authorization to the existing durable admission path. Mismatched
+work is rejected; unknown or acknowledged work cannot supply an authorization.
+Recovery retains the original observation slot and avoids optional checkpoint
+pruning of the incomplete Invoke. Capacity and reservation guards remain active.
+The focused successor-state fixture (2.18 s) proves one ACK and no replacement
+Invoke without a local pending record; it deliberately models metadata absence,
+not an actual election. Existing crash/reopen recovery passes (4.62 s), and the
+bundled Authority outer-PVM variant passes (20.43 s), including original-clock
+restoration, changed-work rejection and refusal after ACK. Logs:
+`fixed-system-projection-successor-state.log` and
+`fixed-system-projection-original-authorization-{recovery,bundled}.log`.
+The `std` library check (3.86 s), formatting and diff checks pass. The attempted
+`shared_journal_driver::tests` filter selected zero tests and is not coverage.
+The real three-owner all-nodes-ready startup/reopen regression also passes
+(71.07 s), `fixed-system-projection-original-authorization-routes.log`; its
+single-process/candidate-artifact limitations still apply.
+
+A former leader's durable reservation still needs end-to-end retirement against
+exact committed evidence, including relay of a query originally attested by a
+different node without weakening ingress identity checks. Forced election,
+incomplete Invoke/ACK and restart must be tested together. Do not backdate
+authorization from peer input or bypass fresh Authority and reservation guards.
+Quorum snapshot certificate collection
 also remains required before sustained three-node operation reaches its replay
 limit. Keep production startup and public Shared management gated until these
 paths and real daemon/HTTP startup/restart are qualified. These are existing

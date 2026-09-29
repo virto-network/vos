@@ -7795,7 +7795,11 @@ where
         }
         let agent = crate::service::AgentId(self.pins.agent.0);
         self._network_host.ensure_reattached(agent)?;
-        let pending = self.prepare_authority_read(query)?;
+        let mut pending = self.prepare_authority_read(query)?;
+        // A successor can inherit a committed Invoke without inheriting the
+        // former leader's local pending record. Recover only the authorization
+        // of that exact locally applied Query; never mint a new clock for it.
+        let recovering = self.restore_committed_projection_authorization(&mut pending)?;
         tracing::debug!(
             elapsed_ms = started.elapsed().as_millis() as u64,
             phase = "prepare",
@@ -7806,24 +7810,28 @@ where
             .ok_or(SharedAgentHostError::ScopeMismatch)?;
         let work = work.clone();
         let authorization = authorization.clone();
-        self._network_host.checkpoint_projection_if_due(
-            agent,
-            &work,
-            &authorization,
-            &self.pins.replicas,
-            self.snapshot_signer.as_ref(),
-        )?;
+        if !recovering {
+            self._network_host.checkpoint_projection_if_due(
+                agent,
+                &work,
+                &authorization,
+                &self.pins.replicas,
+                self.snapshot_signer.as_ref(),
+            )?;
+        }
         let mut reserved = false;
         for attempt in 0..3 {
-            match self
-                ._network_host
-                .reserve_projection_pair(agent, &work, &authorization, false)
-            {
+            match self._network_host.reserve_projection_pair(
+                agent,
+                &work,
+                &authorization,
+                recovering,
+            ) {
                 Ok(()) => {
                     reserved = true;
                     break;
                 }
-                Err(SharedAgentHostError::CapacityExhausted) if attempt < 2 => {
+                Err(SharedAgentHostError::CapacityExhausted) if !recovering && attempt < 2 => {
                     self._network_host
                         .certified_checkpoint_for_projection_pair(
                             agent,
@@ -7844,7 +7852,7 @@ where
             phase = "reserve",
             "Authority projection phase complete"
         );
-        if let Err(error) = self.pending_authority_projection_identity(&pending, false) {
+        if let Err(error) = self.pending_authority_projection_identity(&pending, recovering) {
             let _ = self
                 ._network_host
                 .release_projection_pair(agent, &work, &authorization);
@@ -7888,6 +7896,48 @@ where
         query: AuthorityProjectionQuery,
     ) -> Result<PendingAuthorityProjection, SharedAgentHostError> {
         self.prepare_authority_read(AuthorityReadRequest::Projection(query))
+    }
+
+    fn restore_committed_projection_authorization(
+        &self,
+        pending: &mut PendingAuthorityProjection,
+    ) -> Result<bool, SharedAgentHostError> {
+        if !pending.validate() || pending.query.authority() != self.authority_target() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if !matches!(pending.query, AuthorityReadRequest::Projection(_))
+            || pending.management_anchor.is_some()
+        {
+            return Ok(false);
+        }
+        let (work, _) = pending
+            .invocation()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let Some(original) = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .retained_projection_authorization(crate::service::AgentId(self.pins.agent.0), work)?
+        else {
+            return Ok(false);
+        };
+        let InvocationAuthorization::PublicPreflight(preflight) = &original else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        let RuntimeWork::Invoke {
+            authorization,
+            observed_slot,
+            ..
+        } = &mut pending.work
+        else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        *observed_slot = preflight.observed_slot;
+        **authorization = original;
+        if !pending.validate() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        Ok(true)
     }
 
     fn prepare_authority_read(
@@ -31966,15 +32016,20 @@ mod tests {
 
         #[test]
         fn pending_projection_recovers_exact_invoke_and_ack_before_record_clear() {
-            check_pending_projection_exact_recovery(false);
+            check_pending_projection_exact_recovery(false, false);
         }
 
         #[test]
         fn bundled_inventory_recovers_exact_invoke_and_ack_before_record_clear() {
-            check_pending_projection_exact_recovery(true);
+            check_pending_projection_exact_recovery(true, false);
         }
 
-        fn check_pending_projection_exact_recovery(inventory: bool) {
+        #[test]
+        fn projection_without_local_pending_record_reuses_committed_invoke() {
+            check_pending_projection_exact_recovery(false, true);
+        }
+
+        fn check_pending_projection_exact_recovery(inventory: bool, successor: bool) {
             use crate::agent::sdk::authority::AuthorityCredentialProjection;
             use crate::agent::shared_journal_driver::CleanInvocationReplayRequest;
 
@@ -32119,8 +32174,51 @@ mod tests {
             };
             assert_eq!(projection.query, query);
             assert_eq!(owner.ordered_index_for_test().unwrap(), before_invoke + 1);
+            // A newly prepared retry can observe a later clock. Recovery must
+            // replace it with the exact locally committed authorization, not
+            // authorize a second Invoke under that later observation.
+            let mut successor_pending = pending.clone();
+            let RuntimeWork::Invoke {
+                observed_slot,
+                authorization: candidate,
+                ..
+            } = &mut successor_pending.work
+            else {
+                unreachable!()
+            };
+            *observed_slot += 1;
+            **candidate = InvocationAuthorization::PublicPreflight(
+                crate::agent::sdk::PublicPreflight::for_work(&work, *observed_slot),
+            );
+            assert!(successor_pending.validate());
+            assert_ne!(successor_pending, pending);
+            assert!(
+                owner
+                    .restore_committed_projection_authorization(&mut successor_pending)
+                    .unwrap()
+            );
+            assert_eq!(successor_pending, pending);
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before_invoke + 1);
             {
                 let mut host = owner.host.lock().unwrap();
+                assert_eq!(
+                    host.retained_projection_authorization(agent, &work)
+                        .unwrap(),
+                    Some(authorization.clone())
+                );
+                let mut changed = work.clone();
+                changed.message.push(0);
+                assert!(
+                    host.retained_projection_authorization(agent, &changed)
+                        .is_err()
+                );
+                let mut unknown = work.clone();
+                unknown.invocation = InvocationId([0xf7; 32]);
+                assert_eq!(
+                    host.retained_projection_authorization(agent, &unknown)
+                        .unwrap(),
+                    None
+                );
                 assert_eq!(
                     host.retained_acknowledged_projection(agent, &work).unwrap(),
                     None
@@ -32139,6 +32237,32 @@ mod tests {
                         .unwrap(),
                     Some(1)
                 );
+            }
+            if successor {
+                // Model the successor's local metadata, not a legal deletion
+                // during recovery: it has the replicated Invoke, but never
+                // wrote the former leader's independent pending record. This
+                // is not an election or multi-node qualification fixture.
+                owner
+                    ._network_host
+                    .release_projection_pair(agent, &work, &authorization)
+                    .unwrap();
+                owner.record.pending_projection = None;
+                commit_bootstrap_record(&mut owner.record_store, &owner.record).unwrap();
+                assert_eq!(owner.invoke_authority_projection(query).unwrap(), response);
+                assert_eq!(owner.ordered_index_for_test().unwrap(), before_invoke + 2);
+                assert!(owner.record.pending_projection.is_none());
+                let mut host = owner.host.lock().unwrap();
+                assert!(
+                    host.retained_positive_clean_acknowledgement(agent, &work, &authorization)
+                        .unwrap()
+                );
+                assert_eq!(
+                    host.retained_projection_authorization(agent, &work)
+                        .unwrap(),
+                    None
+                );
+                return;
             }
             let rival = owner
                 .prepare_authority_projection(signed_query(&owner, 0xc2))
@@ -32219,6 +32343,15 @@ mod tests {
             assert_eq!(retained.input(), prepared_input);
             assert_eq!(retained.retained(), Some(&invoked));
             assert_eq!(owner.ordered_index_for_test().unwrap(), before_invoke + 1);
+            assert_eq!(
+                owner
+                    .host
+                    .lock()
+                    .unwrap()
+                    .retained_projection_authorization(agent, &work)
+                    .unwrap(),
+                Some(authorization.clone())
+            );
 
             record.fail_next_before_publish();
             assert_eq!(
@@ -32244,6 +32377,11 @@ mod tests {
             let before_blocked_competitors = {
                 let mut host = owner.host.lock().unwrap();
                 let position = host.journal_position(agent).unwrap();
+                assert_eq!(
+                    host.retained_projection_authorization(agent, &work)
+                        .unwrap(),
+                    None
+                );
                 assert_eq!(
                     host.retained_acknowledged_projection(agent, &work).unwrap(),
                     Some(invoked.clone())

@@ -2830,6 +2830,34 @@ where
             .map(|retained| retained.map(|(request, _)| request))
     }
 
+    /// Recover the original authorization of an exact, locally applied Query
+    /// that still needs acknowledgement. The caller supplies expected work,
+    /// never a replacement clock. An ACK closes this recovery opportunity.
+    pub(crate) fn retained_projection_authorization(
+        &self,
+        expected: &crate::agent_sdk::InvocationWork,
+    ) -> Result<Option<crate::agent_sdk::InvocationAuthorization>, SharedJournalDriverError> {
+        if expected.mode != crate::agent_sdk::MethodMode::Query || !expected.validate() {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        let Some((request, _)) =
+            self.retained_public_invocation(expected.invocation, expected.mode)?
+        else {
+            return Ok(None);
+        };
+        if request.work() != expected {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        let authorization = request.authorization();
+        if self.retained_positive_clean_acknowledgement(expected, authorization)? {
+            return Ok(None);
+        }
+        if !self.retained_terminal_projection_invoke(expected, authorization)? {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        Ok(Some(authorization.clone()))
+    }
+
     /// Read only an exact, locally applied Query whose positive ACK is also
     /// present. Peer response bytes and an invocation ID alone are never
     /// evidence. Results come from this replica's verified replay executor;

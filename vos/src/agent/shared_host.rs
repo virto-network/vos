@@ -2314,6 +2314,25 @@ impl SharedAgentHost {
             .map_err(map_driver_error)
     }
 
+    /// Recover a still-unacknowledged Query's authorization from local
+    /// authenticated history, without accepting a peer-provided clock.
+    pub(crate) fn retained_projection_authorization(
+        &mut self,
+        agent: AgentId,
+        work: &crate::agent_sdk::InvocationWork,
+    ) -> Result<Option<crate::agent_sdk::InvocationAuthorization>, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        if work.agent.0 != agent.0 {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .retained_projection_authorization(work)
+            .map_err(map_driver_error)
+    }
+
     /// Return an exact Query result only after local authenticated application
     /// of both its Invoke and positive ACK. This is not an execution API.
     pub(crate) fn retained_acknowledged_projection(
