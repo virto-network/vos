@@ -2539,6 +2539,27 @@ impl SharedAgentHost {
             .map_err(map_driver_error)
     }
 
+    pub(crate) fn replay_durable_bootstrap_invocation(
+        &mut self,
+        agent: AgentId,
+        work: crate::agent_sdk::InvocationWork,
+        authorization: crate::agent_sdk::InvocationAuthorization,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        self.agents
+            .get_mut(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .replay_durable_bootstrap_invocation(
+                super::shared_journal_driver::CleanInvocationReplayRequest::Invoke {
+                    context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                    work,
+                    authorization,
+                },
+            )
+            .map_err(map_driver_error)
+    }
+
     pub(crate) fn apply_clean_local(
         &mut self,
         agent: AgentId,

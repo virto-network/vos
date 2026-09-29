@@ -257,12 +257,29 @@ bootstrap/file-journal reopen with the actual outer PVM (20.71 s):
 and `target/fixed-system-seal-candidate_authority_real_bootstrap_reopens_file_journal.log`.
 The `std`-only library check passes (3.25 s),
 `target/fixed-system-seal-std-check.log`. The complete Shared-host regression run
-is not yet counted as passing: its near-ceiling raw-tail attachment test is still
-running (`target/fixed-system-seal-host-regressions.log`).
+passes: 30 passed, 1 ignored (214.50 s), including its near-ceiling raw-tail
+attachment test (`target/fixed-system-seal-host-regressions.log`).
 Next: authenticate follower lifecycle catch-up/restart without repeating completed
 policy mutations. Followers currently retain their pre-bootstrap metadata and do
 not expose serving owners merely because physical state matches. Public cluster
 orchestration, production-store crash recovery and backup remain open.
+The first follower-recovery primitive now replays a committed bootstrap invocation
+with a fresh verifier, selecting its original authenticated admission clock. It
+does not propose a missing invocation or replace its work with caller-supplied
+bytes. The expanded three-node candidate test passes after dropping/reopening each
+follower's file-journal owner (32.29 s): both recover exactly the leader's Catalog
+approval despite a different supplied clock, reject changed/absent work, and leave
+journal heads and runtime commitments unchanged. Bootstrap/issuer metadata still
+uses retained memory stores and remains at CreateReceiptIssued, so this is journal
+reopen evidence, not completed follower lifecycle or process-crash qualification.
+Evidence: `target/fixed-system-follower-reopen-proof.log`; the earlier live-owner
+proof also passes (22.83 s), `target/fixed-system-follower-proof.log`.
+Both singleton before/after-every-phase restart regressions pass (16.42 s), and
+the `std`-only library check passes (2.71 s); logs:
+`target/fixed-system-follower-proof-{singleton,std}.log`.
+Recover the original signed application ACK next: recomputing one from the later
+runtime state would change its signed commitment. Then restore follower issuer/
+bootstrap phases from those independently verified records before exposing owners.
 The current full Authority host suite passes: 81 passed, 2 ignored (30.76 s),
 `fixed-roster-guest.ImAzBc/mutation-host-suite.log`.
 The candidate Authority node-table header now supports exactly one or three

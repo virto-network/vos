@@ -8186,16 +8186,13 @@ fn invocation_availability(
 }
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
-fn invoke_actor(
+fn bootstrap_invocation_work(
     host: &Arc<Mutex<SharedAgentHost>>,
-    network_host: &SharedAgentNetworkHost,
     plan: &AuthorizedCleanSystemAgentBootstrap,
     invocation: super::sdk::InvocationId,
     origin: super::sdk::InvocationOrigin,
     message: Vec<u8>,
-) -> Result<crate::actors::value::Value, CleanSystemAgentBootstrapError> {
-    use crate::actors::codec::Decode as _;
-
+) -> Result<super::sdk::InvocationWork, CleanSystemAgentBootstrapError> {
     let install = install_request(&plan.authority_request)?;
     let actor = ensure_actor_installed(host, plan, &plan.authority_request)?;
     let work = super::sdk::InvocationWork {
@@ -8225,6 +8222,20 @@ fn invoke_actor(
     {
         return Err(rejected(CleanSystemAgentBootstrapRejection::WrongAuthority));
     }
+    Ok(work)
+}
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+fn invoke_actor(
+    host: &Arc<Mutex<SharedAgentHost>>,
+    network_host: &SharedAgentNetworkHost,
+    plan: &AuthorizedCleanSystemAgentBootstrap,
+    invocation: super::sdk::InvocationId,
+    origin: super::sdk::InvocationOrigin,
+    message: Vec<u8>,
+) -> Result<crate::actors::value::Value, CleanSystemAgentBootstrapError> {
+    use crate::actors::codec::Decode as _;
+    let work = bootstrap_invocation_work(host, plan, invocation, origin, message)?;
     let authorization = super::sdk::InvocationAuthorization::PublicPreflight(
         super::sdk::PublicPreflight::for_work(&work, plan.pins.observed_slot),
     );
@@ -11478,6 +11489,7 @@ mod tests {
             let mut networks = Vec::new();
             let mut directories = Vec::new();
             let mut pending = Vec::new();
+            let mut bootstrap_stores = Vec::new();
             let mut signer = CountingSigner::new();
             for (fixture, seed) in fixtures.iter().zip([NODE_SEED, 0xd2, 0xd3]) {
                 let keypair = libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap();
@@ -11493,13 +11505,18 @@ mod tests {
                     .listen_addrs()
                     .is_empty()));
                 let directory = TestDirectory::new("fixed-system-pending-election");
-                let mut attached = CleanSystemAgentBootstrapOwner::attach_bootstrap_with_admission(
+                let stores = (
                     BootstrapMemoryStore::default(),
                     BootstrapMemoryStore {
                         bootstrap_clock: fixture.logical_slot.clone(),
                         ..BootstrapMemoryStore::default()
                     },
                     IssuerMemoryStore::default(),
+                );
+                let mut attached = CleanSystemAgentBootstrapOwner::attach_bootstrap_with_admission(
+                    stores.0.clone(),
+                    stores.1.clone(),
+                    stores.2.clone(),
                     &mut signer,
                     &fixture.plan,
                     directory.host(),
@@ -11533,6 +11550,7 @@ mod tests {
                 directories.push(directory);
                 networks.push(network);
                 pending.push(attached);
+                bootstrap_stores.push(stores);
             }
             // Raft may already have an unsuccessful discovery dial in flight.
             // Retry explicit loopback addresses until every authenticated peer
@@ -11639,10 +11657,34 @@ mod tests {
                     .unwrap()
                     .clean_state_commitment(agent)
                     .unwrap();
-                for (index, attached) in pending.iter().enumerate() {
+                for (index, attached) in pending.iter_mut().enumerate() {
                     if index == leader {
                         continue;
                     }
+                    // Reopen the follower's real journal owner before result
+                    // recovery. Bootstrap metadata intentionally still lags.
+                    drop(attached.owner.take().unwrap());
+                    let fixture = &fixtures[index];
+                    let stores = &bootstrap_stores[index];
+                    *attached = CleanSystemAgentBootstrapOwner::attach_bootstrap_with_admission(
+                        stores.0.clone(),
+                        stores.1.clone(),
+                        stores.2.clone(),
+                        &mut signer,
+                        &fixture.plan,
+                        directories[index].host(),
+                        directories[index].lock(),
+                        fixture.plan.pins.space,
+                        fixture.plan.pins.node,
+                        fixture.trust.clone(),
+                        fixture.merge.clone(),
+                        fixture.finality.clone(),
+                        Arc::new(MemoryProvider::new(fixture.provision.clone())),
+                        networks[index].clone(),
+                        None,
+                        None,
+                    )
+                    .unwrap();
                     let owner = attached.owner.as_ref().unwrap();
                     assert!(
                         wait_until(std::time::Duration::from_secs(30), || {
@@ -11668,6 +11710,70 @@ mod tests {
                         &attached.plan.catalog_request,
                     )
                     .unwrap();
+                    let call = &attached.plan.catalog_call;
+                    let work = bootstrap_invocation_work(
+                        &owner.host,
+                        &attached.plan,
+                        call.invocation,
+                        crate::agent_sdk::InvocationOrigin {
+                            principal: Some(call.principal),
+                            transport_node: call.authenticated_node,
+                            credential: Some(call.credential),
+                            actor: None,
+                            capability: None,
+                        },
+                        dynamic_message(
+                            "authorize",
+                            "call",
+                            crate::actors::value::Value::Bytes(call.encode().unwrap()),
+                        ),
+                    )
+                    .unwrap();
+                    let mut host = owner.host.lock().unwrap();
+                    let before = host.journal_position(agent).unwrap();
+                    // This deliberately differs from the original admission
+                    // clock. Recovery must select the authenticated old one.
+                    let authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+                        crate::agent_sdk::PublicPreflight::for_work(&work, LOGICAL_SLOT + 100),
+                    );
+                    let recovered = host
+                        .replay_durable_bootstrap_invocation(agent, work.clone(), authorization)
+                        .unwrap();
+                    let crate::agent_sdk::RuntimeOutcome::Completed(Ok(reply)) = recovered else {
+                        panic!("bootstrap terminal");
+                    };
+                    use crate::actors::codec::Decode as _;
+                    let Some(crate::actors::value::Value::Bytes(bytes)) =
+                        crate::actors::value::Value::try_decode(&reply.reply)
+                    else {
+                        panic!("approval bytes");
+                    };
+                    assert_eq!(
+                        ManagementApproval::decode(&bytes).unwrap(),
+                        completed.record.catalog_approval.clone().unwrap()
+                    );
+                    for altered_invocation in [false, true] {
+                        let mut changed = work.clone();
+                        if altered_invocation {
+                            changed.invocation = InvocationId([0xfe; 32]);
+                        } else {
+                            changed.message.push(0);
+                        }
+                        let authorization =
+                            crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+                                crate::agent_sdk::PublicPreflight::for_work(
+                                    &changed,
+                                    LOGICAL_SLOT + 100,
+                                ),
+                            );
+                        assert!(
+                            host.replay_durable_bootstrap_invocation(agent, changed, authorization)
+                                .is_err()
+                        );
+                    }
+                    assert_eq!(host.journal_position(agent).unwrap(), before);
+                    assert_eq!(host.clean_state_commitment(agent).unwrap(), expected);
+                    drop(host);
                     // Physical replication alone does not qualify follower
                     // lifecycle recovery or expose a serving owner.
                     assert_eq!(

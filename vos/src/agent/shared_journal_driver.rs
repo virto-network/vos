@@ -2738,6 +2738,32 @@ where
         &self,
         request: CleanInvocationReplayRequest,
     ) -> Result<PreparedCleanOrdered, SharedJournalDriverError> {
+        let request = self.bootstrap_invocation_with_original_clock(request, false)?;
+        let crate::agent_sdk::InvocationAuthorization::PublicPreflight(preflight) =
+            request.authorization()
+        else {
+            unreachable!()
+        };
+        let observed_slot = preflight.observed_slot;
+        self.prepare_clean_ordered_operation_with_policy(request, false, Some(observed_slot))
+    }
+
+    /// Recover an already committed bootstrap result through fresh physical
+    /// replay. This neither proposes work nor admits a missing invocation at
+    /// today's clock; followers must not turn absence into a policy mutation.
+    pub(crate) fn replay_durable_bootstrap_invocation(
+        &mut self,
+        request: CleanInvocationReplayRequest,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedJournalDriverError> {
+        let request = self.bootstrap_invocation_with_original_clock(request, true)?;
+        self.replay_durable_clean_terminal(request)
+    }
+
+    fn bootstrap_invocation_with_original_clock(
+        &self,
+        request: CleanInvocationReplayRequest,
+        require_retained: bool,
+    ) -> Result<CleanInvocationReplayRequest, SharedJournalDriverError> {
         use crate::agent_sdk::{InvocationAuthorization, PublicPreflight, RuntimeExecutionContext};
         let CleanInvocationReplayRequest::Invoke {
             context: RuntimeExecutionContext::Direct,
@@ -2788,6 +2814,9 @@ where
         let authorization = match retained {
             Some(authorization) => authorization,
             None => {
+                if require_retained {
+                    return Err(SharedJournalDriverError::CrossStoreMismatch);
+                }
                 if cursor.is_some() && cursor != self.materialization.replay_boundary().head {
                     return Err(SharedJournalDriverError::CrossStoreMismatch);
                 }
@@ -2797,19 +2826,11 @@ where
                 ))
             }
         };
-        let InvocationAuthorization::PublicPreflight(preflight) = &authorization else {
-            unreachable!()
-        };
-        let observed_slot = preflight.observed_slot;
-        self.prepare_clean_ordered_operation_with_policy(
-            CleanInvocationReplayRequest::Invoke {
-                context: RuntimeExecutionContext::Direct,
-                work,
-                authorization,
-            },
-            false,
-            Some(observed_slot),
-        )
+        Ok(CleanInvocationReplayRequest::Invoke {
+            context: RuntimeExecutionContext::Direct,
+            work,
+            authorization,
+        })
     }
 
     pub(crate) fn prepare_terminal_clean_ordered_operation(
