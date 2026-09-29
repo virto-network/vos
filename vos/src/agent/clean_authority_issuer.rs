@@ -220,11 +220,16 @@ pub trait CleanSharedManagementIntentStore:
     fn commit_shared_install_handoff(&mut self, bytes: &[u8]) -> Result<(), Self::Error>;
 }
 
-/// Two signed bare intents and one admitted actor package; no execution state.
+/// Two signed bare intents and one admitted package, optionally extended with
+/// a signed denial certificate and the prior finalized bare request.
 pub const MAX_CLEAN_SHARED_INSTALL_HANDOFF_BYTES: usize = 128
     + 2 * (crate::agent_sdk::wire::MAX_MANAGEMENT_REQUEST_WIRE_BYTES
         + crate::agent_sdk::wire::MAX_AUTHORITY_CREDENTIAL_CALL_WIRE_BYTES)
-    + crate::agent_sdk::package::MAX_PACKAGE_ENCODED_BYTES;
+    + crate::agent_sdk::package::MAX_PACKAGE_ENCODED_BYTES
+    + MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES
+    + 80
+    + crate::agent_sdk::wire::MAX_MANAGEMENT_REQUEST_WIRE_BYTES
+    + crate::agent_sdk::wire::MAX_AUTHORITY_CREDENTIAL_CALL_WIRE_BYTES;
 
 impl<B: CleanManagementActorStore + ?Sized> CleanManagementActorStore for &mut B {
     fn load_actor(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
@@ -3980,6 +3985,124 @@ mod tests {
             }
         }
         assert!(decode_authorized_decision(&vec![0; MAX_AUTHORIZED_DECISION_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn shared_install_denial_handoff_binds_certificate_and_finalized_predecessor() {
+        use super::super::clean_management_intent::{
+            CleanManagementIntent, CleanManagementIntentSlot, ManagementJournalAnchor,
+            SharedInstallHandoff,
+        };
+        use crate::agent_sdk::{
+            InvocationAuthorization, InvocationWork, MethodMode, PublicPreflight,
+            RuntimeExecutionContext, RuntimeState, RuntimeWork, StateLane,
+        };
+        use crate::service::wire::ServiceWire;
+        let mut signer = CountingSigner::new(0x3d);
+        let fixture = fixture(&signer);
+        let package = super::super::package_admission::admitted_standard_actor_for_test(
+            "handoff",
+            StateLane::Local,
+            0x41,
+        );
+        let mut request = install_request(fixture.agent, 0x42);
+        let ManagementRequest::Install(install) = &mut request else {
+            unreachable!()
+        };
+        install.package = package.package_ref().clone();
+        install.entry.package = install.package.clone();
+        install.entry.deployment = package.deployment();
+        install.entry.program = package.program();
+        install.producer = package.producer();
+        let intent = |sequence| {
+            let (call, _) =
+                approved_call_for_profile(&fixture, sequence, &request, AgentProfile::Shared);
+            CleanManagementIntent::new(
+                call.authority,
+                call.managed,
+                request.clone(),
+                call,
+                &TestCredentialVerifier,
+            )
+            .unwrap()
+        };
+        let finalized = intent(1);
+        let previous = intent(2);
+        let next = intent(3);
+        let call = previous.call();
+        let invocation = InvocationWork {
+            space: call.authority.space,
+            agent: call.authority.system_agent,
+            runtime_deployment: call.authority.system_runtime_deployment,
+            invocation: call.invocation,
+            actor: call.authority.binding.issuer.actor,
+            incarnation: Hash([0x43; 32]),
+            deployment: call.authority.binding.issuer.deployment,
+            program: call.authority.binding.issuer.program,
+            roles: crate::agent_sdk::InvocationRoleClaims::none(),
+            mode: MethodMode::Linear,
+            origin: previous.authorization_origin(),
+            message: previous.authorization_message(),
+            installation_data: None,
+            availability: Vec::new(),
+            gas: 100,
+            recovery_only: false,
+        };
+        let work = RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct,
+            state: RuntimeState::default(),
+            authorization: Box::new(InvocationAuthorization::PublicPreflight(
+                PublicPreflight::for_work(&invocation, 10),
+            )),
+            invocation: Box::new(invocation),
+            observed_slot: 10,
+        };
+        let anchor = ManagementJournalAnchor {
+            genesis: super::super::journal::AgentJournalGenesisId([0xa1; 32]),
+            admission: super::super::genesis::AgentGenesisAdmissionId::from_bytes([0xa2; 32]),
+            runtime: crate::service::Hash([0xa3; 32]),
+            ordered: super::super::journal::OrderedBase::post_genesis(),
+        };
+        let mut slot = CleanManagementIntentSlot::open(MemoryImageStore::default()).unwrap();
+        slot.pledge(previous.clone()).unwrap();
+        slot.pledge_authorization_work(work, anchor).unwrap();
+        let signature = signer
+            .sign_management_denial_retirement(&slot.denial_signing_bytes().unwrap())
+            .unwrap();
+        slot.commit_denial(signature).unwrap();
+        let certificate = slot.load_denial_certificate().unwrap().unwrap();
+        let bare = SharedInstallHandoff::new(&previous, &next, &package).unwrap();
+        let old_bytes = bare.encode();
+        assert_eq!(
+            SharedInstallHandoff::decode(&old_bytes).unwrap().encode(),
+            old_bytes
+        );
+        let record = bare.with_denial(certificate.clone(), &finalized).unwrap();
+        let bytes = record.encode();
+        assert!(bytes.starts_with(&old_bytes));
+        assert!(bytes.len() <= MAX_CLEAN_SHARED_INSTALL_HANDOFF_BYTES);
+        assert_eq!(
+            SharedInstallHandoff::decode(&bytes).unwrap().encode(),
+            bytes
+        );
+        assert!(
+            SharedInstallHandoff::new(&previous, &next, &package)
+                .unwrap()
+                .with_denial(certificate.clone(), &next)
+                .is_err()
+        );
+        assert!(
+            SharedInstallHandoff::new(&finalized, &next, &package)
+                .unwrap()
+                .with_denial(certificate, &previous)
+                .is_err()
+        );
+        let mut forged = record;
+        *forged.denial.as_mut().unwrap().0.last_mut().unwrap() ^= 1;
+        assert!(SharedInstallHandoff::decode(&forged.encode()).is_err());
+        let mut extra = bytes;
+        extra.push(0);
+        assert!(SharedInstallHandoff::decode(&extra).is_err());
     }
 
     #[test]

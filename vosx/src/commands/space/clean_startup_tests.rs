@@ -140,6 +140,7 @@ enum InstallFault {
     None,
     Denial,
     DenialAuthorization,
+    DenialSuccessor,
     DenialRetirement,
     Intent(usize),
     Issuer(usize),
@@ -162,6 +163,12 @@ fn shared_install_file_owner_recovers_staged_denial_retirement() {
 #[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
 fn shared_install_file_owner_recovers_pending_policy_denial() {
     check_shared_file_recovery(true, true, InstallFault::DenialAuthorization);
+}
+
+#[test]
+#[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
+fn shared_install_file_owner_recovers_successor_after_denial() {
+    check_shared_file_recovery(true, true, InstallFault::DenialSuccessor);
 }
 
 fn check_shared_file_recovery(
@@ -470,6 +477,7 @@ fn check_shared_file_recovery(
                 InstallFault::Denial
                     | InstallFault::DenialRetirement
                     | InstallFault::DenialAuthorization
+                    | InstallFault::DenialSuccessor
             ) {
                 99
             } else {
@@ -541,6 +549,9 @@ fn check_shared_file_recovery(
     let install_commitment = handoff_files
         .as_ref()
         .map(|(_, _, call, _)| call.commitment());
+    let successor_input = handoff_files
+        .as_ref()
+        .map(|(_, install, call, package)| (install.clone(), call.clone(), package.clone()));
     if let Some((retained, install, install_call, package)) = handoff_files {
         assert!(!lifecycle_root.join("shared-management.actor").exists());
         lifecycle.initialize_shared_management(locator).unwrap();
@@ -617,6 +628,7 @@ fn check_shared_file_recovery(
             InstallFault::Denial
                 | InstallFault::DenialRetirement
                 | InstallFault::DenialAuthorization
+                | InstallFault::DenialSuccessor
         ) {
             use std::fs;
             let issuer_path = lifecycle_root.join("shared-management.issuer");
@@ -684,6 +696,42 @@ fn check_shared_file_recovery(
                 lifecycle.complete_shared_create(locator).unwrap(),
                 acknowledgement
             );
+            if matches!(interrupt_install, InstallFault::DenialSuccessor) {
+                let (install, mut successor, package) = successor_input.unwrap();
+                successor.request_sequence = NonZeroU64::new(3).unwrap();
+                successor.invocation = successor.expected_invocation();
+                successor.signature = sign_exact(&operator, &successor.signing_bytes()).unwrap();
+                let fault = SharedManagementStageFault::install_handoff(&lifecycle_root);
+                assert_eq!(
+                    lifecycle.prepare_shared_install(install.clone(), successor.clone(), &package),
+                    Err(SharedAgentHostError::Unavailable)
+                );
+                assert!(fault.fired());
+                assert_eq!(journal_files(&journal), applied);
+                drop(fault);
+                drop(lifecycle);
+                let (_, mut lifecycle) = open();
+                assert_eq!(journal_files(&journal), applied);
+                lifecycle
+                    .prepare_shared_install(install, successor.clone(), &package)
+                    .unwrap();
+                let terminal = lifecycle.complete_shared_install(locator).unwrap();
+                let SignedManagementTerminal::Applied(ack) = &terminal else {
+                    panic!("successor must apply");
+                };
+                assert_eq!(ack.credential_call, successor.commitment());
+                let installed = journal_files(&journal);
+                assert_ne!(installed, applied);
+                drop(lifecycle);
+                let (_, mut lifecycle) = open();
+                let system = journal_files(&system_journal);
+                assert_eq!(
+                    lifecycle.complete_shared_install(locator).unwrap(),
+                    terminal
+                );
+                assert_eq!(journal_files(&journal), installed);
+                assert_eq!(journal_files(&system_journal), system);
+            }
             return;
         }
         let interruption = match interrupt_install {
@@ -691,6 +739,7 @@ fn check_shared_file_recovery(
             | InstallFault::Successive
             | InstallFault::Denial
             | InstallFault::DenialAuthorization
+            | InstallFault::DenialSuccessor
             | InstallFault::DenialRetirement => None,
             InstallFault::Intent(write) => Some((
                 SharedManagementStageFault::intent(&lifecycle_root, write),
@@ -846,6 +895,32 @@ fn check_shared_file_recovery(
                 next_call.invocation = next_call.expected_invocation();
                 next_call.signature = sign_exact(&operator, &next_call.signing_bytes()).unwrap();
                 let before = journal_files(&journal);
+                if index == 1 {
+                    // Consecutive refusals after an applied Install must keep
+                    // that same finalized predecessor across each handoff.
+                    for sequence in [99, 100] {
+                        let mut denied_call = next_call.clone();
+                        denied_call.request_sequence = NonZeroU64::new(sequence).unwrap();
+                        denied_call.invocation = denied_call.expected_invocation();
+                        denied_call.signature =
+                            sign_exact(&operator, &denied_call.signing_bytes()).unwrap();
+                        lifecycle
+                            .prepare_shared_install(install.clone(), denied_call, &package)
+                            .unwrap();
+                        assert_eq!(
+                            lifecycle.complete_shared_install(locator),
+                            Err(SharedAgentHostError::ScopeMismatch)
+                        );
+                        assert_eq!(journal_files(&journal), before);
+                        drop(lifecycle);
+                        (_, lifecycle) = open();
+                        assert_eq!(
+                            lifecycle.complete_shared_install(locator),
+                            Err(SharedAgentHostError::ScopeMismatch)
+                        );
+                        assert_eq!(journal_files(&journal), before);
+                    }
+                }
                 let old_actor =
                     std::fs::read(lifecycle_root.join("shared-management.actor")).unwrap();
                 let fault = match index {

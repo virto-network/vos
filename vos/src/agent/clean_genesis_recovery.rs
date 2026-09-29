@@ -52,12 +52,13 @@ where
             .map_err(|_| SharedAgentHostError::Unavailable)?
             .is_none()
     {
+        let finalized = record.finalized_predecessor();
         if issuer
             .recover_finalized_terminal(
                 authority,
-                record.previous.call().managed,
-                record.previous.request(),
-                record.previous.call(),
+                finalized.call().managed,
+                finalized.request(),
+                finalized.call(),
                 &RawCredentialVerifier,
             )
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?
@@ -75,20 +76,24 @@ where
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         if before {
-            if !slot
-                .retirement_complete()
-                .map_err(|_| SharedAgentHostError::Unavailable)?
-            {
-                return Err(SharedAgentHostError::Conflict);
-            }
             let old_package = slot
                 .load_actor()
                 .map_err(|_| SharedAgentHostError::Unavailable)?
                 .ok_or(SharedAgentHostError::Unavailable)?;
             validate_actor_install(descriptor, current.request(), &old_package)
                 .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-            slot.handoff_retired(&current, record.next.clone(), &RawCredentialVerifier)
+            if let Some((certificate, _)) = &record.denial {
+                slot.handoff_denied(
+                    &current,
+                    record.next.clone(),
+                    certificate,
+                    &RawCredentialVerifier,
+                )
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
+            } else {
+                slot.handoff_retired(&current, record.next.clone(), &RawCredentialVerifier)
+                    .map_err(|_| SharedAgentHostError::Unavailable)?;
+            }
         }
         slot.retain_actor(&record.package)
             .map_err(|_| SharedAgentHostError::Unavailable)?;
@@ -146,19 +151,28 @@ where
             return Err(SharedAgentHostError::ScopeMismatch);
         }
     }
+    let finalized = record.finalized_predecessor();
     let (receipt, terminal) = issuer
         .recover_finalized_terminal(
             authority,
             managed,
-            record.previous.request(),
-            record.previous.call(),
+            finalized.request(),
+            finalized.call(),
             &RawCredentialVerifier,
         )
         .map_err(|_| SharedAgentHostError::ScopeMismatch)?
         .ok_or(SharedAgentHostError::ScopeMismatch)?;
+    if matches!(finalized.request(), ManagementRequest::Create(_)) {
+        // The caller already recovered this generation against its immutable
+        // Create archive and fresh Authority evidence. Denial adds no transition.
+        return match terminal {
+            SignedManagementTerminal::Applied(ack) if ack.managed == managed => Ok(()),
+            _ => Err(SharedAgentHostError::ScopeMismatch),
+        };
+    }
     let observation = host.observe_durable_install(
         crate::service::AgentId(managed.agent.0),
-        record.previous.request(),
+        finalized.request(),
         &receipt,
     )?;
     let matches = match terminal {
@@ -641,6 +655,9 @@ where
                 && !slot
                     .retirement_complete()
                     .map_err(|_| SharedAgentHostError::Unavailable)?
+                && !slot
+                    .denial_complete()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?
             {
                 return Err(SharedAgentHostError::Conflict);
             }
@@ -654,18 +671,44 @@ where
             .ok_or(SharedAgentHostError::Unavailable)?;
         if let Some(previous) = slot.intent().cloned() {
             if !SharedInstallHandoff::matches(&previous, &intent) {
-                let record = SharedInstallHandoff::new(&previous, &intent, package)
+                let mut record = SharedInstallHandoff::new(&previous, &intent, package)
                     .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
                 let issuer = recovery
                     .management_issuer
                     .as_mut()
                     .ok_or(SharedAgentHostError::Unavailable)?;
+                if slot
+                    .denial_complete()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?
+                {
+                    if !owner.finish_denied_shared_install(slot, issuer, signer)? {
+                        return Err(SharedAgentHostError::Conflict);
+                    }
+                    let saved = slot
+                        .load_shared_install_handoff()
+                        .map_err(|_| SharedAgentHostError::Unavailable)?;
+                    let finalized = match &saved {
+                        Some(saved) => saved.finalized_predecessor(),
+                        None => recovery
+                            .intent
+                            .intent()
+                            .ok_or(SharedAgentHostError::ScopeMismatch)?,
+                    };
+                    let certificate = slot
+                        .load_denial_certificate()
+                        .map_err(|_| SharedAgentHostError::Unavailable)?
+                        .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                    record = record
+                        .with_denial(certificate, finalized)
+                        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                }
+                let finalized = record.finalized_predecessor();
                 if issuer
                     .recover_finalized_terminal(
                         self.authority,
-                        previous.call().managed,
-                        previous.request(),
-                        previous.call(),
+                        finalized.call().managed,
+                        finalized.request(),
+                        finalized.call(),
                         &RawCredentialVerifier,
                     )
                     .map_err(|_| SharedAgentHostError::ScopeMismatch)?
@@ -677,12 +720,16 @@ where
                     .load_actor()
                     .map_err(|_| SharedAgentHostError::Unavailable)?
                     .ok_or(SharedAgentHostError::Unavailable)?;
-                owner.complete_shared_install_from_management_intent(
-                    slot,
-                    &previous_package,
-                    issuer,
-                    signer,
-                )?;
+                if record.denial.is_none() {
+                    owner.complete_shared_install_from_management_intent(
+                        slot,
+                        &previous_package,
+                        issuer,
+                        signer,
+                    )?;
+                } else {
+                    verify_shared_handoff_generation(owner, &record, issuer)?;
+                }
                 slot.stage_shared_install_handoff(&record)
                     .map_err(|_| SharedAgentHostError::Unavailable)?;
                 recover_shared_install_handoff(slot, issuer, self.authority, &descriptor)?;

@@ -477,8 +477,8 @@ does not execute the next Install. This is owner-reopen/staged-file evidence,
 not process-kill, power-loss, public ingress or three-node qualification.
 The final result is in `target/shared-install-successive-file-evidence.log`; other logs use
 `target/shared-install-handoff-*` and `target/shared-install-successive-file*`.
-Other open gates are receipt expiry before application, successor handoff after
-Authority denial, mixed pending continuations, remaining write/retirement interruption
+Other open gates are receipt expiry before application, mixed pending
+continuations, remaining write/retirement interruption
 boundaries and roots already advanced by the old failing startup. Public Shared
 management remains disabled; bundled artifacts are unchanged.
 
@@ -525,11 +525,34 @@ formatting and diff checks pass. Filesystem stores: 79 passed, one ignored, with
 the socket-dependent HTTP retry test explicitly excluded. These are physical
 outer-PVM/production-owner reopen tests, not process-kill or three-node evidence.
 Logs: `target/shared-install-denial-*` in the shared disk-backed build root.
-Still open before ingress: return a distinct authenticated public denial response
-and admit the next Install after a denied request. The existing successor
-handoff only handles finalized application terminals; it must preserve denial
-evidence before replacing a denied intent. These are not release-qualified
-public management paths, and bundled artifacts remain unchanged.
+Successor-after-denial handoff retains the exact signed CND1 certificate and
+the last finalized Create/Install request in a bounded record, including across
+consecutive denials. Recovery checks that predecessor
+against the issuer checkpoint and physical generation; a denial is never treated
+as an application terminal. The certificate must match the still-leased denied
+intent before replacement. Existing application-only SIH1 encodings are unchanged;
+the tagged denial extension is rejected by older readers as trailing data. Do not
+downgrade an owner with such an extension retained. The file bound includes one
+full denial certificate (including its authorization envelope), not an unbounded
+chain of past denials. The production file-owner test passes staged handoff
+publication after an initial denial, then applied Install and exact terminal
+retry after another restart (310.78 s). The expanded successive-handoff fixture
+also passes two consecutive denials after an applied Install, preserving the
+same finalized predecessor across reopen and an interrupted intent replacement
+(504.60 s).
+The certificate/encoding negative test and all 20 issuer tests pass; filesystem
+stores pass 79 tests (one ignored, socket-dependent test excluded), as do the
+default-feature build and formatting/diff checks. Logs:
+`target/shared-denial-successor-*` and `target/shared-denial-successive-file.log`
+in the shared build root. An unrestricted 26-test Local lifecycle run failed 13
+bootstrap fixtures with CorruptResidue/Unavailable before the modified handoff;
+one failed denial test passes in isolation, and the complete two-thread rerun
+passes all 26 tests (373.56 s).
+Do not count the unrestricted run as qualification or assume its cause without
+further evidence.
+Still open before ingress: return a distinct authenticated public denial response.
+These are not release-qualified public management paths, and bundled artifacts
+remain unchanged.
 
 Signed Install failure finality now supports Local and Shared, retaining exact
 call/profile/receipt bindings and rejecting Private. Generic intent, issuer and

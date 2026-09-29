@@ -24,6 +24,9 @@ pub(crate) struct SharedInstallHandoff {
     pub(crate) previous: CleanManagementIntent,
     pub(crate) next: CleanManagementIntent,
     pub(crate) package: super::package_admission::AdmittedActorPackage,
+    /// Exact signed denial and the last applied request, not a fabricated
+    /// application terminal for the refused request.
+    pub(crate) denial: Option<(Vec<u8>, CleanManagementIntent)>,
 }
 
 impl SharedInstallHandoff {
@@ -62,7 +65,39 @@ impl SharedInstallHandoff {
             previous,
             next,
             package: package.clone(),
+            denial: None,
         })
+    }
+
+    pub(crate) fn with_denial(
+        mut self,
+        certificate: Vec<u8>,
+        finalized: &CleanManagementIntent,
+    ) -> Result<Self, DecodeError> {
+        verify_denial_record(&certificate, self.previous.request(), self.previous.call())?;
+        let finalized = CleanManagementIntent::new(
+            self.previous.call().authority,
+            self.previous.call().managed,
+            finalized.request().clone(),
+            finalized.call().clone(),
+            &super::clean_bootstrap::RawCredentialVerifier,
+        )?;
+        if !matches!(
+            finalized.request(),
+            ManagementRequest::Create(_) | ManagementRequest::Install(_)
+        ) || finalized.call() == self.previous.call()
+            || finalized.call() == self.next.call()
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        self.denial = Some((certificate, finalized));
+        Ok(self)
+    }
+
+    pub(crate) fn finalized_predecessor(&self) -> &CleanManagementIntent {
+        self.denial
+            .as_ref()
+            .map_or(&self.previous, |(_, intent)| intent)
     }
 
     pub(crate) fn matches(
@@ -81,6 +116,13 @@ impl ServiceWire for SharedInstallHandoff {
         encoder.bytes(&self.previous.encode());
         encoder.bytes(&self.next.encode());
         encoder.bytes(self.package.exact_bytes());
+        // Existing application handoffs keep their exact SIH1 bytes. Old
+        // readers reject the tagged denial extension as trailing data.
+        if let Some((certificate, finalized)) = &self.denial {
+            encoder.u8(1);
+            encoder.bytes(certificate);
+            encoder.bytes(&finalized.encode());
+        }
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -107,7 +149,23 @@ impl ServiceWire for SharedInstallHandoff {
         }
         let package = super::package_admission::admit_actor_package(package)
             .map_err(|_| DecodeError::NonCanonical)?;
-        Self::new(&previous, &next, &package)
+        let record = Self::new(&previous, &next, &package)?;
+        if decoder.exhausted() {
+            return Ok(record);
+        }
+        if decoder.u8()? != 1 {
+            return Err(DecodeError::InvalidTag);
+        }
+        let certificate = decoder.bytes_ref()?;
+        let finalized = decoder.bytes_ref()?;
+        if certificate.len() > MAX_INTENT_BYTES || finalized.len() > bare_limit {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let finalized = CleanManagementIntent::decode(finalized)?;
+        if finalized.authorization_work().is_some() || finalized.finalization_work().is_some() {
+            return Err(DecodeError::NonCanonical);
+        }
+        record.with_denial(certificate.to_vec(), &finalized)
     }
 }
 
@@ -1020,7 +1078,12 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
                 Err(IntentSlotError::Conflict)
             };
         }
-        if !self.retired || !SharedInstallHandoff::matches(&current, &record.previous) {
+        let terminal_matches = if let Some((certificate, _)) = &record.denial {
+            self.load_denial_certificate()?.as_ref() == Some(certificate)
+        } else {
+            self.retired
+        };
+        if !terminal_matches || !SharedInstallHandoff::matches(&current, &record.previous) {
             return Err(IntentSlotError::Conflict);
         }
         if let Some(saved) = saved {
@@ -1041,6 +1104,31 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
 
     pub(crate) fn intent(&self) -> Option<&CleanManagementIntent> {
         self.intent.as_ref()
+    }
+
+    pub(crate) fn load_denial_certificate(
+        &mut self,
+    ) -> Result<Option<Vec<u8>>, IntentSlotError<B::Error>> {
+        if self.poisoned {
+            return Err(IntentSlotError::Poisoned);
+        }
+        if !self.denied {
+            return Ok(None);
+        }
+        let bytes = self
+            .store
+            .load()
+            .map_err(IntentSlotError::Storage)?
+            .ok_or(IntentSlotError::Invalid)?;
+        if bytes.len() > MAX_INTENT_BYTES {
+            return Err(IntentSlotError::Invalid);
+        }
+        let denied =
+            DeniedManagementIntent::decode(&bytes).map_err(|_| IntentSlotError::Invalid)?;
+        if self.intent.as_ref() != Some(&denied.0) {
+            return Err(IntentSlotError::Conflict);
+        }
+        Ok(Some(bytes))
     }
 
     /// Re-admit the exact actor package named by the current Install intent.
@@ -1342,6 +1430,29 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
         next: CleanManagementIntent,
         verifier: &V,
     ) -> Result<bool, IntentSlotError<B::Error>> {
+        self.handoff_terminal(expected, next, verifier, false)
+    }
+
+    pub(crate) fn handoff_denied<V: AuthorityCredentialVerifier>(
+        &mut self,
+        expected: &CleanManagementIntent,
+        next: CleanManagementIntent,
+        certificate: &[u8],
+        verifier: &V,
+    ) -> Result<bool, IntentSlotError<B::Error>> {
+        if self.load_denial_certificate()?.as_deref() != Some(certificate) {
+            return Err(IntentSlotError::Conflict);
+        }
+        self.handoff_terminal(expected, next, verifier, true)
+    }
+
+    fn handoff_terminal<V: AuthorityCredentialVerifier>(
+        &mut self,
+        expected: &CleanManagementIntent,
+        next: CleanManagementIntent,
+        verifier: &V,
+        allow_denied: bool,
+    ) -> Result<bool, IntentSlotError<B::Error>> {
         if self.poisoned {
             return Err(IntentSlotError::Poisoned);
         }
@@ -1361,7 +1472,7 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
         if current.call == next.call && current.request == next.request {
             return Ok(false);
         }
-        if !self.retired || current != expected {
+        if !(self.retired || (allow_denied && self.denied)) || current != expected {
             return Err(IntentSlotError::Conflict);
         }
         let bytes = next.encode();
@@ -1374,6 +1485,7 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
         }
         self.intent = Some(next);
         self.retired = false;
+        self.denied = false;
         Ok(true)
     }
 
