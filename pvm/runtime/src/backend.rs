@@ -3,7 +3,7 @@
 //! The kernel creates CODE caps that wrap compiled code in one of two backends.
 //! `PvmBackend` controls the selection; `CompiledProgram` holds the result.
 
-use alloc::vec::Vec;
+use alloc::{string::String, sync::Arc, vec, vec::Vec};
 
 /// Backend selection for PVM execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14,7 +14,7 @@ pub enum PvmBackend {
     Default,
     /// Always use the software interpreter.
     ForceInterpreter,
-    /// Always use the JIT recompiler (panics if unavailable).
+    /// Always use the JIT recompiler (returns an error if unavailable).
     ForceRecompiler,
 }
 
@@ -71,14 +71,14 @@ impl core::fmt::Debug for CompiledProgram {
 }
 
 /// Resolve the backend to use based on `PvmBackend` selection and platform.
-fn resolve_backend(backend: PvmBackend) -> ResolvedBackend {
+fn resolve_backend(backend: PvmBackend) -> Result<ResolvedBackend, String> {
     match backend {
-        PvmBackend::ForceInterpreter => ResolvedBackend::Interpreter,
+        PvmBackend::ForceInterpreter => Ok(ResolvedBackend::Interpreter),
         PvmBackend::ForceRecompiler => {
             #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
-            return ResolvedBackend::Recompiler;
+            return Ok(ResolvedBackend::Recompiler);
             #[cfg(not(all(feature = "std", target_os = "linux", target_arch = "x86_64")))]
-            panic!("ForceRecompiler requested but JIT recompiler not available on this platform");
+            return Err("requested recompiler is unavailable on this platform".into());
         }
         PvmBackend::Default => {
             // Check GREY_PVM env var
@@ -86,12 +86,14 @@ fn resolve_backend(backend: PvmBackend) -> ResolvedBackend {
             {
                 if let Ok(val) = std::env::var("GREY_PVM") {
                     match val.as_str() {
-                        "interpreter" => return ResolvedBackend::Interpreter,
+                        "interpreter" => return Ok(ResolvedBackend::Interpreter),
                         "recompiler" => {
                             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-                            return ResolvedBackend::Recompiler;
+                            return Ok(ResolvedBackend::Recompiler);
                             #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-                            panic!("GREY_PVM=recompiler but JIT not available on this platform");
+                            return Err(
+                                "GREY_PVM=recompiler is unavailable on this platform".into()
+                            );
                         }
                         _ => {} // fall through to platform default
                     }
@@ -99,9 +101,9 @@ fn resolve_backend(backend: PvmBackend) -> ResolvedBackend {
             }
             // Platform default: recompiler if available
             #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
-            return ResolvedBackend::Recompiler;
+            return Ok(ResolvedBackend::Recompiler);
             #[cfg(not(all(feature = "std", target_os = "linux", target_arch = "x86_64")))]
-            return ResolvedBackend::Interpreter;
+            return Ok(ResolvedBackend::Interpreter);
         }
     }
 }
@@ -122,7 +124,7 @@ pub fn compile(
     isa_mode: crate::IsaMode,
 ) -> Result<CompiledProgram, alloc::string::String> {
     let mem_cycles = crate::mem_cycles_for_mode(mem_cycles, isa_mode);
-    match resolve_backend(backend) {
+    match resolve_backend(backend)? {
         ResolvedBackend::Interpreter => {
             // Bind the decoder and block boundaries to the selected ISA at
             // compile time; execution still carries the same mode so opcode
@@ -138,5 +140,116 @@ pub fn compile(
                 crate::recompiler::compile_code(code, bitmask, jump_table, mem_cycles, isa_mode)?;
             Ok(CompiledProgram::Recompiler(compiled))
         }
+    }
+}
+
+/// Immutable, profile-bound preparation shared by standard outer and inner
+/// execution. It owns no invocation memory and introduces no global cache.
+#[derive(Clone)]
+pub(crate) struct PreparedExecution {
+    interpreter: Arc<InterpreterProgram>,
+    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    native: Option<Arc<crate::recompiler::CompiledCode>>,
+}
+
+impl PreparedExecution {
+    pub(crate) fn new_standard(
+        code: &[u8],
+        bitmask: &[u8],
+        jump_table: &[u32],
+        backend: PvmBackend,
+    ) -> Result<Self, String> {
+        let compiled = compile(
+            code,
+            bitmask,
+            jump_table,
+            crate::STANDARD_MEM_CYCLES,
+            backend,
+            crate::IsaMode::Conformance,
+        )?;
+        Ok(match compiled {
+            CompiledProgram::Interpreter(interpreter) => Self {
+                interpreter: Arc::new(interpreter),
+                #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+                native: None,
+            },
+            #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+            CompiledProgram::Recompiler(native) => Self {
+                interpreter: Arc::new(crate::Interpreter::predecode(
+                    code,
+                    bitmask,
+                    jump_table,
+                    crate::STANDARD_MEM_CYCLES,
+                    crate::IsaMode::Conformance,
+                )),
+                native: Some(Arc::new(native)),
+            },
+        })
+    }
+
+    pub(crate) fn backend(&self) -> PvmBackend {
+        #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+        if self.native.is_some() {
+            return PvmBackend::ForceRecompiler;
+        }
+        PvmBackend::ForceInterpreter
+    }
+
+    pub(crate) fn interpreter_program(&self) -> &InterpreterProgram {
+        &self.interpreter
+    }
+
+    pub(crate) fn allocate_memory(
+        &self,
+        span: u64,
+        sparse: bool,
+    ) -> Result<crate::interpreter::Memory, String> {
+        if span > 1u64 << 32 || !span.is_multiple_of(crate::PVM_PAGE_SIZE as u64) {
+            return Err("invalid standard memory span".into());
+        }
+        #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+        if self.native.is_some() {
+            if sparse {
+                return Err("recompiler requires native flat memory".into());
+            }
+            return crate::interpreter::Memory::native(span);
+        }
+        Ok(if sparse {
+            crate::interpreter::Memory::sparse(span)
+        } else {
+            if span > isize::MAX as u64 {
+                return Err("flat memory span exceeds host address space".into());
+            }
+            crate::interpreter::Memory::flat(vec![0; span as usize])
+        })
+    }
+
+    /// Execute exactly one slice, preserving an unacknowledged host boundary.
+    /// Backend/host failures are not guest exits and never trigger a retry on
+    /// the interpreter. The caller alone decides when to acknowledge a hostcall.
+    pub(crate) fn run(
+        &self,
+        interpreter: &mut crate::Interpreter,
+    ) -> Result<crate::ExitReason, String> {
+        #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+        if let Some(native) = &self.native {
+            return crate::recompiler::run_standard(native, interpreter);
+        }
+        Ok(interpreter.run().0)
+    }
+}
+
+#[cfg(all(
+    test,
+    not(all(feature = "std", target_os = "linux", target_arch = "x86_64"))
+))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_recompiler_is_an_error_not_an_interpreter_fallback() {
+        assert!(
+            PreparedExecution::new_standard(&[0], &[1], &[], PvmBackend::ForceRecompiler).is_err()
+        );
     }
 }

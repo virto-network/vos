@@ -44,6 +44,13 @@ retired_paths=(
     vos/tests/fixtures/greeter
     vos/tests/fixtures/tally
     vos/tests/fixtures/workflow
+    vos/src/agent/private_control_application_coordinator.rs
+    vos/src/agent/private_host.rs
+    vos/src/agent/private_host/private_replica_establishment.rs
+    vos/src/agent/private_runtime.rs
+    vos/src/agent/private_store.rs
+    vos/src/agent/private_sync.rs
+    vos/src/agent/transition_proof_host/physical.rs
 )
 for path in "${retired_paths[@]}"; do
     [[ ! -e $path ]] || fail "retired path remains: $path"

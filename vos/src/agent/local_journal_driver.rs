@@ -919,6 +919,7 @@ pub(crate) enum LocalReplayExecutorError {
     Package(PackageError),
     RuntimeExit { reason: ExitReason, pc: u32 },
     RuntimeOutput,
+    RuntimeBackend,
     RuntimeStateTooLarge,
     Store(JournalStoreError),
 }
@@ -1212,7 +1213,13 @@ pub(crate) struct StandardLocalReplayExecutor<R> {
 /// decisions are cached. Exact bytes, not a caller-supplied identity, select it.
 #[derive(Default)]
 struct RuntimePreparationCache {
-    entry: std::sync::Mutex<Option<(Vec<u8>, Arc<vos_pvm::refine::PreparedProgram>)>>,
+    entry: std::sync::Mutex<
+        Option<(
+            Vec<u8>,
+            Arc<vos_pvm::refine::PreparedProgram>,
+            vos_pvm::PvmBackend,
+        )>,
+    >,
 }
 
 impl RuntimePreparationCache {
@@ -1222,23 +1229,38 @@ impl RuntimePreparationCache {
         input: &[u8],
         gas: Gas,
     ) -> Result<RefineContext, vos_pvm::refine::RefineError> {
+        let backend = super::runtime_pvm::execution_backend();
         // Preserve the cold loader's behavior outside the cache admission
         // bound; this optimization must not introduce a new execution rule.
         if program.len() > super::execution::MAX_EXECUTION_PROGRAM_BYTES {
-            return RefineContext::load(program, input, gas);
+            return RefineContext::load_with_backend(
+                program,
+                input,
+                gas,
+                vos_pvm::refine::MemoryModel::Auto,
+                backend,
+            );
         }
         let prepared = {
             let Ok(mut entry) = self.entry.lock() else {
-                return RefineContext::load(program, input, gas);
+                return RefineContext::load_with_backend(
+                    program,
+                    input,
+                    gas,
+                    vos_pvm::refine::MemoryModel::Auto,
+                    backend,
+                );
             };
-            if let Some((_, prepared)) = entry
+            if let Some((_, prepared, _)) = entry
                 .as_ref()
-                .filter(|(bytes, _)| bytes.as_slice() == program)
+                .filter(|(bytes, _, selected)| bytes.as_slice() == program && *selected == backend)
             {
                 Arc::clone(prepared)
             } else {
-                let prepared = Arc::new(vos_pvm::refine::PreparedProgram::new(program)?);
-                *entry = Some((program.to_vec(), Arc::clone(&prepared)));
+                let prepared = Arc::new(vos_pvm::refine::PreparedProgram::new_with_backend(
+                    program, backend,
+                )?);
+                *entry = Some((program.to_vec(), Arc::clone(&prepared), backend));
                 prepared
             }
         };
@@ -3222,8 +3244,12 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         let invocation = self
             .runtime_preparation
             .load(runtime_pvm, input, gas)
-            .map_err(|_| LocalReplayExecutorError::RuntimeOutput)?
-            .run();
+            .map_err(|error| match error {
+                vos_pvm::refine::RefineError::Backend => LocalReplayExecutorError::RuntimeBackend,
+                _ => LocalReplayExecutorError::RuntimeOutput,
+            })?
+            .try_run()
+            .map_err(|_| LocalReplayExecutorError::RuntimeBackend)?;
         if invocation.exit != ExitReason::Halt {
             return Err(LocalReplayExecutorError::RuntimeExit {
                 reason: invocation.exit,
@@ -3243,21 +3269,37 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         input: &[u8],
     ) -> Result<T, LocalReplayExecutorError> {
         let started = std::time::Instant::now();
-        let context = self
-            .runtime_preparation
-            .load(runtime_pvm, input, gas)
-            .map_err(|_| LocalReplayExecutorError::RuntimeOutput)?;
+        #[cfg(test)]
+        let observe = (input.len() > 700_000
+            || std::env::var_os("VOS_AGENT_PROFILE_REFINE_ALL_INPUTS").is_some())
+            && std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some()
+            && std::env::var_os("VOS_AGENT_DISABLE_REFINE_ATTRIBUTION").is_none();
+        #[cfg(not(test))]
+        let observe = false;
+        // Instruction attribution is explicitly the sparse reference path,
+        // even when ordinary physical execution selects the native backend.
+        // Native-memory snapshots scan the complete logical address span.
+        let loaded = if observe {
+            RefineContext::load_with_backend(
+                runtime_pvm,
+                input,
+                gas,
+                vos_pvm::refine::MemoryModel::Sparse,
+                vos_pvm::PvmBackend::ForceInterpreter,
+            )
+        } else {
+            self.runtime_preparation.load(runtime_pvm, input, gas)
+        };
+        let context = loaded.map_err(|error| match error {
+            vos_pvm::refine::RefineError::Backend => LocalReplayExecutorError::RuntimeBackend,
+            _ => LocalReplayExecutorError::RuntimeOutput,
+        })?;
         let preparation_us = started.elapsed().as_micros() as u64;
         let execution_started = std::time::Instant::now();
         #[cfg(test)]
-        let invocation = if (input.len() > 700_000
-            || std::env::var_os("VOS_AGENT_PROFILE_REFINE_ALL_INPUTS").is_some())
-            && std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some()
-            // Physical qualification also uses PROFILE_REFINE_MACHINES to
-            // disable fixture-native execution. Permit that same real PVM
-            // path without per-instruction callbacks and hot-PC sorting.
-            && std::env::var_os("VOS_AGENT_DISABLE_REFINE_ATTRIBUTION").is_none()
-        {
+        // PROFILE_REFINE_MACHINES also disables fixture-native execution.
+        // DISABLE_REFINE_ATTRIBUTION keeps that real PVM path unobserved.
+        let invocation = if observe {
             profile_refine_machines(
                 context,
                 input.len(),
@@ -3266,10 +3308,14 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
                     .copied(),
             )
         } else {
-            context.run()
+            context
+                .try_run()
+                .map_err(|_| LocalReplayExecutorError::RuntimeBackend)?
         };
         #[cfg(not(test))]
-        let invocation = context.run();
+        let invocation = context
+            .try_run()
+            .map_err(|_| LocalReplayExecutorError::RuntimeBackend)?;
         tracing::debug!(
             elapsed_us = started.elapsed().as_micros() as u64,
             preparation_us,
@@ -4990,6 +5036,9 @@ where
                     DEFAULT_MANAGEMENT_GAS,
                 )
                 .map_err(|error| match error {
+                    super::state_block_pvm::BlockPvmError::Backend => {
+                        LocalReplayExecutorError::RuntimeBackend
+                    }
                     super::state_block_pvm::BlockPvmError::Exit { reason, pc } => {
                         LocalReplayExecutorError::RuntimeExit { reason, pc }
                     }

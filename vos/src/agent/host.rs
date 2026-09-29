@@ -3766,6 +3766,9 @@ fn map_local_executor_error(error: LocalReplayExecutorError) -> AgentHostError {
         LocalReplayExecutorError::InvalidAuthority => AgentHostError::InvalidAuthority,
         LocalReplayExecutorError::Package(error) => AgentHostError::Package(error),
         LocalReplayExecutorError::Store(error) => map_journal_error(error),
+        LocalReplayExecutorError::RuntimeBackend => {
+            AgentHostError::Journal(AgentHostJournalError::Unavailable)
+        }
         LocalReplayExecutorError::InvalidState
         | LocalReplayExecutorError::InvalidRequest
         | LocalReplayExecutorError::ArtifactUnavailable(_)

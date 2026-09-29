@@ -7,11 +7,11 @@
 //! producer-private Refine witness is an atomic store sidecar and is never
 //! encoded in the public host image or returned to followers.
 //!
-//! The current journal replay executor does not yet expose a tentative
-//! publication transaction, so this module is crate-private until the clean
-//! replay driver owns the verified-publication boundary. The bundled Standard
-//! runtime's target-only attested ABI is driven only by the physical adapter.
-//! Non-attested execution continues through the existing replay path.
+//! These crate-private authenticated admission and publication contracts are
+//! retained for canonical journal validation and replay. The first release
+//! has no physical Agent Attested proof-production adapter; it cannot produce
+//! an attested transition by selecting a host feature. Non-attested execution
+//! continues through the existing replay path.
 //! The bounded host image retains only unfinished publication workflows.
 //! Once the authoritative journal has durably published a verified tuple,
 //! the local workflow is reclaimed; exact retries recover that tuple from
@@ -37,9 +37,6 @@ use super::sdk::{
 use super::sdk::{contract::ActorPackageContract, contract::RuntimePackageContract};
 use crate::actors::codec::Decode as _;
 use crate::actors::value::{Msg, TAG_DYNAMIC};
-
-#[cfg(feature = "agent-transition-proof")]
-pub(crate) mod physical;
 
 const TRANSITION_PROOF_HOST_MAGIC: [u8; 4] = *b"APH5";
 // A single atomic Shared replay/CAS batch may contain this many clean work
@@ -2834,17 +2831,8 @@ fn decode_retained(decoder: &mut Decoder<'_>) -> Result<RetainedTransition, Deco
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "agent-transition-proof")]
-    use std::cell::Cell;
     use std::cell::RefCell;
     use std::rc::Rc;
-
-    #[cfg(feature = "agent-transition-proof")]
-    use super::physical::{
-        AttestedRuntimeProgramLoader, Ed25519PhysicalTransitionSigner, PhysicalRefineProofProducer,
-        PhysicalRefineRouteComponents, PhysicalRefineRouteOpenError, STANDARD_INVOKE_GAS_OVERHEAD,
-        STANDARD_RESUME_GAS_LIMIT, standard_refine_proof_system, standard_runtime_gas,
-    };
 
     use crate::actors::codec::Encode as _;
     use crate::agent::sdk::{
@@ -5506,271 +5494,5 @@ mod tests {
         ));
         assert_eq!(executor.calls, 0);
         assert_eq!(publisher.effective_publications(), 0);
-    }
-
-    #[cfg(feature = "agent-transition-proof")]
-    #[test]
-    fn physical_refine_path_binds_same_run_output_and_replays_exact_proof() {
-        use core::convert::Infallible;
-
-        use vos_pvm_compiler::assembler::{Assembler, Reg};
-        use vos_pvm_proof::{
-            decode_refine_proof_bundle, encode_refine_proof_bundle, refine_bundle_commitment,
-        };
-
-        struct ProgramSource {
-            program: ProgramId,
-            bytes: Vec<u8>,
-            loads: Rc<Cell<usize>>,
-        }
-
-        impl AttestedRuntimeProgramLoader for ProgramSource {
-            type Error = Infallible;
-
-            fn load_attested_runtime_program(
-                &self,
-                program: ProgramId,
-            ) -> Result<Option<Vec<u8>>, Self::Error> {
-                self.loads.set(self.loads.get() + 1);
-                Ok((program == self.program).then(|| self.bytes.clone()))
-            }
-        }
-
-        let proof_system = standard_refine_proof_system();
-        let mut runtime_work = work(0x71);
-        let RuntimeWork::Invoke {
-            context,
-            state,
-            invocation,
-            ..
-        } = &mut runtime_work
-        else {
-            unreachable!()
-        };
-        *context = RuntimeExecutionContext::Attested { proof_system };
-        let mut successor = state.clone();
-        successor.linear = b"physically-proved-linear-successor".to_vec();
-        let transition = RuntimeTransition {
-            state: successor,
-            outcome: RuntimeOutcome::Completed(Ok(InvocationReply {
-                invocation: invocation.invocation,
-                actor: invocation.actor,
-                incarnation: invocation.incarnation,
-                deployment: invocation.deployment,
-                mode: invocation.mode,
-                lane: invocation.mode.write_lane(),
-                status: InvocationStatus::Done,
-                reply: b"proved".to_vec(),
-                gas_remaining: invocation.gas - 1,
-                observation: Default::default(),
-            })),
-        };
-        let invocation_gas = invocation.gas;
-        let canonical_work = runtime_work.encode().unwrap();
-        assert_eq!(
-            standard_runtime_gas(&runtime_work),
-            Some(STANDARD_INVOKE_GAS_OVERHEAD + invocation_gas)
-        );
-        assert_eq!(
-            standard_runtime_gas(&resume_work(0x71, 1)),
-            Some(STANDARD_RESUME_GAS_LIMIT)
-        );
-        let canonical_transition = transition.encode().unwrap();
-        let public_io =
-            crate::agent_sdk::runtime_transition_public_io(&canonical_work, &canonical_transition);
-        let words = public_io
-            .as_bytes()
-            .chunks_exact(8)
-            .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
-            .collect::<Vec<_>>();
-        let mut assembler = Assembler::new();
-        assembler
-            .set_rw_data(canonical_transition.clone())
-            .load_imm_64(Reg::A0, 2 * u64::from(vos_pvm::PVM_ZONE_SIZE))
-            .load_imm_64(Reg::A1, canonical_transition.len() as u64)
-            .load_imm_64(Reg::A2, words[0])
-            .load_imm_64(Reg::A3, words[1])
-            .load_imm_64(Reg::A4, words[2])
-            .load_imm_64(Reg::A5, words[3])
-            .jump_ind(Reg::RA, 0);
-        let runtime = assembler.build_standard();
-
-        let mut physical_route = route();
-        physical_route.runtime_program = ProgramId::of_pvm(&runtime);
-        physical_route.proof_system = proof_system;
-        let signer_seed = [0x71; 32];
-        let signer_public_key = ed25519_dalek::SigningKey::from_bytes(&signer_seed)
-            .verifying_key()
-            .to_bytes();
-        physical_route.producer = ProducerId::of_public_key(&signer_public_key);
-        let mut validator = FakeValidator::new(physical_route.clone());
-        let admission = validator
-            .authenticate_work(&physical_route, &runtime_work, &canonical_work)
-            .unwrap();
-        let authenticated = AuthenticatedAttestedTransition::authenticate_for_test(
-            &physical_route,
-            &runtime_work,
-            admission,
-        )
-        .unwrap();
-        let missing_loads = Rc::new(Cell::new(0));
-        assert!(matches!(
-            PhysicalRefineRouteComponents::open(
-                physical_route.clone(),
-                ProgramSource {
-                    program: ProgramId([0xfe; 32]),
-                    bytes: runtime.clone(),
-                    loads: missing_loads.clone(),
-                },
-                Ed25519PhysicalTransitionSigner::from_seed(signer_seed),
-            ),
-            Err(PhysicalRefineRouteOpenError::MissingProgram)
-        ));
-        assert_eq!(missing_loads.get(), 1);
-
-        let substituted_loads = Rc::new(Cell::new(0));
-        assert!(matches!(
-            PhysicalRefineRouteComponents::open(
-                physical_route.clone(),
-                ProgramSource {
-                    program: physical_route.runtime_program,
-                    bytes: vec![0xff],
-                    loads: substituted_loads.clone(),
-                },
-                Ed25519PhysicalTransitionSigner::from_seed(signer_seed),
-            ),
-            Err(PhysicalRefineRouteOpenError::InvalidRoute)
-        ));
-        assert_eq!(substituted_loads.get(), 1);
-
-        let mut wrong_producer_route = physical_route.clone();
-        wrong_producer_route.producer = ProducerId([0xfd; 32]);
-        let wrong_producer_loads = Rc::new(Cell::new(0));
-        assert!(matches!(
-            PhysicalRefineRouteComponents::open(
-                wrong_producer_route,
-                ProgramSource {
-                    program: physical_route.runtime_program,
-                    bytes: runtime.clone(),
-                    loads: wrong_producer_loads.clone(),
-                },
-                Ed25519PhysicalTransitionSigner::from_seed(signer_seed),
-            ),
-            Err(PhysicalRefineRouteOpenError::WrongProducer)
-        ));
-        assert_eq!(wrong_producer_loads.get(), 0);
-
-        let loads = Rc::new(Cell::new(0));
-        let source = ProgramSource {
-            program: physical_route.runtime_program,
-            bytes: runtime.clone(),
-            loads: loads.clone(),
-        };
-        let components = PhysicalRefineRouteComponents::open(
-            physical_route.clone(),
-            source,
-            Ed25519PhysicalTransitionSigner::from_seed(signer_seed),
-        )
-        .unwrap();
-        assert_eq!(loads.get(), 1);
-        let (mut executor, mut producer, verifier) = components.into_parts();
-        let tentative = executor
-            .execute_tentative(&authenticated, &canonical_work)
-            .unwrap();
-        assert_eq!(tentative.transition, transition);
-        assert_eq!(tentative.public_io, public_io);
-        assert_eq!(loads.get(), 2);
-
-        let subject = subject_for(
-            &physical_route,
-            &runtime_work,
-            authenticated.method().into(),
-        )
-        .unwrap();
-        let before = state_roots(match &runtime_work {
-            RuntimeWork::Invoke { state, .. } => state,
-            _ => unreachable!(),
-        });
-        let after = state_roots(&transition.state);
-        let statement = TransitionProofStatement {
-            subject,
-            before,
-            after,
-            work: TransitionProofStatement::work_commitment(&canonical_work),
-            transition: TransitionProofStatement::transition_commitment(&canonical_transition),
-            refine_trace: tentative.refine_trace,
-            public_io: tentative.public_io,
-            proof_system,
-        };
-        let witness = ProducerPrivateWitness {
-            statement: statement.commitment().unwrap(),
-            bytes: tentative.private_witness,
-        };
-        let material = producer
-            .prove_nested_refine(&authenticated, &statement, &witness)
-            .unwrap();
-        assert_eq!(material, witness.bytes);
-        let mut restarted_producer = PhysicalRefineProofProducer::new(
-            Ed25519PhysicalTransitionSigner::from_seed(signer_seed),
-        );
-        assert_eq!(
-            restarted_producer
-                .prove_nested_refine(&authenticated, &statement, &witness)
-                .unwrap(),
-            material,
-            "restart must reuse the exact durably prepared proof without execution"
-        );
-
-        let signed_message = b"physical-transition-record";
-        let signature = producer
-            .sign_transition_record(&authenticated, signed_message)
-            .unwrap();
-        assert!(verifier.verify_producer(&producer.public_key(), signed_message, &signature));
-
-        assert!(verifier.verify_transition_exact(
-            &statement,
-            &canonical_work,
-            &canonical_transition,
-            &material,
-        ));
-        assert!(!verifier.verify_transition(&statement, &material));
-
-        let mut substituted_transition = transition.clone();
-        substituted_transition.state.linear.push(0xff);
-        assert!(!verifier.verify_transition_exact(
-            &statement,
-            &canonical_work,
-            &substituted_transition.encode().unwrap(),
-            &material,
-        ));
-        let mut substituted_statement = statement.clone();
-        substituted_statement.public_io.0[0] ^= 1;
-        assert!(!verifier.verify_transition_exact(
-            &substituted_statement,
-            &canonical_work,
-            &canonical_transition,
-            &material,
-        ));
-
-        let mut substituted_bundle = decode_refine_proof_bundle(
-            &material,
-            crate::agent_sdk::MAX_TRANSITION_PROOF_MATERIAL_BYTES,
-        )
-        .unwrap();
-        substituted_bundle
-            .slices
-            .last_mut()
-            .unwrap()
-            .proof
-            .final_state
-            .registers[9] ^= 1;
-        substituted_bundle.transcript_commitment = refine_bundle_commitment(&substituted_bundle);
-        let substituted_material = encode_refine_proof_bundle(&substituted_bundle).unwrap();
-        assert!(!verifier.verify_transition_exact(
-            &statement,
-            &canonical_work,
-            &canonical_transition,
-            &substituted_material,
-        ));
     }
 }

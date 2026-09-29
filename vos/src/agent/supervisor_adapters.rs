@@ -4039,83 +4039,6 @@ pub(crate) fn qualify_external_local_route_for_test(
     attachment.retire().unwrap();
 }
 
-#[cfg(feature = "private-agent-store")]
-struct PrivateAgentRouteBackend {
-    host: super::private_host::PrivateAgentHost,
-}
-
-#[cfg(feature = "private-agent-store")]
-fn private_agent_route_readiness() -> Result<(), AgentRouteError> {
-    // Private invocation availability is not implied by a valid management
-    // or ciphertext-sync host. Until a ciphertext-preserving invocation
-    // adapter exists, the only safe readiness state is unpublished.
-    Err(AgentRouteError::NotReady)
-}
-
-#[cfg(feature = "private-agent-store")]
-impl CleanAgentRouteBackend for PrivateAgentRouteBackend {
-    fn identities(&mut self) -> Result<Vec<AgentRouteIdentity>, AgentRouteError> {
-        self.host
-            .supervisor_route_identities()
-            .map_err(|_| AgentRouteError::Unavailable)
-    }
-
-    fn ready(&mut self) -> Result<(), AgentRouteError> {
-        // The current Private host deliberately exposes management and
-        // ciphertext sync only. Publishing a plaintext invocation route or
-        // pretending it can use the Direct Local/Shared path would violate
-        // its confidentiality boundary.
-        private_agent_route_readiness()
-    }
-
-    fn invoke(
-        &mut self,
-        _identity: AgentRouteIdentity,
-        _request: AgentInvocationRequest,
-    ) -> Result<AgentInvocationResponse, AgentRouteError> {
-        Err(AgentRouteError::NotReady)
-    }
-
-    fn resume(
-        &mut self,
-        _identity: AgentRouteIdentity,
-        _request: AgentResumeRequest,
-    ) -> Result<AgentResumeResponse, AgentRouteError> {
-        Err(AgentRouteError::NotReady)
-    }
-
-    fn acknowledge(
-        &mut self,
-        _identity: AgentRouteIdentity,
-        _request: AgentAcknowledgementRequest,
-    ) -> Result<AgentAcknowledgementResponse, AgentRouteError> {
-        Err(AgentRouteError::NotReady)
-    }
-
-    fn prepare(
-        &mut self,
-        _identity: AgentRouteIdentity,
-    ) -> Result<super::invocation_preparation::PhysicalInvocationMaterial, AgentRouteError> {
-        Err(AgentRouteError::NotReady)
-    }
-}
-
-/// Move a Private host under exclusive lifecycle ownership while keeping all
-/// routes fail-closed. Attaching this bundle is intentionally rejected and
-/// retires the owned host until a real ciphertext invocation adapter exists;
-/// there is no plaintext or fake Direct fallback.
-#[cfg(feature = "private-agent-store")]
-pub fn private_agent_supervisor_attachment(
-    host: super::private_host::PrivateAgentHost,
-    queue_capacity: usize,
-) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError> {
-    spawn_backend(
-        PrivateAgentRouteBackend { host },
-        queue_capacity,
-        "vos-private-agent-route",
-    )
-}
-
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 struct SharedAgentRouteBackend {
     host: crate::network::SharedAgentNetworkHost,
@@ -7967,14 +7890,5 @@ mod tests {
         node.collect_checked().unwrap();
         assert!(system_route.retired.load(Ordering::Acquire));
         assert!(!supervisor.is_running());
-    }
-
-    #[cfg(feature = "private-agent-store")]
-    #[test]
-    fn private_route_policy_is_unconditionally_fail_closed() {
-        assert_eq!(
-            private_agent_route_readiness(),
-            Err(AgentRouteError::NotReady)
-        );
     }
 }

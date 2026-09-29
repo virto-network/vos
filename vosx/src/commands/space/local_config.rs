@@ -15,20 +15,29 @@ pub(crate) const IMAGE_LOCAL_LIFECYCLE_DIRECTORY: &str = "local-agent-lifecycle"
 pub(crate) const EXTERNAL_LOCAL_JOURNAL_DIRECTORY: &str = "local-agent-external";
 pub(crate) const EXTERNAL_LOCAL_LIFECYCLE_DIRECTORY: &str = "local-agent-external-lifecycle";
 
-/// Immutable-at-deployment Local persistence choice. Missing fields on older
-/// nodes keep the existing image path; external-state never means an in-place
-/// reinterpretation of either image root.
+/// Production Local is image-based. Keep the retired external-state spelling
+/// recognizable so old experimental configurations fail explicitly, rather
+/// than silently selecting image storage or reinterpreting an existing root.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum LocalAgentStorage {
     #[default]
     Image,
+    /// Retired public experiment; accepted by decoding only for explicit refusal.
     ExternalState,
 }
 
 impl LocalAgentStorage {
     fn is_image(&self) -> bool {
         *self == Self::Image
+    }
+
+    pub(crate) fn require_supported(self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self == Self::Image,
+            "external-state Local deployment is unsupported; preserve its roots and use a fresh image-based Local deployment (no in-place migration)",
+        );
+        Ok(())
     }
 }
 
@@ -38,7 +47,7 @@ pub struct LocalConfig {
     /// Persistent libp2p listen addresses. `space up --listen` overrides these.
     #[serde(default)]
     pub listen: Vec<String>,
-    /// Explicit Local storage format. Existing configs default to `image`.
+    /// Local storage format. Only `image` is supported, including candidate builds.
     #[serde(default, skip_serializing_if = "LocalAgentStorage::is_image")]
     pub local_agent_storage: LocalAgentStorage,
     /// Certified system bootstrap input. Relative paths resolve under the
@@ -87,15 +96,11 @@ pub(crate) fn validate_local_storage_roots(
     data_dir: &Path,
     selected: LocalAgentStorage,
 ) -> anyhow::Result<()> {
-    let forbidden = match selected {
-        LocalAgentStorage::Image => [
-            EXTERNAL_LOCAL_JOURNAL_DIRECTORY,
-            EXTERNAL_LOCAL_LIFECYCLE_DIRECTORY,
-        ],
-        LocalAgentStorage::ExternalState => {
-            [IMAGE_LOCAL_HOST_DIRECTORY, IMAGE_LOCAL_LIFECYCLE_DIRECTORY]
-        }
-    };
+    selected.require_supported()?;
+    let forbidden = [
+        EXTERNAL_LOCAL_JOURNAL_DIRECTORY,
+        EXTERNAL_LOCAL_LIFECYCLE_DIRECTORY,
+    ];
     for name in forbidden {
         let path = data_dir.join(name);
         match std::fs::symlink_metadata(&path) {
@@ -112,8 +117,7 @@ pub(crate) fn validate_local_storage_roots(
     Ok(())
 }
 
-/// Image Install cannot write an external-state root. Opt-in LCQ2 Create uses
-/// its own path, while external Install is not yet public lifecycle ingress.
+/// Production Local Create/Install cannot write an external-state root.
 /// Reject before the CLI reserves a credential or writes a request file.
 pub(crate) fn require_image_local_lifecycle(data_dir: &Path) -> anyhow::Result<()> {
     anyhow::ensure!(
@@ -205,11 +209,14 @@ pub fn load(data_dir: &Path) -> anyhow::Result<LocalConfig> {
     };
     let text = std::str::from_utf8(&bytes)
         .map_err(|error| anyhow::anyhow!("{} is not UTF-8: {error}", config_path.display()))?;
-    toml::from_str(text)
-        .map_err(|error| anyhow::anyhow!("parse {}: {error}", config_path.display()))
+    let config: LocalConfig = toml::from_str(text)
+        .map_err(|error| anyhow::anyhow!("parse {}: {error}", config_path.display()))?;
+    config.local_agent_storage.require_supported()?;
+    Ok(config)
 }
 
 pub fn save(data_dir: &Path, config: &LocalConfig) -> anyhow::Result<()> {
+    config.local_agent_storage.require_supported()?;
     let config_path = path(data_dir);
     let body = toml::to_string_pretty(config)
         .map_err(|error| anyhow::anyhow!("encode local.toml: {error}"))?;
@@ -282,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_external_selection_never_reuses_image_roots() {
+    fn retired_external_selection_fails_before_writes_and_never_reuses_roots() {
         let config: LocalConfig = toml::from_str("local_agent_storage = 'external-state'").unwrap();
         assert_eq!(config.local_agent_storage, LocalAgentStorage::ExternalState);
         assert!(
@@ -314,10 +321,41 @@ mod tests {
         )));
         std::fs::create_dir(&root.0).unwrap();
         validate_local_storage_roots(&root.0, LocalAgentStorage::Image).unwrap();
-        validate_local_storage_roots(&root.0, LocalAgentStorage::ExternalState).unwrap();
-        save(&root.0, &config).unwrap();
+        let error =
+            validate_local_storage_roots(&root.0, LocalAgentStorage::ExternalState).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("external-state Local deployment is unsupported")
+        );
+        assert!(save(&root.0, &config).is_err());
+        assert_eq!(std::fs::read_dir(&root.0).unwrap().count(), 0);
+        // Model a config written by the retired experiment, not by this binary.
+        let retired_config = b"local_agent_storage = 'external-state'\n";
+        std::fs::write(path(&root.0), retired_config).unwrap();
+        assert!(load(&root.0).is_err());
         assert!(require_image_local_lifecycle(&root.0).is_err());
+        #[cfg(target_os = "linux")]
+        {
+            let operator = libp2p::identity::Keypair::ed25519_from_bytes([0x73; 32]).unwrap();
+            let error = super::super::local_create::create_local(
+                &root.0,
+                "127.0.0.1:1".parse().unwrap(),
+                &operator,
+                vos::agent::sdk::SpaceId([1; 32]),
+                [2; 32],
+                false,
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("external-state Local deployment is unsupported")
+            );
+        }
         assert!(!root.0.join("agent-client").exists());
+        assert_eq!(std::fs::read_dir(&root.0).unwrap().count(), 1);
+        assert_eq!(std::fs::read(path(&root.0)).unwrap(), retired_config);
         save(&root.0, &LocalConfig::default()).unwrap();
         require_image_local_lifecycle(&root.0).unwrap();
 
@@ -330,6 +368,7 @@ mod tests {
         let external = root.0.join(EXTERNAL_LOCAL_JOURNAL_DIRECTORY);
         std::fs::create_dir(&external).unwrap();
         assert!(validate_local_storage_roots(&root.0, LocalAgentStorage::Image).is_err());
-        validate_local_storage_roots(&root.0, LocalAgentStorage::ExternalState).unwrap();
+        assert!(validate_local_storage_roots(&root.0, LocalAgentStorage::ExternalState).is_err());
+        assert!(external.is_dir());
     }
 }

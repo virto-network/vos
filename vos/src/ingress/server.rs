@@ -431,7 +431,7 @@ fn handle_clean_inventory(
     }
 }
 
-/// Signed-body authentication: LCQ1 (or opt-in LCQ2) verifies ACC3 locally;
+/// Signed-body authentication: image Local LCQ1 verifies ACC3 locally;
 /// the live Authority independently authorizes the exact request before issue.
 #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
 fn handle_local_create(
@@ -459,26 +459,10 @@ fn handle_local_create(
         return text(415, "Local Create requires application/octet-stream");
     }
     let pending = if request.body().starts_with(b"LCQ2") {
-        #[cfg(feature = "experimental-state-blocks")]
-        {
-            let submission = match crate::agent::local_lifecycle::LocalStateCreateSubmission::decode(
-                request.body(),
-            ) {
-                Ok(value) => value,
-                Err(_) => return text(400, "invalid signed external Local Create submission"),
-            };
-            if submission.call().authenticated_node.is_some() {
-                return text(
-                    403,
-                    "HTTP Local Create does not accept transport-node claims",
-                );
-            }
-            handle.create_clean_external_local_agent(submission)
-        }
-        #[cfg(not(feature = "experimental-state-blocks"))]
-        {
-            return text(400, "external Local Create is not available in this build");
-        }
+        // The experimental codec remains for storage qualification, not public
+        // Local admission. Refuse before decoding, queueing or durable work in
+        // every feature combination; v1 Local roots remain image-based.
+        return text(400, "external Local Create is not supported in v1");
     } else {
         let submission = match LocalCreateSubmission::decode(request.body()) {
             Ok(value) => value,
@@ -1109,10 +1093,14 @@ mod tests {
                 .header(http::header::CONTENT_TYPE, content_type)
                 .body(body)
                 .unwrap();
-            assert_eq!(
-                handle_local_create(&request, &handle).status().as_u16(),
-                expected
-            );
+            let response = handle_local_create(&request, &handle);
+            assert_eq!(response.status().as_u16(), expected);
+            if request.body().starts_with(b"LCQ2") {
+                assert_eq!(
+                    response.body(),
+                    b"external Local Create is not supported in v1"
+                );
+            }
             assert_eq!(
                 handle_clean_invocation(&request, &handle).status().as_u16(),
                 expected

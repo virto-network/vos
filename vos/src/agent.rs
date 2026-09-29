@@ -82,18 +82,8 @@ pub mod machine;
 pub mod package;
 #[cfg(feature = "std")]
 pub mod package_admission;
-#[cfg(feature = "private-agent-store")]
-pub(crate) mod private_control_application_coordinator;
 #[cfg(feature = "private-agent-crypto")]
 pub mod private_crypto;
-#[cfg(feature = "private-agent-store")]
-pub mod private_host;
-#[cfg(feature = "private-agent-store")]
-pub mod private_runtime;
-#[cfg(feature = "private-agent-store")]
-pub mod private_store;
-#[cfg(feature = "private-agent-store")]
-pub mod private_sync;
 #[cfg(all(
     feature = "std",
     feature = "storage",

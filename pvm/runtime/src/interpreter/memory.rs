@@ -333,9 +333,74 @@ impl PagePerms {
 /// check doubles as the byte-range check.
 #[derive(Clone, Debug, Default)]
 pub struct FlatMem {
-    bytes: Vec<u8>,
+    bytes: FlatBytes,
     perms: PagePerms,
     value_revision: u64,
+}
+
+/// Keep the established checked memory API while allowing native execution to
+/// address the same bytes through its separately protected mapping.
+#[derive(Debug)]
+enum FlatBytes {
+    Owned(Vec<u8>),
+    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    Native(crate::recompiler::memory::NativeMemory),
+}
+
+impl Default for FlatBytes {
+    fn default() -> Self {
+        Self::Owned(Vec::new())
+    }
+}
+
+impl Clone for FlatBytes {
+    fn clone(&self) -> Self {
+        Self::Owned(self.to_vec())
+    }
+}
+
+impl core::ops::Deref for FlatBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+            Self::Native(bytes) => bytes,
+        }
+    }
+}
+
+impl core::ops::DerefMut for FlatBytes {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+            Self::Native(bytes) => bytes,
+        }
+    }
+}
+
+impl FlatBytes {
+    fn clear_pages(&mut self, first: usize, count: usize) -> bool {
+        match self {
+            Self::Owned(bytes) => {
+                bytes[first * PAGE..(first + count) * PAGE].fill(0);
+                true
+            }
+            #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+            Self::Native(bytes) => bytes.clear_pages(first, count),
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Owned(bytes) => bytes.capacity(),
+            // As with the old lazily zeroed flat Vec, report reserved capacity,
+            // not physical RSS; this is intentionally not an RSS estimator.
+            #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+            Self::Native(bytes) => bytes.len(),
+        }
+    }
 }
 
 impl FlatMem {
@@ -346,7 +411,7 @@ impl FlatMem {
         let pages = bytes.len().div_ceil(PAGE);
         bytes.resize(pages * PAGE, 0);
         Self {
-            bytes,
+            bytes: FlatBytes::Owned(bytes),
             perms: PagePerms::new_rw(pages),
             value_revision: 0,
         }
@@ -547,6 +612,36 @@ macro_rules! dispatch {
 }
 
 impl Memory {
+    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn native(span: u64) -> Result<Self, alloc::string::String> {
+        let bytes = crate::recompiler::memory::NativeMemory::new(span as usize)?;
+        Ok(Self::Flat(FlatMem {
+            bytes: FlatBytes::Native(bytes),
+            perms: PagePerms::new_rw(span as usize / PAGE),
+            value_revision: 0,
+        }))
+    }
+
+    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn native_window(
+        &mut self,
+    ) -> Result<&crate::backing::CodeWindow, alloc::string::String> {
+        let Self::Flat(memory) = self else {
+            return Err("native execution requires native memory".into());
+        };
+        let FlatBytes::Native(bytes) = &mut memory.bytes else {
+            return Err("native execution requires native memory".into());
+        };
+        bytes.sync_permissions(memory.perms.as_slice(), memory.perms.revision())?;
+        // Native stores bypass checked host writes. Invalidate cached value
+        // commitments at every execution boundary, including fault boundaries.
+        memory.value_revision = memory
+            .value_revision
+            .checked_add(1)
+            .expect("memory revision cannot wrap in one invocation");
+        Ok(bytes.window())
+    }
+
     /// Flat memory over `bytes` (zero-padded to whole pages), all pages RW.
     pub fn flat(bytes: Vec<u8>) -> Self {
         Self::Flat(FlatMem::new(bytes))
@@ -616,6 +711,9 @@ impl Memory {
     /// Reset complete pages to zero without allocating untouched sparse
     /// frames. Existing sparse frames are retained and cleared, so repeatedly
     /// recycling one page range cannot grow host memory.
+    /// Native shared mappings discard backing pages instead of eagerly
+    /// writing a zero-filled heap. Returns `false` for an invalid range or a
+    /// failed native discard; callers must not continue execution on failure.
     pub fn clear_pages(&mut self, first: usize, count: usize) -> bool {
         let Some(end) = first.checked_add(count) else {
             return false;
@@ -625,7 +723,9 @@ impl Memory {
         }
         match self {
             Memory::Flat(m) => {
-                m.bytes[first * PAGE..end * PAGE].fill(0);
+                if !m.bytes.clear_pages(first, count) {
+                    return false;
+                }
                 if count != 0 {
                     m.value_revision = m
                         .value_revision

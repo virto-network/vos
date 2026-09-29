@@ -8,9 +8,8 @@ use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::gas_cost::DEFAULT_MEM_CYCLES;
-use crate::interpreter::{Interpreter, Memory, PERM_NONE, PERM_RO, PERM_RW};
-use crate::program::ParsedCodeBlob;
+use crate::backend::{PreparedExecution, PvmBackend};
+use crate::interpreter::{Interpreter, PERM_NONE, PERM_RO, PERM_RW};
 use crate::spi::deblob;
 use crate::{ExitReason, Gas, IsaMode, PVM_PAGE_SIZE, PVM_REGISTER_COUNT};
 
@@ -22,6 +21,66 @@ pub const INNER_ADDRESS_PAGES: usize = (1u64 << 32) as usize / PVM_PAGE_SIZE as 
 
 /// The first page an inner machine may map.
 pub const INNER_FIRST_MAPPABLE_PAGE: u32 = 16;
+
+/// Only immutable preparation is retained between invocations: one exact
+/// compact program per worker thread, with a bounded admission size. This is
+/// not a program limit; larger programs continue through uncached preparation.
+#[cfg(feature = "std")]
+const MAX_CACHED_INNER_PROGRAM_BYTES: usize = 2 << 20;
+
+#[cfg(feature = "std")]
+struct CachedInnerPreparation {
+    program: Vec<u8>,
+    backend: PvmBackend,
+    execution: PreparedExecution,
+}
+
+#[cfg(feature = "std")]
+std::thread_local! {
+    static INNER_PREPARATION: core::cell::RefCell<Option<CachedInnerPreparation>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+fn prepare_inner_program(
+    program_blob: &[u8],
+    program: &crate::program::ParsedCodeBlob,
+    backend: PvmBackend,
+) -> Result<PreparedExecution, InnerError> {
+    let prepare = || {
+        PreparedExecution::new_standard(
+            &program.code,
+            &program.bitmask,
+            &program.jump_table,
+            backend,
+        )
+        .map_err(|_| InnerError::Backend)
+    };
+    #[cfg(feature = "std")]
+    if program_blob.len() <= MAX_CACHED_INNER_PROGRAM_BYTES
+        // Do not cache the environment-dependent Default selection. Refine
+        // contexts pass their already resolved outer backend to this layer.
+        && backend != PvmBackend::Default
+    {
+        return INNER_PREPARATION.with(|cached| {
+            if let Some(entry) = cached.borrow().as_ref()
+                && entry.backend == backend
+                && entry.program == program_blob
+            {
+                return Ok(entry.execution.clone());
+            }
+            let execution = prepare()?;
+            *cached.borrow_mut() = Some(CachedInnerPreparation {
+                program: program_blob.to_vec(),
+                backend,
+                execution: execution.clone(),
+            });
+            Ok(execution)
+        });
+    }
+    #[cfg(not(feature = "std"))]
+    let _ = program_blob;
+    prepare()
+}
 
 /// Stable host-call identifiers for the standard inner-machine surface.
 pub mod host_call {
@@ -74,6 +133,9 @@ pub enum InnerError {
     Unknown,
     /// The requested inner-memory range is not accessible.
     OutOfBounds,
+    /// The selected host backend could not prepare or execute the machine.
+    /// This is not a guest result and must not be translated to HUH.
+    Backend,
 }
 
 /// Page mutation requested through the standard `pages` operation.
@@ -168,31 +230,34 @@ pub enum InnerMachineObservation<'a> {
 struct InnerMachine {
     generation: u64,
     program_blob: Vec<u8>,
-    program: Option<ParsedCodeBlob>,
+    execution: PreparedExecution,
     initial_pc: u32,
     vm: Option<Interpreter>,
 }
 
 impl InnerMachine {
-    fn vm(&mut self) -> &mut Interpreter {
+    fn vm(&mut self) -> Result<&mut Interpreter, InnerError> {
         if self.vm.is_none() {
-            let program = self.program.take().expect("program exists until VM init");
-            let mut memory = Memory::sparse(1u64 << 32);
+            let mut memory = self
+                .execution
+                .allocate_memory(
+                    1u64 << 32,
+                    self.execution.backend() != PvmBackend::ForceRecompiler,
+                )
+                .map_err(|_| InnerError::Backend)?;
             memory.set_page_perms(vec![PERM_NONE; INNER_ADDRESS_PAGES]);
-            let mut vm = Interpreter::with_memory_and_mode(
-                program.code,
-                program.bitmask,
-                program.jump_table,
+            let mut vm = Interpreter::from_predecoded(
+                self.execution.interpreter_program().clone(),
                 [0; PVM_REGISTER_COUNT],
                 memory,
                 0,
-                DEFAULT_MEM_CYCLES,
+                crate::STANDARD_MEM_CYCLES,
                 IsaMode::Conformance,
             );
             vm.set_pc(self.initial_pc);
             self.vm = Some(vm);
         }
-        self.vm.as_mut().expect("initialized above")
+        Ok(self.vm.as_mut().expect("initialized above"))
     }
 
     fn pc(&self) -> u32 {
@@ -201,15 +266,31 @@ impl InnerMachine {
 }
 
 /// Per-Refine dictionary of standard inner machines.
-#[derive(Default)]
 pub struct InnerMachines {
     machines: BTreeMap<u32, InnerMachine>,
     next_generation: u64,
+    backend: PvmBackend,
+}
+
+impl Default for InnerMachines {
+    fn default() -> Self {
+        Self::with_backend(PvmBackend::ForceInterpreter)
+    }
 }
 
 impl InnerMachines {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Select execution for this invocation's dictionary. Each machine keeps
+    /// independent memory, registers and gas; only preparation is immutable.
+    pub fn with_backend(backend: PvmBackend) -> Self {
+        Self {
+            machines: BTreeMap::new(),
+            next_generation: 0,
+            backend,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -258,6 +339,7 @@ impl InnerMachines {
         // Ω_M maps a failed deblob to HUH; unlike full Ψ it does not create
         // a machine which immediately panics.
         let program = deblob(program_blob, u64::from(initial_pc)).ok_or(InnerError::Invalid)?;
+        let execution = prepare_inner_program(program_blob, &program, self.backend)?;
         let id = (0..MAX_INNER_MACHINES as u32)
             .find(|id| !self.machines.contains_key(id))
             .expect("a free ID exists below the machine limit");
@@ -271,7 +353,7 @@ impl InnerMachines {
             InnerMachine {
                 generation,
                 program_blob: program_blob.to_vec(),
-                program: Some(program),
+                execution,
                 initial_pc,
                 vm: None,
             },
@@ -283,7 +365,7 @@ impl InnerMachines {
     pub fn peek(&mut self, id: u32, source: u32, len: usize) -> Result<Vec<u8>, InnerError> {
         let machine = self.machines.get_mut(&id).ok_or(InnerError::Unknown)?;
         let mut out = vec![0u8; len];
-        if !machine.vm().memory().read_bytes_checked(source, &mut out) {
+        if !machine.vm()?.memory().read_bytes_checked(source, &mut out) {
             return Err(InnerError::OutOfBounds);
         }
         Ok(out)
@@ -293,7 +375,7 @@ impl InnerMachines {
     pub fn poke(&mut self, id: u32, destination: u32, data: &[u8]) -> Result<(), InnerError> {
         let machine = self.machines.get_mut(&id).ok_or(InnerError::Unknown)?;
         if !machine
-            .vm()
+            .vm()?
             .memory_mut()
             .write_bytes_checked(destination, data)
         {
@@ -316,7 +398,7 @@ impl InnerMachines {
             return Err(InnerError::Invalid);
         }
 
-        let vm = machine.vm();
+        let vm = machine.vm()?;
         let memory = vm.memory_mut();
         let first = first as usize;
         let count = count as usize;
@@ -335,7 +417,12 @@ impl InnerMachines {
             mode,
             PageMode::Free | PageMode::AllocateReadOnly | PageMode::AllocateReadWrite
         ) {
-            assert!(memory.clear_pages(first, count));
+            // A native mapping's host zeroing operation can fail even though
+            // this guest range is valid. Keep it distinct from guest HUH and
+            // never continue execution with uncleared bytes.
+            if !memory.clear_pages(first, count) {
+                return Err(InnerError::Backend);
+            }
         }
         assert!(memory.set_page_range(first, count, permission));
         Ok(())
@@ -348,7 +435,11 @@ impl InnerMachines {
 
     /// Resume a machine while exposing immutable entry, instruction, and
     /// exit observations. This follows [`Self::invoke`] exactly while keeping
-    /// the ordinary path on the interpreter's non-observing run loop.
+    /// the observed path explicitly on the reference interpreter. Ordinary
+    /// invocation uses the selected backend without per-instruction callbacks.
+    /// A dictionary selected for native execution still retains native memory;
+    /// proof/snapshot callers should construct it with `ForceInterpreter`,
+    /// which uses sparse inner memory.
     pub fn invoke_observed(
         &mut self,
         id: u32,
@@ -369,7 +460,10 @@ impl InnerMachines {
             slot: id,
             generation: machine.generation,
         };
-        let vm = machine.vm();
+        // Clone immutable preparation, never invocation state. The compiled
+        // program remains shared while the mutable architectural state is lent.
+        let execution = machine.execution.clone();
+        let vm = machine.vm()?;
         vm.gas = state.gas;
         vm.registers = state.registers;
         let mut observer = observer;
@@ -387,7 +481,7 @@ impl InnerMachines {
                 })
                 .0
             }
-            None => vm.run().0,
+            None => execution.run(vm).map_err(|_| InnerError::Backend)?,
         };
         let exit = match exit {
             ExitReason::Halt => {
@@ -450,6 +544,189 @@ mod tests {
 
     fn host_then_trap() -> Vec<u8> {
         compact_blob(&[10, 42, 0], &[0, 2])
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn preparation_cache_is_exact_worker_local_and_revalidates_each_entry() {
+        INNER_PREPARATION.with(|entry| *entry.borrow_mut() = None);
+        let blob = host_then_trap();
+        let mut machines = InnerMachines::new();
+        let first = machines.create(&blob, 0).unwrap();
+        let first = machines.machines[&first].execution.clone();
+        let second = machines.create(&blob, 2).unwrap();
+        assert!(
+            core::ptr::eq(
+                first.interpreter_program(),
+                machines.machines[&second].execution.interpreter_program()
+            ),
+            "valid different entry points share only immutable preparation"
+        );
+        assert_eq!(
+            machines.create(&blob, 1),
+            Err(InnerError::Invalid),
+            "a cache hit must not bypass entry-point validation"
+        );
+        let different_blob = compact_blob(&[10, 43, 0], &[0, 2]);
+        let different = machines.create(&different_blob, 0).unwrap();
+        assert!(!core::ptr::eq(
+            first.interpreter_program(),
+            machines.machines[&different]
+                .execution
+                .interpreter_program()
+        ));
+        INNER_PREPARATION.with(|entry| {
+            let entry = entry.borrow();
+            assert_eq!(entry.as_ref().unwrap().program, different_blob);
+        });
+        let replaced = machines.create(&blob, 0).unwrap();
+        let replaced = machines.machines[&replaced].execution.clone();
+        assert!(
+            !core::ptr::eq(first.interpreter_program(), replaced.interpreter_program()),
+            "the cache retains only its latest admitted program"
+        );
+        let worker = std::thread::spawn(move || {
+            let mut machines = InnerMachines::new();
+            let id = machines.create(&blob, 0).unwrap();
+            machines.machines[&id].execution.clone()
+        })
+        .join()
+        .unwrap();
+        assert!(
+            !core::ptr::eq(worker.interpreter_program(), replaced.interpreter_program()),
+            "another worker does not share a mutable/global cache"
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn preparation_cache_cap_and_default_bypass_do_not_change_admission() {
+        INNER_PREPARATION.with(|entry| *entry.borrow_mut() = None);
+        let blob = host_then_trap();
+        let mut machines = InnerMachines::new();
+        let warm = machines.create(&blob, 0).unwrap();
+        let warm = machines.machines[&warm].execution.clone();
+        // A canonical program larger than the cache ceiling still creates
+        // and executes. Sparse instruction starts keep this fixture modest.
+        let code = vec![0; MAX_CACHED_INNER_PROGRAM_BYTES];
+        let mut bitmask = vec![0; code.len()];
+        for start in (0..code.len()).step_by(25) {
+            bitmask[start] = 1;
+        }
+        let oversized = vos_pvm_program::build_compact_code_blob(&vos_pvm_program::CodeBlob {
+            code,
+            bitmask,
+            jump_table: Vec::new(),
+        })
+        .unwrap();
+        assert!(oversized.len() > MAX_CACHED_INNER_PROGRAM_BYTES);
+        let large = machines.create(&oversized, 0).unwrap();
+        assert_eq!(
+            machines
+                .invoke(
+                    large,
+                    InvokeState {
+                        gas: 1_000_000,
+                        registers: [0; PVM_REGISTER_COUNT],
+                    }
+                )
+                .unwrap()
+                .exit,
+            InnerExit::Panic
+        );
+        let mut default = InnerMachines::with_backend(PvmBackend::Default);
+        let id = default.create(&blob, 0).unwrap();
+        assert!(
+            !core::ptr::eq(
+                warm.interpreter_program(),
+                default.machines[&id].execution.interpreter_program()
+            ),
+            "environment-dependent backend selection must not hit the cache"
+        );
+        INNER_PREPARATION.with(|entry| {
+            let entry = entry.borrow();
+            let entry = entry.as_ref().unwrap();
+            assert_eq!(entry.program, blob);
+            assert_eq!(entry.backend, PvmBackend::ForceInterpreter);
+            assert!(
+                core::ptr::eq(
+                    entry.execution.interpreter_program(),
+                    warm.interpreter_program()
+                ),
+                "bypassed programs must not evict the admitted entry"
+            );
+        });
+    }
+
+    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn preparation_cache_binds_backend_and_never_retains_invocation_state() {
+        INNER_PREPARATION.with(|entry| *entry.borrow_mut() = None);
+        let blob = compact_blob(&[130, 2 + 16 * 3, 10, 42, 0], &[0, 2, 4]);
+        let mut reference = InnerMachines::new();
+        let reference_id = reference.create(&blob, 0).unwrap();
+        let reference_prepared = reference.machines[&reference_id].execution.clone();
+        let mut prior_prepared = None;
+        for value in [37u8, 71] {
+            let mut machines = InnerMachines::with_backend(PvmBackend::ForceRecompiler);
+            let id = machines.create(&blob, 0).unwrap();
+            let prepared = machines.machines[&id].execution.clone();
+            assert_eq!(prepared.backend(), PvmBackend::ForceRecompiler);
+            assert!(!core::ptr::eq(
+                reference_prepared.interpreter_program(),
+                prepared.interpreter_program()
+            ));
+            if let Some(prior) = &prior_prepared {
+                let prior: &PreparedExecution = prior;
+                assert!(core::ptr::eq(
+                    prior.interpreter_program(),
+                    prepared.interpreter_program()
+                ));
+            }
+            prior_prepared = Some(prepared);
+            let address = INNER_FIRST_MAPPABLE_PAGE * PVM_PAGE_SIZE;
+            let mut registers = [0; PVM_REGISTER_COUNT];
+            registers[3] = u64::from(address);
+            let fault = machines
+                .invoke(
+                    id,
+                    InvokeState {
+                        gas: 100_000,
+                        registers,
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                fault.exit,
+                InnerExit::Fault(address),
+                "fresh memory has no cached mappings"
+            );
+            machines
+                .pages(
+                    id,
+                    INNER_FIRST_MAPPABLE_PAGE,
+                    1,
+                    PageMode::AllocateReadWrite,
+                )
+                .unwrap();
+            assert_eq!(
+                machines.peek(id, address, 8).unwrap(),
+                [0; 8],
+                "no prior bytes survive"
+            );
+            machines.poke(id, address, &[value]).unwrap();
+            let host = machines.invoke(id, fault.state).unwrap();
+            assert_eq!(host.exit, InnerExit::Host(42));
+            assert_eq!(host.state.registers[2], u64::from(value));
+            let gas = host.state.gas;
+            let terminal = machines.invoke(id, host.state).unwrap();
+            assert_eq!(terminal.exit, InnerExit::Panic);
+            assert_eq!(
+                terminal.state.gas, gas,
+                "cached preparation does not change funded host resume"
+            );
+            assert_eq!(machines.expunge(id), Ok(0));
+        }
     }
 
     #[test]
@@ -625,6 +902,82 @@ mod tests {
                 .unwrap()
                 .exit,
             InnerExit::OutOfGas
+        );
+    }
+
+    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn recompiled_inner_matches_reference_across_fault_repair_host_resume_and_page_reuse() {
+        fn run(backend: PvmBackend) -> (Vec<InvokeOutcome>, Vec<u32>, Vec<u8>) {
+            let mut machines = InnerMachines::with_backend(backend);
+            // Load r2 from r3, host(42), trap. Repair a fault without resetting
+            // the funded gas block, then suspend/resume through the host call.
+            let blob = compact_blob(&[130, 2 + 16 * 3, 10, 42, 0], &[0, 2, 4]);
+            let id = machines.create(&blob, 0).unwrap();
+            let page = INNER_FIRST_MAPPABLE_PAGE;
+            let address = page * PVM_PAGE_SIZE;
+            let mut registers = [0; PVM_REGISTER_COUNT];
+            registers[3] = u64::from(address);
+            let mut outcomes = Vec::new();
+            let mut pcs = Vec::new();
+            let fault = machines
+                .invoke(
+                    id,
+                    InvokeState {
+                        gas: 100_000,
+                        registers,
+                    },
+                )
+                .unwrap();
+            assert_eq!(fault.exit, InnerExit::Fault(address));
+            outcomes.push(fault.clone());
+            pcs.push(machines.views().next().unwrap().machine.unwrap().pc);
+            machines
+                .pages(id, page, 1, PageMode::AllocateReadWrite)
+                .unwrap();
+            machines.poke(id, address, &[37]).unwrap();
+            machines.pages(id, page, 1, PageMode::SetReadOnly).unwrap();
+            assert_eq!(
+                machines.poke(id, address, &[99]),
+                Err(InnerError::OutOfBounds)
+            );
+            let resumed = machines.invoke(id, fault.state).unwrap();
+            assert_eq!(resumed.exit, InnerExit::Host(42));
+            assert_eq!(resumed.state.registers[2], 37);
+            outcomes.push(resumed.clone());
+            pcs.push(machines.views().next().unwrap().machine.unwrap().pc);
+            outcomes.push(machines.invoke(id, resumed.state).unwrap());
+            pcs.push(machines.expunge(id).unwrap());
+
+            // A reused slot and a fresh machine must not retain the old bytes.
+            let reused = machines.create(&blob, 0).unwrap();
+            assert_eq!(reused, id);
+            machines
+                .pages(reused, page, 1, PageMode::AllocateReadWrite)
+                .unwrap();
+            let bytes = machines.peek(reused, address, 8).unwrap();
+            assert_eq!(bytes, [0; 8]);
+            machines.poke(reused, address, &[71]).unwrap();
+            machines.pages(reused, page, 1, PageMode::Free).unwrap();
+            assert_eq!(
+                machines.peek(reused, address, 1),
+                Err(InnerError::OutOfBounds)
+            );
+            machines
+                .pages(reused, page, 1, PageMode::AllocateReadWrite)
+                .unwrap();
+            assert_eq!(machines.peek(reused, address, 8).unwrap(), [0; 8]);
+            outcomes.push(
+                machines
+                    .invoke(reused, InvokeState { gas: 0, registers })
+                    .unwrap(),
+            );
+            pcs.push(machines.expunge(reused).unwrap());
+            (outcomes, pcs, bytes)
+        }
+        assert_eq!(
+            run(PvmBackend::ForceRecompiler),
+            run(PvmBackend::ForceInterpreter)
         );
     }
 

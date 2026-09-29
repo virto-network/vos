@@ -1267,6 +1267,7 @@ impl<R: CatalogBlobResolver> ReplayExecutor for ExternalLocalReplayExecutor<R> {
         }
         .execute_admitted_journal(&self.runtime, genesis, input, before, position, lanes, gas)
         .map_err(|error| match error {
+            BlockPvmError::Backend => LocalReplayExecutorError::RuntimeBackend,
             BlockPvmError::Exit { reason, pc } => {
                 LocalReplayExecutorError::RuntimeExit { reason, pc }
             }

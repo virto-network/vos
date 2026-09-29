@@ -2134,6 +2134,8 @@ pub enum AgentDriverError {
         pc: u32,
     },
     RuntimeOutput,
+    /// Host compiler/memory failure, not a completed guest outcome.
+    RuntimeBackend,
     RuntimeStateTooLarge,
     PackageUnavailable(Hash),
     ProgramUnavailable(ProgramId),
@@ -2174,6 +2176,7 @@ impl From<RuntimePvmExecutionError> for AgentDriverError {
     fn from(error: RuntimePvmExecutionError) -> Self {
         match error {
             RuntimePvmExecutionError::Load => Self::InvalidRuntime,
+            RuntimePvmExecutionError::Backend => Self::RuntimeBackend,
             RuntimePvmExecutionError::Exit { reason, pc } => Self::RuntimeExit { reason, pc },
             RuntimePvmExecutionError::MissingOutput | RuntimePvmExecutionError::Decode => {
                 Self::RuntimeOutput
@@ -5638,6 +5641,10 @@ mod tests {
 
     #[test]
     fn runtime_pvm_failures_preserve_the_driver_error_contract() {
+        assert_eq!(
+            AgentDriverError::from(RuntimePvmExecutionError::Backend),
+            AgentDriverError::RuntimeBackend
+        );
         assert_eq!(
             AgentDriverError::from(RuntimePvmExecutionError::Load),
             AgentDriverError::InvalidRuntime

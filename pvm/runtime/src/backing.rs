@@ -47,8 +47,11 @@ impl BackingStore {
     /// lazily by the kernel on first write.
     pub fn new(total_pages: u32) -> Option<Self> {
         let name = b"pvm_untyped\0";
-        // SAFETY: memfd_create with a valid null-terminated name.
-        let fd = unsafe { libc::memfd_create(name.as_ptr() as *const libc::c_char, 0) };
+        // Set close-on-exec atomically: another thread may launch a process
+        // while an invocation is constructing its temporary shared mapping.
+        // SAFETY: memfd_create with a valid null-terminated name and flags.
+        let fd =
+            unsafe { libc::memfd_create(name.as_ptr() as *const libc::c_char, libc::MFD_CLOEXEC) };
         if fd < 0 {
             return None;
         }
@@ -524,6 +527,20 @@ mod tests {
     fn test_backing_store_create() {
         let store = BackingStore::new(10).expect("BackingStore::new failed");
         assert_eq!(store.total_pages(), 10);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn backing_descriptor_is_close_on_exec_before_it_can_escape() {
+        let store = BackingStore::new(1).unwrap();
+        // SAFETY: the live store owns this valid descriptor; F_GETFD is read-only.
+        let flags = unsafe { libc::fcntl(store.fd(), libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "a concurrently launched process must not inherit invocation memory"
+        );
     }
 
     #[test]

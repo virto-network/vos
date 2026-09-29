@@ -33,20 +33,7 @@ const BUNDLED_SYSTEM_AUTHORITY_PACKAGE: &[u8] =
     include_bytes!(env!("VOSX_BUNDLED_SYSTEM_AUTHORITY_PACKAGE"));
 const BUNDLED_SYSTEM_CATALOG_PACKAGE: &[u8] =
     include_bytes!(env!("VOSX_BUNDLED_SYSTEM_CATALOG_PACKAGE"));
-#[cfg(feature = "experimental-state-blocks")]
-const CANDIDATE_SYSTEM_AUTHORITY_PACKAGE: &[u8] =
-    include_bytes!(env!("VOSX_CANDIDATE_SYSTEM_AUTHORITY_PACKAGE"));
-#[cfg(feature = "experimental-state-blocks")]
-const CANDIDATE_STATE_RUNTIME_PVM: &[u8] = include_bytes!(env!("VOSX_CANDIDATE_STATE_RUNTIME_PVM"));
 const BUNDLED_AGENT_RUNTIME_PACKAGE_NAME: &str = "standard-agent-runtime";
-#[cfg(feature = "experimental-state-blocks")]
-const CANDIDATE_STATE_RUNTIME_PACKAGE_NAME: &str = "standard-agent-runtime-state";
-#[cfg(feature = "experimental-state-blocks")]
-const FIRST_CUSTOMER_LOCAL_STATE_LIMITS: vos::agent::sdk::contract::ExternalStateResourceLimits =
-    vos::agent::sdk::contract::ExternalStateResourceLimits {
-        max_rows_per_lane: 500_000,
-        max_row_bytes_per_lane: 512 * 1024 * 1024,
-    };
 
 /// Prepare the complete, root-signed package closure used by native bootstrap.
 /// Caching is availability only: installation still requires Authority approval.
@@ -120,34 +107,14 @@ pub(crate) fn system_authority_package_template() -> &'static [u8] {
     BUNDLED_SYSTEM_AUTHORITY_PACKAGE
 }
 
-/// Select the Authority identity only from the immutable node-local storage
-/// choice. An image deployment retains its released package identity even in
-/// an experimental binary. A missing candidate fails before startup opens a
-/// new external lifecycle root.
+/// The Local deployment always retains its released Authority identity,
+/// including artifact-tool builds. Refuse retired external configuration
+/// before selecting or preparing any candidate package.
 pub(crate) fn system_authority_package_template_for_storage(
     storage: crate::commands::space::local_config::LocalAgentStorage,
 ) -> anyhow::Result<&'static [u8]> {
-    use crate::commands::space::local_config::LocalAgentStorage;
-    match storage {
-        LocalAgentStorage::Image => Ok(system_authority_package_template()),
-        LocalAgentStorage::ExternalState => {
-            #[cfg(feature = "experimental-state-blocks")]
-            {
-                anyhow::ensure!(
-                    !CANDIDATE_SYSTEM_AUTHORITY_PACKAGE.is_empty()
-                        && !CANDIDATE_STATE_RUNTIME_PVM.is_empty(),
-                    "external-state Local storage requires a binary built with both checked experimental artifacts",
-                );
-                Ok(CANDIDATE_SYSTEM_AUTHORITY_PACKAGE)
-            }
-            #[cfg(not(feature = "experimental-state-blocks"))]
-            {
-                anyhow::bail!(
-                    "external-state Local storage requires an experimental-state-blocks build"
-                )
-            }
-        }
-    }
+    storage.require_supported()?;
+    Ok(system_authority_package_template())
 }
 
 pub(crate) fn system_authority_package_template_for_data_dir(
@@ -155,15 +122,6 @@ pub(crate) fn system_authority_package_template_for_data_dir(
 ) -> anyhow::Result<&'static [u8]> {
     let storage = crate::commands::space::local_config::load(data_dir)?.local_agent_storage;
     system_authority_package_template_for_storage(storage)
-}
-
-#[cfg(feature = "experimental-state-blocks")]
-pub(crate) fn candidate_state_runtime_pvm() -> anyhow::Result<&'static [u8]> {
-    anyhow::ensure!(
-        !CANDIDATE_STATE_RUNTIME_PVM.is_empty(),
-        "checked experimental state runtime is not bundled",
-    );
-    Ok(CANDIDATE_STATE_RUNTIME_PVM)
 }
 
 pub(crate) fn system_catalog_package_template() -> &'static [u8] {
@@ -192,22 +150,6 @@ pub(crate) fn root_signed_agent_runtime_package(
     // signer/producer binding, exact Ed25519 verification, and that the
     // bundled outer artifact parses as a canonical standard PVM.
     admit_runtime_package(&bytes).map_err(Into::into)
-}
-
-/// A separately admitted, explicitly capped package for new external Local
-/// Agents. No image deployment or Shared system Agent selects this runtime.
-#[cfg(feature = "experimental-state-blocks")]
-pub(crate) fn root_signed_candidate_state_runtime_package(
-    root: &Keypair,
-) -> anyhow::Result<vos::agent::package_admission::AdmittedStateRuntimePackage> {
-    let bytes = root_signed_runtime_package_bytes(
-        root,
-        candidate_state_runtime_pvm()?,
-        CANDIDATE_STATE_RUNTIME_PACKAGE_NAME,
-        RuntimePackageContract::experimental_state_blocks(),
-        Some(FIRST_CUSTOMER_LOCAL_STATE_LIMITS),
-    )?;
-    vos::agent::package_admission::admit_state_runtime_package(&bytes).map_err(Into::into)
 }
 
 fn root_signed_runtime_package_bytes(
@@ -357,41 +299,15 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "experimental-state-blocks")]
     #[test]
-    fn external_authority_requires_both_checked_candidates() {
+    fn retired_external_configuration_cannot_select_an_authority_package() {
         use crate::commands::space::local_config::LocalAgentStorage;
-        let selected =
-            system_authority_package_template_for_storage(LocalAgentStorage::ExternalState);
-        if CANDIDATE_SYSTEM_AUTHORITY_PACKAGE.is_empty() {
-            assert!(selected.is_err());
-            assert!(candidate_state_runtime_pvm().is_err());
-        } else {
-            let selected = selected.unwrap();
-            assert_ne!(selected, system_authority_package_template());
-            let root = space_root();
-            let runtime = root_signed_agent_runtime_package(&root).unwrap();
-            let authority = root_signed_actor_package(selected, "system-authority", &root).unwrap();
-            authority
-                .require_runtime(vos::agent::sdk::AgentProfile::Shared, &runtime)
-                .unwrap();
-            let state = root_signed_candidate_state_runtime_package(&root).unwrap();
-            assert_eq!(
-                state.program_bytes(),
-                candidate_state_runtime_pvm().unwrap()
-            );
-            assert_eq!(
-                state.external_state_limits(),
-                FIRST_CUSTOMER_LOCAL_STATE_LIMITS
-            );
-            assert_eq!(
-                state.exact_bytes(),
-                root_signed_candidate_state_runtime_package(&root)
-                    .unwrap()
-                    .exact_bytes(),
-            );
-            assert!(admit_runtime_package(state.exact_bytes()).is_err());
-        }
+        assert!(
+            system_authority_package_template_for_storage(LocalAgentStorage::ExternalState)
+                .unwrap_err()
+                .to_string()
+                .contains("external-state Local deployment is unsupported")
+        );
     }
 
     #[test]

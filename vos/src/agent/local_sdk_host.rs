@@ -2144,7 +2144,7 @@ mod tests {
             private_recovery: (profile == AgentProfile::Private).then_some(
                 crate::agent_sdk::PrivateRecoveryBinding {
                     signing_key_commitment: Hash([0x86; 32]),
-                    encryption_public_key: [0x87; 32],
+                    encryption_public_key: [0x17; 32],
                 },
             ),
             runtime_package: runtime.package_ref().clone(),
@@ -3272,12 +3272,23 @@ mod tests {
         assert!(root.join(encode_agent_id(second_id)).is_dir());
         assert!(!root.join("first").exists() && !root.join("second").exists());
 
-        let shared_runtime = admitted_runtime();
-        let shared = descriptor(&shared_runtime, 3, AgentProfile::Shared, space(), node());
-        assert_eq!(
-            host.create_agent(shared_runtime, shared.clone(), create_receipt(&shared, 100)),
-            Err(LocalAgentHostError::UnsupportedProfile)
-        );
+        for profile in [AgentProfile::Shared, AgentProfile::Private] {
+            let runtime = admitted_runtime();
+            let unsupported = descriptor(&runtime, 3, profile, space(), node());
+            assert_eq!(
+                host.create_agent(
+                    runtime,
+                    unsupported.clone(),
+                    create_receipt(&unsupported, 100),
+                ),
+                Err(LocalAgentHostError::UnsupportedProfile)
+            );
+            // Unsupported profiles must not leave durable or staged Agent
+            // state behind, including when the Private host is not compiled.
+            assert!(!host.agent_path(unsupported.identity.agent).exists());
+            assert!(!host.creating_path(unsupported.identity.agent).exists());
+            assert_eq!(host.list().unwrap().len(), 2);
+        }
 
         let wrong_space_runtime = admitted_runtime();
         let wrong_space = descriptor(

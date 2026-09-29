@@ -35,7 +35,10 @@
 
 pub mod asm;
 pub mod codegen;
+pub(crate) mod memory;
 pub mod signal;
+mod standard;
+pub(crate) use standard::run_standard;
 
 use crate::ExitReason;
 use crate::{Gas, PVM_REGISTER_COUNT};

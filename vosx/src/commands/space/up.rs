@@ -62,13 +62,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     verify_local_genesis(&data_dir, &space_id)?;
     let local = local_config::load(&data_dir)?;
     local_config::validate_local_storage_roots(&data_dir, local.local_agent_storage)?;
-    #[cfg(not(feature = "experimental-state-blocks"))]
-    anyhow::ensure!(
-        local.local_agent_storage == local_config::LocalAgentStorage::Image,
-        "external-state Local startup is not yet available in this binary; image roots were not opened",
-    );
-    // Reject an experimental mode without its exact candidate closure before
-    // networking, daemon identity, or either Local root is opened.
+    // The selected production format is validated before networking, daemon
+    // identity, or either Local root is opened, including candidate builds.
     crate::bundled::system_authority_package_template_for_storage(local.local_agent_storage)?;
     let daemon_keypair = load_daemon_keypair(&data_dir)?;
     let network = build_network_for_daemon(

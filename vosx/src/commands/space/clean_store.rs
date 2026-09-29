@@ -2620,7 +2620,9 @@ impl CleanManagementLifecycleStoreFactory {
         Self::open_or_create_format(parent.as_ref(), space, LifecycleLayout::ImageLocal)
     }
 
-    #[cfg(feature = "experimental-state-blocks")]
+    // Retained only to qualify durable lifecycle files for the external-state
+    // storage workstream. Released startup never selects this Local format.
+    #[cfg(all(test, feature = "experimental-state-blocks"))]
     pub(crate) fn open_or_create_external(
         parent: impl AsRef<Path>,
         space: vos::agent::sdk::SpaceId,

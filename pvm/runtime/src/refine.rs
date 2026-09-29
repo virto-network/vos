@@ -1,15 +1,16 @@
 //! Kernel-free refine-style execution of GP standard programs (SPI).
 //!
 //! [`execute`] loads a GP standard-program blob directly into the plain
-//! [`Interpreter`] with the specification-defined memory image, page
+//! standard machine with the specification-defined memory image, page
 //! permissions, register file, standard memory latency, and per-page init-gas
 //! charge. It has no capability microkernel or hostcall dispatch. The whole
 //! path is `no_std`, so an
 //! embedder (e.g. a wasm32 runtime) can perform pure refine invocations:
 //! any `ecalli` surfaces as [`ExitReason::HostCall`] in the returned
 //! [`Invocation`] for the embedder to reject or handle itself. Execution
-//! always uses the interpreter — never the kernel or the recompiler — on
-//! every target, which is the cross-machine determinism guarantee.
+//! uses the interpreter by default. Explicit backend constructors can select
+//! the existing Linux x86-64 recompiler, with identical standard semantics;
+//! observed/proof execution remains the interpreter reference path.
 //!
 //! Standard-program semantic notes (pinned by the direct-execution tests):
 //! - Memory image (GP eq A.42): read-only data at `Z_Z`, read-write data
@@ -48,6 +49,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::backend::{PreparedExecution, PvmBackend};
 use crate::interpreter::{Interpreter, Memory, PERM_NONE, PERM_RO, PERM_RW};
 use crate::spi::{deblob, parse_standard_program};
 use crate::{
@@ -69,6 +71,9 @@ pub enum RefineError {
     LayoutOverflow,
     /// The gas budget is below the per-page memory-init charge.
     OutOfGas,
+    /// The requested backend is unavailable, cannot be prepared, or its host
+    /// memory setup failed. This is not a guest exit or an interpreter retry.
+    Backend,
 }
 
 impl core::fmt::Display for RefineError {
@@ -77,6 +82,7 @@ impl core::fmt::Display for RefineError {
             Self::InvalidBlob => f.write_str("blob is not a GP standard program"),
             Self::LayoutOverflow => f.write_str("memory layout exceeds the address space"),
             Self::OutOfGas => f.write_str("gas budget below the memory-init charge"),
+            Self::Backend => f.write_str("standard execution backend failed"),
         }
     }
 }
@@ -101,30 +107,33 @@ pub enum MemoryModel {
     Sparse,
 }
 
-/// Executor-validated standard program and immutable interpreter preparation.
+/// Executor-validated standard program and immutable backend preparation.
 ///
 /// Private fields prevent callers from supplying forged gas tables. Preparing
 /// binds the tables to the standard ISA and memory latency; loading still
 /// checks each invocation's layout and gas and creates independent state.
 pub struct PreparedProgram {
     program: crate::spi::StandardProgram,
-    interpreter: crate::backend::InterpreterProgram,
+    execution: PreparedExecution,
 }
 
 impl PreparedProgram {
     pub fn new(blob: &[u8]) -> Result<Self, RefineError> {
+        Self::new_with_backend(blob, PvmBackend::ForceInterpreter)
+    }
+
+    /// Prepare immutable code for one explicitly selected backend. Invocation
+    /// memory and registers are never shared between loads of this value.
+    pub fn new_with_backend(blob: &[u8], backend: PvmBackend) -> Result<Self, RefineError> {
         let program = parse_standard_program(blob).ok_or(RefineError::InvalidBlob)?;
-        let interpreter = Interpreter::predecode(
+        let execution = PreparedExecution::new_standard(
             &program.code.code,
             &program.code.bitmask,
             &program.code.jump_table,
-            STANDARD_MEM_CYCLES,
-            IsaMode::Conformance,
-        );
-        Ok(Self {
-            program,
-            interpreter,
-        })
+            backend,
+        )
+        .map_err(|_| RefineError::Backend)?;
+        Ok(Self { program, execution })
     }
 }
 
@@ -154,6 +163,7 @@ pub struct Machine {
     initial_gas: Gas,
     interp: Interpreter,
     terminal_exit: Option<ExitReason>,
+    execution: Option<PreparedExecution>,
 }
 
 /// Read-only entry and instruction events for one standard machine slice.
@@ -214,6 +224,7 @@ impl Machine {
             initial_gas: gas,
             interp,
             terminal_exit,
+            execution: None,
         }
     }
 
@@ -230,8 +241,29 @@ impl Machine {
         gas: Gas,
         model: MemoryModel,
     ) -> Result<Self, RefineError> {
-        let prog = parse_standard_program(spi_blob).ok_or(RefineError::InvalidBlob)?;
-        Self::load_program(&prog, None, args, gas, model)
+        Self::load_with_backend(spi_blob, args, gas, model, PvmBackend::ForceInterpreter)
+    }
+
+    pub fn load_with_backend(
+        spi_blob: &[u8],
+        args: &[u8],
+        gas: Gas,
+        model: MemoryModel,
+        backend: PvmBackend,
+    ) -> Result<Self, RefineError> {
+        Self::load_prepared(
+            &PreparedProgram::new_with_backend(spi_blob, backend)?,
+            args,
+            gas,
+            model,
+        )
+    }
+
+    /// The resolved backend, independent of later environment changes.
+    pub fn backend(&self) -> PvmBackend {
+        self.execution
+            .as_ref()
+            .map_or(PvmBackend::ForceInterpreter, PreparedExecution::backend)
     }
 
     /// Instantiate fresh execution state from validated immutable preparation.
@@ -241,18 +273,12 @@ impl Machine {
         gas: Gas,
         model: MemoryModel,
     ) -> Result<Self, RefineError> {
-        Self::load_program(
-            &prepared.program,
-            Some(&prepared.interpreter),
-            args,
-            gas,
-            model,
-        )
+        Self::load_program(&prepared.program, &prepared.execution, args, gas, model)
     }
 
     fn load_program(
         prog: &crate::spi::StandardProgram,
-        prepared: Option<&crate::backend::InterpreterProgram>,
+        prepared: &PreparedExecution,
         args: &[u8],
         gas: Gas,
         model: MemoryModel,
@@ -286,11 +312,9 @@ impl Machine {
         if !use_sparse && max_addr > isize::MAX as u64 {
             return Err(RefineError::LayoutOverflow);
         }
-        let mut mem = if use_sparse {
-            Memory::sparse(max_addr)
-        } else {
-            Memory::flat(vec![0u8; max_addr as usize])
-        };
+        let mut mem = prepared
+            .allocate_memory(max_addr, use_sparse)
+            .map_err(|_| RefineError::Backend)?;
         let mut page_perms = vec![PERM_NONE; (max_addr / page) as usize];
         for r in regions.iter().filter(|r| r.size > 0) {
             let perm = if r.writable { PERM_RW } else { PERM_RO };
@@ -307,44 +331,53 @@ impl Machine {
             }
         }
 
-        let mut interp = match prepared {
-            Some(program) => Interpreter::from_predecoded(
-                program.clone(),
-                registers,
-                mem,
-                gas - init_gas,
-                mem_cycles,
-                IsaMode::Conformance,
-            ),
-            None => Interpreter::with_memory_and_mode(
-                prog.code.code.clone(),
-                prog.code.bitmask.clone(),
-                prog.code.jump_table.clone(),
-                registers,
-                mem,
-                gas - init_gas,
-                mem_cycles,
-                IsaMode::Conformance,
-            ),
-        };
+        let mut interp = Interpreter::from_predecoded(
+            prepared.interpreter_program().clone(),
+            registers,
+            mem,
+            gas - init_gas,
+            mem_cycles,
+            IsaMode::Conformance,
+        );
         interp.set_page_perms(page_perms);
 
         Ok(Self {
             initial_gas: gas,
             interp,
             terminal_exit: None,
+            // The interpreter already owns its decoded invocation state;
+            // retaining cold preparation here would duplicate those tables.
+            execution: (prepared.backend() != PvmBackend::ForceInterpreter)
+                .then(|| prepared.clone()),
         })
     }
 
     /// Run until the next PVM exit.
+    ///
+    /// For explicitly selected backends use [`Self::try_resume`] to handle
+    /// host backend errors without panicking. Interpreter loads cannot produce
+    /// those errors.
     pub fn resume(&mut self) -> ExitReason {
+        self.try_resume().expect(
+            "standard execution backend failed; use try_resume for explicitly selected backends",
+        )
+    }
+
+    /// Run one slice, reporting backend failures separately from guest exits.
+    /// No error or guest fault is retried through another backend.
+    pub fn try_resume(&mut self) -> Result<ExitReason, RefineError> {
         if let Some(exit) = &self.terminal_exit {
-            return exit.clone();
+            return Ok(exit.clone());
         }
         // Resuming is the host's explicit advancement past a previously
         // surfaced ecalli. The first call is a no-op here.
         self.interp.resume_after_host_call();
-        self.interp.run().0
+        match &self.execution {
+            Some(prepared) => prepared
+                .run(&mut self.interp)
+                .map_err(|_| RefineError::Backend),
+            None => Ok(self.interp.run().0),
+        }
     }
 
     /// Run until the next PVM exit while observing every instruction.
@@ -355,6 +388,12 @@ impl Machine {
     /// [`Interpreter::run_observed`], whose callback receives immutable
     /// post-step state. Installing an observer therefore cannot perturb the
     /// standard machine's semantics.
+    ///
+    /// Observation uses interpreter instructions even if this machine was
+    /// prepared for the recompiler, but retains that machine's native memory
+    /// backing. Proof/snapshot callers should load `ForceInterpreter` with
+    /// [`MemoryModel::Sparse`] explicitly: inspecting a native or ordinary
+    /// flat value image can scan the complete logical address space.
     pub fn resume_observed(
         &mut self,
         mut observer: impl for<'a> FnMut(MachineObservation<'a>),
@@ -687,6 +726,47 @@ mod tests {
                 (cold, reused) => panic!("cold/prepared mismatch: {cold:?} / {reused:?}"),
             }
         }
+        #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+        {
+            let native = Machine::load_with_backend(
+                blob,
+                args,
+                gas,
+                MemoryModel::Auto,
+                PvmBackend::ForceRecompiler,
+            )
+            .and_then(|mut machine| {
+                let exit = machine.try_resume()?;
+                Ok(machine.finish(exit))
+            });
+            match (&f, native) {
+                (Ok(reference), Ok(native)) => {
+                    assert_eq!(reference.exit, native.exit, "native exit");
+                    assert_eq!(reference.gas_used, native.gas_used, "native gas");
+                    assert_eq!(reference.registers, native.registers, "native registers");
+                    assert_eq!(reference.pc, native.pc, "native pc");
+                    assert_eq!(reference.output_bounded(4096), native.output_bounded(4096));
+                    assert_eq!(
+                        reference.memory().page_perms(),
+                        native.memory().page_perms()
+                    );
+                    let program = parse_standard_program(blob).unwrap();
+                    let layout = program.layout(args).unwrap();
+                    for region in [layout.ro, layout.rw, layout.stack, layout.args] {
+                        assert_image_range_eq(
+                            reference,
+                            &native,
+                            region.base,
+                            region.base + region.size,
+                        );
+                    }
+                }
+                (Err(reference), Err(native)) => assert_eq!(*reference, native),
+                (reference, native) => {
+                    panic!("reference/native mismatch: {reference:?} / {native:?}")
+                }
+            }
+        }
         match (f, s) {
             (Ok(f), Ok(s)) => {
                 assert_eq!(f.exit, s.exit, "exit reasons agree");
@@ -907,6 +987,162 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn native_preparation_is_shared_but_memory_and_host_continuations_are_independent() {
+        let mut code = Vec::new();
+        let mut bits = Vec::new();
+        asm(&mut code, &mut bits, &[10, 42]);
+        asm(&mut code, &mut bits, &[128, 2 + 16 * 7]);
+        asm(&mut code, &mut bits, &[50, 0]);
+        let blob = build_standard_program(&[], &[], 1, 4096, &code, &bits);
+        let prepared =
+            PreparedProgram::new_with_backend(&blob, PvmBackend::ForceRecompiler).unwrap();
+        for args in [vec![1, 2, 3, 4], vec![5, 6, 7, 8]] {
+            let mut native =
+                Machine::load_prepared(&prepared, &args, 1_000_000, MemoryModel::Auto).unwrap();
+            let mut reference = Machine::load(&blob, &args, 1_000_000).unwrap();
+            assert_eq!(native.backend(), PvmBackend::ForceRecompiler);
+            for machine in [&mut native, &mut reference] {
+                assert_eq!(machine.try_resume().unwrap(), ExitReason::HostCall(42));
+                assert_eq!(machine.interpreter().pc, 0);
+                assert!(machine.gas_charged());
+                assert!(machine.charge(7));
+                machine.credit(3);
+                // Host initialization can edit a guest read-only page without
+                // changing its permissions, through the checked host alias.
+                let address = machine.registers()[7] as u32;
+                machine.memory_mut().init_copy(address, &[9, 8, 7, 6]);
+                assert_eq!(machine.try_resume().unwrap(), ExitReason::Halt);
+            }
+            assert_eq!(native.registers(), reference.registers());
+            assert_eq!(native.gas_remaining(), reference.gas_remaining());
+            assert_eq!(native.interpreter().pc, reference.interpreter().pc);
+            assert_eq!(
+                native.registers()[2],
+                u64::from(u32::from_le_bytes([9, 8, 7, 6]))
+            );
+        }
+        assert!(matches!(
+            Machine::load_prepared(&prepared, &[], 1_000_000, MemoryModel::Sparse),
+            Err(RefineError::Backend)
+        ));
+    }
+
+    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn native_fault_retry_preserves_funded_block_and_permission_changes() {
+        let blob = fault_gap_blob();
+        let mut native = Machine::load_with_backend(
+            &blob,
+            &[],
+            1_000_000,
+            MemoryModel::Auto,
+            PvmBackend::ForceRecompiler,
+        )
+        .unwrap();
+        let mut reference = Machine::load(&blob, &[], 1_000_000).unwrap();
+        for machine in [&mut native, &mut reference] {
+            assert_eq!(
+                machine.try_resume().unwrap(),
+                ExitReason::PageFault(0x10000)
+            );
+            let funded_gas = machine.gas_remaining();
+            assert!(machine.memory_mut().set_page_range(16, 1, PERM_RW));
+            assert!(
+                machine
+                    .memory_mut()
+                    .write_bytes_checked(0x10000, &[1, 2, 3, 4, 5, 6, 7, 8])
+            );
+            assert_eq!(machine.try_resume().unwrap(), ExitReason::Panic);
+            assert_eq!(
+                machine.gas_remaining(),
+                funded_gas,
+                "retry must not fund the block again"
+            );
+        }
+        assert_eq!(native.registers(), reference.registers());
+        assert_eq!(native.gas_remaining(), reference.gas_remaining());
+        assert_eq!(native.interpreter().pc, reference.interpreter().pc);
+    }
+
+    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn native_unacknowledged_host_boundary_is_stable() {
+        let blob = build_standard_program(
+            &[],
+            &[],
+            0,
+            4096,
+            &[51, 2, 9, 10, 42, 0],
+            &[1, 0, 0, 1, 0, 1],
+        );
+        let mut machine = Machine::load_with_backend(
+            &blob,
+            &[],
+            1_000_000,
+            MemoryModel::Auto,
+            PvmBackend::ForceRecompiler,
+        )
+        .unwrap();
+        let prepared = machine.execution.clone().unwrap();
+        assert_eq!(
+            prepared.run(&mut machine.interp).unwrap(),
+            ExitReason::HostCall(42)
+        );
+        let registers = *machine.registers();
+        let gas = machine.gas_remaining();
+        for _ in 0..2 {
+            assert_eq!(
+                prepared.run(&mut machine.interp).unwrap(),
+                ExitReason::HostCall(42)
+            );
+            assert_eq!(machine.interp.pc, 3);
+            assert_eq!(machine.gas_remaining(), gas);
+            assert_eq!(machine.registers(), &registers);
+            assert_eq!(
+                machine.interp.pending_host_call(),
+                Some(crate::PendingHostCall {
+                    id: 42,
+                    cause_pc: 3,
+                    resume_pc: 5,
+                })
+            );
+        }
+        assert_eq!(machine.try_resume().unwrap(), ExitReason::Panic);
+        assert_eq!(machine.interp.pc, 0);
+        assert_eq!(machine.gas_remaining(), gas);
+    }
+
+    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn native_preparation_supports_concurrent_independent_invocations() {
+        let prepared = std::sync::Arc::new(
+            PreparedProgram::new_with_backend(&round_trip_blob(), PvmBackend::ForceRecompiler)
+                .unwrap(),
+        );
+        let workers: Vec<_> = (1u32..=4)
+            .map(|worker| {
+                let prepared = prepared.clone();
+                std::thread::spawn(move || {
+                    for iteration in 0..8 {
+                        let args = (worker * 100 + iteration).to_le_bytes();
+                        let mut machine =
+                            Machine::load_prepared(&prepared, &args, 1_000_000, MemoryModel::Auto)
+                                .unwrap();
+                        let exit = machine.try_resume().unwrap();
+                        let invocation = machine.finish(exit);
+                        assert_eq!(invocation.exit, ExitReason::Halt);
+                        assert_eq!(invocation.output_bounded(4), Some(args.to_vec()));
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
+
     /// Load-only measurement, not an execution or end-to-end latency gate.
     #[cfg(feature = "std")]
     #[test]
@@ -1053,6 +1289,11 @@ mod tests {
     /// two-cluster stack program.
     #[test]
     fn flat_and_sparse_agree_across_corpus() {
+        assert_flat_sparse_parity(
+            &build_standard_program(&[], &[], 0, 0, &[50, 0], &[1, 0]),
+            &[],
+            1_000_000,
+        );
         assert_flat_sparse_parity(&round_trip_blob(), &ARGS, 1_000_000);
         assert_flat_sparse_parity(&round_trip_blob(), &ARGS, INIT_GAS + 1);
         assert_flat_sparse_parity(

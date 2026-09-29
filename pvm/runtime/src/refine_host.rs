@@ -7,7 +7,7 @@ use crate::inner::{
     InvokeState, MAX_INNER_MACHINES, PageMode, gas, host_call,
 };
 use crate::refine::{Invocation, Machine, MachineObservation, MemoryModel, RefineError};
-use crate::{ExitReason, Gas, PVM_REGISTER_COUNT};
+use crate::{ExitReason, Gas, PVM_REGISTER_COUNT, PvmBackend};
 
 /// Standard host result constants used by the inner-machine calls.
 pub mod result {
@@ -21,6 +21,34 @@ pub mod result {
 enum Dispatch {
     Continue,
     Exit(ExitReason),
+    Backend,
+}
+
+/// Aggregate timings only; instruction observation would distort the path
+/// being measured. Inner create includes decoding/preparation, and inner invoke
+/// includes its frame/refund handling. Neither is a queue or quorum benchmark.
+#[cfg(feature = "std")]
+#[derive(Default)]
+struct ExecutionTimings {
+    outer_us: u64,
+    inner_create_us: u64,
+    inner_invoke_us: u64,
+    host_us: u64,
+    outer_slices: u64,
+}
+
+#[cfg(feature = "std")]
+impl Drop for ExecutionTimings {
+    fn drop(&mut self) {
+        tracing::debug!(
+            outer_execution_us = self.outer_us,
+            inner_create_us = self.inner_create_us,
+            inner_invoke_us = self.inner_invoke_us,
+            host_dispatch_us = self.host_us,
+            outer_slices = self.outer_slices,
+            "Refine execution phases"
+        );
+    }
 }
 
 /// Stable identity of a machine participating in one nested Refine run.
@@ -88,6 +116,22 @@ impl RefineContext {
         })
     }
 
+    /// Explicit execution backend for both the outer runtime and its inner
+    /// actors. Use [`Self::try_run`] (or [`Self::try_run_with_host`]) so backend
+    /// failures remain host errors, never signed guest outcomes or retries on
+    /// another backend.
+    pub fn load_with_backend(
+        program: &[u8],
+        args: &[u8],
+        gas: Gas,
+        model: MemoryModel,
+        backend: PvmBackend,
+    ) -> Result<Self, RefineError> {
+        let outer = Machine::load_with_backend(program, args, gas, model, backend)?;
+        let inner = InnerMachines::with_backend(outer.backend());
+        Ok(Self { outer, inner })
+    }
+
     /// Reuse validated program preparation, never per-invocation machines.
     pub fn load_prepared(
         program: &crate::refine::PreparedProgram,
@@ -95,16 +139,21 @@ impl RefineContext {
         gas: Gas,
         model: MemoryModel,
     ) -> Result<Self, RefineError> {
-        Ok(Self {
-            outer: Machine::load_prepared(program, args, gas, model)?,
-            inner: InnerMachines::new(),
-        })
+        let outer = Machine::load_prepared(program, args, gas, model)?;
+        let inner = InnerMachines::with_backend(outer.backend());
+        Ok(Self { outer, inner })
     }
 
     /// Run the outer program, transparently servicing host calls 9 through
     /// 14. Other host calls are returned to the embedder unchanged.
     pub fn run(self) -> Invocation {
         self.run_with_host(|id, _| Err(ExitReason::HostCall(id)))
+    }
+
+    /// Execute the selected backend, preserving backend errors separately from
+    /// a completed guest invocation. No execution fault triggers a fallback.
+    pub fn try_run(self) -> Result<Invocation, RefineError> {
+        self.try_run_with_host(|id, _| Err(ExitReason::HostCall(id)))
     }
 
     /// Service embedder-owned outer calls without restarting this execution or
@@ -117,28 +166,73 @@ impl RefineContext {
     /// an authorization grant. The observed/proof runner does not yet support
     /// external handlers and must not silently substitute for this path.
     pub fn run_with_host(
+        self,
+        host: impl FnMut(u64, &mut Machine) -> Result<(), ExitReason>,
+    ) -> Invocation {
+        self.try_run_with_host(host)
+            .expect("reference Refine execution; selected backends must use try_run_with_host")
+    }
+
+    /// Fallible counterpart of [`Self::run_with_host`] for a selected backend.
+    pub fn try_run_with_host(
         mut self,
         mut host: impl FnMut(u64, &mut Machine) -> Result<(), ExitReason>,
-    ) -> Invocation {
+    ) -> Result<Invocation, RefineError> {
+        #[cfg(feature = "std")]
+        let mut timings = ExecutionTimings::default();
         loop {
-            let exit = self.outer.resume();
+            #[cfg(feature = "std")]
+            let started = std::time::Instant::now();
+            let exit = self.outer.try_resume();
+            #[cfg(feature = "std")]
+            {
+                timings.outer_us += started.elapsed().as_micros() as u64;
+                timings.outer_slices += 1;
+            }
+            let exit = exit?;
             let ExitReason::HostCall(id) = exit else {
-                return self.outer.finish(exit);
+                return Ok(self.outer.finish(exit));
             };
-            match self.dispatch(id) {
+            #[cfg(feature = "std")]
+            let started = std::time::Instant::now();
+            let dispatch = self.dispatch(id);
+            #[cfg(feature = "std")]
+            {
+                let elapsed = started.elapsed().as_micros() as u64;
+                match id {
+                    id if id == u64::from(host_call::MACHINE) => timings.inner_create_us += elapsed,
+                    id if id == u64::from(host_call::INVOKE) => timings.inner_invoke_us += elapsed,
+                    _ => timings.host_us += elapsed,
+                }
+            }
+            match dispatch {
                 Dispatch::Continue => {}
                 Dispatch::Exit(ExitReason::HostCall(call)) => {
-                    if let Err(exit) = host(call, &mut self.outer) {
-                        return self.outer.finish(exit);
+                    #[cfg(feature = "std")]
+                    let started = std::time::Instant::now();
+                    let result = host(call, &mut self.outer);
+                    #[cfg(feature = "std")]
+                    {
+                        timings.host_us += started.elapsed().as_micros() as u64;
+                    }
+                    if let Err(exit) = result {
+                        return Ok(self.outer.finish(exit));
                     }
                 }
-                Dispatch::Exit(exit) => return self.outer.finish(exit),
+                Dispatch::Exit(exit) => return Ok(self.outer.finish(exit)),
+                Dispatch::Backend => return Err(RefineError::Backend),
             }
         }
     }
 
     /// Run the same nested Refine state machine as [`Self::run`] while
     /// reporting immutable machine and host-dispatch boundaries.
+    ///
+    /// This selects reference interpreter instructions, not new memory or
+    /// preparation. A context loaded for the recompiler retains native backing
+    /// and prepares its inner programs for that backend. Proof/snapshot callers
+    /// must explicitly load `ForceInterpreter` with [`MemoryModel::Sparse`] to
+    /// keep value-image inspection proportional to touched pages.
     pub fn run_observed(
         self,
         mut observer: impl for<'a> FnMut(RefineObservation<'a>),
@@ -189,6 +283,9 @@ impl RefineContext {
             match dispatch {
                 Dispatch::Continue => {}
                 Dispatch::Exit(exit) => return self.outer.finish(exit),
+                Dispatch::Backend => {
+                    panic!("observed Refine execution requires the reference backend")
+                }
             }
         }
     }
@@ -255,6 +352,7 @@ impl RefineContext {
             Ok(pc) => match self.inner.create(&program, pc) {
                 Ok(id) => id as u64,
                 Err(InnerError::Full) => result::FULL,
+                Err(InnerError::Backend) => return Dispatch::Backend,
                 Err(_) => result::HUH,
             },
             Err(_) => result::HUH,
@@ -292,6 +390,7 @@ impl RefineContext {
                     }
                     Err(InnerError::Unknown) => result::WHO,
                     Err(InnerError::OutOfBounds) => result::OOB,
+                    Err(InnerError::Backend) => return Dispatch::Backend,
                     Err(_) => result::HUH,
                 },
                 None => result::OOB,
@@ -323,6 +422,7 @@ impl RefineContext {
                     Ok(()) => result::OK,
                     Err(InnerError::Unknown) => result::WHO,
                     Err(InnerError::OutOfBounds) => result::OOB,
+                    Err(InnerError::Backend) => return Dispatch::Backend,
                     Err(_) => result::HUH,
                 },
                 None => result::OOB,
@@ -359,6 +459,7 @@ impl RefineContext {
                     match self.inner.pages(id, first, count, mode) {
                         Ok(()) => result::OK,
                         Err(InnerError::Unknown) => result::WHO,
+                        Err(InnerError::Backend) => return Dispatch::Backend,
                         Err(_) => result::HUH,
                     }
                 }
@@ -449,6 +550,7 @@ impl RefineContext {
                 self.outer.registers_mut()[7] = result::WHO;
                 return Dispatch::Continue;
             }
+            Err(InnerError::Backend) => return Dispatch::Backend,
             Err(_) => {
                 self.outer.registers_mut()[7] = result::HUH;
                 return Dispatch::Continue;
@@ -600,6 +702,33 @@ mod tests {
             expected.memory().read_bytes(RW_BASE, &mut cold_frame);
             reused.memory().read_bytes(RW_BASE, &mut reused_frame);
             assert_eq!(reused_frame, cold_frame);
+        }
+
+        // Use real nested host dispatch with both machines recompiled. Exact
+        // gas includes outer initialization, host charges and the inner refund.
+        #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+        {
+            let native = crate::refine::PreparedProgram::new_with_backend(
+                &outer,
+                PvmBackend::ForceRecompiler,
+            )
+            .unwrap();
+            for _ in 0..2 {
+                let context =
+                    RefineContext::load_prepared(&native, &args, 1_000_000, MemoryModel::Auto)
+                        .unwrap();
+                assert_eq!(context.outer.backend(), PvmBackend::ForceRecompiler);
+                let actual = context.try_run().unwrap();
+                assert_eq!(actual.exit, expected.exit);
+                assert_eq!(actual.pc, expected.pc);
+                assert_eq!(actual.registers, expected.registers);
+                assert_eq!(actual.gas_used, expected.gas_used);
+                let mut actual_frame = [0; 112];
+                let mut expected_frame = [0; 112];
+                actual.memory().read_bytes(RW_BASE, &mut actual_frame);
+                expected.memory().read_bytes(RW_BASE, &mut expected_frame);
+                assert_eq!(actual_frame, expected_frame);
+            }
         }
 
         let mut events = Vec::new();

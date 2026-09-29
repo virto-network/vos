@@ -26,13 +26,9 @@ native-extension-client = ["pvm"]
 # Keep its larger transient arena out of ordinary application actors.
 agent-runtime = ["pvm", "dep:ed25519-dalek"]
 experimental-state-blocks = ["vos-agent-sdk/experimental-state-blocks"]
-# Host-side same-run Standard Refine execution, proving, bounded proof
-# material, and deterministic replay verification. Kept opt-in so ordinary
-# hosts and every no_std guest avoid the prover dependency graph.
-agent-transition-proof = ["std", "pvm", "dep:vos-pvm-proof"]
-# Host-only cryptography and strict control-chain verification for Private
-# agents. Keeping this separate from `std` avoids linking key material and
-# cipher implementations into hosts which do not serve Private agents.
+# Host-only enrollment cryptography and canonical Private control verification.
+# Shared genesis uses enrollment verification; this does not enable a Private
+# Agent host, storage, or routing implementation in the first release.
 private-agent-crypto = [
     "std",
     "dep:chacha20poly1305",
@@ -44,9 +40,6 @@ private-agent-crypto = [
     "dep:x25519-dalek",
     "dep:zeroize",
 ]
-# Durable ciphertext-only storage and bounded authenticated anti-entropy for
-# Private agents. This is host infrastructure and never enters actor guests.
-private-agent-store = ["private-agent-crypto"]
 # NOTE: the ZK actor-IO binding is tagless (`vos::zk`) — the io-hash
 # primitive `compute_io_hash` is pure and always available (guest +
 # host).  Proof *verification* (STARK validity ∧ io-binding) lives in
@@ -102,7 +95,6 @@ vos-pvm-program = { workspace = true }
 # std-only: workspace-owned PVM runtime and compiler dependencies.
 vos-pvm = { workspace = true, optional = true }
 vos-pvm-compiler = { workspace = true, optional = true }
-vos-pvm-proof = { workspace = true, optional = true }
 # Host-side execution of the vos-pvm-proof Ristretto/scalar precompile ECALLs, so
 # a pvm-precompile actor (cipher-clerk crypto) runs LIVE in the runtime
 # bit-identically to the prover's tracer — the `ristretto` feature's
@@ -223,9 +215,8 @@ clerk-settle = { path = "../actors/clerk-settle", default-features = false }
 prover-extension = { path = "../extensions/prover" }
 # vos-pvm-proof canonical prover + segmentation — the `voucher_check_commitment_
 # drift_guard` re-derives the pinned VOUCHER_CHECK_COMMITMENTS by proving
-# two canonical segments. The optional normal dependency above is used only
-# by production physical transition hosts; retaining this dev dependency
-# keeps the pre-existing default test gate intact.
+# two canonical segments. Retain the pre-existing test gate; Agent Attested
+# proof production is not supported in the first release.
 vos-pvm-proof = { workspace = true }
 # Host-side cipher-clerk with `signing` so tests can build
 # signed CreateAccount events to push through the ledger. Pulls in

@@ -11,24 +11,12 @@ use crate::agent_sdk::{
     },
     state_tree::{BlockReader, TreeError},
 };
-use vos_pvm::{
-    ExitReason, Gas,
-    refine::{Machine, MemoryModel, PreparedProgram},
-    refine_host::RefineContext,
-};
-
-// One exact prepared program per executing thread. The cache is only a parse
-// optimization: admission, root checks, gas, and host calls still run for each
-// invocation. It avoids a node-wide lock while bounding retained programs by
-// the number of workers; a different program replaces the old one.
-thread_local! {
-    static PREPARED_BLOCK_PROGRAM: std::cell::RefCell<Option<(Vec<u8>, PreparedProgram)>> =
-        const { std::cell::RefCell::new(None) };
-}
+use vos_pvm::{ExitReason, Gas, refine::Machine, refine_host::RefineContext};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum BlockPvmError {
     Load,
+    Backend,
     InvalidRequest,
     ProgramMismatch,
     UnsupportedCall(u64),
@@ -378,15 +366,29 @@ fn run_block_program(
     mut fetch: impl FnMut(u64, &mut Machine) -> Result<(), BlockPvmError>,
 ) -> Result<Vec<u8>, BlockPvmError> {
     let mut failure = None;
-    let invocation = load_block_context(program, input, gas)
-        .map_err(|_| BlockPvmError::Load)?
-        .run_with_host(|id, machine| match fetch(id, machine) {
+    let started = std::time::Instant::now();
+    let context = load_block_context(program, input, gas).map_err(|error| match error {
+        vos_pvm::refine::RefineError::Backend => BlockPvmError::Backend,
+        _ => BlockPvmError::Load,
+    })?;
+    let preparation_us = started.elapsed().as_micros() as u64;
+    let execution_started = std::time::Instant::now();
+    let invocation = context
+        .try_run_with_host(|id, machine| match fetch(id, machine) {
             Ok(()) => Ok(()),
             Err(error) => {
                 failure = Some(error);
                 Err(ExitReason::Panic)
             }
-        });
+        })
+        .map_err(|_| BlockPvmError::Backend)?;
+    tracing::debug!(
+        preparation_us,
+        execution_us = execution_started.elapsed().as_micros() as u64,
+        input_bytes = input.len(),
+        gas_used = invocation.gas_used,
+        "physical external-state Agent runtime execution"
+    );
     if let Some(error) = failure {
         return Err(error);
     }
@@ -406,24 +408,7 @@ fn load_block_context(
     input: &[u8],
     gas: Gas,
 ) -> Result<RefineContext, vos_pvm::refine::RefineError> {
-    if program.len() > super::execution::MAX_EXECUTION_PROGRAM_BYTES {
-        return RefineContext::load(program, input, gas);
-    }
-    PREPARED_BLOCK_PROGRAM.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot
-            .as_ref()
-            .is_none_or(|(cached, _)| cached.as_slice() != program)
-        {
-            *slot = Some((program.to_vec(), PreparedProgram::new(program)?));
-        }
-        RefineContext::load_prepared(
-            &slot.as_ref().expect("prepared program installed").1,
-            input,
-            gas,
-            MemoryModel::Auto,
-        )
-    })
+    super::runtime_pvm::load_context(program, input, gas)
 }
 
 /// Bounded declared-lane dispatch over one store and one aggregate read budget.

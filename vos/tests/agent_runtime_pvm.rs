@@ -37,6 +37,7 @@ use vos::agent_sdk::{
     RuntimeState, RuntimeTransition, RuntimeWork, SpaceId, StateLane, YieldReason,
 };
 use vos_pvm::ExitReason;
+use vos_pvm::refine::{MemoryModel, PreparedProgram};
 use vos_pvm::refine_host::RefineContext;
 use vos_pvm_compiler::assembler::{Assembler, Reg};
 
@@ -44,6 +45,13 @@ const AGENT_RUNTIME_PVM: &[u8] = include_bytes!("../../vosx/blobs/agent_runtime.
 const GAS: u64 = 1_000_000_000;
 const PACKAGE_SEED: [u8; 32] = [0x71; 32];
 const AUTHORITY_SEED: [u8; 32] = [0x72; 32];
+
+thread_local! {
+    static COMPARISON_PROGRAM: std::cell::RefCell<Option<(Vec<u8>, PreparedProgram)>> =
+        const { std::cell::RefCell::new(None) };
+    static COMPARISON_REFERENCE: std::cell::RefCell<Option<(Vec<u8>, PreparedProgram)>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 fn package_signing() -> PackageSigning {
     let key = SigningKey::from_bytes(&PACKAGE_SEED);
@@ -73,22 +81,17 @@ fn artifact(bytes: &[u8]) -> PackageArtifact {
 }
 
 fn runtime_package_bytes() -> Vec<u8> {
-    runtime_package_bytes_for(AGENT_RUNTIME_PVM, None)
+    runtime_package_bytes_for(AGENT_RUNTIME_PVM)
 }
 
-fn runtime_package_bytes_for(runtime_pvm: &[u8], proof_system: Option<Hash>) -> Vec<u8> {
-    let mut capabilities = RuntimeCapabilities::standard();
-    if let Some(proof_system) = proof_system {
-        capabilities.proof_systems =
-            sdk::ProofSystemSet::from_sorted(&[proof_system]).expect("one canonical proof system");
-    }
+fn runtime_package_bytes_for(runtime_pvm: &[u8]) -> Vec<u8> {
     sign_package(PackageEnvelope {
         manifest: PackageManifest::AgentRuntime(AgentRuntimePackageManifest {
             name: "standard-local-runtime".into(),
             external_state_limits: None,
             outer_program: BlobRef::of_bytes(runtime_pvm),
             contract: RuntimePackageContract::canonical(),
-            capabilities,
+            capabilities: RuntimeCapabilities::standard(),
             signing: package_signing(),
         }),
         artifacts: vec![artifact(runtime_pvm)],
@@ -99,11 +102,6 @@ fn runtime_package_bytes_for(runtime_pvm: &[u8], proof_system: Option<Hash>) -> 
 
 fn admitted_runtime() -> AdmittedRuntimePackage {
     admit_runtime_package(&runtime_package_bytes()).expect("admit bundled VOS3 runtime")
-}
-
-fn admitted_runtime_for(runtime_pvm: &[u8], proof_system: Hash) -> AdmittedRuntimePackage {
-    admit_runtime_package(&runtime_package_bytes_for(runtime_pvm, Some(proof_system)))
-        .expect("admit proof-capable bundled VOS3 runtime")
 }
 
 fn authority_key() -> SigningKey {
@@ -299,9 +297,96 @@ fn apply_runtime(work: RuntimeWork) -> RuntimeTransition {
 
 fn apply_runtime_program(runtime_pvm: &[u8], work: RuntimeWork, gas: u64) -> RuntimeTransition {
     let input = work.encode().expect("encode canonical r7 RuntimeWork");
-    let invocation = RefineContext::load(runtime_pvm, &input, gas)
-        .expect("load bundled AgentRuntime")
-        .run();
+    let comparing = std::env::var_os("VOS_AGENT_COMPARE_BACKENDS").is_some();
+    let started = std::time::Instant::now();
+    let invocation = if comparing {
+        // Warm comparisons must cache both preparations, not compare a cold
+        // interpreter load to warm native code. The first call is cold for both.
+        COMPARISON_REFERENCE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.as_ref().is_none_or(|(bytes, _)| bytes != runtime_pvm) {
+                *slot = Some((
+                    runtime_pvm.to_vec(),
+                    PreparedProgram::new(runtime_pvm).expect("prepare reference interpreter"),
+                ));
+            }
+            RefineContext::load_prepared(&slot.as_ref().unwrap().1, &input, gas, MemoryModel::Auto)
+                .expect("load prepared reference interpreter")
+        })
+    } else {
+        RefineContext::load(runtime_pvm, &input, gas).expect("load bundled AgentRuntime")
+    };
+    let reference_preparation = started.elapsed();
+    let started = std::time::Instant::now();
+    let invocation = invocation.run();
+    let reference_execution = started.elapsed();
+    if comparing {
+        // This switch runs the exact physical work through both backends; it
+        // must never turn a missing recompiler into a passing interpreter-only
+        // test. Preparation is bounded to one exact program per test thread.
+        let started = std::time::Instant::now();
+        let (native, cold) = COMPARISON_PROGRAM.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let cold = slot.as_ref().is_none_or(|(bytes, _)| bytes != runtime_pvm);
+            if cold {
+                *slot = Some((
+                    runtime_pvm.to_vec(),
+                    PreparedProgram::new_with_backend(
+                        runtime_pvm,
+                        vos_pvm::PvmBackend::ForceRecompiler,
+                    )
+                    .expect("prepare selected recompiler"),
+                ));
+            }
+            (
+                RefineContext::load_prepared(
+                    &slot.as_ref().unwrap().1,
+                    &input,
+                    gas,
+                    MemoryModel::Auto,
+                )
+                .expect("load recompiled AgentRuntime"),
+                cold,
+            )
+        });
+        let native_preparation = started.elapsed();
+        let started = std::time::Instant::now();
+        let native = native.try_run().expect("execute recompiled AgentRuntime");
+        let native_execution = started.elapsed();
+        assert_eq!(native.exit, invocation.exit, "backend exit differs");
+        assert_eq!(native.pc, invocation.pc, "backend PC differs");
+        assert_eq!(native.gas_used, invocation.gas_used, "backend gas differs");
+        assert_eq!(
+            native.registers, invocation.registers,
+            "backend registers differ"
+        );
+        assert_eq!(
+            native.output_bounded(RuntimeTransition::MAX_ENCODED_BYTES),
+            invocation.output_bounded(RuntimeTransition::MAX_ENCODED_BYTES),
+            "canonical transition bytes/commitments differ",
+        );
+        let operation = match &work {
+            RuntimeWork::Manage { request, .. } => match request.as_ref() {
+                ManagementRequest::Create(_) => "create",
+                ManagementRequest::Install(_) => "install",
+                _ => "management",
+            },
+            RuntimeWork::Invoke { .. } => "invoke",
+            RuntimeWork::Resume { .. } => "resume",
+            RuntimeWork::Acknowledge { .. } => "ack",
+            #[cfg(feature = "experimental-state-blocks")]
+            RuntimeWork::InspectInvocation { .. } => "inspect-invocation",
+        };
+        eprintln!(
+            "backend_comparison operation={operation} cold={cold} input_bytes={} interpreter_prepare_us={} interpreter_execute_us={} recompiler_prepare_us={} recompiler_execute_us={} gas_used={}",
+            input.len(),
+            reference_preparation.as_micros(),
+            reference_execution.as_micros(),
+            native_preparation.as_micros(),
+            native_execution.as_micros(),
+            invocation.gas_used,
+        );
+    }
     assert_eq!(
         invocation.exit,
         ExitReason::Halt,
@@ -484,13 +569,6 @@ fn yielding_actor_program() -> Vec<u8> {
 }
 
 fn admitted_actor_program(program: Vec<u8>) -> AdmittedActorPackage {
-    admitted_actor_program_for(program, None)
-}
-
-fn admitted_actor_program_for(
-    program: Vec<u8>,
-    proof_system: Option<Hash>,
-) -> AdmittedActorPackage {
     let schema = ParsedSchema {
         constructor: ConstructorContract::Forbidden,
         fields: vec![ParsedField::Inline(ParsedInlineField {
@@ -516,9 +594,7 @@ fn admitted_actor_program_for(
             return_type_identity: "core::primitive::u8".into(),
             authorization_policy: AuthorizationPolicySelector::Public,
             idempotency: IdempotencyRequirement::Required,
-            attestation: proof_system.map_or(AttestationRequirement::None, |proof_system| {
-                AttestationRequirement::Required { proof_system }
-            }),
+            attestation: AttestationRequirement::None,
         }],
     };
     let policy_bytes = policies.encode().expect("encode actor method policy");
@@ -561,10 +637,7 @@ fn admitted_actor_program_for(
             requirements: RuntimeRequirements {
                 lanes: LaneSet::of(StateLane::Linear),
                 scheduling: false,
-                proof_systems: proof_system.map_or(sdk::ProofSystemSet::EMPTY, |proof_system| {
-                    sdk::ProofSystemSet::from_sorted(&[proof_system])
-                        .expect("one canonical proof-system requirement")
-                }),
+                proof_systems: sdk::ProofSystemSet::EMPTY,
             },
             signing: package_signing(),
         }),
@@ -1123,7 +1196,7 @@ fn bundled_runtime_persists_and_resumes_fifo_continuations() {
 fn compiled_runtime_directory_reports_exact_install_lineage_after_restart() {
     let path = std::env::var_os("VOS_AGENT_RUNTIME_PVM").expect("candidate PVM path");
     let pvm = std::fs::read(path).expect("read candidate PVM");
-    let runtime = admit_runtime_package(&runtime_package_bytes_for(&pvm, None)).unwrap();
+    let runtime = admit_runtime_package(&runtime_package_bytes_for(&pvm)).unwrap();
     let (descriptor, created) = create_agent_with_runtime(&pvm, &runtime, 8);
     let actor_package = admitted_actor_program(static_actor_program());
     // This helper also round-trips the installed transition and retries the
@@ -1138,94 +1211,4 @@ fn compiled_runtime_directory_reports_exact_install_lineage_after_restart() {
     assert_eq!(record.installation_id, install.installation_id);
     assert_eq!(record.registry_reservation, install.registry_reservation);
     assert_eq!(record.install_request, install.lineage_commitment());
-}
-
-#[cfg(feature = "agent-transition-proof")]
-#[test]
-#[ignore = "set VOS_AGENT_RUNTIME_PVM to a freshly compiled bundled guest PVM"]
-fn compiled_bundled_runtime_attested_invoke_and_resume_bind_exact_public_output() {
-    let runtime_path = std::env::var_os("VOS_AGENT_RUNTIME_PVM")
-        .expect("VOS_AGENT_RUNTIME_PVM names the freshly compiled guest PVM");
-    let runtime_pvm = std::fs::read(runtime_path).expect("read freshly compiled guest PVM");
-    let proof_system = Hash::digest(
-        b"vos/agent/standard-refine-proof-system/v1",
-        &[
-            sdk::RUNTIME_ABI_ID.as_bytes(),
-            &vos_pvm_proof::PROOF_FORMAT_VERSION.to_le_bytes(),
-            &vos_pvm_proof::REFINE_BUNDLE_FORMAT_VERSION.to_le_bytes(),
-            &vos_pvm_proof::REFINE_PROOF_BUNDLE_CODEC_VERSION.to_le_bytes(),
-        ],
-    );
-    let runtime = admitted_runtime_for(&runtime_pvm, proof_system);
-    let (descriptor, created) = create_agent_with_runtime(&runtime_pvm, &runtime, 4);
-    let actor_package = admitted_actor_program_for(yielding_actor_program(), Some(proof_system));
-    let (installed, _, _) =
-        install_actor_with_runtime(&runtime_pvm, &runtime, &descriptor, created, &actor_package);
-    let record = inspect_actor_with_runtime(&runtime_pvm, &descriptor, installed.clone());
-    let invocation = actor_invocation(&descriptor, &record, &actor_package, 0xc1);
-    let authorization = invocation_receipt(&descriptor, &invocation, 3, 3);
-    let invoke = RuntimeWork::Invoke {
-        context: RuntimeExecutionContext::Attested { proof_system },
-        state: installed,
-        invocation: Box::new(invocation.clone()),
-        authorization: Box::new(InvocationAuthorization::AuthorityReceipt(authorization)),
-        observed_slot: 3,
-    };
-    let invoke_bytes = invoke.encode().expect("canonical attested Invoke");
-    let invoke_observed = vos_pvm_proof::trace_refine_observed(
-        &runtime_pvm,
-        &invoke_bytes,
-        GAS.checked_add(invocation.gas).expect("bounded Invoke gas"),
-        RuntimeTransition::MAX_ENCODED_BYTES,
-    )
-    .expect("trace the compiled guest Attested Invoke exactly once");
-    let invoke_transition = RuntimeTransition::decode(&invoke_observed.output)
-        .expect("canonical observed Invoke transition");
-    assert_eq!(invoke_transition.encode().unwrap(), invoke_observed.output);
-    assert_eq!(
-        invoke_observed.public_io,
-        sdk::runtime_transition_public_io(&invoke_bytes, &invoke_observed.output).0
-    );
-    let RuntimeOutcome::Yielded(first) = &invoke_transition.outcome else {
-        panic!("compiled guest Attested Invoke did not yield")
-    };
-
-    let mut substituted_transition = invoke_transition.clone();
-    substituted_transition.state.linear.push(0xff);
-    assert_ne!(
-        invoke_observed.public_io,
-        sdk::runtime_transition_public_io(&invoke_bytes, &substituted_transition.encode().unwrap())
-            .0
-    );
-    let mut substituted_work = invoke_bytes.clone();
-    *substituted_work.last_mut().unwrap() ^= 1;
-    assert_ne!(
-        invoke_observed.public_io,
-        sdk::runtime_transition_public_io(&substituted_work, &invoke_observed.output).0
-    );
-
-    let resume = RuntimeWork::Resume {
-        context: RuntimeExecutionContext::Attested { proof_system },
-        state: restart(&invoke_transition).state,
-        resume: Box::new(resume_work(first, invocation.availability)),
-    };
-    let resume_bytes = resume.encode().expect("canonical attested Resume");
-    let resume_observed = vos_pvm_proof::trace_refine_observed(
-        &runtime_pvm,
-        &resume_bytes,
-        GAS.saturating_add(GAS),
-        RuntimeTransition::MAX_ENCODED_BYTES,
-    )
-    .expect("trace the compiled guest Attested Resume exactly once");
-    let resume_transition = RuntimeTransition::decode(&resume_observed.output)
-        .expect("canonical observed Resume transition");
-    assert_eq!(resume_transition.encode().unwrap(), resume_observed.output);
-    assert_eq!(
-        resume_observed.public_io,
-        sdk::runtime_transition_public_io(&resume_bytes, &resume_observed.output).0
-    );
-    assert!(matches!(
-        resume_transition.outcome,
-        RuntimeOutcome::Yielded(_)
-    ));
 }

@@ -16572,6 +16572,11 @@ mod tests {
         }
 
         fn check_bundled_authority_fresh_query(inventory: bool) {
+            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                let _ = tracing_subscriber::fmt()
+                    .with_env_filter("vos::agent=debug,vos_pvm::refine_host=debug")
+                    .try_init();
+            }
             let mut harness = NativeProjectionOwnerHarness::with_fixture(
                 "bundled-authority-fresh-query",
                 native_bundled_authority_fixture(),
@@ -16623,8 +16628,12 @@ mod tests {
             // the bundled outer PVM too. These markers separate this fresh
             // query's Invoke/ACK from bootstrap/replay machine observations.
             eprintln!("bundled_authority_fresh_query begin");
+            let query_started = std::time::Instant::now();
             let response = owner.invoke_authority_projection(query.clone()).unwrap();
-            eprintln!("bundled_authority_fresh_query end");
+            eprintln!(
+                "bundled_authority_fresh_query end elapsed_us={}",
+                query_started.elapsed().as_micros()
+            );
             let projection = if inventory {
                 let page = crate::agent_sdk::authority::AuthorityInventoryProjectionPage::decode(
                     &response,
@@ -20287,6 +20296,11 @@ mod tests {
 
         #[cfg(feature = "experimental-state-blocks")]
         fn check_external_local_create(check: ExternalCreateCheck) {
+            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                let _ = tracing_subscriber::fmt()
+                    .with_env_filter("vos::agent=debug,vos_pvm::refine_host=debug")
+                    .try_init();
+            }
             use crate::agent::ExternalLocalJournalDirectory;
             use crate::agent::clean_management_intent::{
                 CleanManagementIntent, CleanManagementIntentSlot,
@@ -21768,6 +21782,7 @@ mod tests {
                             observed_slot: LOGICAL_SLOT + 20,
                         },
                     };
+                    let call_started = std::time::Instant::now();
                     let outcome = installed
                         .submit_direct_clean(
                             input,
@@ -21775,6 +21790,10 @@ mod tests {
                             &mut ReadBudget::new(10_000, 10_000_000),
                         )
                         .unwrap();
+                    eprintln!(
+                        "clerk_physical_call method={method} elapsed_us={}",
+                        call_started.elapsed().as_micros()
+                    );
                     let RuntimeOutcome::Completed(Ok(reply)) = outcome else {
                         panic!("physical Clerk {method} failed: {outcome:?}");
                     };

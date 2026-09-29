@@ -4,17 +4,71 @@
 //! remain responsible for authenticating the program and input, selecting the
 //! gas budget, and validating the returned transition against durable state.
 
+use vos_pvm::refine::{MemoryModel, PreparedProgram, RefineError};
 use vos_pvm::refine_host::RefineContext;
-use vos_pvm::{ExitReason, Gas};
+use vos_pvm::{ExitReason, Gas, PvmBackend};
 
 use crate::agent_sdk::wire::CanonicalWire as AgentCanonicalWire;
 use crate::service::wire::ServiceWire;
+
+// One immutable preparation per worker, shared by image and external-state
+// execution. Exact bytes plus resolved execution semantics select the entry;
+// authorization, memory, host resources and invocation results are never cached.
+thread_local! {
+    static PREPARED_RUNTIME: std::cell::RefCell<Option<(Vec<u8>, PvmBackend, PreparedProgram)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Production Agent execution uses the recompiler on Linux x86-64. Explicit
+/// interpreter selection remains available for reference execution; unsupported
+/// native selection and backend failures never silently fall back.
+pub(crate) fn execution_backend() -> PvmBackend {
+    select_backend(std::env::var("GREY_PVM").ok().as_deref())
+}
+
+fn select_backend(selection: Option<&str>) -> PvmBackend {
+    match selection {
+        Some("interpreter") => PvmBackend::ForceInterpreter,
+        Some("recompiler") => PvmBackend::ForceRecompiler,
+        _ if cfg!(all(target_os = "linux", target_arch = "x86_64")) => PvmBackend::ForceRecompiler,
+        _ => PvmBackend::ForceInterpreter,
+    }
+}
+
+pub(crate) fn load_context(
+    program: &[u8],
+    input: &[u8],
+    gas: Gas,
+) -> Result<RefineContext, RefineError> {
+    let backend = execution_backend();
+    if program.len() > super::execution::MAX_EXECUTION_PROGRAM_BYTES {
+        return RefineContext::load_with_backend(program, input, gas, MemoryModel::Auto, backend);
+    }
+    PREPARED_RUNTIME.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot
+            .as_ref()
+            .is_none_or(|(bytes, selected, _)| bytes.as_slice() != program || *selected != backend)
+        {
+            let prepared = PreparedProgram::new_with_backend(program, backend)?;
+            *slot = Some((program.to_vec(), backend, prepared));
+        }
+        RefineContext::load_prepared(
+            &slot.as_ref().expect("prepared program installed").2,
+            input,
+            gas,
+            MemoryModel::Auto,
+        )
+    })
+}
 
 /// Exact physical failure boundary for one host-side AgentRuntime execution.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RuntimePvmExecutionError {
     /// The authenticated bytes could not be loaded as a standard PVM.
     Load,
+    /// The host backend failed; no guest outcome may be published for it.
+    Backend,
     /// The program ran but did not reach the canonical halt boundary.
     Exit { reason: ExitReason, pc: u32 },
     /// A halted program designated an unreadable output range.
@@ -58,9 +112,23 @@ fn execute_to_halted_output(
     input: &[u8],
     maximum_output_bytes: usize,
 ) -> Result<Vec<u8>, RuntimePvmExecutionError> {
-    let invocation = RefineContext::load(runtime_pvm, input, gas)
-        .map_err(|_| RuntimePvmExecutionError::Load)?
-        .run();
+    let started = std::time::Instant::now();
+    let context = load_context(runtime_pvm, input, gas).map_err(|error| match error {
+        RefineError::Backend => RuntimePvmExecutionError::Backend,
+        _ => RuntimePvmExecutionError::Load,
+    })?;
+    let preparation_us = started.elapsed().as_micros() as u64;
+    let execution_started = std::time::Instant::now();
+    let invocation = context
+        .try_run()
+        .map_err(|_| RuntimePvmExecutionError::Backend)?;
+    tracing::debug!(
+        preparation_us,
+        execution_us = execution_started.elapsed().as_micros() as u64,
+        input_bytes = input.len(),
+        gas_used = invocation.gas_used,
+        "physical image Agent runtime execution"
+    );
     if invocation.exit != ExitReason::Halt {
         return Err(RuntimePvmExecutionError::Exit {
             reason: invocation.exit,
@@ -82,6 +150,25 @@ mod tests {
     use crate::agent_sdk::{ManagementError, RuntimeOutcome, RuntimeState, RuntimeTransition};
 
     const TEST_GAS: Gas = 1_000_000;
+
+    #[test]
+    fn backend_selection_is_explicit_and_platform_bound() {
+        assert_eq!(
+            select_backend(Some("interpreter")),
+            PvmBackend::ForceInterpreter
+        );
+        assert_eq!(
+            select_backend(Some("recompiler")),
+            PvmBackend::ForceRecompiler
+        );
+        let platform = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            PvmBackend::ForceRecompiler
+        } else {
+            PvmBackend::ForceInterpreter
+        };
+        assert_eq!(select_backend(None), platform);
+        assert_eq!(select_backend(Some("unknown")), platform);
+    }
 
     fn returning_program(output: &[u8]) -> Vec<u8> {
         let mut assembler = Assembler::new();

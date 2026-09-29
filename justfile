@@ -425,13 +425,11 @@ agent-system-actors-check:
 agent-sdk-doc-check:
     bash -eu -c 'mkdir -p target/task-tmp; TMPDIR="{{justfile_directory()}}/target/task-tmp" RUSTDOCFLAGS="${RUSTDOCFLAGS:-} -D rustdoc::broken_intra_doc_links" cargo doc -p vos-agent-sdk --no-default-features --no-deps'
 
-# Private host/store modules are absent without private-agent-store. Keep the
-# feature explicit so successful zero-test runs cannot stand in for recovery.
-agent-recovery-check:
-    cargo test -p vos --features pvm,private-agent-store --lib agent::private_host::tests -- --test-threads=1
-    cargo test -p vos --features pvm,private-agent-store --lib agent::private_store::tests -- --test-threads=1
-    cargo test -p vos --features pvm,private-agent-store --lib agent::private_runtime::tests -- --test-threads=1
-    cargo test -p vos --features pvm,private-agent-store --lib portable -- --test-threads=1
+# Exercise supported Local filesystem ownership and retained portable Shared
+# recovery. Deferred Private host/store implementations are not release gates.
+agent-recovery-check: build-agent-recovery-fixture
+    cargo test -p vos --features pvm --lib agent::local_sdk_host::tests -- --test-threads=1
+    cargo test -p vos --features pvm --lib portable -- --test-threads=1
 
 # Lint with clippy.
 lint:
