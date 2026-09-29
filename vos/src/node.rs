@@ -2524,6 +2524,7 @@ impl IngressHandle {
             .as_ref()
             .ok_or(IngressNodeAttestationError::NotConfigured)?;
         let mut query = AuthorityProjectionQuery {
+            recovery: None,
             authority,
             credential: crate::agent::sdk::CredentialId::of_public_key(&credential_public_key),
             nonce,
@@ -13883,7 +13884,7 @@ fn is_private_read_method(method: &str) -> bool {
 /// (status + zero-length state). Both the length and the leading
 /// status byte are load-bearing for the client-side detection.
 #[cfg(feature = "network")]
-#[allow(dead_code)] // Retained as host-side fallback; see doc comment above.
+#[allow(dead_code)]// Retained as host-side fallback; see doc comment above.
 fn forbidden_envelope() -> Vec<u8> {
     use crate::actors::run::STATUS_FORBIDDEN;
     encode_invoke_envelope(STATUS_FORBIDDEN, &[], &[])
@@ -16852,6 +16853,7 @@ mod tests {
             },
         };
         let mut query = AuthorityProjectionQuery {
+            recovery: None,
             authority,
             credential: CredentialId::of_public_key(&public),
             nonce: Hash([0x39; 32]),

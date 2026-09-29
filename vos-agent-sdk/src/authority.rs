@@ -32,6 +32,9 @@ pub const MAX_AUTHORITY_REPLICA_PAGE_ENTRIES: usize = 64;
 pub const MAX_AUTHORITY_INVENTORY_PAGE_ENTRIES: usize = MAX_AUTHORITY_REPLICA_PAGE_ENTRIES;
 /// Maximum application authorization grants projected for one Principal.
 pub const MAX_AUTHORITY_PRINCIPAL_GRANTS: usize = 64;
+/// Bound on the lifetime of newly admitted delegated reads, in trusted slots.
+/// This is not a deadline for finishing an already committed invocation.
+pub const MAX_AUTHORITY_PROJECTION_RECOVERY_SLOTS: u64 = 120;
 
 /// Exact installed system-authority route selected by a credential call.
 ///
@@ -1054,6 +1057,45 @@ pub struct AuthorityProjectionQuery {
     pub nonce: Hash,
     pub selector: AuthorityProjectionSelector,
     pub authentication: AuthorityIngressAuthentication,
+    /// Explicit opt-in for committee recovery of this exact read. Absence keeps
+    /// the original wire/signature format and committed-only relay semantics.
+    pub recovery: Option<AuthorityProjectionRecoveryDelegation>,
+}
+
+/// Signed permission for the exact admitted committee to finish a read while
+/// its ingress attester is offline. The enclosing query signature binds the
+/// target, selector, nonce and original authentication as well as these fields.
+///
+/// `accepted_slot` fixes the PublicPreflight identity across replicas; it is
+/// not evidence of fresh admission. Before proposing unseen work the host must
+/// independently check the current trusted slot and exact stable route/committee.
+/// A committed invocation may finish after expiry without changing its pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthorityProjectionRecoveryDelegation {
+    /// AgentGenerationRouteKey::replication_id(): space, Agent, genesis, admission.
+    pub generation: Hash,
+    /// Complete admitted replica committee commitment (not just voter count).
+    pub committee: Hash,
+    pub accepted_slot: u64,
+    /// Exclusive upper bound for admission of a previously unseen invocation.
+    pub expires_at: u64,
+}
+
+impl AuthorityProjectionRecoveryDelegation {
+    pub fn is_valid(self) -> bool {
+        self.generation != Hash::ZERO
+            && self.committee != Hash::ZERO
+            && self
+                .expires_at
+                .checked_sub(self.accepted_slot)
+                .is_some_and(|lifetime| {
+                    lifetime != 0 && lifetime <= MAX_AUTHORITY_PROJECTION_RECOVERY_SLOTS
+                })
+    }
+
+    pub fn admits_at(self, trusted_slot: u64) -> bool {
+        self.is_valid() && self.accepted_slot <= trusted_slot && trusted_slot < self.expires_at
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1127,13 +1169,48 @@ impl AuthorityProjectionSelector {
 }
 
 impl AuthorityProjectionQuery {
+    pub fn expected_invocation(&self) -> InvocationId {
+        InvocationId(
+            Hash::digest(
+                b"vos/system-authority/projection-invocation/v2",
+                &[self.commitment().as_bytes()],
+            )
+            .0,
+        )
+    }
+
+    /// Deterministic guest-side binding only. Live generation, committee and
+    /// expiry checks require the host's trusted proposal boundary, not replay
+    /// time. Legacy queries keep their existing context-independent behavior.
+    pub fn matches_recovery_context(&self, context: &InvocationContext) -> bool {
+        let Some(recovery) = self.recovery else {
+            return false;
+        };
+        self.validate_shape().is_ok()
+            && context.validate()
+            && context.invocation == self.expected_invocation()
+            && context.actor == self.authority.binding.issuer.actor
+            && context.mode == MethodMode::Query
+            && context.observed_slot == recovery.accepted_slot
+            && context.origin.principal.is_none()
+            && context.origin.credential.is_none()
+            && context.origin.transport_node == self.attesting_node()
+            && context.origin.actor.is_none()
+            && context.origin.capability.is_none()
+            && context.roles == InvocationRoleClaims::none()
+    }
+
     pub fn signing_bytes(&self) -> Vec<u8> {
         crate::wire::authority_projection_query_signing_bytes(self)
     }
 
     pub fn commitment(&self) -> Hash {
         Hash::digest(
-            b"vos/agent/authority-projection-query/v1",
+            if self.recovery.is_some() {
+                b"vos/agent/authority-projection-query/v2"
+            } else {
+                b"vos/agent/authority-projection-query/v1"
+            },
             &[&self.signing_bytes(), &self.authentication.signature()],
         )
     }
@@ -1153,7 +1230,12 @@ impl AuthorityProjectionQuery {
         if !self.authentication.validate_shape(self.credential) {
             return Err(AuthorityActorProtocolError::InvalidCaller);
         }
-        if self.nonce == Hash::ZERO || !self.selector.validate_shape() {
+        if self.nonce == Hash::ZERO
+            || !self.selector.validate_shape()
+            || self
+                .recovery
+                .is_some_and(|delegation| !delegation.is_valid())
+        {
             return Err(AuthorityActorProtocolError::InvalidRequest);
         }
         if crate::wire::authority_projection_query_encoded_len(self)
@@ -2832,9 +2914,149 @@ mod tests {
     }
 
     #[test]
+    fn projection_recovery_is_scoped_expiring_signed_and_context_bound() {
+        let credential_key = [0x61; CREDENTIAL_PUBLIC_KEY_BYTES];
+        let node_key = [0x62; CREDENTIAL_PUBLIC_KEY_BYTES];
+        let recovery = AuthorityProjectionRecoveryDelegation {
+            generation: Hash([0x63; 32]),
+            committee: Hash([0x64; 32]),
+            accepted_slot: 10,
+            expires_at: 10 + MAX_AUTHORITY_PROJECTION_RECOVERY_SLOTS,
+        };
+        assert!(recovery.is_valid());
+        for (slot, admitted) in [
+            (9, false),
+            (10, true),
+            (129, true),
+            (130, false),
+            (u64::MAX, false),
+        ] {
+            assert_eq!(recovery.admits_at(slot), admitted);
+        }
+        for invalid in [
+            AuthorityProjectionRecoveryDelegation {
+                generation: Hash::ZERO,
+                ..recovery
+            },
+            AuthorityProjectionRecoveryDelegation {
+                committee: Hash::ZERO,
+                ..recovery
+            },
+            AuthorityProjectionRecoveryDelegation {
+                expires_at: 10,
+                ..recovery
+            },
+            AuthorityProjectionRecoveryDelegation {
+                expires_at: 9,
+                ..recovery
+            },
+            AuthorityProjectionRecoveryDelegation {
+                expires_at: 131,
+                ..recovery
+            },
+            AuthorityProjectionRecoveryDelegation {
+                accepted_slot: u64::MAX,
+                expires_at: 1,
+                ..recovery
+            },
+        ] {
+            assert!(!invalid.is_valid());
+            assert!(!invalid.admits_at(10));
+        }
+        for ssh in [false, true] {
+            let mut query = AuthorityProjectionQuery {
+                authority: authority_target(),
+                credential: CredentialId::of_public_key(&credential_key),
+                nonce: Hash([0x65; 32]),
+                selector: AuthorityProjectionSelector::Agents {
+                    after: None,
+                    limit: 2,
+                },
+                authentication: if ssh {
+                    AuthorityIngressAuthentication::SshNodeAttestation {
+                        credential_public_key: credential_key,
+                        node: NodeId([0x66; 32]),
+                        request_binding: Hash([0x67; 32]),
+                        signature: [1; CREDENTIAL_SIGNATURE_BYTES],
+                    }
+                } else {
+                    AuthorityIngressAuthentication::ApiCredentialSignature {
+                        credential_public_key: credential_key,
+                        signature: [1; CREDENTIAL_SIGNATURE_BYTES],
+                    }
+                },
+                recovery: Some(recovery),
+            };
+            let signature = test_signature(
+                if ssh { &node_key } else { &credential_key },
+                &query.signing_bytes(),
+            );
+            match &mut query.authentication {
+                AuthorityIngressAuthentication::ApiCredentialSignature {
+                    signature: field, ..
+                }
+                | AuthorityIngressAuthentication::SshNodeAttestation {
+                    signature: field, ..
+                } => *field = signature,
+            }
+            let verifies = |query: &AuthorityProjectionQuery| {
+                if ssh {
+                    query
+                        .verify_ssh_node_attestation_with(&node_key, &TestCredentialVerifier)
+                        .is_ok()
+                } else {
+                    query.verify_api_with(&TestCredentialVerifier).is_ok()
+                }
+            };
+            assert!(verifies(&query));
+            for change in 0..7 {
+                let mut altered = query.clone();
+                match change {
+                    0 => altered.recovery = None,
+                    1 => altered.recovery.as_mut().unwrap().generation.0[0] ^= 1,
+                    2 => altered.recovery.as_mut().unwrap().committee.0[0] ^= 1,
+                    3 => altered.recovery.as_mut().unwrap().accepted_slot += 1,
+                    4 => altered.recovery.as_mut().unwrap().expires_at -= 1,
+                    5 => altered.nonce.0[0] ^= 1,
+                    _ => altered.selector = AuthorityProjectionSelector::Credential,
+                }
+                assert_ne!(query.commitment(), altered.commitment());
+                assert!(!verifies(&altered), "substituted signed field {change}");
+            }
+            let context = InvocationContext {
+                invocation: query.expected_invocation(),
+                actor: query.authority.binding.issuer.actor,
+                mode: MethodMode::Query,
+                observed_slot: recovery.accepted_slot,
+                origin: crate::InvocationOrigin {
+                    principal: None,
+                    credential: None,
+                    transport_node: query.attesting_node(),
+                    actor: None,
+                    capability: None,
+                },
+                roles: InvocationRoleClaims::none(),
+            };
+            assert!(query.matches_recovery_context(&context));
+            for change in 0..5 {
+                let mut altered = context;
+                match change {
+                    0 => altered.observed_slot += 1,
+                    1 => altered.invocation = InvocationId([0x68; 32]),
+                    2 => altered.actor = ActorId([0x69; 32]),
+                    3 => altered.mode = MethodMode::Linear,
+                    _ => altered.origin.transport_node = Some(NodeId([0x70; 32])),
+                }
+                assert!(!query.matches_recovery_context(&altered));
+            }
+        }
+    }
+
+    #[test]
     fn projection_authentication_variants_bind_the_complete_query() {
         let api_key = [0x61; CREDENTIAL_PUBLIC_KEY_BYTES];
         let mut api = AuthorityProjectionQuery {
+            recovery: None,
             authority: authority_target(),
             credential: CredentialId::of_public_key(&api_key),
             nonce: Hash([0x62; 32]),
@@ -2870,6 +3092,7 @@ mod tests {
         let node_key = [0x65; CREDENTIAL_PUBLIC_KEY_BYTES];
         let ssh_key = [0x66; CREDENTIAL_PUBLIC_KEY_BYTES];
         let mut ssh = AuthorityProjectionQuery {
+            recovery: None,
             authority: authority_target(),
             credential: CredentialId::of_public_key(&ssh_key),
             nonce: Hash([0x67; 32]),

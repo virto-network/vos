@@ -8,20 +8,86 @@ implementation branch; do not apply competing fixes on the review worktree.
 
 | Purpose | Branch / checkpoint |
 | --- | --- |
-| Reviewer target | Code `7c1a1b7c` plus this docs-only handoff; verify `saga/agents` contains the code checkpoint |
-| Review range | `fb48603c..7c1a1b7c` as **one batch**: internal Shared journal publication, applied availability and recovery |
-| Code checkpoint | `7c1a1b7c` on `wip/ch08-runtime-directory`; prior backend follow-up is `4ea0271c` |
+| Reviewer target | `saga/agents` containing this signed read-recovery follow-up; verify the implementation fast-forward before reviewing |
+| Review range | `0bec4f58..saga/agents` as **one batch**: scoped delegation, exact pending recovery and crash/refusal regressions |
+| Preceding code checkpoint | Shared journal/applied availability `7c1a1b7c`; prior backend follow-up `4ea0271c` |
 | Prior tested baseline | `62ffbc20`; `master` remains unchanged |
 | Historical startup review | `f1bfa1bd..310ef841`; two findings fixed at `62ffbc20` |
 
-The new code commit changes 13 files (+4,251 / -198 lines), including an
-887-line physical lifecycle fixture. It is one scoped integration batch, not
-release qualification. The preceding pruning code changed 42 files
+The preceding Shared integration changed 13 files (+4,251 / -198 lines), including
+an 887-line physical lifecycle fixture. The current follow-up is one scoped
+read-recovery batch, not release qualification. The preceding pruning changed 42 files
 (+1,942 / -43,868 lines). Documentation handoffs are separate. Verify branch
 heads before reviewing, and apply findings
 on the implementation branch. Do not infer publication from a candidate hash.
 This is not a release: batch 1 is not closed, batches 2/3 remain open, production
 multi-node startup/public Shared management remain gated, and Local is image-based.
+
+### Signed read recovery: follow-up from `0bec4f58`
+
+User-authorized delegation binds the exact signed read to its admitted generation,
+full committee, accepted preflight slot and exclusive expiry (at most 120 trusted
+slots). Host gas/material remain derived from the certified bootstrap and admitted
+Authority installation; the query signature does not directly sign those bytes.
+Every replica derives the same pending work/authorization pair. Before unseen
+proposal, the host independently validates the current clock, stable committee,
+authenticated relay membership and original signature under the proposal guard.
+It repeats the check after terminal preview, immediately before proposal.
+The guest checks the immutable context and the existing credential/enrollment
+policy; replay's accepted slot is never treated as a fresh wall-clock check.
+
+Some/SSH is deliberately restricted to original attestors in the current voter
+roster, whose authenticated keys permit signature verification before PAP2 writes.
+Generic Invoke ingress refuses delegated projections. Exact locally applied
+Invoke/positive-ACK evidence permits completion after expiry; unseen expired work
+retains its reservation. No clock refresh, local-absence clearance or new
+cancellation protocol is introduced. Repeated freshness checks read the existing
+trusted clock directly, without extra runtime directory inspections; borrowed
+pending validation avoids cloning artifact closures.
+
+The query-only wire extension uses tags 2/3 and APQD/delegated-v2 signing and
+commitment domains. None retains byte-identical APQ1 tags 0/1, APQS and v1
+commitments, including embedded response bodies. AOC5/other authenticators are
+unchanged. Old guests reject the new tags. Existing production authenticators
+continue to emit None; the rebuilt candidate Authority is not a bundled-artifact
+repin or a public startup enablement.
+
+The offline-origin fixture stops and joins the attesting node's actual Network,
+then supplies its frozen signed request to a surviving follower for authenticated
+relay. This proves delegated authority and exact completion while origin is
+offline, **not** autonomous discovery/replication of an origin-only pending file.
+Expired-unseen terminal resolution, request availability, coherent artifact/emitter
+cutover and released three-daemon qualification remain open. No failover latency
+or production throughput bound follows from total fixture runtimes.
+
+Evidence (shared target below; candidate/recompiler, not released daemons):
+
+| Check | Result / log |
+| --- | --- |
+| Three-node physical crash matrix | 6 pass, 230.83 s; `delegation-projection-crash-matrix.log`: both pre-Invoke reopen orderings, origin Network offline, expired unseen retention, both post-Invoke orderings and post-ACK recovery after expiry |
+| Portable SDK | 252 pass, 1 existing ignored; `delegation-sdk-tests.log` |
+| Authority host suite | 82 pass, 2 fixture-export tests ignored; `delegation-authority-full-tests.log` |
+| CLI | 300 pass, 45 ignored with loopback access; `delegation-cli-loopback-tests.log`; the initial restricted run failed only socket permissions |
+| Protocol / authenticated transport | 15 / 16 pass; `delegation-protocol-tests.log`, `delegation-network-tests.log` |
+| Feature boundary | Final experimental core test binary and default CLI build; minimal std-only core check passes (`delegation-core-build-final.log`, `delegation-minimal-check.log`) |
+
+The rebuilt `agent-state-authority/riscv64em-vos/release/system_authority.elf`
+has SHA-256 `a88872c5de59d97905ccfb043268fa8ef6aea5a1c0e354b9c7c3255fed05e2ed`.
+Build evidence is `delegation-authority-guest-build-final.log`; reproduce with
+`just build-agent-state-authority-guest` using the disk-backed environment below.
+The prior candidate ELF is preserved under `agent-state-authority/` rather than
+overwritten without recovery. No tracked bundled artifact or production pin changed.
+Independent read-only implementation review found no remaining scoped findings;
+it does not sign off the outstanding release boundaries.
+
+With the final feature-enabled core test binary, rerun the physical matrix using
+`AUTHORITY_CANDIDATE_ELF` set to the ELF above, `GREY_PVM=recompiler`,
+`RUST_MIN_STACK=16777216`, disk-backed `TMPDIR`, and this test filter:
+`agent::clean_bootstrap::tests::physical::candidate_projection_ --ignored --test-threads=1`.
+Authenticated loopback transports require local socket permissions. The matrix
+also checks legacy unseen-relay refusal, signed scope/time/signature/nonmember
+negatives, ordinary-entry enforcement, generic supervisor/raw-network Invoke
+refusal, the decoded exact Authority reply and the original positive ACK pair.
 
 ### Shared publication and recovery: `7c1a1b7c`
 
@@ -94,12 +160,12 @@ reopen refusal and exact restoration. Do not call this ordinary-Agent network
 quorum, public lifecycle, growing-ledger or 100,000-transfer qualification.
 
 Independent review has no remaining findings in the corrected scoped changes.
-The pre-Invoke three-node crash fixture still demonstrates an unresolved release
-gate (`projection-before-invoke.log`): committed-only recovery refuses an unseen
-request while its reservation remains held. Its desired-success test remains
-explicitly ignored; it is not counted as passing. Scoped expiring recovery
-delegation versus original-attestor readmission awaits a user authorization
-decision. Do not bypass the guard or silently refresh an old authorization.
+At this checkpoint the pre-Invoke three-node crash fixture demonstrated an
+unresolved release gate (`projection-before-invoke.log`): committed-only recovery
+refused an unseen request while its reservation remained held. The user approved
+scoped expiring signed recovery delegation on 2026-09-29. The follow-up must
+preserve the original preflight and independently check current admission time;
+that approval does not itself close the release gate.
 
 ### Backend follow-up: `4ea0271c`
 
@@ -345,8 +411,8 @@ deleted by documentation consolidation.
 
 ## What remains before the next release decision
 
-Finish remaining phase/resource qualification before closing batch 1. Next resolve
-pre-Invoke recovery authority, certified snapshot/catch-up with root pinning, then
+Finish remaining phase/resource qualification before closing batch 1. Close the
+remaining signed-read recovery limits, certified snapshot/catch-up with root pinning, then
 join the external file owner to public Shared startup and management. Existing
 snapshots are source-node/store-bound; adding signatures alone is not cross-node
 catch-up. Follow only the live plan:

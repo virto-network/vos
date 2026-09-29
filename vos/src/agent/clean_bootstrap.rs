@@ -1415,6 +1415,42 @@ impl AuthorityReadRequest {
         }
     }
 
+    fn matches_work(
+        &self,
+        work: &super::sdk::InvocationWork,
+        authorization: &InvocationAuthorization,
+    ) -> bool {
+        let InvocationAuthorization::PublicPreflight(preflight) = authorization else {
+            return false;
+        };
+        let target = self.authority();
+        self.is_valid()
+            && match self {
+                Self::Projection(query) => query
+                    .recovery
+                    .is_none_or(|scope| scope.accepted_slot == preflight.observed_slot),
+                Self::GenesisDecision { .. } => true,
+            }
+            && work.validate()
+            && authorization.matches_work(work)
+            && work.space == target.space
+            && work.agent == target.system_agent
+            && work.runtime_deployment == target.system_runtime_deployment
+            && work.actor == target.binding.issuer.actor
+            && work.deployment == target.binding.issuer.deployment
+            && work.program == target.binding.issuer.program
+            && work.mode == self.mode()
+            && work.invocation == self.invocation()
+            && work.origin.principal.is_none()
+            && work.origin.transport_node == self.attesting_node()
+            && work.origin.credential.is_none()
+            && work.origin.actor.is_none()
+            && work.origin.capability.is_none()
+            && work.roles == InvocationRoleClaims::none()
+            && work.message == self.message()
+            && !work.recovery_only
+    }
+
     fn invocation(&self) -> InvocationId {
         let hash = match self {
             Self::Projection(query) => Hash::digest(
@@ -1506,6 +1542,22 @@ pub(crate) struct PendingAuthorityProjection {
 }
 
 impl PendingAuthorityProjection {
+    pub(crate) fn delegated_projection(
+        &self,
+    ) -> Option<(
+        &AuthorityProjectionQuery,
+        &super::sdk::InvocationWork,
+        &InvocationAuthorization,
+    )> {
+        self.validate().then_some(())?;
+        let AuthorityReadRequest::Projection(query) = &self.query else {
+            return None;
+        };
+        query.recovery?;
+        let (work, authorization) = self.invocation()?;
+        Some((query, work, authorization))
+    }
+
     pub(crate) fn management_envelope(
         &self,
     ) -> Option<(
@@ -1529,7 +1581,6 @@ impl PendingAuthorityProjection {
         let InvocationAuthorization::PublicPreflight(preflight) = authorization.as_ref() else {
             return false;
         };
-        let target = self.query.authority();
         self.query.is_valid()
             && self.management_anchor.as_ref().is_none_or(|anchor| {
                 use crate::service::ServiceWire as _;
@@ -1543,24 +1594,7 @@ impl PendingAuthorityProjection {
             && *context == RuntimeExecutionContext::Direct
             && state.is_empty()
             && *observed_slot == preflight.observed_slot
-            && invocation.validate()
-            && authorization.matches_work(invocation)
-            && invocation.space == target.space
-            && invocation.agent == target.system_agent
-            && invocation.runtime_deployment == target.system_runtime_deployment
-            && invocation.actor == target.binding.issuer.actor
-            && invocation.deployment == target.binding.issuer.deployment
-            && invocation.program == target.binding.issuer.program
-            && invocation.mode == self.query.mode()
-            && invocation.invocation == self.query.invocation()
-            && invocation.origin.principal.is_none()
-            && invocation.origin.transport_node == self.query.attesting_node()
-            && invocation.origin.credential.is_none()
-            && invocation.origin.actor.is_none()
-            && invocation.origin.capability.is_none()
-            && invocation.roles == InvocationRoleClaims::none()
-            && invocation.message == self.query.message()
-            && !invocation.recovery_only
+            && self.query.matches_work(invocation, authorization)
     }
 
     fn invocation(&self) -> Option<(&super::sdk::InvocationWork, &InvocationAuthorization)> {
@@ -1636,6 +1670,36 @@ const fn projection_method(selector: AuthorityProjectionSelector) -> &'static st
         AuthorityProjectionSelector::AgentReplicas { .. } => "agent_replica_projection_page",
         AuthorityProjectionSelector::Actors { .. } => "actor_projection_page",
     }
+}
+
+/// Decode only the public Authority projection envelope. This is used to
+/// reject delegated reads on generic Invoke ingress; it never interprets
+/// private runtime or Authority state.
+pub(crate) fn projection_query_from_work(
+    work: &super::sdk::InvocationWork,
+) -> Option<AuthorityProjectionQuery> {
+    use crate::actors::codec::Decode as _;
+    let message = crate::actors::value::Msg::try_decode(
+        work.message
+            .strip_prefix(&[crate::actors::value::TAG_DYNAMIC])?,
+    )?;
+    let crate::actors::value::Value::Bytes(bytes) = message.args.get("query")? else {
+        return None;
+    };
+    let query = AuthorityProjectionQuery::decode(bytes).ok()?;
+    (message.name == projection_method(query.selector)
+        && work.actor == query.authority.binding.issuer.actor
+        && work.deployment == query.authority.binding.issuer.deployment
+        && work.program == query.authority.binding.issuer.program)
+        .then_some(query)
+}
+
+pub(crate) fn projection_query_matches_work(
+    query: &AuthorityProjectionQuery,
+    work: &super::sdk::InvocationWork,
+    authorization: &InvocationAuthorization,
+) -> bool {
+    AuthorityReadRequest::Projection(query.clone()).matches_work(work, authorization)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -7854,7 +7918,7 @@ where
 
     pub(crate) fn install_projection_dispatch(
         &mut self,
-        dispatch: Arc<dyn Fn(AuthorityProjectionQuery, bool) -> bool + Send + Sync>,
+        dispatch: Arc<dyn Fn(AuthorityProjectionQuery, bool, NodeId) -> bool + Send + Sync>,
     ) -> Result<(), SharedAgentHostError> {
         self._network_host.install_projection_dispatch(dispatch)
     }
@@ -7863,6 +7927,7 @@ where
         &mut self,
         query: AuthorityProjectionQuery,
         recovering: bool,
+        sender: NodeId,
     ) -> Result<Vec<u8>, SharedAgentHostError> {
         if !self
             ._network_host
@@ -7870,7 +7935,7 @@ where
         {
             return Err(SharedAgentHostError::Unavailable);
         }
-        if recovering {
+        if recovering || query.recovery.is_some() {
             let mut pending = self.prepare_authority_projection(query.clone())?;
             let (work, _) = pending
                 .invocation()
@@ -7878,15 +7943,19 @@ where
             if let Some(bytes) = self.committed_projection_response(work)? {
                 return Ok(bytes);
             }
-            // Recovery relays may originate from a different node than the
-            // signed query. They cannot create work: require the exact Invoke
-            // and its original authorization in our own applied journal first.
+            // Legacy relays can only finish locally committed work. Explicit
+            // signed delegation additionally permits this exact unseen read,
+            // after current committee, signature and independent clock checks.
             if !self.restore_committed_projection_authorization(&mut pending)? {
-                return Err(SharedAgentHostError::Unavailable);
+                if query.recovery.is_none() {
+                    return Err(SharedAgentHostError::Unavailable);
+                }
+                self._network_host.validate_delegated_projection(&pending, sender)?;
             }
         }
         self.recover_pending_authority_projection()?;
-        self.invoke_local_authority_projection(query, recovering)
+        let require_committed = recovering && query.recovery.is_none();
+        self.invoke_local_authority_projection(query, require_committed)
     }
 
     fn invoke_local_authority_projection(
@@ -8020,6 +8089,10 @@ where
         let recovering = self.restore_committed_projection_authorization(&mut pending)?;
         if require_committed && !recovering {
             return Err(SharedAgentHostError::Unavailable);
+        }
+        if pending.delegated_projection().is_some() {
+            self._network_host
+                .validate_delegated_projection(&pending, self.pins.node)?;
         }
         tracing::debug!(
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -8220,8 +8293,14 @@ where
         if !work.validate() {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
+        let accepted_slot = match &query {
+            AuthorityReadRequest::Projection(query) => query
+                .recovery
+                .map_or(material.observed_slot, |scope| scope.accepted_slot),
+            AuthorityReadRequest::GenesisDecision { .. } => material.observed_slot,
+        };
         let authorization = super::sdk::InvocationAuthorization::PublicPreflight(
-            super::sdk::PublicPreflight::for_work(&work, material.observed_slot),
+            super::sdk::PublicPreflight::for_work(&work, accepted_slot),
         );
         let pending = PendingAuthorityProjection {
             query,
@@ -8256,6 +8335,10 @@ where
             .ok_or(SharedAgentHostError::Unavailable)?;
         if !pending.validate() || pending.query.authority() != self.authority_target() {
             return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if pending.delegated_projection().is_some() {
+            self._network_host
+                .validate_delegated_projection(&pending, self.pins.node)?;
         }
         let (work, authorization) = pending
             .invocation()
@@ -8387,6 +8470,11 @@ where
         if !pending.validate() || pending.query.authority() != self.authority_target() {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
+        let delegated = pending.delegated_projection().is_some();
+        if delegated {
+            self._network_host
+                .validate_delegated_projection(pending, self.pins.node)?;
+        }
         let (work, authorization) = pending
             .invocation()
             .ok_or(SharedAgentHostError::ScopeMismatch)?;
@@ -8405,7 +8493,7 @@ where
         let InvocationAuthorization::PublicPreflight(preflight) = authorization else {
             return Err(SharedAgentHostError::ScopeMismatch);
         };
-        let authorized = if persisted {
+        let authorized = if persisted || delegated {
             super::supervisor_adapters::physical_material_authorizes_reserved_work(
                 &material,
                 identity,
@@ -10503,6 +10591,7 @@ mod tests {
                 credential: CredentialId::of_public_key(&public_key),
                 nonce: inventory_nonce(group, ordinal),
                 selector,
+                recovery: None,
                 authentication: AuthorityIngressAuthentication::ApiCredentialSignature {
                     credential_public_key: public_key,
                     signature: [1; 64],
@@ -12584,15 +12673,31 @@ mod tests {
         }
 
         #[test]
-        #[ignore = "known pre-Invoke failover release gate: PAP2 has no authority to readmit unseen work; requires AUTHORITY_CANDIDATE_ELF and loopback"]
+        #[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
         fn candidate_projection_recovers_before_invoke_and_former_leader_reopen() {
-            // This deliberately remains a desired-success regression, not an
-            // assertion that permanently accepts the current Unavailable loop.
-            // Resolving it needs explicit recovery/readmission authority; do
-            // not weaken the successor's committed-only recovery guard.
             check_fixed_system_pending_cluster(
                 true,
                 Some(ProjectionCrashStage::BeforeInvoke),
+                false,
+            );
+        }
+
+        #[test]
+        #[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
+        fn candidate_projection_before_invoke_completes_with_attestor_offline() {
+            check_fixed_system_pending_cluster(
+                true,
+                Some(ProjectionCrashStage::BeforeInvoke),
+                true,
+            );
+        }
+
+        #[test]
+        #[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
+        fn candidate_projection_expired_unseen_retains_pending_pair() {
+            check_fixed_system_pending_cluster(
+                true,
+                Some(ProjectionCrashStage::ExpiredBeforeInvoke),
                 false,
             );
         }
@@ -12610,6 +12715,7 @@ mod tests {
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         enum ProjectionCrashStage {
             BeforeInvoke,
+            ExpiredBeforeInvoke,
             AfterInvoke,
             AfterAckBeforeMetadataClear,
         }
@@ -12857,7 +12963,9 @@ mod tests {
                                 Some(attached.try_complete(&mut signer).unwrap().unwrap());
                         }
                     }
-                    let attestor = (leader + 1) % 3;
+                    // The original attestor is the node we stop below. A
+                    // surviving origin must not hide a normal-retry dependency.
+                    let attestor = leader;
                     let node_key = SigningKey::from_bytes(&[[NODE_SEED, 0xd2, 0xd3][attestor]; 32]);
                     let credential_public_key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32])
                         .verifying_key()
@@ -12868,6 +12976,7 @@ mod tests {
                         credential: CredentialId::of_public_key(&credential_public_key),
                         nonce: Hash([0xe7; 32]),
                         selector: AuthorityProjectionSelector::Credential,
+                        recovery: None,
                         authentication: AuthorityIngressAuthentication::SshNodeAttestation {
                             credential_public_key,
                             node: fixtures[attestor].plan.pins.node,
@@ -12887,15 +12996,199 @@ mod tests {
                     // signed work that is absent from the local journal.
                     let before = owner.ordered_index_for_test().unwrap();
                     assert_eq!(
-                        owner.invoke_peer_authority_projection(query.clone(), true),
+                        owner.invoke_peer_authority_projection(
+                            query.clone(),
+                            true,
+                            owner.pins.node,
+                        ),
                         Err(SharedAgentHostError::Unavailable)
                     );
                     assert_eq!(owner.ordered_index_for_test().unwrap(), before);
                     assert!(owner.record.pending_projection.is_none());
+                    let attachment = owner
+                        .host
+                        .lock()
+                        .unwrap()
+                        .supervisor_attachment_status(agent)
+                        .unwrap()
+                        .unwrap();
+                    let accepted_slot = owner
+                        .supervisor_invocation_material(
+                            owner.pins.agent,
+                            owner.pins.authority.issuer.actor,
+                        )
+                        .unwrap()
+                        .observed_slot;
+                    query.recovery = Some(
+                        crate::agent::sdk::authority::AuthorityProjectionRecoveryDelegation {
+                            generation: Hash(attachment.replication_id),
+                            committee: Hash(*attachment.route.committee().as_bytes()),
+                            accepted_slot,
+                            expires_at: accepted_slot
+                                + crate::agent::sdk::authority::MAX_AUTHORITY_PROJECTION_RECOVERY_SLOTS,
+                        },
+                    );
+                    let sign_query = |query: &mut AuthorityProjectionQuery| {
+                        let signature = node_key.sign(&query.signing_bytes()).to_bytes();
+                        let AuthorityIngressAuthentication::SshNodeAttestation {
+                            signature: slot,
+                            ..
+                        } = &mut query.authentication
+                        else {
+                            unreachable!()
+                        };
+                        *slot = signature;
+                    };
+                    sign_query(&mut query);
+                    let delegation = query.recovery.unwrap();
+                    // These remain correctly signed except the final case.
+                    // Neither the recovery nor ordinary entry point may turn
+                    // an invalid delegation into an unseen read.
+                    for invalid_case in 0..5 {
+                        let mut invalid = query.clone();
+                        let scope = invalid.recovery.as_mut().unwrap();
+                        match invalid_case {
+                            0 => scope.generation = Hash([0xf1; 32]),
+                            1 => scope.committee = Hash([0xf2; 32]),
+                            2 => {
+                                scope.accepted_slot += 1;
+                                scope.expires_at += 1;
+                            }
+                            3 => {
+                                scope.accepted_slot -= 1;
+                                scope.expires_at = accepted_slot;
+                            }
+                            4 => {}
+                            _ => unreachable!(),
+                        }
+                        sign_query(&mut invalid);
+                        if invalid_case == 4 {
+                            invalid.nonce.0[0] ^= 1;
+                        }
+                        for recovering in [false, true] {
+                            assert!(
+                                owner
+                                    .invoke_peer_authority_projection(
+                                        invalid.clone(),
+                                        recovering,
+                                        fixtures[(leader + 1) % 3].plan.pins.node,
+                                    )
+                                    .is_err(),
+                                "invalid delegation {invalid_case}, recovery={recovering}"
+                            );
+                            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+                            assert!(owner.record.pending_projection.is_none());
+                        }
+                    }
+                    for recovering in [false, true] {
+                        assert!(
+                            owner
+                                .invoke_peer_authority_projection(
+                                    query.clone(),
+                                    recovering,
+                                    NodeId([0xf3; 32]),
+                                )
+                                .is_err(),
+                            "unadmitted relay must not execute a delegated read"
+                        );
+                        assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+                        assert!(owner.record.pending_projection.is_none());
+                    }
+                    let generic_pending =
+                        owner.prepare_authority_projection(query.clone()).unwrap();
+                    let generic_identity = owner
+                        .pending_authority_projection_identity(&generic_pending, false)
+                        .unwrap();
+                    let (generic_work, generic_authorization) =
+                        generic_pending.invocation().unwrap();
+                    assert!(
+                        owner
+                            .supervisor_invoke(
+                                generic_identity,
+                                generic_work.clone(),
+                                generic_authorization.clone(),
+                            )
+                            .is_err(),
+                        "generic invocation must not bypass delegated projection admission"
+                    );
+                    assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+                    assert!(owner.record.pending_projection.is_none());
+                    if crash_stage == ProjectionCrashStage::BeforeInvoke && successor_finishes_first
+                    {
+                        use crate::network::agent_protocol::{
+                            AgentFrame, AgentGenerationRoute, AgentMessage, InvocationRequest,
+                        };
+                        let sender_index = (leader + 1) % 3;
+                        let sender = fixtures[sender_index].plan.pins.node;
+                        let sender_key =
+                            SigningKey::from_bytes(&[[NODE_SEED, 0xd2, 0xd3][sender_index]; 32]);
+                        let mut raw_query = query.clone();
+                        let AuthorityIngressAuthentication::SshNodeAttestation { node, .. } =
+                            &mut raw_query.authentication
+                        else {
+                            unreachable!()
+                        };
+                        *node = sender;
+                        let raw_signature = sender_key.sign(&raw_query.signing_bytes()).to_bytes();
+                        let AuthorityIngressAuthentication::SshNodeAttestation {
+                            signature, ..
+                        } = &mut raw_query.authentication
+                        else {
+                            unreachable!()
+                        };
+                        *signature = raw_signature;
+                        let raw_pending = owner.prepare_authority_projection(raw_query).unwrap();
+                        let (raw_work, raw_authorization) = raw_pending.invocation().unwrap();
+                        let raw_request = InvocationRequest {
+                            work: raw_work.clone(),
+                            authorization: raw_authorization.clone(),
+                        };
+                        let route = AgentGenerationRoute {
+                            space: owner.pins.space,
+                            agent: owner.pins.agent,
+                            generation: delegation.generation,
+                        };
+                        // The frame is canonical and its public origin matches
+                        // the authenticated sender. Refusal must come from the
+                        // delegated-read ingress boundary, not malformed wire.
+                        assert!(
+                            AgentFrame {
+                                route,
+                                sender,
+                                message: AgentMessage::InvokeRequest(raw_request.clone()),
+                            }
+                            .encode()
+                            .is_ok()
+                        );
+                        assert!(
+                            networks[sender_index]
+                                .send_agent_invocation(owner.pins.node, route, raw_request)
+                                .recv_timeout(std::time::Duration::from_secs(10))
+                                .expect(
+                                    "raw delegated InvokeRequest must receive a transport refusal"
+                                )
+                                .is_err()
+                        );
+                        assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+                        assert!(owner.record.pending_projection.is_none());
+                    }
+                    fixtures[leader]
+                        .logical_slot
+                        .as_ref()
+                        .unwrap()
+                        .store(accepted_slot + 1, Ordering::Release);
                     let retained = owner.prepare_authority_projection(query.clone()).unwrap();
                     let (work, authorization) = retained.invocation().unwrap();
                     let work = work.clone();
                     let authorization = authorization.clone();
+                    let InvocationAuthorization::PublicPreflight(preflight) = &authorization else {
+                        unreachable!()
+                    };
+                    assert_eq!(preflight.observed_slot, accepted_slot);
+                    let RuntimeWork::Invoke { observed_slot, .. } = &retained.work else {
+                        unreachable!()
+                    };
+                    assert_eq!(*observed_slot, accepted_slot);
                     owner
                         ._network_host
                         .reserve_projection_pair(agent, &work, &authorization, false)
@@ -12903,7 +13196,11 @@ mod tests {
                     owner.record.pending_projection = Some(retained.clone());
                     commit_bootstrap_record(&mut owner.record_store, &owner.record).unwrap();
                     let mut invoked = None;
-                    if crash_stage != ProjectionCrashStage::BeforeInvoke {
+                    if !matches!(
+                        crash_stage,
+                        ProjectionCrashStage::BeforeInvoke
+                            | ProjectionCrashStage::ExpiredBeforeInvoke
+                    ) {
                         let identity = owner
                             .pending_authority_projection_identity(&retained, true)
                             .unwrap();
@@ -12933,6 +13230,60 @@ mod tests {
                             assert_eq!(acknowledged.authorization, authorization.commitment());
                         }
                     }
+                    if crash_stage == ProjectionCrashStage::ExpiredBeforeInvoke {
+                        fixtures[leader]
+                            .logical_slot
+                            .as_ref()
+                            .unwrap()
+                            .store(delegation.expires_at, Ordering::Release);
+                        let before_record = owner.record.encode();
+                        assert!(owner.recover_pending_authority_projection().is_err());
+                        assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+                        assert_eq!(owner.record.encode(), before_record);
+                        assert_eq!(
+                            owner
+                                .record_store
+                                .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
+                                .unwrap(),
+                            Some(before_record),
+                        );
+                        let changed = InvocationAuthorization::PublicPreflight(
+                            crate::agent::sdk::PublicPreflight::for_work(
+                                &work,
+                                delegation.expires_at,
+                            ),
+                        );
+                        assert_eq!(
+                            owner
+                                ._network_host
+                                .reserve_projection_pair(agent, &work, &changed, false,),
+                            Err(SharedAgentHostError::Conflict)
+                        );
+                        assert!(
+                            !owner
+                                .host
+                                .lock()
+                                .unwrap()
+                                .retained_terminal_projection_invoke(agent, &work, &authorization)
+                                .unwrap()
+                        );
+                        assert!(
+                            !owner
+                                .host
+                                .lock()
+                                .unwrap()
+                                .retained_positive_clean_acknowledgement(
+                                    agent,
+                                    &work,
+                                    &authorization
+                                )
+                                .unwrap()
+                        );
+                        // No cancellation/absence protocol exists in this
+                        // slice: expired unseen metadata intentionally retains
+                        // its reservation rather than refreshing or clearing it.
+                        return;
+                    }
                     for other in owners.iter().flatten() {
                         assert!(wait_until(std::time::Duration::from_secs(30), || {
                             let host = other.host.lock().unwrap();
@@ -12952,10 +13303,35 @@ mod tests {
                                         == ProjectionCrashStage::AfterAckBeforeMetadataClear)
                         }));
                     }
+                    for other in owners.iter_mut().flatten() {
+                        let regenerated =
+                            other.prepare_authority_projection(query.clone()).unwrap();
+                        assert_eq!(
+                            regenerated.work, retained.work,
+                            "signed admission slot must preserve the exact RuntimeWork on every leader"
+                        );
+                    }
                     // Lose the leader at the selected durable boundary. Two
                     // surviving voters elect a successor without its local
                     // pending record; none may weaken the exact pair guard.
                     drop(owners[leader].take());
+                    let stopped_network = networks.remove(leader);
+                    stopped_network.shutdown();
+                    Arc::try_unwrap(stopped_network)
+                        .unwrap_or_else(|_| panic!("retired leader retained its Network"))
+                        .join();
+                    let offline_peer = libp2p::identity::Keypair::ed25519_from_bytes(
+                        [[NODE_SEED, 0xd2, 0xd3][leader]; 32],
+                    )
+                    .unwrap()
+                    .public()
+                    .to_peer_id();
+                    assert!(
+                        wait_until(std::time::Duration::from_secs(5), || networks
+                            .iter()
+                            .all(|network| !network.connected_peers().contains(&offline_peer))),
+                        "stopped attestor must be disconnected from both surviving transports"
+                    );
                     assert!(wait_until(std::time::Duration::from_secs(15), || owners
                         .iter()
                         .flatten()
@@ -12963,25 +13339,14 @@ mod tests {
                             ._network_host
                             .bootstrap_is_local_leader(agent)
                             .unwrap_or(false))));
-                    if successor_finishes_first {
-                        let successor = owners
-                            .iter_mut()
-                            .flatten()
-                            .find(|owner| {
-                                owner
-                                    ._network_host
-                                    .bootstrap_is_local_leader(agent)
-                                    .unwrap()
-                            })
-                            .unwrap();
-                        let response = successor
-                            .invoke_peer_authority_projection(query.clone(), true)
-                            .unwrap();
-                        assert_eq!(
-                            successor.committed_projection_response(&work).unwrap(),
-                            Some(response)
-                        );
-                        assert!(successor.record.pending_projection.is_none());
+                    if crash_stage != ProjectionCrashStage::BeforeInvoke {
+                        // Once the exact Invoke is committed, expiry cannot
+                        // invalidate result/ACK recovery or rewrite admission.
+                        fixtures[leader]
+                            .logical_slot
+                            .as_ref()
+                            .unwrap()
+                            .store(delegation.expires_at, Ordering::Release);
                     }
                     let mut serving = Vec::new();
                     let mut attachments = Vec::new();
@@ -12992,6 +13357,95 @@ mod tests {
                             owner.clone(), 8).unwrap());
                         serving.push(owner);
                     }
+                    if successor_finishes_first {
+                        let relay = serving
+                            .iter()
+                            .find(|owner| {
+                                !owner
+                                    .lock()
+                                    .unwrap()
+                                    ._network_host
+                                    .bootstrap_is_local_leader(agent)
+                                    .unwrap()
+                            })
+                            .unwrap();
+                        assert_ne!(
+                            relay.lock().unwrap().pins.node,
+                            query.attesting_node().unwrap()
+                        );
+                        // Exercise the actual authenticated member relay,
+                        // not an original-attestor retry or a direct callback.
+                        assert!(wait_until(std::time::Duration::from_secs(30), || relay
+                            .lock()
+                            .unwrap()
+                            ._network_host
+                            .forward_projection(agent, query.clone(), true)
+                            .unwrap_or(false)));
+                        for owner in &serving {
+                            assert!(wait_until(std::time::Duration::from_secs(30), || owner
+                                .lock()
+                                .unwrap()
+                                .host
+                                .lock()
+                                .unwrap()
+                                .retained_positive_clean_acknowledgement(
+                                    agent,
+                                    &work,
+                                    &authorization
+                                )
+                                .unwrap()));
+                            let mut owner = owner.lock().unwrap();
+                            assert!(
+                                owner
+                                    .committed_projection_response(&work)
+                                    .unwrap()
+                                    .is_some()
+                            );
+                            assert!(owner.record.pending_projection.is_none());
+                        }
+                    }
+                    // Only now restart the original transport. In the
+                    // successor-first case no original attestor process or
+                    // network was available while the delegated read ran.
+                    let keypair = libp2p::identity::Keypair::ed25519_from_bytes(
+                        [[NODE_SEED, 0xd2, 0xd3][leader]; 32],
+                    )
+                    .unwrap();
+                    let peer = keypair.public().to_peer_id();
+                    let restarted = Arc::new(Network::start(NetworkConfig {
+                        keypair,
+                        local_prefix: crate::network::derive_node_prefix(&peer),
+                        listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+                        bootstrap: vec![],
+                        auto_dial_mdns: false,
+                    }));
+                    assert!(wait_until(std::time::Duration::from_secs(5), || !restarted
+                        .listen_addrs()
+                        .is_empty()));
+                    networks.insert(leader, restarted);
+                    let mut last_dial = None;
+                    assert!(
+                        wait_until(std::time::Duration::from_secs(15), || {
+                            if networks
+                                .iter()
+                                .all(|network| network.connected_peers().len() == 2)
+                            {
+                                return true;
+                            }
+                            if last_dial.is_none_or(|last: std::time::Instant| {
+                                last.elapsed() >= std::time::Duration::from_millis(250)
+                            }) {
+                                for (other, target) in networks.iter().enumerate() {
+                                    if other != leader {
+                                        networks[leader].connect(target.listen_addrs()[0].clone());
+                                    }
+                                }
+                                last_dial = Some(std::time::Instant::now());
+                            }
+                            false
+                        }),
+                        "restarted attestor transport did not reconnect"
+                    );
                     let fixture = &fixtures[leader];
                     let stores = &bootstrap_stores[leader];
                     let mut reopening =
@@ -13115,6 +13569,10 @@ mod tests {
                         .committed_projection_response(&work)
                         .unwrap()
                         .expect("exact committed response remains available after ACK");
+                    let projection = crate::agent::sdk::authority::AuthorityCredentialProjection::decode(
+                        &recovered_response,
+                    ).expect("the physical Authority must accept the delegated query, not return an empty denial");
+                    assert_eq!(projection.query, query);
                     if let Some(RuntimeOutcome::Completed(Ok(reply))) = invoked {
                         use crate::actors::codec::Decode as _;
                         assert_eq!(
@@ -13502,6 +13960,7 @@ mod tests {
                 credential: CredentialId::of_public_key(&credential_public_key),
                 nonce: Hash([0x9a; 32]),
                 selector: AuthorityProjectionSelector::Credential,
+                recovery: None,
                 authentication: AuthorityIngressAuthentication::ApiCredentialSignature {
                     credential_public_key,
                     signature: [0x9b; 64],
@@ -13859,6 +14318,7 @@ mod tests {
                 credential: CredentialId::of_public_key(&public_key),
                 nonce: Hash([nonce; 32]),
                 selector: AuthorityProjectionSelector::Credential,
+                recovery: None,
                 authentication: AuthorityIngressAuthentication::ApiCredentialSignature {
                     credential_public_key: public_key,
                     signature: [1; 64],
@@ -16670,6 +17130,7 @@ mod tests {
                 credential: CredentialId::of_public_key(&public),
                 nonce: Hash([0xdd; 32]),
                 selector: AuthorityProjectionSelector::Credential,
+                recovery: None,
                 authentication: AuthorityIngressAuthentication::SshNodeAttestation {
                     credential_public_key: public,
                     node: NodeId(node.0),
@@ -16864,6 +17325,7 @@ mod tests {
                 authority: owner.authority_target(),
                 credential: CredentialId::of_public_key(&public),
                 nonce: Hash([0xd5; 32]),
+                recovery: None,
                 selector: if inventory {
                     AuthorityProjectionSelector::Inventory {
                         after: None,
@@ -17710,6 +18172,7 @@ mod tests {
                     credential,
                     nonce: Hash([nonce; 32]),
                     selector: AuthorityProjectionSelector::Credential,
+                    recovery: None,
                     authentication: AuthorityIngressAuthentication::SshNodeAttestation {
                         credential_public_key: public,
                         node: NodeId(node.0),
@@ -31810,6 +32273,7 @@ mod tests {
                         credential: CredentialId::of_public_key(&public),
                         nonce: inventory_nonce(0xe9, self.0),
                         selector,
+                        recovery: None,
                         authentication: AuthorityIngressAuthentication::SshNodeAttestation {
                             credential_public_key: public,
                             node: NodeId(node.0),
@@ -32600,6 +33064,7 @@ mod tests {
                 credential: CredentialId::of_public_key(&public_key),
                 nonce: Hash([0xb8; 32]),
                 selector: AuthorityProjectionSelector::Credential,
+                recovery: None,
                 authentication:
                     crate::agent::sdk::authority::AuthorityIngressAuthentication::ApiCredentialSignature {
                         credential_public_key: public_key,
@@ -32756,6 +33221,7 @@ mod tests {
                         limit: 64,
                         known_head: None,
                     },
+                    recovery: None,
                     authentication: AuthorityIngressAuthentication::SshNodeAttestation {
                         credential_public_key: public,
                         node: NodeId(node.0),

@@ -66,6 +66,7 @@ impl AuthorityProjectionQueryAuthenticator for OperatorAuthorityProjectionAuthen
             return Err(AgentProductionOwnerError::Authentication);
         }
         let mut query = AuthorityProjectionQuery {
+            recovery: None,
             authority,
             credential: self.credential,
             nonce: Self::fresh_nonce()?,

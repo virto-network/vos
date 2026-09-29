@@ -90,6 +90,7 @@ impl ApiAccessCredential {
         };
 
         let mut query = AuthorityProjectionQuery {
+            recovery: None,
             authority,
             credential: self.credential_id(),
             nonce,

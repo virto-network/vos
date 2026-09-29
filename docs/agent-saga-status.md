@@ -13,15 +13,13 @@ Clerk with **100,000 retained transfers**. Keep Clerk's kernel, signatures,
 committed roots and exact retry semantics. Do not replace this with a singleton,
 smaller dataset or an experimental-only release without a new user decision.
 
-The current code checkpoint is `7c1a1b7c` on `wip/ch08-runtime-directory`:
-internal external Shared journal integration, applied availability, and recovery
-regressions. Review `fb48603c..7c1a1b7c` as **one batch**, together with this
-docs-only handoff. The preceding backend follow-up is `4ea0271c`, following
-pruning/backend checkpoint `48df3995`; the tested
-admission/recovery baseline remains `62ffbc20`.
-The reviewer checks `saga/agents`: verify that it contains the code checkpoint
-before starting. Fixes continue on the implementation branch before a qualified
-fast-forward. `master` is unchanged; do not push or change it automatically.
+The current follow-up, based on `0bec4f58`, adds scoped signed read-recovery
+delegation and its crash/refusal regressions. Review it as **one batch** on
+`saga/agents` after the qualified implementation fast-forward. The preceding
+Shared journal/applied-availability checkpoint is `7c1a1b7c`; backend follow-up
+`4ea0271c`, pruning `48df3995`, and admission baseline `62ffbc20` retain their
+historical evidence. Fixes continue on `wip/ch08-runtime-directory` before a
+qualified fast-forward. `master` is unchanged; do not push or change it automatically.
 
 Status vocabulary: **implemented** means source and focused tests exist;
 **integrated** means the supported workflow selects it; **qualified** means its
@@ -49,12 +47,17 @@ Current evidence, without promoting production startup or changing the finish li
   declared Merge-root fencing, cover legal suffix recovery budgets, and preserve
   singleton-image snapshot retries. These are correctness fixes, not throughput
   evidence. Direct external operations currently execute preview plus application.
-- A real three-node pre-Invoke leader-loss test reproduces an unresolved pending
-  read: committed-only recovery correctly refuses an unseen request. Do not
-  relax that admission guard. Recovery delegation versus original-attestor
-  readmission needs an explicit authorization decision; production remains gated.
-- Both post-Invoke replay orderings and post-ACK/pre-metadata-clear reopen pass
-  again on the current production source. These do not close the pre-Invoke gate.
+- The user-approved scoped, expiring signed read delegation (2026-09-29) binds
+  the query to its generation, committee and original preflight slot; unseen
+  admission independently checks the current trusted clock. Candidate physical
+  tests now complete a pre-Invoke read with its original attesting Network shut
+  down, preserve both reopen orderings, and refuse invalid delegation/generic
+  ingress bypasses. Legacy reads remain committed-only and byte-compatible.
+  This is an opt-in candidate path, not automatic production read delegation.
+- Expired, unseen pending reads stay fail-closed; safe terminal resolution and
+  durable availability of the signed request remain release limitations. The
+  survivor fixture receives the frozen query from its harness, not replicated
+  discovery of an origin-only PAP2. Production remains gated.
 
 No finish-line change follows from these results. The remaining work stays in
 the three batches below; do not add a parallel plan or treat these as a release.
@@ -136,6 +139,11 @@ do not by themselves qualify Shared capacity or eliminate whole-runtime work.
   crash matrix. Preserve exact retry, fresh authorization, reservation ownership
   and unpublished recovery. The post-Invoke/pre-ACK fixture already passes, but
   does not qualify these other boundaries.
+  Signed delegation is an explicit candidate-only opt-in: legacy authenticators
+  still emit ordinary reads. Delegated SSH attestors must be current voters with
+  authenticated committee keys. Finish expired-unseen terminal resolution and
+  durable availability of the signed request before claiming autonomous recovery
+  while its origin is offline; neither local absence nor a timeout releases PAP2.
 - [ ] Collect quorum-certified snapshots/checkpoints and qualify restart/catch-up
   before replay capacity is exhausted. Optional checkpoint skipping is temporary;
   mandatory capacity/certificate guards must continue to fail closed.
@@ -186,8 +194,15 @@ User decision (2026-09-29): prepare reproducible deployment/load-test tooling;
 the three external test nodes will be provided later. Continue local three-process
 integration checks meanwhile. Tooling preparation and local results do not close
 the hardware, load or soak gates below; no remote deployment is authorized by
-this choice. The separate signed-read recovery-delegation decision remains open.
+this choice. Scoped signed-read recovery delegation was approved separately;
+its implementation and qualification remain in batch 2.
 
+- [ ] Prepare inventory/artifact preflight, a signed Clerk corpus/reference
+  generator and a bounded public-API load runner using existing release packaging
+  and lifecycle evidence collection. Do not revive the retired acceptance API.
+  Execution must remain explicitly blocked until public Shared startup/lifecycle,
+  external ownership and retention prerequisites pass. The native 100k-row probe
+  is not a corpus of 100k signed Clerk transfers or a service load result.
 - [ ] Run the exact release under the acceptance envelope below. Permit **at most
   two measured tuning passes after backend integration**. After two failed passes,
   stop for an evidence-backed scope/architecture decision; do not silently lower

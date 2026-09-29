@@ -1687,6 +1687,10 @@ where
         Ok(self.ledger.active_committee()?)
     }
 
+    pub(crate) fn current_logical_slot(&self) -> Result<u64, SharedJournalDriverError> {
+        self.executor.current_logical_slot().map_err(Into::into)
+    }
+
     pub(crate) fn network_committee_state(
         &self,
     ) -> Result<super::shared_raft::AgentNetworkCommitteeState, SharedJournalDriverError> {

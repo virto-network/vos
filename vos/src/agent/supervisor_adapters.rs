@@ -2263,6 +2263,7 @@ trait CleanAgentRouteBackend: Send + 'static {
         &mut self,
         _query: AuthorityProjectionQuery,
         _recovering: bool,
+        _sender: NodeId,
     ) -> Result<(), AgentRouteError> {
         Err(AgentRouteError::Rejected)
     }
@@ -2312,7 +2313,7 @@ enum RouteHostCommand {
     #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
     RecoverAuthorityProjection(SyncSender<Result<bool, AgentRouteError>>),
     #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
-    PeerAuthorityProjection(AuthorityProjectionQuery, bool),
+    PeerAuthorityProjection(AuthorityProjectionQuery, bool, NodeId),
     Retire(SyncSender<Result<(), AgentRouteWorkerError>>),
 }
 
@@ -2875,8 +2876,11 @@ impl AgentRouteHostHandle {
         &self,
         query: AuthorityProjectionQuery,
         recovering: bool,
+        sender: NodeId,
     ) -> Result<(), AgentRouteError> {
-        self.send(RouteHostCommand::PeerAuthorityProjection(query, recovering))
+        self.send(RouteHostCommand::PeerAuthorityProjection(
+            query, recovering, sender,
+        ))
     }
 
     fn send(&self, command: RouteHostCommand) -> Result<(), AgentRouteError> {
@@ -3247,8 +3251,8 @@ fn execute_route_host_command(
             let _ = reply.send(backend.recover_authority_projection());
         }
         #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
-        RouteHostCommand::PeerAuthorityProjection(query, recovering) => {
-            let _ = backend.peer_authority_projection(query, recovering);
+        RouteHostCommand::PeerAuthorityProjection(query, recovering, sender) => {
+            let _ = backend.peer_authority_projection(query, recovering, sender);
         }
         RouteHostCommand::Retire(reply) => {
             let retired = backend.retire();
@@ -4449,11 +4453,12 @@ where
         &mut self,
         query: AuthorityProjectionQuery,
         recovering: bool,
+        sender: NodeId,
     ) -> Result<(), AgentRouteError> {
         self.owner
             .lock()
             .map_err(|_| AgentRouteError::Unavailable)?
-            .invoke_peer_authority_projection(query, recovering)
+            .invoke_peer_authority_projection(query, recovering, sender)
             .map(|_| ())
             .map_err(map_authority_read_error)
     }
@@ -4503,8 +4508,8 @@ where
     owner
         .lock()
         .map_err(|_| AgentRouteAdapterError::Route(AgentRouteError::Unavailable))?
-        .install_projection_dispatch(Arc::new(move |query, recovering| {
-            handle.enqueue_peer_projection(query, recovering).is_ok()
+        .install_projection_dispatch(Arc::new(move |query, recovering, sender| {
+            handle.enqueue_peer_projection(query, recovering, sender).is_ok()
         }))
         .map_err(|error| AgentRouteAdapterError::Route(map_shared_host_error(error)))?;
     Ok(attachment)
@@ -7315,9 +7320,9 @@ mod tests {
             .unwrap();
         // Acceptance means admission only: the worker is blocked and the
         // default backend will reject these queries when it drains them.
-        let first = handle.enqueue_peer_projection(query.clone(), false);
-        let second = handle.enqueue_peer_projection(query.clone(), true);
-        let full = handle.enqueue_peer_projection(query.clone(), true);
+        let first = handle.enqueue_peer_projection(query.clone(), false, NodeId([0xc3; 32]));
+        let second = handle.enqueue_peer_projection(query.clone(), true, NodeId([0xc3; 32]));
+        let full = handle.enqueue_peer_projection(query.clone(), true, NodeId([0xc3; 32]));
         release.send(()).unwrap();
         operation.join().unwrap().unwrap();
         attachment.retire().unwrap();
@@ -7327,7 +7332,7 @@ mod tests {
         assert!(retired.load(Ordering::Acquire));
         assert!(lifetime.upgrade().is_none());
         assert_eq!(
-            handle.enqueue_peer_projection(query, true),
+            handle.enqueue_peer_projection(query, true, NodeId([0xc3; 32])),
             Err(AgentRouteError::Unavailable)
         );
     }
@@ -7352,6 +7357,7 @@ mod tests {
                 credential: CredentialId::of_public_key(&public_key),
                 nonce: Hash([self.0; 32]),
                 selector,
+                recovery: None,
                 authentication: AuthorityIngressAuthentication::ApiCredentialSignature {
                     credential_public_key: public_key,
                     signature: [0xc2; 64],

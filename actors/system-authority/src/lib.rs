@@ -1642,21 +1642,30 @@ impl SystemAuthority {
     /// credential may still prove possession and receive its revoked status;
     /// unknown, substituted, or corrupt state fails closed.
     #[msg(query)]
-    fn credential_projection(&self, query: Vec<u8>) -> Vec<u8> {
+    fn credential_projection(&self, query: Vec<u8>, ctx: &mut Context<Self>) -> Vec<u8> {
+        if !projection_context_matches(&query, ctx.agent_invocation_context()) {
+            return Vec::new();
+        }
         credential_projection(&self.configuration, &self.state, &query)
     }
 
     /// Bounded, revision-consistent credential and directory stream. One
     /// query authenticates the complete page; no per-row invocation is needed.
     #[msg(query)]
-    fn inventory_projection_page(&self, query: Vec<u8>) -> Vec<u8> {
+    fn inventory_projection_page(&self, query: Vec<u8>, ctx: &mut Context<Self>) -> Vec<u8> {
+        if !projection_context_matches(&query, ctx.agent_invocation_context()) {
+            return Vec::new();
+        }
         inventory_projection_page(&self.configuration, &self.state, &query)
     }
 
     /// Return one bounded, full-ID ordered Agent policy page. Private entries
     /// are visible only to their owner or an Admin and never carry aliases.
     #[msg(query)]
-    fn agent_projection_page(&self, query: Vec<u8>) -> Vec<u8> {
+    fn agent_projection_page(&self, query: Vec<u8>, ctx: &mut Context<Self>) -> Vec<u8> {
+        if !projection_context_matches(&query, ctx.agent_invocation_context()) {
+            return Vec::new();
+        }
         agent_projection_page(&self.configuration, &self.state, &query)
     }
 
@@ -1664,14 +1673,20 @@ impl SystemAuthority {
     /// reconstruct the descriptor only from pages sharing the Agent row's
     /// state head, replica count, and replica generation.
     #[msg(query)]
-    fn agent_replica_projection_page(&self, query: Vec<u8>) -> Vec<u8> {
+    fn agent_replica_projection_page(&self, query: Vec<u8>, ctx: &mut Context<Self>) -> Vec<u8> {
+        if !projection_context_matches(&query, ctx.agent_invocation_context()) {
+            return Vec::new();
+        }
         agent_replica_projection_page(&self.configuration, &self.state, &query)
     }
 
     /// Return one bounded Actor policy/status/artifact page for an exact
     /// Agent. Private inventories are owner/Admin-only.
     #[msg(query)]
-    fn actor_projection_page(&self, query: Vec<u8>) -> Vec<u8> {
+    fn actor_projection_page(&self, query: Vec<u8>, ctx: &mut Context<Self>) -> Vec<u8> {
+        if !projection_context_matches(&query, ctx.agent_invocation_context()) {
+            return Vec::new();
+        }
         actor_projection_page(&self.configuration, &self.state, &query)
     }
 
@@ -1869,6 +1884,17 @@ fn projection_head(state: &AuthorityLinearState) -> Option<AuthorityProjectionHe
         administration_generation: NonZeroU64::new(state.administration_generation)?,
         state_commitment: Hash(state.state_integrity_commitment),
     })
+}
+
+// Live committee/expiry authorization is enforced by the host before proposing
+// unseen work. The guest checks the signed immutable execution identity; using
+// replay's accepted slot as a new admission clock would defeat expiration.
+fn projection_context_matches(encoded: &[u8], context: Option<&InvocationContext>) -> bool {
+    let Ok(query) = AuthorityProjectionQuery::decode(encoded) else {
+        return false;
+    };
+    query.recovery.is_none()
+        || context.is_some_and(|context| query.matches_recovery_context(context))
 }
 
 fn authenticated_projection_query(
@@ -10567,6 +10593,7 @@ mod tests {
     ) -> AuthorityProjectionQuery {
         let public_key = key.verifying_key().to_bytes();
         let mut query = AuthorityProjectionQuery {
+            recovery: None,
             authority: authority_target(config),
             credential: CredentialId::of_public_key(&public_key),
             nonce: Hash([nonce; 32]),
@@ -10598,6 +10625,7 @@ mod tests {
     ) -> AuthorityProjectionQuery {
         let public_key = credential_key.verifying_key().to_bytes();
         let mut query = AuthorityProjectionQuery {
+            recovery: None,
             authority: authority_target(config),
             credential: CredentialId::of_public_key(&public_key),
             nonce: Hash([nonce; 32]),
@@ -10925,6 +10953,96 @@ mod tests {
         let inert = SystemAuthority::new(&old_generation);
         assert!(!inert.state.initialized);
         assert!(inert.state.credentials.is_empty());
+    }
+
+    #[test]
+    fn delegated_projection_dispatch_requires_exact_context_and_original_signature() {
+        use vos::agent_sdk::authority::AuthorityProjectionRecoveryDelegation;
+
+        let mut actor = actor();
+        let before = actor.state.clone();
+        let node_key = signing(0x31);
+        let mut query = ssh_projection_query(
+            configuration(),
+            &signing(0x21),
+            ADMIN_NODE,
+            &node_key,
+            0xd1,
+            AuthorityProjectionSelector::Credential,
+        );
+        let legacy = query.encode().unwrap();
+        query.recovery = Some(AuthorityProjectionRecoveryDelegation {
+            generation: Hash([0xd2; 32]),
+            committee: Hash([0xd3; 32]),
+            accepted_slot: OBSERVED_SLOT,
+            expires_at: OBSERVED_SLOT + 30,
+        });
+        let signature = node_key.sign(&query.signing_bytes()).to_bytes();
+        let AuthorityIngressAuthentication::SshNodeAttestation {
+            signature: field, ..
+        } = &mut query.authentication
+        else {
+            unreachable!()
+        };
+        *field = signature;
+        let invocation_context = InvocationContext {
+            invocation: query.expected_invocation(),
+            actor: query.authority.binding.issuer.actor,
+            mode: MethodMode::Query,
+            origin: InvocationOrigin {
+                principal: None,
+                credential: None,
+                transport_node: Some(ADMIN_NODE),
+                actor: None,
+                capability: None,
+            },
+            roles: InvocationRoleClaims::none(),
+            observed_slot: OBSERVED_SLOT,
+        };
+        let dispatch =
+            |actor: &mut SystemAuthority, bytes: Vec<u8>, context: Option<InvocationContext>| {
+                let mut ctx = Context::new(ServiceId(0));
+                if let Some(context) = context {
+                    ctx.__set_agent_invocation_context(context);
+                }
+                block_on(<SystemAuthority as Message<CredentialProjection>>::handle(
+                    actor,
+                    CredentialProjection { query: bytes },
+                    &mut ctx,
+                ))
+            };
+        // An unchanged legacy read still works against the same method without
+        // the new context requirement; no implicit recovery permission is added.
+        assert!(!dispatch(&mut actor, legacy, None).is_empty());
+        let bytes = query.encode().unwrap();
+        let result = dispatch(&mut actor, bytes.clone(), Some(invocation_context));
+        assert_eq!(
+            AuthorityCredentialProjection::decode(&result)
+                .unwrap()
+                .query,
+            query
+        );
+        assert!(dispatch(&mut actor, bytes.clone(), None).is_empty());
+        for change in 0..4 {
+            let mut context = invocation_context;
+            match change {
+                0 => context.observed_slot += 1,
+                1 => context.origin.transport_node = Some(NodeId([0xd4; 32])),
+                2 => context.invocation = InvocationId([0xd5; 32]),
+                _ => context.mode = MethodMode::Linear,
+            }
+            assert!(dispatch(&mut actor, bytes.clone(), Some(context)).is_empty());
+        }
+        let mut altered = query.clone();
+        altered.recovery.as_mut().unwrap().committee.0[0] ^= 1;
+        // Even a matching altered invocation cannot make the old signature
+        // authorize a different recovery scope.
+        let mut altered_context = invocation_context;
+        altered_context.invocation = altered.expected_invocation();
+        assert!(dispatch(&mut actor, altered.encode().unwrap(), Some(altered_context)).is_empty());
+        altered.recovery = None;
+        assert!(dispatch(&mut actor, altered.encode().unwrap(), None).is_empty());
+        assert_eq!(actor.state, before);
     }
 
     #[test]

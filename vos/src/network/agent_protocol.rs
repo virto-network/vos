@@ -1597,6 +1597,7 @@ mod tests {
         let credential_public_key = [83; 32];
         let route = route();
         let query = AuthorityProjectionQuery {
+            recovery: None,
             authority: AuthorityActorTarget {
                 space: route.space,
                 system_agent: route.agent,

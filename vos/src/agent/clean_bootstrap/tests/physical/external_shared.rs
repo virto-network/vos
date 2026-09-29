@@ -192,6 +192,7 @@ fn enroll_replica(owner: &mut MemoryBootstrapOwner, node_key: &SigningKey, nonce
     let credential = CredentialId::of_public_key(&public);
     let (attestor, _, _, node) = node_material();
     let mut query = AuthorityProjectionQuery {
+            recovery: None,
         authority: owner.authority_target(),
         credential,
         nonce: Hash([nonce; 32]),

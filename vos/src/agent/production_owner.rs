@@ -2275,6 +2275,7 @@ mod tests {
             self.ordinal = self.ordinal.wrapping_add(1).max(1);
             let public_key = [0xa1; 32];
             Ok(AuthorityProjectionQuery {
+            recovery: None,
                 authority,
                 credential: super::super::sdk::CredentialId::of_public_key(&public_key),
                 nonce: Hash([self.ordinal; 32]),

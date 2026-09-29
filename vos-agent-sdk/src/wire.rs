@@ -18,13 +18,14 @@ use crate::authority::{
     AuthorityCredentialStatus, AuthorityEvidence, AuthorityIngressAuthentication,
     AuthorityInventoryCursor, AuthorityInventoryEntry, AuthorityInventoryPosition,
     AuthorityInventoryProjectionPage, AuthorityIssuer, AuthorityLaneRoots, AuthorityOperationKind,
-    AuthorityProjectionHead, AuthorityProjectionQuery, AuthorityProjectionSelector,
-    AuthorityReceipt, AuthorityReceiptSelector, CREDENTIAL_PUBLIC_KEY_BYTES,
-    CREDENTIAL_SIGNATURE_BYTES, CompactAgentDescriptor, CompactInstallActor, CompactReplicaSlot,
-    MAX_AUTHORITY_INVENTORY_PAGE_ENTRIES, MAX_AUTHORITY_INVENTORY_PROJECTION_BYTES,
-    MAX_AUTHORITY_PRINCIPAL_GRANTS, MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES,
-    MAX_AUTHORITY_REPLICA_PAGE_ENTRIES, ManagedAgentTarget, ManagementApplicationAck,
-    ManagementApplicationFailure, ManagementApproval, ManagementAuthorizationPlan,
+    AuthorityProjectionHead, AuthorityProjectionQuery, AuthorityProjectionRecoveryDelegation,
+    AuthorityProjectionSelector, AuthorityReceipt, AuthorityReceiptSelector,
+    CREDENTIAL_PUBLIC_KEY_BYTES, CREDENTIAL_SIGNATURE_BYTES, CompactAgentDescriptor,
+    CompactInstallActor, CompactReplicaSlot, MAX_AUTHORITY_INVENTORY_PAGE_ENTRIES,
+    MAX_AUTHORITY_INVENTORY_PROJECTION_BYTES, MAX_AUTHORITY_PRINCIPAL_GRANTS,
+    MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES, MAX_AUTHORITY_REPLICA_PAGE_ENTRIES, ManagedAgentTarget,
+    ManagementApplicationAck, ManagementApplicationFailure, ManagementApproval,
+    ManagementAuthorizationPlan,
 };
 use crate::catalog::{
     CatalogActorTarget, CatalogAlias, CatalogEntry, CatalogMutationCall, CatalogMutationKind,
@@ -1895,7 +1896,25 @@ fn encode_authority_projection_query_unsigned(
     encoder.fixed(value.credential.as_bytes());
     encoder.fixed(value.nonce.as_bytes());
     encode_authority_projection_selector(encoder, value.selector);
+    encode_projection_authentication_unsigned(encoder, value);
+}
+
+// Query-only extension: tags 0/1 retain the exact APQ1 legacy encoding; tags
+// 2/3 add signed recovery scope. Never teach the shared AOC5 authenticator to
+// accept these tags. Old Authority guests reject delegated queries explicitly.
+fn encode_projection_authentication_unsigned(
+    encoder: &mut Encoder<'_>,
+    value: &AuthorityProjectionQuery,
+) {
+    let start = encoder.0.len();
     encode_authority_ingress_authentication_unsigned(encoder, value.authentication);
+    if let Some(recovery) = value.recovery {
+        encoder.0[start] += 2;
+        encoder.fixed(recovery.generation.as_bytes());
+        encoder.fixed(recovery.committee.as_bytes());
+        encoder.u64(recovery.accepted_slot);
+        encoder.u64(recovery.expires_at);
+    }
 }
 
 pub(crate) fn encode_authority_ingress_authentication_unsigned(
@@ -1935,16 +1954,22 @@ pub(crate) fn encode_authority_ingress_authentication(
 pub(crate) fn decode_authority_ingress_authentication(
     decoder: &mut Decoder<'_>,
 ) -> Result<AuthorityIngressAuthentication, DecodeError> {
-    let authentication = match decoder.u8()? {
+    let tag = decoder.u8()?;
+    let authentication = decode_authority_ingress_authentication_unsigned(decoder, tag)?;
+    decode_ingress_signature(decoder, authentication)
+}
+
+fn decode_authority_ingress_authentication_unsigned(
+    decoder: &mut Decoder<'_>,
+    tag: u8,
+) -> Result<AuthorityIngressAuthentication, DecodeError> {
+    let authentication = match tag {
         0 => AuthorityIngressAuthentication::ApiCredentialSignature {
             credential_public_key: decoder
                 .take(CREDENTIAL_PUBLIC_KEY_BYTES)?
                 .try_into()
                 .map_err(|_| DecodeError::Truncated)?,
-            signature: decoder
-                .take(CREDENTIAL_SIGNATURE_BYTES)?
-                .try_into()
-                .map_err(|_| DecodeError::Truncated)?,
+            signature: [0; CREDENTIAL_SIGNATURE_BYTES],
         },
         1 => AuthorityIngressAuthentication::SshNodeAttestation {
             credential_public_key: decoder
@@ -1953,13 +1978,31 @@ pub(crate) fn decode_authority_ingress_authentication(
                 .map_err(|_| DecodeError::Truncated)?,
             node: NodeId(decoder.fixed()?),
             request_binding: Hash(decoder.fixed()?),
-            signature: decoder
-                .take(CREDENTIAL_SIGNATURE_BYTES)?
-                .try_into()
-                .map_err(|_| DecodeError::Truncated)?,
+            signature: [0; CREDENTIAL_SIGNATURE_BYTES],
         },
         _ => return Err(DecodeError::InvalidTag),
     };
+    Ok(authentication)
+}
+
+fn decode_ingress_signature(
+    decoder: &mut Decoder<'_>,
+    mut authentication: AuthorityIngressAuthentication,
+) -> Result<AuthorityIngressAuthentication, DecodeError> {
+    let signature = decoder
+        .take(CREDENTIAL_SIGNATURE_BYTES)?
+        .try_into()
+        .map_err(|_| DecodeError::Truncated)?;
+    match &mut authentication {
+        AuthorityIngressAuthentication::ApiCredentialSignature {
+            signature: field, ..
+        }
+        | AuthorityIngressAuthentication::SshNodeAttestation {
+            signature: field, ..
+        } => {
+            *field = signature;
+        }
+    }
     Ok(authentication)
 }
 
@@ -1967,7 +2010,11 @@ pub(crate) fn authority_projection_query_signing_bytes(
     value: &AuthorityProjectionQuery,
 ) -> Vec<u8> {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"APQS");
+    bytes.extend_from_slice(if value.recovery.is_some() {
+        b"APQD"
+    } else {
+        b"APQS"
+    });
     bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
     encode_authority_projection_query_unsigned(&mut Encoder(&mut bytes), value);
     bytes
@@ -1977,22 +2024,41 @@ fn encode_authority_projection_query_body(
     encoder: &mut Encoder<'_>,
     value: &AuthorityProjectionQuery,
 ) {
-    encode_authority_actor_target(encoder, value.authority);
-    encoder.fixed(value.credential.as_bytes());
-    encoder.fixed(value.nonce.as_bytes());
-    encode_authority_projection_selector(encoder, value.selector);
-    encode_authority_ingress_authentication(encoder, value.authentication);
+    encode_authority_projection_query_unsigned(encoder, value);
+    encoder
+        .0
+        .extend_from_slice(&value.authentication.signature());
 }
 
 fn decode_authority_projection_query_body(
     decoder: &mut Decoder<'_>,
 ) -> Result<AuthorityProjectionQuery, DecodeError> {
+    let authority = decode_authority_actor_target(decoder)?;
+    let credential = CredentialId(decoder.fixed()?);
+    let nonce = Hash(decoder.fixed()?);
+    let selector = decode_authority_projection_selector(decoder)?;
+    let tag = decoder.u8()?;
+    if tag > 3 {
+        return Err(DecodeError::InvalidTag);
+    }
+    let authentication = decode_authority_ingress_authentication_unsigned(decoder, tag % 2)?;
+    let recovery = if tag >= 2 {
+        Some(AuthorityProjectionRecoveryDelegation {
+            generation: Hash(decoder.fixed()?),
+            committee: Hash(decoder.fixed()?),
+            accepted_slot: decoder.u64()?,
+            expires_at: decoder.u64()?,
+        })
+    } else {
+        None
+    };
     let value = AuthorityProjectionQuery {
-        authority: decode_authority_actor_target(decoder)?,
-        credential: CredentialId(decoder.fixed()?),
-        nonce: Hash(decoder.fixed()?),
-        selector: decode_authority_projection_selector(decoder)?,
-        authentication: decode_authority_ingress_authentication(decoder)?,
+        authority,
+        credential,
+        nonce,
+        selector,
+        authentication: decode_ingress_signature(decoder, authentication)?,
+        recovery,
     };
     value
         .validate_shape()
@@ -5763,6 +5829,7 @@ mod tests {
     ) -> AuthorityProjectionQuery {
         let credential_public_key = [0x71; CREDENTIAL_PUBLIC_KEY_BYTES];
         AuthorityProjectionQuery {
+            recovery: None,
             authority: authority_actor_target(),
             credential: CredentialId::of_public_key(&credential_public_key),
             nonce: Hash([0x72; 32]),
@@ -5987,6 +6054,85 @@ mod tests {
         let operation_tag = 36 + 32 + 328 + 32 + 32 + 8 + 32 + 32 + 8 + 8;
         unknown_operation[operation_tag] = 0xff;
         assert!(AuthorityAdminCall::decode(&unknown_operation).is_err());
+    }
+
+    #[test]
+    fn projection_delegation_preserves_legacy_bytes_and_is_query_only() {
+        let mut query = authority_projection_query(AuthorityProjectionSelector::Credential);
+        for ssh in [false, true] {
+            query.authentication = if ssh {
+                AuthorityIngressAuthentication::SshNodeAttestation {
+                    credential_public_key: query.credential_public_key(),
+                    node: NodeId([0x91; 32]),
+                    request_binding: Hash([0x92; 32]),
+                    signature: [0x93; 64],
+                }
+            } else {
+                AuthorityIngressAuthentication::ApiCredentialSignature {
+                    credential_public_key: query.credential_public_key(),
+                    signature: [0x93; 64],
+                }
+            };
+            query.recovery = None;
+            // Reconstruct the pre-extension APQ1/APQS encoding independently.
+            let mut unsigned = Vec::new();
+            let encoder = &mut Encoder(&mut unsigned);
+            encode_authority_actor_target(encoder, query.authority);
+            encoder.fixed(query.credential.as_bytes());
+            encoder.fixed(query.nonce.as_bytes());
+            encode_authority_projection_selector(encoder, query.selector);
+            let authentication_offset = encoder.0.len();
+            encode_authority_ingress_authentication_unsigned(encoder, query.authentication);
+            let mut signing = b"APQS".to_vec();
+            signing.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+            signing.extend_from_slice(&unsigned);
+            assert_eq!(query.signing_bytes(), signing);
+            assert_eq!(
+                query.commitment(),
+                Hash::digest(
+                    b"vos/agent/authority-projection-query/v1",
+                    &[&signing, &query.authentication.signature()],
+                )
+            );
+            let mut legacy = b"APQ1".to_vec();
+            legacy.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+            legacy.extend_from_slice(&unsigned);
+            legacy.extend_from_slice(&query.authentication.signature());
+            assert_eq!(query.encode().unwrap(), legacy);
+            assert_eq!(AuthorityProjectionQuery::decode(&legacy), Ok(query.clone()));
+
+            query.recovery = Some(AuthorityProjectionRecoveryDelegation {
+                generation: Hash([0x94; 32]),
+                committee: Hash([0x95; 32]),
+                accepted_slot: 42,
+                expires_at: 52,
+            });
+            let delegated = query.encode().unwrap();
+            assert_eq!(delegated.len(), legacy.len() + 80);
+            let tag_offset = HEADER_BYTES + authentication_offset;
+            assert_eq!(delegated[tag_offset], if ssh { 3 } else { 2 });
+            assert_eq!(
+                AuthorityProjectionQuery::decode(&delegated),
+                Ok(query.clone())
+            );
+            assert_eq!(&query.signing_bytes()[..4], b"APQD");
+            assert!(
+                decode_authority_ingress_authentication(&mut Decoder::new(
+                    &delegated[tag_offset..]
+                ),)
+                .is_err(),
+                "AOC5 must not accept query delegation"
+            );
+            for end in tag_offset..delegated.len() {
+                assert!(AuthorityProjectionQuery::decode(&delegated[..end]).is_err());
+            }
+            let mut unknown = delegated.clone();
+            unknown[tag_offset] = 4;
+            assert!(AuthorityProjectionQuery::decode(&unknown).is_err());
+            let mut trailing = delegated;
+            trailing.push(0);
+            assert!(AuthorityProjectionQuery::decode(&trailing).is_err());
+        }
     }
 
     #[test]
@@ -6436,6 +6582,7 @@ mod tests {
     fn authority_projection_ssh_attestation_wire_binds_stable_request_identity() {
         let credential_public_key = [0x81; CREDENTIAL_PUBLIC_KEY_BYTES];
         let query = AuthorityProjectionQuery {
+            recovery: None,
             authority: authority_actor_target(),
             credential: CredentialId::of_public_key(&credential_public_key),
             nonce: Hash([0x82; 32]),

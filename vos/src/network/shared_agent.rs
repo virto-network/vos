@@ -1179,6 +1179,17 @@ impl SharedRouteHandler {
         if applied_slots != barrier.commit_index {
             return Err(SharedAgentHostError::CorruptResidue);
         }
+        if let Some(query) = crate::agent::clean_bootstrap::projection_query_from_work(work)
+            && query.recovery.is_some()
+        {
+            self.validate_delegated_projection_locked(
+                &mut host,
+                &query,
+                work,
+                authorization,
+                self.network.agent_node_id(),
+            )?;
+        }
         let Some(required) =
             host.projection_admission_requirement(self.agent, work, authorization, recovering)?
         else {
@@ -1194,6 +1205,89 @@ impl SharedRouteHandler {
         }
         proposal.projection_pair = Some(key);
         Ok(())
+    }
+
+    /// Called only with the proposal guard held. A retained exact Invoke/ACK
+    /// is retry evidence; a PAP2 record or an old preflight clock is not.
+    fn validate_delegated_projection_locked(
+        &self,
+        host: &mut SharedAgentHost,
+        query: &crate::agent_sdk::authority::AuthorityProjectionQuery,
+        work: &InvocationWork,
+        authorization: &InvocationAuthorization,
+        sender: NodeId,
+    ) -> Result<(), SharedAgentHostError> {
+        if !crate::agent::clean_bootstrap::projection_query_matches_work(query, work, authorization)
+            || crate::service::AgentId(work.agent.0) != self.agent
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let scope = query.recovery.ok_or(SharedAgentHostError::ScopeMismatch)?;
+        if host.retained_positive_clean_acknowledgement(self.agent, work, authorization)?
+            || host.retained_terminal_projection_invoke(self.agent, work, authorization)?
+        {
+            return Ok(());
+        }
+        let status = host
+            .supervisor_attachment_status(self.agent)?
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        let local = self.network.agent_node_id();
+        let current_voter = |node: NodeId| {
+            status
+                .replicas
+                .iter()
+                .any(|member| member.node.0 == node.0 && member.role == ReplicaRole::Voter)
+        };
+        if status.transport != SharedAgentTransportState::Attached
+            || status.committee_transition.is_some()
+            || protocol_route_from(status.generation, status.replication_id) != self.route
+            || scope.generation != Hash(status.replication_id)
+            || scope.committee != Hash(*status.route.committee().as_bytes())
+            || !current_voter(local)
+            || !current_voter(sender)
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        // The first delegated SSH profile is deliberately committee-local:
+        // the authenticated admitted roster supplies the original attestor's
+        // key even when a different voter relays its exact signed read.
+        // None/legacy queries retain their existing ingress contract.
+        let verifier = crate::agent::clean_bootstrap::RawCredentialVerifier;
+        let signature = match query.attesting_node() {
+            Some(attestor) => {
+                let member = status
+                    .replicas
+                    .iter()
+                    .find(|member| member.node.0 == attestor.0 && member.role == ReplicaRole::Voter)
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                query.verify_ssh_node_attestation_with(&member.ed25519_public_key, &verifier)
+            }
+            None => query.verify_api_with(&verifier),
+        };
+        signature.map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if !scope.admits_at(host.current_logical_slot(self.agent)?) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_delegated_projection(
+        &self,
+        query: &crate::agent_sdk::authority::AuthorityProjectionQuery,
+        work: &InvocationWork,
+        authorization: &InvocationAuthorization,
+        sender: NodeId,
+    ) -> Result<(), SharedAgentHostError> {
+        let _proposal = self
+            .proposal
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let mut host = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        drain_committed(&mut host, self.agent, &self.ordered_replies)?;
+        self.validate_delegated_projection_locked(&mut host, query, work, authorization, sender)
     }
 
     /// Capture and durably record a pre-dispatch anchor while proposals and
@@ -1787,6 +1881,28 @@ impl SharedRouteHandler {
                 .lock()
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
             drain_committed(&mut host, self.agent, &self.ordered_replies)?;
+            let delegated_projection =
+                crate::agent::clean_bootstrap::projection_query_from_work(request.work())
+                    .filter(|query| query.recovery.is_some())
+                    .map(|query| {
+                        (
+                            query,
+                            request.work().clone(),
+                            request.authorization().clone(),
+                        )
+                    });
+            if let Some((query, work, authorization)) = &delegated_projection {
+                if !matches!(reservation, Some(ReservedSubmission::Projection(_))) {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                self.validate_delegated_projection_locked(
+                    &mut host,
+                    query,
+                    work,
+                    authorization,
+                    self.network.agent_node_id(),
+                )?;
+            }
             let anchored_input = if let InvocationClock::PersistedManagement(anchor) = clock {
                 let (applied_slots, remaining_slots, _) = host.capacity(self.agent)?;
                 if applied_slots != anchor_barrier.unwrap() {
@@ -1847,6 +1963,19 @@ impl SharedRouteHandler {
                     outcome,
                     new_slot: false,
                 });
+            }
+            // A terminal guest preview can cross a clock boundary. Check
+            // again immediately before proposing; the signed accepted slot
+            // remains immutable, while admission time remains independently
+            // fresh. No locks are released between this check and propose.
+            if let Some((query, work, authorization)) = &delegated_projection {
+                self.validate_delegated_projection_locked(
+                    &mut host,
+                    query,
+                    work,
+                    authorization,
+                    self.network.agent_node_id(),
+                )?;
             }
             self.ordered_replies
                 .register(input)
@@ -2001,6 +2130,13 @@ impl SharedRouteHandler {
         sender: NodeId,
         request: super::agent_protocol::InvocationRequest,
     ) -> Result<AgentMessage, AgentHandlerError> {
+        // Delegated Authority reads require the exact PAP2 reservation and
+        // its fresh proposal-time checks, never generic invocation ingress.
+        if crate::agent::clean_bootstrap::projection_query_from_work(&request.work)
+            .is_some_and(|query| query.recovery.is_some())
+        {
+            return Err(AgentHandlerError);
+        }
         if request
             .work
             .origin
@@ -2463,7 +2599,7 @@ impl AgentRouteHandler for SharedRouteHandler {
                         .lock()
                         .map_err(|_| AgentHandlerError)?
                         .as_ref()
-                        .is_some_and(|dispatch| dispatch(query, recovering));
+                        .is_some_and(|dispatch| dispatch(query, recovering, sender));
                 Ok(AgentMessage::ProjectionAccepted { request, accepted })
             }
             AgentMessage::InvokeRequest(request) => self.handle_invocation(sender, request),
@@ -2680,8 +2816,11 @@ pub struct SharedAgentNetworkHost {
     fail_reattach_once: bool,
 }
 
-pub(crate) type ProjectionDispatch =
-    Arc<dyn Fn(crate::agent_sdk::authority::AuthorityProjectionQuery, bool) -> bool + Send + Sync>;
+pub(crate) type ProjectionDispatch = Arc<
+    dyn Fn(crate::agent_sdk::authority::AuthorityProjectionQuery, bool, NodeId) -> bool
+        + Send
+        + Sync,
+>;
 
 /// Reserves the host's storage boundary before any worker database handle,
 /// route, or background thread is created. Failed setup releases the
@@ -2728,6 +2867,32 @@ impl Drop for TransportAttachReservation {
 }
 
 impl SharedAgentNetworkHost {
+    /// Verify only one exact signed delegated read against this live route.
+    /// This grants no reservation; submit repeats the check under its guard.
+    pub(crate) fn validate_delegated_projection(
+        &self,
+        pending: &crate::agent::clean_bootstrap::PendingAuthorityProjection,
+        sender: NodeId,
+    ) -> Result<(), SharedAgentHostError> {
+        let (query, work, authorization) = pending
+            .delegated_projection()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let attached = self
+            .generations
+            .get(&crate::service::AgentId(work.agent.0))
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        let live = attached
+            .lifecycle
+            .read()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if !*live || attached.stale.load(Ordering::Acquire) {
+            return Err(SharedAgentHostError::TransportNotAttached);
+        }
+        attached
+            .coordinator
+            .validate_delegated_projection(query, work, authorization, sender)
+    }
+
     pub(crate) fn install_projection_dispatch(
         &mut self,
         dispatch: ProjectionDispatch,

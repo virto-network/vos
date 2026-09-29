@@ -15183,6 +15183,7 @@ pub(crate) mod tests {
             nonce[..2].copy_from_slice(&ordinal.to_be_bytes());
             nonce[31] = 1;
             let query = AuthorityProjectionQuery {
+            recovery: None,
                 authority: target,
                 credential: crate::agent_sdk::CredentialId::of_public_key(&public_key),
                 nonce: crate::agent_sdk::Hash(nonce),

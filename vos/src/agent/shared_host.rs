@@ -1694,6 +1694,21 @@ impl SharedAgentHost {
             .transpose()
     }
 
+    /// Read the same trusted clock used by journal admission without loading
+    /// actor material or executing a runtime-directory inspection.
+    pub(crate) fn current_logical_slot(
+        &mut self,
+        agent: AgentId,
+    ) -> Result<u64, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .current_logical_slot()
+            .map_err(map_driver_error)
+    }
+
     /// Read the authenticated descriptor without enumerating actor state.
     pub(crate) fn clean_runtime_descriptor(
         &self,
