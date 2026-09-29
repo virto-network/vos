@@ -576,6 +576,46 @@ authorization regression also passes (195.32 s) in
 These are synchronized staged-file
 interruptions and owner reopen, not process-kill, power-loss or three-node tests.
 
+Mixed expiry/retired-generation file qualification passes (563.61 s). The test adds
+a second, fully retired Shared generation and runs both Agent-ID orderings while
+the first generation crosses staged receipt and finality recovery after expiry.
+It requires the retired peer's exact Create acknowledgement and byte-identical
+ordinary journal after recovery. Evidence is in
+`target/shared-expiry-mixed-file-owner-fixed.log` (one selected test executes both orderings).
+The initial run failed during fixture construction because the ordering search
+selected the forbidden zero creation nonce, before exercising mixed recovery.
+The corrected search excludes zero and validates the descriptor explicitly.
+This covers pending Install beside retired Create, not two independently pending
+Install continuations or a multi-node deployment.
+
+Release-candidate construction has started separately from release cutover. An
+immutable export of `7316e52ddd98b083941ead6dd3ca5ba18b2e1a2c` built default-feature
+Authority/Catalog templates offline under
+`target/shared-expiry-release.8ZIKVS`; both actor lockfiles remain byte-identical
+to the committed files. Candidate package BLAKE2b-256: Authority
+`380c8ec939d0058c484f030fe36805aa1c5f48d3106fd7d1b17e4e9a2161bf9a`, Catalog
+`a56230af10e7ea5a5793d81ffcf362f7addb2782ec062c8529d836596eb1aff6`.
+The latter differs from the currently pinned Catalog. Its actor source is
+unchanged, and the candidate-contract test passes: after normalizing program and
+signature, its full manifest and non-program artifacts match the pinned package
+(`target/shared-expiry-catalog-contract.log`, one test). This is not behavioral
+compatibility proof. A second export at `source-repeat` produced byte-identical
+Authority/Catalog packages at `templates-repeat`, with unchanged actor lockfiles.
+The image runtime built offline/locked
+from the same export; its ELF and converted PVM are byte-identical to the earlier
+candidate from the implementation checkout, and its lockfile is unchanged. This
+establishes cross-checkout reproduction of these candidates with the current
+builder, not a fully pinned release. The default-feature templates pass together
+with that runtime through staged expiry recovery (203.59 s) in
+`target/shared-expiry-default-candidates-file.log`. Test-only startup inputs can
+select all three artifacts; production has no such override. This qualifies the
+default-feature candidate set independently of the earlier experimental Authority.
+The 18 release-verifier tests pass (one candidate test ignored in that suite and
+run separately); the normal CLI check, formatting and diff checks also pass.
+Logs: `target/shared-expiry-release-verifier-tests.log` and
+`target/shared-expiry-default-candidates-check.log`.
+Bundled files and release pins remain unchanged.
+
 The internal bootstrap-owner Shared Install application helper replaces the
 physical fixture's hand-assembled
 authorization/application/signing sequence. It validates the signed target

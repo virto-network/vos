@@ -139,6 +139,7 @@ fn shared_install_file_owner_recovers_successive_handoffs() {
 enum InstallFault {
     None,
     Expiry,
+    MixedExpiry { pending_first: bool },
     Denial,
     DenialAuthorization,
     DenialSuccessor,
@@ -152,6 +153,14 @@ enum InstallFault {
 #[ignore = "requires candidate runtime/Authority guests; use disk-backed TMPDIR"]
 fn shared_install_file_owner_recovers_expiry_and_staged_finality() {
     check_shared_file_recovery(false, true, InstallFault::Expiry);
+}
+
+#[test]
+#[ignore = "requires candidate guests; exercises both Agent-ID recovery orderings"]
+fn shared_install_file_owner_recovers_expiry_beside_retired_generation() {
+    for pending_first in [true, false] {
+        check_shared_file_recovery(false, true, InstallFault::MixedExpiry { pending_first });
+    }
 }
 
 fn expiry_startup_inputs(operator: &Keypair) -> StartupTestInputs {
@@ -192,6 +201,27 @@ fn expiry_startup_inputs(operator: &Keypair) -> StartupTestInputs {
         operator,
     ))
     .unwrap();
+    if let Some(directory) = std::env::var_os("VOS_AGENT_TEMPLATE_CANDIDATES") {
+        let directory = PathBuf::from(directory);
+        let authority = crate::bundled::root_signed_actor_package(
+            &std::fs::read(directory.join("system-authority.vos")).unwrap(),
+            SYSTEM_AUTHORITY_NAME,
+            operator,
+        )
+        .unwrap();
+        let catalog = crate::bundled::root_signed_actor_package(
+            &std::fs::read(directory.join("system-catalog.vos")).unwrap(),
+            SYSTEM_CATALOG_NAME,
+            operator,
+        )
+        .unwrap();
+        return StartupTestInputs {
+            runtime,
+            authority,
+            catalog,
+            clock: Arc::new(AtomicU64::new(system_logical_slot().unwrap() + 1)),
+        };
+    }
     let authority = crate::bundled::root_signed_actor_package(
         crate::bundled::system_authority_package_template(),
         SYSTEM_AUTHORITY_NAME,
@@ -217,6 +247,12 @@ fn expiry_startup_inputs(operator: &Keypair) -> StartupTestInputs {
     StartupTestInputs {
         runtime,
         authority,
+        catalog: crate::bundled::root_signed_actor_package(
+            crate::bundled::system_catalog_package_template(),
+            SYSTEM_CATALOG_NAME,
+            operator,
+        )
+        .unwrap(),
         clock: Arc::new(AtomicU64::new(system_logical_slot().unwrap() + 1)),
     }
 }
@@ -271,8 +307,11 @@ fn check_shared_file_recovery(
         auto_dial_mdns: false,
     }));
     let space = SpaceId([0x73; 32]);
-    let expiry =
-        matches!(interrupt_install, InstallFault::Expiry).then(|| expiry_startup_inputs(&operator));
+    let expiry = matches!(
+        interrupt_install,
+        InstallFault::Expiry | InstallFault::MixedExpiry { .. }
+    )
+    .then(|| expiry_startup_inputs(&operator));
     let open = || {
         open_clean_system_lifecycle_with_inputs(
             network.clone(),
@@ -455,6 +494,54 @@ fn check_shared_file_recovery(
     assert_eq!(acknowledgement.credential_call, call.commitment());
     let applied = journal_files(&journal);
     assert!(!applied.is_empty());
+    let retired_peer = if let InstallFault::MixedExpiry { pending_first } = interrupt_install {
+        let mut other = descriptor.clone();
+        other.creation_nonce = (1u8..=255)
+            .map(|marker| Hash([marker; 32]))
+            .find(|nonce| {
+                let id = AgentId::derive(space, owner, nonce.as_bytes());
+                id != agent && (agent < id) == pending_first
+            })
+            .expect("both Agent-ID orderings must be constructible");
+        other.identity.agent = AgentId::derive(space, owner, other.creation_nonce.as_bytes());
+        other.validate().unwrap();
+        let committee = AgentReplicaCommittee::new(
+            HostSpaceId(space.0),
+            HostAgentId(other.identity.agent.0),
+            HostAgentProfile::Shared,
+            replicas.members().to_vec(),
+        )
+        .unwrap();
+        let mut other_call = call.clone();
+        other_call.managed.agent = other.identity.agent;
+        other_call.request_sequence = NonZeroU64::new(3).unwrap();
+        other_call.plan = ManagementRequest::Create(Box::new(other.clone()))
+            .authorization_plan()
+            .unwrap();
+        other_call.invocation = other_call.expected_invocation();
+        other_call.signature = sign_exact(&operator, &other_call.signing_bytes()).unwrap();
+        let other_locator = lifecycle
+            .reserve_shared_create(&other, &other_call, &runtime, &committee)
+            .unwrap();
+        assert_eq!(locator.agent < other_locator.agent, pending_first);
+        let candidate = lifecycle.prepare_shared_create(other_locator).unwrap();
+        let mut store =
+            CleanAgentGenesisSignatureFile::open_or_create(&signatures, other_locator, signer_id)
+                .unwrap();
+        let signature = candidate.endorse(&mut store, &mut signer).unwrap();
+        lifecycle
+            .publish_shared_create(other_locator, vec![signature])
+            .unwrap();
+        let ack = lifecycle.complete_shared_create(other_locator).unwrap();
+        assert_eq!(ack.credential_call, other_call.commitment());
+        let path = data
+            .join(SHARED_AGENT_HOST_DIRECTORY)
+            .join(format!("{}.agent", hex::encode(other.identity.agent.0)));
+        let files = journal_files(&path);
+        Some((other_locator, ack, path, files))
+    } else {
+        None
+    };
     let denied = with_denial.then(|| {
         let mut denied_descriptor = descriptor.clone();
         denied_descriptor.creation_nonce = Hash([0x75; 32]);
@@ -562,6 +649,8 @@ fn check_shared_file_recovery(
                     | InstallFault::DenialSuccessor
             ) {
                 99
+            } else if retired_peer.is_some() {
+                4
             } else {
                 3
             },
@@ -946,11 +1035,23 @@ fn check_shared_file_recovery(
             );
             assert_eq!(journal_files(&journal), fenced);
             assert_eq!(journal_files(&lifecycle_root), completed);
+            if let Some((other, acknowledgement, path, files)) = &retired_peer {
+                assert_eq!(
+                    lifecycle.complete_shared_create(*other).unwrap(),
+                    *acknowledgement
+                );
+                assert_eq!(
+                    journal_files(path),
+                    *files,
+                    "recovering expiry must not republish the retired peer"
+                );
+            }
             return;
         }
         let interruption = match interrupt_install {
             InstallFault::None
             | InstallFault::Expiry
+            | InstallFault::MixedExpiry { .. }
             | InstallFault::Successive
             | InstallFault::Denial
             | InstallFault::DenialAuthorization

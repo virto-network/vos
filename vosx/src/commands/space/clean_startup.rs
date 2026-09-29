@@ -211,6 +211,7 @@ fn open_clean_system_lifecycle(
 struct StartupTestInputs {
     runtime: vos::agent::package_admission::AdmittedRuntimePackage,
     authority: AdmittedActorPackage,
+    catalog: AdmittedActorPackage,
     clock: Arc<AtomicU64>,
 }
 
@@ -271,6 +272,8 @@ fn open_clean_system_lifecycle_with_inputs(
         SYSTEM_CATALOG_NAME,
         operator,
     )?;
+    #[cfg(test)]
+    let catalog_package = test_inputs.map_or(catalog_package, |inputs| inputs.catalog.clone());
     authority_package.require_runtime(AgentProfile::Shared, &runtime)?;
     catalog_package.require_runtime(AgentProfile::Shared, &runtime)?;
 

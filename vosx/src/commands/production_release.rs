@@ -483,6 +483,44 @@ mod tests {
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
+    #[test]
+    #[ignore = "requires independently built candidate system templates"]
+    fn candidate_catalog_preserves_manifest_and_nonprogram_artifacts() {
+        use vos::agent::sdk::package::{PackageEnvelope, PackageManifest};
+        let directory = PathBuf::from(
+            std::env::var_os("VOS_AGENT_TEMPLATE_CANDIDATES")
+                .expect("set candidate template directory"),
+        );
+        let candidate = fs::read(directory.join(CATALOG_FILE)).unwrap();
+        vos::agent::package_admission::admit_actor_package(&candidate).unwrap();
+        let mut previous =
+            PackageEnvelope::decode(bundled::system_catalog_package_template()).unwrap();
+        let mut current = PackageEnvelope::decode(&candidate).unwrap();
+        let (PackageManifest::Actor(old), PackageManifest::Actor(new)) =
+            (&mut previous.manifest, &current.manifest)
+        else {
+            panic!("Catalog must be an actor");
+        };
+        let old_program = old.program.clone();
+        let new_program = new.program.clone();
+        old.program = new.program.clone();
+        old.signing = new.signing.clone();
+        assert_eq!(
+            &*old, new,
+            "Catalog manifest changed beyond program/signature"
+        );
+        previous
+            .artifacts
+            .retain(|artifact| artifact.identity != old_program);
+        current
+            .artifacts
+            .retain(|artifact| artifact.identity != new_program);
+        assert_eq!(
+            previous.artifacts, current.artifacts,
+            "Catalog schema/policy/constructor artifacts changed"
+        );
+    }
+
     struct TestDir(PathBuf);
 
     impl TestDir {
