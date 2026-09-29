@@ -4,8 +4,181 @@ use super::genesis_issuance::RetainedCommitteeQuery;
 use super::*;
 use crate::agent::clean_authority_issuer::SignedManagementTerminal;
 use crate::agent::clean_management_intent::{
-    CleanManagementIntent, CleanManagementIntentSlot, ManagementJournalAnchor,
+    CleanManagementIntent, CleanManagementIntentSlot, ManagementJournalAnchor, SharedInstallHandoff,
 };
+
+fn recover_shared_install_handoff<I, J>(
+    slot: &mut CleanManagementIntentSlot<I>,
+    issuer: &DurableCleanManagementIssuer<J>,
+    authority: AuthorityActorTarget,
+    descriptor: &AgentDescriptor,
+) -> Result<(), SharedAgentHostError>
+where
+    I: super::super::clean_authority_issuer::CleanSharedManagementIntentStore,
+    J: CleanManagementIssuerStore,
+{
+    let Some(record) = slot
+        .load_shared_install_handoff()
+        .map_err(|_| SharedAgentHostError::Unavailable)?
+    else {
+        return Ok(());
+    };
+    let identity = &descriptor.identity;
+    let managed = ManagedAgentTarget {
+        space: identity.space,
+        agent: identity.agent,
+        owner: identity.owner,
+        profile: identity.profile,
+        runtime_deployment: identity.runtime_deployment,
+        transition_producer: identity.transition_producer,
+    };
+    if record.next.call().authority != authority || record.next.call().managed != managed {
+        return Err(SharedAgentHostError::ScopeMismatch);
+    }
+    validate_actor_install(descriptor, record.next.request(), &record.package)
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+    let current = slot
+        .intent()
+        .ok_or(SharedAgentHostError::ScopeMismatch)?
+        .clone();
+    let before = SharedInstallHandoff::matches(&current, &record.previous);
+    let after = SharedInstallHandoff::matches(&current, &record.next);
+    if !before && !after {
+        return Err(SharedAgentHostError::ScopeMismatch);
+    }
+    if before
+        || slot
+            .authorization_work()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .is_none()
+    {
+        if issuer
+            .recover_finalized_terminal(
+                authority,
+                record.previous.call().managed,
+                record.previous.request(),
+                record.previous.call(),
+                &RawCredentialVerifier,
+            )
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+            .is_none()
+            || !issuer
+                .can_resume_install(
+                    authority,
+                    record.next.call().managed,
+                    record.next.request(),
+                    record.next.call(),
+                    &RawCredentialVerifier,
+                )
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if before {
+            if !slot
+                .retirement_complete()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            {
+                return Err(SharedAgentHostError::Conflict);
+            }
+            let old_package = slot
+                .load_actor()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .ok_or(SharedAgentHostError::Unavailable)?;
+            validate_actor_install(descriptor, current.request(), &old_package)
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            slot.handoff_retired(&current, record.next.clone(), &RawCredentialVerifier)
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+        }
+        slot.retain_actor(&record.package)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+    } else {
+        // Once authorization exists, missing or divergent package evidence is
+        // corruption, not a pre-admission handoff that may repair its sidecar.
+        let package = slot
+            .load_actor()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .ok_or(SharedAgentHostError::Unavailable)?;
+        if package.exact_bytes() != record.package.exact_bytes() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn verify_shared_handoff_generation<B, C, D, J>(
+    owner: &CleanSystemAgentBootstrapOwner<B, C, D>,
+    record: &SharedInstallHandoff,
+    issuer: &DurableCleanManagementIssuer<J>,
+) -> Result<(), SharedAgentHostError>
+where
+    B: CleanSystemAgentBootstrapStore + Send + 'static,
+    C: CleanSystemAgentBootstrapStore + Send + 'static,
+    D: CleanManagementIssuerStore + Send + 'static,
+    J: CleanManagementIssuerStore,
+{
+    let authority = owner.authority_target();
+    let managed = record.next.call().managed;
+    let mut host = owner
+        .host
+        .lock()
+        .map_err(|_| SharedAgentHostError::Unavailable)?;
+    if let Some(receipt) = issuer
+        .recover_issued_application(
+            authority,
+            managed,
+            record.next.request(),
+            record.next.call(),
+            &RawCredentialVerifier,
+        )
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+    {
+        // An interrupted successor may already be physically applied. Its
+        // signed observation/finality is independently completed below.
+        if let Ok(observation) = host.observe_durable_install(
+            crate::service::AgentId(managed.agent.0),
+            record.next.request(),
+            &receipt,
+        ) {
+            if observation.managed() == managed {
+                return Ok(());
+            }
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+    }
+    let (receipt, terminal) = issuer
+        .recover_finalized_terminal(
+            authority,
+            managed,
+            record.previous.request(),
+            record.previous.call(),
+            &RawCredentialVerifier,
+        )
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+        .ok_or(SharedAgentHostError::ScopeMismatch)?;
+    let observation = host.observe_durable_install(
+        crate::service::AgentId(managed.agent.0),
+        record.previous.request(),
+        &receipt,
+    )?;
+    let matches = match terminal {
+        SignedManagementTerminal::Applied(ack) => {
+            observation.result() == &Ok(ack.application)
+                && observation.reopened_state() == ack.reopened_state
+                && observation.applied_at() == ack.applied_at
+        }
+        SignedManagementTerminal::Rejected(failure) => {
+            observation.result() == &Err(failure.error)
+                && observation.reopened_state() == failure.reopened_state
+                && observation.applied_at() == failure.failed_at
+        }
+    };
+    if matches && observation.managed() == managed {
+        Ok(())
+    } else {
+        Err(SharedAgentHostError::ScopeMismatch)
+    }
+}
 
 /// Owns the complete discovered reservation set and its archive leases through
 /// recovery and serving. Construction validates ownership scope, not finality.
@@ -452,6 +625,7 @@ where
         };
         validate_actor_install(descriptor, &request, package)
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let descriptor = (**descriptor).clone();
         let intent = CleanManagementIntent::new(
             self.authority,
             original.call().managed,
@@ -460,23 +634,60 @@ where
             &RawCredentialVerifier,
         )
         .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-        if recovery
-            .management_intent
-            .as_ref()
-            .and_then(|slot| slot.intent())
-            .is_some_and(|retained| {
-                retained.request() != intent.request() || retained.call() != intent.call()
-            })
-        {
-            return Err(SharedAgentHostError::Conflict);
+        if let Some(slot) = recovery.management_intent.as_ref() {
+            if slot
+                .intent()
+                .is_some_and(|retained| !SharedInstallHandoff::matches(retained, &intent))
+                && !slot
+                    .retirement_complete()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?
+            {
+                return Err(SharedAgentHostError::Conflict);
+            }
         }
         let locator = recovery.locator;
         self.initialize_management(owner, locator, signer)?;
-        let slot = self.entries[index]
-            .0
+        let recovery = &mut self.entries[index].0;
+        let slot = recovery
             .management_intent
             .as_mut()
             .ok_or(SharedAgentHostError::Unavailable)?;
+        if let Some(previous) = slot.intent().cloned() {
+            if !SharedInstallHandoff::matches(&previous, &intent) {
+                let record = SharedInstallHandoff::new(&previous, &intent, package)
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                let issuer = recovery
+                    .management_issuer
+                    .as_mut()
+                    .ok_or(SharedAgentHostError::Unavailable)?;
+                if issuer
+                    .recover_finalized_terminal(
+                        self.authority,
+                        previous.call().managed,
+                        previous.request(),
+                        previous.call(),
+                        &RawCredentialVerifier,
+                    )
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+                    .is_none()
+                {
+                    return Err(SharedAgentHostError::Conflict);
+                }
+                let previous_package = slot
+                    .load_actor()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?
+                    .ok_or(SharedAgentHostError::Unavailable)?;
+                owner.complete_shared_install_from_management_intent(
+                    slot,
+                    &previous_package,
+                    issuer,
+                    signer,
+                )?;
+                slot.stage_shared_install_handoff(&record)
+                    .map_err(|_| SharedAgentHostError::Unavailable)?;
+                recover_shared_install_handoff(slot, issuer, self.authority, &descriptor)?;
+            }
+        }
         slot.pledge(intent)
             .map_err(|_| SharedAgentHostError::Conflict)?;
         slot.retain_actor(package)
@@ -549,7 +760,7 @@ where
         B: CleanSystemAgentBootstrapStore + Send + 'static,
         C: CleanSystemAgentBootstrapStore + Send + 'static,
         D: CleanManagementIssuerStore + Send + 'static,
-        I: super::super::clean_authority_issuer::CleanManagementActorStore,
+        I: super::super::clean_authority_issuer::CleanSharedManagementIntentStore,
         S: CleanManagementReceiptSigner,
     {
         if self.recovered {
@@ -717,6 +928,24 @@ where
             self.generations_recovered = true;
         }
         drop(entries);
+        for (entry, _) in &mut self.entries {
+            let Some(slot) = entry.management_intent.as_mut() else {
+                continue;
+            };
+            if let Some(record) = slot
+                .load_shared_install_handoff()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            {
+                verify_shared_handoff_generation(
+                    owner,
+                    &record,
+                    entry
+                        .management_issuer
+                        .as_ref()
+                        .ok_or(SharedAgentHostError::ScopeMismatch)?,
+                )?;
+            }
+        }
         let mut installs = Vec::new();
         for (index, (entry, _)) in self.entries.iter().enumerate() {
             let Some(slot) = entry.management_intent.as_ref() else {
@@ -830,6 +1059,10 @@ impl<
             || candidate
                 .load_actor()
                 .map_err(|_| SharedAgentHostError::Unavailable)?
+                .is_some()
+            || candidate
+                .load_shared_install_handoff()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
                 .is_some();
         if inputs
             && !self
@@ -868,9 +1101,21 @@ impl<
         let actor = store
             .load_actor()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
-        let slot = CleanManagementIntentSlot::open(store)
+        let mut slot = CleanManagementIntentSlot::open(store)
             .map_err(|_| SharedAgentHostError::Unavailable)?;
-        if let Some(pending) = slot.intent() {
+        let continuation = self
+            .issuer
+            .open_creation_continuation()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let original = self
+            .intent
+            .intent()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let ManagementRequest::Create(descriptor) = original.request() else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        recover_shared_install_handoff(&mut slot, &continuation, self.authority, descriptor)?;
+        if let Some(pending) = slot.intent().cloned() {
             if !self
                 .issuer
                 .creation_handoff_activated()
@@ -896,9 +1141,10 @@ impl<
             let ManagementRequest::Create(descriptor) = original.request() else {
                 return Err(SharedAgentHostError::ScopeMismatch);
             };
-            if let Some(bytes) = actor {
-                let package = super::super::package_admission::admit_actor_package(&bytes)
-                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            if let Some(package) = slot
+                .load_actor()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            {
                 validate_actor_install(descriptor, pending.request(), &package)
                     .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
             } else if slot
@@ -911,10 +1157,6 @@ impl<
         } else if actor.is_some() {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        let continuation = self
-            .issuer
-            .open_creation_continuation()
-            .map_err(|_| SharedAgentHostError::Unavailable)?;
         let mut pending_work = Vec::new();
         let mut retirements = Vec::new();
         if let Some(intent) = slot.intent() {

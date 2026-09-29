@@ -8484,6 +8484,7 @@ mod tests {
             management_intent: Arc<Mutex<Option<Vec<u8>>>>,
             management_actor: Arc<Mutex<Option<Vec<u8>>>>,
             management_handoff: Arc<Mutex<Option<Vec<u8>>>>,
+            management_install_handoff: Arc<Mutex<Option<Vec<u8>>>>,
             is_management_continuation: bool,
             runtime: Arc<Mutex<Option<Vec<u8>>>>,
             shared_replicas: Arc<Mutex<Option<Vec<u8>>>>,
@@ -8498,6 +8499,13 @@ mod tests {
         }
 
         impl crate::agent::clean_authority_issuer::CleanSharedManagementIntentStore for IssuerMemoryStore {
+            fn load_shared_install_handoff(&mut self) -> Result<Option<Vec<u8>>, MemoryError> {
+                Ok(self.management_install_handoff.lock().unwrap().clone())
+            }
+            fn commit_shared_install_handoff(&mut self, bytes: &[u8]) -> Result<(), MemoryError> {
+                *self.management_install_handoff.lock().unwrap() = Some(bytes.to_vec());
+                Ok(())
+            }
             fn management_intent_continuation(&mut self) -> Result<Self, MemoryError> {
                 if self.is_management_continuation {
                     return Err(MemoryError);

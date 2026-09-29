@@ -18,6 +18,99 @@ use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 pub(crate) const MAX_INTENT_BYTES: usize =
     super::clean_authority_issuer::MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES;
 
+/// Durable next-Install input, never policy approval. Keep the previous signed
+/// request so startup can authenticate either side of the intent replacement.
+pub(crate) struct SharedInstallHandoff {
+    pub(crate) previous: CleanManagementIntent,
+    pub(crate) next: CleanManagementIntent,
+    pub(crate) package: super::package_admission::AdmittedActorPackage,
+}
+
+impl SharedInstallHandoff {
+    pub(crate) fn new(
+        previous: &CleanManagementIntent,
+        next: &CleanManagementIntent,
+        package: &super::package_admission::AdmittedActorPackage,
+    ) -> Result<Self, DecodeError> {
+        let bare = |intent: &CleanManagementIntent| {
+            CleanManagementIntent::new(
+                intent.call().authority,
+                intent.call().managed,
+                intent.request().clone(),
+                intent.call().clone(),
+                &super::clean_bootstrap::RawCredentialVerifier,
+            )
+        };
+        let previous = bare(previous)?;
+        let next = bare(next)?;
+        let ManagementRequest::Install(install) = next.request() else {
+            return Err(DecodeError::NonCanonical);
+        };
+        if !matches!(previous.request(), ManagementRequest::Install(_))
+            || next.call().managed.profile != crate::agent_sdk::AgentProfile::Shared
+            || previous.call().managed != next.call().managed
+            || previous.call().authority != next.call().authority
+            || previous.call() == next.call()
+            || install.package != *package.package_ref()
+            || install.entry.deployment != package.deployment()
+            || install.entry.program != package.program()
+            || install.producer != package.producer()
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(Self {
+            previous,
+            next,
+            package: package.clone(),
+        })
+    }
+
+    pub(crate) fn matches(
+        intent: &CleanManagementIntent,
+        expected: &CleanManagementIntent,
+    ) -> bool {
+        intent.request() == expected.request() && intent.call() == expected.call()
+    }
+}
+
+impl ServiceWire for SharedInstallHandoff {
+    const MAGIC: [u8; 4] = *b"SIH1";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.bytes(&self.previous.encode());
+        encoder.bytes(&self.next.encode());
+        encoder.bytes(self.package.exact_bytes());
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let previous = decoder.bytes_ref()?;
+        let next = decoder.bytes_ref()?;
+        let package = decoder.bytes_ref()?;
+        let bare_limit = 64
+            + crate::agent_sdk::wire::MAX_MANAGEMENT_REQUEST_WIRE_BYTES
+            + crate::agent_sdk::wire::MAX_AUTHORITY_CREDENTIAL_CALL_WIRE_BYTES;
+        if previous.len() > bare_limit
+            || next.len() > bare_limit
+            || package.len() > crate::agent_sdk::package::MAX_PACKAGE_ENCODED_BYTES
+        {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let previous = CleanManagementIntent::decode(previous)?;
+        let next = CleanManagementIntent::decode(next)?;
+        if previous.authorization_work().is_some()
+            || previous.finalization_work().is_some()
+            || next.authorization_work().is_some()
+            || next.finalization_work().is_some()
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        let package = super::package_admission::admit_actor_package(package)
+            .map_err(|_| DecodeError::NonCanonical)?;
+        Self::new(&previous, &next, &package)
+    }
+}
+
 /// Host-owned pre-dispatch position, not a credential approval. Recovery must
 /// authenticate it against the independently opened system journal.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -871,6 +964,76 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
         self.poisoned = true;
         self.store
             .commit_pending_install(&exact)
+            .map_err(IntentSlotError::Storage)?;
+        self.poisoned = false;
+        Ok(())
+    }
+
+    pub(crate) fn load_shared_install_handoff(
+        &mut self,
+    ) -> Result<Option<SharedInstallHandoff>, IntentSlotError<B::Error>>
+    where
+        B: super::clean_authority_issuer::CleanSharedManagementIntentStore,
+    {
+        if self.poisoned {
+            return Err(IntentSlotError::Poisoned);
+        }
+        self.store
+            .load_shared_install_handoff()
+            .map_err(IntentSlotError::Storage)?
+            .map(|bytes| {
+                if bytes.len()
+                    > super::clean_authority_issuer::MAX_CLEAN_SHARED_INSTALL_HANDOFF_BYTES
+                {
+                    return Err(IntentSlotError::Invalid);
+                }
+                let record =
+                    SharedInstallHandoff::decode(&bytes).map_err(|_| IntentSlotError::Invalid)?;
+                if record.encode() != bytes {
+                    return Err(IntentSlotError::Invalid);
+                }
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    pub(crate) fn stage_shared_install_handoff(
+        &mut self,
+        record: &SharedInstallHandoff,
+    ) -> Result<(), IntentSlotError<B::Error>>
+    where
+        B: super::clean_authority_issuer::CleanSharedManagementIntentStore,
+    {
+        if self.poisoned {
+            return Err(IntentSlotError::Poisoned);
+        }
+        let current = self.intent.clone().ok_or(IntentSlotError::Conflict)?;
+        let bytes = record.encode();
+        if bytes.len() > super::clean_authority_issuer::MAX_CLEAN_SHARED_INSTALL_HANDOFF_BYTES {
+            return Err(IntentSlotError::Invalid);
+        }
+        let saved = self.load_shared_install_handoff()?;
+        if SharedInstallHandoff::matches(&current, &record.next) {
+            return if saved.is_some_and(|saved| saved.encode() == bytes) {
+                Ok(())
+            } else {
+                Err(IntentSlotError::Conflict)
+            };
+        }
+        if !self.retired || !SharedInstallHandoff::matches(&current, &record.previous) {
+            return Err(IntentSlotError::Conflict);
+        }
+        if let Some(saved) = saved {
+            if saved.encode() == bytes {
+                return Ok(());
+            }
+            if !SharedInstallHandoff::matches(&current, &saved.next) {
+                return Err(IntentSlotError::Conflict);
+            }
+        }
+        self.poisoned = true;
+        self.store
+            .commit_shared_install_handoff(&bytes)
             .map_err(IntentSlotError::Storage)?;
         self.poisoned = false;
         Ok(())

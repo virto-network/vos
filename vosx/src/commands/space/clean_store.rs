@@ -121,7 +121,7 @@ const EXTERNAL_LIFECYCLE_ENTRIES: [&str; 13] = [
     LIFECYCLE_PENDING_INSTALL_STAGE_FILE,
 ];
 
-const SHARED_LIFECYCLE_ENTRIES: [&str; 19] = [
+const SHARED_LIFECYCLE_ENTRIES: [&str; 21] = [
     LOCK_FILE,
     INTENT_FILE,
     INTENT_STAGE_FILE,
@@ -141,6 +141,8 @@ const SHARED_LIFECYCLE_ENTRIES: [&str; 19] = [
     "shared-management.intent.next",
     "shared-management.actor",
     "shared-management.actor.next",
+    "shared-management.install-handoff",
+    "shared-management.install-handoff.next",
 ];
 
 #[derive(Clone, Copy)]
@@ -285,6 +287,7 @@ enum StoreRole {
     SharedManagementHandoff = 49,
     SharedManagementIntent = 50,
     SharedManagementActor = 51,
+    SharedInstallHandoff = 52,
 }
 
 impl StoreRole {
@@ -300,6 +303,7 @@ impl StoreRole {
             Self::SharedManagementHandoff => "shared-management.handoff",
             Self::SharedManagementIntent => "shared-management.intent",
             Self::SharedManagementActor => "shared-management.actor",
+            Self::SharedInstallHandoff => "shared-management.install-handoff",
             Self::LocalCreateRequest => LOCAL_REQUEST_FILE,
             Self::CredentialQuery => CREDENTIAL_QUERY_FILE,
             Self::CredentialReservation => RESERVATION_FILE,
@@ -356,6 +360,7 @@ impl StoreRole {
             Self::SharedManagementHandoff => "shared-management.handoff.next",
             Self::SharedManagementIntent => "shared-management.intent.next",
             Self::SharedManagementActor => "shared-management.actor.next",
+            Self::SharedInstallHandoff => "shared-management.install-handoff.next",
             Self::LocalCreateRequest => LOCAL_REQUEST_STAGE_FILE,
             Self::CredentialQuery => CREDENTIAL_QUERY_STAGE_FILE,
             Self::CredentialReservation => RESERVATION_STAGE_FILE,
@@ -477,6 +482,9 @@ impl StoreRole {
             Self::SharedManagementHandoff => 36,
             Self::SharedManagementIntent => MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES,
             Self::SharedManagementActor => MAX_PACKAGE_ENCODED_BYTES,
+            Self::SharedInstallHandoff => {
+                vos::agent::clean_authority_issuer::MAX_CLEAN_SHARED_INSTALL_HANDOFF_BYTES
+            }
             Self::LocalCreateRequest => {
                 vos::agent::local_lifecycle::LocalCreateSubmission::MAX_BYTES
             }
@@ -578,6 +586,7 @@ impl StoreRole {
             49 => Some(Self::SharedManagementHandoff),
             50 => Some(Self::SharedManagementIntent),
             51 => Some(Self::SharedManagementActor),
+            52 => Some(Self::SharedInstallHandoff),
             1 => Some(Self::Pins),
             2 => Some(Self::Bootstrap),
             3 => Some(Self::ManagementIssuer),
@@ -2792,6 +2801,26 @@ impl CleanManagementIssuerStore for CleanManagementIntentFile {
 }
 
 impl CleanSharedManagementIntentStore for CleanManagementIntentFile {
+    fn load_shared_install_handoff(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        if self.0.role != StoreRole::SharedManagementIntent {
+            return Err(CleanFileStoreError::InvalidPath);
+        }
+        let mut store =
+            ExactFileStore::new(Arc::clone(&self.0.root), StoreRole::SharedInstallHandoff);
+        let bytes = store.load(StoreRole::SharedInstallHandoff.maximum_bytes())?;
+        if let Some(bytes) = &bytes {
+            store.commit_with_replacement(bytes, false)?;
+        }
+        Ok(bytes)
+    }
+
+    fn commit_shared_install_handoff(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        if self.0.role != StoreRole::SharedManagementIntent {
+            return Err(CleanFileStoreError::InvalidPath);
+        }
+        ExactFileStore::new(Arc::clone(&self.0.root), StoreRole::SharedInstallHandoff).commit(bytes)
+    }
+
     fn management_intent_continuation(&mut self) -> Result<Self, Self::Error> {
         if self.0.role != StoreRole::ManagementIntent
             || self.0.root.allowed_entries != SHARED_LIFECYCLE_ENTRIES
@@ -2929,6 +2958,9 @@ impl CleanManagementIssuerStore for CleanManagementIssuerFile {
                 .is_some()
             || ExactFileStore::new(Arc::clone(&self.0.root), StoreRole::SharedManagementActor)
                 .load(MAX_PACKAGE_ENCODED_BYTES)?
+                .is_some()
+            || ExactFileStore::new(Arc::clone(&self.0.root), StoreRole::SharedInstallHandoff)
+                .load(StoreRole::SharedInstallHandoff.maximum_bytes())?
                 .is_some())
     }
 }
@@ -3119,6 +3151,14 @@ pub(super) struct SharedManagementStageFault;
 
 #[cfg(test)]
 impl SharedManagementStageFault {
+    pub(super) fn install_handoff(root: &Path) -> Self {
+        Self::arm(root, StoreRole::SharedInstallHandoff, 1)
+    }
+
+    pub(super) fn actor(root: &Path) -> Self {
+        Self::arm(root, StoreRole::SharedManagementActor, 1)
+    }
+
     pub(super) fn intent(root: &Path, changed_write: usize) -> Self {
         Self::arm(root, StoreRole::SharedManagementIntent, changed_write)
     }
@@ -5292,6 +5332,70 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(pending.load().is_err());
+    }
+
+    #[test]
+    fn shared_install_handoff_stage_recovers_under_the_original_lease() {
+        let fixture = Fixture::new("shared-install-handoff");
+        let (mut original, mut issuer) =
+            CleanManagementLifecycleFiles::open(&fixture.root, LifecycleLayout::Shared, false)
+                .unwrap()
+                .into_parts();
+        assert!(original.load_shared_install_handoff().is_err());
+        let mut child = original.management_intent_continuation().unwrap();
+        let fault = SharedManagementStageFault::install_handoff(&fixture.root);
+        assert!(
+            child
+                .commit_shared_install_handoff(b"exact staged successor")
+                .is_err()
+        );
+        assert!(fault.fired());
+        drop(fault);
+        assert!(
+            fixture
+                .root
+                .join(StoreRole::SharedInstallHandoff.stage_file())
+                .exists()
+        );
+        assert_eq!(
+            child.load_shared_install_handoff().unwrap().as_deref(),
+            Some(b"exact staged successor".as_slice())
+        );
+        assert!(
+            !fixture
+                .root
+                .join(StoreRole::SharedInstallHandoff.stage_file())
+                .exists()
+        );
+        assert!(
+            issuer.issuance_disabled().unwrap(),
+            "an orphan handoff cannot unfreeze Create issuance"
+        );
+        drop(original);
+        drop(issuer);
+        assert!(matches!(
+            CleanManagementLifecycleFiles::open(&fixture.root, LifecycleLayout::Shared, true),
+            Err(CleanFileStoreError::Busy),
+        ));
+        drop(child);
+        assert!(
+            CleanManagementLifecycleFiles::open_existing(&fixture.root).is_err(),
+            "Shared handoffs must not enter the Local layout"
+        );
+        let (mut original, mut issuer) =
+            CleanManagementLifecycleFiles::open(&fixture.root, LifecycleLayout::Shared, true)
+                .unwrap()
+                .into_parts();
+        assert!(issuer.issuance_disabled().unwrap());
+        assert_eq!(
+            original
+                .management_intent_continuation()
+                .unwrap()
+                .load_shared_install_handoff()
+                .unwrap()
+                .as_deref(),
+            Some(b"exact staged successor".as_slice())
+        );
     }
 
     #[test]

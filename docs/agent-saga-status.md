@@ -455,10 +455,29 @@ or issuer roles. The default daemon build and 78 non-HTTP file-store tests pass;
 one fixture-dependent test remains ignored. Logs:
 `target/shared-install-file-issuer-{boundaries,default-check,stores}.log`.
 
-Next functional step: crash-safe subsequent-Install input handoff. The current
-controller deliberately refuses a different Install even after the preceding
-one retires; enabling ingress before solving that would ship a one-Install-only
-workflow. Other open gates are receipt expiry before application, Authority-denial
+Subsequent-Install handoff now passes the production-file staged-write workflow.
+A bounded SIH1
+host record retains both signed requests and the successor package under the
+existing lease. It is staged before intent replacement; startup may finish that
+replacement and publish the exact package only before authorization. After
+authorization, missing/divergent package evidence still fails closed. The
+predecessor must be finalized and retired; live handoff rechecks its physical
+terminal. Startup independently requires the predecessor terminal or the exact
+successor application after opening the generation and before route export.
+This adds a Shared-only file role, not a guest or management protocol change.
+The new file-adapter staging/lease/layout test and all 79 non-HTTP store tests
+pass (one fixture-dependent test ignored), as do the latest default daemon build
+(12.92 s), five controller regressions (12.35 s), formatting and diff checks.
+The final outer-PVM run passes (291.85 s): three successive Installs use distinct
+root-signed package variants, interrupt handoff staging, intent replacement and
+actor-package publication, then recover through production discovery and return
+the same terminal without duplicate physical/system journal work. The canonical
+old package stays intact at each interrupted publication; preparation alone
+does not execute the next Install. This is owner-reopen/staged-file evidence,
+not process-kill, power-loss, public ingress or three-node qualification.
+The final result is in `target/shared-install-successive-file-evidence.log`; other logs use
+`target/shared-install-handoff-*` and `target/shared-install-successive-file*`.
+Other open gates are receipt expiry before application, Authority-denial
 retirement, mixed pending continuations, remaining write/retirement interruption
 boundaries and roots already advanced by the old failing startup. Public Shared
 management remains disabled; bundled artifacts are unchanged.

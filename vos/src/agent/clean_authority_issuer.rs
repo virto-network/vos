@@ -216,7 +216,15 @@ pub trait CleanSharedManagementIntentStore:
     CleanManagementRuntimeStore + CleanManagementActorStore + Sized
 {
     fn management_intent_continuation(&mut self) -> Result<Self, Self::Error>;
+    fn load_shared_install_handoff(&mut self) -> Result<Option<Vec<u8>>, Self::Error>;
+    fn commit_shared_install_handoff(&mut self, bytes: &[u8]) -> Result<(), Self::Error>;
 }
+
+/// Two signed bare intents and one admitted actor package; no execution state.
+pub const MAX_CLEAN_SHARED_INSTALL_HANDOFF_BYTES: usize = 128
+    + 2 * (crate::agent_sdk::wire::MAX_MANAGEMENT_REQUEST_WIRE_BYTES
+        + crate::agent_sdk::wire::MAX_AUTHORITY_CREDENTIAL_CALL_WIRE_BYTES)
+    + crate::agent_sdk::package::MAX_PACKAGE_ENCODED_BYTES;
 
 impl<B: CleanManagementActorStore + ?Sized> CleanManagementActorStore for &mut B {
     fn load_actor(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {

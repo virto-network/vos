@@ -129,10 +129,18 @@ fn shared_install_file_owner_recovers_issuer_finality() {
     check_shared_file_recovery(true, true, InstallFault::Issuer(5));
 }
 
+#[test]
+#[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
+fn shared_install_file_owner_recovers_successive_handoffs() {
+    check_shared_file_recovery(true, true, InstallFault::Successive);
+}
+
+#[derive(Clone, Copy)]
 enum InstallFault {
     None,
     Intent(usize),
     Issuer(usize),
+    Successive,
 }
 
 fn check_shared_file_recovery(
@@ -572,7 +580,7 @@ fn check_shared_file_recovery(
         use super::super::clean_store::SharedManagementStageFault;
         use vos::agent::clean_authority_issuer::SignedManagementTerminal;
         let interruption = match interrupt_install {
-            InstallFault::None => None,
+            InstallFault::None | InstallFault::Successive => None,
             InstallFault::Intent(write) => Some((
                 SharedManagementStageFault::intent(&lifecycle_root, write),
                 "shared-management.intent.next",
@@ -667,6 +675,112 @@ fn check_shared_file_recovery(
             discover_shared_genesis_startup(&data, authority, 4),
             Err(CleanFileStoreError::Busy)
         ));
+        if matches!(interrupt_install, InstallFault::Successive) {
+            for index in 0..3u8 {
+                let name = format!("successor-catalog-{index}");
+                use vos::agent::sdk::package::{PackageEnvelope, PackageManifest, PackageSigning};
+                let mut envelope =
+                    PackageEnvelope::decode(crate::bundled::system_catalog_package_template())
+                        .unwrap();
+                let PackageManifest::Actor(manifest) = &mut envelope.manifest else {
+                    panic!("actor template");
+                };
+                manifest.name = name.clone();
+                manifest.signing = PackageSigning {
+                    producer: ProducerId::of_public_key(&public),
+                    public_key: public,
+                    signature: [0; 64],
+                };
+                envelope.manifest.signing_mut().signature =
+                    sign_exact(&operator, &envelope.signing_bytes().unwrap()).unwrap();
+                let package =
+                    vos::agent::package_admission::admit_actor_package(&envelope.encode().unwrap())
+                        .unwrap();
+                let configuration = SystemCatalogConfiguration {
+                    space: space.0,
+                    system_agent: agent.0,
+                    system_runtime_deployment: runtime.deployment().0,
+                    actor: ActorId::top_level(agent, &name).0,
+                    deployment: package.deployment().0,
+                    program: package.program().0,
+                    authority: CatalogAuthorityState {
+                        policy: authority.binding.policy.0,
+                        issuer: CatalogIssuerState {
+                            principal: authority.binding.issuer.principal.0,
+                            actor: authority.binding.issuer.actor.0,
+                            deployment: authority.binding.issuer.deployment.0,
+                            program: authority.binding.issuer.program.0,
+                            producer: authority.binding.issuer.producer.0,
+                        },
+                        public_key: authority.binding.public_key,
+                        initial_epoch: authority.binding.initial_epoch,
+                    },
+                };
+                assert!(configuration.is_valid());
+                let install = crate::commands::space::local_install::build_install(
+                    agent,
+                    InstallationId([0x90 + index; 32]),
+                    Hash([0xa0 + index; 32]),
+                    name,
+                    None,
+                    Some(configuration.encode()),
+                    &package,
+                )
+                .unwrap();
+                let mut next_call = call.clone();
+                next_call.request_sequence = NonZeroU64::new(4 + u64::from(index)).unwrap();
+                next_call.plan = ManagementRequest::Install(Box::new(install.clone()))
+                    .authorization_plan()
+                    .unwrap();
+                next_call.invocation = next_call.expected_invocation();
+                next_call.signature = sign_exact(&operator, &next_call.signing_bytes()).unwrap();
+                let before = journal_files(&journal);
+                let old_actor =
+                    std::fs::read(lifecycle_root.join("shared-management.actor")).unwrap();
+                let fault = match index {
+                    0 => SharedManagementStageFault::install_handoff(&lifecycle_root),
+                    1 => SharedManagementStageFault::intent(&lifecycle_root, 1),
+                    _ => SharedManagementStageFault::actor(&lifecycle_root),
+                };
+                assert_eq!(
+                    lifecycle.prepare_shared_install(install.clone(), next_call.clone(), &package),
+                    Err(SharedAgentHostError::Unavailable),
+                );
+                assert!(fault.fired(), "handoff boundary {index}");
+                assert_eq!(
+                    std::fs::read(lifecycle_root.join("shared-management.actor")).unwrap(),
+                    old_actor
+                );
+                assert_eq!(journal_files(&journal), before);
+                drop(fault);
+                drop(lifecycle);
+                (_, lifecycle) = open();
+                assert_eq!(
+                    journal_files(&journal),
+                    before,
+                    "preparation must not execute Install"
+                );
+                lifecycle
+                    .prepare_shared_install(install, next_call.clone(), &package)
+                    .unwrap();
+                let terminal = lifecycle.complete_shared_install(locator).unwrap();
+                let SignedManagementTerminal::Applied(ack) = &terminal else {
+                    panic!("successor Install failed: {terminal:?}");
+                };
+                assert_eq!(ack.credential_call, next_call.commitment());
+                let completed = journal_files(&journal);
+                assert_ne!(completed, before);
+                drop(lifecycle);
+                (_, lifecycle) = open();
+                let system_completed = journal_files(&system_journal);
+                assert_eq!(
+                    lifecycle.complete_shared_install(locator).unwrap(),
+                    terminal
+                );
+                assert_eq!(journal_files(&journal), completed);
+                assert_eq!(journal_files(&system_journal), system_completed);
+            }
+        }
         drop(lifecycle);
     } else {
         drop(lifecycle);
