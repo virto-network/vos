@@ -245,6 +245,68 @@ fn check_shared_file_recovery(
     with_handoff: bool,
     interrupt_install: InstallFault,
 ) {
+    check_shared_file_recovery_with_candidate(with_denial, with_handoff, interrupt_install, None);
+}
+
+#[test]
+#[ignore = "requires AUTHORITY_CANDIDATE_ELF; candidate bootstrap and Shared Create use production stores"]
+fn candidate_authority_shared_create_reopens_production_stores() {
+    let elf = PathBuf::from(std::env::var("AUTHORITY_CANDIDATE_ELF").unwrap());
+    check_shared_file_recovery_with_candidate(false, false, InstallFault::None, Some(&elf));
+}
+
+fn candidate_authority_inputs(operator: &Keypair, path: &Path) -> StartupTestInputs {
+    use vos::agent::sdk::package::{
+        PackageArtifact, PackageEnvelope, PackageManifest, PackageSigning,
+    };
+    let mut inputs = expiry_startup_inputs(operator);
+    let elf = std::fs::read(path).unwrap();
+    let program = vos_pvm_compiler::link_elf_spi(&elf).unwrap();
+    let schema = vos::agent::schema::raw_section_from_elf(&elf).unwrap();
+    let mut package =
+        PackageEnvelope::decode(crate::bundled::system_authority_package_template()).unwrap();
+    let PackageManifest::Actor(manifest) = &mut package.manifest else {
+        unreachable!()
+    };
+    let old_program = std::mem::replace(
+        &mut manifest.program,
+        vos::agent::sdk::BlobRef::of_bytes(&program),
+    );
+    let old_schema = std::mem::replace(
+        &mut manifest.state_lane_schema,
+        vos::agent::sdk::BlobRef::of_bytes(&schema),
+    );
+    package
+        .artifacts
+        .retain(|artifact| artifact.identity != old_program && artifact.identity != old_schema);
+    for bytes in [program, schema] {
+        package.artifacts.push(PackageArtifact {
+            identity: vos::agent::sdk::BlobRef::of_bytes(&bytes),
+            bytes,
+        });
+    }
+    package
+        .artifacts
+        .sort_unstable_by(|a, b| a.identity.cmp(&b.identity));
+    let public_key = raw_public_key(operator).unwrap();
+    *package.manifest.signing_mut() = PackageSigning {
+        producer: ProducerId::of_public_key(&public_key),
+        public_key,
+        signature: [0; 64],
+    };
+    package.manifest.signing_mut().signature =
+        sign_exact(operator, &package.signing_bytes().unwrap()).unwrap();
+    inputs.authority =
+        vos::agent::package_admission::admit_actor_package(&package.encode().unwrap()).unwrap();
+    inputs
+}
+
+fn check_shared_file_recovery_with_candidate(
+    with_denial: bool,
+    with_handoff: bool,
+    interrupt_install: InstallFault,
+    candidate: Option<&Path>,
+) {
     use crate::commands::space::clean_store::{
         CleanAgentGenesisSignatureFile, CleanFileStoreError, ensure_private_directory,
     };
@@ -266,11 +328,15 @@ fn check_shared_file_recovery(
         auto_dial_mdns: false,
     }));
     let space = SpaceId([0x73; 32]);
-    let expiry = matches!(
-        interrupt_install,
-        InstallFault::Expiry | InstallFault::MixedExpiry { .. }
-    )
-    .then(|| expiry_startup_inputs(&operator));
+    let expiry = candidate
+        .map(|path| candidate_authority_inputs(&operator, path))
+        .or_else(|| {
+            matches!(
+                interrupt_install,
+                InstallFault::Expiry | InstallFault::MixedExpiry { .. }
+            )
+            .then(|| expiry_startup_inputs(&operator))
+        });
     let open = || {
         open_clean_system_lifecycle_with_inputs(
             network.clone(),

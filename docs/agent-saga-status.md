@@ -172,7 +172,24 @@ shortcut disabled (17.66 s):
 `VOS_AGENT_PROFILE_REFINE_MACHINES=1`. This qualifies the candidate actor package
 inside the released runtime for this singleton file-journal path; it does not
 qualify three-node startup or the production bootstrap metadata stores.
-Full production-store recovery and multi-node quorum remain unqualified.
+The candidate now passes the existing production-store Shared Create/recovery
+campaign with the actual bundled outer runtime and Catalog (127.46 s):
+`fixed-roster-guest.ImAzBc/candidate-production-stores.log`. The separate ignored
+test `candidate_authority_shared_create_reopens_production_stores` explicitly
+selects `AUTHORITY_CANDIDATE_ELF`, signs both new program and schema references,
+and reuses the real startup stores, discovery, preparation/publication and terminal
+reopen checks. Existing bundled tests cannot pick up that candidate implicitly.
+This closes this singleton candidate-store integration check, not subprocess crash
+qualification, three-node quorum, public Shared ingress or release artifact pins.
+Next three-node integration must separate attachment/election from bootstrap
+progress. `SharedRouteHandler::has_local_proposer` accepts only a leader,
+and waits for election only for singleton rosters. `submit_clean_management`
+checks that before retained-result lookup. Simply deleting the startup roster
+gate would let followers return `Unavailable` and drop their attachments before
+bootstrap can form quorum. Keep attached followers alive while a leader executes
+ordered bootstrap; qualify follower catch-up and recovery without introducing
+permissive finality or bypassing fresh Authority checks. This is an integration
+requirement, not evidence that the three-node startup path currently works.
 The current full Authority host suite passes: 81 passed, 2 ignored (30.76 s),
 `fixed-roster-guest.ImAzBc/mutation-host-suite.log`.
 The candidate Authority node-table header now supports exactly one or three
