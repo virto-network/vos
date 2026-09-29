@@ -259,27 +259,43 @@ The `std`-only library check passes (3.25 s),
 `target/fixed-system-seal-std-check.log`. The complete Shared-host regression run
 passes: 30 passed, 1 ignored (214.50 s), including its near-ceiling raw-tail
 attachment test (`target/fixed-system-seal-host-regressions.log`).
-Next: authenticate follower lifecycle catch-up/restart without repeating completed
-policy mutations. Followers currently retain their pre-bootstrap metadata and do
-not expose serving owners merely because physical state matches. Public cluster
-orchestration, production-store crash recovery and backup remain open.
-The first follower-recovery primitive now replays a committed bootstrap invocation
-with a fresh verifier, selecting its original authenticated admission clock. It
-does not propose a missing invocation or replace its work with caller-supplied
-bytes. The expanded three-node candidate test passes after dropping/reopening each
-follower's file-journal owner (32.29 s): both recover exactly the leader's Catalog
-approval despite a different supplied clock, reject changed/absent work, and leave
-journal heads and runtime commitments unchanged. Bootstrap/issuer metadata still
-uses retained memory stores and remains at CreateReceiptIssued, so this is journal
-reopen evidence, not completed follower lifecycle or process-crash qualification.
-Evidence: `target/fixed-system-follower-reopen-proof.log`; the earlier live-owner
-proof also passes (22.83 s), `target/fixed-system-follower-proof.log`.
-Both singleton before/after-every-phase restart regressions pass (16.42 s), and
-the `std`-only library check passes (2.71 s); logs:
-`target/fixed-system-follower-proof-{singleton,std}.log`.
-Recover the original signed application ACK next: recomputing one from the later
-runtime state would change its signed commitment. Then restore follower issuer/
-bootstrap phases from those independently verified records before exposing owners.
+Follower lifecycle catch-up now freshly replays the committed bootstrap approval
+and finalization, including the original authenticated admission clocks and signed
+application ACK. It binds the recovered input to the exact expected bootstrap
+message, receipt and installed package; matching physical state alone is not
+completion evidence. The existing phase machine restores issuer/bootstrap metadata
+without repeating completed policy mutations or signing a different state into
+the ACK. This recovery runs before proposing work even on a newly elected leader.
+Completed durable metadata follows the normal authenticated reopen path instead
+of requiring old invocation history indefinitely.
+The three-node candidate regression passes after retiring the original leader's
+bootstrap owner and reopening each remaining replica (75.11 s). Both recover the
+same approval/ACK, issuer 3/3 and Complete phase with unchanged journal/runtime
+commitments. An injected bootstrap-record write failure poisons that owner;
+authenticated reopen recovers it without permitting volatile retries. Evidence:
+`target/fixed-system-bootstrap-leader-loss.log`. Both singleton before/after-every-
+phase restart regressions pass (8.33 s),
+`target/fixed-system-completed-recovery-singleton.log`.
+Pending-owner lifetime/failure recovery passes (7.17 s), the explicitly executed
+three-node election/nonexposure test passes (6.87 s), and the `std`-only library
+check passes (2.97 s). Logs: `target/fixed-system-completed-recovery-lifetime.log`,
+`target/fixed-system-completed-recovery-election-executed.log`, and
+`target/fixed-system-completed-recovery-std.log`. The initial election command
+left the test ignored and is not counted as coverage.
+The extended cluster test also reopens both replicas after Complete and requires
+identical node-local records, issuer counters and journal/runtime commitments;
+it passes (84.46 s), `target/fixed-system-complete-reopen-retained-genesis.log`.
+Its first attempt correctly rejected an empty replacement genesis provider
+(`target/fixed-system-complete-reopen.log`); the fixture now retains the original
+genesis archive across every owner reopen, without changing production checks.
+These tests use actual candidate Authority and bundled runtime execution, real
+file journals and loopback consensus, but a scripted Catalog and retained-memory
+bootstrap/issuer stores. Owner retirement is not a process kill; the original
+Network object survives without its system attachment. Public cluster startup
+remains gated. Production-store/process crash recovery, interruption before
+bootstrap completion, public orchestration and backup remain open. Next integrate
+the qualified private lifecycle into the real startup workflow with signed common
+cluster inputs; do not count these fixture tests as released-node qualification.
 The current full Authority host suite passes: 81 passed, 2 ignored (30.76 s),
 `fixed-roster-guest.ImAzBc/mutation-host-suite.log`.
 The candidate Authority node-table header now supports exactly one or three

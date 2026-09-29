@@ -2776,8 +2776,61 @@ where
         if !preflight.matches_work(&work) || work.mode != crate::agent_sdk::MethodMode::Linear {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
+        let retained = self.retained_bootstrap_invocation(work.invocation)?;
+        let authorization = match retained {
+            Some(previous) => {
+                if previous.work() != &work {
+                    return Err(SharedJournalDriverError::CrossStoreMismatch);
+                }
+                previous.authorization().clone()
+            }
+            None => {
+                if require_retained {
+                    return Err(SharedJournalDriverError::CrossStoreMismatch);
+                }
+                InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(
+                    &work,
+                    self.executor.current_logical_slot()?,
+                ))
+            }
+        };
+        Ok(CleanInvocationReplayRequest::Invoke {
+            context: RuntimeExecutionContext::Direct,
+            work,
+            authorization,
+        })
+    }
+
+    /// Return the original input only together with a freshly replayed result.
+    /// Callers must still bind the input to their expected bootstrap protocol
+    /// message; an invocation ID alone is not lifecycle completion evidence.
+    pub(crate) fn replay_durable_bootstrap_input(
+        &mut self,
+        invocation: crate::agent_sdk::InvocationId,
+    ) -> Result<
+        Option<(
+            crate::agent_sdk::InvocationWork,
+            crate::agent_sdk::RuntimeOutcome,
+        )>,
+        SharedJournalDriverError,
+    > {
+        let Some(request) = self.retained_bootstrap_invocation(invocation)? else {
+            return Ok(None);
+        };
+        let work = request.work().clone();
+        let outcome = self.replay_durable_clean_terminal(request)?;
+        Ok(Some((work, outcome)))
+    }
+
+    fn retained_bootstrap_invocation(
+        &self,
+        invocation: crate::agent_sdk::InvocationId,
+    ) -> Result<Option<CleanInvocationReplayRequest>, SharedJournalDriverError> {
+        use crate::agent_sdk::{InvocationAuthorization, RuntimeExecutionContext};
+        if invocation == crate::agent_sdk::InvocationId::ZERO {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
         let mut cursor = self.materialization.heads().ordered_head;
-        let mut retained = None;
         // Bootstrap contains only a handful of operations. Fail closed if its
         // history unexpectedly grows beyond the normal retained-result bound.
         for _ in 0..1_024 {
@@ -2798,39 +2851,26 @@ where
                 authorization,
                 ..
             } = &entry.input.operation
-                && previous.invocation == work.invocation
+                && previous.invocation == invocation
             {
                 if *context != RuntimeExecutionContext::Direct
-                    || previous != &work
-                    || !matches!(authorization, InvocationAuthorization::PublicPreflight(value) if value.matches_work(&work))
+                    || previous.mode != crate::agent_sdk::MethodMode::Linear
+                    || !matches!(authorization, InvocationAuthorization::PublicPreflight(value) if value.matches_work(previous))
                 {
                     return Err(SharedJournalDriverError::CrossStoreMismatch);
                 }
-                retained = Some(authorization.clone());
-                break;
+                return Ok(Some(CleanInvocationReplayRequest::Invoke {
+                    context: *context,
+                    work: previous.clone(),
+                    authorization: authorization.clone(),
+                }));
             }
             cursor = entry.parent;
         }
-        let authorization = match retained {
-            Some(authorization) => authorization,
-            None => {
-                if require_retained {
-                    return Err(SharedJournalDriverError::CrossStoreMismatch);
-                }
-                if cursor.is_some() && cursor != self.materialization.replay_boundary().head {
-                    return Err(SharedJournalDriverError::CrossStoreMismatch);
-                }
-                InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(
-                    &work,
-                    self.executor.current_logical_slot()?,
-                ))
-            }
-        };
-        Ok(CleanInvocationReplayRequest::Invoke {
-            context: RuntimeExecutionContext::Direct,
-            work,
-            authorization,
-        })
+        if cursor.is_some() && cursor != self.materialization.replay_boundary().head {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        Ok(None)
     }
 
     pub(crate) fn prepare_terminal_clean_ordered_operation(

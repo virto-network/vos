@@ -1704,6 +1704,12 @@ where
 }
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+struct ReplayedCompletedBootstrap {
+    approval: ManagementApproval,
+    acknowledgement: ManagementApplicationAck,
+}
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 impl<P, R, I> PendingCleanSystemAgentBootstrap<P, R, I>
 where
     P: CleanSystemAgentBootstrapStore,
@@ -1721,17 +1727,37 @@ where
         let Some(owner) = self.owner.as_mut() else {
             return Ok(None);
         };
-        if owner.pins.replicas.members().len() > 1
-            && !owner
+        let multi = owner.pins.replicas.members().len() > 1;
+        let leader_ready = !multi
+            || owner
                 ._network_host
                 .bootstrap_is_local_leader(crate::service::AgentId(owner.pins.agent.0))
-                .map_err(CleanSystemAgentBootstrapError::Host)?
-        {
+                .map_err(CleanSystemAgentBootstrapError::Host)?;
+        let completed_record = owner.record.phase == CleanSystemAgentBootstrapPhase::Complete;
+        // A newly elected leader can have the same lagging metadata as a
+        // follower. Recover completed physical work before deciding to propose.
+        let recovered = if multi && !completed_record {
+            match recover_completed_bootstrap(&owner.host, &self.plan) {
+                Ok(Some(recovered)) => Some(recovered),
+                Ok(None) => None,
+                Err(error) => {
+                    self.failed = !matches!(
+                        &error,
+                        CleanSystemAgentBootstrapError::Host(SharedAgentHostError::Unavailable)
+                    );
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        if !leader_ready && !completed_record && recovered.is_none() {
             return Err(CleanSystemAgentBootstrapError::Host(
                 SharedAgentHostError::Unavailable,
             ));
         }
-        if let Err(error) = owner.advance_attached_bootstrap(&self.plan, signer) {
+        if let Err(error) = owner.advance_attached_bootstrap(&self.plan, signer, recovered.as_ref())
+        {
             // A store failure can leave an ambiguous commit. Reopen and
             // authenticate durable state instead of retrying volatile progress.
             self.failed = !matches!(
@@ -2603,6 +2629,7 @@ where
         &mut self,
         plan: &AuthorizedCleanSystemAgentBootstrap,
         signer: &mut S,
+        recovered: Option<&ReplayedCompletedBootstrap>,
     ) -> Result<(), CleanSystemAgentBootstrapError> {
         let started = std::time::Instant::now();
         let report_phase = |phase: &'static str| {
@@ -2649,14 +2676,16 @@ where
             };
         validate_exact_receipt(plan, &plan.authority_decision, &authority_receipt, 2, 1)?;
         if record.phase < CleanSystemAgentBootstrapPhase::AuthorityInstalled {
-            apply_actor_install(
-                &host,
-                &network_host,
-                plan,
-                &plan.authority_request,
-                &authority_receipt,
-                plan.authority_package().map_err(rejected)?,
-            )?;
+            if recovered.is_none() {
+                apply_actor_install(
+                    &host,
+                    &network_host,
+                    plan,
+                    &plan.authority_request,
+                    &authority_receipt,
+                    plan.authority_package().map_err(rejected)?,
+                )?;
+            }
             record.advance(CleanSystemAgentBootstrapPhase::AuthorityInstalled);
             commit_bootstrap_record(record_store, record)?;
         }
@@ -2669,7 +2698,10 @@ where
         }
 
         let approval = if record.phase < CleanSystemAgentBootstrapPhase::CatalogApproved {
-            let approval = invoke_authorize(&host, &network_host, plan)?;
+            let approval = match recovered {
+                Some(recovered) => recovered.approval.clone(),
+                None => invoke_authorize(&host, &network_host, plan)?,
+            };
             record.catalog_approval = Some(approval.clone());
             record.advance(CleanSystemAgentBootstrapPhase::CatalogApproved);
             commit_bootstrap_record(record_store, record)?;
@@ -2681,6 +2713,11 @@ where
                 .ok_or_else(|| rejected(CleanSystemAgentBootstrapRejection::WrongOutcome))?
         };
         validate_approval(plan, &approval)?;
+        if recovered.is_some_and(|recovered| recovered.approval != approval) {
+            return Err(rejected(
+                CleanSystemAgentBootstrapRejection::DivergentRecord,
+            ));
+        }
         let catalog_decision = AuthorizedCleanManagementDecision::from_approval(
             plan.authority_target(),
             plan.managed_target(),
@@ -2708,17 +2745,27 @@ where
                 .ok_or_else(|| rejected(CleanSystemAgentBootstrapRejection::WrongReceipt))?
         };
         validate_exact_receipt(plan, &catalog_decision, &catalog_receipt, 3, 2)?;
+        if recovered.is_some_and(|recovered| recovered.acknowledgement.receipt != catalog_receipt) {
+            return Err(rejected(CleanSystemAgentBootstrapRejection::WrongReceipt));
+        }
 
-        let mut catalog_application = None;
+        let mut catalog_application = recovered.map(|recovered| {
+            (
+                recovered.acknowledgement.application.clone(),
+                recovered.acknowledgement.applied_at,
+            )
+        });
         if record.phase < CleanSystemAgentBootstrapPhase::CatalogInstalled {
-            catalog_application = Some(apply_actor_install(
-                &host,
-                &network_host,
-                plan,
-                &plan.catalog_request,
-                &catalog_receipt,
-                plan.catalog_package().map_err(rejected)?,
-            )?);
+            if recovered.is_none() {
+                catalog_application = Some(apply_actor_install(
+                    &host,
+                    &network_host,
+                    plan,
+                    &plan.catalog_request,
+                    &catalog_receipt,
+                    plan.catalog_package().map_err(rejected)?,
+                )?);
+            }
             record.advance(CleanSystemAgentBootstrapPhase::CatalogInstalled);
             commit_bootstrap_record(record_store, record)?;
         }
@@ -2738,13 +2785,16 @@ where
                     plan.catalog_package().map_err(rejected)?,
                 )?,
             };
-            let reopened_state = host
-                .lock()
-                .map_err(|_| {
-                    CleanSystemAgentBootstrapError::Host(SharedAgentHostError::Unavailable)
-                })?
-                .clean_state_commitment(crate::service::AgentId(plan.pins.agent.0))
-                .map_err(CleanSystemAgentBootstrapError::Host)?;
+            let reopened_state = if let Some(recovered) = recovered {
+                recovered.acknowledgement.reopened_state
+            } else {
+                host.lock()
+                    .map_err(|_| {
+                        CleanSystemAgentBootstrapError::Host(SharedAgentHostError::Unavailable)
+                    })?
+                    .clean_state_commitment(crate::service::AgentId(plan.pins.agent.0))
+                    .map_err(CleanSystemAgentBootstrapError::Host)?
+            };
             let acknowledgement = issuer
                 .observe_durable_application(
                     &catalog_receipt,
@@ -2766,12 +2816,15 @@ where
         };
         if !acknowledgement.matches_pending(&plan.catalog_call, &approval)
             || acknowledgement.verify_with(&RawCredentialVerifier).is_err()
+            || recovered.is_some_and(|recovered| recovered.acknowledgement != acknowledgement)
         {
             return Err(rejected(CleanSystemAgentBootstrapRejection::WrongOutcome));
         }
 
         if record.phase < CleanSystemAgentBootstrapPhase::Complete {
-            invoke_finalize(&host, &network_host, plan, &acknowledgement)?;
+            if recovered.is_none() {
+                invoke_finalize(&host, &network_host, plan, &acknowledgement)?;
+            }
             issuer
                 .observe_durable_actor_finalization(&acknowledgement)
                 .map_err(map_issuer_observation_error)?;
@@ -8234,7 +8287,6 @@ fn invoke_actor(
     origin: super::sdk::InvocationOrigin,
     message: Vec<u8>,
 ) -> Result<crate::actors::value::Value, CleanSystemAgentBootstrapError> {
-    use crate::actors::codec::Decode as _;
     let work = bootstrap_invocation_work(host, plan, invocation, origin, message)?;
     let authorization = super::sdk::InvocationAuthorization::PublicPreflight(
         super::sdk::PublicPreflight::for_work(&work, plan.pins.observed_slot),
@@ -8246,8 +8298,17 @@ fn invoke_actor(
             authorization,
         )
         .map_err(CleanSystemAgentBootstrapError::Host)?;
-    let super::sdk::RuntimeOutcome::Completed(Ok(reply)) = submission.outcome else {
-        match &submission.outcome {
+    decode_bootstrap_reply(&work, submission.outcome)
+}
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+fn decode_bootstrap_reply(
+    work: &super::sdk::InvocationWork,
+    outcome: super::sdk::RuntimeOutcome,
+) -> Result<crate::actors::value::Value, CleanSystemAgentBootstrapError> {
+    use crate::actors::codec::Decode as _;
+    let super::sdk::RuntimeOutcome::Completed(Ok(reply)) = outcome else {
+        match &outcome {
             super::sdk::RuntimeOutcome::Completed(Err(error)) => {
                 tracing::warn!(?error, "system bootstrap invocation failed");
             }
@@ -8350,6 +8411,144 @@ fn invoke_finalize(
         return Err(rejected(CleanSystemAgentBootstrapRejection::WrongOutcome));
     }
     Ok(())
+}
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+fn recover_completed_bootstrap(
+    host: &Arc<Mutex<SharedAgentHost>>,
+    plan: &AuthorizedCleanSystemAgentBootstrap,
+) -> Result<Option<ReplayedCompletedBootstrap>, CleanSystemAgentBootstrapError> {
+    let authority = install_request(&plan.authority_request)?;
+    let catalog = install_request(&plan.catalog_request)?;
+    if inspect_actor(host, plan, authority.entry.actor)?.is_none()
+        || inspect_actor(host, plan, catalog.entry.actor)?.is_none()
+    {
+        return Ok(None);
+    }
+    ensure_actor_installed(host, plan, &plan.authority_request)?;
+    ensure_actor_installed(host, plan, &plan.catalog_request)?;
+    let call = &plan.catalog_call;
+    let work = bootstrap_invocation_work(
+        host,
+        plan,
+        call.invocation,
+        super::sdk::InvocationOrigin {
+            principal: Some(call.principal),
+            transport_node: call.authenticated_node,
+            credential: Some(call.credential),
+            actor: None,
+            capability: None,
+        },
+        dynamic_message(
+            "authorize",
+            "call",
+            crate::actors::value::Value::Bytes(
+                call.encode()
+                    .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::WrongOutcome))?,
+            ),
+        ),
+    )?;
+    let authorization = super::sdk::InvocationAuthorization::PublicPreflight(
+        super::sdk::PublicPreflight::for_work(&work, plan.pins.observed_slot),
+    );
+    let outcome = host
+        .lock()
+        .map_err(|_| CleanSystemAgentBootstrapError::Host(SharedAgentHostError::Unavailable))?
+        .replay_durable_bootstrap_invocation(
+            crate::service::AgentId(plan.pins.agent.0),
+            work.clone(),
+            authorization,
+        )
+        .map_err(CleanSystemAgentBootstrapError::Host)?;
+    let crate::actors::value::Value::Bytes(bytes) = decode_bootstrap_reply(&work, outcome)? else {
+        return Err(rejected(CleanSystemAgentBootstrapRejection::WrongOutcome));
+    };
+    let approval = ManagementApproval::decode(&bytes)
+        .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::WrongOutcome))?;
+    validate_approval(plan, &approval)?;
+    let Some(acknowledgement) = recover_bootstrap_acknowledgement(host, plan, &approval)? else {
+        return Ok(None);
+    };
+    Ok(Some(ReplayedCompletedBootstrap {
+        approval,
+        acknowledgement,
+    }))
+}
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+fn recover_bootstrap_acknowledgement(
+    host: &Arc<Mutex<SharedAgentHost>>,
+    plan: &AuthorizedCleanSystemAgentBootstrap,
+    approval: &ManagementApproval,
+) -> Result<Option<ManagementApplicationAck>, CleanSystemAgentBootstrapError> {
+    use crate::actors::codec::Decode as _;
+    validate_approval(plan, approval)?;
+    let recovered = host
+        .lock()
+        .map_err(|_| CleanSystemAgentBootstrapError::Host(SharedAgentHostError::Unavailable))?
+        .replay_durable_bootstrap_input(
+            crate::service::AgentId(plan.pins.agent.0),
+            approval.acknowledgement_invocation,
+        )
+        .map_err(CleanSystemAgentBootstrapError::Host)?;
+    let Some((work, outcome)) = recovered else {
+        return Ok(None);
+    };
+    let invalid = || rejected(CleanSystemAgentBootstrapRejection::WrongOutcome);
+    if work.message.first() != Some(&crate::actors::value::TAG_DYNAMIC) {
+        return Err(invalid());
+    }
+    let message = crate::actors::value::Msg::try_decode(&work.message[1..]).ok_or_else(invalid)?;
+    let bytes = message.args.get_bytes("ack").ok_or_else(invalid)?;
+    let acknowledgement = ManagementApplicationAck::decode(&bytes).map_err(|_| invalid())?;
+    if !acknowledgement.matches_pending(&plan.catalog_call, approval)
+        || acknowledgement.verify_with(&RawCredentialVerifier).is_err()
+        || acknowledgement.application
+            != super::sdk::ManagementReply::Installed(
+                install_request(&plan.catalog_request)?.entry.clone(),
+            )
+    {
+        return Err(invalid());
+    }
+    let decision = AuthorizedCleanManagementDecision::from_approval(
+        plan.authority_target(),
+        plan.managed_target(),
+        &plan.catalog_request,
+        &plan.catalog_call,
+        approval,
+        &RawCredentialVerifier,
+    )
+    .map_err(|_| invalid())?;
+    validate_exact_receipt(plan, &decision, &acknowledgement.receipt, 3, 2)?;
+    let expected = bootstrap_invocation_work(
+        host,
+        plan,
+        approval.acknowledgement_invocation,
+        super::sdk::InvocationOrigin::anonymous(),
+        dynamic_message(
+            "finalize",
+            "ack",
+            crate::actors::value::Value::Bytes(acknowledgement.encode().map_err(|_| invalid())?),
+        ),
+    )?;
+    if work != expected {
+        return Err(invalid());
+    }
+    let super::sdk::RuntimeOutcome::Completed(Ok(reply)) = outcome else {
+        return Err(invalid());
+    };
+    if reply.invocation != work.invocation
+        || reply.actor != work.actor
+        || reply.incarnation != work.incarnation
+        || reply.deployment != work.deployment
+        || reply.mode != work.mode
+        || reply.status != super::sdk::InvocationStatus::Done
+        || crate::actors::value::Value::try_decode(&reply.reply)
+            != Some(crate::actors::value::Value::Bool(true))
+    {
+        return Err(invalid());
+    }
+    Ok(Some(acknowledgement))
 }
 
 fn validate_actor_install(
@@ -11490,6 +11689,7 @@ mod tests {
             let mut directories = Vec::new();
             let mut pending = Vec::new();
             let mut bootstrap_stores = Vec::new();
+            let mut genesis_providers = Vec::new();
             let mut signer = CountingSigner::new();
             for (fixture, seed) in fixtures.iter().zip([NODE_SEED, 0xd2, 0xd3]) {
                 let keypair = libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap();
@@ -11513,6 +11713,7 @@ mod tests {
                     },
                     IssuerMemoryStore::default(),
                 );
+                let genesis = Arc::new(MemoryProvider::new(fixture.provision.clone()));
                 let mut attached = CleanSystemAgentBootstrapOwner::attach_bootstrap_with_admission(
                     stores.0.clone(),
                     stores.1.clone(),
@@ -11526,7 +11727,7 @@ mod tests {
                     fixture.trust.clone(),
                     fixture.merge.clone(),
                     fixture.finality.clone(),
-                    Arc::new(MemoryProvider::new(fixture.provision.clone())),
+                    genesis.clone(),
                     network.clone(),
                     None,
                     None,
@@ -11551,6 +11752,7 @@ mod tests {
                 networks.push(network);
                 pending.push(attached);
                 bootstrap_stores.push(stores);
+                genesis_providers.push(genesis);
             }
             // Raft may already have an unsuccessful discovery dial in flight.
             // Retry explicit loopback addresses until every authenticated peer
@@ -11657,20 +11859,38 @@ mod tests {
                     .unwrap()
                     .clean_state_commitment(agent)
                     .unwrap();
-                for (index, attached) in pending.iter_mut().enumerate() {
+                let completed_record = completed.record.clone();
+                for (index, attached) in pending.iter().enumerate() {
                     if index == leader {
                         continue;
                     }
-                    // Reopen the follower's real journal owner before result
-                    // recovery. Bootstrap metadata intentionally still lags.
-                    drop(attached.owner.take().unwrap());
+                    let owner = attached.owner.as_ref().unwrap();
+                    assert!(wait_until(std::time::Duration::from_secs(30), || owner
+                        .host
+                        .lock()
+                        .unwrap()
+                        .clean_state_commitment(agent)
+                        .unwrap()
+                        == expected));
+                }
+                // The surviving replicas have applied bootstrap but neither
+                // has advanced its own metadata. The new leader must recover
+                // those same signed results instead of replaying policy calls.
+                drop(completed);
+                assert!(wait_until(std::time::Duration::from_secs(15), || {
+                    pending
+                        .iter()
+                        .enumerate()
+                        .any(|(index, attached)| index != leader && is_leader(attached))
+                }));
+                let reopen = |index: usize, signer: &mut CountingSigner| {
                     let fixture = &fixtures[index];
                     let stores = &bootstrap_stores[index];
-                    *attached = CleanSystemAgentBootstrapOwner::attach_bootstrap_with_admission(
+                    CleanSystemAgentBootstrapOwner::attach_bootstrap_with_admission(
                         stores.0.clone(),
                         stores.1.clone(),
                         stores.2.clone(),
-                        &mut signer,
+                        signer,
                         &fixture.plan,
                         directories[index].host(),
                         directories[index].lock(),
@@ -11679,12 +11899,22 @@ mod tests {
                         fixture.trust.clone(),
                         fixture.merge.clone(),
                         fixture.finality.clone(),
-                        Arc::new(MemoryProvider::new(fixture.provision.clone())),
+                        genesis_providers[index].clone(),
                         networks[index].clone(),
                         None,
                         None,
                     )
-                    .unwrap();
+                    .unwrap()
+                };
+                let mut recovered_followers = Vec::new();
+                for (index, attached) in pending.iter_mut().enumerate() {
+                    if index == leader {
+                        continue;
+                    }
+                    // Reopen the follower's real journal owner before result
+                    // recovery. Bootstrap metadata intentionally still lags.
+                    drop(attached.owner.take().unwrap());
+                    *attached = reopen(index, &mut signer);
                     let owner = attached.owner.as_ref().unwrap();
                     assert!(
                         wait_until(std::time::Duration::from_secs(30), || {
@@ -11750,7 +11980,7 @@ mod tests {
                     };
                     assert_eq!(
                         ManagementApproval::decode(&bytes).unwrap(),
-                        completed.record.catalog_approval.clone().unwrap()
+                        completed_record.catalog_approval.clone().unwrap()
                     );
                     for altered_invocation in [false, true] {
                         let mut changed = work.clone();
@@ -11774,6 +12004,38 @@ mod tests {
                     assert_eq!(host.journal_position(agent).unwrap(), before);
                     assert_eq!(host.clean_state_commitment(agent).unwrap(), expected);
                     drop(host);
+                    let approval = completed_record.catalog_approval.as_ref().unwrap();
+                    let acknowledgement =
+                        recover_bootstrap_acknowledgement(&owner.host, &attached.plan, approval)
+                            .unwrap()
+                            .unwrap();
+                    assert_eq!(
+                        acknowledgement,
+                        completed_record.catalog_acknowledgement.clone().unwrap()
+                    );
+                    let mut wrong_approval = approval.clone();
+                    wrong_approval.managed.agent = AgentId([0xfe; 32]);
+                    assert!(
+                        recover_bootstrap_acknowledgement(
+                            &owner.host,
+                            &attached.plan,
+                            &wrong_approval
+                        )
+                        .is_err()
+                    );
+                    assert_eq!(
+                        owner.host.lock().unwrap().journal_position(agent).unwrap(),
+                        before
+                    );
+                    assert_eq!(
+                        owner
+                            .host
+                            .lock()
+                            .unwrap()
+                            .clean_state_commitment(agent)
+                            .unwrap(),
+                        expected
+                    );
                     // Physical replication alone does not qualify follower
                     // lifecycle recovery or expose a serving owner.
                     assert_eq!(
@@ -11781,8 +12043,89 @@ mod tests {
                         CleanSystemAgentBootstrapPhase::CreateReceiptIssued
                     );
                     assert_eq!(owner.issuer.sequence_high_water(), 1);
+                    if recovered_followers.is_empty() {
+                        bootstrap_stores[index].1.fail_next_before_publish();
+                        assert!(matches!(
+                            attached.try_complete(&mut signer),
+                            Err(CleanSystemAgentBootstrapError::RecordStorage)
+                        ));
+                        assert!(attached.failed);
+                        let commits = bootstrap_stores[index].1.commits();
+                        assert!(matches!(
+                            attached.try_complete(&mut signer),
+                            Err(CleanSystemAgentBootstrapError::Rejected(
+                                CleanSystemAgentBootstrapRejection::InvalidRecord
+                            ))
+                        ));
+                        assert_eq!(bootstrap_stores[index].1.commits(), commits);
+                        drop(attached.owner.take().unwrap());
+                        *attached = reopen(index, &mut signer);
+                    }
+                    let follower = attached.try_complete(&mut signer).unwrap().unwrap();
+                    assert_eq!(
+                        follower.record.phase(),
+                        CleanSystemAgentBootstrapPhase::Complete
+                    );
+                    assert_eq!(follower.issuer.sequence_high_water(), 3);
+                    assert_eq!(follower.issuer.acknowledged_through(), 3);
+                    assert_eq!(
+                        follower.record.catalog_approval,
+                        completed_record.catalog_approval
+                    );
+                    assert_eq!(
+                        follower.record.catalog_acknowledgement,
+                        completed_record.catalog_acknowledgement
+                    );
+                    assert_eq!(
+                        follower
+                            .host
+                            .lock()
+                            .unwrap()
+                            .journal_position(agent)
+                            .unwrap(),
+                        before
+                    );
+                    assert_eq!(
+                        follower
+                            .host
+                            .lock()
+                            .unwrap()
+                            .clean_state_commitment(agent)
+                            .unwrap(),
+                        expected
+                    );
+                    assert!(attached.try_complete(&mut signer).unwrap().is_none());
+                    // Completed metadata must also reopen without requiring
+                    // leadership or replaying policy mutations again.
+                    let follower_record = follower.record.clone();
+                    drop(follower);
+                    *attached = reopen(index, &mut signer);
+                    let reopened = attached.try_complete(&mut signer).unwrap().unwrap();
+                    assert_eq!(reopened.record, follower_record);
+                    assert_eq!(reopened.issuer.sequence_high_water(), 3);
+                    assert_eq!(reopened.issuer.acknowledged_through(), 3);
+                    assert_eq!(
+                        reopened
+                            .host
+                            .lock()
+                            .unwrap()
+                            .journal_position(agent)
+                            .unwrap(),
+                        before
+                    );
+                    assert_eq!(
+                        reopened
+                            .host
+                            .lock()
+                            .unwrap()
+                            .clean_state_commitment(agent)
+                            .unwrap(),
+                        expected
+                    );
+                    assert!(attached.try_complete(&mut signer).unwrap().is_none());
+                    recovered_followers.push(reopened);
                 }
-                drop(completed);
+                drop(recovered_followers);
             }
             drop(pending);
             for network in networks {
