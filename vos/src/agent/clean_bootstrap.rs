@@ -1689,6 +1689,51 @@ where
     fail_live_shared_promotion_once: bool,
 }
 
+/// Attached bootstrap resources without a serving-owner interface. A transient
+/// lack of a leader must not tear down the very attachment needed for election.
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+struct PendingCleanSystemAgentBootstrap<P, R, I>
+where
+    P: CleanSystemAgentBootstrapStore,
+    R: CleanSystemAgentBootstrapStore,
+    I: CleanManagementIssuerStore,
+{
+    owner: Option<CleanSystemAgentBootstrapOwner<P, R, I>>,
+    plan: AuthorizedCleanSystemAgentBootstrap,
+    failed: bool,
+}
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+impl<P, R, I> PendingCleanSystemAgentBootstrap<P, R, I>
+where
+    P: CleanSystemAgentBootstrapStore,
+    R: CleanSystemAgentBootstrapStore,
+    I: CleanManagementIssuerStore,
+{
+    fn try_complete<S: CleanManagementReceiptSigner>(
+        &mut self,
+        signer: &mut S,
+    ) -> Result<Option<CleanSystemAgentBootstrapOwner<P, R, I>>, CleanSystemAgentBootstrapError>
+    {
+        if self.failed {
+            return Err(rejected(CleanSystemAgentBootstrapRejection::InvalidRecord));
+        }
+        let Some(owner) = self.owner.as_mut() else {
+            return Ok(None);
+        };
+        if let Err(error) = owner.advance_attached_bootstrap(&self.plan, signer) {
+            // A store failure can leave an ambiguous commit. Reopen and
+            // authenticate durable state instead of retrying volatile progress.
+            self.failed = !matches!(
+                &error,
+                CleanSystemAgentBootstrapError::Host(SharedAgentHostError::Unavailable)
+            );
+            return Err(error);
+        }
+        Ok(self.owner.take())
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecoveryReadFailure {
@@ -2084,6 +2129,48 @@ where
 
     #[allow(clippy::too_many_arguments)]
     fn open_or_bootstrap_with_admission<S: CleanManagementReceiptSigner>(
+        pins_store: P,
+        record_store: R,
+        issuer_store: I,
+        signer: &mut S,
+        plan: &AuthorizedCleanSystemAgentBootstrap,
+        shared_host_root: impl AsRef<Path>,
+        stable_lock_path: impl AsRef<Path>,
+        expected_space: SpaceId,
+        expected_node: NodeId,
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+        finality: Arc<dyn AgentGenesisFinalityVerifier>,
+        genesis: Arc<dyn SystemAgentGenesisProvider>,
+        network: Arc<Network>,
+        lifecycle: Option<&super::local_lifecycle::LocalLifecycleStartupAdmission>,
+        operations: Option<&NativeAuthorityOperationStartupAdmission<'_>>,
+    ) -> Result<Self, CleanSystemAgentBootstrapError> {
+        let mut pending = Self::attach_bootstrap_with_admission(
+            pins_store,
+            record_store,
+            issuer_store,
+            signer,
+            plan,
+            shared_host_root,
+            stable_lock_path,
+            expected_space,
+            expected_node,
+            trust,
+            merge,
+            finality,
+            genesis,
+            network,
+            lifecycle,
+            operations,
+        )?;
+        pending
+            .try_complete(signer)?
+            .ok_or_else(|| rejected(CleanSystemAgentBootstrapRejection::InvalidRecord))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attach_bootstrap_with_admission<S: CleanManagementReceiptSigner>(
         mut pins_store: P,
         mut record_store: R,
         issuer_store: I,
@@ -2100,7 +2187,7 @@ where
         network: Arc<Network>,
         lifecycle: Option<&super::local_lifecycle::LocalLifecycleStartupAdmission>,
         operations: Option<&NativeAuthorityOperationStartupAdmission<'_>>,
-    ) -> Result<Self, CleanSystemAgentBootstrapError> {
+    ) -> Result<PendingCleanSystemAgentBootstrap<P, R, I>, CleanSystemAgentBootstrapError> {
         let started = std::time::Instant::now();
         let report_phase = |phase: &'static str| {
             tracing::debug!(
@@ -2454,7 +2541,62 @@ where
         }
         .map_err(CleanSystemAgentBootstrapError::Host)?;
 
-        report_phase("attach_network_host");
+        let root_lineage =
+            bootstrap_root_lineage(plan).ok_or(CleanSystemAgentBootstrapError::Rejected(
+                CleanSystemAgentBootstrapRejection::InvalidDecision,
+            ))?;
+        let owner = Self {
+            _pins_store: pins_store,
+            record_store,
+            record,
+            issuer,
+            _network_host: network_host,
+            host,
+            snapshot_signer: merge,
+            pins: plan.pins.clone(),
+            creation_receipt: create_receipt,
+            root_lineage,
+            authority_install: install_request(plan.authority_request())?.clone(),
+            invocation_gas: plan.invocation_gas,
+            shared_lifecycle_recovery_pending: false,
+            #[cfg(test)]
+            finalization_failure_once: None,
+            #[cfg(test)]
+            recovery_read_failure_once: None,
+            #[cfg(test)]
+            fail_deferred_create_stage_once: false,
+            #[cfg(test)]
+            fail_live_shared_promotion_once: false,
+        };
+        Ok(PendingCleanSystemAgentBootstrap {
+            owner: Some(owner),
+            plan: plan.clone(),
+            failed: false,
+        })
+    }
+
+    fn advance_attached_bootstrap<S: CleanManagementReceiptSigner>(
+        &mut self,
+        plan: &AuthorizedCleanSystemAgentBootstrap,
+        signer: &mut S,
+    ) -> Result<(), CleanSystemAgentBootstrapError> {
+        let started = std::time::Instant::now();
+        let report_phase = |phase: &'static str| {
+            tracing::debug!(
+                phase,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Attached system bootstrap phase complete"
+            );
+        };
+        let Self {
+            record_store,
+            record,
+            issuer,
+            host,
+            _network_host: network_host,
+            creation_receipt: create_receipt,
+            ..
+        } = self;
         if issuer.acknowledged_through() < 1 {
             issuer
                 .observe_durable(&create_receipt)
@@ -2462,7 +2604,7 @@ where
         }
         if record.phase < CleanSystemAgentBootstrapPhase::Created {
             record.advance(CleanSystemAgentBootstrapPhase::Created);
-            commit_bootstrap_record(&mut record_store, &record)?;
+            commit_bootstrap_record(record_store, record)?;
         }
 
         let authority_receipt =
@@ -2473,7 +2615,7 @@ where
                 validate_exact_receipt(plan, &plan.authority_decision, &issued, 2, 1)?;
                 record.authority_receipt = Some(issued.clone());
                 record.advance(CleanSystemAgentBootstrapPhase::AuthorityReceiptIssued);
-                commit_bootstrap_record(&mut record_store, &record)?;
+                commit_bootstrap_record(record_store, record)?;
                 issued
             } else {
                 record
@@ -2492,7 +2634,7 @@ where
                 plan.authority_package().map_err(rejected)?,
             )?;
             record.advance(CleanSystemAgentBootstrapPhase::AuthorityInstalled);
-            commit_bootstrap_record(&mut record_store, &record)?;
+            commit_bootstrap_record(record_store, record)?;
         }
         ensure_actor_installed(&host, plan, &plan.authority_request)?;
         report_phase("ensure_authority");
@@ -2506,7 +2648,7 @@ where
             let approval = invoke_authorize(&host, &network_host, plan)?;
             record.catalog_approval = Some(approval.clone());
             record.advance(CleanSystemAgentBootstrapPhase::CatalogApproved);
-            commit_bootstrap_record(&mut record_store, &record)?;
+            commit_bootstrap_record(record_store, record)?;
             approval
         } else {
             record
@@ -2533,7 +2675,7 @@ where
             validate_exact_receipt(plan, &catalog_decision, &issued, 3, 2)?;
             record.catalog_receipt = Some(issued.clone());
             record.advance(CleanSystemAgentBootstrapPhase::CatalogReceiptIssued);
-            commit_bootstrap_record(&mut record_store, &record)?;
+            commit_bootstrap_record(record_store, record)?;
             issued
         } else {
             record
@@ -2554,7 +2696,7 @@ where
                 plan.catalog_package().map_err(rejected)?,
             )?);
             record.advance(CleanSystemAgentBootstrapPhase::CatalogInstalled);
-            commit_bootstrap_record(&mut record_store, &record)?;
+            commit_bootstrap_record(record_store, record)?;
         }
         ensure_actor_installed(&host, plan, &plan.catalog_request)?;
         report_phase("ensure_catalog");
@@ -2590,7 +2732,7 @@ where
                 .map_err(map_issuer_issue_error)?;
             record.catalog_acknowledgement = Some(acknowledgement.clone());
             record.advance(CleanSystemAgentBootstrapPhase::CatalogAcknowledged);
-            commit_bootstrap_record(&mut record_store, &record)?;
+            commit_bootstrap_record(record_store, record)?;
             acknowledgement
         } else {
             record
@@ -2610,7 +2752,7 @@ where
                 .observe_durable_actor_finalization(&acknowledgement)
                 .map_err(map_issuer_observation_error)?;
             record.advance(CleanSystemAgentBootstrapPhase::Complete);
-            commit_bootstrap_record(&mut record_store, &record)?;
+            commit_bootstrap_record(record_store, record)?;
         } else {
             issuer
                 .observe_durable_actor_finalization(&acknowledgement)
@@ -2620,63 +2762,34 @@ where
             return Err(CleanSystemAgentBootstrapError::InvalidIssuerState);
         }
 
-        let root_lineage =
-            bootstrap_root_lineage(plan).ok_or(CleanSystemAgentBootstrapError::Rejected(
-                CleanSystemAgentBootstrapRejection::InvalidDecision,
-            ))?;
-        let mut owner = Self {
-            _pins_store: pins_store,
-            record_store,
-            record,
-            issuer,
-            _network_host: network_host,
-            host,
-            snapshot_signer: merge,
-            pins: plan.pins.clone(),
-            creation_receipt: create_receipt,
-            root_lineage,
-            authority_install: install_request(plan.authority_request())?.clone(),
-            invocation_gas: plan.invocation_gas,
-            shared_lifecycle_recovery_pending: false,
-            #[cfg(test)]
-            finalization_failure_once: None,
-            #[cfg(test)]
-            recovery_read_failure_once: None,
-            #[cfg(test)]
-            fail_deferred_create_stage_once: false,
-            #[cfg(test)]
-            fail_live_shared_promotion_once: false,
-        };
         // Reconstruct volatile admission from the durable exact pending work
         // before returning an owner that could authenticate a fresh query.
         // This reservation is idempotent with the first recovery drive.
-        if let Some(pending) = owner.record.pending_projection.clone() {
+        if let Some(pending) = self.record.pending_projection.clone() {
             if let Some((anchor, work)) = pending.management_envelope() {
-                owner
-                    ._network_host
+                self._network_host
                     .ensure_management_pending_member(
-                        crate::service::AgentId(owner.pins.agent.0),
+                        crate::service::AgentId(self.pins.agent.0),
                         anchor,
                         work,
                     )
                     .map_err(CleanSystemAgentBootstrapError::Host)?;
-                return Ok(owner);
+                return Ok(());
             }
             let (work, authorization) = pending
                 .invocation()
                 .ok_or_else(|| rejected(CleanSystemAgentBootstrapRejection::DivergentRecord))?;
-            owner
-                ._network_host
+            self._network_host
                 .reserve_recovering_projection_pair(
-                    crate::service::AgentId(owner.pins.agent.0),
+                    crate::service::AgentId(self.pins.agent.0),
                     work,
                     authorization,
-                    &owner.pins.replicas,
-                    owner.snapshot_signer.as_ref(),
+                    &self.pins.replicas,
+                    self.snapshot_signer.as_ref(),
                 )
                 .map_err(CleanSystemAgentBootstrapError::Host)?;
         }
-        Ok(owner)
+        Ok(())
     }
 
     pub const fn pins(&self) -> &CleanSystemAgentPins {
@@ -14573,6 +14686,103 @@ mod tests {
             );
             drop(reopened);
             stop_network(network);
+        }
+
+        #[test]
+        fn pending_system_bootstrap_retains_attachment_and_requires_reopen_after_store_error() {
+            for fail_store in [false, true] {
+                let fixture = native_bundled_authority_fixture();
+                let directory = TestDirectory::new("pending-system-bootstrap");
+                let network = network(NODE_SEED);
+                let pins = BootstrapMemoryStore::default();
+                let record = BootstrapMemoryStore {
+                    bootstrap_clock: fixture.logical_slot.clone(),
+                    ..BootstrapMemoryStore::default()
+                };
+                let issuer = IssuerMemoryStore::default();
+                let provider = Arc::new(MemoryProvider::new(fixture.provision.clone()));
+                let mut signer = CountingSigner::new();
+                let mut pending = CleanSystemAgentBootstrapOwner::attach_bootstrap_with_admission(
+                    pins.clone(),
+                    record.clone(),
+                    issuer.clone(),
+                    &mut signer,
+                    &fixture.plan,
+                    directory.host(),
+                    directory.lock(),
+                    fixture.plan.pins.space,
+                    fixture.plan.pins.node,
+                    fixture.trust.clone(),
+                    fixture.merge.clone(),
+                    fixture.finality.clone(),
+                    provider.clone(),
+                    network.clone(),
+                    None,
+                    None,
+                )
+                .unwrap();
+                let attached = pending.owner.as_ref().unwrap();
+                let host = Arc::downgrade(&attached.host);
+                assert_eq!(
+                    attached.record.phase(),
+                    CleanSystemAgentBootstrapPhase::CreateReceiptIssued
+                );
+                assert!(
+                    inspect_actor(
+                        &attached.host,
+                        &fixture.plan,
+                        fixture.plan.pins.authority.issuer.actor
+                    )
+                    .unwrap()
+                    .is_none()
+                );
+                if fail_store {
+                    record.fail_next_before_publish();
+                    assert!(matches!(
+                        pending.try_complete(&mut signer),
+                        Err(CleanSystemAgentBootstrapError::RecordStorage)
+                    ));
+                    assert!(host.upgrade().is_some());
+                    let commits = record.commits();
+                    assert!(matches!(
+                        pending.try_complete(&mut signer),
+                        Err(CleanSystemAgentBootstrapError::Rejected(
+                            CleanSystemAgentBootstrapRejection::InvalidRecord
+                        ))
+                    ));
+                    assert_eq!(record.commits(), commits);
+                    drop(pending);
+                    assert!(host.upgrade().is_none());
+                    let owner = open_owner(
+                        &fixture,
+                        &directory,
+                        pins,
+                        record,
+                        issuer,
+                        &mut signer,
+                        provider,
+                        network.clone(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        owner.record.phase(),
+                        CleanSystemAgentBootstrapPhase::Complete
+                    );
+                    drop(owner);
+                } else {
+                    let owner = pending.try_complete(&mut signer).unwrap().unwrap();
+                    assert_eq!(
+                        owner.record.phase(),
+                        CleanSystemAgentBootstrapPhase::Complete
+                    );
+                    assert!(pending.try_complete(&mut signer).unwrap().is_none());
+                    drop(pending);
+                    assert!(host.upgrade().is_some());
+                    drop(owner);
+                    assert!(host.upgrade().is_none());
+                }
+                stop_network(network);
+            }
         }
 
         #[test]

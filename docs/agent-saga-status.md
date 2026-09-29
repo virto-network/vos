@@ -190,6 +190,21 @@ bootstrap can form quorum. Keep attached followers alive while a leader executes
 ordered bootstrap; qualify follower catch-up and recovery without introducing
 permissive finality or bypassing fresh Authority checks. This is an integration
 requirement, not evidence that the three-node startup path currently works.
+The bootstrap implementation now separates authenticated attachment from ordered
+phase advancement behind an internal pending-owner type. That type retains stores,
+the locked host and Raft attachment without exporting the normal serving-owner
+interface. `Unavailable` leaves it retryable; storage/validation failures require
+drop and authenticated reopen rather than trusting possibly uncommitted phase
+state. Completion transfers ownership once. Existing public startup still performs
+both steps synchronously and retains the singleton gate; follower coordination is
+not implemented merely by this separation.
+The new lifetime/store-failure regression passes (6.88 s), including successful
+transfer, resource release, refusal to reuse ambiguous progress, and durable reopen.
+Both existing before/after-every-phase restart regressions pass (8.47 s).
+Logs: `target/pending-system-bootstrap-{lifetime,restarts}.log`.
+The candidate installation/file-journal reopen test still passes with the actual
+outer PVM (18.08 s), `target/pending-system-bootstrap-outer-pvm.log`; the `std`-only
+library check passes (2.91 s), `target/pending-system-bootstrap-std-check.log`.
 The current full Authority host suite passes: 81 passed, 2 ignored (30.76 s),
 `fixed-roster-guest.ImAzBc/mutation-host-suite.log`.
 The candidate Authority node-table header now supports exactly one or three
