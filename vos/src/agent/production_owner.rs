@@ -37,6 +37,7 @@ use super::supervisor_adapters::{
 };
 
 const MAX_INVENTORY_AGENTS: usize = 4096;
+const INITIAL_RECONCILIATION_RETRY: Duration = Duration::from_secs(1);
 
 fn installed_local_route_matches(
     identity: Option<AgentRouteIdentity>,
@@ -94,6 +95,7 @@ pub enum AgentProductionOwnerError {
     InvalidConfiguration,
     Authentication,
     ProjectionTransport,
+    ProjectionNotReady,
     InvalidProjection,
     RevokedCredential,
     WrongCredentialKind,
@@ -160,6 +162,17 @@ struct SystemAgentProjectionTransport {
     handle: AgentRouteHostHandle,
 }
 
+fn projection_transport_error(
+    error: super::supervisor::AgentRouteError,
+) -> AgentProductionOwnerError {
+    match error {
+        super::supervisor::AgentRouteError::NotReady => {
+            AgentProductionOwnerError::ProjectionNotReady
+        }
+        _ => AgentProductionOwnerError::ProjectionTransport,
+    }
+}
+
 impl AuthorityProjectionTransport for SystemAgentProjectionTransport {
     fn target(&self) -> AuthorityActorTarget {
         self.target
@@ -168,7 +181,7 @@ impl AuthorityProjectionTransport for SystemAgentProjectionTransport {
     fn recover_pending(&mut self) -> Result<bool, AgentProductionOwnerError> {
         self.handle
             .recover_authority_projection()
-            .map_err(|_| AgentProductionOwnerError::ProjectionTransport)
+            .map_err(projection_transport_error)
     }
 
     fn dispatch(
@@ -180,7 +193,7 @@ impl AuthorityProjectionTransport for SystemAgentProjectionTransport {
         }
         self.handle
             .authority_projection(query)
-            .map_err(|_| AgentProductionOwnerError::ProjectionTransport)
+            .map_err(projection_transport_error)
     }
 }
 
@@ -1200,8 +1213,19 @@ impl AgentProductionOwner {
                 return Ok(false);
             }
         }
-        self.reconcile_at(now)?;
-        Ok(true)
+        match self.reconcile_at(now) {
+            // No ingress has been published yet. Retain the quorum participant
+            // while election or leader access is unavailable; tearing it down
+            // here can prevent every other node from becoming ready as well.
+            Err(AgentProductionOwnerError::ProjectionNotReady) if self.accepted_head.is_none() => {
+                self.reconcile_after = Instant::now()
+                    .max(now)
+                    .checked_add(INITIAL_RECONCILIATION_RETRY)
+                    .ok_or(AgentProductionOwnerError::InvalidConfiguration)?;
+                Ok(false)
+            }
+            result => result.map(|()| true),
+        }
     }
 
     /// Reconciliation is crate-private: only the node owner may mutate route
@@ -1929,6 +1953,77 @@ mod tests {
             "shutdown must hide admission before inventory returns"
         );
         assert!(result.is_ok());
+    }
+
+    struct FailedInventory(AgentProductionOwnerError);
+
+    impl AuthorityInventorySource for FailedInventory {
+        fn set_shutdown_signal(&mut self, _: Arc<AtomicBool>) {}
+
+        fn load_inventory(&mut self) -> Result<AgentAuthorityInventory, AgentProductionOwnerError> {
+            Err(self.0)
+        }
+    }
+
+    #[test]
+    fn initial_projection_unavailability_retains_owner_without_exposing_routes() {
+        use super::super::supervisor::AgentRouteError;
+        assert_eq!(
+            projection_transport_error(AgentRouteError::NotReady),
+            AgentProductionOwnerError::ProjectionNotReady
+        );
+        for error in [AgentRouteError::Unavailable, AgentRouteError::Rejected] {
+            assert_eq!(
+                projection_transport_error(error),
+                AgentProductionOwnerError::ProjectionTransport
+            );
+        }
+        let (mut owner, _, _) = held_inventory_owner();
+        owner.source = Box::new(FailedInventory(
+            AgentProductionOwnerError::ProjectionNotReady,
+        ));
+        let now = Instant::now();
+        for attempt in 0..3 {
+            let due = now + INITIAL_RECONCILIATION_RETRY * attempt;
+            assert_eq!(owner.drive_if_due(due), Ok(false));
+            assert!(owner.is_running());
+            assert!(!owner.is_ready());
+            assert!(owner.ingress().is_err());
+        }
+        let retry = owner.reconcile_after;
+        owner.source = Box::new(FailedInventory(
+            AgentProductionOwnerError::InvalidProjection,
+        ));
+        assert_eq!(
+            owner.drive_if_due(retry - Duration::from_millis(1)),
+            Ok(false)
+        );
+        assert_eq!(
+            owner.drive_if_due(retry),
+            Err(AgentProductionOwnerError::InvalidProjection)
+        );
+
+        // A fresh, verified inventory can publish normally on the same owner.
+        let descriptor = descriptor(1, AgentProfile::Shared, owner.node);
+        let actor = actor(&descriptor, true);
+        owner.system_agent = descriptor.identity.agent;
+        owner.source = Box::new(client(
+            vec![descriptor],
+            vec![actor],
+            head(1),
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+        assert_eq!(owner.drive_if_due(retry), Ok(true));
+        assert!(owner.is_ready());
+        owner.source = Box::new(FailedInventory(
+            AgentProductionOwnerError::ProjectionNotReady,
+        ));
+        // Existing routes do not acquire a new stale-serving exemption.
+        assert_eq!(
+            owner.drive_if_due(owner.reconcile_after),
+            Err(AgentProductionOwnerError::ProjectionNotReady)
+        );
+        owner.shutdown_and_join().unwrap();
     }
 
     #[test]

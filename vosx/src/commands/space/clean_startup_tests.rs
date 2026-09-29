@@ -443,28 +443,42 @@ fn candidate_authority_shared_create_reopens_production_stores() {
 #[test]
 #[ignore = "requires AUTHORITY_CANDIDATE_ELF; prepares a common three-node bundle with production materials and root archive"]
 fn candidate_fixed_roster_materials_prepare_one_common_bundle() {
-    check_fixed_roster_preparation(false, false);
+    check_fixed_roster_preparation(FixedRosterStage::Bundle);
 }
 
 #[test]
 #[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback networks; production lifecycle file owners"]
 fn candidate_fixed_roster_production_owners_start_from_common_bundle() {
-    check_fixed_roster_preparation(true, false);
+    check_fixed_roster_preparation(FixedRosterStage::Owners);
+}
+
+#[test]
+#[ignore = "KNOWN RELEASE GAP: restart with a pending projection waits for promotion before route registration; requires AUTHORITY_CANDIDATE_ELF and loopback"]
+fn candidate_fixed_roster_production_retains_pending_participants() {
+    check_fixed_roster_preparation(FixedRosterStage::Participants);
 }
 
 #[test]
 #[ignore = "KNOWN RELEASE GAP: follower projection admission requires a local leader; requires AUTHORITY_CANDIDATE_ELF and loopback"]
 fn candidate_fixed_roster_production_routes_start_from_common_bundle() {
+    check_fixed_roster_preparation(FixedRosterStage::Routes);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FixedRosterStage {
+    Bundle,
+    Owners,
+    Participants,
+    Routes,
+}
+
+fn check_fixed_roster_preparation(stage: FixedRosterStage) {
     if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .with_test_writer()
             .try_init();
     }
-    check_fixed_roster_preparation(true, true);
-}
-
-fn check_fixed_roster_preparation(start_owners: bool, attach_routes: bool) {
     use vos::agent::bootstrap::SystemAgentGenesisLocator;
     let scratch = Scratch::new();
     let operator = Keypair::ed25519_from_bytes([0x71; 32]).unwrap();
@@ -595,7 +609,7 @@ fn check_fixed_roster_preparation(start_owners: bool, attach_routes: bool) {
         assert_eq!(journal_files(&certificate_path), published);
     }
     assert_eq!(certifications, 1);
-    if start_owners {
+    if stage != FixedRosterStage::Bundle {
         let networks: Vec<_> = daemons
             .iter()
             .map(|key| {
@@ -681,7 +695,10 @@ fn check_fixed_roster_preparation(start_owners: bool, attach_routes: bool) {
             for (index, (node, _)) in owners.iter().enumerate() {
                 assert_eq!(*node, enrollments[index].node);
             }
-            if attach_routes {
+            if matches!(
+                stage,
+                FixedRosterStage::Participants | FixedRosterStage::Routes
+            ) {
                 let nodes = std::thread::scope(|scope| {
                     let handles: Vec<_> = owners
                         .into_iter()
@@ -720,10 +737,24 @@ fn check_fixed_roster_preparation(start_owners: bool, attach_routes: bool) {
                         "replica {index} route attachment (restart={restart}): {result:?}"
                     );
                     assert!(
-                        node.clean_agent_supervisor().is_some(),
-                        "replica {index} routes not ready"
+                        !node
+                            .shutdown_handle()
+                            .load(std::sync::atomic::Ordering::Acquire),
+                        "replica {index} stopped during initial reconciliation"
                     );
+                    if stage == FixedRosterStage::Routes {
+                        assert!(
+                            node.clean_agent_supervisor().is_some(),
+                            "replica {index} routes not ready"
+                        );
+                    }
                 }
+                assert!(
+                    nodes
+                        .iter()
+                        .any(|(node, _)| node.clean_agent_supervisor().is_some()),
+                    "no leader published verified routes"
+                );
                 drop(nodes);
             } else {
                 drop(owners);

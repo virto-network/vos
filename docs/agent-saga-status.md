@@ -47,9 +47,36 @@ or certificate checks. The rerun reaches projection admission: followers return
 startup drops their owners and the leader's request also fails
 (`fixed-system-production-routes-no-early-checkpoint.log`, 34.60 s).
 
-Next implementation must keep consensus participants alive while initial
-reconciliation is unavailable, and provide authenticated leader-coordinated
-projection access on followers. Preserve signed query binding, fresh committed
+Initial reconciliation now retains its consensus owner on explicitly classified
+temporary Authority unavailability, with a one-second retry delay and no ingress
+publication. Transport loss, corrupt state, invalid scope/certificates and
+capacity failures are not classified as retryable. After first publication the
+existing fail-closed refresh behavior is unchanged; this is not failover
+qualification. All 19 production-owner tests and the error-classification test
+pass (`fixed-system-initial-projection-{owner,error}-tests.log`). The real
+three-node route-gate rerun now gets all three Node attachments accepted and the
+leader's verified routes published; it still fails the all-nodes-ready assertion
+because followers cannot query through the leader
+(`fixed-system-initial-projection-retained-participants.log`, 28.02 s).
+The extended `candidate_fixed_roster_production_retains_pending_participants`
+reproducer deliberately keeps the restart requirement: fresh attachment accepts
+all participants and publishes leader routes, but reopen after projection
+activity fails `Host(Unavailable)` (52.25 s; diagnostic rerun 40.58 s).
+Logs: `fixed-system-initial-projection-participants-restart{,-diagnostics}.log`.
+Two owners reopen; the retained-projection path uses
+`attach_recovering_projection`, whose promotion barrier runs before network
+route registration. Unlike the no-pending-work fixed-roster attachment, it
+still assumes a locally elected singleton. Keep this second test explicitly
+ignored as a known release failure, not successful restart qualification.
+The CLI regression suite passes (298 passed, 44 ignored, 29.72 s),
+`fixed-system-initial-projection-cli-suite.log`; this does not cover the two
+ignored release-gate failures.
+
+Next implementation must defer pending-projection recovery promotion until
+authenticated consensus routes exist, retaining the exact reservation and
+capacity checks, and provide authenticated leader-coordinated projection
+access/recovery on followers. Treat these together: retaining a follower alone
+does not let it retire its pending read after leadership moves. Preserve signed query binding, fresh committed
 Authority state, pending-operation exclusion and no routes before validation;
 do not substitute stale local projections or unsigned responses. Reuse the
 existing clean peer transport and Raft read/admission primitives where possible.

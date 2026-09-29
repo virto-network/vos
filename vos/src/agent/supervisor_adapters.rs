@@ -4486,7 +4486,7 @@ where
                 if std::env::var_os("VOS_TEST_INNER_DIAGNOSTICS").is_some() {
                     eprintln!("system projection host error: {error:?}");
                 }
-                map_shared_host_error(error)
+                map_authority_read_error(error)
             })
     }
 
@@ -4495,7 +4495,7 @@ where
             .lock()
             .map_err(|_| AgentRouteError::Unavailable)?
             .recover_pending_authority_projection()
-            .map_err(map_shared_host_error)
+            .map_err(map_authority_read_error)
     }
 }
 
@@ -4561,6 +4561,17 @@ fn map_shared_projection_error(error: super::shared_host::SharedAgentHostError) 
             AgentRouteError::Rejected
         }
         error => map_shared_host_error(error),
+    }
+}
+
+// Keep temporary consensus unavailability distinct from malformed state or
+// failed authentication. Only this private Authority-read path may defer
+// initial publication while retaining its consensus owner.
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+fn map_authority_read_error(error: super::shared_host::SharedAgentHostError) -> AgentRouteError {
+    match error {
+        super::shared_host::SharedAgentHostError::Unavailable => AgentRouteError::NotReady,
+        _ => AgentRouteError::Unavailable,
     }
 }
 
@@ -4695,6 +4706,30 @@ pub fn dispatch_encoded_acknowledgement(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+    #[test]
+    fn authority_read_only_defers_explicit_unavailability() {
+        use crate::agent::shared_host::SharedAgentHostError as Error;
+        assert_eq!(
+            map_authority_read_error(Error::Unavailable),
+            AgentRouteError::NotReady
+        );
+        for error in [
+            Error::CorruptResidue,
+            Error::ScopeMismatch,
+            Error::SnapshotCertificateInvalid,
+            Error::CapacityExhausted,
+            Error::Conflict,
+            Error::AgentNotFound,
+            Error::TransportNotAttached,
+        ] {
+            assert_eq!(
+                map_authority_read_error(error),
+                AgentRouteError::Unavailable
+            );
+        }
+    }
     use core::num::NonZeroU64;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Mutex, mpsc};
