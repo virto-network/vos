@@ -13,10 +13,11 @@ Clerk with **100,000 retained transfers**. Keep Clerk's kernel, signatures,
 committed roots and exact retry semantics. Do not replace this with a singleton,
 smaller dataset or an experimental-only release without a new user decision.
 
-The current code checkpoint is `4ea0271c` on `wip/ch08-runtime-directory`:
-terminal gas-parity repair and exact custom-runtime qualification. Review
-`bd378ae9..4ea0271c` as **one batch**, together with this docs-only handoff.
-The preceding pruning/backend checkpoint is `48df3995`; the tested
+The current code checkpoint is `7c1a1b7c` on `wip/ch08-runtime-directory`:
+internal external Shared journal integration, applied availability, and recovery
+regressions. Review `fb48603c..7c1a1b7c` as **one batch**, together with this
+docs-only handoff. The preceding backend follow-up is `4ea0271c`, following
+pruning/backend checkpoint `48df3995`; the tested
 admission/recovery baseline remains `62ffbc20`.
 The reviewer checks `saga/agents`: verify that it contains the code checkpoint
 before starting. Fixes continue on the implementation branch before a qualified
@@ -26,8 +27,7 @@ Status vocabulary: **implemented** means source and focused tests exist;
 **integrated** means the supported workflow selects it; **qualified** means its
 specified acceptance test passes on the actual release. These are not synonyms.
 
-Completed backend follow-up at `4ea0271c`, with subsequent Shared work still
-unpromoted in the implementation worktree:
+Current evidence, without promoting production startup or changing the finish line:
 
 - Independent review reproduced a recompiler gas-parity bug when re-invoking
   a terminal inner machine. The reviewed fix preserves reference funding;
@@ -38,13 +38,23 @@ unpromoted in the implementation worktree:
 - Shared external integration uses the existing signed Linear-only runtime
   capabilities. Physical Create/Clerk Install produce identical state on three
   replica identities without normalizing node-local roots or changing the ABI.
-  Journal integration and majority durable-availability checks are in progress.
+  The internal journal now passes Create/Install/Invoke, lost-response reopen,
+  ACK/reopen and missing-block refusal across three independent file owners.
+  This uses committed-slot fixtures, not three released daemons or Clerk transfers.
+- Transport result delivery now requires exact applied availability on a voter
+  majority, with an independent bounded request pool. External blocks are durable
+  before head publication; detected missing data invalidates the serving pin.
+  The external driver and transport are not yet joined through public startup.
+- Review-driven fixes align physical preview with committed replay, retain exact
+  declared Merge-root fencing, cover legal suffix recovery budgets, and preserve
+  singleton-image snapshot retries. These are correctness fixes, not throughput
+  evidence. Direct external operations currently execute preview plus application.
 - A real three-node pre-Invoke leader-loss test reproduces an unresolved pending
   read: committed-only recovery correctly refuses an unseen request. Do not
   relax that admission guard. Recovery delegation versus original-attestor
   readmission needs an explicit authorization decision; production remains gated.
-- Both post-Invoke replay orderings and post-ACK/pre-metadata-clear reopen now
-  pass physical three-node tests. These do not close the pre-Invoke gate.
+- Both post-Invoke replay orderings and post-ACK/pre-metadata-clear reopen pass
+  again on the current production source. These do not close the pre-Invoke gate.
 
 No finish-line change follows from these results. The remaining work stays in
 the three batches below; do not add a parallel plan or treat these as a release.
@@ -54,7 +64,7 @@ the three batches below; do not add a parallel plan or treat these as a release.
 | Admission and recovery | Baseline `62ffbc20` binds complete imported-plan certification and rejects unsupported rosters before writes; mixed-generation recovery P1 resolved | Review checkpoint findings; remaining three-node crash boundaries |
 | Fixed three-node bootstrap | Baseline common certified genesis, physical startup/reopen and post-Invoke leader-loss fixtures pass | Production startup remains gated; actual three-process daemon/HTTP qualification is pending |
 | Local execution | Image path retained; final default/reference Local suites and actual default-selected image daemon pass; public external Local removed | Exact-release performance, recovery and backup qualification |
-| External actor storage | Experimental authenticated incremental storage, durable publication/recovery and real Clerk fixture pass on both backends with rebuilt guests | Shared executor/finality integration, block availability, retained growth, safe reclamation and export |
+| External actor storage | Internal fixed-three-voter Linear-only Shared executor/finality and three-file Clerk query/recovery slice pass; prior Local Clerk transfer fixture passes on both backends | Public Shared owner/startup/route integration, network availability/catch-up, retained growth, reclamation and export |
 | VM backend | Outer/inner recompiler integrated; Linux x86-64 Agent default and explicit interpreter pass focused differential/physical checks; bounded preparation caches and post-cache phase measurements recorded; custom-runtime differential and terminal-reuse fix pass | Exact-release resource/cold-warm qualification and service capacity |
 | Customer workflow | Ordinary Shared production finality and public management are unavailable | Released Shared Create/Install/Invoke, Shared Clerk and usable CLI orchestration |
 | Operations | Historical source-specific tests exist; current backup is registry-only | Load, overload, failover, Agent backup/restore, soak and reproducible release artifacts |
@@ -105,13 +115,14 @@ and cold/warm customer-workflow qualification remain open. See the [candidate ev
   another backend.
   Default/reference host suites and default-selected CLI/daemon checks pass;
   exact-release resource and service qualification remain mandatory.
-- [ ] Differentially compare outputs, gas, PC/registers, exits/faults, memory
+- [x] Differentially compare outputs, gas, PC/registers, exits/faults, memory
   permissions, host-call suspension/resume and commitments, including standard
   and genuinely different custom-runtime layouts. Run physical lifecycle/recovery
   tests and supported feature builds after pruning and backend changes.
   Exact standard-runtime comparisons and both custom-runtime physical suites pass.
-  The continuation adds 36 exact custom-runtime comparisons; final integrated
-  host/feature reruns remain pending before promoting that work.
+  The continuation adds 36 exact custom-runtime comparisons; core feature checks,
+  CLI build and focused integrated host reruns pass. The final released-artifact
+  matrix remains a batch 3 gate.
 
 Exit: a scoped, tested checkpoint with actual phase timings. Recompiler speedups
 do not by themselves qualify Shared capacity or eliminate whole-runtime work.
@@ -128,14 +139,23 @@ do not by themselves qualify Shared capacity or eliminate whole-runtime work.
 - [ ] Collect quorum-certified snapshots/checkpoints and qualify restart/catch-up
   before replay capacity is exhausted. Optional checkpoint skipping is temporary;
   mandatory capacity/certificate guards must continue to fail closed.
+  Existing snapshot claims contain source-local node/store fields; collecting
+  each voter's different local claim is not a quorum certificate. Reuse the
+  current certificate with independent source-evidence verification, then add
+  certified destination rebinding for catch-up before enabling prefix pruning.
 - [ ] Integrate the existing external-state executor and block store into Shared
   Clerk through a narrow internal executor selection, not a new driver framework.
-  Current Shared replay selects the image executor and the external executor
-  admits Local descriptors; neither is a CLI-only cutover.
+  The internal driver now supports signed Linear-only Shared Create/Install,
+  completed Direct Linear/LinearizableQuery and ACK. Public filesystem-owner
+  startup, lifecycle and route selection still use the image path; this is not
+  a CLI-only cutover. Control Query, Resume, yield, timers and Attested execution
+  remain unsupported on this external Shared slice, not on the generic SDK.
 - [ ] Prove durable, available blocks before acknowledging their roots/results
   under Shared quorum rules, including missing blocks, minority failure and
   catch-up. Preserve provenance, exact predecessor checks and retry atomicity.
   Missing data is unavailable state, never an absent row or successful execution.
+  Local file-owner and authenticated transport checks pass independently; the
+  integrated external network/minority/catch-up workflow is still required.
 - [ ] Bound reclamation and root-pinned export. Retain authoritative, pending,
   checkpoint, retry/recovery and backup roots. Maintenance-window reclamation is
   acceptable; unbounded historical retention is not. Use public block closure
@@ -206,6 +226,15 @@ These are approved targets, not measured capacity or an availability promise.
 - Incremental actor rows do not eliminate whole-runtime control-state transport,
   directory reconstruction/publication or Shared ordering/locking. Measure their
   actual cost; the release does not promise every operation scales with touched data.
+- External Shared preview uses the same physical response validator and read/reuse
+  budget as application, preventing deterministic invalid-output admission.
+  It currently repeats execution for Install/Invoke/ACK; measure that cost before
+  optimizing. Recovery budgets cover the legal bounded suffix, not a qualified
+  recovery-time target. Historical roots remain pinned until certified snapshots,
+  reclamation and export are implemented; this cannot qualify unbounded retention.
+- Qualify sustained minority load: unused requests to a silent voter retain
+  availability permits until transport completion/timeout even after another
+  voter establishes quorum. Idle-loopback progress is not load qualification.
 - Native full-memory snapshots and cloning still scale with the guest address
   span, not touched pages, and can materialize a large flat image. Sparse snapshot
   behavior must not be assumed for the native mapping. Instruction attribution

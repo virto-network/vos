@@ -8,24 +8,103 @@ implementation branch; do not apply competing fixes on the review worktree.
 
 | Purpose | Branch / checkpoint |
 | --- | --- |
-| Reviewer target | Code `4ea0271c` plus this docs-only handoff; verify `saga/agents` contains the code checkpoint |
-| Review range | `bd378ae9..4ea0271c` as **one batch**: reviewed terminal gas fix and custom-runtime differential |
-| Code checkpoint | `4ea0271c` on `wip/ch08-runtime-directory`; preceding pruning/backend code is `48df3995` |
+| Reviewer target | Code `7c1a1b7c` plus this docs-only handoff; verify `saga/agents` contains the code checkpoint |
+| Review range | `fb48603c..7c1a1b7c` as **one batch**: internal Shared journal publication, applied availability and recovery |
+| Code checkpoint | `7c1a1b7c` on `wip/ch08-runtime-directory`; prior backend follow-up is `4ea0271c` |
 | Prior tested baseline | `62ffbc20`; `master` remains unchanged |
 | Historical startup review | `f1bfa1bd..310ef841`; two findings fixed at `62ffbc20` |
 
-The new code commit changes five files (+571 lines, including 463 lines of
-custom-runtime qualification). The preceding pruning code changed 42 files
+The new code commit changes 13 files (+4,251 / -198 lines), including an
+887-line physical lifecycle fixture. It is one scoped integration batch, not
+release qualification. The preceding pruning code changed 42 files
 (+1,942 / -43,868 lines). Documentation handoffs are separate. Verify branch
 heads before reviewing, and apply findings
 on the implementation branch. Do not infer publication from a candidate hash.
 This is not a release: batch 1 is not closed, batches 2/3 remain open, production
 multi-node startup/public Shared management remain gated, and Local is image-based.
 
+### Shared publication and recovery: `7c1a1b7c`
+
+This connects the existing external executor to internal Shared journal replay;
+it does not introduce another driver framework or enable public startup.
+The admitted external profile is exactly three voters, signed Linear-only
+capabilities, no scheduling/proof support, Install and completed Direct
+Linear/LinearizableQuery plus ACK. Control Query, Resume, yield and Attested
+execution are refused before proposal. Generic SDK/image behavior is unchanged.
+Create uses the complete physical state commitment, never normalized Local roots.
+
+Durable block publication precedes journal heads and exact V2 applied anchors.
+Per-open verified availability pins avoid repeating full closure audits on every
+request; detected missing/corrupt data invalidates the pin and requires an audited
+reopen. Historical roots remain retained. Snapshot, compaction, portable import
+and reclamation are deliberately unavailable for this external slice.
+
+The transport now correlates applied-availability replies to authenticated voter,
+generation, physical index/term and complete claim. Result delivery needs a
+majority, including retained replies; no host/proposal mutex crosses collection.
+A separate 32-request pool cannot be starved by the 160 application requests;
+the existing 64 Raft slots and total 256 limit are unchanged. The 1.8-second
+collection deadline is not a bound on host-lock/filesystem waiting. These replies
+are fresh process evidence, not durable snapshot certificates. The external file
+owner is not yet selected by public startup or attached to this transport.
+Unused requests to a silent voter retain their permits until transport completion
+or the two-second timeout; sustained minority-load qualification remains open.
+
+Review found and fixed legal-gas admission, insufficient aggregate recovery
+budget, Linear-only Merge-fence assumptions, and raw-preview/full-replay mismatch.
+Install/Invoke/ACK now use exact candidate contexts, shared execution/reuse read
+budgets and committed replay's existing physical-response validator before
+proposal. The malformed-output regression physically demonstrates excess reported
+gas and Control mutation refusal. Wrong reply lane is already rejected by wire
+decoding; it is defense-in-depth coverage, not a newly discovered admission gap.
+Preview plus application currently executes twice; no throughput improvement is
+claimed for that correctness guard.
+
+The new gate initially broke an existing singleton-image retry at a compacted
+snapshot boundary. Its narrowly scoped fix retains live-lease, image-mode,
+stable-committee and exact-result checks; it does not exempt three-voter or
+external generations. The routed regression preserves the result without a new
+Invoke after two snapshot/reopen cycles.
+
+Current evidence (logs in the shared target below):
+
+| Slice | Evidence |
+| --- | --- |
+| Physical three-file external Shared | 1 pass, 37.35 s; `external-shared-file-qualified.log` |
+| Existing external Local lifecycle/recovery | 1 pass, 28.56 s; `shared-external-final-local-physical.log` |
+| Existing image Shared finality/publication | 1 pass, 82.30 s; `shared-image-publication-refactor.log` |
+| Shared replay/fence | 7 pass; `shared-external-final-shared-replay.log` |
+| Three-node post-Invoke recovery | Both orderings pass, 29.24/29.29 s; `shared-external-final-crash-{former-first,successor-first}.log` |
+| Three-node post-ACK/pre-clear recovery | 1 pass, 28.05 s; `shared-external-final-crash-after-ack.log` |
+| Shared host | 31 pass, 1 ignored; `shared-checkpoint-host-final.log`; excludes the five-minute raw-tail capacity fixture, which passed separately earlier in this continuation |
+| Protocol and live transport | 15 protocol and 16 network tests pass, including availability while application permits are exhausted |
+| V2 applied-anchor ledger | 33 pass, including exact indexed physical-row checks and snapshot-prefix refusal; `shared-checkpoint-ledger-final.log` |
+| Semantic preflight | Physical malformed-response matrix passes; `shared-external-semantic-preflight-test.log`; recovery-budget arithmetic unit also passes |
+| Feature builds | Experimental core tests build; ordinary image core, minimal std-only core and default CLI checks pass; `shared-external-final-binary.log`, `shared-image-feature-final.log`, `shared-checkpoint-minimal-check.log`, `shared-checkpoint-cli-check.log` |
+
+The external fixture uses **one real system-Authority replica** for enrolled,
+credential-authorized Create, committee certification and physical publication/
+positive ACK. Its ordinary target has three independently locked file owners,
+fed identical committed slots through the existing application harness. Install
+uses the fixture's pinned Authority signing key, not public management finalization;
+Clerk's invoked method is `journal_id`, not a transfer/load run. Driver reopen is
+not released-daemon restart. It covers exact lost-response recovery, ACK/reopen,
+gas/context rejection and missing-block refusal, pin invalidation, read-only
+reopen refusal and exact restoration. Do not call this ordinary-Agent network
+quorum, public lifecycle, growing-ledger or 100,000-transfer qualification.
+
+Independent review has no remaining findings in the corrected scoped changes.
+The pre-Invoke three-node crash fixture still demonstrates an unresolved release
+gate (`projection-before-invoke.log`): committed-only recovery refuses an unseen
+request while its reservation remains held. Its desired-success test remains
+explicitly ignored; it is not counted as passing. Scoped expiring recovery
+delegation versus original-attestor readmission awaits a user authorization
+decision. Do not bypass the guard or silently refresh an old authorization.
+
 ### Backend follow-up: `4ea0271c`
 
 This commit contains the reviewed backend correction and custom guest test;
-later Shared integration stays unpromoted until its own qualification completes.
+its qualification is separate from the Shared checkpoint above.
 
 Independent review found terminal inner-machine reuse could charge gas twice
 under native execution. The fix restores the funded-block marker only on
@@ -50,21 +129,7 @@ These are guest semantics tests, not filesystem/quorum evidence. Independent
 read-only review found no additional issue in the terminal fix; invalid external
 entry handling and Jar behavior remain unchanged.
 
-### Unpromoted Shared work
-
-The pre-Invoke three-node crash fixture now reproduces the unresolved recovery
-gate with real loopback election and former-leader reopen
-(`projection-before-invoke.log`). Preserve the committed-only relay and exact
-reservation checks. Its desired-success regression remains explicitly ignored
-until a safe authorization design is approved and implemented; do not count it
-as a pass. Shared external-state publication/availability work remains under
-construction and must not enable production startup by itself.
-The post-Invoke former-leader-first and successor-first fixtures pass (28.36 s
-and 34.49 s); post-ACK/pre-metadata-clear reopen passes (29.10 s), including
-cleanup during initial open. Logs: `projection-former-leader-first.log`,
-`projection-successor-first.log`, `projection-after-ack-qualified.log`.
-
-## Code checkpoint changes and review focus
+## Prior pruning/backend checkpoint and review focus
 
 Private host/storage/synchronization, the physical Agent Attested production
 adapter, and public external-Local deployment/LCQ2 selection are removed.
@@ -105,7 +170,7 @@ memory. Native memory descriptors now use atomic `MFD_CLOEXEC`; its regression
 passes. Measure memory before making concurrency claims. Whole-runtime
 control-state work and Shared serialization are not eliminated by a faster backend.
 
-## Candidate correctness evidence
+## Prior pruning/backend correctness evidence
 
 Logs below are in the disk-backed shared target,
 `.worktrees/ch08-c2-native/target`. Counts qualify only the named slice; ignored
@@ -244,6 +309,18 @@ run its full test name with `--ignored --exact --test-threads=1`. Verify artifac
 digests; a different file at the same path cannot inherit recorded evidence.
 Candidate guest rebuilding is not the reproducible release-promotion gate.
 
+For this checkpoint's three-file external Shared fixture, with those same
+artifact digests and exports:
+
+```sh
+GREY_PVM=recompiler VOS_AGENT_PROFILE_REFINE_MACHINES=1 \
+CLERK_AGENT_PACKAGE="$CARGO_TARGET_DIR/clerk-agent-canonical/clerk-ledger.vos" \
+cargo +nightly-2025-05-09 test --offline --locked -p vos \
+  --features 'agent-runtime storage network http-ingress experimental-state-blocks' \
+  --lib agent::clean_bootstrap::tests::physical::external_shared::three_file_replicas_external_clerk_install_invoke_ack_reopen \
+  -- --ignored --exact --test-threads=1 --nocapture
+```
+
 ## Tested admission/recovery baseline: 62ffbc20
 
 This commit fixes both findings from the `f1bfa1bd..310ef841` review:
@@ -268,9 +345,11 @@ deleted by documentation consolidation.
 
 ## What remains before the next release decision
 
-Finish post-cache phase measurements and remaining backend/resource qualification
-before closing batch 1. The recorded default-path checks are complete. Then follow
-only the live plan:
+Finish remaining phase/resource qualification before closing batch 1. Next resolve
+pre-Invoke recovery authority, certified snapshot/catch-up with root pinning, then
+join the external file owner to public Shared startup and management. Existing
+snapshots are source-node/store-bound; adding signatures alone is not cross-node
+catch-up. Follow only the live plan:
 real fixed-three-node Shared lifecycle/Clerk and retained growth (batch 2);
 exact-release load, failure/backup/restore, soak and artifact qualification
 (batch 3). No release date, completion percentage or production capacity claim
