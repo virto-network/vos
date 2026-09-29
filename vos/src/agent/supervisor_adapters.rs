@@ -2258,6 +2258,14 @@ trait CleanAgentRouteBackend: Send + 'static {
         Ok(false)
     }
 
+    #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+    fn peer_authority_projection(
+        &mut self,
+        _query: AuthorityProjectionQuery,
+    ) -> Result<(), AgentRouteError> {
+        Err(AgentRouteError::Rejected)
+    }
+
     fn retire(&mut self) -> Result<(), AgentRouteWorkerError> {
         Ok(())
     }
@@ -2302,6 +2310,8 @@ enum RouteHostCommand {
     },
     #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
     RecoverAuthorityProjection(SyncSender<Result<bool, AgentRouteError>>),
+    #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+    PeerAuthorityProjection(AuthorityProjectionQuery),
     Retire(SyncSender<Result<(), AgentRouteWorkerError>>),
 }
 
@@ -2859,6 +2869,14 @@ impl AgentRouteHostHandle {
         result.recv().unwrap_or(Err(AgentRouteError::Unavailable))
     }
 
+    #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+    fn enqueue_peer_projection(
+        &self,
+        query: AuthorityProjectionQuery,
+    ) -> Result<(), AgentRouteError> {
+        self.send(RouteHostCommand::PeerAuthorityProjection(query))
+    }
+
     fn send(&self, command: RouteHostCommand) -> Result<(), AgentRouteError> {
         if !self.is_running() {
             return Err(AgentRouteError::Unavailable);
@@ -3225,6 +3243,10 @@ fn execute_route_host_command(
         #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
         RouteHostCommand::RecoverAuthorityProjection(reply) => {
             let _ = reply.send(backend.recover_authority_projection());
+        }
+        #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+        RouteHostCommand::PeerAuthorityProjection(query) => {
+            let _ = backend.peer_authority_projection(query);
         }
         RouteHostCommand::Retire(reply) => {
             let retired = backend.retire();
@@ -4497,6 +4519,18 @@ where
             .recover_pending_authority_projection()
             .map_err(map_authority_read_error)
     }
+
+    fn peer_authority_projection(
+        &mut self,
+        query: AuthorityProjectionQuery,
+    ) -> Result<(), AgentRouteError> {
+        self.owner
+            .lock()
+            .map_err(|_| AgentRouteError::Unavailable)?
+            .invoke_peer_authority_projection(query)
+            .map(|_| ())
+            .map_err(map_authority_read_error)
+    }
 }
 
 /// Move the complete bootstrapped system-Agent owner—including its durable
@@ -4532,11 +4566,22 @@ where
     R: super::clean_bootstrap::CleanSystemAgentBootstrapStore + Send + 'static,
     I: super::clean_authority_issuer::CleanManagementIssuerStore + Send + 'static,
 {
-    spawn_backend(
-        SystemAgentRouteBackend { owner },
+    let attachment = spawn_backend(
+        SystemAgentRouteBackend {
+            owner: Arc::clone(&owner),
+        },
         queue_capacity,
         "vos-system-agent-route",
-    )
+    )?;
+    let handle = attachment.handle();
+    owner
+        .lock()
+        .map_err(|_| AgentRouteAdapterError::Route(AgentRouteError::Unavailable))?
+        .install_projection_dispatch(Arc::new(move |query| {
+            handle.enqueue_peer_projection(query).is_ok()
+        }))
+        .map_err(|error| AgentRouteAdapterError::Route(map_shared_host_error(error)))?;
+    Ok(attachment)
 }
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
@@ -7307,6 +7352,59 @@ mod tests {
     }
 
     struct OwnerAuthenticator(u8);
+
+    #[test]
+    fn peer_projection_queue_is_bounded_and_closed_handles_release_backend() {
+        use crate::agent::production_owner::AuthorityProjectionQueryAuthenticator as _;
+
+        let system = owner_projection(
+            owner_descriptor(0x31, AgentProfile::Shared, NodeId([0x32; 32])),
+            0x31,
+            true,
+        );
+        let query = OwnerAuthenticator(0)
+            .authenticate(
+                owner_target(&system),
+                AuthorityProjectionSelector::Credential,
+            )
+            .unwrap();
+        let request = request(0x33, RuntimeExecutionContext::Direct);
+        let (started, observed) = mpsc::sync_channel(1);
+        let (release, wait) = mpsc::sync_channel(1);
+        let (attachment, identities, _, retired) = fake_attachment(
+            identity(&request),
+            Some(ReadyGate {
+                started,
+                release: wait,
+            }),
+            FakeReply::RequestBoundError,
+        );
+        let lifetime = Arc::downgrade(&identities);
+        drop(identities);
+        let handle = attachment.handle();
+        let operation_handle = handle.clone();
+        let operation = std::thread::spawn(move || operation_handle.ready());
+        observed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        // Acceptance means admission only: the worker is blocked and the
+        // default backend will reject these queries when it drains them.
+        let first = handle.enqueue_peer_projection(query.clone());
+        let second = handle.enqueue_peer_projection(query.clone());
+        let full = handle.enqueue_peer_projection(query.clone());
+        release.send(()).unwrap();
+        operation.join().unwrap().unwrap();
+        attachment.retire().unwrap();
+        assert_eq!(first, Ok(()));
+        assert_eq!(second, Ok(()));
+        assert_eq!(full, Err(AgentRouteError::NotReady));
+        assert!(retired.load(Ordering::Acquire));
+        assert!(lifetime.upgrade().is_none());
+        assert_eq!(
+            handle.enqueue_peer_projection(query),
+            Err(AgentRouteError::Unavailable)
+        );
+    }
 
     impl crate::agent::production_owner::AuthorityProjectionQueryAuthenticator for OwnerAuthenticator {
         fn expected_kind(&self) -> AuthorityCredentialKind {

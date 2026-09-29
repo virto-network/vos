@@ -33,91 +33,59 @@ integration gaps, not optional tuning. Keep Local image-based and public Shared
 management disabled until the corresponding recovery/admission path is proved.
 Measure the integrated Clerk path before spending the remaining tuning pass.
 
-Current integration blocker: followers cannot obtain authenticated Authority
-projections through the leader. All three filesystem owners can now recover
-after projection activity, and a leader publishes verified routes, but this is
-not all-node serving readiness. The executable
-`candidate_fixed_roster_production_routes_start_from_common_bundle` is an
-explicitly ignored, currently failing release-gate reproducer, not passing
-coverage. It uses real owner stores and the public Node attachment method;
-it is not a three-process HTTP test. First failure was optional early
-compaction calling a singleton-only certificate collector on all three nodes
-(`fixed-system-production-routes-diagnostics.log`). Optional scheduling now
-skips unsupported multi-voter collection, without changing mandatory capacity
-or certificate checks. The rerun reaches projection admission: followers return
-`Unavailable` because reservation requires a local leader, then failed Node
-startup drops their owners and the leader's request also fails
-(`fixed-system-production-routes-no-early-checkpoint.log`, 34.60 s).
+Current integration result: all three Nodes publish verified routes on fresh
+startup and again after filesystem owner reopen. The physical candidate test
+`candidate_fixed_roster_production_routes_start_from_common_bundle` passes
+(90.29 s), `fixed-system-follower-projection-routes-final.log` in the shared
+build root. It uses real stores, candidate Authority, bundled runtime, loopback
+consensus and the public Node attachment method. It is still explicitly ignored
+because it requires candidate artifacts and sockets; it is **not** a released
+three-process daemon/HTTP, forced leadership-transfer or throughput test.
 
-Initial reconciliation now retains its consensus owner on explicitly classified
-temporary Authority unavailability, with a one-second retry delay and no ingress
-publication. Transport loss, corrupt state, invalid scope/certificates and
-capacity failures are not classified as retryable. After first publication the
-existing fail-closed refresh behavior is unchanged; this is not failover
-qualification. All 19 production-owner tests and the error-classification test
-pass (`fixed-system-initial-projection-{owner,error}-tests.log`). The real
-three-node route-gate rerun now gets all three Node attachments accepted and the
-leader's verified routes published; it still fails the all-nodes-ready assertion
-because followers cannot query through the leader
-(`fixed-system-initial-projection-retained-participants.log`, 28.02 s).
-The extended `candidate_fixed_roster_production_retains_pending_participants`
-test now passes startup, participant retention, owner drop/reopen and leader
-route publication (42.93 s), `fixed-system-pending-projection-attach-restart.log`.
-Its original failure was a retained projection waiting for local promotion
-before registering the route peers needed for election. Fixed-three-voter
-recovery now defers that wait: the exact committee must match durable routing,
-there must be one system generation and no membership transition, and all
-existing pending-work/capacity checks (including election headroom) still run
-before registration. The exact reservation is seeded before ordinary ingress
-or Merge pumping can run. Singleton promotion and mandatory checkpoint guards
-are unchanged. Singleton exact Invoke/ACK recovery and rival-reservation
-rejection pass (4.10 s), `fixed-system-pending-projection-singleton-recovery.log`;
-all eight network tests pass, `fixed-system-pending-projection-network-tests.log`.
-This remains a single-process loopback test; no full daemon restart, follower
-route publication, leadership-transfer pending-read recovery or HTTP claim.
-The CLI regression suite passes (298 passed, 44 ignored, 29.72 s),
-`fixed-system-initial-projection-cli-suite.log` (before the deferred-attachment
-change); ignored physical cases are qualified separately above.
+Followers now enqueue the signed query on the authenticated leader's bounded
+route worker. Peer acceptance proves only queue admission, never query success.
+The existing durable Authority Invoke/ACK owner performs execution, after
+rechecking leadership. Followers return only locally verified replay results
+with an exact Query work match and a committed positive ACK under the original
+authorization. The peer returns no response bytes. Generation, sender, route
+and query correlation are checked; no VM work runs inside the network handler.
+Ordinary Invoke retries still cannot resurrect a result after ACK. Missing or
+pruned evidence remains unavailable, not permission to publish routes.
+Follower waiting is bounded to 30 seconds; this is an availability timeout,
+not a service-latency target. Cancellation responsiveness remains unqualified.
 
-Next implementation must provide authenticated leader-coordinated projection
-access/recovery on followers. Retaining a follower alone does not let it retire
-its pending read after leadership moves. Preserve signed query binding, fresh committed
-Authority state, pending-operation exclusion and no routes before validation;
-do not substitute stale local projections or unsigned responses. Reuse the
-existing clean peer transport and Raft read/admission primitives where possible.
-Follower result verification now has a private, result-only lookup: it finds
-the exact Query work in the locally authenticated ordered suffix, requires its
-positive ACK under the original authorization, and returns the locally verified
-replay-cache outcome. It neither proposes work nor re-executes the VM. Ordinary
-retry lookup still refuses to resurrect an Invoke after its ACK; the new path
-uses the authenticated Invoke input only after proving completion. The bounded
-history/cache is not permanent result availability, and a missing result is
-never authority to publish routes. Bootstrap lookup remains Linear-only.
-Exact recovery/nonmutation and wrong-work/mode/Agent/unknown-ID tests pass
-(3.91 s), `fixed-system-projection-local-evidence-test.log`; the bundled Authority
-inventory version with outer-PVM execution passes (19.59 s),
-`fixed-system-projection-local-evidence-bundled.log`. Both also verify lookup
-after filesystem owner reopen. The existing candidate three-node bootstrap,
-follower replay and metadata-recovery regression also passes (86.78 s),
-`fixed-system-projection-local-evidence-bootstrap-regression.log`; its scripted
-Catalog/retained-memory metadata limitations still apply. The `std`-only library
-check passes (2.92 s), `fixed-system-projection-local-evidence-std.log`, along
-with formatting and diff checks. This primitive is not yet wired to peer traffic.
-Next, dispatch the signed query through the leader's existing durable
-Invoke/ACK owner, then wait for and validate local committed evidence on the
-requesting follower. Do not return peer-supplied response bytes as authority,
-or duplicate the leader's management/projection protocol in a network handler.
-Quorum snapshot certificate collection remains required before sustained
-three-node operation reaches the existing replay limit. These are extensions
-of the current fixed-three-node gate, not new release scope. Keep production
-startup gated and resolve this reproducer before investing in operator CLI
-polish or presenting another deployment-ready checkpoint.
-The checkpoint policy regression and all eight Shared-network unit tests pass
-(`fixed-system-projection-checkpoint-policy.log`,
-`fixed-system-projection-network-tests.log`). Three-owner filesystem startup
-and reopen still pass (28.39 s),
-`fixed-system-production-routes-owner-regression.log`. The route-gate test's
-failure above is intentionally not counted as successful qualification.
+Supporting corrections retain unpublished consensus owners on specifically
+classified temporary unavailability, defer fixed-roster pending-read promotion
+until peer routes exist, and skip optional multi-voter checkpoint scheduling
+while its collector is unavailable. Exact reservations, fresh authorization,
+mandatory capacity and certificate guards remain intact. Earlier failing logs
+`fixed-system-production-routes-{diagnostics,no-early-checkpoint}.log` and
+`fixed-system-initial-projection-retained-participants.log` are historical
+diagnoses, superseded by the passing all-node result above.
+
+Targeted evidence: 21 projection-related tests pass (17.91 s). All 33 route
+adapter tests pass (0.09 s), including bounded peer admission and backend
+release despite surviving closed handles, in
+`fixed-system-follower-projection-adapter-tests.log`. Peer protocol/network
+tests pass (26, 3.56 s), Shared-network tests pass (8, 0.47 s), and the CLI
+suite passes (298 passed, 44 ignored, 25.84 s). Logs:
+`fixed-system-follower-projection-{network-tests,shared-network-tests,cli-suite}.log`.
+The `std`-only library check (2.75 s), formatting and diff checks also pass.
+Previous local-evidence
+qualification includes exact recovery/nonmutation (3.91 s), bundled Authority
+outer-PVM inventory (19.59 s), and candidate bootstrap/replay recovery (86.78 s),
+in `fixed-system-projection-local-evidence-{test,bundled,bootstrap-regression}.log`.
+Those earlier tests retain their documented fixture limitations.
+
+Next bounded work is pending-read recovery across **forced leadership transfer**:
+a former leader's durable reservation must retire against exact committed
+evidence, and a successor must preserve the original authorization for an
+unacknowledged Invoke. Do not backdate authorization from peer input or bypass
+fresh Authority and reservation guards. Quorum snapshot certificate collection
+also remains required before sustained three-node operation reaches its replay
+limit. Keep production startup and public Shared management gated until these
+paths and real daemon/HTTP startup/restart are qualified. These are existing
+fixed-three-node release gates, not new scope; CLI polish and load claims wait.
 
 ### Fixed three-node bootstrap integration
 

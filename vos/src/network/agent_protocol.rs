@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::request_response::Codec;
 use libp2p::{PeerId, StreamProtocol};
+use vos_agent_sdk::authority::AuthorityProjectionQuery;
 use vos_agent_sdk::wire::{
     CanonicalWire, MAX_INVOCATION_AUTHORIZATION_WIRE_BYTES, MAX_RUNTIME_TRANSITION_WIRE_BYTES,
     MAX_RUNTIME_WORK_WIRE_BYTES, WireError,
@@ -62,6 +63,8 @@ const _: () = assert!(MAX_MERGE_NODE_BYTES + 1024 < MAX_FRAME_BYTES);
 const TAG_INVOKE_REQUEST: u8 = 0x10;
 const TAG_INVOKE_REPLY: u8 = 0x11;
 const TAG_INVOKE_REDIRECT: u8 = 0x12;
+const TAG_PROJECTION_REQUEST: u8 = 0x13;
+const TAG_PROJECTION_ACCEPTED: u8 = 0x14;
 const TAG_RAFT_APPEND_REQUEST: u8 = 0x20;
 const TAG_RAFT_APPEND_REPLY: u8 = 0x21;
 const TAG_RAFT_VOTE_REQUEST: u8 = 0x22;
@@ -366,6 +369,12 @@ pub(crate) enum AgentMessage {
     InvokeRequest(InvocationRequest),
     InvokeReply(InvocationReply),
     InvokeRedirect(InvocationRedirect),
+    /// Queue admission only. No peer-supplied projection result is trusted.
+    ProjectionRequest(AuthorityProjectionQuery),
+    ProjectionAccepted {
+        request: Hash,
+        accepted: bool,
+    },
     Raft(RaftMessage),
     Merge(MergeMessage),
 }
@@ -525,6 +534,13 @@ fn decode_route(decoder: &mut Decoder<'_>) -> Result<AgentGenerationRoute, Agent
 
 fn message_is_valid(message: &AgentMessage, route: AgentGenerationRoute, sender: NodeId) -> bool {
     match message {
+        AgentMessage::ProjectionRequest(query) => {
+            query.validate_shape().is_ok()
+                && query.authority.space == route.space
+                && query.authority.system_agent == route.agent
+                && query.attesting_node().is_none_or(|node| node == sender)
+        }
+        AgentMessage::ProjectionAccepted { request, .. } => *request != Hash::ZERO,
         AgentMessage::InvokeRequest(request) => {
             request.work.validate()
                 && request.work.space == route.space
@@ -691,6 +707,15 @@ fn encode_message(
     message: &AgentMessage,
 ) -> Result<(), AgentProtocolError> {
     match message {
+        AgentMessage::ProjectionRequest(query) => {
+            encoder.u8(TAG_PROJECTION_REQUEST);
+            encoder.bytes(&query.encode()?);
+        }
+        AgentMessage::ProjectionAccepted { request, accepted } => {
+            encoder.u8(TAG_PROJECTION_ACCEPTED);
+            encoder.fixed(request.as_bytes());
+            encoder.bool(*accepted);
+        }
         AgentMessage::InvokeRequest(request) => {
             encoder.u8(TAG_INVOKE_REQUEST);
             encode_invocation_work(encoder, &request.work);
@@ -939,6 +964,15 @@ fn encode_heads(encoder: &mut Encoder<'_>, heads: &[Hash]) {
 fn decode_message(decoder: &mut Decoder<'_>) -> Result<AgentMessage, AgentProtocolError> {
     let tag = decoder.u8()?;
     match tag {
+        TAG_PROJECTION_REQUEST => Ok(AgentMessage::ProjectionRequest(
+            AuthorityProjectionQuery::decode(decoder.bytes_ref_bounded(
+                vos_agent_sdk::wire::MAX_AUTHORITY_PROJECTION_QUERY_WIRE_BYTES,
+            )?)?,
+        )),
+        TAG_PROJECTION_ACCEPTED => Ok(AgentMessage::ProjectionAccepted {
+            request: Hash(decoder.fixed()?),
+            accepted: decoder.bool()?,
+        }),
         TAG_INVOKE_REQUEST => {
             let work = decode_invocation_work(decoder)?;
             let authorization_wire =
@@ -1381,6 +1415,85 @@ mod tests {
 
     fn node(peer: &PeerId) -> NodeId {
         NodeId::of_authenticated_peer(&peer.to_bytes())
+    }
+
+    #[test]
+    fn projection_queue_frames_bind_scope_sender_and_exact_query() {
+        use vos_agent_sdk::authority::{
+            AgentAuthorityBinding, AuthorityActorTarget, AuthorityIngressAuthentication,
+            AuthorityProjectionSelector,
+        };
+        let peer = peer(81);
+        let public_key = [82; 32];
+        let credential_public_key = [83; 32];
+        let route = route();
+        let query = AuthorityProjectionQuery {
+            authority: AuthorityActorTarget {
+                space: route.space,
+                system_agent: route.agent,
+                system_runtime_deployment: DeploymentId([84; 32]),
+                binding: AgentAuthorityBinding {
+                    policy: Hash([85; 32]),
+                    issuer: AuthorityIssuer {
+                        principal: PrincipalId([86; 32]),
+                        actor: ActorId([87; 32]),
+                        deployment: DeploymentId([88; 32]),
+                        program: ProgramId([89; 32]),
+                        producer: ProducerId::of_public_key(&public_key),
+                    },
+                    public_key,
+                    initial_epoch: 1,
+                },
+            },
+            credential: CredentialId::of_public_key(&credential_public_key),
+            nonce: Hash([90; 32]),
+            selector: AuthorityProjectionSelector::Credential,
+            authentication: AuthorityIngressAuthentication::SshNodeAttestation {
+                credential_public_key,
+                node: node(&peer),
+                request_binding: Hash([91; 32]),
+                signature: [92; 64],
+            },
+        };
+        let frame = AgentFrame {
+            route,
+            sender: node(&peer),
+            message: AgentMessage::ProjectionRequest(query.clone()),
+        };
+        let bytes = frame.encode().unwrap();
+        assert_eq!(AgentFrame::decode(&bytes).unwrap(), frame);
+        for end in 0..bytes.len() {
+            assert!(AgentFrame::decode(&bytes[..end]).is_err());
+        }
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(AgentFrame::decode(&trailing).is_err());
+        let mut wrong = frame.clone();
+        wrong.route.agent = AgentId([93; 32]);
+        assert!(wrong.encode().is_err());
+        wrong = frame.clone();
+        wrong.sender = NodeId([94; 32]);
+        assert!(wrong.encode().is_err());
+        for accepted in [false, true] {
+            let reply = AgentFrame {
+                route,
+                sender: node(&peer),
+                message: AgentMessage::ProjectionAccepted {
+                    request: query.commitment(),
+                    accepted,
+                },
+            };
+            assert_eq!(AgentFrame::decode(&reply.encode().unwrap()).unwrap(), reply);
+        }
+        let empty = AgentFrame {
+            route,
+            sender: node(&peer),
+            message: AgentMessage::ProjectionAccepted {
+                request: Hash::ZERO,
+                accepted: true,
+            },
+        };
+        assert!(empty.encode().is_err());
     }
 
     fn receipt(work: &InvocationWork) -> AuthorityReceipt {

@@ -7622,7 +7622,105 @@ where
         &mut self,
         query: AuthorityProjectionQuery,
     ) -> Result<Vec<u8>, SharedAgentHostError> {
+        if self.pins.replicas.members().len() == 1
+            || self
+                ._network_host
+                .bootstrap_is_local_leader(crate::service::AgentId(self.pins.agent.0))?
+        {
+            return self.invoke_authority_read(AuthorityReadRequest::Projection(query));
+        }
+        if self.record.pending_projection.is_some() {
+            return Err(SharedAgentHostError::Unavailable);
+        }
+        let pending = self.prepare_authority_projection(query.clone())?;
+        let (work, _) = pending
+            .invocation()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        if let Some(bytes) = self.committed_projection_response(work)? {
+            return Ok(bytes);
+        }
+        if !self
+            ._network_host
+            .forward_projection(crate::service::AgentId(self.pins.agent.0), query)?
+        {
+            return Err(SharedAgentHostError::Unavailable);
+        }
+        // The peer's queue acknowledgement is not result evidence. Wait only
+        // for this replica's authenticated Invoke and positive ACK to apply.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(bytes) = self.committed_projection_response(work)? {
+                return Ok(bytes);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(SharedAgentHostError::Unavailable);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    pub(crate) fn install_projection_dispatch(
+        &mut self,
+        dispatch: Arc<dyn Fn(AuthorityProjectionQuery) -> bool + Send + Sync>,
+    ) -> Result<(), SharedAgentHostError> {
+        self._network_host.install_projection_dispatch(dispatch)
+    }
+
+    pub(crate) fn invoke_peer_authority_projection(
+        &mut self,
+        query: AuthorityProjectionQuery,
+    ) -> Result<Vec<u8>, SharedAgentHostError> {
+        if !self
+            ._network_host
+            .bootstrap_is_local_leader(crate::service::AgentId(self.pins.agent.0))?
+        {
+            return Err(SharedAgentHostError::Unavailable);
+        }
+        self.recover_pending_authority_projection()?;
+        self.invoke_local_authority_projection(query)
+    }
+
+    fn invoke_local_authority_projection(
+        &mut self,
+        query: AuthorityProjectionQuery,
+    ) -> Result<Vec<u8>, SharedAgentHostError> {
+        let pending = self.prepare_authority_projection(query.clone())?;
+        let (work, _) = pending
+            .invocation()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        if let Some(bytes) = self.committed_projection_response(work)? {
+            return Ok(bytes);
+        }
         self.invoke_authority_read(AuthorityReadRequest::Projection(query))
+    }
+
+    fn committed_projection_response(
+        &self,
+        work: &super::sdk::InvocationWork,
+    ) -> Result<Option<Vec<u8>>, SharedAgentHostError> {
+        let Some(outcome) = self
+            ._network_host
+            .retained_projection(crate::service::AgentId(self.pins.agent.0), work)?
+        else {
+            return Ok(None);
+        };
+        let super::sdk::RuntimeOutcome::Completed(Ok(reply)) = outcome else {
+            return Err(SharedAgentHostError::Unavailable);
+        };
+        if reply.invocation != work.invocation
+            || reply.actor != work.actor
+            || reply.incarnation != work.incarnation
+            || reply.deployment != work.deployment
+            || reply.mode != work.mode
+            || reply.status != super::sdk::InvocationStatus::Done
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        use crate::actors::codec::Decode as _;
+        match crate::actors::value::Value::try_decode(&reply.reply) {
+            Some(crate::actors::value::Value::Bytes(bytes)) => Ok(Some(bytes)),
+            _ => Err(SharedAgentHostError::Unavailable),
+        }
     }
 
     /// Startup-only verification read. Extend a real retained reservation and

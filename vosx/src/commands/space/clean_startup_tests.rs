@@ -459,7 +459,7 @@ fn candidate_fixed_roster_production_retains_pending_participants() {
 }
 
 #[test]
-#[ignore = "KNOWN RELEASE GAP: follower projection admission requires a local leader; requires AUTHORITY_CANDIDATE_ELF and loopback"]
+#[ignore = "requires AUTHORITY_CANDIDATE_ELF and loopback; physical three-owner startup/restart qualification"]
 fn candidate_fixed_roster_production_routes_start_from_common_bundle() {
     check_fixed_roster_preparation(FixedRosterStage::Routes);
 }

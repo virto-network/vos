@@ -270,6 +270,11 @@ pub(super) struct PendingMeta {
 }
 
 pub(super) enum PendingAgentReply {
+    Projection {
+        meta: PendingMeta,
+        request: Hash,
+        reply: std_mpsc::Sender<Result<bool, AgentNetworkError>>,
+    },
     Invocation {
         meta: PendingMeta,
         request: InvocationRequest,
@@ -307,7 +312,8 @@ pub(super) enum PendingAgentReply {
 impl PendingAgentReply {
     fn meta(&self) -> PendingMeta {
         match self {
-            Self::Invocation { meta, .. }
+            Self::Projection { meta, .. }
+            | Self::Invocation { meta, .. }
             | Self::RaftAppend { meta, .. }
             | Self::RaftVote { meta, .. }
             | Self::RaftInstallSnapshot { meta, .. }
@@ -319,6 +325,9 @@ impl PendingAgentReply {
 
     pub(super) fn fail(self, error: AgentNetworkError) {
         match self {
+            Self::Projection { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
             Self::Invocation { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
@@ -359,6 +368,19 @@ impl PendingAgentReply {
         }
         let message = authenticated.into_frame().message;
         match (self, message) {
+            (
+                Self::Projection { request, reply, .. },
+                AgentMessage::ProjectionAccepted {
+                    request: response,
+                    accepted,
+                },
+            ) => {
+                let _ = reply.send(if response == request {
+                    Ok(accepted)
+                } else {
+                    Err(AgentNetworkError::ResponseCorrelationMismatch)
+                });
+            }
             (Self::Invocation { request, reply, .. }, AgentMessage::InvokeReply(response))
                 if response.request == invocation_request_correlation(&request)
                     && outcome_matches_work(&response.outcome, &request.work) =>
@@ -819,6 +841,43 @@ impl Network {
         receiver
     }
 
+    pub(crate) fn send_agent_projection(
+        &self,
+        target: NodeId,
+        route: AgentGenerationRoute,
+        query: vos_agent_sdk::authority::AuthorityProjectionQuery,
+    ) -> std_mpsc::Receiver<Result<bool, AgentNetworkError>> {
+        let (reply, receiver) = std_mpsc::channel();
+        let request = query.commitment();
+        let permit = match self.reserve_agent_outbound(AgentTrafficClass::Application) {
+            Ok(permit) => permit,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return receiver;
+            }
+        };
+        match self.prepare_agent_request(target, route, AgentMessage::ProjectionRequest(query)) {
+            Ok((peer, frame)) => self.queue_agent_request(AgentOutboundRequest {
+                peer,
+                frame,
+                permit,
+                pending: PendingAgentReply::Projection {
+                    meta: PendingMeta {
+                        route,
+                        target_node: target,
+                        target_peer: peer,
+                    },
+                    request,
+                    reply,
+                },
+            }),
+            Err(error) => {
+                let _ = reply.send(Err(error));
+            }
+        }
+        receiver
+    }
+
     pub(crate) fn send_agent_raft_append(
         &self,
         target: NodeId,
@@ -1108,6 +1167,7 @@ fn is_request(message: &AgentMessage) -> bool {
     matches!(
         message,
         AgentMessage::InvokeRequest(_)
+            | AgentMessage::ProjectionRequest(_)
             | AgentMessage::Raft(RaftMessage::AppendRequest { .. })
             | AgentMessage::Raft(RaftMessage::VoteRequest { .. })
             | AgentMessage::Raft(RaftMessage::InstallSnapshotRequest { .. })
@@ -1120,6 +1180,10 @@ fn is_request(message: &AgentMessage) -> bool {
 
 fn response_matches_request(request: &AgentMessage, response: &AgentMessage) -> bool {
     match (request, response) {
+        (
+            AgentMessage::ProjectionRequest(query),
+            AgentMessage::ProjectionAccepted { request, .. },
+        ) => query.commitment() == *request,
         (AgentMessage::InvokeRequest(request), AgentMessage::InvokeReply(response)) => {
             response.request == invocation_request_correlation(request)
                 && outcome_matches_work(&response.outcome, &request.work)
@@ -1497,6 +1561,60 @@ mod tests {
             AgentNetworkError::UnknownMember(node(attacker))
         );
         assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn projection_acceptance_requires_exact_peer_route_and_query_correlation() {
+        let peer = key(80).public().to_peer_id();
+        let route = test_route(81);
+        let request = Hash(id(82));
+        for fault in 0..5 {
+            let (reply, result) = std_mpsc::channel();
+            let pending = PendingAgentReply::Projection {
+                meta: PendingMeta {
+                    route,
+                    target_node: node(peer),
+                    target_peer: peer,
+                },
+                request,
+                reply,
+            };
+            let mut frame = frame(
+                peer,
+                route,
+                AgentMessage::ProjectionAccepted {
+                    request,
+                    accepted: true,
+                },
+            );
+            if fault == 1 {
+                frame.route = test_route(83);
+            }
+            if fault == 2 {
+                frame.message = AgentMessage::ProjectionAccepted {
+                    request: Hash(id(84)),
+                    accepted: true,
+                };
+            }
+            if fault == 3 {
+                frame.message = AgentMessage::Merge(MergeMessage::Heads(vec![]));
+            }
+            let authenticated = authenticate_sender(&peer, frame).unwrap();
+            pending.complete(
+                if fault == 4 {
+                    key(85).public().to_peer_id()
+                } else {
+                    peer
+                },
+                authenticated,
+            );
+            let actual = result.recv().unwrap();
+            if fault == 0 {
+                assert_eq!(actual, Ok(true));
+            } else {
+                assert!(actual.is_err(), "fault {fault}");
+            }
+        }
     }
 
     fn invocation_request(
