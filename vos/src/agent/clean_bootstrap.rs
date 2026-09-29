@@ -31973,6 +31973,15 @@ mod tests {
                 .pending_authority_projection_identity(&pending, true)
                 .unwrap();
             let before_invoke = owner.ordered_index_for_test().unwrap();
+            assert_eq!(
+                owner
+                    .host
+                    .lock()
+                    .unwrap()
+                    .retained_acknowledged_projection(agent, &work)
+                    .unwrap(),
+                None,
+            );
             let prepared_input = owner
                 .host
                 .lock()
@@ -32013,7 +32022,11 @@ mod tests {
             assert_eq!(projection.query, query);
             assert_eq!(owner.ordered_index_for_test().unwrap(), before_invoke + 1);
             {
-                let host = owner.host.lock().unwrap();
+                let mut host = owner.host.lock().unwrap();
+                assert_eq!(
+                    host.retained_acknowledged_projection(agent, &work).unwrap(),
+                    None
+                );
                 assert!(
                     host.retained_terminal_projection_invoke(agent, &work, &authorization)
                         .unwrap()
@@ -32131,7 +32144,38 @@ mod tests {
                 );
             }
             let before_blocked_competitors = {
-                let host = owner.host.lock().unwrap();
+                let mut host = owner.host.lock().unwrap();
+                let position = host.journal_position(agent).unwrap();
+                assert_eq!(
+                    host.retained_acknowledged_projection(agent, &work).unwrap(),
+                    Some(invoked.clone())
+                );
+                let mut changed = work.clone();
+                changed.message.push(0);
+                assert!(
+                    host.retained_acknowledged_projection(agent, &changed)
+                        .is_err()
+                );
+                let mut unknown = work.clone();
+                unknown.invocation = InvocationId([0xf7; 32]);
+                assert_eq!(
+                    host.retained_acknowledged_projection(agent, &unknown)
+                        .unwrap(),
+                    None
+                );
+                for mode in [MethodMode::Linear, MethodMode::Merge, MethodMode::Local] {
+                    let mut wrong_mode = work.clone();
+                    wrong_mode.mode = mode;
+                    assert!(
+                        host.retained_acknowledged_projection(agent, &wrong_mode)
+                            .is_err()
+                    );
+                }
+                assert_eq!(
+                    host.retained_acknowledged_projection(HostAgentId([0xf8; 32]), &work),
+                    Err(SharedAgentHostError::ScopeMismatch)
+                );
+                assert_eq!(host.journal_position(agent).unwrap(), position);
                 (
                     host.journal_position(agent).unwrap(),
                     host.clean_state_commitment(agent).unwrap(),
@@ -32248,6 +32292,16 @@ mod tests {
                     .retained_positive_clean_acknowledgement(agent, &work, &authorization)
                     .unwrap()
             );
+            assert_eq!(
+                owner
+                    .host
+                    .lock()
+                    .unwrap()
+                    .retained_acknowledged_projection(agent, &work)
+                    .unwrap(),
+                Some(invoked.clone()),
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), after_ack);
             let fresh = signed_query(&owner, 0xc3);
             assert!(owner.invoke_authority_projection(fresh).is_ok());
             assert_eq!(owner.ordered_index_for_test().unwrap(), after_ack + 2);

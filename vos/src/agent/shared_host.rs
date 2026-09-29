@@ -2314,6 +2314,25 @@ impl SharedAgentHost {
             .map_err(map_driver_error)
     }
 
+    /// Return an exact Query result only after local authenticated application
+    /// of both its Invoke and positive ACK. This is not an execution API.
+    pub(crate) fn retained_acknowledged_projection(
+        &mut self,
+        agent: AgentId,
+        work: &crate::agent_sdk::InvocationWork,
+    ) -> Result<Option<crate::agent_sdk::RuntimeOutcome>, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        if work.agent.0 != agent.0 {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .retained_acknowledged_projection(work)
+            .map_err(map_driver_error)
+    }
+
     pub(crate) fn prepare_clean_ordered_operation(
         &self,
         agent: AgentId,

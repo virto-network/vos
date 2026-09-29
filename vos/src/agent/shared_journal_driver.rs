@@ -2826,13 +2826,59 @@ where
         &self,
         invocation: crate::agent_sdk::InvocationId,
     ) -> Result<Option<CleanInvocationReplayRequest>, SharedJournalDriverError> {
+        self.retained_public_invocation(invocation, crate::agent_sdk::MethodMode::Linear)
+            .map(|retained| retained.map(|(request, _)| request))
+    }
+
+    /// Read only an exact, locally applied Query whose positive ACK is also
+    /// present. Peer response bytes and an invocation ID alone are never
+    /// evidence. Results come from this replica's verified replay executor;
+    /// this performs no proposal, acknowledgement or speculative execution.
+    /// Missing/pruned history returns None, never a newly executed query.
+    pub(crate) fn retained_acknowledged_projection(
+        &self,
+        expected: &crate::agent_sdk::InvocationWork,
+    ) -> Result<Option<crate::agent_sdk::RuntimeOutcome>, SharedJournalDriverError> {
+        if expected.mode != crate::agent_sdk::MethodMode::Query || !expected.validate() {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        let Some((request, input)) =
+            self.retained_public_invocation(expected.invocation, expected.mode)?
+        else {
+            return Ok(None);
+        };
+        if request.work() != expected {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        if !self.retained_positive_clean_acknowledgement(expected, request.authorization())? {
+            return Ok(None);
+        }
+        // Ordinary retry lookup intentionally stops at a newer ACK. This
+        // result-only path uses the authenticated Invoke input located above,
+        // but only after proving that exact ACK; it never retries the Invoke.
+        let outcome = self
+            .executor
+            .clean_ordered_result(input)
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        if !matches!(outcome, crate::agent_sdk::RuntimeOutcome::Completed(_)) {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        Ok(Some(outcome))
+    }
+
+    fn retained_public_invocation(
+        &self,
+        invocation: crate::agent_sdk::InvocationId,
+        mode: crate::agent_sdk::MethodMode,
+    ) -> Result<Option<(CleanInvocationReplayRequest, ReplayInputId)>, SharedJournalDriverError>
+    {
         use crate::agent_sdk::{InvocationAuthorization, RuntimeExecutionContext};
         if invocation == crate::agent_sdk::InvocationId::ZERO {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
         let mut cursor = self.materialization.heads().ordered_head;
-        // Bootstrap contains only a handful of operations. Fail closed if its
-        // history unexpectedly grows beyond the normal retained-result bound.
+        // Exact bootstrap/projection lookup is bounded independently of the
+        // complete journal's size. Exceeding that bound is not fresh evidence.
         for _ in 0..1_024 {
             let Some(id) = cursor else { break };
             if self.materialization.replay_boundary().head == Some(id) {
@@ -2854,16 +2900,19 @@ where
                 && previous.invocation == invocation
             {
                 if *context != RuntimeExecutionContext::Direct
-                    || previous.mode != crate::agent_sdk::MethodMode::Linear
+                    || previous.mode != mode
                     || !matches!(authorization, InvocationAuthorization::PublicPreflight(value) if value.matches_work(previous))
                 {
                     return Err(SharedJournalDriverError::CrossStoreMismatch);
                 }
-                return Ok(Some(CleanInvocationReplayRequest::Invoke {
-                    context: *context,
-                    work: previous.clone(),
-                    authorization: authorization.clone(),
-                }));
+                return Ok(Some((
+                    CleanInvocationReplayRequest::Invoke {
+                        context: *context,
+                        work: previous.clone(),
+                        authorization: authorization.clone(),
+                    },
+                    entry.input.id(),
+                )));
             }
             cursor = entry.parent;
         }

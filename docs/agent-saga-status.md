@@ -85,6 +85,28 @@ its pending read after leadership moves. Preserve signed query binding, fresh co
 Authority state, pending-operation exclusion and no routes before validation;
 do not substitute stale local projections or unsigned responses. Reuse the
 existing clean peer transport and Raft read/admission primitives where possible.
+Follower result verification now has a private, result-only lookup: it finds
+the exact Query work in the locally authenticated ordered suffix, requires its
+positive ACK under the original authorization, and returns the locally verified
+replay-cache outcome. It neither proposes work nor re-executes the VM. Ordinary
+retry lookup still refuses to resurrect an Invoke after its ACK; the new path
+uses the authenticated Invoke input only after proving completion. The bounded
+history/cache is not permanent result availability, and a missing result is
+never authority to publish routes. Bootstrap lookup remains Linear-only.
+Exact recovery/nonmutation and wrong-work/mode/Agent/unknown-ID tests pass
+(3.91 s), `fixed-system-projection-local-evidence-test.log`; the bundled Authority
+inventory version with outer-PVM execution passes (19.59 s),
+`fixed-system-projection-local-evidence-bundled.log`. Both also verify lookup
+after filesystem owner reopen. The existing candidate three-node bootstrap,
+follower replay and metadata-recovery regression also passes (86.78 s),
+`fixed-system-projection-local-evidence-bootstrap-regression.log`; its scripted
+Catalog/retained-memory metadata limitations still apply. The `std`-only library
+check passes (2.92 s), `fixed-system-projection-local-evidence-std.log`, along
+with formatting and diff checks. This primitive is not yet wired to peer traffic.
+Next, dispatch the signed query through the leader's existing durable
+Invoke/ACK owner, then wait for and validate local committed evidence on the
+requesting follower. Do not return peer-supplied response bytes as authority,
+or duplicate the leader's management/projection protocol in a network handler.
 Quorum snapshot certificate collection remains required before sustained
 three-node operation reaches the existing replay limit. These are extensions
 of the current fixed-three-node gate, not new release scope. Keep production
