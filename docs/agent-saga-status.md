@@ -400,6 +400,21 @@ The CLI singleton guard stays intact. Preparing the one common bundle from
 operator-supplied roster inputs and qualifying all three production owners
 together are next, before removing that guard. There is no need for a separate
 per-node root-certification or bundle-signing workflow.
+Roster preparation now shares one verifier with singleton startup. It accepts
+exactly one or three existing `NodeEncryptionEnrollment` values, verifies each
+transport signature against the exact Space and operator owner, rejects duplicate
+or absent planning nodes, and derives canonical voter/raft identities from full
+peer keys. Remote node secrets are not needed. The same builder produces
+descriptor-bound Authority constructor data: SAC5 for one node, SAC6 for three,
+with operator principal distinct from transport-derived replica principals.
+Two focused tests pass (0.24 s), `target/fixed-system-roster-authority-tests.log`,
+covering scope/signature/key substitution, valid foreign-owner enrollment,
+cardinality/duplicates, every planning-node position, input ordering, constructor
+round-trip and descriptor/operator mismatch. The real-file singleton/import/
+restart regression also passes (29.41 s), `target/fixed-system-roster-startup.log`.
+This verifies roster and constructor preparation, not a completed operator-facing
+bundle-generation command. Next reuse this builder in common-plan preparation
+and exercise it with all three production startup owners; retain the CLI guard.
 No three-node deployment or throughput claim follows from these singleton startup
 and separate fixed-roster admission tests.
 The current full Authority host suite passes: 81 passed, 2 ignored (30.76 s),

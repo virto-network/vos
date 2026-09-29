@@ -87,6 +87,164 @@ const PROJECTION_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 // deadline. Keep the same owner/leases while consensus work becomes available.
 const SYSTEM_BOOTSTRAP_RETRY_WINDOW: Duration = Duration::from_secs(60);
 
+/// Verified node-key possession plus the operator-selected fixed roster. This
+/// is preparation input, not live Authority admission or route authority.
+struct SystemBootstrapRoster {
+    primary: vos::agent::sdk::private::NodeEncryptionEnrollment,
+    additional: Option<[system_authority::AuthorityBootstrapNode; 2]>,
+    replicas: AgentReplicaCommittee,
+}
+
+impl SystemBootstrapRoster {
+    fn from_enrollments(
+        space: SpaceId,
+        agent: AgentId,
+        owner: PrincipalId,
+        local_node: vos::agent::sdk::NodeId,
+        enrollments: &[vos::agent::sdk::private::NodeEncryptionEnrollment],
+    ) -> anyhow::Result<Self> {
+        use vos::agent::private_crypto::StrictNodeEncryptionEnrollmentVerifier;
+        anyhow::ensure!(
+            matches!(enrollments.len(), 1 | 3),
+            "system bootstrap requires exactly one or three nodes"
+        );
+        let mut nodes = enrollments.to_vec();
+        nodes.sort_by_key(|node| node.node);
+        anyhow::ensure!(
+            nodes.windows(2).all(|pair| pair[0].node != pair[1].node),
+            "duplicate bootstrap node"
+        );
+        for node in &nodes {
+            anyhow::ensure!(
+                node.space == space
+                    && node.principal == owner
+                    && node.verify_with(&StrictNodeEncryptionEnrollmentVerifier),
+                "bootstrap enrollment has invalid scope or transport signature"
+            );
+        }
+        let primary = *nodes
+            .iter()
+            .find(|node| node.node == local_node)
+            .ok_or_else(|| anyhow::anyhow!("planning node is outside the bootstrap roster"))?;
+        let mut members = Vec::with_capacity(nodes.len());
+        for node in &nodes {
+            members.push(AgentReplicaMember::new(
+                vos::agent::AgentReplica {
+                    node: HostNodeId(node.node.0),
+                    principal: HostPrincipalId(
+                        PrincipalId::of_public_key(&node.transport_public_key).0,
+                    ),
+                    role: HostReplicaRole::Voter,
+                },
+                node.transport_peer_id.to_vec(),
+                node.transport_public_key,
+                Some(derive_replica_raft_slot(&node.transport_peer_id)),
+            )?);
+        }
+        let additional = if nodes.len() == 3 {
+            let extra: Vec<_> = nodes
+                .iter()
+                .filter(|node| node.node != local_node)
+                .map(|node| system_authority::AuthorityBootstrapNode {
+                    transport_public_key: node.transport_public_key,
+                    encryption_public_key: node.encryption_public_key,
+                    transport_signature: node.transport_signature,
+                })
+                .collect();
+            Some(
+                extra
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("invalid bootstrap roster"))?,
+            )
+        } else {
+            None
+        };
+        let replicas = AgentReplicaCommittee::new(
+            HostSpaceId(space.0),
+            HostAgentId(agent.0),
+            HostAgentProfile::Shared,
+            members,
+        )?;
+        Ok(Self {
+            primary,
+            additional,
+            replicas,
+        })
+    }
+
+    fn descriptor_replicas(&self) -> Vec<AgentReplica> {
+        self.replicas
+            .members()
+            .iter()
+            .map(|member| AgentReplica {
+                node: vos::agent::sdk::NodeId(member.replica().node.0),
+                principal: PrincipalId(member.replica().principal.0),
+                role: ReplicaRole::Voter,
+            })
+            .collect()
+    }
+
+    fn authority_configuration(
+        &self,
+        descriptor: &AgentDescriptor,
+        operator_public: [u8; 32],
+    ) -> anyhow::Result<SystemAuthorityConfiguration> {
+        anyhow::ensure!(
+            descriptor.identity.owner == PrincipalId::of_public_key(&operator_public)
+                && descriptor.authority.public_key == operator_public
+                && self.replicas.space() == HostSpaceId(descriptor.identity.space.0)
+                && self.replicas.agent() == HostAgentId(descriptor.identity.agent.0),
+            "bootstrap descriptor does not belong to the configured root operator"
+        );
+        let authority = descriptor.authority;
+        let enrollment = self.primary;
+        let configuration = SystemAuthorityConfiguration {
+            space: descriptor.identity.space.0,
+            system_agent: descriptor.identity.agent.0,
+            system_runtime_deployment: descriptor.identity.runtime_deployment.0,
+            system_runtime_program: descriptor.identity.runtime_program.0,
+            system_runtime_producer: descriptor.identity.runtime_producer.0,
+            system_transition_producer: descriptor.identity.transition_producer.0,
+            system_runtime_package: AuthorityBlobRow {
+                hash: descriptor.runtime_package.hash.0,
+                len: descriptor.runtime_package.len,
+            },
+            binding: AuthorityBindingState {
+                policy: authority.policy.0,
+                issuer: AuthorityIssuerState {
+                    principal: authority.issuer.principal.0,
+                    actor: authority.issuer.actor.0,
+                    deployment: authority.issuer.deployment.0,
+                    program: authority.issuer.program.0,
+                    producer: authority.issuer.producer.0,
+                },
+                public_key: authority.public_key,
+                initial_epoch: authority.initial_epoch,
+            },
+            bootstrap_authorization_high_water: ROOT_BOOTSTRAP_AUTHORIZATION_HIGH_WATER,
+            bootstrap_system_agent_creation_nonce: descriptor.creation_nonce.0,
+            bootstrap_principal: descriptor.identity.owner.0,
+            bootstrap_replica_principal: PrincipalId::of_public_key(
+                &enrollment.transport_public_key,
+            )
+            .0,
+            bootstrap_credential_public_key: operator_public,
+            bootstrap_credential_kind: AuthorityCredentialKind::Api as u8,
+            bootstrap_node: enrollment.node.0,
+            bootstrap_node_transport_public_key: enrollment.transport_public_key,
+            bootstrap_node_transport_peer_id: enrollment.transport_peer_id,
+            bootstrap_node_encryption_public_key: enrollment.encryption_public_key,
+            bootstrap_node_transport_signature: enrollment.transport_signature,
+            bootstrap_additional_nodes: self.additional,
+        };
+        anyhow::ensure!(
+            configuration.matches_system_descriptor(descriptor),
+            "derived system-authority configuration does not match its system descriptor"
+        );
+        Ok(configuration)
+    }
+}
+
 /// Shared immutable bootstrap derivation for startup and fresh CLI requests.
 /// This derives an expected target, not proof of the daemon's live state.
 pub(crate) fn derive_system_authority_target(
@@ -317,7 +475,6 @@ fn open_clean_system_lifecycle_with_inputs(
     let operator_public = raw_public_key(operator)?;
     let node_public = raw_public_key(daemon)?;
     let operator_principal = PrincipalId::of_public_key(&operator_public);
-    let node_principal = PrincipalId::of_public_key(&node_public);
     let operator_producer = ProducerId::of_public_key(&operator_public);
     let transition_producer = ProducerId::of_public_key(&node_public);
     if transition_producer == operator_producer {
@@ -325,7 +482,6 @@ fn open_clean_system_lifecycle_with_inputs(
     }
 
     let peer = daemon.public().to_peer_id();
-    let peer_bytes = peer.to_bytes();
     let clean_node = node_id_from_authenticated_peer(&peer);
 
     let stores =
@@ -390,11 +546,13 @@ fn open_clean_system_lifecycle_with_inputs(
         anyhow::bail!("node enrollment does not bind the authenticated transport identity");
     }
 
-    let replica = AgentReplica {
-        node: clean_node,
-        principal: node_principal,
-        role: ReplicaRole::Voter,
-    };
+    let roster = SystemBootstrapRoster::from_enrollments(
+        space,
+        system_agent,
+        operator_principal,
+        clean_node,
+        &[enrollment],
+    )?;
     let descriptor = AgentDescriptor {
         identity: AgentIdentity {
             space,
@@ -412,72 +570,14 @@ fn open_clean_system_lifecycle_with_inputs(
         runtime_package: runtime.package_ref().clone(),
         runtime_contract: runtime.manifest().contract,
         capabilities: runtime.capabilities(),
-        replicas: vec![replica],
+        replicas: roster.descriptor_replicas(),
     };
     descriptor
         .validate()
         .map_err(|error| anyhow::anyhow!("invalid system-Agent descriptor: {error:?}"))?;
 
-    let host_replica = vos::agent::AgentReplica {
-        node: HostNodeId(clean_node.0),
-        principal: HostPrincipalId(node_principal.0),
-        role: HostReplicaRole::Voter,
-    };
-    let member = AgentReplicaMember::new(
-        host_replica,
-        peer_bytes.clone(),
-        node_public,
-        Some(derive_replica_raft_slot(&peer_bytes)),
-    )?;
-    let replicas = AgentReplicaCommittee::new(
-        HostSpaceId(space.0),
-        HostAgentId(system_agent.0),
-        HostAgentProfile::Shared,
-        vec![member],
-    )?;
-
-    let authority_state = AuthorityBindingState {
-        policy: authority.policy.0,
-        issuer: AuthorityIssuerState {
-            principal: authority.issuer.principal.0,
-            actor: authority.issuer.actor.0,
-            deployment: authority.issuer.deployment.0,
-            program: authority.issuer.program.0,
-            producer: authority.issuer.producer.0,
-        },
-        public_key: authority.public_key,
-        initial_epoch: authority.initial_epoch,
-    };
-    let authority_configuration = SystemAuthorityConfiguration {
-        space: space.0,
-        system_agent: system_agent.0,
-        system_runtime_deployment: runtime.deployment().0,
-        system_runtime_program: runtime.program().0,
-        system_runtime_producer: runtime.producer().0,
-        system_transition_producer: transition_producer.0,
-        system_runtime_package: AuthorityBlobRow {
-            hash: runtime.package_ref().hash.0,
-            len: runtime.package_ref().len,
-        },
-        binding: authority_state,
-        bootstrap_authorization_high_water: ROOT_BOOTSTRAP_AUTHORIZATION_HIGH_WATER,
-        bootstrap_system_agent_creation_nonce: creation_nonce.0,
-        bootstrap_principal: operator_principal.0,
-        bootstrap_replica_principal: node_principal.0,
-        bootstrap_credential_public_key: operator_public,
-        bootstrap_credential_kind: AuthorityCredentialKind::Api as u8,
-        bootstrap_node: enrollment.node.0,
-        bootstrap_node_transport_public_key: enrollment.transport_public_key,
-        bootstrap_node_transport_peer_id: enrollment.transport_peer_id,
-        bootstrap_node_encryption_public_key: enrollment.encryption_public_key,
-        bootstrap_node_transport_signature: enrollment.transport_signature,
-        bootstrap_additional_nodes: None,
-    };
-    if !authority_configuration.matches_system_descriptor(&descriptor) {
-        anyhow::bail!(
-            "derived system-authority configuration does not match its system descriptor"
-        );
-    }
+    let authority_configuration = roster.authority_configuration(&descriptor, operator_public)?;
+    let replicas = roster.replicas;
     let catalog_configuration = SystemCatalogConfiguration {
         space: space.0,
         system_agent: system_agent.0,

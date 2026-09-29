@@ -7,6 +7,104 @@ use vos::network::{Network, NetworkConfig, derive_node_prefix};
 
 struct Scratch(PathBuf);
 
+#[test]
+fn bootstrap_roster_requires_exact_signed_owner_and_node_inputs() {
+    let space = SpaceId([0x61; 32]);
+    let agent = AgentId([0x62; 32]);
+    let owner = PrincipalId([0x63; 32]);
+    let mut nodes = Vec::new();
+    for seed in [0x64, 0x65, 0x66] {
+        let key = Keypair::ed25519_from_bytes([seed; 32]).unwrap();
+        nodes.push(
+            sign_node_encryption_enrollment(
+                &key,
+                space,
+                owner,
+                derive_node_encryption_public(&key, space).unwrap(),
+            )
+            .unwrap(),
+        );
+    }
+    let mut sorted = nodes.clone();
+    sorted.sort_by_key(|node| node.node);
+    for primary in &nodes {
+        let roster =
+            SystemBootstrapRoster::from_enrollments(space, agent, owner, primary.node, &nodes)
+                .unwrap();
+        assert_eq!(roster.primary, *primary);
+        let expected: Vec<_> = sorted
+            .iter()
+            .map(|node| AgentReplica {
+                node: node.node,
+                principal: PrincipalId::of_public_key(&node.transport_public_key),
+                role: ReplicaRole::Voter,
+            })
+            .collect();
+        assert_eq!(roster.descriptor_replicas(), expected);
+        let extra = roster.additional.unwrap();
+        let expected_extra: Vec<_> = sorted
+            .iter()
+            .filter(|node| node.node != primary.node)
+            .collect();
+        for (actual, expected) in extra.iter().zip(expected_extra) {
+            assert_eq!(actual.transport_public_key, expected.transport_public_key);
+            assert_eq!(actual.encryption_public_key, expected.encryption_public_key);
+            assert_eq!(actual.transport_signature, expected.transport_signature);
+        }
+        let mut reversed = nodes.clone();
+        reversed.reverse();
+        let reversed =
+            SystemBootstrapRoster::from_enrollments(space, agent, owner, primary.node, &reversed)
+                .unwrap();
+        assert_eq!(reversed.replicas, roster.replicas);
+        let single =
+            SystemBootstrapRoster::from_enrollments(space, agent, owner, primary.node, &[*primary])
+                .unwrap();
+        assert!(single.additional.is_none());
+        assert_eq!(single.descriptor_replicas().len(), 1);
+    }
+    let check = |nodes: &[vos::agent::sdk::private::NodeEncryptionEnrollment]| {
+        SystemBootstrapRoster::from_enrollments(space, agent, owner, sorted[0].node, nodes)
+    };
+    assert!(check(&[]).is_err());
+    assert!(check(&sorted[..2]).is_err());
+    assert!(check(&[sorted[0]; 3]).is_err());
+    assert!(check(&[sorted[0], sorted[1], sorted[2], sorted[0]]).is_err());
+    assert!(
+        SystemBootstrapRoster::from_enrollments(
+            space,
+            agent,
+            owner,
+            vos::agent::sdk::NodeId([0xff; 32]),
+            &sorted
+        )
+        .is_err()
+    );
+    for field in 0..5 {
+        let mut altered = sorted.clone();
+        match field {
+            0 => altered[1].space = SpaceId([0x71; 32]),
+            1 => altered[1].principal = PrincipalId([0x72; 32]),
+            2 => altered[1].transport_signature[0] ^= 1,
+            3 => altered[1].transport_peer_id[0] ^= 1,
+            _ => altered[1].encryption_public_key[0] ^= 1,
+        }
+        assert!(check(&altered).is_err(), "field {field}");
+    }
+    // A cryptographically valid enrollment for a different owner is also
+    // refused; node possession alone cannot select the Space's operator.
+    let key = Keypair::ed25519_from_bytes([0x65; 32]).unwrap();
+    let mut foreign = nodes;
+    foreign[1] = sign_node_encryption_enrollment(
+        &key,
+        space,
+        PrincipalId([0x72; 32]),
+        derive_node_encryption_public(&key, space).unwrap(),
+    )
+    .unwrap();
+    assert!(check(&foreign).is_err());
+}
+
 impl Scratch {
     fn new() -> Self {
         use std::os::unix::fs::DirBuilderExt;
@@ -22,6 +120,93 @@ impl Scratch {
             }
         }
         panic!("recovery directory namespace exhausted");
+    }
+}
+
+#[test]
+fn bootstrap_roster_constructs_exact_singleton_and_fixed_authority_configuration() {
+    let operator = Keypair::ed25519_from_bytes([0x61; 32]).unwrap();
+    let public = raw_public_key(&operator).unwrap();
+    let owner = PrincipalId::of_public_key(&public);
+    let space = SpaceId([0x62; 32]);
+    let runtime = crate::bundled::root_signed_agent_runtime_package(&operator).unwrap();
+    let authority = crate::bundled::root_signed_actor_package(
+        crate::bundled::system_authority_package_template(),
+        SYSTEM_AUTHORITY_NAME,
+        &operator,
+    )
+    .unwrap();
+    let (target, nonce) =
+        derive_system_authority_target(space, public, &runtime, &authority).unwrap();
+    let mut nodes = Vec::new();
+    for seed in [0x64, 0x65, 0x66] {
+        let key = Keypair::ed25519_from_bytes([seed; 32]).unwrap();
+        nodes.push(
+            sign_node_encryption_enrollment(
+                &key,
+                space,
+                owner,
+                derive_node_encryption_public(&key, space).unwrap(),
+            )
+            .unwrap(),
+        );
+    }
+    for count in [1, 3] {
+        let selected = &nodes[..count];
+        for primary in selected {
+            let roster = SystemBootstrapRoster::from_enrollments(
+                space,
+                target.system_agent,
+                owner,
+                primary.node,
+                selected,
+            )
+            .unwrap();
+            let descriptor = AgentDescriptor {
+                identity: AgentIdentity {
+                    space,
+                    agent: target.system_agent,
+                    owner,
+                    profile: AgentProfile::Shared,
+                    runtime_deployment: runtime.deployment(),
+                    runtime_program: runtime.program(),
+                    runtime_producer: runtime.producer(),
+                    transition_producer: ProducerId::of_public_key(&primary.transport_public_key),
+                },
+                creation_nonce: nonce,
+                authority: target.binding,
+                private_recovery: None,
+                runtime_package: runtime.package_ref().clone(),
+                runtime_contract: runtime.manifest().contract,
+                capabilities: runtime.capabilities(),
+                replicas: roster.descriptor_replicas(),
+            };
+            let configuration = roster.authority_configuration(&descriptor, public).unwrap();
+            assert!(configuration.matches_system_descriptor(&descriptor));
+            let bytes = configuration.encode();
+            assert_eq!(&bytes[..4], if count == 1 { b"SAC5" } else { b"SAC6" });
+            assert_eq!(
+                SystemAuthorityConfiguration::decode(&bytes),
+                Some(configuration)
+            );
+            assert_eq!(configuration.bootstrap_node, primary.node.0);
+            assert_eq!(configuration.bootstrap_principal, owner.0);
+            assert_eq!(
+                configuration.bootstrap_replica_principal,
+                PrincipalId::of_public_key(&primary.transport_public_key).0
+            );
+            assert!(
+                roster
+                    .authority_configuration(&descriptor, [0x99; 32])
+                    .is_err()
+            );
+            let mut changed = descriptor.clone();
+            changed.replicas[0].principal = owner;
+            assert!(roster.authority_configuration(&changed, public).is_err());
+            let mut changed = descriptor;
+            changed.identity.agent = AgentId([0x99; 32]);
+            assert!(roster.authority_configuration(&changed, public).is_err());
+        }
     }
 }
 
