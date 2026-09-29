@@ -22,6 +22,59 @@ fn candidate_common_checkpoint_compacts_catches_up_reopens_and_continues() {
 pub(super) enum Exercise {
     Healthy,
     Crash(CommonCheckpointCrashStage),
+    Recovery(RecoveryBoundary),
+    ContendedIntent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RecoveryBoundary {
+    BeforeInvoke,
+    AfterAcknowledgement,
+    FollowerDelivery,
+}
+
+#[test]
+#[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
+fn candidate_registered_projection_is_discovered_with_origin_offline_and_survives_checkpoints() {
+    check_fixed_system_pending_cluster_with_checkpoint(
+        true,
+        None,
+        false,
+        Some(Exercise::Recovery(RecoveryBoundary::BeforeInvoke)),
+    );
+}
+
+#[test]
+#[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
+fn candidate_registered_post_ack_projection_survives_repeated_checkpoint_import_and_reopen() {
+    check_fixed_system_pending_cluster_with_checkpoint(
+        true,
+        None,
+        false,
+        Some(Exercise::Recovery(RecoveryBoundary::AfterAcknowledgement)),
+    );
+}
+
+#[test]
+#[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
+fn candidate_registered_follower_delivery_survives_leader_reads_and_repeated_checkpoints() {
+    check_fixed_system_pending_cluster_with_checkpoint(
+        true,
+        None,
+        false,
+        Some(Exercise::Recovery(RecoveryBoundary::FollowerDelivery)),
+    );
+}
+
+#[test]
+#[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
+fn candidate_registered_request_precedes_competing_unadmitted_wal_after_election() {
+    check_fixed_system_pending_cluster_with_checkpoint(
+        true,
+        None,
+        false,
+        Some(Exercise::ContendedIntent),
+    );
 }
 
 #[test]
@@ -120,6 +173,38 @@ fn query(owner: &MemoryBootstrapOwner, index: usize, nonce: u8) -> AuthorityProj
     query
 }
 
+fn delegated_query(
+    owner: &MemoryBootstrapOwner,
+    index: usize,
+    nonce: u8,
+) -> AuthorityProjectionQuery {
+    let mut query = query(owner, index, nonce);
+    let agent = HostAgentId(owner.pins.agent.0);
+    let mut host = owner.host.lock().unwrap();
+    let attachment = host.supervisor_attachment_status(agent).unwrap().unwrap();
+    let accepted_slot = host.current_logical_slot(agent).unwrap();
+    drop(host);
+    query.recovery = Some(
+        crate::agent_sdk::authority::AuthorityProjectionRecoveryDelegation {
+            generation: Hash(attachment.replication_id),
+            committee: Hash(*attachment.route.committee().as_bytes()),
+            accepted_slot,
+            expires_at: accepted_slot
+                + crate::agent_sdk::authority::MAX_AUTHORITY_PROJECTION_RECOVERY_SLOTS,
+        },
+    );
+    let key = SigningKey::from_bytes(&[[NODE_SEED, 0xd2, 0xd3][index]; 32]);
+    let signature = key.sign(&query.signing_bytes()).to_bytes();
+    let AuthorityIngressAuthentication::SshNodeAttestation {
+        signature: actual, ..
+    } = &mut query.authentication
+    else {
+        unreachable!()
+    };
+    *actual = signature;
+    query
+}
+
 fn restart_network(index: usize) -> Arc<Network> {
     let keypair =
         libp2p::identity::Keypair::ed25519_from_bytes([[NODE_SEED, 0xd2, 0xd3][index]; 32])
@@ -138,6 +223,681 @@ fn restart_network(index: usize) -> Arc<Network> {
     network
 }
 
+/// Forced small checkpoint cycles qualify custody retention, not the full
+/// replay-window capacity or service throughput. The harness transfers only
+/// certified checkpoint bytes; it never supplies the lost query to a successor.
+fn exercise_contended_intent(
+    leader: usize,
+    owners: &mut [Option<MemoryBootstrapOwner>],
+    fixtures: &[PhysicalFixture],
+    networks: &mut Vec<Arc<Network>>,
+) {
+    let agent = HostAgentId(fixtures[leader].plan.pins.agent.0);
+    let mut intents = Vec::new();
+    for index in 0..3 {
+        let owner = owners[index].as_mut().unwrap();
+        let query = delegated_query(owner, index, 0xe1 + index as u8);
+        let mut pending = owner.prepare_authority_projection(query).unwrap();
+        owner
+            .prepare_projection_recovery_registration(&mut pending)
+            .unwrap();
+        let (work, authorization) = pending.invocation().unwrap();
+        if index == leader {
+            owner
+                ._network_host
+                .reserve_projection_pair(agent, work, authorization, false)
+                .unwrap();
+        } else {
+            owner
+                ._network_host
+                .reserve_forwarded_projection_pair(agent, work, authorization)
+                .unwrap();
+        }
+        owner.record.pending_projection = Some(pending.clone());
+        commit_bootstrap_record(&mut owner.record_store, &owner.record).unwrap();
+        intents.push(pending);
+    }
+    let admitted = &intents[leader];
+    owners[leader]
+        .as_ref()
+        .unwrap()
+        .register_pending_projection(admitted)
+        .unwrap();
+    let (work, authorization) = admitted.invocation().unwrap();
+    let work = work.clone();
+    let authorization = authorization.clone();
+    for index in 0..3 {
+        if index == leader {
+            continue;
+        }
+        let owner = owners[index].as_ref().unwrap();
+        let before = owner.record.encode();
+        assert!(owner.register_pending_projection(&intents[index]).is_err());
+        assert_eq!(owner.record.encode(), before);
+    }
+    drop(owners[leader].take());
+    let mut live_networks: Vec<_> = networks.drain(..).map(Some).collect();
+    stop_network(live_networks[leader].take().unwrap());
+    assert!(wait_until(std::time::Duration::from_secs(30), || owners
+        .iter()
+        .flatten()
+        .any(|owner| owner
+            ._network_host
+            .bootstrap_is_local_leader(agent)
+            .unwrap_or(false))));
+    let successor = owners
+        .iter()
+        .position(|owner| {
+            owner.as_ref().is_some_and(|owner| {
+                owner
+                    ._network_host
+                    .bootstrap_is_local_leader(agent)
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap();
+    let owner = owners[successor].as_mut().unwrap();
+    let before_record = owner.record.encode();
+    let before_index = owner.ordered_index_for_test().unwrap();
+    owner
+        .recover_registered_projection_dependency(&intents[successor])
+        .unwrap();
+    assert_eq!(
+        owner.record.encode(),
+        before_record,
+        "help must not replace or clear the losing WAL"
+    );
+    assert_eq!(
+        owner
+            .record_store
+            .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
+            .unwrap(),
+        Some(before_record)
+    );
+    assert_eq!(owner.ordered_index_for_test().unwrap(), before_index + 2);
+    assert!(
+        owner
+            .host
+            .lock()
+            .unwrap()
+            .retained_positive_clean_acknowledgement(agent, &work, &authorization)
+            .unwrap()
+    );
+    let response = owner.committed_projection_response(&work).unwrap().unwrap();
+    let projection =
+        crate::agent_sdk::authority::AuthorityCredentialProjection::decode(&response).unwrap();
+    let AuthorityReadRequest::Projection(expected_query) = &admitted.query else {
+        unreachable!()
+    };
+    assert_eq!(&projection.query, expected_query);
+    assert!(owner.recover_pending_authority_projection().unwrap());
+    assert!(owner.record.pending_projection.is_none());
+    assert_eq!(owner.ordered_index_for_test().unwrap(), before_index + 4);
+    let manifest = owner
+        ._network_host
+        .projection_recovery_manifest(agent)
+        .unwrap();
+    assert!(
+        manifest
+            .slot(HostNodeId(fixtures[leader].plan.pins.node.0))
+            .unwrap()
+            .is_acknowledged()
+    );
+    assert!(
+        manifest
+            .slot(HostNodeId(fixtures[successor].plan.pins.node.0))
+            .unwrap()
+            .is_acknowledged()
+    );
+    // The other follower's rejected local intent was never custody-admitted;
+    // it remains durable until that owner explicitly retries it.
+    let other = (0..3)
+        .find(|index| *index != leader && *index != successor)
+        .unwrap();
+    assert_eq!(
+        owners[other]
+            .as_ref()
+            .unwrap()
+            .record
+            .pending_projection
+            .as_ref(),
+        Some(&intents[other])
+    );
+    assert!(
+        manifest
+            .slot(HostNodeId(fixtures[other].plan.pins.node.0))
+            .is_none()
+    );
+    // The enclosing fixture needs only live handles for its normal cleanup.
+    *networks = live_networks.into_iter().flatten().collect();
+}
+
+fn exercise_registered_recovery(
+    leader: usize,
+    owners: &mut [Option<MemoryBootstrapOwner>],
+    fixtures: &[PhysicalFixture],
+    directories: &[TestDirectory],
+    stores: &[(
+        BootstrapMemoryStore,
+        BootstrapMemoryStore,
+        IssuerMemoryStore,
+    )],
+    providers: &[Arc<MemoryProvider>],
+    networks: &mut Vec<Arc<Network>>,
+    signer: &mut CountingSigner,
+    boundary: RecoveryBoundary,
+) {
+    let agent = HostAgentId(fixtures[leader].plan.pins.agent.0);
+    let origin = if boundary == RecoveryBoundary::FollowerDelivery {
+        (leader + 1) % 3
+    } else {
+        leader
+    };
+    let owner = owners[origin].as_mut().unwrap();
+    let request = delegated_query(owner, origin, 0xc1);
+    let mut pending = owner.prepare_authority_projection(request.clone()).unwrap();
+    owner
+        .prepare_projection_recovery_registration(&mut pending)
+        .unwrap();
+    let (work, authorization) = pending.invocation().unwrap();
+    let work = work.clone();
+    let authorization = authorization.clone();
+    if origin == leader {
+        owner
+            ._network_host
+            .reserve_projection_pair(agent, &work, &authorization, false)
+            .unwrap();
+    } else {
+        owner
+            ._network_host
+            .reserve_forwarded_projection_pair(agent, &work, &authorization)
+            .unwrap();
+    }
+    owner.record.pending_projection = Some(pending.clone());
+    commit_bootstrap_record(&mut owner.record_store, &owner.record).unwrap();
+    // Until this succeeds PAP2 is a local WAL attempt, not a recoverably
+    // admitted request. No survivor is expected to discover that earlier cut.
+    owner.register_pending_projection(&pending).unwrap();
+    let manifest = owner
+        ._network_host
+        .projection_recovery_manifest(agent)
+        .unwrap();
+    let registration = pending
+        .registration(manifest.generation(), manifest.committee().id())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        manifest.slot(registration.owner()).unwrap().registration(),
+        &registration
+    );
+    let mut expected_response = None;
+    if boundary == RecoveryBoundary::AfterAcknowledgement {
+        let identity = owner
+            .pending_authority_projection_identity(&pending, true)
+            .unwrap();
+        let outcome = owner
+            .supervisor_invoke_terminal_reserved(identity, work.clone(), authorization.clone())
+            .unwrap();
+        let RuntimeOutcome::Completed(Ok(reply)) = outcome else {
+            panic!("registered Query must complete")
+        };
+        let Some(crate::actors::value::Value::Bytes(response)) =
+            crate::actors::value::Value::try_decode(&reply.reply)
+        else {
+            panic!("projection bytes")
+        };
+        expected_response = Some(response);
+        let outcome = owner
+            .supervisor_acknowledge_reserved(identity, work.clone(), authorization.clone())
+            .unwrap();
+        let RuntimeOutcome::Acknowledged(Ok(ack)) = outcome else {
+            panic!("positive exact ACK required")
+        };
+        assert_eq!(ack.invocation, work.invocation);
+        assert_eq!(ack.work, work.commitment());
+        assert_eq!(ack.authorization, authorization.commitment());
+    } else if boundary == RecoveryBoundary::FollowerDelivery {
+        // The forwarding node keeps its own durable delivery obligation even
+        // when a different lifecycle owner executes and retires the result.
+        expected_response = Some(
+            owners[leader]
+                .as_mut()
+                .unwrap()
+                .invoke_peer_authority_projection(
+                    request.clone(),
+                    false,
+                    fixtures[origin].plan.pins.node,
+                )
+                .unwrap(),
+        );
+    }
+    for owner in owners.iter().flatten() {
+        assert!(wait_until(std::time::Duration::from_secs(30), || {
+            owner
+                ._network_host
+                .projection_recovery_manifest(agent)
+                .is_ok_and(|manifest| {
+                    manifest.slot(registration.owner()).is_some_and(|slot| {
+                        slot.registration() == &registration
+                            && slot.is_acknowledged()
+                                == (boundary != RecoveryBoundary::BeforeInvoke)
+                    })
+                })
+        }));
+    }
+    let offline_host = owners[origin].as_ref().unwrap().host.clone();
+    let saved_record = owners[origin].as_ref().unwrap().record.encode();
+    drop(owners[origin].take());
+    let mut live_networks: Vec<_> = networks.drain(..).map(Some).collect();
+    stop_network(live_networks[origin].take().unwrap());
+    let offline_peer =
+        libp2p::identity::Keypair::ed25519_from_bytes([[NODE_SEED, 0xd2, 0xd3][origin]; 32])
+            .unwrap()
+            .public()
+            .to_peer_id();
+    assert!(wait_until(std::time::Duration::from_secs(10), || {
+        live_networks
+            .iter()
+            .flatten()
+            .all(|network| !network.connected_peers().contains(&offline_peer))
+    }));
+    assert!(wait_until(std::time::Duration::from_secs(30), || owners
+        .iter()
+        .flatten()
+        .any(|owner| owner
+            ._network_host
+            .bootstrap_is_local_leader(agent)
+            .unwrap_or(false))));
+    let mut successor = owners
+        .iter()
+        .position(|owner| {
+            owner.as_ref().is_some_and(|owner| {
+                owner
+                    ._network_host
+                    .bootstrap_is_local_leader(agent)
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap();
+    if boundary == RecoveryBoundary::BeforeInvoke {
+        assert!(
+            owners[successor]
+                .as_ref()
+                .unwrap()
+                .record
+                .pending_projection
+                .is_none()
+        );
+        // Discovery consumes the committed manifest, not a harness-supplied
+        // original query or a request reconstructed at today's clock.
+        let mut last_error = None;
+        assert!(
+            wait_until(std::time::Duration::from_secs(30), || {
+                let Some(current) = owners.iter().position(|owner| {
+                    owner.as_ref().is_some_and(|owner| {
+                        owner
+                            ._network_host
+                            .bootstrap_is_local_leader(agent)
+                            .unwrap_or(false)
+                    })
+                }) else {
+                    return false;
+                };
+                successor = current;
+                let owner = owners[current].as_mut().unwrap();
+                let recovered = owner.recover_pending_authority_projection();
+                if let Err(error) = &recovered {
+                    let message = format!(
+                        "{error:?}; pending={:?}",
+                        owner.record.pending_projection.as_ref().map(|pending| (
+                            &pending.query,
+                            pending.recovery_registration.is_some()
+                        ))
+                    );
+                    if last_error.as_ref() != Some(&message) {
+                        eprintln!("registered recovery: {message}");
+                    }
+                    last_error = Some(message);
+                }
+                recovered.is_ok()
+                    && owner
+                        ._network_host
+                        .projection_recovery_manifest(agent)
+                        .is_ok_and(|manifest| {
+                            manifest
+                                .slot(registration.owner())
+                                .is_some_and(|slot| slot.is_acknowledged())
+                        })
+            }),
+            "registered recovery failed: {last_error:?}"
+        );
+        expected_response = owners[successor]
+            .as_ref()
+            .unwrap()
+            .committed_projection_response(&work)
+            .unwrap();
+    }
+    for owner in owners.iter_mut().flatten() {
+        if owner.record.pending_projection.is_some() {
+            assert!(wait_until(std::time::Duration::from_secs(30), || owner
+                .recover_pending_authority_projection()
+                .is_ok()));
+            assert!(owner.record.pending_projection.is_none());
+        }
+    }
+    let expected_response = expected_response.unwrap();
+    let archived = owners[successor]
+        .as_ref()
+        .unwrap()
+        ._network_host
+        .projection_recovery_manifest(agent)
+        .unwrap()
+        .slot(registration.owner())
+        .unwrap()
+        .clone();
+    assert!(archived.is_acknowledged());
+    assert_eq!(archived.registration(), &registration);
+    // An archived result remains recoverable after the original execution
+    // delegation has expired; it does not reauthorize a new execution.
+    let expired = request.recovery.unwrap().expires_at;
+    for fixture in fixtures {
+        fixture
+            .logical_slot
+            .as_ref()
+            .unwrap()
+            .store(expired, Ordering::Release);
+    }
+    let limits = SharedAgentPortableBackupLimits {
+        max_objects: 4096,
+        max_blobs: 4096,
+        max_index_nodes: 4096,
+        max_bytes: 64 * 1024 * 1024,
+    };
+    let crash = match boundary {
+        RecoveryBoundary::BeforeInvoke => CommonCheckpointCrashStage::Marker,
+        RecoveryBoundary::AfterAcknowledgement => CommonCheckpointCrashStage::Journal,
+        RecoveryBoundary::FollowerDelivery => CommonCheckpointCrashStage::Ledger,
+    };
+    for cycle in 0..3u8 {
+        let owner = owners[successor].as_ref().unwrap();
+        let next_query = delegated_query(owner, successor, 0xc3 + cycle * 2);
+        let sender = owner.pins.node;
+        let mut last_error = None;
+        assert!(
+            wait_until(std::time::Duration::from_secs(30), || {
+                let Some(current) = owners.iter().position(|owner| {
+                    owner.as_ref().is_some_and(|owner| {
+                        owner
+                            ._network_host
+                            .bootstrap_is_local_leader(agent)
+                            .unwrap_or(false)
+                    })
+                }) else {
+                    return false;
+                };
+                successor = current;
+                match owners[current]
+                    .as_mut()
+                    .unwrap()
+                    .invoke_peer_authority_projection(next_query.clone(), false, sender)
+                {
+                    Ok(_) => true,
+                    Err(error) => {
+                        last_error = Some(error);
+                        false
+                    }
+                }
+            }),
+            "exact next query did not complete: {last_error:?}"
+        );
+        for owner in owners.iter_mut().flatten() {
+            if owner.record.pending_projection.is_some() {
+                assert!(wait_until(std::time::Duration::from_secs(30), || owner
+                    .recover_pending_authority_projection()
+                    .is_ok()));
+                assert!(owner.record.pending_projection.is_none());
+            }
+        }
+        // Pending-owner cleanup and the previous checkpoint's reopen can
+        // complete across an election. Choose the current leader at this
+        // boundary, not the node that happened to finish the preceding read.
+        // The checkpoint itself is still attempted exactly once.
+        assert!(wait_until(std::time::Duration::from_secs(30), || {
+            let Some(current) = owners.iter().position(|owner| {
+                owner.as_ref().is_some_and(|owner| {
+                    owner
+                        ._network_host
+                        .bootstrap_is_local_leader(agent)
+                        .unwrap_or(false)
+                })
+            }) else {
+                return false;
+            };
+            successor = current;
+            true
+        }));
+        let owner = owners[successor].as_mut().unwrap();
+        let checkpoint = owner
+            .prepare_authority_projection(query(owner, successor, 0xd1 + cycle))
+            .unwrap();
+        let (checkpoint_work, checkpoint_auth) = checkpoint.invocation().unwrap();
+        let committee = owner.pins.replicas.clone();
+        if cycle == 0 {
+            owner
+                .host
+                .lock()
+                .unwrap()
+                .set_common_checkpoint_crash_for_test(crash);
+        }
+        let installed = owner
+            ._network_host
+            .certified_common_checkpoint_for_admission(
+                agent,
+                checkpoint_work,
+                checkpoint_auth,
+                &committee,
+                fixtures[successor].merge.as_ref(),
+            );
+        if cycle == 0 {
+            assert!(
+                installed.is_err(),
+                "source nonempty capsule checkpoint must hit {crash:?}"
+            );
+            assert!(owner.host.lock().unwrap().show(agent).unwrap().is_none());
+            drop(owners[successor].take());
+            owners[successor] = Some(reopen_owner(
+                &fixtures[successor],
+                &directories[successor],
+                &stores[successor],
+                providers[successor].clone(),
+                live_networks[successor].as_ref().unwrap().clone(),
+                signer,
+            ));
+        } else {
+            if let Err(error) = &installed {
+                eprintln!(
+                    "checkpoint_cycle_failure cycle={cycle} selected={successor} error={error:?}"
+                );
+                for (index, owner) in owners
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, owner)| owner.as_ref().map(|owner| (index, owner)))
+                {
+                    eprintln!(
+                        "checkpoint_voter index={index} leader={:?}",
+                        owner._network_host.bootstrap_is_local_leader(agent)
+                    );
+                    let mut host = owner.host.lock().unwrap();
+                    match host.request_common_snapshot_compaction(agent) {
+                        Ok(candidate) => {
+                            let manifest = host.recovery_manifest(agent).unwrap();
+                            crate::network::shared_agent::trace_common_checkpoint_material_for_test(
+                                "fixture_failure",
+                                HostNodeId(owner.pins.node.0),
+                                candidate.claim(),
+                                &manifest,
+                            );
+                        }
+                        Err(error) => {
+                            eprintln!("checkpoint_voter index={index} candidate_error={error:?}")
+                        }
+                    }
+                }
+            }
+            installed.unwrap();
+        }
+        let owner = owners[successor].as_mut().unwrap();
+        let bytes = owner
+            .host
+            .lock()
+            .unwrap()
+            .export_common_checkpoint(agent, limits)
+            .unwrap();
+        let source_manifest = owner
+            ._network_host
+            .projection_recovery_manifest(agent)
+            .unwrap();
+        assert_eq!(source_manifest.slot(registration.owner()), Some(&archived));
+        assert_eq!(
+            owner.committed_projection_response(&work).unwrap(),
+            Some(expected_response.clone())
+        );
+        let mut destination = offline_host.lock().unwrap();
+        if cycle == 2 {
+            destination.set_common_checkpoint_crash_for_test(crash);
+        }
+        let imported = destination.restore_common_checkpoint(&bytes, limits);
+        if cycle == 2 {
+            assert!(
+                imported.is_err(),
+                "destination nonempty capsule import must hit {crash:?}"
+            );
+            assert!(destination.show(agent).unwrap().is_none());
+        } else {
+            imported.unwrap();
+            assert_eq!(
+                destination.recovery_manifest(agent).unwrap(),
+                source_manifest
+            );
+            assert!(
+                destination
+                    .retained_positive_clean_acknowledgement(agent, &work, &authorization)
+                    .unwrap()
+            );
+        }
+        assert_eq!(
+            stores[origin]
+                .1
+                .clone()
+                .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
+                .unwrap(),
+            Some(saved_record.clone())
+        );
+        drop(destination);
+        assert!(wait_until(std::time::Duration::from_secs(30), || owners
+            .iter()
+            .flatten()
+            .any(|owner| owner
+                ._network_host
+                .bootstrap_is_local_leader(agent)
+                .unwrap_or(false))));
+        successor = owners
+            .iter()
+            .position(|owner| {
+                owner.as_ref().is_some_and(|owner| {
+                    owner
+                        ._network_host
+                        .bootstrap_is_local_leader(agent)
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap();
+    }
+    drop(offline_host);
+    // Complete the interrupted destination journal/ledger import without
+    // opening its bootstrap lifecycle or network. This captures the exact
+    // restored Ordered cursor before startup is allowed to retire its PAP.
+    let restored = SharedAgentHost::open_with_root(
+        directories[origin].host(),
+        directories[origin].lock(),
+        AgentHostScope {
+            space: HostSpaceId(fixtures[origin].plan.pins.space.0),
+            node: HostNodeId(fixtures[origin].plan.pins.node.0),
+        },
+        fixtures[origin].trust.clone(),
+        fixtures[origin].merge.clone(),
+        fixtures[origin].finality.clone(),
+        fixtures[origin].plan.pins.root.clone(),
+    )
+    .unwrap();
+    let restored_ordered = restored.journal_position(agent).unwrap().ordered_index;
+    drop(restored);
+    assert!(
+        stores[origin]
+            .1
+            .clone()
+            .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
+            .unwrap()
+            .as_deref()
+            == Some(saved_record.as_slice()),
+        "detached import must preserve the exact signed pending record"
+    );
+    live_networks[origin] = Some(restart_network(origin));
+    for index in 0..3 {
+        if index != origin {
+            live_networks[origin]
+                .as_ref()
+                .unwrap()
+                .connect(live_networks[index].as_ref().unwrap().listen_addrs()[0].clone());
+        }
+    }
+    owners[origin] = Some(reopen_owner(
+        &fixtures[origin],
+        &directories[origin],
+        &stores[origin],
+        providers[origin].clone(),
+        live_networks[origin].as_ref().unwrap().clone(),
+        signer,
+    ));
+    let owner = owners[origin].as_mut().unwrap();
+    // Startup proves the retained positive ACK and durably clears PAP before
+    // attaching the route. It must not leave the already-completed PAP live,
+    // replace any other bootstrap field, or execute another Ordered entry.
+    let mut cleared_record = CleanSystemAgentBootstrapRecord::decode(&saved_record).unwrap();
+    cleared_record.pending_projection = None;
+    assert!(owner.record == cleared_record);
+    assert!(
+        owner
+            .record_store
+            .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
+            .unwrap()
+            .as_deref()
+            == Some(cleared_record.encode().as_slice()),
+        "startup must durably retire only the completed pending record"
+    );
+    assert_eq!(owner.ordered_index_for_test().unwrap(), restored_ordered);
+    assert_eq!(
+        owner.committed_projection_response(&work).unwrap(),
+        Some(expected_response.clone())
+    );
+    assert!(!owner.recover_pending_authority_projection().unwrap());
+    assert!(owner.record.pending_projection.is_none());
+    assert_eq!(owner.ordered_index_for_test().unwrap(), restored_ordered);
+    assert_eq!(
+        owner.committed_projection_response(&work).unwrap(),
+        Some(expected_response)
+    );
+    assert_eq!(
+        owner
+            ._network_host
+            .projection_recovery_manifest(agent)
+            .unwrap()
+            .slot(registration.owner()),
+        Some(&archived)
+    );
+    *networks = live_networks.into_iter().map(Option::unwrap).collect();
+}
+
 pub(super) fn exercise(
     leader: usize,
     owners: &mut [Option<MemoryBootstrapOwner>],
@@ -153,9 +913,29 @@ pub(super) fn exercise(
     signer: &mut CountingSigner,
     exercise: Exercise,
 ) {
+    if let Exercise::ContendedIntent = exercise {
+        exercise_contended_intent(leader, owners, fixtures, networks);
+        return;
+    }
+    if let Exercise::Recovery(boundary) = exercise {
+        exercise_registered_recovery(
+            leader,
+            owners,
+            fixtures,
+            directories,
+            stores,
+            providers,
+            networks,
+            signer,
+            boundary,
+        );
+        return;
+    }
     let crash = match exercise {
         Exercise::Healthy => None,
         Exercise::Crash(stage) => Some(stage),
+        Exercise::Recovery(_) => unreachable!(),
+        Exercise::ContendedIntent => unreachable!(),
     };
     let agent = HostAgentId(fixtures[leader].plan.pins.agent.0);
     let lagger = (leader + 1) % 3;

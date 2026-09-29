@@ -26,12 +26,12 @@ use super::genesis::{
     AgentGenesisAdmissionId, AgentReplicaCommittee, AgentReplicaCommitteeId,
     MAX_AGENT_REPLICA_COMMITTEE_BYTES,
 };
-#[cfg(feature = "storage")]
-use super::journal::OrderedBase;
 use super::journal::{
     AgentJournalGenesisId, CanonicalJournalRecord, JournalHeadsId, MAX_JOURNAL_RECORD_BYTES,
     OrderedEntry, OrderedEntryId,
 };
+#[cfg(feature = "storage")]
+use super::journal::{OrderedBase, ReplayInput, ReplayOperation};
 #[cfg(all(feature = "std", feature = "storage"))]
 use super::replay::PublishedSharedOrdered;
 #[cfg(feature = "storage")]
@@ -46,6 +46,14 @@ use super::shared_commit::{
     SharedAgentSnapshotCertificate, SharedAgentSnapshotClaim, VerifiedSharedAgentPortableSnapshot,
 };
 use super::shared_commit::{OrderedCommitClaim, SharedCommitError};
+#[cfg(feature = "storage")]
+use super::shared_recovery::SharedRecoverySlot;
+#[cfg(feature = "storage")]
+use super::shared_recovery::{
+    MAX_SHARED_RECOVERY_MANIFEST_BYTES, SharedRecoveryManifest, SharedRecoveryObservation,
+    VerifiedSharedRecoveryObservation,
+};
+use super::shared_recovery::{MAX_SHARED_RECOVERY_REGISTRATION_BYTES, SharedRecoveryRegistration};
 use super::{
     AgentProfile, MAX_AGENT_REPLICAS, MAX_CATALOG_ARTIFACT_BYTES,
     MAX_CATALOG_ARTIFACT_REFERENCED_BYTES, MAX_CATALOG_ARTIFACT_REFERENCES, ReplicaRole,
@@ -101,6 +109,10 @@ pub const MAX_ARTIFACT_CHUNK_WIRE_BYTES: usize = 96 * 1024;
 /// otherwise valid clean work.
 pub const MAX_AGENT_RAFT_COMMAND_BYTES: usize =
     MAX_JOURNAL_RECORD_BYTES + MAX_AGENT_ROUTE_KEY_BYTES + 512;
+const _: () = assert!(
+    MAX_AGENT_RAFT_COMMAND_BYTES
+        >= MAX_SHARED_RECOVERY_REGISTRATION_BYTES + MAX_AGENT_ROUTE_KEY_BYTES + 128
+);
 /// Maximum complete authorized committee-change preparation.
 pub const MAX_PREPARE_COMMITTEE_CHANGE_BYTES: usize = 160 * 1024;
 /// Maximum complete encoded physical `vos-raft` slot admitted by the Shared
@@ -921,13 +933,19 @@ pub enum AgentRaftCommand {
         entry: OrderedEntry,
     },
     PrepareCommitteeChange(PrepareCommitteeChange),
+    RegisterRecovery {
+        route: AgentRouteKey,
+        registration: SharedRecoveryRegistration,
+    },
 }
 
 impl AgentRaftCommand {
     pub fn route(&self) -> AgentRouteKey {
         match self {
             Self::ArtifactChunk(chunk) => chunk.manifest.route,
-            Self::ArtifactAbort { route, .. } | Self::Ordered { route, .. } => *route,
+            Self::ArtifactAbort { route, .. }
+            | Self::Ordered { route, .. }
+            | Self::RegisterRecovery { route, .. } => *route,
             Self::PrepareCommitteeChange(change) => change.route(),
         }
     }
@@ -944,6 +962,9 @@ impl AgentRaftCommand {
                 .validate()
                 .map_err(|_| AgentRaftWireError::InvalidOrderedCommand)?,
             Self::PrepareCommitteeChange(change) => change.validate()?,
+            Self::RegisterRecovery { registration, .. } => registration
+                .validate()
+                .map_err(|_| AgentRaftWireError::InvalidOrderedCommand)?,
             Self::ArtifactAbort { .. } => {}
         }
         enforce_wire_bound(self, MAX_AGENT_RAFT_COMMAND_BYTES)
@@ -974,6 +995,17 @@ impl AgentRaftCommand {
                 }
             }
             Self::ArtifactChunk(_) | Self::PrepareCommitteeChange(_) => {}
+            Self::RegisterRecovery {
+                route,
+                registration,
+            } => {
+                route.validate()?;
+                if registration.generation() != route.generation()
+                    || registration.committee() != route.committee()
+                {
+                    return Err(AgentRaftWireError::InvalidOrderedCommand);
+                }
+            }
         }
         Ok(())
     }
@@ -1010,6 +1042,14 @@ impl ServiceWire for AgentRaftCommand {
                 encoder.u8(3);
                 encoder.bytes(&change.encode());
             }
+            Self::RegisterRecovery {
+                route,
+                registration,
+            } => {
+                encoder.u8(4);
+                encode_route(&mut encoder, *route);
+                encoder.bytes(&registration.encode());
+            }
         }
     }
 
@@ -1034,6 +1074,13 @@ impl ServiceWire for AgentRaftCommand {
                 decoder,
                 MAX_PREPARE_COMMITTEE_CHANGE_BYTES,
             )?),
+            4 => Self::RegisterRecovery {
+                route: decode_route(decoder)?,
+                registration: decode_nested::<SharedRecoveryRegistration>(
+                    decoder,
+                    MAX_SHARED_RECOVERY_REGISTRATION_BYTES,
+                )?,
+            },
             _ => return Err(DecodeError::InvalidTag),
         };
         // The complete incoming frame was bounded above, and decode_nested
@@ -1750,6 +1797,10 @@ impl DurableSharedRaftLogWitness for RedbSharedRaftLogWitness {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AgentRaftApplyDispositionV2 {
     LeaderNoop,
+    RecoveryRegistered {
+        registration: Hash,
+        manifest: Hash,
+    },
     Command(AgentRaftAuditDisposition),
     CommitteeChangePrepared {
         transition: CommitteeTransitionId,
@@ -1773,6 +1824,10 @@ impl AgentRaftApplyDispositionV2 {
     fn validate(self) -> Result<(), AgentRaftWireError> {
         match self {
             Self::LeaderNoop => {}
+            Self::RecoveryRegistered {
+                registration,
+                manifest,
+            } if registration != Hash::ZERO && manifest != Hash::ZERO => {}
             Self::Command(disposition) => disposition.validate()?,
             Self::CommitteeChangePrepared {
                 transition,
@@ -2621,6 +2676,14 @@ fn decode_disposition(decoder: &mut Decoder<'_>) -> Result<AgentRaftAuditDisposi
 fn encode_disposition_v2(encoder: &mut Encoder<'_>, disposition: AgentRaftApplyDispositionV2) {
     match disposition {
         AgentRaftApplyDispositionV2::LeaderNoop => encoder.u8(0),
+        AgentRaftApplyDispositionV2::RecoveryRegistered {
+            registration,
+            manifest,
+        } => {
+            encoder.u8(5);
+            encoder.fixed(&registration.0);
+            encoder.fixed(&manifest.0);
+        }
         AgentRaftApplyDispositionV2::Command(disposition) => {
             encoder.u8(1);
             encode_disposition(encoder, disposition);
@@ -2679,6 +2742,10 @@ fn decode_disposition_v2(
             previous: AgentReplicaCommitteeId::from_bytes(decoder.fixed()?),
             next: AgentReplicaCommitteeId::from_bytes(decoder.fixed()?),
             authority: Hash(decoder.fixed()?),
+        },
+        5 => AgentRaftApplyDispositionV2::RecoveryRegistered {
+            registration: Hash(decoder.fixed()?),
+            manifest: Hash(decoder.fixed()?),
         },
         _ => return Err(DecodeError::InvalidTag),
     };
@@ -4414,6 +4481,7 @@ mod application_ledger_v2 {
             >= MAX_SHARED_AGENT_SNAPSHOT_CLAIM_BYTES
                 + MAX_SHARED_AGENT_COMMON_SNAPSHOT_CERTIFICATE_BYTES
                 + MAX_SHARED_AGENT_LOCAL_SNAPSHOT_BINDING_BYTES
+                + MAX_SHARED_RECOVERY_MANIFEST_BYTES
                 + 4096
     );
     const RETIRED_AUDIT_ROOT_DOMAIN: &[u8] = b"vos/agent/shared/retired-audit-root/v1";
@@ -4424,6 +4492,48 @@ mod application_ledger_v2 {
         b"vos/agent/shared/portable-recovery-retired-root/v1";
     const GENERATION_STORAGE_KEY_BYTES: usize = 32 * 4;
     const AUDIT_STORAGE_KEY_BYTES: usize = GENERATION_STORAGE_KEY_BYTES + 8;
+
+    #[cfg(test)]
+    struct RecoveryPhaseTiming {
+        started: std::time::Instant,
+        previous: std::time::Instant,
+        operation: &'static str,
+        index: u64,
+        node: NodeId,
+    }
+
+    #[cfg(test)]
+    impl RecoveryPhaseTiming {
+        fn start(enabled: bool, operation: &'static str, index: u64, node: NodeId) -> Option<Self> {
+            if !enabled || std::env::var_os("VOS_SHARED_RECOVERY_TIMING").is_none() {
+                return None;
+            }
+            let started = std::time::Instant::now();
+            Some(Self {
+                started,
+                previous: started,
+                operation,
+                index,
+                node,
+            })
+        }
+
+        fn mark(timing: &mut Option<Self>, phase: &'static str) {
+            if let Some(timing) = timing {
+                let now = std::time::Instant::now();
+                std::eprintln!(
+                    "recovery_phase operation={} index={} node={:?} phase={} phase_us={} total_us={}",
+                    timing.operation,
+                    timing.index,
+                    timing.node,
+                    phase,
+                    now.duration_since(timing.previous).as_micros(),
+                    now.duration_since(timing.started).as_micros(),
+                );
+                timing.previous = now;
+            }
+        }
+    }
 
     fn canonical_leader_noop_commitment() -> Result<Hash, AgentRaftApplicationErrorV2> {
         let raw = encode_agent_raft_entry_kind(&vos_raft::EntryKind::Data {
@@ -4448,6 +4558,10 @@ mod application_ledger_v2 {
         TableDefinition::new("agent_shared_raft_command_reservation_v2");
     const SNAPSHOT_TABLE_V2: TableDefinition<&[u8], &[u8]> =
         TableDefinition::new("agent_shared_raft_snapshot_v2");
+    const RECOVERY_MANIFEST_TABLE_V2: TableDefinition<&[u8], &[u8]> =
+        TableDefinition::new("agent_shared_raft_recovery_manifest_v2");
+    const RECOVERY_OBSERVATION_TABLE_V2: TableDefinition<&[u8], &[u8]> =
+        TableDefinition::new("agent_shared_raft_recovery_observation_v2");
 
     const V2_TABLE_NAMES: &[&str] = &[
         "raft_log",
@@ -4458,6 +4572,8 @@ mod application_ledger_v2 {
         "agent_shared_raft_committee_state_v2",
         "agent_shared_raft_command_reservation_v2",
         "agent_shared_raft_snapshot_v2",
+        "agent_shared_raft_recovery_manifest_v2",
+        "agent_shared_raft_recovery_observation_v2",
     ];
 
     // Any table from the previous committee-keyed evidence generation makes
@@ -4725,6 +4841,7 @@ mod application_ledger_v2 {
         Common {
             certificate: SharedAgentCommonSnapshotCertificate,
             binding: SharedAgentLocalSnapshotBinding,
+            recovery: Option<(SharedRecoveryManifest, AgentRaftApplyDispositionV2)>,
         },
     }
 
@@ -4743,6 +4860,29 @@ mod application_ledger_v2 {
     }
 
     impl AgentRaftSnapshotRecordV2 {
+        fn boundary_disposition(
+            &self,
+        ) -> Result<AgentRaftApplyDispositionV2, AgentRaftApplicationErrorV2> {
+            if let SnapshotAuthorityV2::Common {
+                recovery: Some((_, disposition)),
+                ..
+            } = &self.authority
+            {
+                return Ok(*disposition);
+            }
+            legacy_snapshot_boundary(&self.claim)
+        }
+
+        fn recovery_manifest(&self) -> Option<&SharedRecoveryManifest> {
+            match &self.authority {
+                SnapshotAuthorityV2::Common {
+                    recovery: Some((manifest, _)),
+                    ..
+                } => Some(manifest),
+                _ => None,
+            }
+        }
+
         fn authority_commitment(&self) -> Hash {
             match &self.authority {
                 SnapshotAuthorityV2::Physical(certificate) => certificate.commitment(),
@@ -4753,17 +4893,35 @@ mod application_ledger_v2 {
 
         fn verify_authority(&self) -> Result<(), AgentRaftApplicationErrorV2> {
             match &self.authority {
-                SnapshotAuthorityV2::Common { certificate, binding } => {
-                    binding.verify(certificate, &self.claim)
+                SnapshotAuthorityV2::Common {
+                    certificate,
+                    binding,
+                    recovery,
+                } => {
+                    binding
+                        .verify(certificate, &self.claim)
                         .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+                    validate_common_recovery_manifest(
+                        certificate,
+                        recovery.as_ref().map(|(manifest, _)| manifest),
+                    )?;
+                    if let Some((manifest, disposition)) = recovery {
+                        validate_snapshot_recovery_boundary(self, manifest, *disposition)?;
+                    }
                     let foundation = common_restore_foundation(
-                        self.generation, self.journal_store, self.local_node, certificate.commitment(),
+                        self.generation,
+                        self.journal_store,
+                        self.local_node,
+                        certificate.commitment(),
                     );
                     // Import mode is bound by the signed physical foundation,
                     // not an independently mutable flag in the ledger row.
-                    if self.claim.boundary_payload_commitment() == foundation.boundary_payload_commitment {
+                    if self.claim.boundary_payload_commitment()
+                        == foundation.boundary_payload_commitment
+                    {
                         if self.claim.retired_audit_root() != foundation.retired_audit_root
-                            || self.claim.committee_evidence_root() != foundation.committee_evidence_root
+                            || self.claim.committee_evidence_root()
+                                != foundation.committee_evidence_root
                             || self.claim.previous_snapshot().is_some()
                             || !self.committee_evidence.is_empty()
                         {
@@ -4864,6 +5022,101 @@ mod application_ledger_v2 {
         }
     }
 
+    fn legacy_snapshot_boundary(
+        claim: &SharedAgentSnapshotClaim,
+    ) -> Result<AgentRaftApplyDispositionV2, AgentRaftApplicationErrorV2> {
+        if claim.boundary_payload_commitment() == canonical_leader_noop_commitment()? {
+            Ok(AgentRaftApplyDispositionV2::LeaderNoop)
+        } else {
+            Ok(AgentRaftApplyDispositionV2::Command(
+                AgentRaftAuditDisposition::OrderedApplied {
+                    entry: claim
+                        .ordered()
+                        .ordered()
+                        .head
+                        .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?,
+                    claim: claim.ordered().commitment(),
+                    successor: claim.ordered_successor(),
+                },
+            ))
+        }
+    }
+
+    fn validate_common_recovery_manifest(
+        certificate: &SharedAgentCommonSnapshotCertificate,
+        manifest: Option<&SharedRecoveryManifest>,
+    ) -> Result<(), AgentRaftApplicationErrorV2> {
+        if let Some(manifest) = manifest {
+            manifest
+                .validate_at(certificate.claim().ordered().raft_index())
+                .map_err(|_| AgentRaftApplicationErrorV2::SnapshotCertificateInvalid)?;
+            let ordered = certificate.claim().ordered();
+            if manifest.generation()
+                != AgentGenerationRouteKey::new(
+                    ordered.space(),
+                    ordered.agent(),
+                    ordered.genesis(),
+                    ordered.admission(),
+                )
+                .map_err(|_| AgentRaftApplicationErrorV2::SnapshotCertificateInvalid)?
+                || manifest.committee() != certificate.claim().active_committee()
+            {
+                return Err(AgentRaftApplicationErrorV2::SnapshotCertificateInvalid);
+            }
+        }
+        match (certificate.claim().recovery_manifest(), manifest) {
+            (Some(expected), Some(manifest)) if manifest.commitment() == expected => Ok(()),
+            (None, None) => Ok(()),
+            (None, Some(manifest)) if manifest.is_empty() => Ok(()),
+            _ => Err(AgentRaftApplicationErrorV2::SnapshotCertificateInvalid),
+        }
+    }
+
+    fn validate_snapshot_recovery_boundary(
+        record: &AgentRaftSnapshotRecordV2,
+        manifest: &SharedRecoveryManifest,
+        disposition: AgentRaftApplyDispositionV2,
+    ) -> Result<(), AgentRaftApplicationErrorV2> {
+        if let AgentRaftApplyDispositionV2::RecoveryRegistered {
+            registration,
+            manifest: root,
+        } = disposition
+        {
+            if root != manifest.commitment() {
+                return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+            }
+            let registered = manifest
+                .slots()
+                .iter()
+                .find(|slot| slot.registration().commitment() == registration)
+                .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+            let route = AgentRouteKey::new(
+                record.generation.space,
+                record.generation.agent,
+                record.generation.genesis,
+                record.generation.admission,
+                manifest.committee().id(),
+            )
+            .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            let physical = encode_agent_raft_entry_kind(&vos_raft::EntryKind::Data {
+                payload: AgentRaftCommand::RegisterRecovery {
+                    route,
+                    registration: registered.registration().clone(),
+                }
+                .encode(),
+            })
+            .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            if Hash::digest(AGENT_RAFT_PHYSICAL_SLOT_COMMITMENT_DOMAIN, &[&physical])
+                != record.claim.boundary_payload_commitment()
+            {
+                return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+            }
+        } else if disposition != legacy_snapshot_boundary(&record.claim)? {
+            return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+        }
+        Ok(())
+    }
+
     impl ServiceWire for AgentRaftSnapshotRecordV2 {
         const MAGIC: [u8; 4] = *b"ASR4";
 
@@ -4882,10 +5135,18 @@ mod application_ledger_v2 {
                     encoder.u8(1);
                     encoder.bytes(&certificate.encode());
                 }
-                SnapshotAuthorityV2::Common { certificate, binding } => {
-                    encoder.u8(2);
+                SnapshotAuthorityV2::Common {
+                    certificate,
+                    binding,
+                    recovery,
+                } => {
+                    encoder.u8(if recovery.is_some() { 3 } else { 2 });
                     encoder.bytes(&certificate.encode());
                     encoder.bytes(&binding.encode());
+                    if let Some((manifest, disposition)) = recovery {
+                        encoder.bytes(&manifest.encode());
+                        encode_disposition_v2(&mut encoder, *disposition);
+                    }
                 }
             }
             encoder.u32(self.committee_evidence.len() as u32);
@@ -4918,8 +5179,32 @@ mod application_ledger_v2 {
                     MAX_SHARED_AGENT_PORTABLE_SNAPSHOT_CERTIFICATE_BYTES,
                 )?),
                 2 => SnapshotAuthorityV2::Common {
-                    certificate: decode_nested::<SharedAgentCommonSnapshotCertificate>(decoder, MAX_SHARED_AGENT_COMMON_SNAPSHOT_CERTIFICATE_BYTES)?,
-                    binding: decode_nested::<SharedAgentLocalSnapshotBinding>(decoder, MAX_SHARED_AGENT_LOCAL_SNAPSHOT_BINDING_BYTES)?,
+                    certificate: decode_nested::<SharedAgentCommonSnapshotCertificate>(
+                        decoder,
+                        MAX_SHARED_AGENT_COMMON_SNAPSHOT_CERTIFICATE_BYTES,
+                    )?,
+                    binding: decode_nested::<SharedAgentLocalSnapshotBinding>(
+                        decoder,
+                        MAX_SHARED_AGENT_LOCAL_SNAPSHOT_BINDING_BYTES,
+                    )?,
+                    recovery: None,
+                },
+                3 => SnapshotAuthorityV2::Common {
+                    certificate: decode_nested::<SharedAgentCommonSnapshotCertificate>(
+                        decoder,
+                        MAX_SHARED_AGENT_COMMON_SNAPSHOT_CERTIFICATE_BYTES,
+                    )?,
+                    binding: decode_nested::<SharedAgentLocalSnapshotBinding>(
+                        decoder,
+                        MAX_SHARED_AGENT_LOCAL_SNAPSHOT_BINDING_BYTES,
+                    )?,
+                    recovery: Some((
+                        decode_nested::<SharedRecoveryManifest>(
+                            decoder,
+                            MAX_SHARED_RECOVERY_MANIFEST_BYTES,
+                        )?,
+                        decode_disposition_v2(decoder)?,
+                    )),
                 },
                 _ => return Err(DecodeError::InvalidTag),
             };
@@ -4953,6 +5238,8 @@ mod application_ledger_v2 {
     /// Read-only ledger contribution to an exact journal checkpoint claim.
     #[derive(Clone, Debug)]
     pub(crate) struct AgentRaftSnapshotContextV2 {
+        pub(crate) recovery_manifest: Option<SharedRecoveryManifest>,
+        boundary_disposition: AgentRaftApplyDispositionV2,
         /// Exact logical Ordered projection rebound only for this snapshot to
         /// the latest authenticated physical foundation.
         pub(crate) ordered: OrderedCommitClaim,
@@ -4964,6 +5251,64 @@ mod application_ledger_v2 {
         pub(crate) committee_evidence_root: Hash,
         pub(crate) previous_snapshot: Option<Hash>,
         committee_evidence: Vec<SnapshotCommitteeEvidenceV2>,
+    }
+
+    /// Call-local products of one complete audit in one database snapshot.
+    /// Never retained across application calls or peer I/O.
+    struct AuditedRecoveryView {
+        meta: AgentRaftApplyMetaV2,
+        committee: CommitteeApplicationStateV2,
+        raft: crate::raft::RaftMeta,
+        snapshot: Option<AgentRaftSnapshotRecordV2>,
+        recovery: Option<SharedRecoveryManifest>,
+        reservation_pending: bool,
+    }
+
+    impl AuditedRecoveryView {
+        fn capacity(&self) -> (u64, u64, bool) {
+            (
+                self.meta.applied_index,
+                (MAX_AGENT_RAFT_ORDERED_EVIDENCE_ENTRIES as u64).saturating_sub(
+                    self.meta
+                        .applied_index
+                        .saturating_sub(self.raft.snap_last_index),
+                ),
+                self.reservation_pending,
+            )
+        }
+    }
+
+    /// One call's exact predecessor, never retained across application calls.
+    struct RecoveryUpdatePredecessor {
+        manifest: Option<Vec<u8>>,
+        meta: AgentRaftApplyMetaV2,
+        snapshot: (u64, u64),
+    }
+
+    struct StagedRecoveryUpdate {
+        predecessor: RecoveryUpdatePredecessor,
+        manifest: Option<Vec<u8>>,
+        observation: Option<Vec<u8>>,
+    }
+
+    impl StagedRecoveryUpdate {
+        fn require_current(
+            &self,
+            transaction: &redb::WriteTransaction,
+            key: &[u8],
+            meta: &AgentRaftApplyMetaV2,
+            raft: &crate::raft::RaftMeta,
+        ) -> Result<(), AgentRaftApplicationErrorV2> {
+            let table = transaction.open_table(RECOVERY_MANIFEST_TABLE_V2)?;
+            let current = table.get(key)?;
+            if current.as_ref().map(|value| value.value()) != self.predecessor.manifest.as_deref()
+                || meta != &self.predecessor.meta
+                || (raft.snap_last_index, raft.snap_last_term) != self.predecessor.snapshot
+            {
+                return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+            }
+            Ok(())
+        }
     }
 
     #[cfg(test)]
@@ -5199,6 +5544,8 @@ mod application_ledger_v2 {
                 drop(transaction.open_table(COMMITTEE_STATE_TABLE_V2)?);
                 drop(transaction.open_table(COMMAND_RESERVATION_TABLE_V2)?);
                 drop(transaction.open_table(SNAPSHOT_TABLE_V2)?);
+                drop(transaction.open_table(RECOVERY_MANIFEST_TABLE_V2)?);
+                drop(transaction.open_table(RECOVERY_OBSERVATION_TABLE_V2)?);
             }
             validate_v2_table_namespace_write(&transaction, true)?;
             ensure_single_generation_in_write(&transaction, &key, true)?;
@@ -5293,6 +5640,187 @@ mod application_ledger_v2 {
 
         pub(crate) const fn local_node(&self) -> NodeId {
             self.local_node
+        }
+
+        pub(crate) fn recovery_manifest(
+            &self,
+        ) -> Result<SharedRecoveryManifest, AgentRaftApplicationErrorV2> {
+            let transaction = self.database.begin_read()?;
+            let table = transaction.open_table(RECOVERY_MANIFEST_TABLE_V2)?;
+            let key = generation_storage_key(self.generation);
+            read_recovery_manifest(&table, &key, self.generation, &self.initial_committee)?
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    SharedRecoveryManifest::new(self.generation, self.initial_committee.clone())
+                        .map_err(|_| AgentRaftApplicationErrorV2::ConfigurationMismatch)
+                })
+        }
+
+        pub(crate) fn recovery_manifest_if_present(
+            &self,
+        ) -> Result<Option<SharedRecoveryManifest>, AgentRaftApplicationErrorV2> {
+            let transaction = self.database.begin_read()?;
+            read_recovery_manifest(
+                &transaction.open_table(RECOVERY_MANIFEST_TABLE_V2)?,
+                &generation_storage_key(self.generation),
+                self.generation,
+                &self.initial_committee,
+            )
+        }
+
+        pub(crate) fn recovery_input_registered(
+            &self,
+            input: &ReplayInput,
+        ) -> Result<bool, AgentRaftApplicationErrorV2> {
+            Ok(self
+                .recovery_manifest_if_present()?
+                .as_ref()
+                .is_some_and(|manifest| recovery_input_matches(manifest, input)))
+        }
+
+        pub(crate) fn recovery_observations(
+            &self,
+        ) -> Result<Vec<SharedRecoveryObservation>, AgentRaftApplicationErrorV2> {
+            let transaction = self.database.begin_read()?;
+            let key = generation_storage_key(self.generation);
+            let table = transaction.open_table(RECOVERY_OBSERVATION_TABLE_V2)?;
+            exact_audit_row_count(&table, &key)?;
+            table
+                .iter()?
+                .map(|row| {
+                    let (key, _) = row?;
+                    read_recovery_observation(&table, key.value())?
+                        .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)
+                })
+                .collect()
+        }
+
+        /// Exact bounded hot-read proof. This does not authenticate outcome
+        /// bytes by itself: the driver also compares its fresh replay cache.
+        pub(crate) fn validate_recovery_observation(
+            &self,
+            observation: &SharedRecoveryObservation,
+        ) -> Result<(), AgentRaftApplicationErrorV2> {
+            let transaction = self.database.begin_read()?;
+            let raft = crate::raft::RaftMeta::load_from_read_transaction(&transaction)?;
+            let key = audit_storage_key(self.generation, observation.raft_index());
+            let audit_table = transaction.open_table(APPLY_AUDIT_TABLE_V2)?;
+            let bytes = audit_table
+                .get(key.as_slice())?
+                .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+            let audit = AgentRaftApplyAuditRecordV2::decode(bytes.value())
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            if audit.encode() != bytes.value()
+                || audit.generation != self.generation
+                || audit.index != observation.raft_index()
+            {
+                return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+            }
+            let physical = verify_audited_physical_row_in_read(&transaction, &raft, &audit)?;
+            let (
+                AgentRaftApplyDispositionV2::Command(AgentRaftAuditDisposition::OrderedApplied {
+                    claim,
+                    ..
+                }),
+                Some(AgentRaftCommand::Ordered { entry, .. }),
+            ) = (audit.disposition, physical.command)
+            else {
+                return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+            };
+            observation
+                .validate_binding(audit.index, audit.term, claim, &entry.input)
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            if read_recovery_observation(
+                &transaction.open_table(RECOVERY_OBSERVATION_TABLE_V2)?,
+                &key,
+            )?
+            .as_ref()
+                != Some(observation)
+            {
+                return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+            }
+            Ok(())
+        }
+
+        pub(crate) fn validate_recovery_registration(
+            &self,
+            registration: &SharedRecoveryRegistration,
+        ) -> Result<(), AgentRaftApplicationErrorV2> {
+            let state = self.network_committee_state()?;
+            if state.next.is_some() || state.active != self.initial_committee {
+                return Err(AgentRaftApplicationErrorV2::TransitionBarrier);
+            }
+            let mut manifest = self.recovery_manifest()?;
+            let cursor = self.cursor()?;
+            manifest
+                .apply_registration(
+                    registration,
+                    cursor.applied_index.saturating_add(1),
+                    cursor.applied_term.max(1),
+                )
+                .map_err(|_| AgentRaftApplicationErrorV2::InvalidCommandDisposition)?;
+            Ok(())
+        }
+
+        /// A custody signature is not proof of application. Check the exact
+        /// registration metadata against its durable applied physical slot.
+        pub(crate) fn validate_recovery_slot_registration(
+            &self,
+            slot: &SharedRecoverySlot,
+        ) -> Result<(), AgentRaftApplicationErrorV2> {
+            let transaction = self.database.begin_read()?;
+            let raft = crate::raft::RaftMeta::load_from_read_transaction(&transaction)?;
+            let generation_key = generation_storage_key(self.generation);
+            let meta_table = transaction.open_table(APPLY_META_TABLE_V2)?;
+            let meta_bytes = meta_table
+                .get(generation_key.as_slice())?
+                .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+            let meta = AgentRaftApplyMetaV2::decode(meta_bytes.value())
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            validate_bound_meta(&meta, self.generation, self.journal_store)?;
+            if meta.encode() != meta_bytes.value()
+                || raft.last_applied != meta.applied_index
+                || slot.raft_index() > meta.applied_index
+                || slot.raft_index() <= raft.snap_last_index
+            {
+                return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+            }
+            let key = audit_storage_key(self.generation, slot.raft_index());
+            let table = transaction.open_table(APPLY_AUDIT_TABLE_V2)?;
+            let bytes = table
+                .get(key.as_slice())?
+                .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+            let audit = AgentRaftApplyAuditRecordV2::decode(bytes.value())
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            if audit.encode() != bytes.value()
+                || audit.generation != self.generation
+                || audit.index != slot.raft_index()
+                || audit.term != slot.raft_term()
+            {
+                return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+            }
+            let physical = verify_audited_physical_row_in_read(&transaction, &raft, &audit)?;
+            let (
+                AgentRaftApplyDispositionV2::RecoveryRegistered {
+                    registration: commitment,
+                    ..
+                },
+                Some(AgentRaftCommand::RegisterRecovery {
+                    route,
+                    registration,
+                }),
+            ) = (audit.disposition, physical.command)
+            else {
+                return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+            };
+            if route.generation() != self.generation
+                || route.committee() != self.initial_committee.id()
+                || commitment != slot.registration().commitment()
+                || registration != *slot.registration()
+            {
+                return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+            }
+            Ok(())
         }
 
         /// Test-only physical consensus harness. Production callers cannot
@@ -5406,49 +5934,67 @@ mod application_ledger_v2 {
                 .writes
                 .lock()
                 .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
-            self.audit_recovery()?;
-            self.snapshot_context_unlocked(ordered)
+            let transaction = self.database.begin_read()?;
+            let audited = self.audit_recovery_in_read(&transaction)?;
+            self.snapshot_context_from_audit(&transaction, ordered, audited)
         }
 
-        fn snapshot_context_unlocked(
+        /// Select the exact installed or journal-bound logical projection and
+        /// derive its physical context from the same fresh audited read view.
+        pub(crate) fn snapshot_candidate_context(
             &self,
+            heads: &super::super::journal::JournalHeads,
+            journal_ordered: Option<&OrderedCommitClaim>,
+        ) -> Result<AgentRaftSnapshotContextV2, AgentRaftApplicationErrorV2> {
+            let _guard = self
+                .writes
+                .lock()
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            let transaction = self.database.begin_read()?;
+            let audited = self.audit_recovery_in_read(&transaction)?;
+            let entry = heads
+                .ordered_head
+                .ok_or(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired)?;
+            let matches_heads = |claim: &&OrderedCommitClaim| {
+                claim.ordered().head == Some(entry)
+                    && claim.ordered().index == heads.ordered_index
+                    && claim.genesis() == heads.genesis
+                    && claim.admission() == heads.admission
+                    && claim.runtime() == &heads.runtime
+            };
+            // Prefer the installed foundation after no-op-only progress; an
+            // older retained journal binding must not skip that certified base.
+            let ordered = audited
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.claim.ordered())
+                .filter(matches_heads)
+                .or_else(|| journal_ordered.filter(matches_heads))
+                .ok_or(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired)?
+                .clone();
+            self.snapshot_context_from_audit(&transaction, &ordered, audited)
+        }
+
+        fn snapshot_context_from_audit(
+            &self,
+            transaction: &redb::ReadTransaction,
             ordered: &OrderedCommitClaim,
+            audited: AuditedRecoveryView,
         ) -> Result<AgentRaftSnapshotContextV2, AgentRaftApplicationErrorV2> {
             ordered
                 .validate()
                 .map_err(|_| AgentRaftApplicationErrorV2::SnapshotBoundaryRequired)?;
             let key = generation_storage_key(self.generation);
-            let transaction = self.database.begin_read()?;
-            ensure_v2_config_in_read(
-                &transaction,
-                key.as_slice(),
-                self.generation,
-                self.journal_store,
-                self.local_node,
-                &self.initial_committee,
-                self.authority,
-            )?;
-            let meta_bytes = transaction
-                .open_table(APPLY_META_TABLE_V2)?
-                .get(key.as_slice())?
-                .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?
-                .value()
-                .to_vec();
-            let meta = AgentRaftApplyMetaV2::decode(&meta_bytes)
-                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
-            let state_bytes = transaction
-                .open_table(COMMITTEE_STATE_TABLE_V2)?
-                .get(key.as_slice())?
-                .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?
-                .value()
-                .to_vec();
-            let state = CommitteeApplicationStateV2::decode(&state_bytes)
-                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            let AuditedRecoveryView {
+                meta,
+                committee: state,
+                raft,
+                snapshot: previous,
+                recovery,
+                reservation_pending,
+            } = audited;
             if state.pending.is_some()
-                || transaction
-                    .open_table(COMMAND_RESERVATION_TABLE_V2)?
-                    .get(key.as_slice())?
-                    .is_some()
+                || reservation_pending
                 || meta.applied_index < ordered.raft_index()
                 || ordered.space() != self.generation.space
                 || ordered.agent() != self.generation.agent
@@ -5459,8 +6005,6 @@ mod application_ledger_v2 {
                 return Err(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired);
             }
 
-            let previous = read_snapshot_in_read(&transaction, key.as_slice())?;
-            let raft = crate::raft::RaftMeta::load_from_read_transaction(&transaction)?;
             if meta.applied_index <= raft.snap_last_index {
                 return Err(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired);
             }
@@ -5536,7 +6080,11 @@ mod application_ledger_v2 {
                     logical_boundary_seen = true;
                     ordered_successor = Some(successor);
                 } else if record.index > ordered.raft_index()
-                    && record.disposition != AgentRaftApplyDispositionV2::LeaderNoop
+                    && !matches!(
+                        record.disposition,
+                        AgentRaftApplyDispositionV2::LeaderNoop
+                            | AgentRaftApplyDispositionV2::RecoveryRegistered { .. }
+                    )
                 {
                     return Err(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired);
                 }
@@ -5567,6 +6115,10 @@ mod application_ledger_v2 {
                 .with_raft_foundation(meta.applied_index, meta.applied_term)
                 .map_err(|_| AgentRaftApplicationErrorV2::SnapshotBoundaryRequired)?;
             Ok(AgentRaftSnapshotContextV2 {
+                boundary_disposition: meta
+                    .disposition
+                    .ok_or(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired)?,
+                recovery_manifest: recovery,
                 ordered,
                 active_committee: state.active,
                 authority_epoch: state.authority_epoch,
@@ -5610,11 +6162,44 @@ mod application_ledger_v2 {
             binding
                 .verify(certificate, binding.claim())
                 .map_err(|_| AgentRaftApplicationErrorV2::SnapshotCertificateInvalid)?;
+            {
+                let transaction = self.database.begin_read()?;
+                if let Some(current) = read_snapshot_in_read(
+                    &transaction,
+                    generation_storage_key(self.generation).as_slice(),
+                )? && let SnapshotAuthorityV2::Common {
+                    certificate: installed,
+                    binding: local,
+                    ..
+                } = &current.authority
+                    && installed == certificate
+                    && local == binding
+                {
+                    current.verify_authority()?;
+                    return Ok(InstalledAgentRaftSnapshotV2 {
+                        claim: current.claim.clone(),
+                        certificate_commitment: current.authority_commitment(),
+                    });
+                }
+            }
+            let manifest = self.recovery_manifest()?;
+            validate_common_recovery_manifest(certificate, Some(&manifest))?;
+            let recovery = if certificate.claim().recovery_manifest().is_some() {
+                Some((
+                    manifest,
+                    self.cursor()?
+                        .disposition
+                        .ok_or(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired)?,
+                ))
+            } else {
+                None
+            };
             self.install_snapshot_authority(
                 binding.claim(),
                 SnapshotAuthorityV2::Common {
                     certificate: certificate.clone(),
                     binding: binding.clone(),
+                    recovery,
                 },
                 logical_ordered,
             )
@@ -5630,11 +6215,11 @@ mod application_ledger_v2 {
                 .writes
                 .lock()
                 .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
-            self.audit_recovery()?;
             let key = generation_storage_key(self.generation);
-            {
+            let context = {
                 let transaction = self.database.begin_read()?;
-                if let Some(current) = read_snapshot_in_read(&transaction, key.as_slice())? {
+                let audited = self.audit_recovery_in_read(&transaction)?;
+                if let Some(current) = &audited.snapshot {
                     let current_index = current.claim.raft_index();
                     if claim.raft_index() <= current_index {
                         if current.authority == authority && &current.claim == claim {
@@ -5646,16 +6231,40 @@ mod application_ledger_v2 {
                         return Err(AgentRaftApplicationErrorV2::SnapshotStale);
                     }
                 }
-            }
 
-            // The certificate may bind the same logical Ordered projection to
-            // a later leader-noop foundation. Reconstruct that projection
-            // independently from the journal binding (or prior installed
-            // snapshot); never feed the synthetic foundation back into an
-            // Ordered commit-verification path.
-            let logical_ordered =
-                logical_ordered.ok_or(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired)?;
-            let context = self.snapshot_context_unlocked(logical_ordered)?;
+                // The certificate may bind the same logical Ordered projection
+                // to a later metadata foundation. Never feed that synthetic
+                // foundation back into an Ordered commit-verification path.
+                let logical_ordered =
+                    logical_ordered.ok_or(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired)?;
+                self.snapshot_context_from_audit(&transaction, logical_ordered, audited)?
+            };
+            match &authority {
+                SnapshotAuthorityV2::Common {
+                    certificate,
+                    recovery,
+                    ..
+                } => {
+                    validate_common_recovery_manifest(
+                        certificate,
+                        context.recovery_manifest.as_ref(),
+                    )?;
+                    if recovery.as_ref().is_some_and(|(manifest, disposition)| {
+                        Some(manifest) != context.recovery_manifest.as_ref()
+                            || *disposition != context.boundary_disposition
+                    }) {
+                        return Err(AgentRaftApplicationErrorV2::SnapshotReplay);
+                    }
+                }
+                _ if context
+                    .recovery_manifest
+                    .as_ref()
+                    .is_some_and(|manifest| !manifest.is_empty()) =>
+                {
+                    return Err(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired);
+                }
+                _ => {}
+            }
             if claim.ordered() != &context.ordered
                 || claim.active_committee() != &context.active_committee
                 || claim.authority_epoch() != context.authority_epoch
@@ -5707,6 +6316,7 @@ mod application_ledger_v2 {
                 let mut table = transaction.open_table(SNAPSHOT_TABLE_V2)?;
                 table.insert(key.as_slice(), record.encode().as_slice())?;
             }
+            retire_recovery_observations(&transaction, &key, claim.raft_index())?;
             {
                 let mut table = transaction.open_table(APPLY_AUDIT_TABLE_V2)?;
                 let mut retired = Vec::new();
@@ -5884,7 +6494,7 @@ mod application_ledger_v2 {
             let target = certificate.claim().ordered().raft_index();
             let exact_anchor = read_snapshot_in_write(transaction, key.as_slice())?
                 .is_some_and(|current| matches!(current.authority,
-                    SnapshotAuthorityV2::Common { certificate: ref existing, binding: ref existing_binding }
+                    SnapshotAuthorityV2::Common { certificate: ref existing, binding: ref existing_binding, .. }
                     if existing == certificate && binding == Some(existing_binding)
                         && &current.claim == existing_binding.claim()));
             if state != expected_state
@@ -5926,8 +6536,10 @@ mod application_ledger_v2 {
             &self,
             certificate: &SharedAgentCommonSnapshotCertificate,
             binding: &SharedAgentLocalSnapshotBinding,
+            manifest: &SharedRecoveryManifest,
         ) -> Result<InstalledAgentRaftSnapshotV2, AgentRaftApplicationErrorV2> {
             let foundation = self.common_restore_foundation(certificate)?;
+            validate_common_recovery_manifest(certificate, Some(manifest))?;
             let claim = binding.claim();
             binding
                 .verify(certificate, claim)
@@ -5949,6 +6561,11 @@ mod application_ledger_v2 {
                 authority: SnapshotAuthorityV2::Common {
                     certificate: certificate.clone(),
                     binding: binding.clone(),
+                    recovery: if certificate.claim().recovery_manifest().is_some() {
+                        Some((manifest.clone(), legacy_snapshot_boundary(claim)?))
+                    } else {
+                        None
+                    },
                 },
                 committee_evidence: Vec::new(),
             };
@@ -6025,6 +6642,8 @@ mod application_ledger_v2 {
             transaction
                 .open_table(SNAPSHOT_TABLE_V2)?
                 .insert(key.as_slice(), record.encode().as_slice())?;
+            write_recovery_manifest(&transaction, &key, Some(manifest))?;
+            retire_recovery_observations(&transaction, &key, claim.raft_index())?;
             // Hard state is monotonic even when the destination had an election
             // while offline. Never clear a vote in an unchanged term.
             if raft.current_term < claim.raft_term() {
@@ -6056,23 +6675,109 @@ mod application_ledger_v2 {
             )>,
             AgentRaftApplicationErrorV2,
         > {
+            Ok(self
+                .common_snapshot_authority_with_recovery()?
+                .map(|(certificate, binding, _, _)| (certificate, binding)))
+        }
+
+        /// One freshly audited database view supplies both the physical
+        /// authority, certified recovery baseline, and current live manifest.
+        /// The live manifest is still only provisional execution evidence:
+        /// callers must check nonbaseline observations against fresh replay
+        /// results. Never retain this view across application calls or peer I/O.
+        pub(crate) fn common_snapshot_authority_with_recovery(
+            &self,
+        ) -> Result<
+            Option<(
+                SharedAgentCommonSnapshotCertificate,
+                SharedAgentLocalSnapshotBinding,
+                Option<SharedRecoveryManifest>,
+                Option<SharedRecoveryManifest>,
+            )>,
+            AgentRaftApplicationErrorV2,
+        > {
             let _guard = self
                 .writes
                 .lock()
                 .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
-            self.audit_recovery()?;
             let transaction = self.database.begin_read()?;
-            Ok(read_snapshot_in_read(
-                &transaction,
-                generation_storage_key(self.generation).as_slice(),
-            )?
-            .and_then(|record| match record.authority {
+            let audit = self.audit_recovery_in_read(&transaction)?;
+            let Some(record) = audit.snapshot else {
+                return Ok(None);
+            };
+            match record.authority {
                 SnapshotAuthorityV2::Common {
                     certificate,
                     binding,
-                } => Some((certificate, binding)),
-                _ => None,
-            }))
+                    recovery,
+                } => {
+                    // Preserve the stronger baseline accessor's fixed-roster
+                    // scope checks as well as the complete audit above.
+                    self.validate_common_scope(&certificate)?;
+                    if record.generation != self.generation
+                        || record.journal_store != self.journal_store
+                        || record.local_node != self.local_node
+                        || record.claim.raft_index() != audit.raft.snap_last_index
+                        || record.claim.raft_term() != audit.raft.snap_last_term
+                    {
+                        return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                    }
+                    Ok(Some((
+                        certificate,
+                        binding,
+                        recovery.map(|(manifest, _)| manifest),
+                        audit.recovery,
+                    )))
+                }
+                _ => Ok(None),
+            }
+        }
+
+        /// The certified checkpoint baseline, never the manifest advanced by
+        /// later application slots. Export and replay must not substitute the
+        /// current live manifest for this preimage.
+        pub(crate) fn common_snapshot_recovery_manifest(
+            &self,
+        ) -> Result<Option<SharedRecoveryManifest>, AgentRaftApplicationErrorV2> {
+            self.common_snapshot_recovery_manifest_at(None)
+        }
+
+        pub(crate) fn common_snapshot_recovery_manifest_at(
+            &self,
+            checkpoint: Option<super::super::journal::CheckpointId>,
+        ) -> Result<Option<SharedRecoveryManifest>, AgentRaftApplicationErrorV2> {
+            let transaction = self.database.begin_read()?;
+            let snapshot = read_snapshot_in_read(
+                &transaction,
+                generation_storage_key(self.generation).as_slice(),
+            )?;
+            match snapshot {
+                Some(record) if matches!(record.authority, SnapshotAuthorityV2::Common { .. }) => {
+                    if let SnapshotAuthorityV2::Common { certificate, .. } = &record.authority {
+                        self.validate_common_scope(certificate)?;
+                    }
+                    let raft = crate::raft::RaftMeta::load_from_read_transaction(&transaction)?;
+                    if record.generation != self.generation
+                        || record.journal_store != self.journal_store
+                        || record.local_node != self.local_node
+                        || record.claim.raft_index() != raft.snap_last_index
+                        || record.claim.raft_term() != raft.snap_last_term
+                        || checkpoint.is_some_and(|expected| expected != record.claim.checkpoint())
+                    {
+                        return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                    }
+                    record.verify_authority()?;
+                    Ok(Some(match record.recovery_manifest() {
+                        Some(manifest) => manifest.clone(),
+                        None => SharedRecoveryManifest::new(
+                            self.generation,
+                            self.initial_committee.clone(),
+                        )
+                        .map_err(|_| AgentRaftApplicationErrorV2::SnapshotCertificateInvalid)?,
+                    }))
+                }
+                _ => Ok(None),
+            }
         }
 
         /// Establish one fresh physical Raft generation from a quorum-signed
@@ -6387,6 +7092,7 @@ mod application_ledger_v2 {
             if matches!(
                 slot.entry().command(),
                 AgentRaftCommand::PrepareCommitteeChange(_)
+                    | AgentRaftCommand::RegisterRecovery { .. }
             ) {
                 return Err(AgentRaftApplicationErrorV2::CommandExecutionRequired);
             }
@@ -6500,7 +7206,7 @@ mod application_ledger_v2 {
             ) {
                 return Err(AgentRaftApplicationErrorV2::InvalidCommandDisposition);
             }
-            self.complete_reserved_command(reserved, disposition)
+            self.complete_reserved_command(reserved, disposition, None)
         }
 
         #[cfg(test)]
@@ -6527,6 +7233,7 @@ mod application_ledger_v2 {
                     claim: claim.commitment(),
                     successor,
                 },
+                None,
             )
         }
 
@@ -6535,6 +7242,14 @@ mod application_ledger_v2 {
         pub(crate) fn anchor_applied_ordered(
             &self,
             published: PublishedSharedOrdered,
+        ) -> Result<AgentRaftCommandApplyOutcomeV2, AgentRaftApplicationErrorV2> {
+            self.anchor_applied_ordered_with_recovery(published, None)
+        }
+
+        pub(crate) fn anchor_applied_ordered_with_recovery(
+            &self,
+            published: PublishedSharedOrdered,
+            observation: Option<&VerifiedSharedRecoveryObservation>,
         ) -> Result<AgentRaftCommandApplyOutcomeV2, AgentRaftApplicationErrorV2> {
             let reserved = published.reservation();
             if published.journal_store() != self.journal_store
@@ -6569,31 +7284,213 @@ mod application_ledger_v2 {
                     claim: claim.commitment(),
                     successor: published.successor(),
                 },
+                observation,
             )
+        }
+
+        /// Capture only a fresh application's predecessor. Historical retry
+        /// classification remains inside the write transaction and must not
+        /// refold a request whose live owner slot has since been replaced.
+        fn recovery_update_predecessor(
+            &self,
+            index: u64,
+        ) -> Result<Option<RecoveryUpdatePredecessor>, AgentRaftApplicationErrorV2> {
+            let transaction = self.database.begin_read()?;
+            let key = generation_storage_key(self.generation);
+            let table = transaction.open_table(APPLY_META_TABLE_V2)?;
+            let bytes = table
+                .get(key.as_slice())?
+                .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+            let meta = AgentRaftApplyMetaV2::decode(bytes.value())
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            validate_bound_meta(&meta, self.generation, self.journal_store)?;
+            if meta.encode() != bytes.value() {
+                return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+            }
+            if index <= meta.applied_index {
+                return Ok(None);
+            }
+            let raft = crate::raft::RaftMeta::load_from_read_transaction(&transaction)?;
+            let table = transaction.open_table(RECOVERY_MANIFEST_TABLE_V2)?;
+            let manifest = table
+                .get(key.as_slice())?
+                .map(|value| {
+                    if value.value().len() > MAX_SHARED_RECOVERY_MANIFEST_BYTES {
+                        return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                    }
+                    Ok(value.value().to_vec())
+                })
+                .transpose()?;
+            Ok(Some(RecoveryUpdatePredecessor {
+                manifest,
+                meta,
+                snapshot: (raft.snap_last_index, raft.snap_last_term),
+            }))
+        }
+
+        fn decode_recovery_predecessor(
+            &self,
+            predecessor: &RecoveryUpdatePredecessor,
+        ) -> Result<Option<SharedRecoveryManifest>, AgentRaftApplicationErrorV2> {
+            predecessor
+                .manifest
+                .as_deref()
+                .map(|bytes| {
+                    decode_recovery_manifest(bytes, self.generation, &self.initial_committee)
+                })
+                .transpose()
+        }
+
+        fn stage_recovery_observation(
+            &self,
+            reserved: &ReservedAgentRaftApplication,
+            observation: Option<&VerifiedSharedRecoveryObservation>,
+        ) -> Result<Option<StagedRecoveryUpdate>, AgentRaftApplicationErrorV2> {
+            let Some(predecessor) = self.recovery_update_predecessor(reserved.index())? else {
+                return Ok(None);
+            };
+            let mut manifest = self.decode_recovery_predecessor(&predecessor)?;
+            let matches_recovery = match (manifest.as_ref(), reserved.committed().command()) {
+                (Some(manifest), AgentRaftCommand::Ordered { entry, .. }) => {
+                    recovery_input_matches(manifest, &entry.input)
+                }
+                _ => false,
+            };
+            if matches_recovery != observation.is_some() {
+                return Err(AgentRaftApplicationErrorV2::InvalidCommandDisposition);
+            }
+            let (manifest, observation) = if let Some(observation) = observation {
+                let manifest = manifest
+                    .as_mut()
+                    .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+                manifest
+                    .observe(observation)
+                    .map_err(|_| AgentRaftApplicationErrorV2::InvalidCommandDisposition)?;
+                (
+                    Some(manifest.encode()),
+                    Some(observation.observation().encode()),
+                )
+            } else {
+                (None, None)
+            };
+            Ok(Some(StagedRecoveryUpdate {
+                predecessor,
+                manifest,
+                observation,
+            }))
+        }
+
+        fn stage_recovery_registration(
+            &self,
+            slot: &CommittedSharedRaftSlot,
+        ) -> Result<
+            Option<(StagedRecoveryUpdate, AgentRaftApplyDispositionV2)>,
+            AgentRaftApplicationErrorV2,
+        > {
+            let CommittedSharedRaftSlot::Command(command) = slot else {
+                return Ok(None);
+            };
+            let AgentRaftCommand::RegisterRecovery { registration, .. } = command.entry().command()
+            else {
+                return Ok(None);
+            };
+            let Some(predecessor) = self.recovery_update_predecessor(slot.index())? else {
+                return Ok(None);
+            };
+            let mut manifest = self
+                .decode_recovery_predecessor(&predecessor)?
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    SharedRecoveryManifest::new(self.generation, self.initial_committee.clone())
+                        .map_err(|_| AgentRaftApplicationErrorV2::ConfigurationMismatch)
+                })?;
+            manifest
+                .apply_registration(registration, slot.index(), slot.term())
+                .map_err(|_| AgentRaftApplicationErrorV2::InvalidCommandDisposition)?;
+            let disposition = AgentRaftApplyDispositionV2::RecoveryRegistered {
+                registration: registration.commitment(),
+                manifest: manifest.commitment(),
+            };
+            Ok(Some((
+                StagedRecoveryUpdate {
+                    predecessor,
+                    manifest: Some(manifest.encode()),
+                    observation: None,
+                },
+                disposition,
+            )))
         }
 
         fn complete_reserved_command(
             &self,
             reserved: &ReservedAgentRaftApplication,
             disposition: AgentRaftAuditDisposition,
+            observation: Option<&VerifiedSharedRecoveryObservation>,
         ) -> Result<AgentRaftCommandApplyOutcomeV2, AgentRaftApplicationErrorV2> {
+            #[cfg(test)]
+            let mut recovery_timing = RecoveryPhaseTiming::start(
+                observation.is_some(),
+                "observation",
+                reserved.index(),
+                self.local_node,
+            );
             disposition
                 .validate()
                 .map_err(|_| AgentRaftApplicationErrorV2::InvalidCommandDisposition)?;
             validate_command_disposition(reserved.committed().command(), disposition)?;
+            if let Some(observation) = observation {
+                let (
+                    AgentRaftCommand::Ordered { entry, .. },
+                    AgentRaftAuditDisposition::OrderedApplied { claim, .. },
+                ) = (reserved.committed().command(), disposition)
+                else {
+                    return Err(AgentRaftApplicationErrorV2::InvalidCommandDisposition);
+                };
+                observation
+                    .observation()
+                    .validate_binding(reserved.index(), reserved.term(), claim, &entry.input)
+                    .map_err(|_| AgentRaftApplicationErrorV2::InvalidCommandDisposition)?;
+            }
             if reserved.journal_store() != self.journal_store {
                 return Err(AgentRaftApplicationErrorV2::WrongJournalStore);
             }
             if reserved.route().generation() != self.generation {
                 return Err(AgentRaftApplicationErrorV2::WrongGeneration);
             }
+            #[cfg(test)]
+            RecoveryPhaseTiming::mark(&mut recovery_timing, "binding_validated");
 
             let _guard = self
                 .writes
                 .lock()
                 .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            #[cfg(test)]
+            RecoveryPhaseTiming::mark(&mut recovery_timing, "application_lock_acquired");
+            let staged = self.stage_recovery_observation(reserved, observation)?;
+            #[cfg(test)]
+            RecoveryPhaseTiming::mark(&mut recovery_timing, "recovery_staged_before_writer");
+            self.complete_staged_reserved_command(
+                reserved,
+                disposition,
+                observation,
+                staged,
+                #[cfg(test)]
+                recovery_timing,
+            )
+        }
+
+        fn complete_staged_reserved_command(
+            &self,
+            reserved: &ReservedAgentRaftApplication,
+            disposition: AgentRaftAuditDisposition,
+            observation: Option<&VerifiedSharedRecoveryObservation>,
+            staged: Option<StagedRecoveryUpdate>,
+            #[cfg(test)] mut recovery_timing: Option<RecoveryPhaseTiming>,
+        ) -> Result<AgentRaftCommandApplyOutcomeV2, AgentRaftApplicationErrorV2> {
             let key = generation_storage_key(self.generation);
             let transaction = self.database.begin_write()?;
+            #[cfg(test)]
+            RecoveryPhaseTiming::mark(&mut recovery_timing, "write_lock_acquired");
             ensure_v2_config_in_write(
                 &transaction,
                 key.as_slice(),
@@ -6641,6 +7538,15 @@ mod application_ledger_v2 {
                     reserved,
                     stored.raw_payload_commitment,
                 )?;
+                let stored_observation = read_recovery_observation(
+                    &transaction.open_table(RECOVERY_OBSERVATION_TABLE_V2)?,
+                    &audit_key,
+                )?;
+                if stored_observation.as_ref() != observation.map(|value| value.observation()) {
+                    return Err(AgentRaftApplicationErrorV2::ConflictingDuplicate(
+                        reserved.index(),
+                    ));
+                }
                 return Ok(AgentRaftCommandApplyOutcomeV2::Duplicate(current));
             }
 
@@ -6693,6 +7599,22 @@ mod application_ledger_v2 {
             if read_audit_in_write(&transaction, audit_key.as_slice())?.is_some() {
                 return Err(AgentRaftApplicationErrorV2::CorruptLedger);
             }
+            #[cfg(test)]
+            RecoveryPhaseTiming::mark(&mut recovery_timing, "physical_binding_validated");
+            let staged = staged.ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+            staged.require_current(&transaction, &key, &current, &raft)?;
+            if let Some(manifest) = &staged.manifest {
+                transaction
+                    .open_table(RECOVERY_MANIFEST_TABLE_V2)?
+                    .insert(key.as_slice(), manifest.as_slice())?;
+            }
+            if let Some(observation) = &staged.observation {
+                transaction
+                    .open_table(RECOVERY_OBSERVATION_TABLE_V2)?
+                    .insert(audit_key.as_slice(), observation.as_slice())?;
+            }
+            #[cfg(test)]
+            RecoveryPhaseTiming::mark(&mut recovery_timing, "recovery_cas_rows_written");
             let next_meta = AgentRaftApplyMetaV2 {
                 generation: self.generation,
                 journal_store: self.journal_store,
@@ -6720,7 +7642,11 @@ mod application_ledger_v2 {
             }
             raft.last_applied = reserved.index();
             raft.write_host_fields_in_txn(&transaction)?;
+            #[cfg(test)]
+            RecoveryPhaseTiming::mark(&mut recovery_timing, "application_rows_written");
             transaction.commit()?;
+            #[cfg(test)]
+            RecoveryPhaseTiming::mark(&mut recovery_timing, "committed");
             Ok(AgentRaftCommandApplyOutcomeV2::Applied(next_meta))
         }
 
@@ -6731,12 +7657,40 @@ mod application_ledger_v2 {
             &self,
             slot: &CommittedSharedRaftSlot,
         ) -> Result<AgentRaftFoundationApplyOutcomeV2, AgentRaftApplicationErrorV2> {
+            #[cfg(test)]
+            let mut recovery_timing = RecoveryPhaseTiming::start(
+                matches!(slot, CommittedSharedRaftSlot::Command(command) if matches!(command.entry().command(), AgentRaftCommand::RegisterRecovery { .. })),
+                "registration",
+                slot.index(),
+                self.local_node,
+            );
             let _guard = self
                 .writes
                 .lock()
                 .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            #[cfg(test)]
+            RecoveryPhaseTiming::mark(&mut recovery_timing, "application_lock_acquired");
+            let staged = self.stage_recovery_registration(slot)?;
+            #[cfg(test)]
+            RecoveryPhaseTiming::mark(&mut recovery_timing, "recovery_staged_before_writer");
+            self.apply_staged_foundation_slot(
+                slot,
+                staged,
+                #[cfg(test)]
+                recovery_timing,
+            )
+        }
+
+        fn apply_staged_foundation_slot(
+            &self,
+            slot: &CommittedSharedRaftSlot,
+            staged: Option<(StagedRecoveryUpdate, AgentRaftApplyDispositionV2)>,
+            #[cfg(test)] mut recovery_timing: Option<RecoveryPhaseTiming>,
+        ) -> Result<AgentRaftFoundationApplyOutcomeV2, AgentRaftApplicationErrorV2> {
             let key = generation_storage_key(self.generation);
             let transaction = self.database.begin_write()?;
+            #[cfg(test)]
+            RecoveryPhaseTiming::mark(&mut recovery_timing, "write_lock_acquired");
             ensure_v2_config_in_write(
                 &transaction,
                 key.as_slice(),
@@ -6797,8 +7751,42 @@ mod application_ledger_v2 {
                 return Err(AgentRaftApplicationErrorV2::BacklogLimit);
             }
 
-            let (disposition, next_state) = self.transition_state(&state, slot)?;
+            let (disposition, next_state, recovery_update) = if let CommittedSharedRaftSlot::Command(
+                command,
+            ) = slot
+                && let AgentRaftCommand::RegisterRecovery { route, .. } = command.entry().command()
+            {
+                if state.pending.is_some()
+                    || state.active != self.initial_committee
+                    || route.generation() != self.generation
+                    || route.committee() != state.active.id()
+                {
+                    return Err(AgentRaftApplicationErrorV2::TransitionBarrier);
+                }
+                #[cfg(test)]
+                RecoveryPhaseTiming::mark(&mut recovery_timing, "application_state_validated");
+                let (staged, disposition) =
+                    staged.ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+                staged.require_current(&transaction, &key, &current, &raft)?;
+                (disposition, state.clone(), staged.manifest)
+            } else {
+                if matches!(slot, CommittedSharedRaftSlot::Command(command) if matches!(command.entry().command(), AgentRaftCommand::PrepareCommitteeChange(_)))
+                    && read_recovery_manifest(
+                        &transaction.open_table(RECOVERY_MANIFEST_TABLE_V2)?,
+                        &key,
+                        self.generation,
+                        &self.initial_committee,
+                    )?
+                    .is_some()
+                {
+                    return Err(AgentRaftApplicationErrorV2::TransitionBarrier);
+                }
+                let (disposition, next_state) = self.transition_state(&state, slot)?;
+                (disposition, next_state, None)
+            };
             verify_physical_row_in_write(&transaction, &raft, slot, disposition)?;
+            #[cfg(test)]
+            RecoveryPhaseTiming::mark(&mut recovery_timing, "physical_binding_validated");
 
             let expected_record = AgentRaftApplyAuditRecordV2 {
                 generation: self.generation,
@@ -6841,9 +7829,17 @@ mod application_ledger_v2 {
                 let mut table = transaction.open_table(COMMITTEE_STATE_TABLE_V2)?;
                 table.insert(key.as_slice(), next_state.encode().as_slice())?;
             }
+            if let Some(manifest) = recovery_update {
+                let mut table = transaction.open_table(RECOVERY_MANIFEST_TABLE_V2)?;
+                table.insert(key.as_slice(), manifest.as_slice())?;
+            }
             raft.last_applied = slot.index();
             raft.write_host_fields_in_txn(&transaction)?;
+            #[cfg(test)]
+            RecoveryPhaseTiming::mark(&mut recovery_timing, "application_rows_encoded_written");
             transaction.commit()?;
+            #[cfg(test)]
+            RecoveryPhaseTiming::mark(&mut recovery_timing, "committed");
             Ok(AgentRaftFoundationApplyOutcomeV2::Applied(next_meta))
         }
 
@@ -6984,9 +7980,17 @@ mod application_ledger_v2 {
         }
 
         fn audit_recovery_capacity(&self) -> Result<(u64, u64, bool), AgentRaftApplicationErrorV2> {
+            let transaction = self.database.begin_read()?;
+            self.audit_recovery_in_read(&transaction)
+                .map(|view| view.capacity())
+        }
+
+        fn audit_recovery_in_read(
+            &self,
+            transaction: &redb::ReadTransaction,
+        ) -> Result<AuditedRecoveryView, AgentRaftApplicationErrorV2> {
             let started = std::time::Instant::now();
             let key = generation_storage_key(self.generation);
-            let transaction = self.database.begin_read()?;
             ensure_v2_config_in_read(
                 &transaction,
                 key.as_slice(),
@@ -7075,6 +8079,12 @@ mod application_ledger_v2 {
             }
 
             let table = transaction.open_table(APPLY_AUDIT_TABLE_V2)?;
+            let observation_table = transaction.open_table(RECOVERY_OBSERVATION_TABLE_V2)?;
+            let mut replayed_recovery = snapshot
+                .as_ref()
+                .and_then(|record| record.recovery_manifest())
+                .cloned();
+            let mut observed_recovery_rows = 0_usize;
             let mut expected_index = raft.snap_last_index.saturating_add(1);
             let mut previous_term = raft.snap_last_term;
             let mut last_record = None;
@@ -7102,6 +8112,71 @@ mod application_ledger_v2 {
                     return Err(AgentRaftApplicationErrorV2::CorruptLedger);
                 }
                 let physical = verify_audited_physical_row_in_read(&transaction, &raft, &record)?;
+                let observation =
+                    read_recovery_observation(&observation_table, stored_key.value())?;
+                match (&record.disposition, physical.command.as_ref()) {
+                    (
+                        AgentRaftApplyDispositionV2::RecoveryRegistered {
+                            registration: expected,
+                            manifest: root,
+                        },
+                        Some(AgentRaftCommand::RegisterRecovery { registration, .. }),
+                    ) => {
+                        if observation.is_some() || registration.commitment() != *expected {
+                            return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                        }
+                        let manifest = match &mut replayed_recovery {
+                            Some(manifest) => manifest,
+                            empty @ None => empty.insert(
+                                SharedRecoveryManifest::new(
+                                    self.generation,
+                                    self.initial_committee.clone(),
+                                )
+                                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?,
+                            ),
+                        };
+                        manifest
+                            .apply_registration(registration, record.index, record.term)
+                            .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+                        if manifest.commitment() != *root {
+                            return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                        }
+                    }
+                    (
+                        AgentRaftApplyDispositionV2::Command(
+                            AgentRaftAuditDisposition::OrderedApplied { claim, .. },
+                        ),
+                        Some(AgentRaftCommand::Ordered { entry, .. }),
+                    ) => {
+                        let matches = replayed_recovery
+                            .as_ref()
+                            .is_some_and(|manifest| recovery_input_matches(manifest, &entry.input));
+                        if matches != observation.is_some() {
+                            return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                        }
+                        if let Some(observation) = observation {
+                            observation
+                                .validate_binding(record.index, record.term, *claim, &entry.input)
+                                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+                            // This is a provisional ledger fold, not execution
+                            // authority. Driver reopen independently compares all
+                            // retained outcomes with authenticated physical replay.
+                            let verified =
+                                VerifiedSharedRecoveryObservation::from_audited_record(observation)
+                                    .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+                            replayed_recovery
+                                .as_mut()
+                                .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?
+                                .observe(&verified)
+                                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+                            observed_recovery_rows += 1;
+                        }
+                    }
+                    _ if observation.is_some() => {
+                        return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                    }
+                    _ => {}
+                }
                 replay_committee_disposition(
                     &mut replayed_committee_state,
                     self.authority,
@@ -7112,13 +8187,27 @@ mod application_ledger_v2 {
                 expected_index = expected_index.saturating_add(1);
                 last_record = Some(record);
             }
+            let live_recovery = read_recovery_manifest(
+                &transaction.open_table(RECOVERY_MANIFEST_TABLE_V2)?,
+                &key,
+                self.generation,
+                &self.initial_committee,
+            )?;
+            if replayed_recovery.as_ref().filter(|value| !value.is_empty())
+                != live_recovery.as_ref()
+                || observed_recovery_rows != exact_audit_row_count(&observation_table, &key)?
+                || live_recovery
+                    .as_ref()
+                    .is_some_and(|value| value.validate_at_raft_index(meta.applied_index).is_err())
+            {
+                return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+            }
             let observed = expected_index.saturating_sub(1);
             if observed != meta.applied_index {
                 return Err(AgentRaftApplicationErrorV2::MissingAuditRecord(
                     expected_index.min(meta.applied_index),
                 ));
             }
-            let canonical_noop = canonical_leader_noop_commitment()?;
             match last_record {
                 Some(record)
                     if record.term == meta.applied_term
@@ -7126,25 +8215,14 @@ mod application_ledger_v2 {
                         && Some(record.disposition) == meta.disposition => {}
                 None if meta.applied_index == 0 && snapshot_claim.is_none() => {}
                 None if snapshot_claim.is_some_and(|claim| {
-                    let expected = if canonical_noop == claim.boundary_payload_commitment() {
-                        AgentRaftApplyDispositionV2::LeaderNoop
-                    } else {
-                        AgentRaftApplyDispositionV2::Command(
-                            AgentRaftAuditDisposition::OrderedApplied {
-                                entry: claim
-                                    .ordered()
-                                    .ordered()
-                                    .head
-                                    .unwrap_or(OrderedEntryId::ZERO),
-                                claim: claim.ordered().commitment(),
-                                successor: claim.ordered_successor(),
-                            },
-                        )
-                    };
+                    let expected = snapshot
+                        .as_ref()
+                        .expect("snapshot claim has record")
+                        .boundary_disposition();
                     meta.applied_index == claim.raft_index()
                         && meta.applied_term == claim.raft_term()
                         && meta.raw_payload_commitment == claim.boundary_payload_commitment()
-                        && meta.disposition == Some(expected)
+                        && expected.is_ok_and(|expected| meta.disposition == Some(expected))
                 }) => {}
                 _ => return Err(AgentRaftApplicationErrorV2::CorruptLedger),
             }
@@ -7189,12 +8267,14 @@ mod application_ledger_v2 {
                 rows = retained,
                 "Shared recovery audit complete"
             );
-            Ok((
-                meta.applied_index,
-                (MAX_AGENT_RAFT_ORDERED_EVIDENCE_ENTRIES as u64)
-                    .saturating_sub(meta.applied_index.saturating_sub(raft.snap_last_index)),
+            Ok(AuditedRecoveryView {
+                meta,
+                committee: stored_committee_state,
+                raft,
+                snapshot,
+                recovery: live_recovery,
                 reservation_pending,
-            ))
+            })
         }
 
         /// Read one retained applied Ordered slot without rerunning a full
@@ -7548,6 +8628,24 @@ mod application_ledger_v2 {
     ) -> Result<(), AgentRaftApplicationErrorV2> {
         let ValidatedPhysicalEntry { kind, command } = physical;
         match (record.disposition, kind) {
+            (
+                AgentRaftApplyDispositionV2::RecoveryRegistered { registration, .. },
+                vos_raft::EntryKind::Data { .. },
+            ) if state.pending.is_none() => {
+                let Some(AgentRaftCommand::RegisterRecovery {
+                    route,
+                    registration: request,
+                }) = command
+                else {
+                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                };
+                if route.generation() != state.generation
+                    || route.committee() != state.active.id()
+                    || request.commitment() != registration
+                {
+                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                }
+            }
             (AgentRaftApplyDispositionV2::LeaderNoop, vos_raft::EntryKind::Data { payload })
                 if payload.is_empty() && state.pending.is_none() => {}
             (
@@ -7889,6 +8987,17 @@ mod application_ledger_v2 {
             let table = transaction.open_table(SNAPSHOT_TABLE_V2)?;
             exact_generation_row_count(&table, expected_key)?
         };
+        let recovery_rows = exact_generation_row_count(
+            &transaction.open_table(RECOVERY_MANIFEST_TABLE_V2)?,
+            expected_key,
+        )?;
+        let observation_rows = exact_audit_row_count(
+            &transaction.open_table(RECOVERY_OBSERVATION_TABLE_V2)?,
+            expected_key,
+        )?;
+        if config_rows == 0 && (recovery_rows != 0 || observation_rows != 0) {
+            return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+        }
         validate_single_generation_counts(
             config_rows,
             meta_rows,
@@ -7929,6 +9038,17 @@ mod application_ledger_v2 {
             let table = transaction.open_table(SNAPSHOT_TABLE_V2)?;
             exact_generation_row_count(&table, expected_key.as_slice())?
         };
+        let recovery_rows = exact_generation_row_count(
+            &transaction.open_table(RECOVERY_MANIFEST_TABLE_V2)?,
+            expected_key.as_slice(),
+        )?;
+        let observation_rows = exact_audit_row_count(
+            &transaction.open_table(RECOVERY_OBSERVATION_TABLE_V2)?,
+            expected_key.as_slice(),
+        )?;
+        if config_rows == 0 && (recovery_rows != 0 || observation_rows != 0) {
+            return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+        }
         validate_single_generation_counts(
             config_rows,
             meta_rows,
@@ -7938,6 +9058,124 @@ mod application_ledger_v2 {
             snapshot_rows,
             allow_empty,
         )
+    }
+
+    fn read_recovery_manifest<T>(
+        table: &T,
+        key: &[u8],
+        generation: AgentGenerationRouteKey,
+        committee: &AgentReplicaCommittee,
+    ) -> Result<Option<SharedRecoveryManifest>, AgentRaftApplicationErrorV2>
+    where
+        T: ReadableTable<&'static [u8], &'static [u8]>,
+    {
+        let Some(stored) = table.get(key)? else {
+            return Ok(None);
+        };
+        decode_recovery_manifest(stored.value(), generation, committee).map(Some)
+    }
+
+    fn decode_recovery_manifest(
+        stored: &[u8],
+        generation: AgentGenerationRouteKey,
+        committee: &AgentReplicaCommittee,
+    ) -> Result<SharedRecoveryManifest, AgentRaftApplicationErrorV2> {
+        let manifest = SharedRecoveryManifest::decode(stored)
+            .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+        if manifest.encode() != stored
+            || manifest.generation() != generation
+            || manifest.committee() != committee
+        {
+            return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+        }
+        Ok(manifest)
+    }
+
+    fn recovery_input_matches(manifest: &SharedRecoveryManifest, input: &ReplayInput) -> bool {
+        manifest.slots().iter().any(|slot| match &input.operation {
+            ReplayOperation::CleanInvoke {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                work,
+                authorization,
+                ..
+            } => {
+                work == slot.registration().work()
+                    && authorization == slot.registration().authorization()
+            }
+            ReplayOperation::CleanAcknowledge {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                work,
+                authorization,
+                ..
+            } => {
+                *work
+                    == crate::agent_sdk::InvocationRetirement::from_work(slot.registration().work())
+                    && authorization == slot.registration().authorization()
+            }
+            _ => false,
+        })
+    }
+
+    fn write_recovery_manifest(
+        transaction: &redb::WriteTransaction,
+        key: &[u8],
+        manifest: Option<&SharedRecoveryManifest>,
+    ) -> Result<(), AgentRaftApplicationErrorV2> {
+        let mut table = transaction.open_table(RECOVERY_MANIFEST_TABLE_V2)?;
+        if let Some(manifest) = manifest.filter(|value| !value.is_empty()) {
+            table.insert(key, manifest.encode().as_slice())?;
+        } else {
+            table.remove(key)?;
+        }
+        Ok(())
+    }
+
+    fn retire_recovery_observations(
+        transaction: &redb::WriteTransaction,
+        key: &[u8],
+        boundary: u64,
+    ) -> Result<(), AgentRaftApplicationErrorV2> {
+        let mut table = transaction.open_table(RECOVERY_OBSERVATION_TABLE_V2)?;
+        let retired = table
+            .range(key..)?
+            .take_while(|row| {
+                row.as_ref()
+                    .map_or(true, |(stored, _)| stored.value().starts_with(key))
+            })
+            .map(|row| row.map(|(stored, _)| stored.value().to_vec()))
+            .collect::<Result<Vec<_>, _>>()?;
+        for stored in retired {
+            if stored.len() != AUDIT_STORAGE_KEY_BYTES {
+                return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+            }
+            let index = u64::from_be_bytes(
+                stored[stored.len() - 8..]
+                    .try_into()
+                    .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?,
+            );
+            if index <= boundary {
+                table.remove(stored.as_slice())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn read_recovery_observation<T>(
+        table: &T,
+        key: &[u8],
+    ) -> Result<Option<SharedRecoveryObservation>, AgentRaftApplicationErrorV2>
+    where
+        T: ReadableTable<&'static [u8], &'static [u8]>,
+    {
+        let Some(stored) = table.get(key)? else {
+            return Ok(None);
+        };
+        let observation = SharedRecoveryObservation::decode(stored.value())
+            .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+        if observation.encode() != stored.value() {
+            return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+        }
+        Ok(Some(observation))
     }
 
     fn exact_generation_row_count<T>(
@@ -8280,7 +9518,11 @@ mod application_ledger_v2 {
         let command = AgentRaftCommand::decode(&payload)
             .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
         if command.encode() != payload
-            || matches!(command, AgentRaftCommand::PrepareCommitteeChange(_))
+            || matches!(
+                command,
+                AgentRaftCommand::PrepareCommitteeChange(_)
+                    | AgentRaftCommand::RegisterRecovery { .. }
+            )
             || command.route() != expected_route
             || command.commitment() != expected_command_commitment
             || expected_command.is_some_and(|expected| expected != &command)
@@ -8374,8 +9616,18 @@ mod application_ledger_v2 {
             }
             (vos_raft::EntryKind::Data { .. }, AgentRaftApplyDispositionV2::Command(_)) => {
                 command.as_ref().is_some_and(|command| {
-                    !matches!(command, AgentRaftCommand::PrepareCommitteeChange(_))
+                    !matches!(
+                        command,
+                        AgentRaftCommand::PrepareCommitteeChange(_)
+                            | AgentRaftCommand::RegisterRecovery { .. }
+                    )
                 })
+            }
+            (
+                vos_raft::EntryKind::Data { .. },
+                AgentRaftApplyDispositionV2::RecoveryRegistered { registration, .. },
+            ) => {
+                matches!(command.as_ref(), Some(AgentRaftCommand::RegisterRecovery { registration: request, .. }) if request.commitment() == registration)
             }
             (
                 vos_raft::EntryKind::Data { .. },
@@ -8479,6 +9731,473 @@ mod application_ledger_v2 {
             let mut stored = 7u64.to_le_bytes().to_vec();
             stored.extend_from_slice(&raw);
             assert!(verify_physical_bytes(1, 7, commitment, disposition, &stored).is_err());
+        }
+    }
+
+    #[cfg(test)]
+    mod recovery_staging_tests {
+        use super::super::tests::{TempDirectory, committee_authority_binding};
+        use super::*;
+        use crate::agent::shared_recovery::{
+            SharedRecoveryRegistrationRequest, recovery_observation_for_test,
+            recovery_registration_for_test,
+        };
+        use ed25519_dalek::{Signer as _, SigningKey};
+
+        fn fixture(
+            label: &str,
+        ) -> (
+            TempDirectory,
+            AgentRaftApplicationLedgerV2,
+            SharedRecoveryRegistration,
+        ) {
+            let directory = TempDirectory::new(label);
+            let registration = recovery_registration_for_test(1, 7);
+            let committee = crate::agent::shared_commit::common_snapshot_claim_for_test()
+                .active_committee()
+                .clone();
+            let ledger = AgentRaftApplicationLedgerV2::open(
+                Arc::new(Database::create(directory.database()).unwrap()),
+                registration.generation(),
+                JournalStoreInstanceId::from_bytes([0xe9; 32]).unwrap(),
+                registration.owner(),
+                committee,
+                committee_authority_binding(),
+            )
+            .unwrap();
+            (directory, ledger, registration)
+        }
+
+        fn route(registration: &SharedRecoveryRegistration) -> AgentRouteKey {
+            let scope = registration.generation();
+            AgentRouteKey::new(
+                scope.space(),
+                scope.agent(),
+                scope.genesis(),
+                scope.admission(),
+                registration.committee(),
+            )
+            .unwrap()
+        }
+
+        fn append_registration(
+            ledger: &AgentRaftApplicationLedgerV2,
+            registration: &SharedRecoveryRegistration,
+        ) -> CommittedSharedRaftSlot {
+            ledger
+                .append_committed_for_test(
+                    3,
+                    &vos_raft::EntryKind::Data {
+                        payload: AgentRaftCommand::RegisterRecovery {
+                            route: route(registration),
+                            registration: registration.clone(),
+                        }
+                        .encode(),
+                    },
+                )
+                .unwrap();
+            ledger.next_committed_slot().unwrap().unwrap()
+        }
+
+        fn reserve_observation(
+            ledger: &AgentRaftApplicationLedgerV2,
+            registration: &SharedRecoveryRegistration,
+            acknowledge: bool,
+        ) -> (
+            ReservedAgentRaftApplication,
+            AgentRaftAuditDisposition,
+            VerifiedSharedRecoveryObservation,
+        ) {
+            let index = ledger.cursor().unwrap().applied_index + 1;
+            let prototype = recovery_observation_for_test(registration, index, acknowledge);
+            let entry = OrderedEntry {
+                genesis: registration.generation().genesis(),
+                index: 1,
+                parent: None,
+                merge_frontier: prototype.observation().claim().merge_frontier(),
+                merge_seal: None,
+                input: prototype.observation().input().clone(),
+            };
+            entry
+                .validate()
+                .expect("ordinary Invoke/ACK has no lifecycle seal");
+            ledger
+                .append_committed_for_test(
+                    3,
+                    &vos_raft::EntryKind::Data {
+                        payload: AgentRaftCommand::Ordered {
+                            route: route(registration),
+                            artifact_batch: None,
+                            entry: entry.clone(),
+                        }
+                        .encode(),
+                    },
+                )
+                .unwrap();
+            let CommittedSharedRaftSlot::Command(command) =
+                ledger.next_committed_slot().unwrap().unwrap()
+            else {
+                panic!("expected Ordered")
+            };
+            let reserved = ledger.reserve_command_application(&command).unwrap();
+            let previous = prototype.observation().claim();
+            let claim = OrderedCommitClaim::new(
+                previous.genesis(),
+                previous.admission(),
+                previous.committee(),
+                index,
+                3,
+                OrderedBase {
+                    index: entry.index,
+                    head: Some(entry.id()),
+                },
+                entry.merge_frontier,
+                previous.merge().clone(),
+                previous.merge_invocations(),
+                previous.runtime().clone(),
+                previous.control().clone(),
+                previous.linear().clone(),
+                previous.ordered_invocations(),
+                previous.artifacts(),
+                OrderedBase::post_genesis(),
+                None,
+                previous.fence_ancestry(),
+            )
+            .unwrap();
+            let observation = VerifiedSharedRecoveryObservation::from_validated_replay(
+                index,
+                3,
+                &claim,
+                &entry.input,
+                prototype.observation().outcome(),
+            )
+            .unwrap();
+            let disposition = AgentRaftAuditDisposition::OrderedApplied {
+                entry: entry.id(),
+                claim: claim.commitment(),
+                successor: JournalHeadsId([0xea; 32]),
+            };
+            (reserved, disposition, observation)
+        }
+
+        #[derive(Debug, PartialEq, Eq)]
+        struct DurableRows {
+            tables: Vec<Vec<(Vec<u8>, Vec<u8>)>>,
+            log: Vec<(u64, Vec<u8>)>,
+            raft: crate::raft::RaftMeta,
+            vote: Option<Vec<u8>>,
+        }
+
+        fn durable_rows(ledger: &AgentRaftApplicationLedgerV2) -> DurableRows {
+            let transaction = ledger.database.begin_read().unwrap();
+            let tables = [
+                CONFIG_TABLE_V2,
+                APPLY_META_TABLE_V2,
+                APPLY_AUDIT_TABLE_V2,
+                COMMITTEE_STATE_TABLE_V2,
+                COMMAND_RESERVATION_TABLE_V2,
+                SNAPSHOT_TABLE_V2,
+                RECOVERY_MANIFEST_TABLE_V2,
+                RECOVERY_OBSERVATION_TABLE_V2,
+            ]
+            .into_iter()
+            .map(|definition| {
+                transaction
+                    .open_table(definition)
+                    .unwrap()
+                    .iter()
+                    .unwrap()
+                    .map(|row| {
+                        let (key, value) = row.unwrap();
+                        (key.value().to_vec(), value.value().to_vec())
+                    })
+                    .collect()
+            })
+            .collect();
+            let log = transaction
+                .open_table(crate::raft::RAFT_LOG)
+                .unwrap()
+                .iter()
+                .unwrap()
+                .map(|row| {
+                    let (key, value) = row.unwrap();
+                    (key.value(), value.value().to_vec())
+                })
+                .collect();
+            let vote = transaction
+                .open_table(crate::raft::RAFT_META)
+                .unwrap()
+                .get(META_AGENT_VOTED_FOR)
+                .unwrap()
+                .map(|value| value.value().to_vec());
+            DurableRows {
+                tables,
+                log,
+                raft: crate::raft::RaftMeta::load_from_read_transaction(&transaction).unwrap(),
+                vote,
+            }
+        }
+
+        // A staged computation carries no authority to overwrite a changed
+        // predecessor, even if that change has not advanced the applied index.
+        #[test]
+        fn staged_recovery_rejects_changed_raw_meta_and_snapshot_atomically() {
+            for observation_path in [false, true] {
+                for mutation in 0..3 {
+                    let (_directory, ledger, registration) = fixture("staged_recovery_cas");
+                    let initial = append_registration(&ledger, &registration);
+                    ledger.apply_foundation_slot(&initial).unwrap();
+                    let next_registration = recovery_registration_for_test(2, 7);
+                    let next = (!observation_path)
+                        .then(|| append_registration(&ledger, &next_registration));
+                    let observation = observation_path
+                        .then(|| reserve_observation(&ledger, &registration, false));
+                    let staged_registration = next
+                        .as_ref()
+                        .and_then(|slot| ledger.stage_recovery_registration(slot).unwrap());
+                    let staged_observation =
+                        observation.as_ref().and_then(|(reserved, _, observed)| {
+                            ledger
+                                .stage_recovery_observation(reserved, Some(observed))
+                                .unwrap()
+                        });
+                    let key = generation_storage_key(ledger.generation);
+                    let mut altered = ledger.recovery_manifest().unwrap();
+                    altered
+                        .apply_registration(&next_registration, 2, 3)
+                        .unwrap();
+                    let transaction = ledger.database.begin_write().unwrap();
+                    match mutation {
+                        0 => {
+                            transaction
+                                .open_table(RECOVERY_MANIFEST_TABLE_V2)
+                                .unwrap()
+                                .insert(key.as_slice(), altered.encode().as_slice())
+                                .unwrap();
+                        }
+                        1 => {
+                            let mut meta = read_meta_in_write(&transaction, &key).unwrap().unwrap();
+                            meta.raw_payload_commitment = Hash([0xeb; 32]);
+                            transaction
+                                .open_table(APPLY_META_TABLE_V2)
+                                .unwrap()
+                                .insert(key.as_slice(), meta.encode().as_slice())
+                                .unwrap();
+                        }
+                        _ => {
+                            let mut raft =
+                                crate::raft::RaftMeta::load_from_write_transaction(&transaction)
+                                    .unwrap();
+                            raft.snap_last_index = 1;
+                            raft.snap_last_term = 3;
+                            raft.write_in_txn(&transaction).unwrap();
+                        }
+                    }
+                    transaction.commit().unwrap();
+                    let before = durable_rows(&ledger);
+                    if let Some(slot) = &next {
+                        assert!(
+                            ledger
+                                .apply_staged_foundation_slot(slot, staged_registration, None)
+                                .is_err()
+                        );
+                    } else {
+                        let (reserved, disposition, observed) = observation.as_ref().unwrap();
+                        assert!(
+                            ledger
+                                .complete_staged_reserved_command(
+                                    reserved,
+                                    *disposition,
+                                    Some(observed),
+                                    staged_observation,
+                                    None
+                                )
+                                .is_err()
+                        );
+                    }
+                    assert_eq!(
+                        durable_rows(&ledger),
+                        before,
+                        "path={observation_path} mutation={mutation}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn staged_recovery_preserves_concurrent_worker_hard_state() {
+            for observation_path in [false, true] {
+                let (_directory, ledger, registration) = fixture("staged_recovery_worker");
+                let initial = append_registration(&ledger, &registration);
+                ledger.apply_foundation_slot(&initial).unwrap();
+                let next = (!observation_path)
+                    .then(|| append_registration(&ledger, &recovery_registration_for_test(2, 7)));
+                let observation =
+                    observation_path.then(|| reserve_observation(&ledger, &registration, false));
+                let staged_registration = next
+                    .as_ref()
+                    .and_then(|slot| ledger.stage_recovery_registration(slot).unwrap());
+                let staged_observation =
+                    observation.as_ref().and_then(|(reserved, _, observed)| {
+                        ledger
+                            .stage_recovery_observation(reserved, Some(observed))
+                            .unwrap()
+                    });
+                ledger
+                    .append_committed_for_test(
+                        9,
+                        &vos_raft::EntryKind::Data {
+                            payload: Vec::new(),
+                        },
+                    )
+                    .unwrap();
+                let transaction = ledger.database.begin_write().unwrap();
+                let mut expected =
+                    crate::raft::RaftMeta::load_from_write_transaction(&transaction).unwrap();
+                expected.current_term = 9;
+                expected.voted_for = Some(0xabcd);
+                expected.write_in_txn(&transaction).unwrap();
+                let vote = [0xec; 32];
+                transaction
+                    .open_table(crate::raft::RAFT_META)
+                    .unwrap()
+                    .insert(META_AGENT_VOTED_FOR, vote.as_slice())
+                    .unwrap();
+                transaction.commit().unwrap();
+                if let Some(slot) = &next {
+                    assert!(matches!(
+                        ledger
+                            .apply_staged_foundation_slot(slot, staged_registration, None)
+                            .unwrap(),
+                        AgentRaftFoundationApplyOutcomeV2::Applied(_)
+                    ));
+                } else {
+                    let (reserved, disposition, observed) = observation.as_ref().unwrap();
+                    assert!(matches!(
+                        ledger
+                            .complete_staged_reserved_command(
+                                reserved,
+                                *disposition,
+                                Some(observed),
+                                staged_observation,
+                                None
+                            )
+                            .unwrap(),
+                        AgentRaftCommandApplyOutcomeV2::Applied(_)
+                    ));
+                }
+                expected.last_applied = 2;
+                let after = durable_rows(&ledger);
+                assert_eq!(after.raft, expected);
+                assert_eq!(after.vote.as_deref(), Some(vote.as_slice()));
+                ledger.audit_recovery().unwrap();
+            }
+        }
+
+        #[test]
+        fn staged_recovery_rejects_malformed_or_oversized_predecessor_without_writes() {
+            for observation_path in [false, true] {
+                for oversized in [false, true] {
+                    let (_directory, ledger, registration) = fixture("staged_recovery_invalid");
+                    let initial = append_registration(&ledger, &registration);
+                    ledger.apply_foundation_slot(&initial).unwrap();
+                    let next = (!observation_path).then(|| {
+                        append_registration(&ledger, &recovery_registration_for_test(2, 7))
+                    });
+                    let observation = observation_path
+                        .then(|| reserve_observation(&ledger, &registration, false));
+                    let bytes = if oversized {
+                        vec![0; MAX_SHARED_RECOVERY_MANIFEST_BYTES + 1]
+                    } else {
+                        b"malformed-recovery".to_vec()
+                    };
+                    let transaction = ledger.database.begin_write().unwrap();
+                    transaction
+                        .open_table(RECOVERY_MANIFEST_TABLE_V2)
+                        .unwrap()
+                        .insert(
+                            generation_storage_key(ledger.generation).as_slice(),
+                            bytes.as_slice(),
+                        )
+                        .unwrap();
+                    transaction.commit().unwrap();
+                    let before = durable_rows(&ledger);
+                    if let Some(slot) = &next {
+                        assert!(ledger.apply_foundation_slot(slot).is_err());
+                    } else {
+                        let (reserved, disposition, observed) = observation.as_ref().unwrap();
+                        assert!(
+                            ledger
+                                .complete_reserved_command(reserved, *disposition, Some(observed))
+                                .is_err()
+                        );
+                    }
+                    assert_eq!(durable_rows(&ledger), before);
+                }
+            }
+        }
+
+        #[test]
+        fn staged_recovery_historical_duplicates_do_not_refold_replaced_owner() {
+            let (_directory, ledger, registration) = fixture("staged_recovery_duplicates");
+            let initial = append_registration(&ledger, &registration);
+            ledger.apply_foundation_slot(&initial).unwrap();
+            let invoke = reserve_observation(&ledger, &registration, false);
+            ledger
+                .complete_reserved_command(&invoke.0, invoke.1, Some(&invoke.2))
+                .unwrap();
+            let acknowledge = reserve_observation(&ledger, &registration, true);
+            ledger
+                .complete_reserved_command(&acknowledge.0, acknowledge.1, Some(&acknowledge.2))
+                .unwrap();
+            let manifest = ledger.recovery_manifest().unwrap();
+            let previous = manifest.slot(registration.owner()).unwrap();
+            let new = recovery_registration_for_test(1, 8);
+            let request = SharedRecoveryRegistrationRequest::new(
+                new.generation(),
+                new.committee(),
+                new.owner(),
+                previous.sequence() + 1,
+                Some(previous.commitment()),
+                new.query().clone(),
+                new.work().clone(),
+                new.authorization().clone(),
+            )
+            .unwrap();
+            let signature = SigningKey::from_bytes(&[1; 32])
+                .sign(&request.signing_message().0)
+                .to_bytes();
+            let replacement = SharedRecoveryRegistration::new(
+                request,
+                ReplicaCommitSignature::new(new.owner(), signature).unwrap(),
+            )
+            .unwrap();
+            let slot = append_registration(&ledger, &replacement);
+            ledger.apply_foundation_slot(&slot).unwrap();
+            assert_ne!(
+                ledger
+                    .recovery_manifest()
+                    .unwrap()
+                    .slot(registration.owner())
+                    .unwrap()
+                    .registration(),
+                &registration
+            );
+            let before = durable_rows(&ledger);
+            assert!(matches!(
+                ledger.apply_foundation_slot(&initial).unwrap(),
+                AgentRaftFoundationApplyOutcomeV2::Duplicate(_)
+            ));
+            for (reserved, disposition, observation) in [&invoke, &acknowledge] {
+                assert!(matches!(
+                    ledger
+                        .complete_reserved_command(reserved, *disposition, Some(observation))
+                        .unwrap(),
+                    AgentRaftCommandApplyOutcomeV2::Duplicate(_)
+                ));
+            }
+            assert_eq!(durable_rows(&ledger), before);
+            ledger.audit_recovery().unwrap();
         }
     }
 
@@ -8795,7 +10514,7 @@ mod tests {
     const COMMITTEE_AUTHORITY_EPOCH: u64 = 41;
 
     #[cfg(feature = "storage")]
-    fn committee_authority_binding() -> CommitteeChangeAuthorityBinding {
+    pub(super) fn committee_authority_binding() -> CommitteeChangeAuthorityBinding {
         let key = key(0xe1);
         let public_key = key.verifying_key().to_bytes();
         CommitteeChangeAuthorityBinding::new(
@@ -10542,7 +12261,7 @@ mod tests {
 
         let database = Arc::new(Database::create(&path).unwrap());
         let reopened = AgentRaftApplicationLedgerV2::open(
-            database,
+            Arc::clone(&database),
             generation,
             store,
             local_node,
@@ -10563,23 +12282,295 @@ mod tests {
         assert!(history.contains(&initial));
         assert!(history.contains(&next));
         reopened.audit_recovery().unwrap();
+
+        // Candidate boundary selection reuses one freshly audited view. A
+        // metadata-only successor keeps the exact installed logical boundary,
+        // including when the original journal binding has been retired.
+        let previous = certificate.claim().ordered();
+        let mut heads = super::super::journal::JournalHeads::initial(
+            generation.genesis(),
+            generation.admission(),
+            local_node,
+            previous.merge_frontier(),
+            previous.runtime().clone(),
+        );
+        heads.ordered_head = previous.ordered().head;
+        heads.ordered_index = previous.ordered().index;
+        reopened
+            .append_committed_for_test(
+                10,
+                &EntryKind::Data {
+                    payload: Vec::new(),
+                },
+            )
+            .unwrap();
+        let noop = reopened.next_committed_slot().unwrap().unwrap();
+        reopened.apply_foundation_slot(&noop).unwrap();
+        let context = reopened.snapshot_candidate_context(&heads, None).unwrap();
+        let repeated = reopened
+            .snapshot_candidate_context(&heads, Some(previous))
+            .unwrap();
+        assert_eq!(context.ordered, repeated.ordered);
+        assert_eq!(context.retired_audit_root, repeated.retired_audit_root);
+        assert_eq!(context.previous_snapshot, Some(certificate.commitment()));
+        assert_eq!(context.ordered.ordered(), previous.ordered());
+        assert_eq!(context.ordered.raft_index(), 5);
+
+        // A new Ordered transition selects only its matching journal-bound
+        // claim; neither an old installed projection nor changed heads suffice.
+        let mut entry = ordered_entry(route(&next));
+        entry.index = previous.ordered().index + 1;
+        entry.parent = previous.ordered().head;
+        reopened
+            .append_committed_for_test(
+                10,
+                &EntryKind::Data {
+                    payload: AgentRaftCommand::Ordered {
+                        route: route(&next),
+                        artifact_batch: None,
+                        entry: entry.clone(),
+                    }
+                    .encode(),
+                },
+            )
+            .unwrap();
+        let CommittedSharedRaftSlot::Command(command) =
+            reopened.next_committed_slot().unwrap().unwrap()
+        else {
+            panic!("expected changed Ordered boundary")
+        };
+        let changed = claim(route(&next), &entry, 6, 10, b"changed-boundary");
+        reopened
+            .anchor_ordered_for_test(&command, &changed, successor(0xdc))
+            .unwrap();
+        assert!(
+            reopened
+                .snapshot_candidate_context(&heads, Some(previous))
+                .is_err()
+        );
+        heads.ordered_head = Some(entry.id());
+        heads.ordered_index = entry.index;
+        assert!(
+            reopened
+                .snapshot_candidate_context(&heads, Some(previous))
+                .is_err()
+        );
+        assert_eq!(
+            reopened
+                .snapshot_candidate_context(&heads, Some(&changed))
+                .unwrap()
+                .ordered,
+            changed,
+        );
+        let transaction = database.begin_write().unwrap();
+        transaction
+            .open_table(crate::raft::RAFT_LOG)
+            .unwrap()
+            .remove(5)
+            .unwrap();
+        transaction.commit().unwrap();
+        assert!(
+            reopened
+                .snapshot_candidate_context(&heads, Some(&changed))
+                .is_err(),
+            "each candidate must freshly authenticate even an earlier metadata row",
+        );
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn v2_recovery_registration_is_typed_bounded_durable_metadata() {
+        use crate::agent::shared_recovery::recovery_registration_for_test;
+        let registration = recovery_registration_for_test(1, 7);
+        let committee = crate::agent::shared_commit::common_snapshot_claim_for_test()
+            .active_committee()
+            .clone();
+        let generation = registration.generation();
+        let local_node = registration.owner();
+        let directory = TempDirectory::new("v2_recovery_registration");
+        let path = directory.database();
+        let store = journal_store(0xe1);
+        let expected;
+        {
+            let database = Arc::new(Database::create(&path).unwrap());
+            let ledger = AgentRaftApplicationLedgerV2::open(
+                Arc::clone(&database),
+                generation,
+                store,
+                local_node,
+                committee.clone(),
+                committee_authority_binding(),
+            )
+            .unwrap();
+            assert!(ledger.recovery_manifest().unwrap().is_empty());
+            ledger
+                .validate_recovery_registration(&registration)
+                .unwrap();
+            let command = AgentRaftCommand::RegisterRecovery {
+                route: AgentRouteKey::new(
+                    generation.space(),
+                    generation.agent(),
+                    generation.genesis(),
+                    generation.admission(),
+                    committee.id(),
+                )
+                .unwrap(),
+                registration: registration.clone(),
+            };
+            assert_eq!(
+                AgentRaftCommand::decode(&command.encode()).unwrap(),
+                command
+            );
+            ledger
+                .append_committed_for_test(
+                    3,
+                    &EntryKind::Data {
+                        payload: command.encode(),
+                    },
+                )
+                .unwrap();
+            let slot = ledger.next_committed_slot().unwrap().unwrap();
+            let CommittedSharedRaftSlot::Command(ordinary) = &slot else {
+                panic!("registration is data metadata")
+            };
+            assert!(ledger.reserve_command_application(ordinary).is_err());
+            ledger.apply_foundation_slot(&slot).unwrap();
+            expected = ledger.recovery_manifest().unwrap();
+            assert_eq!(ledger.active_committee().unwrap(), committee);
+            assert_eq!(expected.slots().len(), 1);
+            assert_eq!(
+                expected.slot(local_node).unwrap().registration(),
+                &registration
+            );
+            assert_eq!(
+                ledger.cursor().unwrap().disposition(),
+                Some(AgentRaftApplyDispositionV2::RecoveryRegistered {
+                    registration: registration.commitment(),
+                    manifest: expected.commitment(),
+                })
+            );
+            assert!(matches!(
+                ledger.apply_foundation_slot(&slot).unwrap(),
+                AgentRaftFoundationApplyOutcomeV2::Duplicate(_)
+            ));
+            assert!(ledger.journal_audit().unwrap().ordered.is_empty());
+            assert!(ledger.recovery_observations().unwrap().is_empty());
+            // An unacknowledged owner cannot acquire an unrelated obligation.
+            let divergent = recovery_registration_for_test(1, 8);
+            assert!(ledger.validate_recovery_registration(&divergent).is_err());
+            assert_eq!(ledger.recovery_manifest().unwrap(), expected);
+            ledger.audit_recovery().unwrap();
+        }
+        let database = Arc::new(Database::create(&path).unwrap());
+        let ledger = AgentRaftApplicationLedgerV2::open(
+            Arc::clone(&database),
+            generation,
+            store,
+            local_node,
+            committee,
+            committee_authority_binding(),
+        )
+        .unwrap();
+        assert_eq!(ledger.recovery_manifest().unwrap(), expected);
+        ledger
+            .validate_recovery_slot_registration(expected.slot(local_node).unwrap())
+            .unwrap();
+        assert_eq!(ledger.cursor().unwrap().applied(), (1, 3));
+        // A valid-looking replacement live manifest cannot override its exact
+        // signed physical registration history on reopen/audit.
+        const MANIFEST: TableDefinition<&[u8], &[u8]> =
+            TableDefinition::new("agent_shared_raft_recovery_manifest_v2");
+        let transaction = database.begin_write().unwrap();
+        let mut table = transaction.open_table(MANIFEST).unwrap();
+        let key = table
+            .iter()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .0
+            .value()
+            .to_vec();
+        let original = table.get(key.as_slice()).unwrap().unwrap().value().to_vec();
+        let mut altered = expected.clone();
+        altered
+            .apply_registration(&recovery_registration_for_test(2, 7), 2, 3)
+            .unwrap();
+        let unadmitted = altered
+            .slot(recovery_registration_for_test(2, 7).owner())
+            .unwrap();
+        assert!(
+            ledger
+                .validate_recovery_slot_registration(unadmitted)
+                .is_err()
+        );
+        let mut forged_position =
+            SharedRecoveryManifest::new(generation, expected.committee().clone()).unwrap();
+        forged_position
+            .apply_registration(&recovery_registration_for_test(2, 7), 1, 3)
+            .unwrap();
+        assert!(
+            ledger
+                .validate_recovery_slot_registration(forged_position.slots().first().unwrap())
+                .is_err()
+        );
+        table
+            .insert(key.as_slice(), altered.encode().as_slice())
+            .unwrap();
+        drop(table);
+        transaction.commit().unwrap();
+        assert!(
+            ledger
+                .validate_recovery_slot_registration(unadmitted)
+                .is_err()
+        );
+        assert!(ledger.audit_recovery().is_err());
+        let transaction = database.begin_write().unwrap();
+        transaction
+            .open_table(MANIFEST)
+            .unwrap()
+            .insert(key.as_slice(), original.as_slice())
+            .unwrap();
+        transaction.commit().unwrap();
+        ledger.audit_recovery().unwrap();
     }
 
     #[cfg(feature = "storage")]
     #[test]
     fn v2_common_snapshot_restore_preserves_hard_state_and_refuses_unknown_suffix() {
+        assert_common_snapshot_restore(false);
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn v2_common_recovery_view_reaudits_fresh_corruption_and_preserves_exact_baseline() {
+        assert_common_snapshot_restore(true);
+    }
+
+    #[cfg(feature = "storage")]
+    fn assert_common_snapshot_restore(with_recovery: bool) {
         use crate::agent::shared_commit::{
             SharedAgentCommonSnapshotClaim, common_snapshot_claim_for_test,
         };
         let fixture = common_snapshot_claim_for_test();
         let initial = fixture.active_committee().clone();
-        let common = SharedAgentCommonSnapshotClaim::new(
+        let recovery = if with_recovery {
+            crate::agent::shared_recovery::completed_recovery_manifest_for_test()
+        } else {
+            SharedRecoveryManifest::new(route(&initial).generation(), initial.clone()).unwrap()
+        };
+        let mut common = SharedAgentCommonSnapshotClaim::new(
             fixture.ordered().clone(),
             initial.clone(),
             committee_authority_binding().initial_epoch,
             fixture.ancestry().clone(),
         )
         .unwrap();
+        if with_recovery {
+            common = common
+                .with_recovery_manifest(recovery.commitment())
+                .unwrap();
+        }
         let message = SharedAgentCommonSnapshotCertificate::signing_message(
             initial.id(),
             common.commitment(),
@@ -10686,6 +12677,20 @@ mod tests {
             };
             let binding = bind(0xd1);
             let before = crate::raft::RaftMeta::load(&database).unwrap();
+            let mut unsigned_pending = recovery.clone();
+            unsigned_pending
+                .apply_registration(
+                    &crate::agent::shared_recovery::recovery_registration_for_test(2, 7),
+                    4,
+                    3,
+                )
+                .unwrap();
+            assert!(matches!(
+                ledger.restore_common_snapshot(&certificate, &binding, &unsigned_pending),
+                Err(AgentRaftApplicationErrorV2::SnapshotCertificateInvalid)
+            ));
+            assert_eq!(crate::raft::RaftMeta::load(&database).unwrap(), before);
+            assert!(ledger.current_snapshot().unwrap().is_none());
             let read_node_vote = || {
                 database
                     .begin_read()
@@ -10738,7 +12743,7 @@ mod tests {
                     ));
                     assert!(
                         ledger
-                            .restore_common_snapshot(&certificate, &binding)
+                            .restore_common_snapshot(&certificate, &binding, &recovery)
                             .is_err()
                     );
                     assert!(ledger.current_snapshot().unwrap().is_none());
@@ -10797,7 +12802,7 @@ mod tests {
                 ));
                 assert!(
                     ledger
-                        .restore_common_snapshot(&certificate, &binding)
+                        .restore_common_snapshot(&certificate, &binding, &recovery)
                         .is_err()
                 );
                 assert_eq!(crate::raft::RaftMeta::load(&database).unwrap(), before);
@@ -10820,7 +12825,7 @@ mod tests {
             }
             ledger.validate_common_restore(&certificate).unwrap();
             let installed = ledger
-                .restore_common_snapshot(&certificate, &binding)
+                .restore_common_snapshot(&certificate, &binding, &recovery)
                 .unwrap();
             let after = crate::raft::RaftMeta::load(&database).unwrap();
             assert_eq!(
@@ -10837,7 +12842,7 @@ mod tests {
             );
             assert_eq!(
                 ledger
-                    .restore_common_snapshot(&certificate, &binding)
+                    .restore_common_snapshot(&certificate, &binding, &recovery)
                     .unwrap(),
                 installed
             );
@@ -10845,7 +12850,7 @@ mod tests {
             assert!(ledger.validate_common_restore(&certificate).is_err());
             assert!(
                 ledger
-                    .restore_common_snapshot(&certificate, &bind(0xd9))
+                    .restore_common_snapshot(&certificate, &bind(0xd9), &recovery)
                     .is_err()
             );
             assert_eq!(crate::raft::RaftMeta::load(&database).unwrap(), after);
@@ -10853,6 +12858,71 @@ mod tests {
                 ledger.common_snapshot_authority().unwrap(),
                 Some((certificate.clone(), binding.clone()))
             );
+            let expected_view = Some((
+                certificate.clone(),
+                binding.clone(),
+                with_recovery.then(|| recovery.clone()),
+                with_recovery.then(|| recovery.clone()),
+            ));
+            assert_eq!(
+                ledger.common_snapshot_authority_with_recovery().unwrap(),
+                expected_view
+            );
+            if with_recovery && previous_term == 12 {
+                // Successful earlier reads are never durable authority for a
+                // later call. A valid owner-signed but unapplied live slot and
+                // fresh snapshot corruption must each invalidate the view.
+                const MANIFEST: TableDefinition<&[u8], &[u8]> =
+                    TableDefinition::new("agent_shared_raft_recovery_manifest_v2");
+                const SNAPSHOT: TableDefinition<&[u8], &[u8]> =
+                    TableDefinition::new("agent_shared_raft_snapshot_v2");
+                for (table, is_manifest) in [(MANIFEST, true), (SNAPSHOT, false)] {
+                    let (row_key, original) = {
+                        let transaction = database.begin_read().unwrap();
+                        let table = transaction.open_table(table).unwrap();
+                        let row = table.iter().unwrap().next().unwrap().unwrap();
+                        (row.0.value().to_vec(), row.1.value().to_vec())
+                    };
+                    let mut corrupt = if is_manifest {
+                        unsigned_pending.encode()
+                    } else {
+                        original.clone()
+                    };
+                    if !is_manifest {
+                        *corrupt.last_mut().unwrap() ^= 1;
+                    }
+                    let write_row = |bytes: &[u8]| {
+                        let transaction = database.begin_write().unwrap();
+                        transaction
+                            .open_table(table)
+                            .unwrap()
+                            .insert(row_key.as_slice(), bytes)
+                            .unwrap();
+                        transaction.commit().unwrap();
+                    };
+                    write_row(&corrupt);
+                    assert!(ledger.common_snapshot_authority_with_recovery().is_err());
+                    assert_eq!(crate::raft::RaftMeta::load(&database).unwrap(), after);
+                    write_row(&original);
+                    assert_eq!(
+                        ledger.common_snapshot_authority_with_recovery().unwrap(),
+                        expected_view
+                    );
+                }
+                let transaction = database.begin_write().unwrap();
+                let mut changed = after.clone();
+                changed.snap_last_term += 1;
+                changed.write_in_txn(&transaction).unwrap();
+                transaction.commit().unwrap();
+                assert!(ledger.common_snapshot_authority_with_recovery().is_err());
+                let transaction = database.begin_write().unwrap();
+                after.write_in_txn(&transaction).unwrap();
+                transaction.commit().unwrap();
+                assert_eq!(
+                    ledger.common_snapshot_authority_with_recovery().unwrap(),
+                    expected_view
+                );
+            }
             drop(ledger);
             let reopened = AgentRaftApplicationLedgerV2::open(
                 Arc::clone(&database),
@@ -10864,6 +12934,10 @@ mod tests {
             )
             .unwrap();
             reopened.audit_recovery().unwrap();
+            assert_eq!(
+                reopened.common_snapshot_authority_with_recovery().unwrap(),
+                expected_view
+            );
             let next = append_committed_kind(
                 &database,
                 after.current_term,
@@ -10878,9 +12952,36 @@ mod tests {
                 reopened.cursor().unwrap().applied(),
                 (next, after.current_term)
             );
+            let registration = crate::agent::shared_recovery::recovery_registration_for_test(2, 7);
+            let registration_index = append_committed_kind(
+                &database,
+                after.current_term,
+                &EntryKind::Data {
+                    payload: AgentRaftCommand::RegisterRecovery {
+                        route: route(&initial),
+                        registration: registration.clone(),
+                    }
+                    .encode(),
+                },
+            );
+            let slot = reopened.next_committed_slot().unwrap().unwrap();
+            reopened.apply_foundation_slot(&slot).unwrap();
+            let mut live = recovery.clone();
+            live.apply_registration(&registration, registration_index, after.current_term)
+                .unwrap();
+            assert_eq!(
+                reopened.common_snapshot_authority_with_recovery().unwrap(),
+                Some((
+                    certificate.clone(),
+                    binding.clone(),
+                    with_recovery.then(|| recovery.clone()),
+                    Some(live),
+                )),
+                "later applied custody changes the audited live manifest, never its certified baseline",
+            );
             assert!(
                 reopened
-                    .restore_common_snapshot(&certificate, &binding)
+                    .restore_common_snapshot(&certificate, &binding, &recovery)
                     .is_err()
             );
         }
@@ -11697,11 +13798,11 @@ mod tests {
     }
 
     #[cfg(feature = "storage")]
-    struct TempDirectory(std::path::PathBuf);
+    pub(super) struct TempDirectory(std::path::PathBuf);
 
     #[cfg(feature = "storage")]
     impl TempDirectory {
-        fn new(label: &str) -> Self {
+        pub(super) fn new(label: &str) -> Self {
             let path = std::env::temp_dir().join(alloc::format!(
                 "vos_shared_raft_{label}_{}_{}",
                 std::process::id(),
@@ -11714,7 +13815,7 @@ mod tests {
             Self(path)
         }
 
-        fn database(&self) -> std::path::PathBuf {
+        pub(super) fn database(&self) -> std::path::PathBuf {
             self.0.join("evidence.redb")
         }
     }

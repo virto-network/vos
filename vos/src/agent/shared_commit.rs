@@ -45,6 +45,7 @@ const PORTABLE_SNAPSHOT_MESSAGE_DOMAIN: &[u8] = b"vos/agent/shared/portable-snap
 const PORTABLE_SNAPSHOT_CERTIFICATE_DOMAIN: &[u8] =
     b"vos/agent/shared/portable-snapshot-certificate/v1";
 const COMMON_SNAPSHOT_CLAIM_DOMAIN: &[u8] = b"vos/agent/shared/common-snapshot-claim/v1";
+const COMMON_RECOVERY_SNAPSHOT_CLAIM_DOMAIN: &[u8] = b"vos/agent/shared/common-snapshot-claim/v2";
 const COMMON_SNAPSHOT_MESSAGE_DOMAIN: &[u8] = b"vos/agent/shared/common-snapshot-signature/v1";
 const COMMON_SNAPSHOT_CERTIFICATE_DOMAIN: &[u8] =
     b"vos/agent/shared/common-snapshot-certificate/v1";
@@ -81,7 +82,7 @@ pub const MAX_SHARED_AGENT_PORTABLE_SNAPSHOT_CERTIFICATE_BYTES: usize =
         + MAX_REPLICA_COMMIT_SIGNATURES * MAX_REPLICA_COMMIT_SIGNATURE_BYTES
         + 1024;
 pub const MAX_SHARED_AGENT_COMMON_SNAPSHOT_CLAIM_BYTES: usize =
-    MAX_ORDERED_COMMIT_CLAIM_BYTES + super::genesis::MAX_AGENT_REPLICA_COMMITTEE_BYTES + 128;
+    MAX_ORDERED_COMMIT_CLAIM_BYTES + super::genesis::MAX_AGENT_REPLICA_COMMITTEE_BYTES + 160;
 pub const MAX_SHARED_AGENT_COMMON_SNAPSHOT_CERTIFICATE_BYTES: usize =
     MAX_SHARED_AGENT_COMMON_SNAPSHOT_CLAIM_BYTES + 3 * MAX_REPLICA_COMMIT_SIGNATURE_BYTES + 128;
 pub const MAX_SHARED_AGENT_LOCAL_SNAPSHOT_BINDING_BYTES: usize =
@@ -1207,6 +1208,10 @@ pub struct SharedAgentCommonSnapshotClaim {
     active_committee: AgentReplicaCommittee,
     authority_epoch: u64,
     ancestry: SharedAgentCommonSnapshotAncestry,
+    // None is the original AGC1 meaning, not permission to drop recovery
+    // obligations. AGC2 additionally authenticates the complete bounded
+    // per-owner recovery manifest at this exact physical Raft foundation.
+    recovery_manifest: Option<Hash>,
 }
 
 /// Bounded preimage of the existing Ordered fence-ancestry commitment. Physical
@@ -1271,6 +1276,7 @@ impl SharedAgentCommonSnapshotClaim {
             active_committee,
             authority_epoch,
             ancestry,
+            recovery_manifest: None,
         };
         claim.validate()?;
         Ok(claim)
@@ -1288,8 +1294,21 @@ impl SharedAgentCommonSnapshotClaim {
     pub const fn ancestry(&self) -> &SharedAgentCommonSnapshotAncestry {
         &self.ancestry
     }
+    pub const fn recovery_manifest(&self) -> Option<Hash> {
+        self.recovery_manifest
+    }
+    pub fn with_recovery_manifest(mut self, commitment: Hash) -> Result<Self, SharedCommitError> {
+        self.recovery_manifest = Some(commitment);
+        self.validate()?;
+        Ok(self)
+    }
     pub fn commitment(&self) -> Hash {
-        Hash::digest(COMMON_SNAPSHOT_CLAIM_DOMAIN, &[&self.encode()])
+        let domain = if self.recovery_manifest.is_some() {
+            COMMON_RECOVERY_SNAPSHOT_CLAIM_DOMAIN
+        } else {
+            COMMON_SNAPSHOT_CLAIM_DOMAIN
+        };
+        Hash::digest(domain, &[&self.encode()])
     }
 
     pub fn validate(&self) -> Result<(), SharedCommitError> {
@@ -1298,6 +1317,7 @@ impl SharedAgentCommonSnapshotClaim {
             .validate()
             .map_err(|_| SharedCommitError::InvalidCommittee)?;
         if self.authority_epoch == 0
+            || self.recovery_manifest == Some(Hash::ZERO)
             || self.active_committee.profile() != AgentProfile::Shared
             || self.active_committee.members().len() != 3
             || self.active_committee.voter_count() != 3
@@ -1329,6 +1349,33 @@ impl SharedAgentCommonSnapshotClaim {
 
 impl ServiceWire for SharedAgentCommonSnapshotClaim {
     const MAGIC: [u8; 4] = *b"AGC1";
+    fn encode(&self) -> Vec<u8> {
+        let mut output = Vec::new();
+        output.extend_from_slice(if self.recovery_manifest.is_some() {
+            b"AGC2"
+        } else {
+            &Self::MAGIC
+        });
+        output.extend_from_slice(&crate::service::PLATFORM_ID.0);
+        self.encode_body(&mut output);
+        output
+    }
+    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut decoder = Decoder::new(bytes);
+        let recovery = match decoder.take(4)? {
+            b"AGC1" => false,
+            b"AGC2" => true,
+            _ => return Err(DecodeError::InvalidTag),
+        };
+        if Hash(decoder.fixed()?) != crate::service::PLATFORM_ID {
+            return Err(DecodeError::InvalidPlatform);
+        }
+        let value = Self::decode_body(&mut decoder)?;
+        if !decoder.exhausted() || value.recovery_manifest.is_some() != recovery {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
     fn encode_body(&self, output: &mut Vec<u8>) {
         let encoder = &mut Encoder(output);
         encoder.bytes(&self.ordered.encode());
@@ -1336,10 +1383,13 @@ impl ServiceWire for SharedAgentCommonSnapshotClaim {
         encoder.u64(self.authority_epoch);
         encode_ordered_base(encoder, self.ancestry.checkpoint_base);
         encoder.fixed(&self.ancestry.ordered_anchor.0);
+        if let Some(commitment) = self.recovery_manifest {
+            encoder.fixed(&commitment.0);
+        }
     }
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         enforce_complete_bound(decoder, MAX_SHARED_AGENT_COMMON_SNAPSHOT_CLAIM_BYTES)?;
-        Self::new(
+        let mut claim = Self::new(
             decode_nested::<OrderedCommitClaim>(decoder, MAX_ORDERED_COMMIT_CLAIM_BYTES)?,
             decode_nested::<AgentReplicaCommittee>(
                 decoder,
@@ -1352,7 +1402,13 @@ impl ServiceWire for SharedAgentCommonSnapshotClaim {
             )
             .map_err(map_decode_error)?,
         )
-        .map_err(map_decode_error)
+        .map_err(map_decode_error)?;
+        if !decoder.exhausted() {
+            claim = claim
+                .with_recovery_manifest(Hash(decoder.fixed()?))
+                .map_err(map_decode_error)?;
+        }
+        Ok(claim)
     }
 }
 
@@ -2589,6 +2645,74 @@ mod tests {
             ReplicaCommitSignature::new(claim.local_node(), key.sign(&message.0).to_bytes())
                 .unwrap();
         SharedAgentLocalSnapshotBinding::new(certificate.commitment(), claim, signature).unwrap()
+    }
+
+    #[test]
+    fn common_snapshot_recovery_manifest_is_versioned_and_signed() {
+        let legacy = common_snapshot_claim_fixture();
+        let legacy_bytes = legacy.encode();
+        assert_eq!(&legacy_bytes[..4], b"AGC1");
+        assert_eq!(legacy.recovery_manifest(), None);
+        assert_eq!(
+            legacy.commitment(),
+            Hash::digest(COMMON_SNAPSHOT_CLAIM_DOMAIN, &[&legacy_bytes])
+        );
+        let recovery = legacy
+            .clone()
+            .with_recovery_manifest(Hash([0x81; 32]))
+            .unwrap();
+        let recovery_bytes = recovery.encode();
+        assert_eq!(&recovery_bytes[..4], b"AGC2");
+        assert_eq!(&recovery_bytes[4..legacy_bytes.len()], &legacy_bytes[4..]);
+        assert_eq!(recovery_bytes.len(), legacy_bytes.len() + 32);
+        assert_eq!(
+            SharedAgentCommonSnapshotClaim::decode(&legacy_bytes).unwrap(),
+            legacy
+        );
+        assert_eq!(
+            SharedAgentCommonSnapshotClaim::decode(&recovery_bytes).unwrap(),
+            recovery
+        );
+        let certificate = common_certificate(recovery.clone(), &[&key(1), &key(2)]);
+        certificate
+            .verify(recovery.active_committee(), &recovery)
+            .unwrap();
+        assert!(
+            certificate
+                .verify(legacy.active_committee(), &legacy)
+                .is_err()
+        );
+        let substituted = recovery
+            .clone()
+            .with_recovery_manifest(Hash([0x82; 32]))
+            .unwrap();
+        assert!(
+            certificate
+                .verify(substituted.active_committee(), &substituted)
+                .is_err()
+        );
+        let binding = local_binding(
+            &certificate,
+            physical_common_claim(&recovery, &key(1), 0x61),
+            &key(1),
+        );
+        binding.verify(&certificate, binding.claim()).unwrap();
+        let changed_certificate = common_certificate(substituted, &[&key(1), &key(2)]);
+        assert!(
+            binding
+                .verify(&changed_certificate, binding.claim())
+                .is_err()
+        );
+        assert!(legacy.clone().with_recovery_manifest(Hash::ZERO).is_err());
+        let mut wrong_version = recovery_bytes.clone();
+        wrong_version[..4].copy_from_slice(b"AGC1");
+        assert!(SharedAgentCommonSnapshotClaim::decode(&wrong_version).is_err());
+        let mut missing = legacy_bytes;
+        missing[..4].copy_from_slice(b"AGC2");
+        assert!(SharedAgentCommonSnapshotClaim::decode(&missing).is_err());
+        let mut trailing = recovery_bytes;
+        trailing.push(0);
+        assert!(SharedAgentCommonSnapshotClaim::decode(&trailing).is_err());
     }
 
     #[test]

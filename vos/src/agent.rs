@@ -108,6 +108,7 @@ pub mod shared_host;
 #[cfg(all(feature = "std", feature = "storage"))]
 pub(crate) mod shared_journal_driver;
 pub mod shared_raft;
+pub mod shared_recovery;
 pub mod standard;
 #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
 pub(crate) mod state_block_pvm;

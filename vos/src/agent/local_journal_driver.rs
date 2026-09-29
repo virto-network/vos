@@ -87,7 +87,7 @@ type LocalReplayError = MaterializeError<core::convert::Infallible, LocalReplayE
 /// Replay-derived result recovery and exact-management retry discovery are
 /// deliberately bounded to the same newest Ordered suffix. State equality by
 /// itself is never treated as retry evidence.
-const MAX_PENDING_CLEAN_INVOCATION_RESULTS: usize = 1_024;
+pub(crate) const MAX_PENDING_CLEAN_INVOCATION_RESULTS: usize = 1_024;
 
 pub(super) fn recent_clean_management_input<S: AgentJournalStore>(
     store: &S,
@@ -837,6 +837,17 @@ pub trait LocalMergeAuthenticator: Send + Sync {
     ) -> Option<super::shared_commit::ReplicaCommitSignature> {
         None
     }
+
+    /// Sign only a recovery-registration candidate minted by the bootstrap
+    /// lifecycle after its preceding local delivery obligation is durably
+    /// clear. Decoding an arbitrary registration never grants this authority.
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    fn sign_projection_recovery_registration(
+        &self,
+        _candidate: &super::clean_bootstrap::VerifiedProjectionRecoveryRegistration,
+    ) -> Option<super::shared_commit::ReplicaCommitSignature> {
+        None
+    }
 }
 
 /// Why an authenticated node key cannot back Local Merge publications.
@@ -960,6 +971,29 @@ impl LocalMergeAuthenticator for Ed25519NodeMergeAuthenticator {
             .active_committee()
             .member_by_node(self.node)?;
         if candidate.claim().local_node() != self.node
+            || member.replica().role != super::ReplicaRole::Voter
+            || member.ed25519_public_key()
+                != &self.keypair.public().try_into_ed25519().ok()?.to_bytes()
+            || member.peer_id() != self.keypair.public().to_peer_id().to_bytes()
+        {
+            return None;
+        }
+        let signature = self
+            .keypair
+            .sign(&candidate.signing_message().0)
+            .ok()?
+            .try_into()
+            .ok()?;
+        super::shared_commit::ReplicaCommitSignature::new(self.node, signature).ok()
+    }
+
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    fn sign_projection_recovery_registration(
+        &self,
+        candidate: &super::clean_bootstrap::VerifiedProjectionRecoveryRegistration,
+    ) -> Option<super::shared_commit::ReplicaCommitSignature> {
+        let member = candidate.committee().member_by_node(self.node)?;
+        if candidate.owner() != self.node
             || member.replica().role != super::ReplicaRole::Voter
             || member.ed25519_public_key()
                 != &self.keypair.public().try_into_ed25519().ok()?.to_bytes()

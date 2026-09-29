@@ -13,13 +13,15 @@ Clerk with **100,000 retained transfers**. Keep Clerk's kernel, signatures,
 committed roots and exact retry semantics. Do not replace this with a singleton,
 smaller dataset or an experimental-only release without a new user decision.
 
-The current follow-up, based on `6d2a9b38`, implements fixed-three common
-checkpoint certification and candidate cross-node catch-up. Review it as **one
-batch** on `saga/agents` after the qualified implementation fast-forward. The
-preceding signed read-delegation checkpoint is `6d2a9b38`; Shared journal/applied
-availability is `7c1a1b7c`; backend follow-up
-`4ea0271c`, pruning `48df3995`, and admission baseline `62ffbc20` retain their
-historical evidence. Fixes continue on `wip/ch08-runtime-directory` before a
+The reviewable custody checkpoint is `7c850160..saga/agents`, based on the
+common-checkpoint/catch-up baseline. It qualifies bounded pending-read recovery
+retention across pruning in candidate physical fixtures, not production startup
+or service capacity. This is **one batch**, with findings applied on the
+implementation branch. Preceding signed read delegation is `6d2a9b38`; Shared
+journal/applied availability is `7c1a1b7c`; backend follow-up `4ea0271c`, pruning
+`48df3995`, and admission baseline `62ffbc20` retain their
+historical evidence. `wip/ch08-runtime-directory` and `saga/agents` share this
+checkpoint; subsequent fixes continue on the implementation branch before a
 qualified fast-forward. `master` is unchanged; do not push or change it automatically.
 
 Status vocabulary: **implemented** means source and focused tests exist;
@@ -55,10 +57,10 @@ Current evidence, without promoting production startup or changing the finish li
   down, preserve both reopen orderings, and refuse invalid delegation/generic
   ingress bypasses. Legacy reads remain committed-only and byte-compatible.
   This is an opt-in candidate path, not automatic production read delegation.
-- Expired, unseen pending reads stay fail-closed; safe terminal resolution and
-  durable availability of the signed request remain release limitations. The
-  survivor fixture receives the frozen query from its harness, not replicated
-  discovery of an origin-only PAP2. Production remains gated.
+- Expired, unseen pending reads stay fail-closed. The `6d2a9b38` survivor fixture
+  receives the frozen query from its harness; the current custody batch adds
+  replicated discovery after registration is applied. Origin loss before that
+  admission and safe terminal resolution remain limitations. Production stays gated.
 - Common snapshot votes bind the same shared Ordered state, committee, epoch
   and exact semantic ancestry. Each node separately signs its own physical
   checkpoint binding. Existing AGS3/AGP1 formats keep their meaning; no foreign
@@ -74,7 +76,44 @@ Current evidence, without promoting production startup or changing the finish li
   test-only: a local "no pending work" check cannot protect an offline origin's
   unresolved after-ACK PAP2. Boundary-only Query recovery is not evidence of
   arbitrary historical reply retention. Production pruning stays disabled until
-  shared recovery pins or bounded certified request/result/ACK evidence exist.
+  all pending scopes have qualified recovery evidence, not only delegated reads.
+
+This checkpoint implements at most one recovery slot per physical owner in the
+fixed-three committee, not per query attestor. Registration retains
+the exact signed request and original work/preflight in the existing Raft log
+before claiming recoverable admission. Physically verified terminal Invoke and
+positive ACK evidence enrich the slot; common checkpoints bind and carry it.
+Forwarding followers also need a delivery obligation because their original
+response can otherwise disappear after the leader's local cleanup. An owner
+may replace only its own completed slot, using a signed monotonic sequence after
+its prior PAP2 is durably clear. Keep the last completed slot until replacement,
+avoiding a separate release round on every read while retaining a fixed bound.
+This adds one registration round for Authority reads, not ordinary actor calls.
+The local PAP2 write is a registration intent, not recoverable admission: an
+origin lost before quorum registration can still leave a request undiscoverable
+to survivors. This slice conservatively admits one distinct unfinished delegated
+read per system Agent; separate owner holds for that exact read share its result.
+Recovery may finish an admitted read directly from shared custody while retaining
+a different, unadmitted local intent unchanged. Neither path relaxes execution
+authorization or treats a registration signature as proof of its result.
+This batch adds no guest ABI or private-state decoding. Delegation expiry is never
+permission to drop evidence; expired-unseen cancellation and unsupported
+management/legacy obligations remain explicit pruning gates until qualified.
+
+Final exact-release evidence: all 16 physical custody/checkpoint/delegation cases
+pass, including both persisted-intent/legacy-execution races; 238 focused tests
+pass with four existing ignored. A late first custody slot is refused after an
+exact legacy Invoke or positive ACK. A racing signed intent remains unchanged
+while exact legacy recovery finishes, and clears only after proven positive ACK.
+These fixtures use the native clean-runtime test adapter around physical Authority
+execution; full outer-PVM and released-daemon qualification remain separate gates.
+
+TODO: qualify reconciliation when a registration append times out and is later
+overwritten before commitment. The coordinator conservatively retains its exact
+volatile projection exclusion; without an owner retry, reattachment may be needed
+to release that exclusion. This is a liveness limitation of an unadmitted intent,
+not evidence that an admitted request or result was lost. The current policy unit
+tests establish retained exclusion, not a physical append-overwrite recovery test.
 
 No finish-line change follows from these results. The remaining work stays in
 the three batches below; do not add a parallel plan or treat these as a release.
@@ -154,13 +193,16 @@ do not by themselves qualify Shared capacity or eliminate whole-runtime work.
   Keep unsupported production paths gated until their admission/recovery is proved.
 - [ ] Qualify leader loss before Invoke commit and the remaining ACK/metadata-clear
   crash matrix. Preserve exact retry, fresh authorization, reservation ownership
-  and unpublished recovery. The post-Invoke/pre-ACK fixture already passes, but
-  does not qualify these other boundaries.
+  and unpublished recovery. The current candidate custody/checkpoint/delegation
+  matrix passes all 16 exact-release fixtures, including six prior delegation
+  cases and two signed-intent/legacy-execution races. This does not qualify all
+  pending scopes, full outer-PVM execution or production startup.
   Signed delegation is an explicit candidate-only opt-in: legacy authenticators
   still emit ordinary reads. Delegated SSH attestors must be current voters with
-  authenticated committee keys. Finish expired-unseen terminal resolution and
-  durable availability of the signed request before claiming autonomous recovery
-  while its origin is offline; neither local absence nor a timeout releases PAP2.
+  authenticated committee keys. Applied custody now retains delegated signed
+  requests for offline-origin discovery. Finish expired-unseen terminal resolution
+  and qualify every pending scope before production; neither local absence nor
+  a timeout releases PAP2.
 - [ ] Collect quorum-certified snapshots/checkpoints and qualify restart/catch-up
   before replay capacity is exhausted. Optional checkpoint skipping is temporary;
   mandatory capacity/certificate guards must continue to fail closed.
@@ -267,6 +309,12 @@ These are approved targets, not measured capacity or an availability promise.
 
 ## Shortcomings to track without expanding scope
 
+- Exploratory `vos --no-default-features --features 'std storage'` currently
+  fails because Shared-host route-audit methods refer to network-gated adapter
+  types/functions. The affected code is unchanged from `7c850160`; this is a
+  pre-existing embedding-feature defect, not a regression from pending custody.
+  The approved v1 host/CLI includes networking. Keep this extra combination
+  explicitly unqualified and repair its feature boundary separately.
 - Incremental actor rows do not eliminate whole-runtime control-state transport,
   directory reconstruction/publication or Shared ordering/locking. Measure their
   actual cost; the release does not promise every operation scales with touched data.
@@ -279,6 +327,24 @@ These are approved targets, not measured capacity or an availability promise.
 - Qualify sustained minority load: unused requests to a silent voter retain
   availability permits until transport completion/timeout even after another
   voter establishes quorum. Idle-loopback progress is not load qualification.
+- Pending-read custody has a fixed three-owner bound, but includes complete
+  signed work/artifacts and public evidence (declared manifest ceiling about
+  14.8 MiB). Canonical decoding, signature checks and evidence validation are
+  still real control-path costs. Candidate debug-test timings are not release
+  latency evidence; measure the exact optimized workflow before claiming capacity.
+  Qualification exposed two concrete costs: manifest preparation holding the
+  database writer needed by Raft heartbeats, and repeated proof construction
+  consuming the availability deadline before peer confirmation. The scoped fixes
+  prepare manifests before the writer with exact atomic predecessor checks,
+  reuse one freshly audited view within each proof call, and skip locking for
+  empty Merge advertisements. Validation after peer I/O stays fresh; nonempty import,
+  durability, authorization and deadline guards remain unchanged.
+  Focused corruption/interleaving tests and all four new exact-release custody
+  fixtures pass after call-local proof reuse and a startup-auto-cleanup fixture
+  correction. The legacy after-Invoke compatibility regression and racing signed
+  intents are covered by the final eight passing delegation fixtures. Measurements
+  and reproduction live in the review guide; these candidate recovery tests do not
+  qualify service capacity or the remaining production recovery scopes.
 - Native full-memory snapshots and cloning still scale with the guest address
   span, not touched pages, and can materialize a large flat image. Sparse snapshot
   behavior must not be assumed for the native mapping. Instruction attribution

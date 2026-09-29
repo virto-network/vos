@@ -16,6 +16,9 @@ use crate::agent::shared_commit::{
     MAX_REPLICA_COMMIT_SIGNATURE_BYTES, MAX_SHARED_AGENT_COMMON_SNAPSHOT_CLAIM_BYTES,
     ReplicaCommitSignature, SharedAgentCommonSnapshotClaim,
 };
+use crate::agent::shared_recovery::{
+    MAX_SHARED_RECOVERY_REGISTRATION_BYTES, SharedRecoveryRegistration,
+};
 use crate::service::wire::ServiceWire;
 use async_trait::async_trait;
 use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -75,6 +78,8 @@ const TAG_APPLIED_AVAILABILITY_REQUEST: u8 = 0x16;
 const TAG_APPLIED_AVAILABILITY_REPLY: u8 = 0x17;
 const TAG_COMMON_SNAPSHOT_VOTE_REQUEST: u8 = 0x18;
 const TAG_COMMON_SNAPSHOT_VOTE_REPLY: u8 = 0x19;
+const TAG_RECOVERY_REGISTRATION_REQUEST: u8 = 0x1a;
+const TAG_RECOVERY_REGISTRATION_REPLY: u8 = 0x1b;
 const TAG_RAFT_APPEND_REQUEST: u8 = 0x20;
 const TAG_RAFT_APPEND_REPLY: u8 = 0x21;
 const TAG_RAFT_VOTE_REQUEST: u8 = 0x22;
@@ -417,6 +422,13 @@ pub(crate) enum AgentMessage {
         claim: Hash,
         signature: Option<ReplicaCommitSignature>,
     },
+    RecoveryRegistrationRequest(SharedRecoveryRegistration),
+    /// True means this exact signed registration was durably applied, not
+    /// merely accepted into an in-memory projection queue.
+    RecoveryRegistrationReply {
+        registration: Hash,
+        applied: bool,
+    },
     Raft(RaftMessage),
     Merge(MergeMessage),
 }
@@ -596,6 +608,15 @@ fn message_is_valid(message: &AgentMessage, route: AgentGenerationRoute, sender:
                 && signature.as_ref().is_none_or(|signature| {
                     signature.validate().is_ok() && signature.signer().0 == sender.0
                 })
+        }
+        AgentMessage::RecoveryRegistrationRequest(registration) => {
+            registration.validate().is_ok()
+                && registration.generation().space().0 == route.space.0
+                && registration.generation().agent().0 == route.agent.0
+                && registration.generation().replication_id() == route.generation.0
+        }
+        AgentMessage::RecoveryRegistrationReply { registration, .. } => {
+            *registration != Hash::ZERO
         }
         AgentMessage::InvokeRequest(request) => {
             request.work.validate()
@@ -795,6 +816,15 @@ fn encode_message(
             encoder.option(signature, |encoder, signature| {
                 encoder.bytes(&signature.encode());
             });
+        }
+        AgentMessage::RecoveryRegistrationRequest(registration) => {
+            encoder.u8(TAG_RECOVERY_REGISTRATION_REQUEST);
+            encoder.bytes(&registration.encode());
+        }
+        AgentMessage::RecoveryRegistrationReply { registration, applied } => {
+            encoder.u8(TAG_RECOVERY_REGISTRATION_REPLY);
+            encoder.fixed(registration.as_bytes());
+            encoder.bool(*applied);
         }
         AgentMessage::InvokeRequest(request) => {
             encoder.u8(TAG_INVOKE_REQUEST);
@@ -1098,6 +1128,16 @@ fn decode_message(decoder: &mut Decoder<'_>) -> Result<AgentMessage, AgentProtoc
                 )
                 .map_err(|_| DecodeError::NonCanonical)
             })?,
+        }),
+        TAG_RECOVERY_REGISTRATION_REQUEST => Ok(AgentMessage::RecoveryRegistrationRequest(
+            SharedRecoveryRegistration::decode(
+                decoder.bytes_ref_bounded(MAX_SHARED_RECOVERY_REGISTRATION_BYTES)?,
+            )
+            .map_err(|_| AgentProtocolError::InvalidValue)?,
+        )),
+        TAG_RECOVERY_REGISTRATION_REPLY => Ok(AgentMessage::RecoveryRegistrationReply {
+            registration: Hash(decoder.fixed()?),
+            applied: decoder.bool()?,
         }),
         TAG_INVOKE_REQUEST => {
             let work = decode_invocation_work(decoder)?;
@@ -1522,6 +1562,69 @@ mod tests {
 
     fn id<const BYTE: u8>() -> [u8; 32] {
         [BYTE; 32]
+    }
+
+    #[test]
+    fn recovery_registration_wire_is_bounded_canonical_and_route_bound() {
+        let registration = crate::agent::shared_recovery::recovery_registration_for_test(1, 7);
+        let generation = registration.generation();
+        // The authenticated relay may differ from the custody owner; the
+        // latter's signature remains inside the unchanged registration.
+        let request = AgentFrame {
+            route: AgentGenerationRoute {
+                space: SpaceId(generation.space().0),
+                agent: AgentId(generation.agent().0),
+                generation: Hash(generation.replication_id()),
+            },
+            sender: node(&peer(80)),
+            message: AgentMessage::RecoveryRegistrationRequest(registration.clone()),
+        };
+        let encoded = request.encode().unwrap();
+        assert!(encoded.len() <= MAX_SHARED_RECOVERY_REGISTRATION_BYTES + 256);
+        assert_eq!(AgentFrame::decode(&encoded).unwrap(), request);
+        for field in 0..3 {
+            let mut wrong = request.clone();
+            match field {
+                0 => wrong.route.space = SpaceId(id::<99>()),
+                1 => wrong.route.agent = AgentId(id::<99>()),
+                _ => wrong.route.generation = Hash(id::<99>()),
+            }
+            assert!(wrong.encode().is_err());
+        }
+        let body = 4 + 2 + 4 * 32 + 1;
+        let mut oversized = encoded.clone();
+        oversized[body..body + 4]
+            .copy_from_slice(&((MAX_SHARED_RECOVERY_REGISTRATION_BYTES + 1) as u32).to_le_bytes());
+        assert!(AgentFrame::decode(&oversized).is_err());
+        for end in 0..encoded.len() {
+            assert!(AgentFrame::decode(&encoded[..end]).is_err());
+        }
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert_eq!(
+            AgentFrame::decode(&trailing),
+            Err(AgentProtocolError::TrailingBytes)
+        );
+        for applied in [false, true] {
+            let response = AgentFrame {
+                message: AgentMessage::RecoveryRegistrationReply {
+                    registration: Hash(registration.commitment().0),
+                    applied,
+                },
+                ..request.clone()
+            };
+            let encoded = response.encode().unwrap();
+            assert_eq!(AgentFrame::decode(&encoded).unwrap(), response);
+            for end in 0..encoded.len() {
+                assert!(AgentFrame::decode(&encoded[..end]).is_err());
+            }
+        }
+        let mut zero = request;
+        zero.message = AgentMessage::RecoveryRegistrationReply {
+            registration: Hash([0; 32]),
+            applied: true,
+        };
+        assert!(zero.encode().is_err());
     }
 
     #[test]

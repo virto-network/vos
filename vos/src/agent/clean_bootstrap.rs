@@ -1420,17 +1420,18 @@ impl AuthorityReadRequest {
         work: &super::sdk::InvocationWork,
         authorization: &InvocationAuthorization,
     ) -> bool {
+        if let Self::Projection(query) = self {
+            return super::shared_recovery::projection_query_matches_work(
+                query,
+                work,
+                authorization,
+            );
+        }
         let InvocationAuthorization::PublicPreflight(preflight) = authorization else {
             return false;
         };
         let target = self.authority();
         self.is_valid()
-            && match self {
-                Self::Projection(query) => query
-                    .recovery
-                    .is_none_or(|scope| scope.accepted_slot == preflight.observed_slot),
-                Self::GenesisDecision { .. } => true,
-            }
             && work.validate()
             && authorization.matches_work(work)
             && work.space == target.space
@@ -1532,6 +1533,84 @@ impl AuthorityReadRequest {
     }
 }
 
+/// Opaque owner-signing authority. Only this bootstrap lifecycle constructs
+/// it after verifying the preceding local PAP2 record is durably clear.
+pub struct VerifiedProjectionRecoveryRegistration {
+    request: super::shared_recovery::SharedRecoveryRegistrationRequest,
+    committee: AgentReplicaCommittee,
+}
+
+impl VerifiedProjectionRecoveryRegistration {
+    pub const fn owner(&self) -> crate::service::NodeId {
+        self.request.owner()
+    }
+
+    pub const fn committee(&self) -> &AgentReplicaCommittee {
+        &self.committee
+    }
+
+    pub fn signing_message(&self) -> crate::service::Hash {
+        self.request.signing_message()
+    }
+}
+
+/// Small PAP2 trailer: the query and complete work already live in PAP2 and
+/// are reconstructed verbatim, never copied or resampled for a retry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingProjectionRecoveryRegistration {
+    owner: crate::service::NodeId,
+    sequence: u64,
+    previous: Option<crate::service::Hash>,
+    signature: super::shared_commit::ReplicaCommitSignature,
+}
+
+impl PendingProjectionRecoveryRegistration {
+    const MAGIC: [u8; 4] = *b"PPR1";
+    const MAX_BYTES: usize = 256;
+
+    fn encode(&self) -> Vec<u8> {
+        use crate::service::wire::ServiceWire as _;
+        let mut bytes = Self::MAGIC.to_vec();
+        let mut encoder = Encoder(&mut bytes);
+        encoder.fixed(&self.owner.0);
+        encoder.u64(self.sequence);
+        encoder.option(&self.previous, |encoder, value| encoder.fixed(&value.0));
+        encoder.bytes(&self.signature.encode());
+        bytes
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        use crate::service::wire::ServiceWire as _;
+        if bytes.len() > Self::MAX_BYTES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let mut decoder = Decoder::new(bytes);
+        if decoder.take(4)? != Self::MAGIC {
+            return Err(DecodeError::NonCanonical);
+        }
+        let value = Self {
+            owner: crate::service::NodeId(decoder.fixed()?),
+            sequence: decoder.u64()?,
+            previous: decoder.option(|decoder| Ok(crate::service::Hash(decoder.fixed()?)))?,
+            signature: super::shared_commit::ReplicaCommitSignature::decode(
+                decoder
+                    .bytes_ref_bounded(super::shared_commit::MAX_REPLICA_COMMIT_SIGNATURE_BYTES)?,
+            )
+            .map_err(|_| DecodeError::NonCanonical)?,
+        };
+        if !decoder.exhausted()
+            || value.owner == crate::service::NodeId::ZERO
+            || value.signature.signer() != value.owner
+            || value.sequence == 0
+            || (value.sequence == 1) != value.previous.is_none()
+            || value.previous == Some(crate::service::Hash::ZERO)
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PendingAuthorityProjection {
     query: AuthorityReadRequest,
@@ -1539,6 +1618,7 @@ pub(crate) struct PendingAuthorityProjection {
     // Present only for a startup GenesisDecision read admitted as a child of
     // retained management work. Ordinary projections never use this lane.
     management_anchor: Option<super::clean_management_intent::ManagementJournalAnchor>,
+    recovery_registration: Option<PendingProjectionRecoveryRegistration>,
 }
 
 impl PendingAuthorityProjection {
@@ -1582,6 +1662,13 @@ impl PendingAuthorityProjection {
             return false;
         };
         self.query.is_valid()
+            && self.recovery_registration.as_ref().is_none_or(|registration| {
+                self.management_anchor.is_none()
+                    && matches!(&self.query, AuthorityReadRequest::Projection(query)
+                        if query.recovery.is_some())
+                    && PendingProjectionRecoveryRegistration::decode(&registration.encode())
+                        .as_ref() == Ok(registration)
+            })
             && self.management_anchor.as_ref().is_none_or(|anchor| {
                 use crate::service::ServiceWire as _;
                 matches!(self.query, AuthorityReadRequest::GenesisDecision { .. })
@@ -1608,6 +1695,38 @@ impl PendingAuthorityProjection {
         };
         Some((invocation, authorization))
     }
+
+    #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+    fn registration(
+        &self,
+        generation: super::shared_raft::AgentGenerationRouteKey,
+        committee: super::genesis::AgentReplicaCommitteeId,
+    ) -> Result<Option<super::shared_recovery::SharedRecoveryRegistration>, SharedAgentHostError>
+    {
+        let Some(trailer) = &self.recovery_registration else {
+            return Ok(None);
+        };
+        let AuthorityReadRequest::Projection(query) = &self.query else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        let (work, authorization) = self
+            .invocation()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let request = super::shared_recovery::SharedRecoveryRegistrationRequest::new(
+            generation,
+            committee,
+            trailer.owner,
+            trailer.sequence,
+            trailer.previous,
+            query.clone(),
+            work.clone(),
+            authorization.clone(),
+        )
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        super::shared_recovery::SharedRecoveryRegistration::new(request, trailer.signature.clone())
+            .map(Some)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)
+    }
 }
 
 impl CanonicalWire for PendingAuthorityProjection {
@@ -1629,6 +1748,8 @@ impl CanonicalWire for PendingAuthorityProjection {
         if let Some(anchor) = &self.management_anchor {
             use crate::service::ServiceWire as _;
             encoder.bytes(&anchor.encode());
+        } else if let Some(registration) = &self.recovery_registration {
+            encoder.bytes(&registration.encode());
         }
     }
 
@@ -1639,21 +1760,32 @@ impl CanonicalWire for PendingAuthorityProjection {
         .map_err(|_| DecodeError::NonCanonical)?;
         let work = RuntimeWork::decode(&decoder.bytes_bounded(MAX_RUNTIME_WORK_WIRE_BYTES)?)
             .map_err(|_| DecodeError::NonCanonical)?;
-        let management_anchor = if decoder.exhausted() {
-            None
+        let (management_anchor, recovery_registration) = if decoder.exhausted() {
+            (None, None)
         } else {
             use crate::service::ServiceWire as _;
-            Some(
-                super::clean_management_intent::ManagementJournalAnchor::decode(
-                    &decoder.bytes_bounded(256)?,
+            let trailer =
+                decoder.bytes_bounded(PendingProjectionRecoveryRegistration::MAX_BYTES)?;
+            if trailer.starts_with(&PendingProjectionRecoveryRegistration::MAGIC) {
+                (
+                    None,
+                    Some(PendingProjectionRecoveryRegistration::decode(&trailer)?),
                 )
-                .map_err(|_| DecodeError::NonCanonical)?,
-            )
+            } else {
+                (
+                    Some(
+                        super::clean_management_intent::ManagementJournalAnchor::decode(&trailer)
+                            .map_err(|_| DecodeError::NonCanonical)?,
+                    ),
+                    None,
+                )
+            }
         };
         let value = Self {
             query,
             work,
             management_anchor,
+            recovery_registration,
         };
         value
             .validate()
@@ -1699,7 +1831,7 @@ pub(crate) fn projection_query_matches_work(
     work: &super::sdk::InvocationWork,
     authorization: &InvocationAuthorization,
 ) -> bool {
-    AuthorityReadRequest::Projection(query.clone()).matches_work(work, authorization)
+    super::shared_recovery::projection_query_matches_work(query, work, authorization)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -7804,10 +7936,169 @@ where
 
     /// Drain the exact authenticated operation retained before a failed
     /// dispatch. Callers must do this before minting another query nonce.
+    fn prepare_projection_recovery_registration(
+        &mut self,
+        pending: &mut PendingAuthorityProjection,
+    ) -> Result<(), SharedAgentHostError> {
+        if self.pins.replicas.members().len() != 3 || pending.delegated_projection().is_none() {
+            return Ok(());
+        }
+        if self.record.pending_projection.is_some()
+            || pending.recovery_registration.is_some()
+            || pending.management_anchor.is_some()
+        {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        // This durable read is a reconciliation barrier, not an inference
+        // from the in-memory Option. Only a cleared exact owner image can
+        // authorize replacement of its prior completed recovery slot.
+        if self
+            .record_store
+            .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            != Some(self.record.encode())
+        {
+            return Err(SharedAgentHostError::Unavailable);
+        }
+        let agent = crate::service::AgentId(self.pins.agent.0);
+        let manifest = self._network_host.projection_recovery_manifest(agent)?;
+        if manifest.committee() != &self.pins.replicas {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let (work, authorization) = pending
+            .invocation()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        if self
+            ._network_host
+            .legacy_projection_without_custody(agent, work, authorization)?
+        {
+            // A legacy Invoke predates custody, so a new first holder could
+            // never inherit its Invoke observation. Keep its exact PAP2/ACK
+            // recovery on the legacy path; legacy pruning remains gated.
+            // An existing same-request capsule still requires a new owner's
+            // delivery hold, including when its Invoke already completed.
+            return Ok(());
+        }
+        let owner = crate::service::NodeId(self.pins.node.0);
+        let (sequence, previous) = match manifest.slot(owner) {
+            None => (1, None),
+            Some(slot) if slot.is_acknowledged() => (
+                slot.sequence()
+                    .checked_add(1)
+                    .ok_or(SharedAgentHostError::CapacityExhausted)?,
+                Some(slot.commitment()),
+            ),
+            Some(_) => return Err(SharedAgentHostError::Conflict),
+        };
+        let AuthorityReadRequest::Projection(query) = &pending.query else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        let (work, authorization) = pending
+            .invocation()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let request = super::shared_recovery::SharedRecoveryRegistrationRequest::new(
+            manifest.generation(),
+            manifest.committee().id(),
+            owner,
+            sequence,
+            previous,
+            query.clone(),
+            work.clone(),
+            authorization.clone(),
+        )
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        manifest
+            .validate_registration(&request)
+            .map_err(|_| SharedAgentHostError::Conflict)?;
+        let candidate = VerifiedProjectionRecoveryRegistration {
+            request,
+            committee: self.pins.replicas.clone(),
+        };
+        let signature = self
+            .snapshot_signer
+            .sign_projection_recovery_registration(&candidate)
+            .ok_or(SharedAgentHostError::SnapshotCertificateInvalid)?;
+        let registration = super::shared_recovery::SharedRecoveryRegistration::new(
+            candidate.request,
+            signature.clone(),
+        )
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        registration
+            .verify(manifest.generation(), manifest.committee())
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        pending.recovery_registration = Some(PendingProjectionRecoveryRegistration {
+            owner,
+            sequence,
+            previous,
+            signature,
+        });
+        Ok(())
+    }
+
+    fn register_pending_projection(
+        &self,
+        pending: &PendingAuthorityProjection,
+    ) -> Result<(), SharedAgentHostError> {
+        if pending.recovery_registration.is_none() {
+            return Ok(());
+        }
+        let agent = crate::service::AgentId(self.pins.agent.0);
+        let manifest = self._network_host.projection_recovery_manifest(agent)?;
+        let registration = pending
+            .registration(manifest.generation(), manifest.committee().id())?
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        if registration.owner().0 != self.pins.node.0 {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        registration
+            .verify(manifest.generation(), manifest.committee())
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if manifest
+            .slot(registration.owner())
+            .is_some_and(|slot| slot.registration() == &registration)
+        {
+            return Ok(());
+        }
+        if self._network_host.legacy_projection_without_custody(
+            agent,
+            registration.work(),
+            registration.authorization(),
+        )? {
+            // The signed local intent lost the race to a legacy Invoke/ACK.
+            // Keep its exact WAL bytes until normal positive-ACK retirement,
+            // but do not claim that custody was admitted or rewrite its scope.
+            return Ok(());
+        }
+        self._network_host
+            .register_projection_recovery(agent, &registration)
+    }
+
     pub(crate) fn recover_pending_authority_projection(
         &mut self,
     ) -> Result<bool, SharedAgentHostError> {
         let Some(pending) = self.record.pending_projection.clone() else {
+            let agent = crate::service::AgentId(self.pins.agent.0);
+            if self.pins.replicas.members().len() == 3
+                && self._network_host.bootstrap_is_local_leader(agent)?
+            {
+                let manifest = self._network_host.projection_recovery_manifest(agent)?;
+                let now = self.host.lock().map_err(|_| SharedAgentHostError::Unavailable)?
+                    .current_logical_slot(agent)?;
+                if let Some(query) = manifest.slots().iter().find_map(|slot| {
+                    let registration = slot.registration();
+                    let query = registration.query();
+                    (registration.owner().0 != self.pins.node.0
+                        && !slot.is_acknowledged()
+                        && query.recovery.is_some_and(|scope| slot.invoke().is_some() || scope.admits_at(now)))
+                        .then(|| query.clone())
+                }) {
+                    // prepare_authority_read resolves this exact query back
+                    // to the authenticated registered work/preflight. The
+                    // successor takes its own durable hold before execution.
+                    self.invoke_local_authority_projection(query, false)?;
+                    return Ok(true);
+                }
+            }
             return Ok(false);
         };
         if let Some((anchor, work)) = pending.management_envelope() {
@@ -7822,19 +8113,28 @@ where
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
             return self.execute_pending_authority_projection().map(|_| true);
         }
+        self.recover_registered_projection_dependency(&pending)?;
         let (work, authorization) = pending
             .invocation()
             .ok_or(SharedAgentHostError::ScopeMismatch)?;
         let work = work.clone();
         let authorization = authorization.clone();
-        self._network_host.reserve_recovering_projection_pair(
+        let agent = crate::service::AgentId(self.pins.agent.0);
+        if pending.recovery_registration.is_some()
+            && !self._network_host.bootstrap_is_local_leader(agent)?
+        {
+            self._network_host
+                .reserve_forwarded_projection_pair(agent, &work, &authorization)?;
+        } else {
+            self._network_host.reserve_recovering_projection_pair(
             crate::service::AgentId(self.pins.agent.0),
             &work,
             &authorization,
             &self.pins.replicas,
             self.snapshot_signer.as_ref(),
-        )?;
-        let agent = crate::service::AgentId(self.pins.agent.0);
+            )?;
+        }
+        self.register_pending_projection(&pending)?;
         if self.pins.replicas.members().len() > 1
             && !self._network_host.bootstrap_is_local_leader(agent)?
         {
@@ -7871,6 +8171,76 @@ where
         self.execute_pending_authority_projection().map(|_| true)
     }
 
+    fn recover_registered_projection_dependency(
+        &mut self,
+        pending: &PendingAuthorityProjection,
+    ) -> Result<(), SharedAgentHostError> {
+        let agent = crate::service::AgentId(self.pins.agent.0);
+        if pending.recovery_registration.is_none() {
+            return Ok(());
+        }
+        let manifest = self._network_host.projection_recovery_manifest(agent)?;
+        let intent = pending
+            .registration(manifest.generation(), manifest.committee().id())?
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        if self.record.pending_projection.as_ref() != Some(pending)
+            || self
+                .record_store
+                .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                != Some(self.record.encode())
+        {
+            return Err(SharedAgentHostError::Unavailable);
+        }
+        self._network_host
+            .reconcile_completed_projection_dependency(agent, &intent)?;
+        if !self._network_host.bootstrap_is_local_leader(agent)? {
+            return Ok(());
+        }
+        if manifest
+            .slot(intent.owner())
+            .is_some_and(|slot| slot.registration() == &intent)
+        {
+            return Ok(());
+        }
+        let Some(dependency) = manifest
+            .slots()
+            .iter()
+            .find(|slot| {
+                !slot.is_acknowledged()
+                    && (slot.registration().work() != intent.work()
+                        || slot.registration().authorization() != intent.authorization())
+            })
+            .map(|slot| slot.registration().clone())
+        else {
+            return Ok(());
+        };
+        // The lifecycle-held WAL must still be the exact durable candidate.
+        // It remains untouched throughout help, including any error/crash.
+        if self.record.pending_projection.as_ref() != Some(pending)
+            || self
+                .record_store
+                .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                != Some(self.record.encode())
+        {
+            return Err(SharedAgentHostError::Unavailable);
+        }
+        self._network_host
+            .reserve_registered_projection_dependency(agent, &intent, &dependency)?;
+        let registered = PendingAuthorityProjection {
+            query: AuthorityReadRequest::Projection(dependency.query().clone()),
+            work: dependency.request().envelope().clone(),
+            management_anchor: None,
+            recovery_registration: None,
+        };
+        if registered.delegated_projection().is_none() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self.execute_authority_projection_work(registered, false)?;
+        Ok(())
+    }
+
     /// Execute one read-only authority projection through the exact physical
     /// system route, then durably acknowledge its retained result before any
     /// bytes are returned to the inventory client.
@@ -7885,15 +8255,52 @@ where
         {
             return self.invoke_authority_read(AuthorityReadRequest::Projection(query));
         }
-        if self.record.pending_projection.is_some() {
-            return Err(SharedAgentHostError::Unavailable);
+        if let Some(pending) = self.record.pending_projection.clone() {
+            if pending.query != AuthorityReadRequest::Projection(query.clone()) {
+                return Err(SharedAgentHostError::Conflict);
+            }
+            let work = pending
+                .invocation()
+                .ok_or(SharedAgentHostError::ScopeMismatch)?
+                .0
+                .clone();
+            self.recover_pending_authority_projection()?;
+            return self
+                .committed_projection_response(&work)?
+                .ok_or(SharedAgentHostError::Unavailable);
         }
-        let pending = self.prepare_authority_projection(query.clone())?;
-        let (work, _) = pending
+        let mut pending = self.prepare_authority_projection(query.clone())?;
+        let (work, authorization) = pending
             .invocation()
             .ok_or(SharedAgentHostError::ScopeMismatch)?;
-        if let Some(bytes) = self.committed_projection_response(work)? {
+        let work = work.clone();
+        let authorization = authorization.clone();
+        if let Some(bytes) = self.committed_projection_response(&work)? {
             return Ok(bytes);
+        }
+        self.prepare_projection_recovery_registration(&mut pending)?;
+        let registered = pending.recovery_registration.is_some();
+        if registered {
+            let agent = crate::service::AgentId(self.pins.agent.0);
+            self.pending_authority_projection_identity(&pending, false)?;
+            self._network_host
+                .reserve_forwarded_projection_pair(agent, &work, &authorization)?;
+            let prior = self.record.clone();
+            let mut candidate = prior.clone();
+            candidate.pending_projection = Some(pending.clone());
+            match commit_new_pending_projection(&mut self.record_store, &prior, &candidate) {
+                PendingProjectionRecordCommit::Durable => self.record = candidate,
+                PendingProjectionRecordCommit::PriorVisible => {
+                    let _ =
+                        self._network_host
+                            .release_projection_pair(agent, &work, &authorization);
+                    return Err(SharedAgentHostError::Unavailable);
+                }
+                PendingProjectionRecordCommit::Ambiguous => {
+                    return Err(SharedAgentHostError::Unavailable);
+                }
+            }
+            self.register_pending_projection(&pending)?;
         }
         if !self._network_host.forward_projection(
             crate::service::AgentId(self.pins.agent.0),
@@ -7906,7 +8313,10 @@ where
         // for this replica's authenticated Invoke and positive ACK to apply.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
-            if let Some(bytes) = self.committed_projection_response(work)? {
+            if let Some(bytes) = self.committed_projection_response(&work)? {
+                if registered {
+                    self.complete_pending_authority_projection(&work, &authorization)?;
+                }
                 return Ok(bytes);
             }
             if std::time::Instant::now() >= deadline {
@@ -8094,6 +8504,7 @@ where
             self._network_host
                 .validate_delegated_projection(&pending, self.pins.node)?;
         }
+        self.prepare_projection_recovery_registration(&mut pending)?;
         tracing::debug!(
             elapsed_ms = started.elapsed().as_millis() as u64,
             phase = "prepare",
@@ -8238,6 +8649,33 @@ where
         &self,
         query: AuthorityReadRequest,
     ) -> Result<PendingAuthorityProjection, SharedAgentHostError> {
+        if self.pins.replicas.members().len() == 3
+            && let AuthorityReadRequest::Projection(expected) = &query
+            && expected.recovery.is_some()
+        {
+            let manifest = self
+                ._network_host
+                .projection_recovery_manifest(crate::service::AgentId(self.pins.agent.0))?;
+            if let Some(slot) = manifest
+                .slots()
+                .iter()
+                .find(|slot| slot.registration().query() == expected)
+            {
+                // Custody already authenticated the complete work, not just
+                // the query nonce. Never reconstruct it using newer gas,
+                // availability artifacts, or a freshly sampled clock.
+                let pending = PendingAuthorityProjection {
+                    query,
+                    work: slot.registration().request().envelope().clone(),
+                    management_anchor: None,
+                    recovery_registration: None,
+                };
+                return pending
+                    .validate()
+                    .then_some(pending)
+                    .ok_or(SharedAgentHostError::ScopeMismatch);
+            }
+        }
         let mut material =
             self.supervisor_invocation_material(self.pins.agent, self.pins.authority.issuer.actor)?;
         if material.actor.entry.actor != self.pins.authority.issuer.actor
@@ -8305,6 +8743,7 @@ where
         let pending = PendingAuthorityProjection {
             query,
             management_anchor: None,
+            recovery_registration: None,
             work: RuntimeWork::Invoke {
                 context: RuntimeExecutionContext::Direct,
                 state: RuntimeState::default(),
@@ -8325,16 +8764,26 @@ where
     fn execute_pending_authority_projection(
         &mut self,
     ) -> Result<Option<Vec<u8>>, SharedAgentHostError> {
-        use crate::actors::codec::Decode as _;
-        let started = std::time::Instant::now();
-
         let pending = self
             .record
             .pending_projection
             .clone()
             .ok_or(SharedAgentHostError::Unavailable)?;
+        self.execute_authority_projection_work(pending, true)
+    }
+
+    fn execute_authority_projection_work(
+        &mut self,
+        pending: PendingAuthorityProjection,
+        local_pending: bool,
+    ) -> Result<Option<Vec<u8>>, SharedAgentHostError> {
+        use crate::actors::codec::Decode as _;
+        let started = std::time::Instant::now();
         if !pending.validate() || pending.query.authority() != self.authority_target() {
             return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if local_pending {
+            self.register_pending_projection(&pending)?;
         }
         if pending.delegated_projection().is_some() {
             self._network_host
@@ -8353,7 +8802,7 @@ where
                 authorization,
             )?
         {
-            self.complete_pending_authority_projection(work, authorization)?;
+            self.finish_projection_execution(work, authorization, local_pending)?;
             return Ok(None);
         }
         let identity = self.pending_authority_projection_identity(&pending, true)?;
@@ -8440,13 +8889,31 @@ where
         }
         #[cfg(test)]
         self.check_recovery_read_failure(&pending, RecoveryReadFailure::BeforeCleanup)?;
-        self.complete_pending_authority_projection(work, authorization)?;
+        self.finish_projection_execution(work, authorization, local_pending)?;
         tracing::debug!(
             elapsed_ms = started.elapsed().as_millis() as u64,
             phase = "complete",
             "Authority projection execution phase complete"
         );
         Ok(response)
+    }
+
+    fn finish_projection_execution(
+        &mut self,
+        work: &super::sdk::InvocationWork,
+        authorization: &InvocationAuthorization,
+        local_pending: bool,
+    ) -> Result<(), SharedAgentHostError> {
+        if local_pending {
+            self.complete_pending_authority_projection(work, authorization)
+        } else {
+            self._network_host.complete_projection_pair(
+                crate::service::AgentId(self.pins.agent.0),
+                work,
+                authorization,
+                || Ok(()),
+            )
+        }
     }
 
     #[cfg(test)]
@@ -10175,6 +10642,17 @@ mod tests {
                 )
                 .ok()?
                 .sign_local_snapshot_candidate(candidate)
+            }
+
+            fn sign_projection_recovery_registration(
+                &self,
+                candidate: &VerifiedProjectionRecoveryRegistration,
+            ) -> Option<crate::agent::shared_commit::ReplicaCommitSignature> {
+                crate::agent::local_journal_driver::Ed25519NodeMergeAuthenticator::new(
+                    libp2p::identity::Keypair::ed25519_from_bytes(self.key.to_bytes()).ok()?,
+                )
+                .ok()?
+                .sign_projection_recovery_registration(candidate)
             }
         }
 
@@ -12735,6 +13213,30 @@ mod tests {
             );
         }
 
+        #[test]
+        #[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
+        fn candidate_projection_stale_registration_recovers_legacy_invoke_after_election() {
+            check_fixed_system_pending_cluster_with_legacy_race(
+                true,
+                Some(ProjectionCrashStage::AfterInvoke),
+                true,
+                None,
+                true,
+            );
+        }
+
+        #[test]
+        #[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
+        fn candidate_projection_stale_registration_recovers_legacy_ack_after_election() {
+            check_fixed_system_pending_cluster_with_legacy_race(
+                true,
+                Some(ProjectionCrashStage::AfterAckBeforeMetadataClear),
+                true,
+                None,
+                true,
+            );
+        }
+
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         enum ProjectionCrashStage {
             BeforeInvoke,
@@ -12761,6 +13263,22 @@ mod tests {
             projection_failover: Option<ProjectionCrashStage>,
             successor_finishes_first: bool,
             common_checkpoint: Option<common_checkpoint::Exercise>,
+        ) {
+            check_fixed_system_pending_cluster_with_legacy_race(
+                complete_leader,
+                projection_failover,
+                successor_finishes_first,
+                common_checkpoint,
+                false,
+            );
+        }
+
+        fn check_fixed_system_pending_cluster_with_legacy_race(
+            complete_leader: bool,
+            projection_failover: Option<ProjectionCrashStage>,
+            successor_finishes_first: bool,
+            common_checkpoint: Option<common_checkpoint::Exercise>,
+            legacy_registration_race: bool,
         ) {
             if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
                 let _ = tracing_subscriber::fmt()
@@ -13255,6 +13773,28 @@ mod tests {
                         unreachable!()
                     };
                     assert_eq!(*observed_slot, accepted_slot);
+                    // Both surviving delivery owners stage a signed intent
+                    // before legacy execution wins the race. Neither intent
+                    // has been admitted to the shared custody manifest.
+                    let mut staged_records: Vec<Option<Vec<u8>>> = vec![None; 3];
+                    if legacy_registration_race {
+                        for (index, peer) in owners.iter_mut().enumerate() {
+                            if index == leader {
+                                continue;
+                            }
+                            let peer = peer.as_mut().unwrap();
+                            let mut staged = peer.prepare_authority_projection(query.clone()).unwrap();
+                            peer.prepare_projection_recovery_registration(&mut staged).unwrap();
+                            assert!(staged.recovery_registration.is_some());
+                            peer._network_host.reserve_forwarded_projection_pair(
+                                agent, &work, &authorization,
+                            ).unwrap();
+                            peer.record.pending_projection = Some(staged);
+                            commit_bootstrap_record(&mut peer.record_store, &peer.record).unwrap();
+                            staged_records[index] = Some(peer.record.encode());
+                        }
+                    }
+                    let owner = owners[leader].as_mut().unwrap();
                     owner
                         ._network_host
                         .reserve_projection_pair(agent, &work, &authorization, false)
@@ -13370,12 +13910,43 @@ mod tests {
                         }));
                     }
                     for other in owners.iter_mut().flatten() {
-                        let regenerated =
+                        let mut regenerated =
                             other.prepare_authority_projection(query.clone()).unwrap();
                         assert_eq!(
                             regenerated.work, retained.work,
                             "signed admission slot must preserve the exact RuntimeWork on every leader"
                         );
+                        if matches!(
+                            crash_stage,
+                            ProjectionCrashStage::AfterInvoke
+                                | ProjectionCrashStage::AfterAckBeforeMetadataClear
+                        )
+                            && other.record.pending_projection.is_none()
+                        {
+                            other
+                                .prepare_projection_recovery_registration(&mut regenerated)
+                                .unwrap();
+                            assert!(
+                                regenerated.recovery_registration.is_none(),
+                                "a legacy committed Invoke/ACK cannot acquire its first custody holder afterward"
+                            );
+                        }
+                    }
+                    if legacy_registration_race {
+                        for index in 0..3 {
+                            if index == leader {
+                                continue;
+                            }
+                            let peer = owners[index].as_ref().unwrap();
+                            assert!(peer.record.encode() == *staged_records[index].as_ref().unwrap());
+                            let manifest = peer._network_host.projection_recovery_manifest(agent).unwrap();
+                            assert!(manifest.is_empty());
+                            let registration = peer.record.pending_projection.as_ref().unwrap()
+                                .registration(manifest.generation(), manifest.committee().id())
+                                .unwrap().unwrap();
+                            owners[leader].as_ref().unwrap()._network_host
+                                .assert_late_registration_refused_for_test(agent, &registration);
+                        }
                     }
                     // Lose the leader at the selected durable boundary. Two
                     // surviving voters elect a successor without its local
@@ -13417,11 +13988,40 @@ mod tests {
                     let mut serving = Vec::new();
                     let mut attachments = Vec::new();
                     for owner in owners.into_iter().flatten() {
-                        assert!(owner.record.pending_projection.is_none());
+                        assert_eq!(owner.record.pending_projection.is_some(), legacy_registration_race);
                         let owner = Arc::new(Mutex::new(owner));
                         attachments.push(crate::agent::supervisor_adapters::system_agent_supervisor_attachment_shared(
                             owner.clone(), 8).unwrap());
                         serving.push(owner);
+                    }
+                    if legacy_registration_race {
+                        let successor = serving.iter().position(|owner| owner.lock().unwrap()
+                            ._network_host.bootstrap_is_local_leader(agent).unwrap()).unwrap();
+                        let before = serving[successor].lock().unwrap().ordered_index_for_test().unwrap();
+                        let mut order = vec![successor];
+                        order.extend((0..serving.len()).filter(|index| *index != successor));
+                        for index in order {
+                            let mut owner = serving[index].lock().unwrap();
+                            let saved = owner.record.encode();
+                            assert!(owner.record.pending_projection.as_ref().unwrap()
+                                .recovery_registration.is_some());
+                            // Registration reconciliation is read-only: it
+                            // must not report wire admission or rewrite PPR1.
+                            let pending = owner.record.pending_projection.clone().unwrap();
+                            owner.register_pending_projection(&pending).unwrap();
+                            assert!(owner.record.encode() == saved);
+                            assert!(owner.record_store.load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
+                                .unwrap() == Some(saved));
+                            assert!(owner._network_host.projection_recovery_manifest(agent).unwrap().is_empty());
+                            assert!(owner.recover_pending_authority_projection().unwrap());
+                            assert!(owner.record.pending_projection.is_none());
+                            assert!(owner._network_host.projection_recovery_manifest(agent).unwrap().is_empty());
+                        }
+                        assert_eq!(
+                            serving[successor].lock().unwrap().ordered_index_for_test().unwrap(),
+                            before + u64::from(crash_stage == ProjectionCrashStage::AfterInvoke),
+                            "legacy recovery adds only a missing ACK, never another Invoke or custody slot"
+                        );
                     }
                     if successor_finishes_first {
                         let relay = serving
@@ -27764,6 +28364,96 @@ mod tests {
         }
 
         #[test]
+        fn pending_projection_registration_trailer_preserves_legacy_and_exact_signed_work() {
+            let registration = crate::agent::shared_recovery::recovery_registration_for_test(1, 7);
+            let mut pending = PendingAuthorityProjection {
+                query: AuthorityReadRequest::Projection(registration.query().clone()),
+                work: registration.request().envelope().clone(),
+                management_anchor: None,
+                recovery_registration: None,
+            };
+            let legacy = pending.encode().unwrap();
+            // Build the pre-trailer wire by its original two fields, rather
+            // than comparing two calls to the new encoder.
+            let mut original = b"PAP2".to_vec();
+            original.extend_from_slice(crate::agent_sdk::RUNTIME_ABI_ID.as_bytes());
+            let mut encoder = Encoder(&mut original);
+            encoder.bytes(&pending.query.encode());
+            encoder.bytes(&pending.work.encode().unwrap());
+            assert_eq!(legacy, original);
+            assert_eq!(
+                PendingAuthorityProjection::decode(&legacy).unwrap(),
+                pending
+            );
+            pending.recovery_registration = Some(PendingProjectionRecoveryRegistration {
+                owner: registration.owner(),
+                sequence: registration.sequence(),
+                previous: registration.previous(),
+                signature: registration.signature().clone(),
+            });
+            let extended = pending.encode().unwrap();
+            assert!(extended.starts_with(&legacy));
+            assert!(
+                extended.len() - legacy.len()
+                    <= PendingProjectionRecoveryRegistration::MAX_BYTES + 4
+            );
+            assert_eq!(
+                PendingAuthorityProjection::decode(&extended).unwrap(),
+                pending
+            );
+            assert_eq!(
+                pending
+                    .registration(registration.generation(), registration.committee())
+                    .unwrap(),
+                Some(registration.clone())
+            );
+            for end in legacy.len() + 1..extended.len() {
+                assert!(PendingAuthorityProjection::decode(&extended[..end]).is_err());
+            }
+            let mut trailing = extended;
+            trailing.push(0);
+            assert!(PendingAuthorityProjection::decode(&trailing).is_err());
+            for mutation in 0..4 {
+                let mut altered = pending.clone();
+                let trailer = altered.recovery_registration.as_mut().unwrap();
+                match mutation {
+                    0 => trailer.owner = crate::service::NodeId([99; 32]),
+                    1 => trailer.sequence = 0,
+                    2 => trailer.previous = Some(crate::service::Hash([99; 32])),
+                    _ => trailer.sequence = 2,
+                }
+                assert!(altered.encode().is_err(), "malformed trailer {mutation}");
+            }
+            let mut altered = pending;
+            let RuntimeWork::Invoke {
+                invocation,
+                authorization,
+                ..
+            } = &mut altered.work
+            else {
+                unreachable!()
+            };
+            invocation.gas -= 1;
+            let InvocationAuthorization::PublicPreflight(preflight) = authorization.as_ref() else {
+                unreachable!()
+            };
+            **authorization = InvocationAuthorization::PublicPreflight(
+                crate::agent_sdk::PublicPreflight::for_work(invocation, preflight.observed_slot),
+            );
+            let changed = altered
+                .registration(registration.generation(), registration.committee())
+                .unwrap()
+                .unwrap();
+            let committee = crate::agent::shared_commit::common_snapshot_claim_for_test();
+            assert!(
+                changed
+                    .verify(registration.generation(), committee.active_committee())
+                    .is_err(),
+                "unchanged owner signature must not bind modified gas"
+            );
+        }
+
+        #[test]
         fn native_genesis_read_envelope_binds_target_nonce_and_method() {
             let harness = NativeProjectionOwnerHarness::new("genesis-read-envelope");
             let owner = harness.owner.as_ref().unwrap();
@@ -33175,6 +33865,7 @@ mod tests {
             let pending = PendingAuthorityProjection {
                 query: AuthorityReadRequest::Projection(query),
                 management_anchor: None,
+                recovery_registration: None,
                 work: RuntimeWork::Invoke {
                     context: RuntimeExecutionContext::Direct,
                     state: RuntimeState::default(),

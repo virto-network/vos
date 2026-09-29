@@ -80,7 +80,9 @@ const SHARED_GENESIS_INTENT_DOMAIN: &[u8] = b"vos/agent-host/shared-genesis-inte
 const SHARED_PORTABLE_ROOT_PINS_DOMAIN: &[u8] = b"vos/agent-host/shared-portable-root-pins/v1";
 const MAX_COMMON_CHECKPOINT_BUNDLE_BYTES: usize = MAX_SHARED_AGENT_PORTABLE_BACKUP_BYTES
     + super::shared_commit::MAX_SHARED_AGENT_LOCAL_SNAPSHOT_BINDING_BYTES
-    + super::shared_commit::MAX_SHARED_AGENT_COMMON_SNAPSHOT_CERTIFICATE_BYTES;
+    + super::shared_commit::MAX_SHARED_AGENT_COMMON_SNAPSHOT_CERTIFICATE_BYTES
+    + super::shared_recovery::MAX_SHARED_RECOVERY_MANIFEST_BYTES
+    + 4;
 const MAX_COMMON_RESTORE_BYTES: usize = MAX_COMMON_CHECKPOINT_BUNDLE_BYTES
     + super::shared_commit::MAX_SHARED_AGENT_LOCAL_SNAPSHOT_BINDING_BYTES
     + MAX_JOURNAL_RECORD_BYTES;
@@ -752,9 +754,32 @@ struct CommonCheckpointBundle {
     certificate: SharedAgentCommonSnapshotCertificate,
     binding: SharedAgentLocalSnapshotBinding,
     journal: PortableJournalCheckpoint,
+    recovery: Option<super::shared_recovery::SharedRecoveryManifest>,
 }
 
 impl CommonCheckpointBundle {
+    fn recovery_manifest_for_restore(
+        &self,
+    ) -> Result<super::shared_recovery::SharedRecoveryManifest, SharedAgentHostError> {
+        self.validate()?;
+        if let Some(manifest) = &self.recovery {
+            return Ok(manifest.clone());
+        }
+        let ordered = self.certificate.claim().ordered();
+        let generation = AgentGenerationRouteKey::new(
+            ordered.space(),
+            ordered.agent(),
+            ordered.genesis(),
+            ordered.admission(),
+        )
+        .map_err(|_| SharedAgentHostError::PortableBackupInvalid)?;
+        super::shared_recovery::SharedRecoveryManifest::new(
+            generation,
+            self.certificate.claim().active_committee().clone(),
+        )
+        .map_err(|_| SharedAgentHostError::PortableBackupInvalid)
+    }
+
     fn validate(&self) -> Result<(), SharedAgentHostError> {
         self.intent.validate()?;
         self.root_pins
@@ -771,6 +796,28 @@ impl CommonCheckpointBundle {
             return Err(SharedAgentHostError::PortableBackupUnsupported);
         };
         let claim = self.binding.claim();
+        match (&self.recovery, self.certificate.claim().recovery_manifest()) {
+            (None, None) => {}
+            (Some(recovery), Some(commitment)) => {
+                let generation = AgentGenerationRouteKey::new(
+                    claim.ordered().space(),
+                    claim.ordered().agent(),
+                    claim.ordered().genesis(),
+                    claim.ordered().admission(),
+                )
+                .map_err(|_| SharedAgentHostError::PortableBackupInvalid)?;
+                recovery
+                    .validate_at_raft_index(claim.raft_index())
+                    .map_err(|_| SharedAgentHostError::PortableBackupInvalid)?;
+                if recovery.generation() != generation
+                    || recovery.committee() != committee
+                    || recovery.commitment() != commitment
+                {
+                    return Err(SharedAgentHostError::PortableBackupInvalid);
+                }
+            }
+            _ => return Err(SharedAgentHostError::PortableBackupInvalid),
+        }
         if provision.root() != &self.root_pins
             || self.certificate.claim().active_committee() != committee
             || provision.proposal().replica().node != claim.local_node()
@@ -809,6 +856,33 @@ fn decode_common_field<T: ServiceWire>(
 
 impl ServiceWire for CommonCheckpointBundle {
     const MAGIC: [u8; 4] = *b"ACB1";
+    fn encode(&self) -> Vec<u8> {
+        let mut output = Vec::new();
+        output.extend_from_slice(if self.recovery.is_some() {
+            b"ACB2"
+        } else {
+            &Self::MAGIC
+        });
+        output.extend_from_slice(&crate::service::PLATFORM_ID.0);
+        self.encode_body(&mut output);
+        output
+    }
+    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut decoder = Decoder::new(bytes);
+        let recovery = match decoder.take(4)? {
+            b"ACB1" => false,
+            b"ACB2" => true,
+            _ => return Err(DecodeError::InvalidTag),
+        };
+        if Hash(decoder.fixed()?) != crate::service::PLATFORM_ID {
+            return Err(DecodeError::InvalidPlatform);
+        }
+        let value = Self::decode_body(&mut decoder)?;
+        if !decoder.exhausted() || value.recovery.is_some() != recovery {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
     fn encode_body(&self, output: &mut Vec<u8>) {
         let mut encoder = Encoder(output);
         encoder.bytes(&self.intent.encode());
@@ -816,6 +890,9 @@ impl ServiceWire for CommonCheckpointBundle {
         encoder.bytes(&self.certificate.encode());
         encoder.bytes(&self.binding.encode());
         encoder.bytes(&self.journal.encode());
+        if let Some(recovery) = &self.recovery {
+            encoder.bytes(&recovery.encode());
+        }
     }
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         if decoder.remaining() > MAX_COMMON_CHECKPOINT_BUNDLE_BYTES {
@@ -833,6 +910,14 @@ impl ServiceWire for CommonCheckpointBundle {
                 super::shared_commit::MAX_SHARED_AGENT_LOCAL_SNAPSHOT_BINDING_BYTES,
             )?,
             journal: decode_common_field(decoder, MAX_PORTABLE_JOURNAL_IMAGE_BYTES)?,
+            recovery: if decoder.exhausted() {
+                None
+            } else {
+                Some(decode_common_field(
+                    decoder,
+                    super::shared_recovery::MAX_SHARED_RECOVERY_MANIFEST_BYTES,
+                )?)
+            },
         };
         bundle.validate().map_err(|_| DecodeError::NonCanonical)?;
         Ok(bundle)
@@ -2747,6 +2832,33 @@ impl SharedAgentHost {
             .map_err(map_driver_error)
     }
 
+    pub(crate) fn recovery_manifest(
+        &mut self,
+        agent: AgentId,
+    ) -> Result<super::shared_recovery::SharedRecoveryManifest, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .recovery_manifest()
+            .map_err(map_driver_error)
+    }
+
+    pub(crate) fn validate_recovery_registration(
+        &mut self,
+        agent: AgentId,
+        registration: &super::shared_recovery::SharedRecoveryRegistration,
+    ) -> Result<(), SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .validate_recovery_registration(registration)
+            .map_err(map_driver_error)
+    }
+
     pub(crate) fn retained_terminal_projection_invoke(
         &self,
         agent: AgentId,
@@ -3479,6 +3591,16 @@ impl SharedAgentHost {
             .driver
             .portable_checkpoint(limits.journal()?)
             .map_err(map_driver_error)?;
+        let recovery = hosted
+            .driver
+            .ledger()
+            .common_snapshot_recovery_manifest()
+            .map_err(map_ledger_error)?;
+        let recovery = match certificate.claim().recovery_manifest() {
+            Some(_) => Some(recovery.ok_or(SharedAgentHostError::CorruptResidue)?),
+            None if recovery.as_ref().is_none_or(|manifest| manifest.is_empty()) => None,
+            None => return Err(SharedAgentHostError::CorruptResidue),
+        };
         let bundle = CommonCheckpointBundle {
             intent: hosted.intent.clone(),
             root_pins: self
@@ -3488,6 +3610,7 @@ impl SharedAgentHost {
             certificate,
             binding,
             journal,
+            recovery,
         };
         bundle.validate()?;
         self.lease.validate_live().map_err(map_outer_lease_error)?;
@@ -3951,8 +4074,9 @@ impl SharedAgentHost {
             .map_err(|_| SharedAgentHostError::CorruptResidue)?;
         #[cfg(test)]
         self.common_checkpoint_crash_at(CommonCheckpointCrashStage::Journal)?;
+        let recovery = record.bundle.recovery_manifest_for_restore()?;
         ledger
-            .restore_common_snapshot(&record.bundle.certificate, &record.binding)
+            .restore_common_snapshot(&record.bundle.certificate, &record.binding, &recovery)
             .map_err(map_ledger_error)?;
         #[cfg(test)]
         self.common_checkpoint_crash_at(CommonCheckpointCrashStage::Ledger)?;
@@ -10500,6 +10624,7 @@ mod tests {
                 .unwrap();
         let (handler, owns_worker) = attachment.attachment_for_test(fixture.agent).unwrap();
         assert!(!owns_worker);
+        attachment.assert_merge_noop_gate_for_test(fixture.agent);
         assert_eq!(
             host.lock().unwrap().require_transport(fixture.agent),
             Ok(())

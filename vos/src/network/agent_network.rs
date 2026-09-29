@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::time::Duration;
 
 use crate::agent::shared_commit::{ReplicaCommitSignature, SharedAgentCommonSnapshotClaim};
+use crate::agent::shared_recovery::SharedRecoveryRegistration;
 use futures_channel::oneshot;
 use libp2p::request_response::{self, Message};
 use libp2p::{PeerId, Swarm};
@@ -279,6 +280,11 @@ pub(super) struct PendingMeta {
 }
 
 pub(super) enum PendingAgentReply {
+    RecoveryRegistration {
+        meta: PendingMeta,
+        registration: Hash,
+        reply: std_mpsc::Sender<Result<bool, AgentNetworkError>>,
+    },
     CommonSnapshotVote {
         meta: PendingMeta,
         claim: Hash,
@@ -332,6 +338,7 @@ impl PendingAgentReply {
     fn meta(&self) -> PendingMeta {
         match self {
             Self::CommonSnapshotVote { meta, .. }
+            | Self::RecoveryRegistration { meta, .. }
             | Self::AppliedAvailability { meta, .. }
             | Self::Projection { meta, .. }
             | Self::Invocation { meta, .. }
@@ -349,7 +356,9 @@ impl PendingAgentReply {
             Self::CommonSnapshotVote { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
-            Self::AppliedAvailability { reply, .. } | Self::Projection { reply, .. } => {
+            Self::AppliedAvailability { reply, .. }
+            | Self::Projection { reply, .. }
+            | Self::RecoveryRegistration { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
             Self::Invocation { reply, .. } => {
@@ -392,6 +401,16 @@ impl PendingAgentReply {
         }
         let message = authenticated.into_frame().message;
         match (self, message) {
+            (
+                Self::RecoveryRegistration { registration, reply, .. },
+                AgentMessage::RecoveryRegistrationReply { registration: actual, applied },
+            ) => {
+                let _ = reply.send(if actual == registration {
+                    Ok(applied)
+                } else {
+                    Err(AgentNetworkError::ResponseCorrelationMismatch)
+                });
+            }
             (
                 Self::CommonSnapshotVote { claim, reply, .. },
                 AgentMessage::CommonSnapshotVoteReply {
@@ -953,6 +972,47 @@ impl Network {
         receiver
     }
 
+    pub(crate) fn send_agent_recovery_registration(
+        &self,
+        target: NodeId,
+        route: AgentGenerationRoute,
+        registration: SharedRecoveryRegistration,
+    ) -> std_mpsc::Receiver<Result<bool, AgentNetworkError>> {
+        let (reply, receiver) = std_mpsc::channel();
+        let permit = match self.reserve_agent_outbound(AgentTrafficClass::Application) {
+            Ok(permit) => permit,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return receiver;
+            }
+        };
+        let commitment = Hash(registration.commitment().0);
+        match self.prepare_agent_request(
+            target,
+            route,
+            AgentMessage::RecoveryRegistrationRequest(registration),
+        ) {
+            Ok((peer, frame)) => self.queue_agent_request(AgentOutboundRequest {
+                peer,
+                frame,
+                permit,
+                pending: PendingAgentReply::RecoveryRegistration {
+                    meta: PendingMeta {
+                        route,
+                        target_node: target,
+                        target_peer: peer,
+                    },
+                    registration: commitment,
+                    reply,
+                },
+            }),
+            Err(error) => {
+                let _ = reply.send(Err(error));
+            }
+        }
+        receiver
+    }
+
     pub(crate) fn send_agent_invocation(
         &self,
         target: NodeId,
@@ -1327,6 +1387,7 @@ fn is_request(message: &AgentMessage) -> bool {
         AgentMessage::InvokeRequest(_)
             | AgentMessage::AppliedAvailabilityRequest(_)
             | AgentMessage::CommonSnapshotVoteRequest(_)
+            | AgentMessage::RecoveryRegistrationRequest(_)
             | AgentMessage::ProjectionRequest(_)
             | AgentMessage::ProjectionRecoveryRequest(_)
             | AgentMessage::Raft(RaftMessage::AppendRequest { .. })
@@ -1341,6 +1402,10 @@ fn is_request(message: &AgentMessage) -> bool {
 
 fn response_matches_request(request: &AgentMessage, response: &AgentMessage) -> bool {
     match (request, response) {
+        (
+            AgentMessage::RecoveryRegistrationRequest(request),
+            AgentMessage::RecoveryRegistrationReply { registration, .. },
+        ) => request.commitment().0 == registration.0,
         (
             AgentMessage::CommonSnapshotVoteRequest(request),
             AgentMessage::CommonSnapshotVoteReply { claim, .. },
@@ -1732,6 +1797,105 @@ mod tests {
             AgentNetworkError::UnknownMember(node(attacker))
         );
         assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recovery_registration_reply_requires_exact_peer_sender_route_and_commitment() {
+        let peer = key(84).public().to_peer_id();
+        let other = key(85).public().to_peer_id();
+        let route = test_route(84);
+        let registration = Hash(id(86));
+        for fault in 0..7 {
+            let (reply, result) = std_mpsc::channel();
+            let pending = PendingAgentReply::RecoveryRegistration {
+                meta: PendingMeta {
+                    route,
+                    target_node: node(peer),
+                    target_peer: peer,
+                },
+                registration,
+                reply,
+            };
+            let mut response = frame(
+                peer,
+                route,
+                AgentMessage::RecoveryRegistrationReply {
+                    registration: if fault == 2 {
+                        Hash(id(87))
+                    } else {
+                        registration
+                    },
+                    applied: fault != 1,
+                },
+            );
+            if fault == 3 {
+                response.route.generation = Hash(id(88));
+            }
+            if fault == 5 {
+                response.sender = node(other);
+            }
+            if fault == 6 {
+                response.message = AgentMessage::ProjectionAccepted {
+                    request: registration,
+                    accepted: true,
+                };
+            }
+            let authenticated =
+                authenticate_sender(if fault == 5 { &other } else { &peer }, response).unwrap();
+            pending.complete(if fault == 4 { other } else { peer }, authenticated);
+            let expected = match fault {
+                0 => Ok(true),
+                1 => Ok(false),
+                2 => Err(AgentNetworkError::ResponseCorrelationMismatch),
+                3 => Err(AgentNetworkError::ResponseRouteMismatch),
+                4 => Err(AgentNetworkError::ResponsePeerMismatch),
+                5 => Err(AgentNetworkError::ResponseSenderMismatch),
+                6 => Err(AgentNetworkError::ResponseTypeMismatch),
+                _ => unreachable!(),
+            };
+            assert_eq!(result.recv().unwrap(), expected, "fault {fault}");
+        }
+    }
+
+    #[test]
+    fn recovery_registration_uses_bounded_application_pool_and_exact_reply() {
+        let registration = crate::agent::shared_recovery::recovery_registration_for_test(1, 7);
+        let request = AgentMessage::RecoveryRegistrationRequest(registration.clone());
+        let reply = AgentMessage::RecoveryRegistrationReply {
+            registration: Hash(registration.commitment().0),
+            applied: true,
+        };
+        assert!(is_request(&request));
+        assert!(!is_request(&reply));
+        assert!(response_matches_request(&request, &reply));
+        assert!(!response_matches_request(
+            &request,
+            &AgentMessage::RecoveryRegistrationReply {
+                registration: Hash(id(99)),
+                applied: true,
+            }
+        ));
+        for message in [&request, &reply] {
+            assert_eq!(
+                AgentTrafficClass::for_message(message),
+                AgentTrafficClass::Application
+            );
+        }
+        let pools = new_agent_outbound_permits();
+        let _application = pools
+            .application
+            .clone()
+            .try_acquire_many_owned(MAX_AGENT_OUTBOUND_APPLICATION_REQUESTS as u32)
+            .unwrap();
+        assert!(reserve_agent_outbound_permit(&pools, AgentTrafficClass::Application).is_err());
+        assert_eq!(
+            pools.available(AgentTrafficClass::Availability),
+            MAX_AGENT_OUTBOUND_AVAILABILITY_REQUESTS
+        );
+        assert_eq!(
+            pools.available(AgentTrafficClass::Raft),
+            MAX_AGENT_OUTBOUND_RAFT_REQUESTS
+        );
     }
 
     #[test]
