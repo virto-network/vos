@@ -131,7 +131,7 @@ const CONFIG_ENCODED_BYTES: usize = SYSTEM_AUTHORITY_CONFIGURATION_MAGIC.len()
     + PRIVATE_SIGNATURE_BYTES;
 const EVIDENCE_DOMAIN: &[u8] = b"vos/system-authority/policy-evidence/v1";
 const OPERATION_EVIDENCE_DOMAIN: &[u8] = b"vos/system-authority/operation-evidence/v1";
-const STATE_INTEGRITY_DOMAIN: &[u8] = b"vos/system-authority/state-integrity/v17";
+const STATE_INTEGRITY_DOMAIN: &[u8] = b"vos/system-authority/state-integrity/v18";
 
 const _: () = assert!(MAX_RETAINED_EXACT_WIRE_BYTES < MAX_RUNTIME_STATE_BYTES);
 
@@ -1371,7 +1371,7 @@ fn refresh_state_integrity_commitment(
 }
 
 /// Linear policy state for one Space's built-in system Agent.
-#[actor(agent, state_version = 20)]
+#[actor(agent, state_version = 21)]
 pub struct SystemAuthority {
     #[state(const)]
     configuration: SystemAuthorityConfiguration,
@@ -8538,7 +8538,7 @@ mod tests {
         let mut actor =
             <SystemAuthority as Actor>::__load_agent_state(Some(&installation), None, None, None)
                 .unwrap();
-        assert_eq!(SystemAuthority::STATE_SCHEMA_VERSION, 20);
+        assert_eq!(SystemAuthority::STATE_SCHEMA_VERSION, 21);
         assert!(actor.node_certificates.is_empty());
         let seed = NodeOwnerRow::from_enrollment(config.bootstrap_node_enrollment());
         assert!(node_storage::bootstrap(&mut actor.node_certificates, &seed).is_some());
@@ -8641,6 +8641,76 @@ mod tests {
         assert_eq!(table, before);
         assert!(table.remove(&mut rows, next.node, next.owner));
         assert_eq!(table.owner(next.node), None);
+        mock::reset();
+    }
+
+    #[test]
+    fn node_table_fixed_roster_materializes_atomically_and_recovers_exactly() {
+        use node_storage::{NodeRows, NodeTable};
+        use vos::{Decode, Encode, storage::mock};
+        mock::reset();
+        let config = configuration();
+        let mut seeds: Vec<_> = [0x31, 0x32, 0x33]
+            .into_iter()
+            .map(|seed| {
+                NodeOwnerRow::from_enrollment(signed_node_enrollment(
+                    SpaceId(config.space),
+                    ADMIN_PRINCIPAL,
+                    seed,
+                ))
+            })
+            .collect();
+        seeds.sort_by_key(|row| row.node);
+        assert!(NodeTable::pending_bootstrap_roster(Vec::new()).is_none());
+        assert!(NodeTable::pending_bootstrap_roster(seeds[..2].to_vec()).is_none());
+        assert!(NodeTable::pending_bootstrap_roster(vec![seeds[0].clone(); 3]).is_none());
+        let mut reversed = seeds.clone();
+        reversed.reverse();
+        assert!(NodeTable::pending_bootstrap_roster(reversed).is_none());
+        let mut table = NodeTable::pending_bootstrap_roster(seeds.clone()).unwrap();
+        let mut rows = NodeRows::default();
+        for seed in &seeds {
+            assert_eq!(table.get(&rows, seed.node), Some(seed.clone()));
+        }
+        let pending = table.encode();
+        table = NodeTable::try_decode(&pending).unwrap();
+        assert!(table.index_is_valid());
+        rows.__init(b"test/fixed-roster-nodes/");
+        let next = NodeOwnerRow::from_enrollment(signed_node_enrollment(
+            SpaceId(config.space),
+            ADMIN_PRINCIPAL,
+            0x34,
+        ));
+        // An existing row rejects the entire seed, without partially publishing it.
+        rows.insert(&seeds[1].node, &seeds[1]);
+        assert!(!table.insert_verified(&mut rows, &next));
+        assert_eq!(table.encode(), pending);
+        assert!(rows.get(&seeds[0].node).is_none());
+        assert!(rows.get(&seeds[2].node).is_none());
+        rows.remove(&seeds[1].node);
+        let mut candidate = table.clone();
+        assert!(!authority_row_transaction(|| {
+            assert!(candidate.insert_verified(&mut rows, &next));
+            false
+        }));
+        assert!(rows.is_empty());
+        assert_eq!(table.encode(), pending);
+        assert!(table.insert_verified(&mut rows, &next));
+        let published = table.encode();
+        mock::commit_dispatch();
+        let reopened = NodeTable::try_decode(&published).unwrap();
+        let mut reopened_rows = NodeRows::default();
+        reopened_rows.__init(b"test/fixed-roster-nodes/");
+        for seed in &seeds {
+            assert_eq!(reopened.get(&reopened_rows, seed.node), Some(seed.clone()));
+        }
+        assert_eq!(reopened.get(&reopened_rows, next.node), Some(next));
+        let mut substituted = seeds[1].clone();
+        substituted.transport_signature[0] ^= 1;
+        reopened_rows.insert(&substituted.node, &substituted);
+        assert!(reopened.get(&reopened_rows, substituted.node).is_none());
+        reopened_rows.remove(&seeds[0].node);
+        assert!(reopened.get(&reopened_rows, seeds[0].node).is_none());
         mock::reset();
     }
 
@@ -10441,8 +10511,8 @@ mod tests {
         assert_eq!(SystemAuthorityConfiguration::decode(&encoded), Some(config));
         assert_eq!(
             <SystemAuthority as vos::Actor>::STATE_SCHEMA_VERSION,
-            20,
-            "row-backed node headers require the new clean state generation",
+            21,
+            "fixed-roster bootstrap headers require the new clean state generation",
         );
 
         let mut old_generation = encoded.clone();

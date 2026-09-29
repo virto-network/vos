@@ -3,7 +3,7 @@
 //! storage namespace. These primitives do not replace enrollment verification.
 
 use super::{Hash, NodeOwnerRow};
-use alloc::{boxed::Box, vec, vec::Vec};
+use alloc::{vec, vec::Vec};
 use vos::Encode;
 use vos::storage::StorageMap;
 
@@ -36,8 +36,8 @@ impl NodeIndexRow {
 
 pub(super) type NodeRows = StorageMap<[u8; 32], NodeOwnerRow>;
 
-/// Portable Linear header. A new incarnation carries exactly one verified
-/// bootstrap certificate until its first successful mutation materializes it.
+/// Portable Linear header. A new incarnation carries its fixed verified
+/// bootstrap roster until its first successful mutation materializes it.
 /// Restore never invents a seed when this option is absent.
 #[derive(
     vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
@@ -48,7 +48,7 @@ pub(super) struct NodeTable {
     owners: Vec<[u8; 32]>,
     // Keep the one-time seed out of every cloned Authority stack frame. The
     // archive still carries it until materialization; absent means no fallback.
-    bootstrap: Option<Box<NodeOwnerRow>>,
+    bootstrap: Option<Vec<NodeOwnerRow>>,
 }
 
 #[derive(
@@ -119,16 +119,36 @@ impl NodeTable {
 
     /// No storage access: safe before generated handle initialization.
     pub fn pending_bootstrap(verified: NodeOwnerRow) -> Self {
-        let index = NodeIndexRow::of_verified(&verified);
-        Self {
-            entries: vec![CompactNodeIndexRow {
+        Self::pending_bootstrap_roster(vec![verified])
+            .expect("valid singleton bootstrap certificate")
+    }
+
+    /// Caller verifies enrollment signatures before constructing the header.
+    /// Require the exact canonical roster; never sort or drop duplicate inputs.
+    pub fn pending_bootstrap_roster(verified: Vec<NodeOwnerRow>) -> Option<Self> {
+        if !matches!(verified.len(), 1 | 3)
+            || !verified.windows(2).all(|pair| pair[0].node < pair[1].node)
+        {
+            return None;
+        }
+        let mut table = Self::empty();
+        for row in &verified {
+            let owner = match table.owners.iter().position(|owner| *owner == row.owner) {
+                Some(owner) => owner,
+                None => {
+                    table.owners.push(row.owner);
+                    table.owners.len() - 1
+                }
+            };
+            let index = NodeIndexRow::of_verified(row);
+            table.entries.push(CompactNodeIndexRow {
                 node: index.node,
                 certificate: index.certificate,
-                owner: 0,
-            }],
-            owners: vec![index.owner],
-            bootstrap: Some(Box::new(verified)),
+                owner: u8::try_from(owner).ok()?,
+            });
         }
+        table.bootstrap = Some(verified);
+        table.index_is_valid().then_some(table)
     }
 
     /// Header integrity is checked by the enclosing Authority commitment;
@@ -153,8 +173,12 @@ impl NodeTable {
                     && (entry.owner as usize) < self.owners.len()
                     && entry.certificate != [0; 32]
             })
-            && self.bootstrap.as_ref().is_none_or(|seed| {
-                self.entries.len() == 1 && self.expanded(0) == Some(NodeIndexRow::of_verified(seed))
+            && self.bootstrap.as_ref().is_none_or(|seeds| {
+                matches!(seeds.len(), 1 | 3)
+                    && self.entries.len() == seeds.len()
+                    && seeds.iter().enumerate().all(|(index, seed)| {
+                        self.expanded(index) == Some(NodeIndexRow::of_verified(seed))
+                    })
             })
     }
 
@@ -182,8 +206,15 @@ impl NodeTable {
                 .ok()?,
         )?;
         match &self.bootstrap {
-            Some(seed) => (self.index_is_valid() && NodeIndexRow::of_verified(seed) == index)
-                .then(|| (**seed).clone()),
+            Some(seeds) => {
+                if !self.index_is_valid() {
+                    return None;
+                }
+                seeds
+                    .iter()
+                    .find(|seed| NodeIndexRow::of_verified(seed) == index)
+                    .cloned()
+            }
             None => read(rows, &index),
         }
     }
@@ -192,10 +223,15 @@ impl NodeTable {
         if !self.index_is_valid() {
             return None;
         }
-        if let Some(seed) = &self.bootstrap {
-            let index = bootstrap(rows, seed)?;
-            if self.entries.len() != 1 || self.expanded(0) != Some(index) {
+        if let Some(seeds) = &self.bootstrap {
+            if !rows.is_empty() {
                 return None;
+            }
+            for (position, seed) in seeds.iter().enumerate() {
+                let index = insert_verified(rows, seed)?;
+                if self.expanded(position) != Some(index) {
+                    return None;
+                }
             }
             self.bootstrap = None;
         }

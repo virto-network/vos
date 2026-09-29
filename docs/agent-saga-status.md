@@ -98,10 +98,24 @@ node/enrollment, and `root_managed_agent` seeds one replica. Extend that bounded
 authenticated configuration and its directory projection to the common fixed
 roster, then qualify real actor installation, file ownership and
 quorum/startup/restart before exposing configuration.
-The Authority node-table header also retains only one bootstrap certificate;
-the roster change must cover that seed and its materialization/recovery, not
-merely add replica IDs to the managed-Agent row. Preserve singleton compatibility
-and reject incomplete or differently ordered rosters before signing admission.
+The candidate Authority node-table header now supports exactly one or three
+bootstrap certificates in canonical node order. Materialization writes the whole
+seed inside the existing row transaction; an occupied namespace refuses it, and
+restored materialized headers never recreate missing certificates. The new
+host test covers pending-header encode/decode, all three lookups, conflicting
+storage, rollback, publication/reopen, and missing/substituted rows. Four focused
+node-table tests pass in `target/authority-fixed-roster-node-table.log` (0.22 s).
+The complete candidate Authority host suite passes: 79 passed, 2 ignored
+(30.88 s), `target/authority-fixed-roster-host-suite-final.log`. The first suite
+run exposed a stale schema-version assertion (78 passed, 1 failed, 2 ignored);
+it was updated to assert the new version. These are host tests, not physical-PVM
+or three-node qualification.
+This changes the candidate state schema to 21 and integrity domain to v18;
+bundled artifacts are unchanged, and no schema-20 migration is implemented.
+The production configuration still constructs a singleton seed. Integration must
+wire the validated fixed roster through configuration, managed-Agent projection
+and certificate seeds together, then qualify the actual guest. Preserve singleton
+operation and reject incomplete or differently ordered rosters before admission.
 Preserve exact roster, credential-node, package and receipt checks; do not
 replace them with index-zero assumptions or permissive finality. Do not claim
 that node-independent replay commitments alone establish a deployable cluster.
