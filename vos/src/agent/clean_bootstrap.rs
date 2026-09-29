@@ -1692,7 +1692,7 @@ where
 /// Attached bootstrap resources without a serving-owner interface. A transient
 /// lack of a leader must not tear down the very attachment needed for election.
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
-struct PendingCleanSystemAgentBootstrap<P, R, I>
+pub struct PendingCleanSystemAgentBootstrap<P, R, I>
 where
     P: CleanSystemAgentBootstrapStore,
     R: CleanSystemAgentBootstrapStore,
@@ -1716,7 +1716,16 @@ where
     R: CleanSystemAgentBootstrapStore,
     I: CleanManagementIssuerStore,
 {
-    fn try_complete<S: CleanManagementReceiptSigner>(
+    /// Immutable identity for startup orchestration, not serving authority.
+    pub fn pins(&self) -> &CleanSystemAgentPins {
+        self.plan.pins()
+    }
+
+    /// Advance bootstrap without relinquishing its journal leases or consensus
+    /// attachment. `Host(Unavailable)` is retryable on this same owner. Other
+    /// errors require dropping and reopening from durable state. A completed
+    /// owner is returned exactly once; subsequent calls return `Ok(None)`.
+    pub fn try_complete<S: CleanManagementReceiptSigner>(
         &mut self,
         signer: &mut S,
     ) -> Result<Option<CleanSystemAgentBootstrapOwner<P, R, I>>, CleanSystemAgentBootstrapError>
@@ -1767,6 +1776,124 @@ where
             return Err(error);
         }
         Ok(self.owner.take())
+    }
+
+    /// Load the exact durable bootstrap plan, or call `fresh_plan` only for an
+    /// empty root, then attach without exposing a serving owner. Supports the
+    /// authenticated singleton or fixed three-voter roster. Callers must retain
+    /// this value while driving `try_complete`, and publish routes only after
+    /// completing the returned owner's remaining lifecycle recovery.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_operation_admission<S, F>(
+        mut pins_store: P,
+        mut record_store: R,
+        issuer_store: I,
+        signer: &mut S,
+        fresh_plan: F,
+        shared_host_root: impl AsRef<Path>,
+        stable_lock_path: impl AsRef<Path>,
+        expected_space: SpaceId,
+        expected_node: NodeId,
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+        finality: Arc<dyn AgentGenesisFinalityVerifier>,
+        genesis: Arc<dyn SystemAgentGenesisProvider>,
+        network: Arc<Network>,
+        lifecycle: Option<&super::local_lifecycle::LocalLifecycleStartupAdmission>,
+        operations: Option<&NativeAuthorityOperationStartupAdmission<'_>>,
+    ) -> Result<Self, CleanSystemAgentBootstrapError>
+    where
+        S: CleanManagementReceiptSigner,
+        F: FnOnce() -> Result<AuthorizedCleanSystemAgentBootstrap, CleanSystemAgentBootstrapError>,
+    {
+        let plan = load_or_prepare_bootstrap_plan(
+            &mut pins_store,
+            &mut record_store,
+            fresh_plan,
+            shared_host_root.as_ref(),
+            lifecycle,
+            operations,
+        )?;
+        CleanSystemAgentBootstrapOwner::attach_bootstrap_with_admission(
+            pins_store,
+            record_store,
+            issuer_store,
+            signer,
+            &plan,
+            shared_host_root,
+            stable_lock_path,
+            expected_space,
+            expected_node,
+            trust,
+            merge,
+            finality,
+            genesis,
+            network,
+            lifecycle,
+            operations,
+        )
+    }
+}
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+fn load_or_prepare_bootstrap_plan<P, R, F>(
+    pins_store: &mut P,
+    record_store: &mut R,
+    fresh_plan: F,
+    shared_host_root: &Path,
+    lifecycle: Option<&super::local_lifecycle::LocalLifecycleStartupAdmission>,
+    operations: Option<&NativeAuthorityOperationStartupAdmission<'_>>,
+) -> Result<AuthorizedCleanSystemAgentBootstrap, CleanSystemAgentBootstrapError>
+where
+    P: CleanSystemAgentBootstrapStore,
+    R: CleanSystemAgentBootstrapStore,
+    F: FnOnce() -> Result<AuthorizedCleanSystemAgentBootstrap, CleanSystemAgentBootstrapError>,
+{
+    let loaded_pins = pins_store
+        .load(MAX_CLEAN_SYSTEM_AGENT_PINS_BYTES)
+        .map_err(|_| CleanSystemAgentBootstrapError::PinsStorage)?;
+    let loaded_record = record_store
+        .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
+        .map_err(|_| CleanSystemAgentBootstrapError::RecordStorage)?;
+    if operations.is_some_and(|admission| admission.has_history)
+        && loaded_record.as_deref().is_none_or(|bytes| {
+            !CleanSystemAgentBootstrapRecord::decode(bytes)
+                .is_ok_and(|record| record.phase == CleanSystemAgentBootstrapPhase::Complete)
+        })
+    {
+        return Err(rejected(CleanSystemAgentBootstrapRejection::InvalidRecord));
+    }
+    match (loaded_pins.as_deref(), loaded_record.as_deref()) {
+        (None, Some(_)) => Err(rejected(CleanSystemAgentBootstrapRejection::MissingPins)),
+        (Some(_), None) => Err(rejected(CleanSystemAgentBootstrapRejection::MissingRecord)),
+        (Some(pins), Some(record)) => {
+            let pins = CleanSystemAgentPins::decode(pins)
+                .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidPins))?;
+            let record = CleanSystemAgentBootstrapRecord::decode(record)
+                .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidRecord))?;
+            let plan = AuthorizedCleanSystemAgentBootstrap::decode(&record.plan)
+                .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidRecord))?;
+            if plan.pins() != &pins {
+                return Err(rejected(CleanSystemAgentBootstrapRejection::DivergentPins));
+            }
+            if !record.matches_plan(&plan) {
+                return Err(rejected(
+                    CleanSystemAgentBootstrapRejection::DivergentRecord,
+                ));
+            }
+            Ok(plan)
+        }
+        (None, None) => {
+            if lifecycle.is_some_and(|admission| !admission.is_empty()) {
+                return Err(rejected(CleanSystemAgentBootstrapRejection::InvalidRecord));
+            }
+            if host_root_exists(shared_host_root)? {
+                return Err(rejected(
+                    CleanSystemAgentBootstrapRejection::PreexistingHost,
+                ));
+            }
+            fresh_plan()
+        }
     }
 }
 
@@ -2056,56 +2183,14 @@ where
     {
         let shared_host_root = shared_host_root.as_ref();
         let stable_lock_path = stable_lock_path.as_ref();
-        let loaded_pins = pins_store
-            .load(MAX_CLEAN_SYSTEM_AGENT_PINS_BYTES)
-            .map_err(|_| CleanSystemAgentBootstrapError::PinsStorage)?;
-        let loaded_record = record_store
-            .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
-            .map_err(|_| CleanSystemAgentBootstrapError::RecordStorage)?;
-        if operations.is_some_and(|admission| admission.has_history)
-            && loaded_record.as_deref().is_none_or(|bytes| {
-                !CleanSystemAgentBootstrapRecord::decode(bytes)
-                    .is_ok_and(|record| record.phase == CleanSystemAgentBootstrapPhase::Complete)
-            })
-        {
-            return Err(rejected(CleanSystemAgentBootstrapRejection::InvalidRecord));
-        }
-        let plan = match (loaded_pins.as_deref(), loaded_record.as_deref()) {
-            (None, Some(_)) => {
-                return Err(rejected(CleanSystemAgentBootstrapRejection::MissingPins));
-            }
-            (Some(_), None) => {
-                return Err(rejected(CleanSystemAgentBootstrapRejection::MissingRecord));
-            }
-            (Some(pins), Some(record)) => {
-                let pins = CleanSystemAgentPins::decode(pins)
-                    .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidPins))?;
-                let record = CleanSystemAgentBootstrapRecord::decode(record)
-                    .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidRecord))?;
-                let plan = AuthorizedCleanSystemAgentBootstrap::decode(&record.plan)
-                    .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidRecord))?;
-                if plan.pins() != &pins {
-                    return Err(rejected(CleanSystemAgentBootstrapRejection::DivergentPins));
-                }
-                if !record.matches_plan(&plan) {
-                    return Err(rejected(
-                        CleanSystemAgentBootstrapRejection::DivergentRecord,
-                    ));
-                }
-                plan
-            }
-            (None, None) => {
-                if lifecycle.is_some_and(|admission| !admission.is_empty()) {
-                    return Err(rejected(CleanSystemAgentBootstrapRejection::InvalidRecord));
-                }
-                if host_root_exists(shared_host_root)? {
-                    return Err(rejected(
-                        CleanSystemAgentBootstrapRejection::PreexistingHost,
-                    ));
-                }
-                fresh_plan()?
-            }
-        };
+        let plan = load_or_prepare_bootstrap_plan(
+            &mut pins_store,
+            &mut record_store,
+            fresh_plan,
+            shared_host_root,
+            lifecycle,
+            operations,
+        )?;
         Self::open_or_bootstrap_with_admission(
             pins_store,
             record_store,
@@ -11714,12 +11799,12 @@ mod tests {
                     IssuerMemoryStore::default(),
                 );
                 let genesis = Arc::new(MemoryProvider::new(fixture.provision.clone()));
-                let mut attached = CleanSystemAgentBootstrapOwner::attach_bootstrap_with_admission(
+                let mut attached = PendingCleanSystemAgentBootstrap::open_with_operation_admission(
                     stores.0.clone(),
                     stores.1.clone(),
                     stores.2.clone(),
                     &mut signer,
-                    &fixture.plan,
+                    || Ok(fixture.plan.clone()),
                     directory.host(),
                     directory.lock(),
                     fixture.plan.pins.space,
@@ -11886,12 +11971,12 @@ mod tests {
                 let reopen = |index: usize, signer: &mut CountingSigner| {
                     let fixture = &fixtures[index];
                     let stores = &bootstrap_stores[index];
-                    CleanSystemAgentBootstrapOwner::attach_bootstrap_with_admission(
+                    PendingCleanSystemAgentBootstrap::open_with_operation_admission(
                         stores.0.clone(),
                         stores.1.clone(),
                         stores.2.clone(),
                         signer,
-                        &fixture.plan,
+                        || panic!("replica reopen must use its durable plan"),
                         directories[index].host(),
                         directories[index].lock(),
                         fixture.plan.pins.space,

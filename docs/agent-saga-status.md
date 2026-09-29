@@ -296,6 +296,32 @@ remains gated. Production-store/process crash recovery, interruption before
 bootstrap completion, public orchestration and backup remain open. Next integrate
 the qualified private lifecycle into the real startup workflow with signed common
 cluster inputs; do not count these fixture tests as released-node qualification.
+The retained bootstrap owner now has a production-facing pending-startup API.
+Synchronous singleton startup and pending startup share exact durable-plan
+loading, including partial/malformed-store refusal and no fresh-plan fallback
+on restart. The fixed-three-node cluster/recovery test now uses this API on
+initial attachment and every reopen; fresh-plan calls on reopen panic. It passes
+(100.55 s), `target/fixed-system-pending-api-cluster.log`. The existing singleton
+factory/restart regression passes (2.37 s), `target/fixed-system-pending-api-factory.log`.
+`vosx` startup uses the pending owner and retains it during temporary-unavailability
+retries, with a 60-second retry window between bounded operations (not a hard
+execution deadline). Non-transient errors still require authenticated reopen.
+No routes are exposed by pending ownership. The CLI explicitly refuses a
+non-singleton pending plan until common signed cluster configuration is integrated;
+this API integration does not enable a deployable three-node startup by itself.
+The candidate Authority production-filesystem startup/Shared Create/reopen test
+passes through this CLI path (123.43 s),
+`target/fixed-system-pending-api-production-stores.log`. It is a singleton system
+fixture using real file owners, not three-process crash or load qualification.
+The CLI test binary builds and the `std`-only library check passes (3.02 s):
+`target/fixed-system-pending-api-vosx-final-build.log` and
+`target/fixed-system-pending-api-std.log`. The earlier `--lib` CLI build command
+selected a nonexistent target; only the subsequent binary build is evidence.
+Next connect common signed inputs to `clean_startup.rs` and
+`clean_genesis_archive.rs`: every node must import the same root-certified
+bootstrap evidence and select its own authenticated replica, rather than certify
+independent local roots. Qualify this with the production file stores before
+removing the CLI singleton guard. Keep singleton behavior and image Local intact.
 The current full Authority host suite passes: 81 passed, 2 ignored (30.76 s),
 `fixed-roster-guest.ImAzBc/mutation-host-suite.log`.
 The candidate Authority node-table header now supports exactly one or three

@@ -18,7 +18,8 @@ use vos::agent::Ed25519NodeMergeAuthenticator;
 use vos::agent::authority::ed25519_public_key_wire;
 use vos::agent::bootstrap::SystemAgentGenesisProvider;
 use vos::agent::clean_bootstrap::{
-    AuthorizedCleanSystemAgentBootstrap, CleanSystemAgentBootstrapOwner,
+    AuthorizedCleanSystemAgentBootstrap, CleanSystemAgentBootstrapError,
+    PendingCleanSystemAgentBootstrap,
 };
 use vos::agent::driver::AgentTrustProvider;
 use vos::agent::genesis::{
@@ -80,6 +81,9 @@ const ADMIN_RETIREMENTS_DIRECTORY: &str = "authority-admin-retirements";
 const PROJECTION_ROUTE_QUEUE_CAPACITY: usize = 64;
 const LOCAL_LIFECYCLE_RECOVERY_LIMIT: usize = 1_024;
 const PROJECTION_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+// A retry window between bounded bootstrap operations, not a hard execution
+// deadline. Keep the same owner/leases while consensus work becomes available.
+const SYSTEM_BOOTSTRAP_RETRY_WINDOW: Duration = Duration::from_secs(60);
 
 /// Shared immutable bootstrap derivation for startup and fresh CLI requests.
 /// This derives an expected target, not proof of the daemon's live state.
@@ -374,7 +378,9 @@ fn open_clean_system_lifecycle_with_inputs(
         bootstrap_additional_nodes: None,
     };
     if !authority_configuration.matches_system_descriptor(&descriptor) {
-        anyhow::bail!("derived system-authority configuration does not match its system descriptor");
+        anyhow::bail!(
+            "derived system-authority configuration does not match its system descriptor"
+        );
     }
     let catalog_configuration = SystemCatalogConfiguration {
         space: space.0,
@@ -625,7 +631,7 @@ fn open_clean_system_lifecycle_with_inputs(
         .map_err(|error| {
             anyhow::anyhow!("admit Shared recovery before startup; preserved stores: {error:?}")
         })?;
-    let mut owner = CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
+    let mut pending = PendingCleanSystemAgentBootstrap::open_with_operation_admission(
         pins_store,
         record_store,
         issuer_store,
@@ -643,6 +649,23 @@ fn open_clean_system_lifecycle_with_inputs(
         Some(&lifecycle_admission),
         Some(&operation_admission),
     )?;
+    anyhow::ensure!(
+        pending.pins().replicas().members().len() == 1,
+        "public startup requires singleton bootstrap until signed cluster configuration is integrated"
+    );
+    let retry_started = std::time::Instant::now();
+    let mut owner = loop {
+        match pending.try_complete(&mut owner_signer) {
+            Ok(Some(owner)) => break owner,
+            Ok(None) => anyhow::bail!("system bootstrap owner was already transferred"),
+            Err(CleanSystemAgentBootstrapError::Host(
+                vos::agent::shared_host::SharedAgentHostError::Unavailable,
+            )) if retry_started.elapsed() < SYSTEM_BOOTSTRAP_RETRY_WINDOW => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
     report_phase("system_owner");
     drop(operation_admission);
     let mut admin_signer = OwnedCleanOperatorIdentitySigner::new(operator.clone())?;
