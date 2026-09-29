@@ -572,20 +572,48 @@ impl PreparedCleanSystemAgentBootstrap {
         trust: Arc<dyn AgentTrustProvider>,
         merge: Arc<dyn LocalMergeAuthenticator>,
     ) -> Result<Self, CleanSystemAgentBootstrapError> {
+        Self::admit_certified_parts(plan, provision, catalog, trust, merge, false)
+    }
+
+    /// Select this node from one common, already-certified bundle. Only local
+    /// ownership changes: Create, root evidence, actor packages and credential
+    /// signatures are preserved. No root/management signer is required.
+    pub fn from_common_certified_parts(
+        plan: AuthorizedCleanSystemAgentBootstrap,
+        provision: SystemAgentGenesisProvision,
+        catalog: Vec<RuntimeBlob>,
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+    ) -> Result<Self, CleanSystemAgentBootstrapError> {
+        Self::admit_certified_parts(plan, provision, catalog, trust, merge, true)
+    }
+
+    fn admit_certified_parts(
+        mut plan: AuthorizedCleanSystemAgentBootstrap,
+        provision: SystemAgentGenesisProvision,
+        catalog: Vec<RuntimeBlob>,
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+        select_local_replica: bool,
+    ) -> Result<Self, CleanSystemAgentBootstrapError> {
         plan.validate().map_err(rejected)?;
         provision
             .validate()
             .map_err(CleanSystemAgentBootstrapError::Bootstrap)?;
-        let locator = SystemAgentGenesisLocator {
+        let mut locator = SystemAgentGenesisLocator {
             space: crate::service::SpaceId(plan.pins.space.0),
             agent: crate::service::AgentId(plan.pins.agent.0),
             node: crate::service::NodeId(plan.pins.node.0),
         };
         if provision.root() != &plan.pins.root
             || provision.proposal().locator() != locator
-            || merge.node() != locator.node
+            || (!select_local_replica && merge.node() != locator.node)
         {
             return Err(rejected(CleanSystemAgentBootstrapRejection::WrongScope));
+        }
+        if select_local_replica {
+            plan = plan.for_node(NodeId(merge.node().0)).map_err(rejected)?;
+            locator.node = merge.node();
         }
         let super::journal::ReplayOperation::CleanManage {
             authority: receipt, ..
@@ -629,11 +657,20 @@ impl PreparedCleanSystemAgentBootstrap {
             .map_err(CleanSystemAgentBootstrapError::Bootstrap)?;
         let proposal = SystemAgentGenesisProposal::from_prepared(locator, &prepared)
             .map_err(CleanSystemAgentBootstrapError::Bootstrap)?;
-        if &proposal != provision.proposal() {
+        if (!select_local_replica && &proposal != provision.proposal())
+            || proposal.expectations() != provision.proposal().expectations()
+            || proposal.catalog() != provision.proposal().catalog()
+        {
             return Err(rejected(
                 CleanSystemAgentBootstrapRejection::DivergentRecord,
             ));
         }
+        let provision = SystemAgentGenesisProvision::new(
+            proposal,
+            provision.root().clone(),
+            provision.evidence().clone(),
+        )
+        .map_err(CleanSystemAgentBootstrapError::Bootstrap)?;
         Ok(Self {
             plan,
             provision,
@@ -11679,6 +11716,70 @@ mod tests {
         }
 
         #[test]
+        fn common_certified_bundle_selects_only_signed_replicas_without_resigning() {
+            let fixtures = fixed_system_bootstrap_fixtures();
+            for source in &fixtures {
+                for target in &fixtures {
+                    let admitted = PreparedCleanSystemAgentBootstrap::from_common_certified_parts(
+                        source.plan.clone(),
+                        source.provision.clone(),
+                        source.catalog.clone(),
+                        target.trust.clone(),
+                        target.merge.clone(),
+                    )
+                    .unwrap();
+                    assert_eq!(admitted.plan().commitment(), target.plan.commitment());
+                    assert_eq!(admitted.provision(), &target.provision);
+                    assert_eq!(admitted.provision().root(), source.provision.root());
+                    assert_eq!(admitted.provision().evidence(), source.provision.evidence());
+                    assert_eq!(
+                        admitted.provision().proposal().create(),
+                        source.provision.proposal().create()
+                    );
+                    assert_eq!(admitted.plan().catalog_call(), source.plan.catalog_call());
+                    assert_eq!(admitted.catalog(), source.catalog.as_slice());
+                }
+            }
+            let source = &fixtures[0];
+            assert!(
+                PreparedCleanSystemAgentBootstrap::from_common_certified_parts(
+                    source.plan.clone(),
+                    fixtures[1].provision.clone(),
+                    source.catalog.clone(),
+                    source.trust.clone(),
+                    source.merge.clone(),
+                )
+                .is_err()
+            );
+            let outsider: Arc<dyn LocalMergeAuthenticator> = Arc::new(SigningMerge {
+                key: SigningKey::from_bytes(&[0xee; 32]),
+                node: HostNodeId([0xff; 32]),
+            });
+            assert!(
+                PreparedCleanSystemAgentBootstrap::from_common_certified_parts(
+                    source.plan.clone(),
+                    source.provision.clone(),
+                    source.catalog.clone(),
+                    source.trust.clone(),
+                    outsider,
+                )
+                .is_err()
+            );
+            let mut changed = source.plan.clone();
+            changed.catalog_call.signature[0] ^= 1;
+            assert!(
+                PreparedCleanSystemAgentBootstrap::from_common_certified_parts(
+                    changed,
+                    source.provision.clone(),
+                    source.catalog.clone(),
+                    source.trust.clone(),
+                    source.merge.clone(),
+                )
+                .is_err()
+            );
+        }
+
+        #[test]
         fn fixed_system_certified_inputs_bind_plan_provision_and_catalog() {
             let fixtures = fixed_system_bootstrap_fixtures();
             for (index, fixture) in fixtures.iter().enumerate() {
@@ -12010,13 +12111,37 @@ mod tests {
                     )
                     .try_init();
             }
-            let fixtures = if complete_leader {
+            let mut fixtures = if complete_leader {
                 fixed_system_bootstrap_fixtures_with_authority(Some(
                     admit_actor_package(&candidate_authority_package()).unwrap(),
                 ))
             } else {
                 fixed_system_bootstrap_fixtures()
             };
+            // All replicas consume the same transported bundle. Per-node
+            // fixtures remain an independent expected-value oracle only.
+            let common = PreparedCleanSystemAgentBootstrap {
+                plan: fixtures[0].plan.clone(),
+                provision: fixtures[0].provision.clone(),
+                catalog: fixtures[0].catalog.clone(),
+            }
+            .encode_import()
+            .unwrap();
+            for fixture in &mut fixtures {
+                let (plan, provision, catalog) =
+                    PreparedCleanSystemAgentBootstrap::decode_import_parts(&common).unwrap();
+                let localized = PreparedCleanSystemAgentBootstrap::from_common_certified_parts(
+                    plan,
+                    provision,
+                    catalog,
+                    fixture.trust.clone(),
+                    fixture.merge.clone(),
+                )
+                .unwrap();
+                assert_eq!(localized.plan().commitment(), fixture.plan.commitment());
+                assert_eq!(localized.provision(), &fixture.provision);
+                (fixture.plan, fixture.provision, fixture.catalog) = localized.into_parts();
+            }
             let mut networks = Vec::new();
             let mut directories = Vec::new();
             let mut pending = Vec::new();

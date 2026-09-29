@@ -247,7 +247,12 @@ fn read_certified_bootstrap_bundle(
         .map_err(|error| anyhow::anyhow!("invalid bootstrap bundle encoding: {error:?}"))?;
     let node = node_id_from_authenticated_peer(&daemon.public().to_peer_id());
     anyhow::ensure!(
-        plan.pins().space() == SpaceId(space) && plan.pins().node() == node,
+        plan.pins().space() == SpaceId(space)
+            && plan
+                .pins()
+                .replicas()
+                .member_by_node(HostNodeId(node.0))
+                .is_some(),
         "bootstrap bundle belongs to another Space or node"
     );
     let root_key = raw_public_key(operator)?;
@@ -266,8 +271,10 @@ fn read_certified_bootstrap_bundle(
         Ed25519NodeMergeAuthenticator::new(daemon.clone())
             .map_err(|error| anyhow::anyhow!("construct bootstrap verifier: {error:?}"))?,
     );
-    PreparedCleanSystemAgentBootstrap::from_certified_parts(plan, provision, catalog, trust, merge)
-        .map_err(Into::into)
+    PreparedCleanSystemAgentBootstrap::from_common_certified_parts(
+        plan, provision, catalog, trust, merge,
+    )
+    .map_err(Into::into)
 }
 
 #[cfg(test)]

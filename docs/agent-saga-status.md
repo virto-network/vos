@@ -357,7 +357,7 @@ CLI test build and `std`-only library check pass (3.08 s for the latter):
 `target/fixed-system-certified-startup-archive-guard-build.log` and
 `target/fixed-system-certified-parts-std.log`. Early compilation attempts exposed
 private-codec access mistakes; they are not counted as qualification.
-`local.toml` now accepts optional `system_bootstrap_bundle = "bootstrap/node.bundle"`.
+`local.toml` now accepts optional `system_bootstrap_bundle = "bootstrap/system.bundle"`.
 Relative paths resolve under the Space data directory; absolute paths are also
 accepted. The bounded CBI1 transport contains the exact plan, certified provision
 and runtime catalog; it is not a new lifecycle-store format. Encoding signs
@@ -377,8 +377,29 @@ The `std` library check passes (3.19 s), `target/fixed-system-bundle-std.log`.
 The final configured-startup rerun adds sparse oversized-file refusal and passes
 (29.48 s), `target/fixed-system-bundle-config-final.log`; CLI test build,
 formatting and diff checks also pass.
-The CLI singleton guard stays intact. Bundle-generation tooling and qualification
-of all three production owners together are next, before removing that guard.
+One common CBI1 bundle can now serve the entire signed roster: the configured
+reader selects the local authenticated node and physically reproduces its local
+proposal while preserving the original Create, root certificate, packages and
+credential signatures. It does not need a root or management signer to localize
+the bundle. Strict node-specific admission remains separate and unchanged.
+All nine source/target combinations across the three-node fixture pass (4.28 s),
+including exact agreement with independently prepared node-local inputs and
+rejection of mixed source plan/provision, outsider node and altered signature:
+`target/fixed-system-common-bundle-selection.log`. Strict admission/codec checks
+pass (5.56 s), `target/fixed-system-common-bundle-strict.log`.
+The candidate three-node bootstrap/recovery fixture now consumes the same encoded
+bundle at every node and passes leader-owner retirement, metadata failure and
+completed-owner reopen (96.69 s), `target/fixed-system-common-bundle-cluster.log`.
+Its existing scripted-Catalog and retained-memory metadata limitations still
+apply; it is not three production daemons. The configured singleton file-owner
+startup/restart/safety regression also passes (36.16 s),
+`target/fixed-system-common-bundle-configured-startup.log`.
+The CLI test build, formatting/diff checks and `std` library check pass (2.70 s
+for the latter), `target/fixed-system-common-bundle-std.log`.
+The CLI singleton guard stays intact. Preparing the one common bundle from
+operator-supplied roster inputs and qualifying all three production owners
+together are next, before removing that guard. There is no need for a separate
+per-node root-certification or bundle-signing workflow.
 No three-node deployment or throughput claim follows from these singleton startup
 and separate fixed-roster admission tests.
 The current full Authority host suite passes: 81 passed, 2 ignored (30.76 s),
