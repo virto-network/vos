@@ -357,11 +357,30 @@ CLI test build and `std`-only library check pass (3.08 s for the latter):
 `target/fixed-system-certified-startup-archive-guard-build.log` and
 `target/fixed-system-certified-parts-std.log`. Early compilation attempts exposed
 private-codec access mistakes; they are not counted as qualification.
-Operator-facing bounded bundle configuration/transport remains unwired, and the
-CLI singleton guard stays intact. Next connect common signed plan/per-node inputs
-to that configuration and qualify all three production owners together before
-removing the guard. No three-node deployment or throughput claim follows from
-these singleton startup and separate fixed-roster admission tests.
+`local.toml` now accepts optional `system_bootstrap_bundle = "bootstrap/node.bundle"`.
+Relative paths resolve under the Space data directory; absolute paths are also
+accepted. The bounded CBI1 transport contains the exact plan, certified provision
+and runtime catalog; it is not a new lifecycle-store format. Encoding signs
+nothing. Decoding is structural only; startup verifies configured operator key,
+Space and local node before physical admission. The file reader rejects symlinks,
+non-regular files and oversized input, and bounds reads even if the file grows.
+The configured startup wrapper passes the real-file import/restart regression
+(35.13 s), `target/fixed-system-bundle-config-startup.log`, without test package
+overrides. This found and fixed a restart gap: package identities now come from
+the authenticated durable plan when the bundle is omitted, not current bundled
+defaults. The bundle option can be removed after publication; if left configured,
+the exact file remains required and is reverified. All five local-config tests
+pass, `target/fixed-system-bundle-config-unit.log`. Three-node bundle round-trip,
+truncation, wrong magic/ABI, corrupt catalog, oversized advertised length and
+trailing-data rejection pass (4.29 s), `target/fixed-system-bundle-codec.log`.
+The `std` library check passes (3.19 s), `target/fixed-system-bundle-std.log`.
+The final configured-startup rerun adds sparse oversized-file refusal and passes
+(29.48 s), `target/fixed-system-bundle-config-final.log`; CLI test build,
+formatting and diff checks also pass.
+The CLI singleton guard stays intact. Bundle-generation tooling and qualification
+of all three production owners together are next, before removing that guard.
+No three-node deployment or throughput claim follows from these singleton startup
+and separate fixed-roster admission tests.
 The current full Authority host suite passes: 81 passed, 2 ignored (30.76 s),
 `fixed-roster-guest.ImAzBc/mutation-host-suite.log`.
 The candidate Authority node-table header now supports exactly one or three

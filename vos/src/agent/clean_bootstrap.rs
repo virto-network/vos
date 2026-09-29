@@ -212,6 +212,14 @@ const CLEAN_SYSTEM_AGENT_PINS_MAGIC: [u8; 4] = *b"CSP2";
 const CLEAN_SYSTEM_AGENT_PLAN_MAGIC: [u8; 4] = *b"CBP3";
 const CLEAN_SYSTEM_AGENT_BOOTSTRAP_MAGIC: [u8; 4] = *b"CSB2";
 const CLEAN_SYSTEM_AGENT_BOOTSTRAP_VERSION: u8 = 3;
+const CLEAN_SYSTEM_AGENT_IMPORT_MAGIC: [u8; 4] = *b"CBI1";
+
+/// Bound for transporting one certified bootstrap plan, provision and runtime
+/// catalog. This is not the format of any live lifecycle store.
+pub const MAX_CLEAN_SYSTEM_AGENT_IMPORT_BYTES: usize = MAX_CLEAN_SYSTEM_AGENT_PLAN_BYTES
+    + super::bootstrap::MAX_SYSTEM_AGENT_GENESIS_PROVISION_BYTES
+    + MAX_PACKAGE_ENCODED_BYTES
+    + 60;
 
 pub const MAX_CLEAN_SYSTEM_AGENT_PINS_BYTES: usize = MAX_AGENT_DESCRIPTOR_WIRE_BYTES
     + MAX_ROOT_ANCHOR_PINS_BYTES
@@ -490,6 +498,69 @@ pub struct PreparedCleanSystemAgentBootstrap {
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 impl PreparedCleanSystemAgentBootstrap {
+    /// Export the already-certified inputs without signing or publishing them.
+    pub fn encode_import(&self) -> Result<Vec<u8>, DecodeError> {
+        use crate::service::ServiceWire as _;
+        let [catalog] = self.catalog.as_slice() else {
+            return Err(DecodeError::NonCanonical);
+        };
+        let mut bytes = CLEAN_SYSTEM_AGENT_IMPORT_MAGIC.to_vec();
+        let mut encoder = Encoder(&mut bytes);
+        encoder.fixed(super::sdk::RUNTIME_ABI_ID.as_bytes());
+        encode_large_bytes(&mut encoder, &self.plan.canonical_bytes());
+        encode_large_bytes(&mut encoder, &self.provision.encode());
+        encode_large_bytes(&mut encoder, &catalog.bytes);
+        if bytes.len() > MAX_CLEAN_SYSTEM_AGENT_IMPORT_BYTES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        Ok(bytes)
+    }
+
+    /// Bounded transport decoding only. The returned parts must pass
+    /// `from_certified_parts` with the local trust/identity before publication.
+    pub fn decode_import_parts(
+        bytes: &[u8],
+    ) -> Result<
+        (
+            AuthorizedCleanSystemAgentBootstrap,
+            SystemAgentGenesisProvision,
+            Vec<RuntimeBlob>,
+        ),
+        DecodeError,
+    > {
+        use crate::service::ServiceWire as _;
+        if bytes.len() > MAX_CLEAN_SYSTEM_AGENT_IMPORT_BYTES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let mut decoder = Decoder::new(bytes);
+        if decoder.take(4)? != CLEAN_SYSTEM_AGENT_IMPORT_MAGIC {
+            return Err(DecodeError::InvalidTag);
+        }
+        if Hash(decoder.fixed()?) != super::sdk::RUNTIME_ABI_ID {
+            return Err(DecodeError::InvalidPlatform);
+        }
+        let plan = AuthorizedCleanSystemAgentBootstrap::decode(&decode_large_bytes(
+            &mut decoder,
+            MAX_CLEAN_SYSTEM_AGENT_PLAN_BYTES,
+        )?)?;
+        let provision = SystemAgentGenesisProvision::decode(&decode_large_bytes(
+            &mut decoder,
+            super::bootstrap::MAX_SYSTEM_AGENT_GENESIS_PROVISION_BYTES,
+        )?)
+        .map_err(|_| DecodeError::NonCanonical)?;
+        let bytes = decode_large_bytes(&mut decoder, MAX_PACKAGE_ENCODED_BYTES)?;
+        if !decoder.exhausted() {
+            return Err(DecodeError::NonCanonical);
+        }
+        let catalog = vec![RuntimeBlob {
+            reference: crate::service::BlobRef::of_bytes(&bytes),
+            bytes,
+        }];
+        validate_system_agent_genesis_catalog(provision.proposal(), &catalog)
+            .map_err(|_| DecodeError::NonCanonical)?;
+        Ok((plan, provision, catalog))
+    }
+
     /// Admit externally supplied bootstrap inputs as one exact local bundle.
     /// Signature checks alone do not tie an arbitrary provision to this plan:
     /// reproduce Create with the original receipt and compare its physical
@@ -11632,6 +11703,32 @@ mod tests {
                 );
                 assert_eq!(accepted.provision(), &fixture.provision);
                 assert_eq!(accepted.catalog(), fixture.catalog.as_slice());
+                let bytes = accepted.encode_import().unwrap();
+                let (plan, provision, catalog) =
+                    PreparedCleanSystemAgentBootstrap::decode_import_parts(&bytes).unwrap();
+                let roundtrip = admit(plan, provision, catalog).unwrap();
+                assert_eq!(roundtrip.encode_import().unwrap(), bytes);
+                for cut in [0, 3, 35, 43, bytes.len() - 1] {
+                    assert!(
+                        PreparedCleanSystemAgentBootstrap::decode_import_parts(&bytes[..cut])
+                            .is_err()
+                    );
+                }
+                for offset in [0, 4, bytes.len() - 1] {
+                    let mut changed = bytes.clone();
+                    changed[offset] ^= 1;
+                    assert!(
+                        PreparedCleanSystemAgentBootstrap::decode_import_parts(&changed).is_err()
+                    );
+                }
+                let mut oversized = bytes.clone();
+                oversized[36..44].copy_from_slice(&u64::MAX.to_le_bytes());
+                assert!(
+                    PreparedCleanSystemAgentBootstrap::decode_import_parts(&oversized).is_err()
+                );
+                let mut trailing = bytes;
+                trailing.push(0);
+                assert!(PreparedCleanSystemAgentBootstrap::decode_import_parts(&trailing).is_err());
                 let foreign = &fixtures[(index + 1) % fixtures.len()];
                 assert!(
                     admit(

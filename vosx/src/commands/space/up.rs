@@ -121,6 +121,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         &operator_keypair,
         &daemon_keypair,
         local.local_agent_storage,
+        local.system_bootstrap_bundle.as_deref(),
     )?;
     let extension_caps = register_extensions_from_local(
         &mut node,

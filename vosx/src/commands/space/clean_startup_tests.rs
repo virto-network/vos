@@ -357,9 +357,31 @@ fn candidate_certified_genesis_import_is_scoped_immutable_and_restartable() {
     )
     .unwrap();
     let imported_data = scratch.0.join("imported-startup");
+    let bundle_path = scratch.0.join("bootstrap.bundle");
+    std::fs::write(&bundle_path, certified.encode_import().unwrap()).unwrap();
+    let certified =
+        read_certified_bootstrap_bundle(&bundle_path, space.0, &operator, &daemon).unwrap();
+    assert!(read_certified_bootstrap_bundle(&bundle_path, [0x94; 32], &operator, &daemon).is_err());
+    let foreign = Keypair::ed25519_from_bytes([0x95; 32]).unwrap();
+    assert!(read_certified_bootstrap_bundle(&bundle_path, space.0, &foreign, &daemon).is_err());
+    assert!(read_certified_bootstrap_bundle(&bundle_path, space.0, &operator, &foreign).is_err());
+    let link = scratch.0.join("bundle-link");
+    std::os::unix::fs::symlink(&bundle_path, &link).unwrap();
+    assert!(read_certified_bootstrap_bundle(&link, space.0, &operator, &daemon).is_err());
+    assert!(read_certified_bootstrap_bundle(&scratch.0, space.0, &operator, &daemon).is_err());
+    let oversized_path = scratch.0.join("oversized-bundle");
+    std::fs::File::create(&oversized_path)
+        .unwrap()
+        .set_len(vos::agent::clean_bootstrap::MAX_CLEAN_SYSTEM_AGENT_IMPORT_BYTES as u64 + 1)
+        .unwrap();
+    assert!(read_certified_bootstrap_bundle(&oversized_path, space.0, &operator, &daemon).is_err());
     drop(ensure_private_directory(&imported_data).unwrap());
-    for supplied in [Some(&certified), None, Some(&certified)] {
-        let (_, recovered) = open_clean_system_lifecycle_with_inputs(
+    for supplied in [
+        Some(bundle_path.as_path()),
+        None,
+        Some(bundle_path.as_path()),
+    ] {
+        let (_, recovered) = open_clean_system_lifecycle(
             network.clone(),
             &imported_data,
             space.0,
@@ -368,7 +390,6 @@ fn candidate_certified_genesis_import_is_scoped_immutable_and_restartable() {
             crate::commands::space::local_config::LocalAgentStorage::Image,
             &scratch.0.join("imported-host.lock"),
             supplied,
-            Some(&inputs),
         )
         .unwrap();
         drop(recovered);

@@ -1,8 +1,8 @@
 //! Node-local space configuration.
 //!
-//! The clean cutover retains only daemon listeners, built-in ingress, and
-//! native extension adapters. Replicated Agent lifecycle state does not live
-//! in this file and has no compatibility CLI.
+//! Daemon listeners, built-in ingress, native extension adapters and an optional
+//! certified bootstrap input path. Replicated Agent lifecycle state does not
+//! live in this file and has no compatibility CLI.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -41,6 +41,10 @@ pub struct LocalConfig {
     /// Explicit Local storage format. Existing configs default to `image`.
     #[serde(default, skip_serializing_if = "LocalAgentStorage::is_image")]
     pub local_agent_storage: LocalAgentStorage,
+    /// Certified system bootstrap input. Relative paths resolve under the
+    /// Space data directory. Optional on restart after durable publication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_bootstrap_bundle: Option<std::path::PathBuf>,
     /// Built-in node-local ingress listeners.
     #[serde(default, skip_serializing_if = "IngressLocal::is_empty")]
     pub ingress: IngressLocal,
@@ -55,6 +59,7 @@ impl LocalConfig {
         Self {
             listen: vec!["/ip4/127.0.0.1/tcp/0".into()],
             local_agent_storage: LocalAgentStorage::Image,
+            system_bootstrap_bundle: None,
             ingress: IngressLocal {
                 http: vec![HttpIngressLocal {
                     name: "http".into(),
@@ -242,6 +247,26 @@ mod tests {
         ] {
             assert!(toml::from_str::<LocalConfig>(text).is_err(), "{text}");
         }
+    }
+
+    #[test]
+    fn bootstrap_bundle_path_is_explicit_and_optional() {
+        let config: LocalConfig =
+            toml::from_str("system_bootstrap_bundle = 'bootstrap/node.bundle'").unwrap();
+        assert_eq!(
+            config.system_bootstrap_bundle.as_deref(),
+            Some(Path::new("bootstrap/node.bundle"))
+        );
+        assert_eq!(
+            toml::from_str::<LocalConfig>(&toml::to_string(&config).unwrap()).unwrap(),
+            config
+        );
+        assert!(LocalConfig::default().system_bootstrap_bundle.is_none());
+        assert!(
+            !toml::to_string(&LocalConfig::for_new_space())
+                .unwrap()
+                .contains("system_bootstrap_bundle")
+        );
     }
 
     #[test]

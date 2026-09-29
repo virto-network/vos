@@ -148,6 +148,7 @@ pub(crate) fn start_clean_system_agent(
     operator: &Keypair,
     daemon: &Keypair,
     local_storage: super::local_config::LocalAgentStorage,
+    bootstrap_bundle: Option<&Path>,
 ) -> anyhow::Result<()> {
     let startup_started = std::time::Instant::now();
     let network = node
@@ -161,6 +162,7 @@ pub(crate) fn start_clean_system_agent(
         daemon,
         local_storage,
         &crate::paths::agent_host_lock_path(&space_bytes),
+        bootstrap_bundle,
     )?;
     node.start_clean_local_agent_production(
         clean_node,
@@ -199,7 +201,13 @@ fn open_clean_system_lifecycle(
     daemon: &Keypair,
     local_storage: super::local_config::LocalAgentStorage,
     host_lock: &Path,
+    bootstrap_bundle: Option<&Path>,
 ) -> anyhow::Result<(vos::agent::sdk::NodeId, CleanProductionLifecycle)> {
+    let certified = bootstrap_bundle
+        .map(|path| {
+            read_certified_bootstrap_bundle(&data_dir.join(path), space_bytes, operator, daemon)
+        })
+        .transpose()?;
     open_clean_system_lifecycle_with_inputs(
         network,
         data_dir,
@@ -208,10 +216,58 @@ fn open_clean_system_lifecycle(
         daemon,
         local_storage,
         host_lock,
-        None,
+        certified.as_ref(),
         #[cfg(test)]
         None,
     )
+}
+
+fn read_certified_bootstrap_bundle(
+    path: &Path,
+    space: [u8; 32],
+    operator: &Keypair,
+    daemon: &Keypair,
+) -> anyhow::Result<PreparedCleanSystemAgentBootstrap> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use vos::agent::clean_bootstrap::MAX_CLEAN_SYSTEM_AGENT_IMPORT_BYTES;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() <= MAX_CLEAN_SYSTEM_AGENT_IMPORT_BYTES as u64,
+        "bootstrap bundle must be a bounded regular file"
+    );
+    let mut bytes = Vec::new();
+    file.take(MAX_CLEAN_SYSTEM_AGENT_IMPORT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    let (plan, provision, catalog) = PreparedCleanSystemAgentBootstrap::decode_import_parts(&bytes)
+        .map_err(|error| anyhow::anyhow!("invalid bootstrap bundle encoding: {error:?}"))?;
+    let node = node_id_from_authenticated_peer(&daemon.public().to_peer_id());
+    anyhow::ensure!(
+        plan.pins().space() == SpaceId(space) && plan.pins().node() == node,
+        "bootstrap bundle belongs to another Space or node"
+    );
+    let root_key = raw_public_key(operator)?;
+    let members = plan.pins().root().record().initial_committee().members();
+    anyhow::ensure!(
+        members.len() == 1 && members[0].public_key() == &root_key,
+        "bootstrap bundle was not certified by the configured root operator"
+    );
+    let descriptor = plan.pins().descriptor();
+    let trust = Arc::new(SystemAgentTrust::new(
+        plan.pins().observed_slot(),
+        HostSpaceId(space),
+        host_authority_binding(descriptor.identity.agent, descriptor.authority),
+    ));
+    let merge = Arc::new(
+        Ed25519NodeMergeAuthenticator::new(daemon.clone())
+            .map_err(|error| anyhow::anyhow!("construct bootstrap verifier: {error:?}"))?,
+    );
+    PreparedCleanSystemAgentBootstrap::from_certified_parts(plan, provision, catalog, trust, merge)
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -265,6 +321,18 @@ fn open_clean_system_lifecycle_with_inputs(
     let peer_bytes = peer.to_bytes();
     let clean_node = node_id_from_authenticated_peer(&peer);
 
+    let stores =
+        CleanSystemAgentFileStores::open_or_create(data_dir.join(SYSTEM_AGENT_CONTROL_DIRECTORY))?;
+    let (mut pins_store, mut record_store, issuer_store, genesis_store) =
+        stores.into_production_parts();
+    let stored_plan = record_store
+        .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)?
+        .map(|bytes| {
+            CleanSystemAgentBootstrapRecord::authorized_plan(&bytes)
+                .map_err(|error| anyhow::anyhow!("invalid persisted bootstrap plan: {error:?}"))
+        })
+        .transpose()?;
+
     let runtime = crate::bundled::root_signed_agent_runtime_package(operator)?;
     let authority_package = crate::bundled::root_signed_actor_package(
         crate::bundled::system_authority_package_template_for_storage(local_storage)?,
@@ -282,9 +350,11 @@ fn open_clean_system_lifecycle_with_inputs(
     )?;
     #[cfg(test)]
     let catalog_package = test_inputs.map_or(catalog_package, |inputs| inputs.catalog.clone());
-    let (runtime, authority_package, catalog_package) = match certified_inputs {
-        Some(inputs) => {
-            let plan = inputs.plan();
+    let (runtime, authority_package, catalog_package) = match certified_inputs
+        .map(|inputs| inputs.plan())
+        .or(stored_plan.as_ref())
+    {
+        Some(plan) => {
             anyhow::ensure!(
                 plan.pins().space() == space && plan.pins().node() == clean_node,
                 "certified bootstrap inputs belong to another Space or node"
@@ -439,10 +509,6 @@ fn open_clean_system_lifecycle_with_inputs(
     )?;
     report_phase("bootstrap_material");
 
-    let stores =
-        CleanSystemAgentFileStores::open_or_create(data_dir.join(SYSTEM_AGENT_CONTROL_DIRECTORY))?;
-    let (mut pins_store, mut record_store, issuer_store, genesis_store) =
-        stores.into_production_parts();
     let archive = Arc::new(CleanSystemAgentGenesisArchive::new(
         genesis_store,
         HostSpaceId(space.0),
