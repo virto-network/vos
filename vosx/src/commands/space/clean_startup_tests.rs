@@ -138,6 +138,7 @@ fn shared_install_file_owner_recovers_successive_handoffs() {
 #[derive(Clone, Copy)]
 enum InstallFault {
     None,
+    Expiry,
     Denial,
     DenialAuthorization,
     DenialSuccessor,
@@ -145,6 +146,79 @@ enum InstallFault {
     Intent(usize),
     Issuer(usize),
     Successive,
+}
+
+#[test]
+#[ignore = "requires candidate runtime/Authority guests; use disk-backed TMPDIR"]
+fn shared_install_file_owner_recovers_expiry_and_staged_finality() {
+    check_shared_file_recovery(false, true, InstallFault::Expiry);
+}
+
+fn expiry_startup_inputs(operator: &Keypair) -> StartupTestInputs {
+    use vos::agent::sdk::package::{PackageArtifact, PackageEnvelope, PackageManifest};
+    fn replace_program(bytes: &[u8], program: Vec<u8>, operator: &Keypair) -> Vec<u8> {
+        let mut envelope = PackageEnvelope::decode(bytes).unwrap();
+        let reference = BlobRef::of_bytes(&program);
+        let old = match &mut envelope.manifest {
+            PackageManifest::Actor(manifest) => {
+                std::mem::replace(&mut manifest.program, reference.clone())
+            }
+            PackageManifest::AgentRuntime(manifest) => {
+                std::mem::replace(&mut manifest.outer_program, reference.clone())
+            }
+        };
+        envelope
+            .artifacts
+            .retain(|artifact| artifact.identity != old);
+        envelope.artifacts.push(PackageArtifact {
+            identity: reference,
+            bytes: program,
+        });
+        envelope
+            .artifacts
+            .sort_unstable_by(|a, b| a.identity.cmp(&b.identity));
+        envelope.manifest.signing_mut().signature =
+            sign_exact(operator, &envelope.signing_bytes().unwrap()).unwrap();
+        envelope.encode().unwrap()
+    }
+    let runtime = crate::bundled::root_signed_agent_runtime_package(operator).unwrap();
+    let program = std::fs::read(
+        std::env::var_os("VOS_AGENT_RUNTIME_COST_CANDIDATE").expect("set candidate runtime PVM"),
+    )
+    .unwrap();
+    let runtime = vos::agent::package_admission::admit_runtime_package(&replace_program(
+        runtime.exact_bytes(),
+        program,
+        operator,
+    ))
+    .unwrap();
+    let authority = crate::bundled::root_signed_actor_package(
+        crate::bundled::system_authority_package_template(),
+        SYSTEM_AUTHORITY_NAME,
+        operator,
+    )
+    .unwrap();
+    let target = PathBuf::from(
+        std::env::var_os("CARGO_TARGET_DIR").expect("set candidate guest build root"),
+    );
+    let program = vos_pvm_compiler::link_elf_spi(
+        &std::fs::read(
+            target.join("agent-state-authority/riscv64em-vos/release/system_authority.elf"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let authority = vos::agent::package_admission::admit_actor_package(&replace_program(
+        authority.exact_bytes(),
+        program,
+        operator,
+    ))
+    .unwrap();
+    StartupTestInputs {
+        runtime,
+        authority,
+        clock: Arc::new(AtomicU64::new(system_logical_slot().unwrap() + 1)),
+    }
 }
 
 #[test]
@@ -197,8 +271,10 @@ fn check_shared_file_recovery(
         auto_dial_mdns: false,
     }));
     let space = SpaceId([0x73; 32]);
+    let expiry =
+        matches!(interrupt_install, InstallFault::Expiry).then(|| expiry_startup_inputs(&operator));
     let open = || {
-        open_clean_system_lifecycle(
+        open_clean_system_lifecycle_with_inputs(
             network.clone(),
             &data,
             space.0,
@@ -206,6 +282,7 @@ fn check_shared_file_recovery(
             &daemon,
             crate::commands::space::local_config::LocalAgentStorage::Image,
             &lock,
+            expiry.as_ref(),
         )
         .unwrap()
     };
@@ -220,6 +297,11 @@ fn check_shared_file_recovery(
         &operator,
     )
     .unwrap();
+    let (runtime, authority_package) = expiry
+        .as_ref()
+        .map_or((runtime, authority_package), |inputs| {
+            (inputs.runtime.clone(), inputs.authority.clone())
+        });
     let public = raw_public_key(&operator).unwrap();
     let owner = PrincipalId::of_public_key(&public);
     let (authority, _) =
@@ -488,6 +570,9 @@ fn check_shared_file_recovery(
         install_call.plan = ManagementRequest::Install(Box::new(install.clone()))
             .authorization_plan()
             .unwrap();
+        if let Some(inputs) = &expiry {
+            install_call.requested_expires_at = inputs.clock.load(Ordering::Acquire) + 10_000;
+        }
         install_call.invocation = install_call.expected_invocation();
         install_call.signature = sign_exact(&operator, &install_call.signing_bytes()).unwrap();
         let mut forged = install_call.clone();
@@ -790,8 +875,82 @@ fn check_shared_file_recovery(
             }
             return;
         }
+        if let Some(inputs) = &expiry {
+            // Stop after signing the immutable receipt, before first application.
+            let fault = SharedManagementStageFault::issuer(&lifecycle_root, 2);
+            assert_eq!(
+                lifecycle.complete_shared_install(locator),
+                Err(SharedAgentHostError::Unavailable)
+            );
+            assert!(fault.fired());
+            assert!(
+                lifecycle_root
+                    .join("shared-management.issuer.next")
+                    .exists()
+            );
+            assert_eq!(journal_files(&journal), applied);
+            drop(fault);
+            drop(lifecycle);
+            let (_, call, _) = successor_input.as_ref().unwrap();
+            inputs
+                .clock
+                .fetch_max(call.requested_expires_at + 1, Ordering::AcqRel);
+            // Reopen the receipt, record non-execution, then interrupt issuer
+            // finality after sync but before publication under the real lease.
+            let fault = SharedManagementStageFault::issuer(&lifecycle_root, 3);
+            assert!(
+                open_clean_system_lifecycle_with_inputs(
+                    network.clone(),
+                    &data,
+                    space.0,
+                    &operator,
+                    &daemon,
+                    crate::commands::space::local_config::LocalAgentStorage::Image,
+                    &lock,
+                    expiry.as_ref(),
+                )
+                .is_err()
+            );
+            assert!(fault.fired());
+            assert!(
+                lifecycle_root
+                    .join("shared-management.issuer.next")
+                    .exists()
+            );
+            let fenced = journal_files(&journal);
+            assert_ne!(fenced, applied);
+            drop(fault);
+            (_, lifecycle) = open();
+            assert!(
+                !lifecycle_root
+                    .join("shared-management.issuer.next")
+                    .exists()
+            );
+            assert_eq!(journal_files(&journal), fenced);
+            let terminal = lifecycle.complete_shared_install(locator).unwrap();
+            let SignedManagementTerminal::Rejected(failure) = &terminal else {
+                panic!("expiry must not install");
+            };
+            assert_eq!(
+                failure.error,
+                vos::agent::sdk::ManagementError::ExpiredBeforeApplication
+            );
+            assert_eq!(Some(failure.credential_call), install_commitment);
+            assert!(failure.failed_at > failure.receipt.selector.expires_at);
+            let completed = journal_files(&lifecycle_root);
+            drop(lifecycle);
+            (_, lifecycle) = open();
+            assert_eq!(
+                lifecycle.complete_shared_install(locator).unwrap(),
+                terminal
+            );
+            assert_eq!(journal_files(&journal), fenced);
+            assert_eq!(journal_files(&lifecycle_root), completed);
+            return;
+        }
         let interruption = match interrupt_install {
             InstallFault::None
+            | InstallFault::Expiry
             | InstallFault::Successive
             | InstallFault::Denial
             | InstallFault::DenialAuthorization

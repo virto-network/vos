@@ -194,6 +194,36 @@ fn open_clean_system_lifecycle(
     local_storage: super::local_config::LocalAgentStorage,
     host_lock: &Path,
 ) -> anyhow::Result<(vos::agent::sdk::NodeId, CleanProductionLifecycle)> {
+    open_clean_system_lifecycle_with_inputs(
+        network,
+        data_dir,
+        space_bytes,
+        operator,
+        daemon,
+        local_storage,
+        host_lock,
+        #[cfg(test)]
+        None,
+    )
+}
+
+#[cfg(test)]
+struct StartupTestInputs {
+    runtime: vos::agent::package_admission::AdmittedRuntimePackage,
+    authority: AdmittedActorPackage,
+    clock: Arc<AtomicU64>,
+}
+
+fn open_clean_system_lifecycle_with_inputs(
+    network: Arc<vos::network::Network>,
+    data_dir: &Path,
+    space_bytes: [u8; 32],
+    operator: &Keypair,
+    daemon: &Keypair,
+    local_storage: super::local_config::LocalAgentStorage,
+    host_lock: &Path,
+    #[cfg(test)] test_inputs: Option<&StartupTestInputs>,
+) -> anyhow::Result<(vos::agent::sdk::NodeId, CleanProductionLifecycle)> {
     super::local_config::validate_local_storage_roots(data_dir, local_storage)?;
     #[cfg(not(feature = "experimental-state-blocks"))]
     anyhow::ensure!(
@@ -232,6 +262,10 @@ fn open_clean_system_lifecycle(
         SYSTEM_AUTHORITY_NAME,
         operator,
     )?;
+    #[cfg(test)]
+    let (runtime, authority_package) = test_inputs.map_or((runtime, authority_package), |inputs| {
+        (inputs.runtime.clone(), inputs.authority.clone())
+    });
     let catalog_package = crate::bundled::root_signed_actor_package(
         crate::bundled::system_catalog_package_template(),
         SYSTEM_CATALOG_NAME,
@@ -390,12 +424,17 @@ fn open_clean_system_lifecycle(
     let observed_slot = archive
         .stored_observed_slot()?
         .unwrap_or(system_logical_slot()?);
-    let clock = Arc::new(SystemAgentTrust::new(
+    let clock = SystemAgentTrust::new(
         observed_slot,
         HostSpaceId(space.0),
         host_authority_binding(system_agent, authority),
-    ));
-    let trust: Arc<dyn AgentTrustProvider> = clock;
+    );
+    #[cfg(test)]
+    let clock = SystemAgentTrust {
+        test_clock: test_inputs.map(|inputs| inputs.clock.clone()),
+        ..clock
+    };
+    let trust: Arc<dyn AgentTrustProvider> = Arc::new(clock);
     let merge: Arc<dyn LocalMergeAuthenticator> = Arc::new(
         Ed25519NodeMergeAuthenticator::new(daemon.clone())
             .map_err(|error| anyhow::anyhow!("construct node merge signer: {error:?}"))?,
@@ -838,6 +877,8 @@ struct SystemAgentTrust {
     floor: AtomicU64,
     space: HostSpaceId,
     authority: vos::agent::authority::AgentAuthorityBinding,
+    #[cfg(test)]
+    test_clock: Option<Arc<AtomicU64>>,
 }
 
 impl SystemAgentTrust {
@@ -850,6 +891,8 @@ impl SystemAgentTrust {
             floor: AtomicU64::new(floor),
             space,
             authority,
+            #[cfg(test)]
+            test_clock: None,
         }
     }
 }
@@ -857,6 +900,11 @@ impl SystemAgentTrust {
 impl AgentTrustProvider for SystemAgentTrust {
     fn current_logical_slot(&self) -> Option<u64> {
         let observed = system_logical_slot().ok()?;
+        #[cfg(test)]
+        let observed = self
+            .test_clock
+            .as_ref()
+            .map_or(observed, |clock| clock.fetch_add(1, Ordering::AcqRel));
         Some(
             self.floor
                 .fetch_max(observed, Ordering::AcqRel)

@@ -516,8 +516,8 @@ reload. The issuer suite passes (21 tests), SDK suite passes (251, one ignored),
 Authority suite passes (78, two ignored), and default `vosx` check passes. These
 are native contract/recovery tests, not physical expiry qualification.
 This is not yet a production fix: bundled guests are unchanged. Remaining expiry
-gates are production lifecycle-file interruption of expiry finalization/retirement,
-and release-artifact reproduction and cutover.
+gates are remaining interruption/mixed-pending cases and release-artifact
+reproduction and cutover. The staged receipt/finality file case below now passes.
 Keep generic errors and
 uncommitted previews ineligible for finality. Logs: `target/shared-install-expiry-*`,
 `target/shared-expiry-finality-*` and `target/shared-expiry-host-*`
@@ -559,9 +559,22 @@ build and eight Shared host tests also pass (2.64 s); logs are
 change was needed for this recovery case. Formatting and diff checks pass.
 The existing production-file Install tests use `requested_expires_at = u64::MAX`;
 their staged issuer/finalization coverage must not be counted as expiry coverage.
-The expiry file test needs a bounded signed window and a controlled forward-only
-clock, plus the qualified runtime/Authority pair. Reuse the current staged-file
-fault hooks; do not add a new persistence protocol or relax replay admission.
+The new expiry file test passes (189.79 s) with a bounded signed window and a
+controlled forward-only clock, plus the qualified runtime/Authority pair. It
+reuses the existing staged-file hooks: interrupt receipt publication, reopen
+after expiry, interrupt finality publication, and reopen to exact retirement.
+Candidate packages and the clock enter through `cfg(test)` startup inputs; normal
+startup retains pinned bundled packages and the system clock. No new persistence
+protocol or relaxed replay admission is introduced. The test verifies the exact
+signed expiry terminal, unchanged ordinary journal on repeated reopen, and
+byte-identical retired lifecycle files. Evidence is
+`target/shared-expiry-file-owner.log` (one selected test; empty integration-test
+filters are not coverage). The default build check also passes in
+`target/shared-expiry-file-owner-default-check.log`. The bundled staged-
+authorization regression also passes (195.32 s) in
+`target/shared-expiry-file-owner-baseline.log`. Formatting and diff checks pass.
+These are synchronized staged-file
+interruptions and owner reopen, not process-kill, power-loss or three-node tests.
 
 The internal bootstrap-owner Shared Install application helper replaces the
 physical fixture's hand-assembled
