@@ -3362,6 +3362,12 @@ impl Compiler {
             // Full Ψ returns instruction counter zero on final success or
             // panic. Fault/OOG/host exits retain their causing counter.
             self.asm.mov_store32_imm(CTX, CTX_PC, 0);
+            // The reference interpreter exits before successful-terminator
+            // bookkeeping, so a terminal instruction retains its funded
+            // block. Inner machines can be invoked again after PC resets;
+            // clearing this bit would charge that block a second time.
+            // Invalid external entries return before entering generated code.
+            self.asm.mov_store32_imm(CTX, CTX_GAS_CHARGED, 1);
         }
         self.asm
             .mov_store32_imm(CTX, CTX_EXIT_REASON, reason as i32);
@@ -3461,6 +3467,8 @@ impl Compiler {
         self.asm.bind_label(self.panic_label);
         if self.isa_mode == crate::IsaMode::Conformance {
             self.asm.mov_store32_imm(CTX, CTX_PC, 0);
+            // Dynamic-jump validation also exits from a funded instruction.
+            self.asm.mov_store32_imm(CTX, CTX_GAS_CHARGED, 1);
         }
         self.asm
             .mov_store32_imm(CTX, CTX_EXIT_REASON, EXIT_PANIC as i32);

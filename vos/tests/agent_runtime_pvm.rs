@@ -46,6 +46,10 @@ const GAS: u64 = 1_000_000_000;
 const PACKAGE_SEED: [u8; 32] = [0x71; 32];
 const AUTHORITY_SEED: [u8; 32] = [0x72; 32];
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "agent_runtime_pvm/custom_linear.rs"]
+mod custom_linear;
+
 thread_local! {
     static COMPARISON_PROGRAM: std::cell::RefCell<Option<(Vec<u8>, PreparedProgram)>> =
         const { std::cell::RefCell::new(None) };

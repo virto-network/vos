@@ -2055,6 +2055,9 @@ mod tests {
         assert_eq!(recompiled.run(), ExitReason::Panic);
         assert_eq!(recompiled.gas(), interpreter.gas);
 
+        assert!(interpreter.gas_charged);
+        assert_eq!(recompiled.ctx().gas_charged, 1);
+
         // ecalli is not in T. Its resumed falloff must not charge the implicit
         // panic a second time after the enclosing block was prepaid.
         let code = vec![10, 7];
@@ -2093,6 +2096,8 @@ mod tests {
         assert!(recompiled.acknowledge_host_call());
         assert_eq!(recompiled.run(), ExitReason::Panic);
         assert_eq!(recompiled.gas(), 50);
+        assert!(interpreter.gas_charged);
+        assert_eq!(recompiled.ctx().gas_charged, 1);
     }
 
     #[test]

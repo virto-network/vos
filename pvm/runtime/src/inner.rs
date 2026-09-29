@@ -907,6 +907,97 @@ mod tests {
 
     #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
     #[test]
+    fn recompiled_inner_matches_reference_when_reusing_terminal_machines() {
+        // A terminal exit resets the inner PC, but does not discard the
+        // interpreter's funded gas block. Reusing the same machine must not
+        // silently charge it again under a different execution backend.
+        let cases = [
+            ("host then trap", vec![10, 42, 0], vec![0, 2], 0),
+            (
+                "host then halt",
+                vec![10, 42, 50, 0],
+                vec![0, 2],
+                crate::PVM_HALT_ADDR,
+            ),
+            ("trap", vec![0], vec![0], 0),
+            ("halt", vec![50, 0], vec![0], crate::PVM_HALT_ADDR),
+            ("invalid indirect jump", vec![50, 0], vec![0], 1),
+            ("invalid static jump", vec![40, 1], vec![0], 0),
+            ("final fallthrough", vec![1], vec![0], 0),
+        ];
+        for (name, code, starts, return_address) in cases {
+            for initial_gas in [0, 1, 100, 1_000] {
+                let run = |backend| {
+                    let mut machines = InnerMachines::with_backend(backend);
+                    let id = machines
+                        .create(&compact_blob(&code, &starts), 0)
+                        .unwrap_or_else(|error| panic!("{name}, {backend:?}: {error:?}"));
+                    let mut registers = [0; PVM_REGISTER_COUNT];
+                    registers[0] = return_address;
+                    let mut state = InvokeState {
+                        gas: initial_gas,
+                        registers,
+                    };
+                    let mut observations = Vec::new();
+                    for _ in 0..6 {
+                        let outcome = machines.invoke(id, state).unwrap();
+                        let vm = machines.machines[&id].vm.as_ref().unwrap();
+                        observations.push((outcome.clone(), vm.pc, vm.gas_charged));
+                        state = outcome.state;
+                    }
+                    (observations, machines.expunge(id).unwrap())
+                };
+                assert_eq!(
+                    run(PvmBackend::ForceRecompiler),
+                    run(PvmBackend::ForceInterpreter),
+                    "{name}, initial gas {initial_gas}"
+                );
+            }
+        }
+    }
+
+    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn recompiled_inner_invalid_entry_preserves_existing_funding() {
+        for pc in [1, 4, u32::MAX] {
+            for funded in [false, true] {
+                for gas in [0, 1_000] {
+                    let run = |backend| {
+                        let mut machines = InnerMachines::with_backend(backend);
+                        let id = machines.create(&host_then_trap(), 0).unwrap();
+                        let vm = machines.machines.get_mut(&id).unwrap().vm().unwrap();
+                        vm.pc = pc;
+                        vm.restore_boundary_state(funded, None);
+                        let mut state = InvokeState {
+                            gas,
+                            registers: [0; PVM_REGISTER_COUNT],
+                        };
+                        let mut observations = Vec::new();
+                        for step in 0..3 {
+                            let outcome = machines.invoke(id, state).unwrap();
+                            let vm = machines.machines[&id].vm.as_ref().unwrap();
+                            if step == 0 {
+                                assert_eq!(outcome.exit, InnerExit::Panic);
+                                assert_eq!(outcome.state.gas, gas);
+                                assert_eq!(vm.gas_charged, funded);
+                            }
+                            observations.push((outcome.clone(), vm.pc, vm.gas_charged));
+                            state = outcome.state;
+                        }
+                        observations
+                    };
+                    assert_eq!(
+                        run(PvmBackend::ForceRecompiler),
+                        run(PvmBackend::ForceInterpreter),
+                        "invalid pc {pc}, funded {funded}, gas {gas}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
     fn recompiled_inner_matches_reference_across_fault_repair_host_resume_and_page_reuse() {
         fn run(backend: PvmBackend) -> (Vec<InvokeOutcome>, Vec<u32>, Vec<u8>) {
             let mut machines = InnerMachines::with_backend(backend);
