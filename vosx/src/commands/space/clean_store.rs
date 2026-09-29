@@ -3110,37 +3110,45 @@ impl StoreRoot {
 // before publication. Production builds have no fault configuration surface.
 #[cfg(test)]
 std::thread_local! {
-    static SHARED_INTENT_STAGE_FAULT: std::cell::RefCell<Option<(PathBuf, usize)>> =
+    static SHARED_MANAGEMENT_STAGE_FAULT: std::cell::RefCell<Option<(PathBuf, StoreRole, usize)>> =
         const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
-pub(super) struct SharedIntentStageFault;
+pub(super) struct SharedManagementStageFault;
 
 #[cfg(test)]
-impl SharedIntentStageFault {
-    pub(super) fn arm(root: &Path, changed_write: usize) -> Self {
+impl SharedManagementStageFault {
+    pub(super) fn intent(root: &Path, changed_write: usize) -> Self {
+        Self::arm(root, StoreRole::SharedManagementIntent, changed_write)
+    }
+
+    pub(super) fn issuer(root: &Path, changed_write: usize) -> Self {
+        Self::arm(root, StoreRole::SharedManagementIssuer, changed_write)
+    }
+
+    fn arm(root: &Path, role: StoreRole, changed_write: usize) -> Self {
         assert!(changed_write > 0);
-        SHARED_INTENT_STAGE_FAULT.with(|slot| {
+        SHARED_MANAGEMENT_STAGE_FAULT.with(|slot| {
             assert!(slot.borrow().is_none());
-            *slot.borrow_mut() = Some((root.to_owned(), changed_write));
+            *slot.borrow_mut() = Some((root.to_owned(), role, changed_write));
         });
         Self
     }
 
     pub(super) fn fired(&self) -> bool {
-        SHARED_INTENT_STAGE_FAULT.with(|slot| {
+        SHARED_MANAGEMENT_STAGE_FAULT.with(|slot| {
             slot.borrow()
                 .as_ref()
-                .is_some_and(|(_, remaining)| *remaining == 0)
+                .is_some_and(|(_, _, remaining)| *remaining == 0)
         })
     }
 }
 
 #[cfg(test)]
-impl Drop for SharedIntentStageFault {
+impl Drop for SharedManagementStageFault {
     fn drop(&mut self) {
-        SHARED_INTENT_STAGE_FAULT.with(|slot| *slot.borrow_mut() = None);
+        SHARED_MANAGEMENT_STAGE_FAULT.with(|slot| *slot.borrow_mut() = None);
     }
 }
 
@@ -3230,20 +3238,20 @@ impl ExactFileStore {
         let encoded = encode_envelope(self.role, predecessor, image)?;
         self.write_stage(&encoded)?;
         #[cfg(test)]
-        if self.role == StoreRole::SharedManagementIntent
-            && SHARED_INTENT_STAGE_FAULT.with(|slot| {
-                let mut slot = slot.borrow_mut();
-                let Some((root, remaining)) = slot.as_mut() else {
-                    return false;
-                };
-                if root != &self.root.path || *remaining == 0 {
-                    return false;
-                }
-                *remaining -= 1;
-                *remaining == 0
-            })
-        {
-            return Err(std::io::Error::other("injected Shared intent publication failure").into());
+        if SHARED_MANAGEMENT_STAGE_FAULT.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let Some((root, role, remaining)) = slot.as_mut() else {
+                return false;
+            };
+            if root != &self.root.path || *role != self.role || *remaining == 0 {
+                return false;
+            }
+            *remaining -= 1;
+            *remaining == 0
+        }) {
+            return Err(
+                std::io::Error::other("injected Shared management publication failure").into(),
+            );
         }
         self.publish_stage(
             current.as_ref(),

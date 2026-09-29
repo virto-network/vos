@@ -72,34 +72,74 @@ impl GenesisClaimSigner for GenesisSigner<'_> {
 #[test]
 #[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
 fn shared_create_file_owner_reopens_preparation_publication_and_terminal() {
-    check_shared_file_recovery(false, false, 0);
+    check_shared_file_recovery(false, false, InstallFault::None);
 }
 
 #[test]
 #[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
 fn shared_create_file_owner_reopens_denial_beside_retired_generation() {
-    check_shared_file_recovery(true, false, 0);
+    check_shared_file_recovery(true, false, InstallFault::None);
 }
 
 #[test]
 #[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
 fn shared_management_handoff_reopens_under_production_lifecycle_owner() {
-    check_shared_file_recovery(true, true, 0);
+    check_shared_file_recovery(true, true, InstallFault::None);
 }
 
 #[test]
 #[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
 fn shared_install_file_owner_recovers_staged_finalization() {
-    check_shared_file_recovery(true, true, 2);
+    check_shared_file_recovery(true, true, InstallFault::Intent(2));
 }
 
 #[test]
 #[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
 fn shared_install_file_owner_recovers_staged_authorization() {
-    check_shared_file_recovery(true, true, 1);
+    check_shared_file_recovery(true, true, InstallFault::Intent(1));
 }
 
-fn check_shared_file_recovery(with_denial: bool, with_handoff: bool, interrupt_install: usize) {
+#[test]
+#[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
+fn shared_install_file_owner_recovers_issuer_decision() {
+    check_shared_file_recovery(true, true, InstallFault::Issuer(1));
+}
+
+#[test]
+#[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
+fn shared_install_file_owner_recovers_issuer_receipt() {
+    check_shared_file_recovery(true, true, InstallFault::Issuer(2));
+}
+
+#[test]
+#[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
+fn shared_install_file_owner_recovers_issuer_observation() {
+    check_shared_file_recovery(true, true, InstallFault::Issuer(3));
+}
+
+#[test]
+#[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
+fn shared_install_file_owner_recovers_issuer_terminal() {
+    check_shared_file_recovery(true, true, InstallFault::Issuer(4));
+}
+
+#[test]
+#[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
+fn shared_install_file_owner_recovers_issuer_finality() {
+    check_shared_file_recovery(true, true, InstallFault::Issuer(5));
+}
+
+enum InstallFault {
+    None,
+    Intent(usize),
+    Issuer(usize),
+}
+
+fn check_shared_file_recovery(
+    with_denial: bool,
+    with_handoff: bool,
+    interrupt_install: InstallFault,
+) {
     use crate::commands::space::clean_store::{
         CleanAgentGenesisSignatureFile, CleanFileStoreError, ensure_private_directory,
     };
@@ -529,35 +569,43 @@ fn check_shared_file_recovery(with_denial: bool, with_handoff: bool, interrupt_i
         assert_eq!(journal_files(&journal), applied);
     }
     if with_handoff {
+        use super::super::clean_store::SharedManagementStageFault;
         use vos::agent::clean_authority_issuer::SignedManagementTerminal;
-        if interrupt_install != 0 {
+        let interruption = match interrupt_install {
+            InstallFault::None => None,
+            InstallFault::Intent(write) => Some((
+                SharedManagementStageFault::intent(&lifecycle_root, write),
+                "shared-management.intent.next",
+                write >= 2,
+            )),
+            InstallFault::Issuer(write) => Some((
+                SharedManagementStageFault::issuer(&lifecycle_root, write),
+                "shared-management.issuer.next",
+                write >= 3,
+            )),
+        };
+        if let Some((fault, staged_file, already_applied)) = interruption {
             // The first changed intent write retains authorization work; the
             // second retains finalization work after the signed observation.
+            // Issuer writes retain the decision pledge, receipt, observation
+            // pledge, signed terminal, and finality, in that order.
             // Leave its real staged envelope on disk, without publication.
-            let fault = super::super::clean_store::SharedIntentStageFault::arm(
-                &lifecycle_root,
-                interrupt_install,
-            );
             assert_eq!(
                 lifecycle.complete_shared_install(locator),
                 Err(SharedAgentHostError::Unavailable)
             );
             assert!(fault.fired());
-            assert!(
-                lifecycle_root
-                    .join("shared-management.intent.next")
-                    .exists()
-            );
+            assert!(lifecycle_root.join(staged_file).exists());
             let installed = journal_files(&journal);
-            if interrupt_install == 1 {
+            if !already_applied {
                 assert_eq!(
                     installed, applied,
-                    "authorization fault must precede application"
+                    "pre-application fault must leave the Agent unchanged"
                 );
             } else {
                 assert_ne!(
                     installed, applied,
-                    "finalization fault must follow application"
+                    "post-application fault must retain the applied Agent"
                 );
             }
             drop(fault);
@@ -573,12 +621,8 @@ fn check_shared_file_recovery(with_denial: bool, with_handoff: bool, interrupt_i
             }
             assert!(system_logical_slot().unwrap() > interrupted_at);
             (_, lifecycle) = open();
-            assert!(
-                !lifecycle_root
-                    .join("shared-management.intent.next")
-                    .exists()
-            );
-            if interrupt_install == 1 {
+            assert!(!lifecycle_root.join(staged_file).exists());
+            if !already_applied {
                 assert_ne!(
                     journal_files(&journal),
                     installed,

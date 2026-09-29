@@ -446,12 +446,22 @@ one fixture-dependent store test was ignored, and a zero-test controller filter
 is not counted. Fault hooks are test-only and thread/root scoped, after
 staged-file sync and before publication. These are owner-reopen tests, not
 process-kill/power-loss, public-routing, or three-node qualification.
-Still required before ingress: remaining issuer/finalization crash boundaries
-under the production file owner, receipt expiry before physical application,
-and recovery of roots already advanced by the old failing startup;
-mixed pending continuations, Authority-denial retirement
-and crash-safe subsequent-Install input handoff. Public Shared management remains
-disabled; bundled artifacts are unchanged.
+All five production-file issuer regressions pass (694.64 s, two test threads):
+staged decision pledge, receipt, observation pledge, signed terminal and finality
+recover through normal discovery, preserving exactly-once physical application
+and terminal retry. No additional production fix was needed after the earlier
+clock-ordering corrections. The test-only fault hook now selects either intent
+or issuer roles. The default daemon build and 78 non-HTTP file-store tests pass;
+one fixture-dependent test remains ignored. Logs:
+`target/shared-install-file-issuer-{boundaries,default-check,stores}.log`.
+
+Next functional step: crash-safe subsequent-Install input handoff. The current
+controller deliberately refuses a different Install even after the preceding
+one retires; enabling ingress before solving that would ship a one-Install-only
+workflow. Other open gates are receipt expiry before application, Authority-denial
+retirement, mixed pending continuations, remaining write/retirement interruption
+boundaries and roots already advanced by the old failing startup. Public Shared
+management remains disabled; bundled artifacts are unchanged.
 
 The internal bootstrap-owner Shared Install application helper replaces the
 physical fixture's hand-assembled
