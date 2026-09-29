@@ -8,17 +8,61 @@ implementation branch; do not apply competing fixes on the review worktree.
 
 | Purpose | Branch / checkpoint |
 | --- | --- |
-| Reviewer target | Code `48df3995` plus this docs-only handoff; verify `saga/agents` contains the code checkpoint |
-| Review range | `62ffbc20..48df3995` as **one batch**, not individual review assignments |
-| Code checkpoint | `48df3995` on `wip/ch08-runtime-directory`: pruning and Linux x86-64 Agent recompiler default |
+| Reviewer target | Code `4ea0271c` plus this docs-only handoff; verify `saga/agents` contains the code checkpoint |
+| Review range | `bd378ae9..4ea0271c` as **one batch**: reviewed terminal gas fix and custom-runtime differential |
+| Code checkpoint | `4ea0271c` on `wip/ch08-runtime-directory`; preceding pruning/backend code is `48df3995` |
 | Prior tested baseline | `62ffbc20`; `master` remains unchanged |
 | Historical startup review | `f1bfa1bd..310ef841`; two findings fixed at `62ffbc20` |
 
-The code commit changes 42 files (+1,942 / -43,868 lines); the documentation
-handoff is separate. Verify branch heads before reviewing, and apply findings
+The new code commit changes five files (+571 lines, including 463 lines of
+custom-runtime qualification). The preceding pruning code changed 42 files
+(+1,942 / -43,868 lines). Documentation handoffs are separate. Verify branch
+heads before reviewing, and apply findings
 on the implementation branch. Do not infer publication from a candidate hash.
 This is not a release: batch 1 is not closed, batches 2/3 remain open, production
 multi-node startup/public Shared management remain gated, and Local is image-based.
+
+### Backend follow-up: `4ea0271c`
+
+This commit contains the reviewed backend correction and custom guest test;
+later Shared integration stays unpromoted until its own qualification completes.
+
+Independent review found terminal inner-machine reuse could charge gas twice
+under native execution. The fix restores the funded-block marker only on
+generated Conformance terminal exits; invalid external entries preserve their
+prior marker, and Jar semantics are unchanged. New repeated Halt/Panic/invalid
+jump/fallthrough and invalid-entry tests pass: `wrap-terminal-gas-parity.log`
+records 276 PVM tests plus 20 vectors; `wrap-terminal-no-std.log` records the
+portable check. The original standalone reproducer is
+`task-tmp/review_terminal_reinvoke.rs` in the shared target.
+
+The normal, non-scripted custom-linear guest passes 36 exact-input backend
+comparisons (18 each for Local and Shared), including management history,
+retained Invoke/ACK, recovery-only behavior and one-shot scheduling. Evidence:
+`custom-linear-backend-differential-final.log`; after the terminal gas fix,
+`wrap-final-custom-exact.log` passes again in 2.20 s. ELF SHA-256:
+`a8ec48426bc9dcea554c09f9da1c5edf089819aa51de90d927ca558c49239612`;
+program ID `88d4c9d6c8bc4705a7cdc7150c06682ff26cff38e6808c4bd9679f6ec021b5a7`.
+Build with the guest's normal `cargo actor` recipe, not `scripted-fixture`, and
+set `AGENT_CUSTOM_RUNTIME_ELF` when selecting
+`custom_linear::normal_custom_linear_exact_backend_lifecycle_and_recovery`.
+These are guest semantics tests, not filesystem/quorum evidence. Independent
+read-only review found no additional issue in the terminal fix; invalid external
+entry handling and Jar behavior remain unchanged.
+
+### Unpromoted Shared work
+
+The pre-Invoke three-node crash fixture now reproduces the unresolved recovery
+gate with real loopback election and former-leader reopen
+(`projection-before-invoke.log`). Preserve the committed-only relay and exact
+reservation checks. Its desired-success regression remains explicitly ignored
+until a safe authorization design is approved and implemented; do not count it
+as a pass. Shared external-state publication/availability work remains under
+construction and must not enable production startup by itself.
+The post-Invoke former-leader-first and successor-first fixtures pass (28.36 s
+and 34.49 s); post-ACK/pre-metadata-clear reopen passes (29.10 s), including
+cleanup during initial open. Logs: `projection-former-leader-first.log`,
+`projection-successor-first.log`, `projection-after-ack-qualified.log`.
 
 ## Code checkpoint changes and review focus
 

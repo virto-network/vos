@@ -13,9 +13,11 @@ Clerk with **100,000 retained transfers**. Keep Clerk's kernel, signatures,
 committed roots and exact retry semantics. Do not replace this with a singleton,
 smaller dataset or an experimental-only release without a new user decision.
 
-The current code checkpoint is `48df3995` on `wip/ch08-runtime-directory`,
-based on the tested admission/recovery baseline `62ffbc20`. Review
-`62ffbc20..48df3995` as **one batch**, together with this docs-only handoff.
+The current code checkpoint is `4ea0271c` on `wip/ch08-runtime-directory`:
+terminal gas-parity repair and exact custom-runtime qualification. Review
+`bd378ae9..4ea0271c` as **one batch**, together with this docs-only handoff.
+The preceding pruning/backend checkpoint is `48df3995`; the tested
+admission/recovery baseline remains `62ffbc20`.
 The reviewer checks `saga/agents`: verify that it contains the code checkpoint
 before starting. Fixes continue on the implementation branch before a qualified
 fast-forward. `master` is unchanged; do not push or change it automatically.
@@ -24,13 +26,36 @@ Status vocabulary: **implemented** means source and focused tests exist;
 **integrated** means the supported workflow selects it; **qualified** means its
 specified acceptance test passes on the actual release. These are not synonyms.
 
+Completed backend follow-up at `4ea0271c`, with subsequent Shared work still
+unpromoted in the implementation worktree:
+
+- Independent review reproduced a recompiler gas-parity bug when re-invoking
+  a terminal inner machine. The reviewed fix preserves reference funding;
+  276 PVM tests and 20 vectors pass, plus the no-default-features check.
+- The normal custom-linear guest now has 36 exact-input backend comparisons
+  across Local/Shared lifecycle, retained results, retries and scheduling.
+  This closes the missing custom-layout test coverage, not service qualification.
+- Shared external integration uses the existing signed Linear-only runtime
+  capabilities. Physical Create/Clerk Install produce identical state on three
+  replica identities without normalizing node-local roots or changing the ABI.
+  Journal integration and majority durable-availability checks are in progress.
+- A real three-node pre-Invoke leader-loss test reproduces an unresolved pending
+  read: committed-only recovery correctly refuses an unseen request. Do not
+  relax that admission guard. Recovery delegation versus original-attestor
+  readmission needs an explicit authorization decision; production remains gated.
+- Both post-Invoke replay orderings and post-ACK/pre-metadata-clear reopen now
+  pass physical three-node tests. These do not close the pre-Invoke gate.
+
+No finish-line change follows from these results. The remaining work stays in
+the three batches below; do not add a parallel plan or treat these as a release.
+
 | Area | Current checkpoint evidence | Remaining release boundary |
 | --- | --- | --- |
 | Admission and recovery | Baseline `62ffbc20` binds complete imported-plan certification and rejects unsupported rosters before writes; mixed-generation recovery P1 resolved | Review checkpoint findings; remaining three-node crash boundaries |
 | Fixed three-node bootstrap | Baseline common certified genesis, physical startup/reopen and post-Invoke leader-loss fixtures pass | Production startup remains gated; actual three-process daemon/HTTP qualification is pending |
 | Local execution | Image path retained; final default/reference Local suites and actual default-selected image daemon pass; public external Local removed | Exact-release performance, recovery and backup qualification |
 | External actor storage | Experimental authenticated incremental storage, durable publication/recovery and real Clerk fixture pass on both backends with rebuilt guests | Shared executor/finality integration, block availability, retained growth, safe reclamation and export |
-| VM backend | Outer/inner recompiler integrated; Linux x86-64 Agent default and explicit interpreter pass focused differential/physical checks; bounded preparation caches and post-cache phase measurements recorded | Complete custom-runtime differential, exact-release resource/cold-warm qualification and service capacity |
+| VM backend | Outer/inner recompiler integrated; Linux x86-64 Agent default and explicit interpreter pass focused differential/physical checks; bounded preparation caches and post-cache phase measurements recorded; custom-runtime differential and terminal-reuse fix pass | Exact-release resource/cold-warm qualification and service capacity |
 | Customer workflow | Ordinary Shared production finality and public management are unavailable | Released Shared Create/Install/Invoke, Shared Clerk and usable CLI orchestration |
 | Operations | Historical source-specific tests exist; current backup is registry-only | Load, overload, failover, Agent backup/restore, soak and reproducible release artifacts |
 
@@ -84,8 +109,9 @@ and cold/warm customer-workflow qualification remain open. See the [candidate ev
   permissions, host-call suspension/resume and commitments, including standard
   and genuinely different custom-runtime layouts. Run physical lifecycle/recovery
   tests and supported feature builds after pruning and backend changes.
-  Exact standard-runtime comparisons and both custom-runtime physical suites pass;
-  a complete custom-runtime exact-input gas/register comparison remains outstanding.
+  Exact standard-runtime comparisons and both custom-runtime physical suites pass.
+  The continuation adds 36 exact custom-runtime comparisons; final integrated
+  host/feature reruns remain pending before promoting that work.
 
 Exit: a scoped, tested checkpoint with actual phase timings. Recompiler speedups
 do not by themselves qualify Shared capacity or eliminate whole-runtime work.
