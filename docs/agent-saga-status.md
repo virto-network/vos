@@ -139,8 +139,24 @@ using `AUTHORITY_FIXED_ROSTER_FIXTURE`; the ignored core test
 and `AUTHORITY_CANDIDATE_ELF`. Use a new directory when exporting.
 The first guest-test compile had a test-only empty-row container mismatch; the
 first constructor run had an incorrect query-persistence expectation. Both were
-corrected without changing execution or policy validation. Durable candidate
-installation/mutation, file recovery and multi-node quorum remain unqualified.
+corrected without changing execution or policy validation.
+Candidate mutation qualification now reuses the existing signed node-mutation
+campaign with SAC6 configuration and three pending bootstrap certificates.
+Six guest executions cover bad-signature refusal, enrollment/materialization,
+exact retry, another refusal, removal and exact retry. Each resulting complete
+inline/row image is encoded, reopened and compared with native execution;
+all founding certificates remain intact. The test passes (3.06 s), exporting no
+row writes on retries/refusals. Evidence:
+`fixed-roster-guest.ImAzBc/{mutation-export,mutation-guest}.log` and `mutation/`.
+Export with `AUTHORITY_FIXED_ROSTER_MUTATION_FIXTURE` and host test
+`fixed_roster_node_mutations_materialize_and_recover`; run core test
+`compiled_authority_node_mutations_match_native_rows_and_retry --ignored`
+with that directory as `AUTHORITY_NODE_FIXTURE` and the candidate ELF above.
+This qualifies the guest's mutation and encoded-image recovery, not durable
+file publication. Candidate installation, filesystem recovery and multi-node
+quorum remain unqualified.
+The current full Authority host suite passes: 81 passed, 2 ignored (30.76 s),
+`fixed-roster-guest.ImAzBc/mutation-host-suite.log`.
 The candidate Authority node-table header now supports exactly one or three
 bootstrap certificates in canonical node order. Materialization writes the whole
 seed inside the existing row transaction; an occupied namespace refuses it, and
@@ -148,7 +164,7 @@ restored materialized headers never recreate missing certificates. The new
 host test covers pending-header encode/decode, all three lookups, conflicting
 storage, rollback, publication/reopen, and missing/substituted rows. Four focused
 node-table tests pass in `target/authority-fixed-roster-node-table.log` (0.22 s).
-The complete candidate Authority host suite passes: 79 passed, 2 ignored
+The earlier candidate Authority host suite passed: 79 passed, 2 ignored
 (30.88 s), `target/authority-fixed-roster-host-suite-final.log`. The first suite
 run exposed a stale schema-version assertion (78 passed, 1 failed, 2 ignored);
 it was updated to assert the new version. These are host tests, not physical-PVM

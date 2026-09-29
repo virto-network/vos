@@ -10644,10 +10644,7 @@ mod tests {
         install
     }
 
-    #[test]
-    fn sac6_fixed_roster_binds_directory_certificates_and_restore() {
-        use vos::Actor;
-        vos::storage::mock::reset();
+    fn fixed_roster_configuration() -> SystemAuthorityConfiguration {
         let mut config = configuration();
         let mut extra = [0x32, 0x33]
             .map(|seed| signed_node_enrollment(SpaceId(config.space), ADMIN_PRINCIPAL, seed));
@@ -10657,6 +10654,14 @@ mod tests {
             encryption_public_key: node.encryption_public_key,
             transport_signature: node.transport_signature,
         }));
+        config
+    }
+
+    #[test]
+    fn sac6_fixed_roster_binds_directory_certificates_and_restore() {
+        use vos::Actor;
+        vos::storage::mock::reset();
+        let config = fixed_roster_configuration();
         assert!(config.is_valid());
         let encoded = config.encode();
         assert_eq!(encoded.len(), FIXED_ROSTER_CONFIG_BYTES);
@@ -16755,11 +16760,34 @@ mod tests {
     }
 
     fn exercise_node_mutations(export: Option<&std::path::Path>, initial_nodes: usize) {
+        exercise_node_mutations_from_config(export, initial_nodes, configuration());
+    }
+
+    #[test]
+    fn fixed_roster_node_mutations_materialize_and_recover() {
+        let directory = std::env::var("AUTHORITY_FIXED_ROSTER_MUTATION_FIXTURE").ok();
+        if let Some(directory) = &directory {
+            std::fs::create_dir(directory).expect("new mutation fixture directory");
+        }
+        exercise_node_mutations_from_config(
+            directory.as_deref().map(std::path::Path::new),
+            3,
+            fixed_roster_configuration(),
+        );
+    }
+
+    fn exercise_node_mutations_from_config(
+        export: Option<&std::path::Path>,
+        initial_nodes: usize,
+        config: SystemAuthorityConfiguration,
+    ) {
         use vos::{Actor, Encode, storage::mock};
         assert!((1..MAX_AUTHORITY_NODES).contains(&initial_nodes));
-        let mut actor = actor();
-        let config = actor.configuration;
-        for ordinal in 0..initial_nodes - 1 {
+        mock::reset();
+        let mut actor = SystemAuthority::new(&config.encode());
+        let bootstrap_count = config.bootstrap_enrollments().len();
+        assert!(initial_nodes >= bootstrap_count);
+        for ordinal in 0..initial_nodes - bootstrap_count {
             let mut seed = [0x53; 32];
             seed[..8].copy_from_slice(&(ordinal as u64).to_le_bytes());
             let transport_key = SigningKey::from_bytes(&seed);
@@ -16774,7 +16802,7 @@ mod tests {
             assert!(enrollment.verify_with(&Ed25519CredentialVerifier));
             assert!(insert_enrolled_node(&mut actor.state, enrollment));
         }
-        if initial_nodes != 1 {
+        if initial_nodes != bootstrap_count {
             assert!(refresh_state_integrity_commitment(
                 &config,
                 &mut actor.state
@@ -16785,7 +16813,11 @@ mod tests {
         mock::commit_dispatch();
         let initial_rows = mock::snapshot();
         let key = signing(0x21);
-        let enrollment = signed_node_enrollment(SpaceId(config.space), ADMIN_PRINCIPAL, 0x32);
+        let enrollment = signed_node_enrollment(
+            SpaceId(config.space),
+            ADMIN_PRINCIPAL,
+            if bootstrap_count == 3 { 0x34 } else { 0x32 },
+        );
         let call = admin_call(
             config,
             &key,
@@ -16854,6 +16886,12 @@ mod tests {
         assert!(enrolled_node(&actor.state, enrollment.node).is_none());
         assert_eq!(actor.state.nodes.len(), initial_nodes);
         assert!(enrolled_node(&actor.state, ADMIN_NODE).is_some());
+        for bootstrap in config.bootstrap_enrollments() {
+            assert_eq!(
+                enrolled_node(&actor.state, bootstrap.node),
+                Some(NodeOwnerRow::from_enrollment(bootstrap))
+            );
+        }
         assert_eq!(dispatch_admin(&mut actor, &removal), removed_reply);
         assert_eq!(actor.__save_agent_lane(StateLane::Linear), removed_linear);
         mock::commit_dispatch();
