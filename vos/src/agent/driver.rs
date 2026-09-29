@@ -2793,6 +2793,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
         &self,
     ) -> Result<PhysicalAuthorityDirectory<'_, S>, AgentDriverError> {
         let descriptor = clean_image_descriptor(&self.image)?;
+        self.verify_physical_runtime(&descriptor)?;
         Ok(PhysicalAuthorityDirectory {
             driver: self,
             records: self.inspect_sdk_actor_directory(&descriptor)?,
@@ -2805,6 +2806,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
         require_ready: bool,
     ) -> Result<super::invocation_preparation::PhysicalInvocationMaterial, AgentDriverError> {
         let descriptor = clean_image_descriptor(&self.image)?;
+        self.verify_physical_runtime(&descriptor)?;
         let record = self.inspect_sdk_actor(&descriptor, actor)?;
         self.physical_material_from_record(record, require_ready)
     }
@@ -2877,14 +2879,14 @@ impl<S: AgentImageStore> AgentDriver<S> {
             .ok_or_else(not_found)
     }
 
-    fn physical_material_from_record(
+    /// Authenticate process bytes before asking the runtime for directory data.
+    /// A borrowed directory view needs this once, not once per returned actor.
+    fn verify_physical_runtime(
         &self,
-        record: crate::agent_sdk::ActorDirectoryRecord,
-        require_ready: bool,
-    ) -> Result<super::invocation_preparation::PhysicalInvocationMaterial, AgentDriverError> {
-        let descriptor = clean_image_descriptor(&self.image)?;
+        descriptor: &crate::agent_sdk::AgentDescriptor,
+    ) -> Result<(), AgentDriverError> {
         validate_sdk_process_local_profile(descriptor.identity.profile)?;
-        let projected = super::standard::clean_descriptor_to_legacy_config(&descriptor)
+        let projected = super::standard::clean_descriptor_to_legacy_config(descriptor)
             .map_err(AgentDriverError::Lifecycle)?;
         if self.image.config != projected
             || self.image.runtime_program.0 != descriptor.identity.runtime_program.0
@@ -2898,13 +2900,24 @@ impl<S: AgentImageStore> AgentDriver<S> {
         let runtime_package =
             super::package_admission::admit_runtime_package(&runtime_package_bytes)
                 .map_err(AgentDriverError::PackageAdmission)?;
-        verify_clean_runtime_package_binding(&descriptor, &runtime_package)?;
+        verify_clean_runtime_package_binding(descriptor, &runtime_package)?;
         let runtime_pvm = self.store.load_program(self.image.runtime_program)?.ok_or(
             AgentDriverError::ProgramUnavailable(self.image.runtime_program),
         )?;
         if runtime_pvm != runtime_package.program_bytes() || runtime_pvm != self.runtime_pvm {
             return Err(AgentDriverError::RuntimeProgramMismatch);
         }
+        Ok(())
+    }
+
+    /// Callers hold an immutable driver borrow and have authenticated its
+    /// runtime before obtaining this directory record.
+    fn physical_material_from_record(
+        &self,
+        record: crate::agent_sdk::ActorDirectoryRecord,
+        require_ready: bool,
+    ) -> Result<super::invocation_preparation::PhysicalInvocationMaterial, AgentDriverError> {
+        let descriptor = clean_image_descriptor(&self.image)?;
         if require_ready && record.entry.suspended {
             return Err(AgentDriverError::SdkManagement(
                 crate::agent_sdk::ManagementError::InvalidRequest,
@@ -5962,9 +5975,19 @@ mod tests {
             .unwrap();
 
         driver.runtime_pvm = b"substituted-process-runtime".to_vec();
+        let executions = DIRECTORY_EXECUTIONS.with(|count| count.get());
         assert_eq!(
             driver.physical_invocation_material(actor),
             Err(AgentDriverError::RuntimeProgramMismatch)
+        );
+        assert_eq!(
+            driver.physical_authority_directory().err(),
+            Some(AgentDriverError::RuntimeProgramMismatch)
+        );
+        assert_eq!(
+            DIRECTORY_EXECUTIONS.with(|count| count.get()),
+            executions,
+            "reject substituted runtime bytes before directory execution"
         );
         driver.runtime_pvm = runtime_package.program_bytes().to_vec();
 

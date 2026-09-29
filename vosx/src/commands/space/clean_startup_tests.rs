@@ -150,99 +150,58 @@ enum InstallFault {
 }
 
 #[test]
-#[ignore = "requires candidate runtime/Authority guests; use disk-backed TMPDIR"]
+#[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
 fn shared_install_file_owner_recovers_expiry_and_staged_finality() {
     check_shared_file_recovery(false, true, InstallFault::Expiry);
 }
 
 #[test]
-#[ignore = "requires candidate guests; exercises both Agent-ID recovery orderings"]
+#[ignore = "executes bundled outer PVM; exercises both Agent-ID recovery orderings"]
 fn shared_install_file_owner_recovers_expiry_beside_retired_generation() {
     for pending_first in [true, false] {
         check_shared_file_recovery(false, true, InstallFault::MixedExpiry { pending_first });
     }
 }
 
-fn expiry_startup_inputs(operator: &Keypair) -> StartupTestInputs {
-    use vos::agent::sdk::package::{PackageArtifact, PackageEnvelope, PackageManifest};
-    fn replace_program(bytes: &[u8], program: Vec<u8>, operator: &Keypair) -> Vec<u8> {
-        let mut envelope = PackageEnvelope::decode(bytes).unwrap();
-        let reference = BlobRef::of_bytes(&program);
-        let old = match &mut envelope.manifest {
-            PackageManifest::Actor(manifest) => {
-                std::mem::replace(&mut manifest.program, reference.clone())
-            }
-            PackageManifest::AgentRuntime(manifest) => {
-                std::mem::replace(&mut manifest.outer_program, reference.clone())
-            }
-        };
-        envelope
-            .artifacts
-            .retain(|artifact| artifact.identity != old);
-        envelope.artifacts.push(PackageArtifact {
-            identity: reference,
-            bytes: program,
-        });
-        envelope
-            .artifacts
-            .sort_unstable_by(|a, b| a.identity.cmp(&b.identity));
-        envelope.manifest.signing_mut().signature =
-            sign_exact(operator, &envelope.signing_bytes().unwrap()).unwrap();
-        envelope.encode().unwrap()
-    }
-    let runtime = crate::bundled::root_signed_agent_runtime_package(operator).unwrap();
-    let program = std::fs::read(
-        std::env::var_os("VOS_AGENT_RUNTIME_COST_CANDIDATE").expect("set candidate runtime PVM"),
+#[test]
+fn expiry_test_clock_tracks_wall_time_and_preserves_forward_jump() {
+    let operator = Keypair::generate_ed25519();
+    let inputs = expiry_startup_inputs(&operator);
+    let space = SpaceId([0x73; 32]);
+    let (target, _) = derive_system_authority_target(
+        space,
+        raw_public_key(&operator).unwrap(),
+        &inputs.runtime,
+        &inputs.authority,
     )
     .unwrap();
-    let runtime = vos::agent::package_admission::admit_runtime_package(&replace_program(
-        runtime.exact_bytes(),
-        program,
-        operator,
-    ))
-    .unwrap();
-    if let Some(directory) = std::env::var_os("VOS_AGENT_TEMPLATE_CANDIDATES") {
-        let directory = PathBuf::from(directory);
-        let authority = crate::bundled::root_signed_actor_package(
-            &std::fs::read(directory.join("system-authority.vos")).unwrap(),
-            SYSTEM_AUTHORITY_NAME,
-            operator,
+    inputs.clock.store(1, Ordering::Release);
+    let trust = SystemAgentTrust {
+        test_clock: Some(inputs.clock.clone()),
+        ..SystemAgentTrust::new(
+            1,
+            HostSpaceId(space.0),
+            host_authority_binding(target.system_agent, target.binding),
         )
-        .unwrap();
-        let catalog = crate::bundled::root_signed_actor_package(
-            &std::fs::read(directory.join("system-catalog.vos")).unwrap(),
-            SYSTEM_CATALOG_NAME,
-            operator,
-        )
-        .unwrap();
-        return StartupTestInputs {
-            runtime,
-            authority,
-            catalog,
-            clock: Arc::new(AtomicU64::new(system_logical_slot().unwrap() + 1)),
-        };
-    }
+    };
+    let wall = system_logical_slot().unwrap();
+    let first = trust.current_logical_slot().unwrap();
+    assert!(first >= wall);
+    let future = first + 10_000;
+    inputs.clock.fetch_max(future, Ordering::AcqRel);
+    assert!(trust.current_logical_slot().unwrap() >= future);
+    assert!(trust.current_logical_slot().unwrap() > future);
+}
+
+fn expiry_startup_inputs(operator: &Keypair) -> StartupTestInputs {
+    // Qualify exactly the shipped packages. Only the logical clock is
+    // controlled; no candidate environment variable can replace guest bytes.
+    let runtime = crate::bundled::root_signed_agent_runtime_package(operator).unwrap();
     let authority = crate::bundled::root_signed_actor_package(
         crate::bundled::system_authority_package_template(),
         SYSTEM_AUTHORITY_NAME,
         operator,
     )
-    .unwrap();
-    let target = PathBuf::from(
-        std::env::var_os("CARGO_TARGET_DIR").expect("set candidate guest build root"),
-    );
-    let program = vos_pvm_compiler::link_elf_spi(
-        &std::fs::read(
-            target.join("agent-state-authority/riscv64em-vos/release/system_authority.elf"),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    let authority = vos::agent::package_admission::admit_actor_package(&replace_program(
-        authority.exact_bytes(),
-        program,
-        operator,
-    ))
     .unwrap();
     StartupTestInputs {
         runtime,

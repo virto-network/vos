@@ -904,10 +904,13 @@ impl AgentTrustProvider for SystemAgentTrust {
     fn current_logical_slot(&self) -> Option<u64> {
         let observed = system_logical_slot().ok()?;
         #[cfg(test)]
-        let observed = self
-            .test_clock
-            .as_ref()
-            .map_or(observed, |clock| clock.fetch_add(1, Ordering::AcqRel));
+        let observed = self.test_clock.as_ref().map_or(observed, |clock| {
+            // Requests still use wall-clock valid_from slots. Slow guest
+            // execution must not leave the injected clock behind them;
+            // explicit forward jumps for expiry remain authoritative.
+            clock.fetch_max(observed, Ordering::AcqRel);
+            clock.fetch_add(1, Ordering::AcqRel)
+        });
         Some(
             self.floor
                 .fetch_max(observed, Ordering::AcqRel)

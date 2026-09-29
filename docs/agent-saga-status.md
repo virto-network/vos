@@ -595,7 +595,7 @@ Authority/Catalog templates offline under
 to the committed files. Candidate package BLAKE2b-256: Authority
 `380c8ec939d0058c484f030fe36805aa1c5f48d3106fd7d1b17e4e9a2161bf9a`, Catalog
 `a56230af10e7ea5a5793d81ffcf362f7addb2782ec062c8529d836596eb1aff6`.
-The latter differs from the currently pinned Catalog. Its actor source is
+The latter differs from the previous pinned Catalog. Its actor source is
 unchanged, and the candidate-contract test passes: after normalizing program and
 signature, its full manifest and non-program artifacts match the pinned package
 (`target/shared-expiry-catalog-contract.log`, one test). This is not behavioral
@@ -614,7 +614,38 @@ The 18 release-verifier tests pass (one candidate test ignored in that suite and
 run separately); the normal CLI check, formatting and diff checks also pass.
 Logs: `target/shared-expiry-release-verifier-tests.log` and
 `target/shared-expiry-default-candidates-check.log`.
-Bundled files and release pins remain unchanged.
+The bundled integration now replaces the runtime, Authority and Catalog
+with this default-feature set and pins source/builder revision `7316e52d`.
+The runtime program identity and build-time digests move together. The expiry
+file tests now use only root-signed bundled packages, with a controlled clock;
+candidate environment overrides have been removed from that fixture. Eighteen
+release-verifier tests pass against the new bundles (one ignored). Full pinned
+builder reproduction passes: immutable source and builder exports reproduce all
+three tracked blobs byte-for-byte, including runtime identity and ELF digest
+(`target/shared-expiry-pinned-reproduction.log`). The first bundled staged-expiry
+file test failed at Shared Create preparation with `InvalidProvision` (43.04 s),
+before expiry coverage. An unchanged diagnostic rerun passed (205.54 s), so that
+failure is not conclusively attributed. A test-clock inconsistency was found:
+wall-time-signed requests can overtake a clock advancing only on reads during
+slow guest execution. The test-only clock now catches up to wall time while
+preserving explicit forward jumps; its regression passes (0.19 s). Logs are
+`target/shared-expiry-bundled-{file,diagnostic}.log` and
+`target/shared-expiry-clock.log`. Bundled expiry recovery with the clock fix
+passes (206.21 s) in `target/shared-expiry-bundled-file-fixed.log`. The default
+feature path uses the actual bundles and production file stores, but this remains
+a controlled interruption/reopen fixture, not released-process crash qualification.
+The driver suite initially exposed a consistency-check ordering bug: substituted
+process runtime bytes reached directory execution before package/program checks.
+Physical lookup and borrowed audit-directory construction now authenticate the
+runtime first; audit records reuse that check under the immutable driver borrow.
+All 35 driver tests pass (0.97 s), including explicit no-directory-execution
+assertions for substituted bytes on both paths, in
+`target/shared-expiry-repinned-driver-final.log`. Formatting and diff checks pass.
+Bundled mixed-generation recovery still needs a rerun; its earlier passing
+candidate evidence is retained above and must not be counted as this new run.
+Existing-deployment migration is not established by fresh-root recovery tests.
+Public Shared management remains disabled and the three-node customer workflow
+and load/recovery gates above remain open.
 
 The internal bootstrap-owner Shared Install application helper replaces the
 physical fixture's hand-assembled
