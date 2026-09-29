@@ -4676,11 +4676,13 @@ where
     }
 
     /// Construct the exact clean SDK Create input used by the independently
-    /// root/QC-authorized one-voter Shared system Agent. This is deliberately
+    /// root/QC-authorized fixed-roster Shared system Agent. This is deliberately
     /// separate from ordinary system-Agent finality: it performs only package,
     /// descriptor, receipt, clock, and physical-replica binding. The returned
     /// input still has to pass [`Self::prepare_system_genesis`] and the root
-    /// seal before any Shared journal bytes may be initialized.
+    /// seal before any Shared journal bytes may be initialized. Preparation
+    /// accepts the existing singleton and a fixed three-voter roster; this
+    /// does not enable multi-node root certification or startup.
     pub(crate) fn clean_shared_system_genesis_input(
         descriptor: crate::agent_sdk::AgentDescriptor,
         runtime_package: &super::package_admission::AdmittedRuntimePackage,
@@ -4689,10 +4691,19 @@ where
         trust: &Arc<dyn AgentTrustProvider>,
         merge: &Arc<dyn LocalMergeAuthenticator>,
     ) -> Result<(ReplayInput, Vec<RuntimeBlob>), LocalJournalDriverError> {
-        let [replica] = descriptor.replicas.as_slice() else {
+        let Some(replica) = descriptor
+            .replicas
+            .iter()
+            .find(|replica| replica.node.0 == merge.node().0)
+        else {
             return Err(LocalReplayExecutorError::WrongReplica.into());
         };
-        if replica.role != crate::agent_sdk::ReplicaRole::Voter || replica.node.0 != merge.node().0
+        if !matches!(descriptor.replicas.len(), 1 | 3)
+            || descriptor
+                .replicas
+                .iter()
+                .any(|entry| entry.role != crate::agent_sdk::ReplicaRole::Voter)
+            || replica.role != crate::agent_sdk::ReplicaRole::Voter
         {
             return Err(LocalReplayExecutorError::WrongReplica.into());
         }
@@ -4794,10 +4805,14 @@ where
         };
         if descriptor.validate().is_err()
             || descriptor.identity.profile != crate::agent_sdk::AgentProfile::Shared
-            || descriptor.replicas.len() != 1
-            || descriptor.replicas[0].role != crate::agent_sdk::ReplicaRole::Voter
-            || descriptor.replicas[0].node.0 != replica.node.0
-            || descriptor.replicas[0].principal.0 != replica.principal.0
+            || !matches!(descriptor.replicas.len(), 1 | 3)
+            || descriptor
+                .replicas
+                .iter()
+                .any(|entry| entry.role != crate::agent_sdk::ReplicaRole::Voter)
+            || !descriptor.replicas.iter().any(|entry| {
+                entry.node.0 == replica.node.0 && entry.principal.0 == replica.principal.0
+            })
             || replica.role != super::ReplicaRole::Voter
         {
             return Err(LocalReplayExecutorError::InvalidRequest.into());
@@ -7664,6 +7679,116 @@ mod tests {
         receipt.signature = authority_key.sign(&receipt.signing_bytes()).to_bytes();
         receipt.validate_shape().unwrap();
         receipt
+    }
+
+    #[test]
+    fn fixed_system_genesis_preparation_is_replica_independent() {
+        use crate::agent_sdk as sdk;
+        type Driver = LocalJournalAgentDriver<FileAgentJournalStore>;
+        let runtime = super::super::package_admission::admitted_standard_runtime_for_test(
+            "fixed-system-genesis",
+            0x42,
+        );
+        let key = SigningKey::from_bytes(&[0x41; 32]);
+        let nodes = [NodeId([0x40; 32]), NodeId([0x50; 32]), NodeId([0x60; 32])];
+        let mut descriptor = clean_test_descriptor(&runtime, nodes[0], &key);
+        descriptor.identity.profile = sdk::AgentProfile::Shared;
+        descriptor.replicas = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| sdk::AgentReplica {
+                node: sdk::NodeId(node.0),
+                principal: sdk::PrincipalId([0x70 + index as u8; 32]),
+                role: sdk::ReplicaRole::Voter,
+            })
+            .collect();
+        descriptor.validate().unwrap();
+        let request = sdk::ManagementRequest::Create(Box::new(descriptor.clone()));
+        let receipt = clean_test_receipt(&descriptor, &request, 1, &key);
+        let trust: Arc<dyn AgentTrustProvider> = Arc::new(CleanClockTrust {
+            slot: Arc::new(AtomicU64::new(10)),
+        });
+        assert!(!trust.use_native_clean_runtime_for_test());
+        let mut expected = None;
+        for entry in &descriptor.replicas {
+            let merge: Arc<dyn LocalMergeAuthenticator> =
+                Arc::new(StaticMerge(NodeId(entry.node.0)));
+            let (input, catalog) = Driver::clean_shared_system_genesis_input(
+                descriptor.clone(),
+                &runtime,
+                receipt.clone(),
+                10,
+                &trust,
+                &merge,
+            )
+            .unwrap();
+            let replica = AgentReplica {
+                node: NodeId(entry.node.0),
+                principal: crate::service::PrincipalId(entry.principal.0),
+                role: super::super::ReplicaRole::Voter,
+            };
+            let prepared = Driver::prepare_system_genesis(
+                input.clone(),
+                replica,
+                &catalog,
+                trust.clone(),
+                merge.clone(),
+            )
+            .unwrap();
+            assert_eq!(prepared.replica(), replica);
+            let commitments = (
+                prepared.create().clone(),
+                prepared.expectations(),
+                prepared.artifacts().to_vec(),
+            );
+            if let Some(expected) = &expected {
+                assert_eq!(&commitments, expected);
+            } else {
+                expected = Some(commitments);
+            }
+            let mut wrong_principal = replica;
+            wrong_principal.principal = crate::service::PrincipalId([0x7f; 32]);
+            assert!(
+                Driver::prepare_system_genesis(
+                    input,
+                    wrong_principal,
+                    &catalog,
+                    trust.clone(),
+                    merge,
+                )
+                .is_err()
+            );
+        }
+        let outsider: Arc<dyn LocalMergeAuthenticator> = Arc::new(StaticMerge(NodeId([0x7f; 32])));
+        assert!(
+            Driver::clean_shared_system_genesis_input(
+                descriptor.clone(),
+                &runtime,
+                receipt.clone(),
+                10,
+                &trust,
+                &outsider,
+            )
+            .is_err()
+        );
+        // Signed but unsupported roster shapes must not reach preparation.
+        for observer in [false, true] {
+            let mut invalid = descriptor.clone();
+            if observer {
+                invalid.replicas[2].role = sdk::ReplicaRole::Observer;
+            } else {
+                invalid.replicas.pop();
+            }
+            let request = sdk::ManagementRequest::Create(Box::new(invalid.clone()));
+            let receipt = clean_test_receipt(&invalid, &request, 1, &key);
+            let merge: Arc<dyn LocalMergeAuthenticator> = Arc::new(StaticMerge(nodes[0]));
+            assert!(
+                Driver::clean_shared_system_genesis_input(
+                    invalid, &runtime, receipt, 10, &trust, &merge,
+                )
+                .is_err()
+            );
+        }
     }
 
     fn clean_test_state(control: &[u8]) -> crate::agent_sdk::RuntimeState {

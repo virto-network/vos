@@ -9,8 +9,9 @@ to expand these batches.
 
 Implementation checkpoint `fdb6ad2d` bundles the reproduced signed-expiry
 runtime/Authority set and fixes runtime authentication before directory execution.
-The review batch after `65f35760` is described in
-[the review guide](agent-saga-review.md) for publication on `saga/agents`.
+The review batch after `65f35760` is now on `saga/agents` at `f1bfa1bd` and
+described in [the review guide](agent-saga-review.md). Subsequent implementation
+stays on `wip/ch08-runtime-directory` while that checkpoint is reviewed.
 Pinned-source reproduction, 18 release-verifier tests, 35 driver tests and the
 bundled staged-expiry recovery test pass. All 21 Local-host regressions pass
 (40.85 s). The default CLI unit suite passes with loopback access: 295 passed,
@@ -31,6 +32,32 @@ external-state executor to Shared Clerk publication/replay. These are required
 integration gaps, not optional tuning. Keep Local image-based and public Shared
 management disabled until the corresponding recovery/admission path is proved.
 Measure the integrated Clerk path before spending the remaining tuning pass.
+
+### Fixed three-node bootstrap integration
+
+Direct fixed-roster genesis is the current implementation candidate, avoiding
+an operator join/committee-transition workflow for a release whose membership
+is fixed. The existing singleton remains supported. The first physical check
+passes: the bundled runtime executes the same signed three-voter Create at each
+replica and derives identical runtime/request/state/artifact commitments (0.54 s).
+Preparation selects the local replica by node identity rather than roster index;
+outsiders, wrong principals, two-voter and observer rosters are rejected.
+Evidence: `target/fixed-system-genesis-preparation-fixed.log` in the shared build
+root. This test disables the native test shortcut; it does not run network quorum.
+All 34 journal-driver regressions pass (34.72 s), and the existing fresh
+bootstrap/exact-restart factory regression passes (2.05 s). Logs:
+`target/fixed-system-genesis-driver-regressions.log` and
+`target/fixed-system-genesis-singleton-restart.log`. Formatting and diff checks
+pass. Bundled artifacts and the reviewer checkpoint are unchanged.
+
+Only the internal input/replay preparation boundary currently admits three
+voters. Root proposal/sealing, bootstrap pins/owner and released startup remain
+singleton-only. Next separate shared bootstrap material from node-local locator
+selection, bind all three replicas to the same independently certified root,
+and qualify their real quorum/startup/restart before exposing configuration.
+Preserve exact roster, credential-node, package and receipt checks; do not
+replace them with index-zero assumptions or permissive finality. Do not claim
+that node-independent replay commitments alone establish a deployable cluster.
 
 ## Customer release scope and implementation order
 
@@ -111,10 +138,11 @@ rejects `ChangeReplicas`; three-node system placement therefore needs a real
 bootstrap/placement cutover, not merely a CLI wrapper around existing calls.
 The V2 Raft committee-transition primitive exists, but it is not an operator
 onboarding workflow or a substitute for node-local authenticated recovery.
-The smallest candidate is to keep the existing one-voter root bootstrap, then
+An earlier candidate was to keep the existing one-voter root bootstrap, then
 admit two nodes and use that signed V2 transition before customer traffic.
-Qualify the joiners' fresh-key recovery, catch-up and final three-voter state
-before selecting this over direct three-voter root-bootstrap changes. Existing
+The fixed-roster preparation evidence above now supports pursuing direct
+three-voter bootstrap first, without adding dynamic-membership orchestration.
+Existing
 portable Shared restore is same-node only, so it cannot serve as the joiner
 handoff without a separate authenticated onboarding path.
 A focused signed V2 Raft regression now applies the exact one-voter-to-three-
@@ -124,8 +152,8 @@ The test supplies already-committed entries, so it establishes only the
 transition ledger's authorization, application and recovery for this shape.
 It does not exercise a real quorum, enroll fresh node keys, transfer an
 authenticated generation to joiners or qualify released CLI orchestration.
-Those remain the decision gate before choosing staged expansion over direct
-three-voter genesis.
+The V2 primitive remains available, but staged expansion is not the current
+implementation path. Its passing ledger test is not direct-genesis qualification.
 The ordinary Shared startup finality gap is not a one-line adapter swap:
 fresh discovery remains noncreating, but startup now retains an empty Shared
 lifecycle controller under the production owner without creating any Shared
