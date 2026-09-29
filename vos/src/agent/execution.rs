@@ -1883,6 +1883,98 @@ mod tests {
 
     #[cfg(feature = "agent-runtime")]
     #[test]
+    #[ignore = "requires candidate Authority ELF and exported fixed-roster fixture"]
+    fn compiled_authority_fixed_roster_queries_match_native() {
+        use super::super::actor_storage::{ActorLaneImage, ActorStorageAccess, ActorStorageReader};
+        use crate::actors::codec::{Decode, Encode};
+        use crate::actors::value::{Msg, TAG_DYNAMIC, Value};
+        let root =
+            std::path::PathBuf::from(std::env::var("AUTHORITY_FIXED_ROSTER_FIXTURE").unwrap());
+        let read = |name: &str| std::fs::read(root.join(name)).unwrap();
+        let elf = std::fs::read(std::env::var("AUTHORITY_CANDIDATE_ELF").unwrap()).unwrap();
+        let program = vos_pvm_compiler::link_elf_spi(&elf).unwrap();
+        assert!(program.len() <= MAX_EXECUTION_PROGRAM_BYTES);
+        let schema = crate::agent_sdk::schema::decode(
+            &super::super::schema::raw_section_from_elf(&elf).unwrap(),
+        )
+        .unwrap();
+        let config_bytes = read("configuration");
+        let config = system_authority::SystemAuthorityConfiguration::decode(&config_bytes).unwrap();
+        assert!(config.bootstrap_additional_nodes.is_some());
+        let image = ActorLaneImage::from_parts(read("linear"), Default::default());
+        let access = ActorStorageAccess::new(
+            &schema,
+            "inventory_projection_page",
+            crate::agent_sdk::MethodMode::Query,
+        )
+        .unwrap();
+        let reader = ActorStorageReader::new(&access, Some(&image), None, None).unwrap();
+        let before = ActorStateLanes {
+            linear: Some(image.inline().to_vec()),
+            merge: Some(Vec::new()),
+            local: Some(Vec::new()),
+        };
+        for seed in [0x31, 0x32, 0x33] {
+            let mut call = invocation();
+            call.actor = ActorId(config.binding.issuer.actor);
+            call.mode = MethodMode::Query;
+            call.gas = MAX_EXECUTION_GAS;
+            call.message = vec![TAG_DYNAMIC];
+            call.message.extend(
+                Msg::new("inventory_projection_page")
+                    .with("query", Value::Bytes(read(&std::format!("query-{seed}"))))
+                    .encode(),
+            );
+            let context = crate::agent_sdk::InvocationContext {
+                invocation: crate::agent_sdk::InvocationId(call.invocation.0),
+                actor: crate::agent_sdk::ActorId(call.actor.0),
+                mode: crate::agent_sdk::MethodMode::Query,
+                origin: crate::agent_sdk::InvocationOrigin::anonymous(),
+                roles: crate::agent_sdk::InvocationRoleClaims::none(),
+                observed_slot: 1,
+            };
+            // First execute the constructor from installation data alone;
+            // then restore and repeat against the native canonical image.
+            for input in [&ActorStateLanes::default(), &before, &before] {
+                let ActorRunOutcome::Completed { reply, state, rows } =
+                    run_inner_actor_with_storage(
+                        &call,
+                        Some(context),
+                        &program,
+                        Some(&config_bytes),
+                        input,
+                        None,
+                        Some(&reader),
+                    )
+                    .expect("fixed-roster guest query")
+                else {
+                    panic!("query yielded")
+                };
+                assert_eq!(reply.status, ActorExecutionStatus::Done);
+                assert_eq!(
+                    Value::decode(&reply.reply),
+                    Value::Bytes(read(&std::format!("reply-{seed}")))
+                );
+                // Query dispatch echoes its input lanes, even when the guest
+                // constructs an ephemeral initial state to answer the query.
+                // It must not persist that state as a side effect of inspection.
+                assert_eq!(
+                    state.linear.as_deref(),
+                    Some(input.linear.as_deref().unwrap_or(&[]))
+                );
+                assert_eq!(state.merge.as_deref(), Some(&[][..]));
+                assert_eq!(state.local.as_deref(), Some(&[][..]));
+                assert!(rows.is_empty());
+                std::eprintln!(
+                    "fixed-roster node={seed} gas_remaining={}",
+                    reply.gas_remaining
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
     #[ignore = "requires Authority candidate ELF and exported signed publication fixture"]
     fn compiled_authority_publication_matches_native_state_and_retry() {
         use crate::actors::codec::{Decode, Encode};

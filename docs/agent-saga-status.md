@@ -124,6 +124,23 @@ The focused bundled singleton Authority credential-query/ACK test passes with
 the new descriptor check (3.53 s),
 `target/authority-descriptor-singleton-physical.log`. It uses the existing bundled
 Authority with the fixture's native outer runtime, not the SAC6 candidate guest.
+The SAC6 candidate guest now executes authenticated inventory queries from each
+of the three founding nodes. Nine real inner-machine executions cover constructor
+evaluation from installation data, restored native state, and repeat queries.
+Every reply exactly matches native Authority execution; queries export no row
+writes and preserve input lanes (construction during a query is ephemeral, not
+durable installation). The test passes in 2.41 s, consuming about 46.6–47.0 million
+gas per query. This is a debug inner-machine regression, not a throughput benchmark
+or outer-runtime/consensus qualification. Evidence under shared target:
+`fixed-roster-guest.ImAzBc/{export,guest-constructor-final}.log` and `fixture/`.
+The fixture is exported by `sac6_fixed_roster_binds_directory_certificates_and_restore`
+using `AUTHORITY_FIXED_ROSTER_FIXTURE`; the ignored core test
+`compiled_authority_fixed_roster_queries_match_native` consumes that directory
+and `AUTHORITY_CANDIDATE_ELF`. Use a new directory when exporting.
+The first guest-test compile had a test-only empty-row container mismatch; the
+first constructor run had an incorrect query-persistence expectation. Both were
+corrected without changing execution or policy validation. Durable candidate
+installation/mutation, file recovery and multi-node quorum remain unqualified.
 The candidate Authority node-table header now supports exactly one or three
 bootstrap certificates in canonical node order. Materialization writes the whole
 seed inside the existing row transaction; an occupied namespace refuses it, and

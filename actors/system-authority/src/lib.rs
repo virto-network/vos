@@ -10729,6 +10729,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reopened.state, actor.state);
+        if let Ok(directory) = std::env::var("AUTHORITY_FIXED_ROSTER_FIXTURE") {
+            let directory = std::path::Path::new(&directory);
+            std::fs::create_dir(directory).expect("new fixed-roster fixture directory");
+            std::fs::write(directory.join("configuration"), &encoded).unwrap();
+            std::fs::write(directory.join("linear"), &linear).unwrap();
+            for seed in [0x31, 0x32, 0x33] {
+                let node =
+                    signed_node_enrollment(SpaceId(config.space), ADMIN_PRINCIPAL, seed).node;
+                let query = ssh_projection_query(
+                    config,
+                    &signing(0x21),
+                    node,
+                    &signing(seed),
+                    seed,
+                    AuthorityProjectionSelector::Inventory {
+                        after: None,
+                        limit: 64,
+                        known_head: None,
+                    },
+                );
+                let bytes = query.encode().unwrap();
+                let reply = inventory_projection_page(&config, &actor.state, &bytes);
+                let page = AuthorityInventoryProjectionPage::decode(&reply).unwrap();
+                page.validate_shape().unwrap();
+                assert!(!page.unchanged);
+                std::fs::write(directory.join(std::format!("query-{seed}")), bytes).unwrap();
+                std::fs::write(directory.join(std::format!("reply-{seed}")), reply).unwrap();
+            }
+        }
         let mut changed = config;
         changed
             .bootstrap_additional_nodes
