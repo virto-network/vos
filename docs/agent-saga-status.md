@@ -5,6 +5,32 @@ supersedes the previous all-capabilities release mandate. A review checkpoint
 is not a release. Full-saga ambitions remain a deferred backlog, not permission
 to expand these batches.
 
+## Immediate integration checkpoint
+
+Implementation checkpoint `fdb6ad2d` bundles the reproduced signed-expiry
+runtime/Authority set and fixes runtime authentication before directory execution.
+`saga/agents` is still at `65f35760`; it has not received this implementation batch.
+Pinned-source reproduction, 18 release-verifier tests, 35 driver tests and the
+bundled staged-expiry recovery test pass. All 21 Local-host regressions pass
+(40.85 s). The default CLI unit suite passes with loopback access: 295 passed,
+38 ignored (53.31 s); the sandboxed attempt had 16 socket-permission failures,
+not passing network evidence. Logs in the shared build root:
+`target/shared-expiry-repinned-local-host.log` and
+`target/shared-expiry-repinned-vosx-loopback.log`.
+Bundled mixed-generation recovery is running in
+`target/shared-expiry-bundled-mixed.log`; do not count its earlier candidate result
+as this run. The detailed entries below are historical evidence unless they
+explicitly describe an open gate; current artifact pins are listed at the end.
+
+After qualification, the next implementation milestone is the authenticated
+Shared customer workflow, not another performance cache or storage format:
+resolve the fixed three-node system bootstrap/join path, carry Shared lifecycle
+orchestration through the production owner and public CLI, and attach the
+external-state executor to Shared Clerk publication/replay. These are required
+integration gaps, not optional tuning. Keep Local image-based and public Shared
+management disabled until the corresponding recovery/admission path is proved.
+Measure the integrated Clerk path before spending the remaining tuning pass.
+
 ## Customer release scope and implementation order
 
 Supported target: Linux, a fixed authenticated three-node deployment with
@@ -477,10 +503,11 @@ does not execute the next Install. This is owner-reopen/staged-file evidence,
 not process-kill, power-loss, public ingress or three-node qualification.
 The final result is in `target/shared-install-successive-file-evidence.log`; other logs use
 `target/shared-install-handoff-*` and `target/shared-install-successive-file*`.
-Other open gates are receipt expiry before application, mixed pending
-continuations, remaining write/retirement interruption
-boundaries and roots already advanced by the old failing startup. Public Shared
-management remains disabled; bundled artifacts are unchanged.
+At that checkpoint the open gates included receipt expiry before application,
+mixed pending continuations, remaining write/retirement interruption boundaries
+and roots already advanced by the old failing startup. The subsequent expiry
+qualification and bundle update below supersede its unchanged-artifact status;
+public Shared management remains disabled.
 
 Receipt-expiry admission was a source-confirmed gap. The initial 73.92-second
 owner test was insufficient evidence: its fixture issued approval before retaining
@@ -515,7 +542,7 @@ installing an actor, rejects substituted signatures/profiles, and survives state
 reload. The issuer suite passes (21 tests), SDK suite passes (251, one ignored),
 Authority suite passes (78, two ignored), and default `vosx` check passes. These
 are native contract/recovery tests, not physical expiry qualification.
-This is not yet a production fix: bundled guests are unchanged. Remaining expiry
+At this native-only checkpoint bundled guests were unchanged. Remaining expiry
 gates are remaining interruption/mixed-pending cases and release-artifact
 reproduction and cutover. The staged receipt/finality file case below now passes.
 Keep generic errors and
@@ -3054,10 +3081,13 @@ runtime dispatch or qualifies production retained-result semantics.
 ## Artifact and test boundaries
 
 `support/production-artifacts.toml` and `vosx/build.rs` own the exact pins.
-Runtime source `2ccfacb82089f804dbdbfea7ebfcabf377e7dde3`, ABI r19;
-template source `c5e751e7bc7992782bf7403f73b254c64e5c26c6`;
-builder `3c5e44c769d4cc16c1c13a9949c60a154f378a57`.
-No artifact changes are part of this capacity investigation.
+Runtime source, system-template source and template builder now use
+`7316e52ddd98b083941ead6dd3ca5ba18b2e1a2c` (bundled at `fdb6ad2d`).
+The image-runtime ABI remains r19; the experimental external-state ABI is not
+silently enabled. Runtime/Authority/Catalog artifacts changed for authenticated
+Install expiry; immutable-source reproduction passed for all three. Service,
+registry and Clerk pins are unchanged. Earlier unchanged-artifact statements
+describe their respective historical checkpoints, not the current bundle.
 
 Use `cargo +nightly-2025-05-09`, offline/locked, with disk-backed
 `CARGO_TARGET_DIR=.worktrees/ch08-c2-native/target` and its `task-tmp`
