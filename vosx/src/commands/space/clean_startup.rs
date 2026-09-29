@@ -371,6 +371,7 @@ fn open_clean_system_lifecycle_with_inputs(
         bootstrap_node_transport_peer_id: enrollment.transport_peer_id,
         bootstrap_node_encryption_public_key: enrollment.encryption_public_key,
         bootstrap_node_transport_signature: enrollment.transport_signature,
+        bootstrap_additional_nodes: None,
     };
     if !authority_configuration.is_valid() {
         anyhow::bail!("derived system-authority configuration is invalid");

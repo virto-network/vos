@@ -236,7 +236,42 @@ pub struct SystemAuthorityConfiguration {
     pub bootstrap_node_transport_peer_id: [u8; ED25519_TRANSPORT_PEER_ID_BYTES],
     pub bootstrap_node_encryption_public_key: [u8; 32],
     pub bootstrap_node_transport_signature: [u8; PRIVATE_SIGNATURE_BYTES],
+    /// Two additional founding-owner nodes for the fixed three-voter profile.
+    /// Absent preserves the exact SAC5 singleton constructor representation.
+    pub bootstrap_additional_nodes: Option<[AuthorityBootstrapNode; 2]>,
 }
+
+#[derive(
+    vos::rkyv::Archive,
+    vos::rkyv::Serialize,
+    vos::rkyv::Deserialize,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct AuthorityBootstrapNode {
+    pub transport_public_key: [u8; 32],
+    pub encryption_public_key: [u8; 32],
+    pub transport_signature: [u8; PRIVATE_SIGNATURE_BYTES],
+}
+
+impl AuthorityBootstrapNode {
+    fn enrollment(self, space: SpaceId, principal: PrincipalId) -> NodeEncryptionEnrollment {
+        NodeEncryptionEnrollment::from_keys(
+            space,
+            principal,
+            self.transport_public_key,
+            self.encryption_public_key,
+            self.transport_signature,
+        )
+    }
+}
+
+const FIXED_ROSTER_CONFIGURATION_MAGIC: [u8; 4] = *b"SAC6";
+const FIXED_ROSTER_CONFIG_BYTES: usize = CONFIG_ENCODED_BYTES + 2 * (64 + PRIVATE_SIGNATURE_BYTES);
 
 impl Default for SystemAuthorityConfiguration {
     fn default() -> Self {
@@ -263,11 +298,39 @@ impl Default for SystemAuthorityConfiguration {
             bootstrap_node_transport_peer_id: [0; ED25519_TRANSPORT_PEER_ID_BYTES],
             bootstrap_node_encryption_public_key: [0; 32],
             bootstrap_node_transport_signature: [0; PRIVATE_SIGNATURE_BYTES],
+            bootstrap_additional_nodes: None,
         }
     }
 }
 
 impl SystemAuthorityConfiguration {
+    fn founding_replica_principal(&self, node: [u8; 32]) -> Option<[u8; 32]> {
+        if node == self.bootstrap_node {
+            return Some(self.bootstrap_replica_principal);
+        }
+        self.bootstrap_additional_nodes
+            .as_ref()?
+            .iter()
+            .find(|entry| {
+                entry
+                    .enrollment(SpaceId(self.space), PrincipalId(self.bootstrap_principal))
+                    .node
+                    .0
+                    == node
+            })
+            .map(|entry| PrincipalId::of_public_key(&entry.transport_public_key).0)
+    }
+    fn bootstrap_enrollments(&self) -> Vec<NodeEncryptionEnrollment> {
+        let mut nodes = vec![self.bootstrap_node_enrollment()];
+        if let Some(additional) = self.bootstrap_additional_nodes {
+            nodes.extend(additional.map(|node| {
+                node.enrollment(SpaceId(self.space), PrincipalId(self.bootstrap_principal))
+            }));
+        }
+        nodes.sort_by_key(|node| node.node);
+        nodes
+    }
+
     fn bootstrap_node_enrollment(self) -> NodeEncryptionEnrollment {
         NodeEncryptionEnrollment {
             space: SpaceId(self.space),
@@ -282,6 +345,16 @@ impl SystemAuthorityConfiguration {
 
     pub fn is_valid(self) -> bool {
         self.space != [0; 32]
+            && self.bootstrap_additional_nodes.is_none_or(|additional| {
+                let nodes = additional.map(|node| {
+                    node.enrollment(SpaceId(self.space), PrincipalId(self.bootstrap_principal))
+                });
+                nodes[0].node < nodes[1].node
+                    && nodes.iter().all(|node| {
+                        node.node.0 != self.bootstrap_node
+                            && node.verify_with(&Ed25519CredentialVerifier)
+                    })
+            })
             && self.system_agent != [0; 32]
             && self.system_runtime_deployment != [0; 32]
             && self.system_runtime_program != [0; 32]
@@ -314,7 +387,11 @@ impl SystemAuthorityConfiguration {
     /// One exact clean-generation installation-data representation.
     pub fn encode(self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(CONFIG_ENCODED_BYTES);
-        bytes.extend_from_slice(&SYSTEM_AUTHORITY_CONFIGURATION_MAGIC);
+        bytes.extend_from_slice(&if self.bootstrap_additional_nodes.is_some() {
+            FIXED_ROSTER_CONFIGURATION_MAGIC
+        } else {
+            SYSTEM_AUTHORITY_CONFIGURATION_MAGIC
+        });
         bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
         bytes.extend_from_slice(&self.space);
         bytes.extend_from_slice(&self.system_agent);
@@ -343,14 +420,23 @@ impl SystemAuthorityConfiguration {
         bytes.extend_from_slice(&self.bootstrap_node_transport_peer_id);
         bytes.extend_from_slice(&self.bootstrap_node_encryption_public_key);
         bytes.extend_from_slice(&self.bootstrap_node_transport_signature);
+        if let Some(additional) = self.bootstrap_additional_nodes {
+            for node in additional {
+                bytes.extend_from_slice(&node.transport_public_key);
+                bytes.extend_from_slice(&node.encryption_public_key);
+                bytes.extend_from_slice(&node.transport_signature);
+            }
+        }
         bytes
     }
 
-    /// Decode SAC5 exactly. Prior clean generations, truncation, and trailing
-    /// data are all rejected; there is no legacy constructor fallback.
+    /// Decode exact SAC5 singleton or SAC6 fixed-three-node constructors.
+    /// Prior generations, truncation, and trailing data are rejected.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != CONFIG_ENCODED_BYTES
-            || bytes.get(..4) != Some(SYSTEM_AUTHORITY_CONFIGURATION_MAGIC.as_slice())
+        let fixed_roster = bytes.get(..4) == Some(FIXED_ROSTER_CONFIGURATION_MAGIC.as_slice());
+        if !(fixed_roster && bytes.len() == FIXED_ROSTER_CONFIG_BYTES
+            || bytes.get(..4) == Some(SYSTEM_AUTHORITY_CONFIGURATION_MAGIC.as_slice())
+                && bytes.len() == CONFIG_ENCODED_BYTES)
             || bytes.get(4..36) != Some(RUNTIME_ABI_ID.as_bytes().as_slice())
         {
             return None;
@@ -392,6 +478,18 @@ impl SystemAuthorityConfiguration {
         let bootstrap_node_transport_peer_id = take_array(bytes, &mut cursor)?;
         let bootstrap_node_encryption_public_key = take_fixed(bytes, &mut cursor)?;
         let bootstrap_node_transport_signature = take_array(bytes, &mut cursor)?;
+        let bootstrap_additional_nodes = if fixed_roster {
+            let mut take_node = || {
+                Some(AuthorityBootstrapNode {
+                    transport_public_key: take_fixed(bytes, &mut cursor)?,
+                    encryption_public_key: take_fixed(bytes, &mut cursor)?,
+                    transport_signature: take_array(bytes, &mut cursor)?,
+                })
+            };
+            Some([take_node()?, take_node()?])
+        } else {
+            None
+        };
         if cursor != bytes.len() {
             return None;
         }
@@ -420,6 +518,7 @@ impl SystemAuthorityConfiguration {
             bootstrap_node_transport_peer_id,
             bootstrap_node_encryption_public_key,
             bootstrap_node_transport_signature,
+            bootstrap_additional_nodes,
         };
         value.is_valid().then_some(value)
     }
@@ -857,11 +956,15 @@ fn root_managed_agent(config: SystemAuthorityConfiguration) -> ManagedAgentRow {
         runtime_package: config.system_runtime_package,
         runtime_contract: RuntimeContractRow::from_sdk(RuntimePackageContract::canonical()),
         capabilities: RuntimeCapabilitiesRow::from_sdk(RuntimeCapabilities::standard()),
-        replicas: vec![ManagedReplicaRow {
-            node: config.bootstrap_node,
-            principal: config.bootstrap_replica_principal,
-            role: ReplicaRole::Voter as u8,
-        }],
+        replicas: config
+            .bootstrap_enrollments()
+            .iter()
+            .map(|node| ManagedReplicaRow {
+                node: node.node.0,
+                principal: PrincipalId::of_public_key(&node.transport_public_key).0,
+                role: ReplicaRole::Voter as u8,
+            })
+            .collect(),
         replica_generation: [0; 32],
     };
     row.replica_generation = managed_replica_generation(&config, &row)
@@ -1284,9 +1387,14 @@ impl AuthorityLinearState {
             operation_request_high_water: 0,
             admin_request_high_water: 0,
         });
-        let nodes = node_storage::NodeTable::pending_bootstrap(NodeOwnerRow::from_enrollment(
-            config.bootstrap_node_enrollment(),
-        ));
+        let nodes = node_storage::NodeTable::pending_bootstrap_roster(
+            config
+                .bootstrap_enrollments()
+                .into_iter()
+                .map(NodeOwnerRow::from_enrollment)
+                .collect(),
+        )
+        .expect("validated bootstrap roster");
         let mut roles = Vec::with_capacity(1);
         roles.push(PrincipalRoleRow {
             principal: config.bootstrap_principal,
@@ -3122,7 +3230,7 @@ fn node_is_in_use(
     state: &AuthorityLinearState,
     node: vos::agent_sdk::NodeId,
 ) -> bool {
-    if node.0 == configuration.bootstrap_node
+    if configuration.founding_replica_principal(node.0).is_some()
         || state.managed_agents.iter().any(|managed| {
             managed
                 .replicas
@@ -6481,14 +6589,15 @@ fn managed_agent_projection_is_valid(
                 || replica.sdk().is_none()
                 || enrolled_node_owner(state, vos::agent_sdk::NodeId(replica.node)).is_none_or(
                     |owner| {
-                        if row.agent == configuration.system_agent
-                            && replica.node == configuration.bootstrap_node
+                        if let Some(principal) = (row.agent == configuration.system_agent)
+                            .then(|| configuration.founding_replica_principal(replica.node))
+                            .flatten()
                         {
                             // The founding operator owns and enrolls the Node,
                             // while the physical replica principal is bound to
                             // that Node's authenticated transport key.
                             owner.0 != configuration.bootstrap_principal
-                                || replica.principal != configuration.bootstrap_replica_principal
+                                || replica.principal != principal
                         } else {
                             owner.0 != replica.principal
                         }
@@ -8962,6 +9071,7 @@ mod tests {
             bootstrap_node_transport_peer_id: bootstrap_enrollment.transport_peer_id,
             bootstrap_node_encryption_public_key: bootstrap_enrollment.encryption_public_key,
             bootstrap_node_transport_signature: bootstrap_enrollment.transport_signature,
+            bootstrap_additional_nodes: None,
         }
     }
 
@@ -10500,6 +10610,102 @@ mod tests {
         assert_eq!(approval.authorization_sequence.get(), 3);
         assert!(dispatch_application_ack(actor, &call, &approval));
         install
+    }
+
+    #[test]
+    fn sac6_fixed_roster_binds_directory_certificates_and_restore() {
+        use vos::Actor;
+        vos::storage::mock::reset();
+        let mut config = configuration();
+        let mut extra = [0x32, 0x33]
+            .map(|seed| signed_node_enrollment(SpaceId(config.space), ADMIN_PRINCIPAL, seed));
+        extra.sort_by_key(|node| node.node);
+        config.bootstrap_additional_nodes = Some(extra.map(|node| AuthorityBootstrapNode {
+            transport_public_key: node.transport_public_key,
+            encryption_public_key: node.encryption_public_key,
+            transport_signature: node.transport_signature,
+        }));
+        assert!(config.is_valid());
+        let encoded = config.encode();
+        assert_eq!(encoded.len(), FIXED_ROSTER_CONFIG_BYTES);
+        assert_eq!(&encoded[..4], b"SAC6");
+        assert_eq!(SystemAuthorityConfiguration::decode(&encoded), Some(config));
+        let actor =
+            <SystemAuthority as Actor>::__load_agent_state(Some(&encoded), None, None, None)
+                .unwrap();
+        assert!(authority_state_is_valid(&config, &actor.state));
+        assert_eq!(actor.state.managed_agents[0].replicas.len(), 3);
+        assert_eq!(actor.state.nodes.len(), 3);
+        for index in 0..3 {
+            let mut changed = actor.state.managed_agents[0].clone();
+            changed.replicas[index].principal = [0xee; 32];
+            changed.replica_generation = managed_replica_generation(&config, &changed).unwrap().0;
+            assert!(!managed_agent_projection_is_valid(
+                &config,
+                &actor.state,
+                &changed
+            ));
+        }
+        for node in config.bootstrap_enrollments() {
+            assert_eq!(
+                enrolled_node(&actor.state, node.node),
+                Some(NodeOwnerRow::from_enrollment(node.clone()))
+            );
+            assert!(node_is_in_use(&config, &actor.state, node.node));
+            assert!(
+                actor.state.managed_agents[0]
+                    .replicas
+                    .iter()
+                    .any(|replica| replica.node == node.node.0
+                        && replica.principal
+                            == PrincipalId::of_public_key(&node.transport_public_key).0)
+            );
+        }
+        let linear = actor.__save_agent_lane(vos::agent::StateLane::Linear);
+        let reopened = <SystemAuthority as Actor>::__load_agent_state(
+            Some(&encoded),
+            Some(&linear),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(reopened.state, actor.state);
+        let mut changed = config;
+        changed
+            .bootstrap_additional_nodes
+            .as_mut()
+            .unwrap()
+            .swap(0, 1);
+        assert!(!changed.is_valid());
+        assert!(SystemAuthorityConfiguration::decode(&changed.encode()).is_none());
+        changed = config;
+        changed.bootstrap_additional_nodes.as_mut().unwrap()[0].transport_signature[0] ^= 1;
+        assert!(!changed.is_valid());
+        let foreign = signed_node_enrollment(SpaceId([0xf1; 32]), ADMIN_PRINCIPAL, 0x32);
+        changed = config;
+        changed.bootstrap_additional_nodes.as_mut().unwrap()[0] = AuthorityBootstrapNode {
+            transport_public_key: foreign.transport_public_key,
+            encryption_public_key: foreign.encryption_public_key,
+            transport_signature: foreign.transport_signature,
+        };
+        assert!(!changed.is_valid());
+        changed = config;
+        changed.bootstrap_additional_nodes.as_mut().unwrap()[0] = AuthorityBootstrapNode {
+            transport_public_key: config.bootstrap_node_transport_public_key,
+            encryption_public_key: config.bootstrap_node_encryption_public_key,
+            transport_signature: config.bootstrap_node_transport_signature,
+        };
+        assert!(!changed.is_valid());
+        for len in [CONFIG_ENCODED_BYTES, encoded.len() - 1] {
+            assert!(SystemAuthorityConfiguration::decode(&encoded[..len]).is_none());
+        }
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(SystemAuthorityConfiguration::decode(&trailing).is_none());
+        let mut wrong_tag = encoded;
+        wrong_tag[..4].copy_from_slice(b"SAC5");
+        assert!(SystemAuthorityConfiguration::decode(&wrong_tag).is_none());
+        vos::storage::mock::reset();
     }
 
     #[test]

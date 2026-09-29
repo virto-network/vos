@@ -92,12 +92,22 @@ Singleton factory/exact restart passes (1.92 s), and both before/after-every-pha
 restart tests pass (7.60 s). These are existing singleton fixtures, not network
 quorum evidence.
 
-The owner and released startup remain explicitly singleton-only. The next
-concrete blocker is `SystemAuthorityConfiguration`: it encodes one bootstrap
-node/enrollment, and `root_managed_agent` seeds one replica. Extend that bounded,
-authenticated configuration and its directory projection to the common fixed
-roster, then qualify real actor installation, file ownership and
-quorum/startup/restart before exposing configuration.
+The owner and released startup remain explicitly singleton-only. The candidate
+Authority now accepts an exact SAC6 three-node constructor alongside unchanged
+SAC5 singleton bytes. The additional two nodes have transport-signed enrollments
+bound to the founding owner and Space; their node/replica identities are derived
+from the transport keys. Reject duplicates, reversed additional-node order,
+wrong-Space signatures and nonexact encodings. The selected bootstrap origin
+remains explicit, while the combined replica/certificate roster is node-sorted.
+Managed-Agent validation preserves the founding-owner versus transport-principal
+distinction for every founding replica. The generated host actor loader initializes
+all three rows and restores the same state. The full host suite passes: 80 passed,
+2 ignored (31.38 s), `target/authority-sac6-host-suite.log`; default `vosx` check
+passes (19.86 s), `target/authority-sac6-vosx-check.log`.
+Next bind this constructor roster to the root-certified descriptor in startup
+orchestration, then qualify real actor installation, file ownership and
+quorum/startup/restart before exposing configuration. Host tests do not prove
+candidate guest execution or its stack/resource bounds.
 The candidate Authority node-table header now supports exactly one or three
 bootstrap certificates in canonical node order. Materialization writes the whole
 seed inside the existing row transaction; an occupied namespace refuses it, and
@@ -112,10 +122,9 @@ it was updated to assert the new version. These are host tests, not physical-PVM
 or three-node qualification.
 This changes the candidate state schema to 21 and integrity domain to v18;
 bundled artifacts are unchanged, and no schema-20 migration is implemented.
-The production configuration still constructs a singleton seed. Integration must
-wire the validated fixed roster through configuration, managed-Agent projection
-and certificate seeds together, then qualify the actual guest. Preserve singleton
-operation and reject incomplete or differently ordered rosters before admission.
+Released startup still supplies no additional nodes and uses existing bundles.
+No candidate artifacts are activated by the constructor change. Qualify the actual
+guest before repinning packages or removing the owner startup gate.
 Preserve exact roster, credential-node, package and receipt checks; do not
 replace them with index-zero assumptions or permissive finality. Do not claim
 that node-independent replay commitments alone establish a deployable cluster.
