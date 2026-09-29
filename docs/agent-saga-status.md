@@ -477,8 +477,8 @@ does not execute the next Install. This is owner-reopen/staged-file evidence,
 not process-kill, power-loss, public ingress or three-node qualification.
 The final result is in `target/shared-install-successive-file-evidence.log`; other logs use
 `target/shared-install-handoff-*` and `target/shared-install-successive-file*`.
-Other open gates are receipt expiry before application, Authority-denial
-retirement, mixed pending continuations, remaining write/retirement interruption
+Other open gates are receipt expiry before application, successor handoff after
+Authority denial, mixed pending continuations, remaining write/retirement interruption
 boundaries and roots already advanced by the old failing startup. Public Shared
 management remains disabled; bundled artifacts are unchanged.
 
@@ -504,12 +504,32 @@ It never reconstructs a missing retained package after application. Controller
 startup now uses this helper; production file-owner interruption qualification
 is still required before public dispatch.
 
-Continuation recovery must also handle an Authority refusal before receipt
-issuance, separately from an applied Install rejection: the current generic
-denial coordinator requires an initial Create/absent generation. Do not reuse
-that absence proof for Install on an existing generation or treat a refused
-authorization as MAF1. Include this boundary with pending authorization,
-application, finalization and retirement restart tests before enabling ingress.
+Continuation recovery now retires an Authority refusal before receipt issuance,
+separately from an applied Install rejection. Shared Install uses the exact
+authorization replay and positive ACK helpers, but requires an untouched prior
+finalized issuer checkpoint, no pending approval, no receipt and no application.
+It does not reuse Create's whole-generation absence proof. The signed CND1
+marker must persist before the reservation is released; a refusal is not MAF1.
+Completed denials reopen without restoring a pending reservation, and exact
+internal completion retries return ScopeMismatch without executing again.
+The production file-owner policy-denial test passed (217.37 s), preserving
+issuer bytes and the ordinary journal across restart; a fresh Authority read
+proves reservation release. Five Local denial tests, the unissued-approval
+guard and two Shared Create denial tests pass (one outer-PVM test ignored).
+The staged CND1 publication regression also passes (216.13 s), as does the
+interrupted receipt regression (224.81 s); receipt storage errors stay retryable,
+not reclassified as policy refusals. Pending-authorization denial recovery also
+passes (172.26 s): startup executes and retires the refused authorization before
+ordinary recovery reads. Five controller tests, the default `vosx` build,
+formatting and diff checks pass. Filesystem stores: 79 passed, one ignored, with
+the socket-dependent HTTP retry test explicitly excluded. These are physical
+outer-PVM/production-owner reopen tests, not process-kill or three-node evidence.
+Logs: `target/shared-install-denial-*` in the shared disk-backed build root.
+Still open before ingress: return a distinct authenticated public denial response
+and admit the next Install after a denied request. The existing successor
+handoff only handles finalized application terminals; it must preserve denial
+evidence before replacing a denied intent. These are not release-qualified
+public management paths, and bundled artifacts remain unchanged.
 
 Signed Install failure finality now supports Local and Shared, retaining exact
 call/profile/receipt bindings and rejecting Private. Generic intent, issuer and

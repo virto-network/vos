@@ -850,12 +850,19 @@ where
                 .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
             if recovery.management_pending.len() == 1 {
                 if observed.is_none() {
-                    owner.issue_management_intent_with_admission(
-                        slot, managed, issuer, signer, true,
-                    )?;
+                    if let Err(error) = owner
+                        .issue_management_intent_with_admission(slot, managed, issuer, signer, true)
+                    {
+                        if error != SharedAgentHostError::ScopeMismatch
+                            || !owner.finish_denied_shared_install(slot, issuer, signer)?
+                        {
+                            return Err(error);
+                        }
+                        recovery.management_pending.clear();
+                    }
                 }
-                // Keep the reservation until generation verification and
-                // physical application yield a replay-proved signed outcome.
+                // Approved work keeps its reservation until generation
+                // verification and physical application prove a signed outcome.
                 continue;
             }
             let (_, terminal) = observed.ok_or(SharedAgentHostError::ScopeMismatch)?;
@@ -951,6 +958,12 @@ where
             let Some(slot) = entry.management_intent.as_ref() else {
                 continue;
             };
+            if slot
+                .denial_complete()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            {
+                continue;
+            }
             let Some(anchor) = slot
                 .authorization_anchor()
                 .map_err(|_| SharedAgentHostError::Unavailable)?
@@ -994,12 +1007,32 @@ where
             .management_issuer
             .as_mut()
             .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        if slot
+            .denial_complete()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        {
+            owner.finish_denied_shared_install(slot, issuer, signer)?;
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
         let package = slot
             .load_actor()
             .map_err(|_| SharedAgentHostError::Unavailable)?
             .ok_or(SharedAgentHostError::Unavailable)?;
-        let terminal =
-            owner.complete_shared_install_from_management_intent(slot, &package, issuer, signer)?;
+        let terminal = match owner
+            .complete_shared_install_from_management_intent(slot, &package, issuer, signer)
+        {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                if error == SharedAgentHostError::ScopeMismatch
+                    && owner.finish_denied_shared_install(slot, issuer, signer)?
+                {
+                    recovery.management_pending.clear();
+                    recovery.management_retirements.clear();
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                return Err(error);
+            }
+        };
         recovery.management_pending.clear();
         recovery.management_retirements.clear();
         Ok(terminal)
@@ -1121,9 +1154,6 @@ impl<
                 .creation_handoff_activated()
                 .map_err(|_| SharedAgentHostError::Unavailable)?
                 || !matches!(pending.request(), ManagementRequest::Install(_))
-                || slot
-                    .denial_complete()
-                    .map_err(|_| SharedAgentHostError::Unavailable)?
             {
                 return Err(SharedAgentHostError::Conflict);
             }
@@ -1190,13 +1220,25 @@ impl<
             let retired = slot
                 .retirement_complete()
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
+            let denied = slot
+                .denial_complete()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
             let authorization = slot
                 .authorization_work()
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
             let finalization = slot
                 .finalization_work()
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
-            if (retired && finalized.is_none())
+            if (denied
+                && (retired
+                    || issued.is_some()
+                    || observed.is_some()
+                    || finalized.is_some()
+                    || authorization.is_none()
+                    || finalization.is_some()
+                    || continuation.has_pending_decision()
+                    || continuation.has_pending_application_observation()))
+                || (retired && finalized.is_none())
                 || (finalized.is_some() && finalized != observed)
                 || observed.as_ref().is_some_and(|(receipt, _)| {
                     issued.as_ref() != Some(receipt)
@@ -1237,6 +1279,7 @@ impl<
                 }
             }
             match (authorization, finalization) {
+                (Some(_), None) if denied => {}
                 (None, None)
                     if issued.is_none()
                         && !continuation.has_pending_decision()

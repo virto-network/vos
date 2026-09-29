@@ -138,9 +138,30 @@ fn shared_install_file_owner_recovers_successive_handoffs() {
 #[derive(Clone, Copy)]
 enum InstallFault {
     None,
+    Denial,
+    DenialAuthorization,
+    DenialRetirement,
     Intent(usize),
     Issuer(usize),
     Successive,
+}
+
+#[test]
+#[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
+fn shared_install_file_owner_retires_policy_denial() {
+    check_shared_file_recovery(true, true, InstallFault::Denial);
+}
+
+#[test]
+#[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
+fn shared_install_file_owner_recovers_staged_denial_retirement() {
+    check_shared_file_recovery(true, true, InstallFault::DenialRetirement);
+}
+
+#[test]
+#[ignore = "executes bundled outer PVM with production file stores; use disk-backed TMPDIR"]
+fn shared_install_file_owner_recovers_pending_policy_denial() {
+    check_shared_file_recovery(true, true, InstallFault::DenialAuthorization);
 }
 
 fn check_shared_file_recovery(
@@ -443,7 +464,19 @@ fn check_shared_file_recovery(
         )
         .unwrap();
         let mut install_call = call.clone();
-        install_call.request_sequence = NonZeroU64::new(3).unwrap();
+        install_call.request_sequence = NonZeroU64::new(
+            if matches!(
+                interrupt_install,
+                InstallFault::Denial
+                    | InstallFault::DenialRetirement
+                    | InstallFault::DenialAuthorization
+            ) {
+                99
+            } else {
+                3
+            },
+        )
+        .unwrap();
         install_call.plan = ManagementRequest::Install(Box::new(install.clone()))
             .authorization_plan()
             .unwrap();
@@ -579,8 +612,86 @@ fn check_shared_file_recovery(
     if with_handoff {
         use super::super::clean_store::SharedManagementStageFault;
         use vos::agent::clean_authority_issuer::SignedManagementTerminal;
+        if matches!(
+            interrupt_install,
+            InstallFault::Denial
+                | InstallFault::DenialRetirement
+                | InstallFault::DenialAuthorization
+        ) {
+            use std::fs;
+            let issuer_path = lifecycle_root.join("shared-management.issuer");
+            let issuer_before = fs::read(&issuer_path).unwrap();
+            let system_journal = data
+                .join(SHARED_AGENT_HOST_DIRECTORY)
+                .join(format!("{}.agent", hex::encode(authority.system_agent.0)));
+            if matches!(
+                interrupt_install,
+                InstallFault::DenialRetirement | InstallFault::DenialAuthorization
+            ) {
+                // Authorization is the first intent write; CND1 follows the
+                // positive ACK. Interrupt either durable boundary.
+                let write = if matches!(interrupt_install, InstallFault::DenialAuthorization) {
+                    1
+                } else {
+                    2
+                };
+                let fault = SharedManagementStageFault::intent(&lifecycle_root, write);
+                assert_eq!(
+                    lifecycle.complete_shared_install(locator),
+                    Err(SharedAgentHostError::Unavailable)
+                );
+                assert!(fault.fired());
+                assert!(
+                    lifecycle_root
+                        .join("shared-management.intent.next")
+                        .exists()
+                );
+                assert_eq!(journal_files(&journal), applied);
+                assert_eq!(fs::read(&issuer_path).unwrap(), issuer_before);
+                drop(fault);
+                drop(lifecycle);
+                (_, lifecycle) = open();
+                assert!(
+                    !lifecycle_root
+                        .join("shared-management.intent.next")
+                        .exists()
+                );
+            }
+            assert_eq!(
+                lifecycle.complete_shared_install(locator),
+                Err(SharedAgentHostError::ScopeMismatch)
+            );
+            assert_eq!(journal_files(&journal), applied);
+            assert_eq!(fs::read(&issuer_path).unwrap(), issuer_before);
+            let denied_system = journal_files(&system_journal);
+            assert_eq!(
+                lifecycle.complete_shared_install(locator),
+                Err(SharedAgentHostError::ScopeMismatch)
+            );
+            assert_eq!(journal_files(&system_journal), denied_system);
+            drop(lifecycle);
+            let (_, mut lifecycle) = open();
+            let recovered_system = journal_files(&system_journal);
+            assert_eq!(
+                lifecycle.complete_shared_install(locator),
+                Err(SharedAgentHostError::ScopeMismatch)
+            );
+            assert_eq!(journal_files(&system_journal), recovered_system);
+            assert_eq!(journal_files(&journal), applied);
+            assert_eq!(fs::read(&issuer_path).unwrap(), issuer_before);
+            // A fresh Authority read proves the rejected Install released its reservation.
+            assert_eq!(
+                lifecycle.complete_shared_create(locator).unwrap(),
+                acknowledgement
+            );
+            return;
+        }
         let interruption = match interrupt_install {
-            InstallFault::None | InstallFault::Successive => None,
+            InstallFault::None
+            | InstallFault::Successive
+            | InstallFault::Denial
+            | InstallFault::DenialAuthorization
+            | InstallFault::DenialRetirement => None,
             InstallFault::Intent(write) => Some((
                 SharedManagementStageFault::intent(&lifecycle_root, write),
                 "shared-management.intent.next",

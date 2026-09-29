@@ -1688,7 +1688,7 @@ fn bootstrap_root_lineage(
 
 /// Ephemeral evidence of an executed authorization producing no approval.
 /// Only the independently pinned owner can construct it, after fresh replay
-/// and checking that neither issuance nor Local application exists. It is not
+/// under the caller's lifecycle-specific non-application guards. It is not
 /// itself a durable denial marker or permission to release admission.
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 pub(crate) struct VerifiedManagementDenial {
@@ -6482,6 +6482,20 @@ where
         if !absent(managed.agent)? {
             return Err(SharedAgentHostError::Conflict);
         }
+        self.replay_management_denial(slot)
+    }
+
+    /// Replay evidence shared by the separately guarded Create and Install
+    /// denial paths. This does not establish either path's non-application guard.
+    fn replay_management_denial<B: CleanManagementIssuerStore>(
+        &mut self,
+        slot: &super::clean_management_intent::CleanManagementIntentSlot<B>,
+    ) -> Result<Option<VerifiedManagementDenial>, SharedAgentHostError> {
+        let target = self.authority_target();
+        let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
+        intent
+            .verify(target, intent.call().managed, &RawCredentialVerifier)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
         let anchor = slot
             .authorization_anchor()
             .map_err(|_| SharedAgentHostError::Unavailable)?
@@ -6754,48 +6768,70 @@ where
             else {
                 return Ok(false);
             };
-            let RuntimeWork::Invoke {
-                invocation,
-                authorization,
-                ..
-            } = &proof.work
-            else {
-                unreachable!()
-            };
-            let agent = crate::service::AgentId(self.pins.agent.0);
-            if !self
-                .host
-                .lock()
-                .map_err(|_| SharedAgentHostError::Unavailable)?
-                .retained_positive_clean_acknowledgement(agent, invocation, authorization)?
-            {
-                let mut material = self
-                    .supervisor_invocation_material(self.pins.agent, target.binding.issuer.actor)?;
-                material.root_provenance = false;
-                let identity = super::supervisor_adapters::physical_material_identity(&material)
-                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-                let outcome = self
-                    ._network_host
-                    .supervisor_acknowledge_management_denial(identity, &proof)?;
-                if !matches!(outcome, super::sdk::RuntimeOutcome::Acknowledged(Ok(_))) {
-                    return Err(SharedAgentHostError::Unavailable);
-                }
-            }
-            if !self
-                .host
-                .lock()
-                .map_err(|_| SharedAgentHostError::Unavailable)?
-                .retained_positive_clean_acknowledgement(agent, invocation, authorization)?
-            {
-                return Err(SharedAgentHostError::ScopeMismatch);
-            }
+            self.acknowledge_management_denial(&proof)?;
         }
-        // A denial must still have no managed generation after Authority
-        // result acknowledgement, immediately before the durable CND1 marker
-        // and pending-admission release.
+        // Preserve Create's absence check on both sides of acknowledgement.
         if !absent(managed.agent)? {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
+        self.commit_management_denial_retirement(slot, signer, completed)?;
+        Ok(true)
+    }
+
+    fn acknowledge_management_denial(
+        &mut self,
+        proof: &VerifiedManagementDenial,
+    ) -> Result<(), SharedAgentHostError> {
+        let target = self.authority_target();
+        let RuntimeWork::Invoke {
+            invocation,
+            authorization,
+            ..
+        } = &proof.work
+        else {
+            unreachable!()
+        };
+        let agent = crate::service::AgentId(self.pins.agent.0);
+        if !self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .retained_positive_clean_acknowledgement(agent, invocation, authorization)?
+        {
+            let mut material =
+                self.supervisor_invocation_material(self.pins.agent, target.binding.issuer.actor)?;
+            material.root_provenance = false;
+            let identity = super::supervisor_adapters::physical_material_identity(&material)
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            let outcome = self
+                ._network_host
+                .supervisor_acknowledge_management_denial(identity, proof)?;
+            if !matches!(outcome, super::sdk::RuntimeOutcome::Acknowledged(Ok(_))) {
+                return Err(SharedAgentHostError::Unavailable);
+            }
+        }
+        if !self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .retained_positive_clean_acknowledgement(agent, invocation, authorization)?
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        Ok(())
+    }
+
+    fn commit_management_denial_retirement<B, S>(
+        &mut self,
+        slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
+        signer: &mut S,
+        completed: bool,
+    ) -> Result<(), SharedAgentHostError>
+    where
+        B: CleanManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+    {
+        let target = self.authority_target();
         let anchor = slot
             .authorization_anchor()
             .map_err(|_| SharedAgentHostError::Unavailable)?
@@ -6835,6 +6871,71 @@ where
                 Ok(())
             },
         )?;
+        Ok(())
+    }
+
+    /// Retire an exact Shared Install refusal without issuing a receipt or
+    /// claiming that an actor applied. The prior finalized issuer checkpoint
+    /// must remain untouched. A pre-signature pledge is approval, not denial.
+    pub(crate) fn finish_denied_shared_install<B, J, S>(
+        &mut self,
+        slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
+        issuer: &DurableCleanManagementIssuer<J>,
+        signer: &mut S,
+    ) -> Result<bool, SharedAgentHostError>
+    where
+        B: CleanManagementIssuerStore,
+        J: CleanManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+    {
+        let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let target = self.authority_target();
+        let managed = intent.call().managed;
+        intent
+            .verify(target, managed, &RawCredentialVerifier)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if managed.profile != AgentProfile::Shared
+            || managed.agent == self.pins.agent
+            || !matches!(intent.request(), ManagementRequest::Install(_))
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if slot
+            .authorization_work()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .is_none()
+            || slot
+                .finalization_work()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .is_some()
+            || slot
+                .retirement_complete()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            || issuer.has_pending_decision()
+            || issuer.has_pending_application_observation()
+            || issuer.retained_decisions() != 0
+            || !issuer
+                .can_resume_install(
+                    target,
+                    managed,
+                    intent.request(),
+                    intent.call(),
+                    &RawCredentialVerifier,
+                )
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+        {
+            return Ok(false);
+        }
+        let completed = slot
+            .denial_complete()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if !completed {
+            let Some(proof) = self.replay_management_denial(slot)? else {
+                return Ok(false);
+            };
+            self.acknowledge_management_denial(&proof)?;
+        }
+        self.commit_management_denial_retirement(slot, signer, completed)?;
         Ok(true)
     }
 
