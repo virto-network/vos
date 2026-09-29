@@ -1502,7 +1502,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             binding,
             &runtime,
         )?;
-        super::driver::verify_clean_management_receipt(
+        let expiry = super::driver::verify_clean_management_journal_receipt(
             &descriptor,
             request,
             authority,
@@ -1546,6 +1546,18 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
                 .map_err(|_| LocalReplayExecutorError::InvalidRequest)?;
             self.execute_agent_wire(runtime.program_bytes(), self.management_gas, &encoded)?
         };
+        if expiry
+            && (returned.outcome
+                != crate::agent_sdk::RuntimeOutcome::Management(Err(
+                    crate::agent_sdk::ManagementError::ExpiredBeforeApplication,
+                ))
+                || (returned.state.control == before.control
+                    && returned.state.linear == before.linear
+                    && returned.state.merge == before.merge
+                    && returned.state.local == before.local))
+        {
+            return Err(LocalReplayExecutorError::InvalidState);
+        }
         if !super::driver::sdk_management_reply_matches(&descriptor, request, &returned.outcome)
             || returned.state.encoded_len().is_none_or(|bytes| {
                 bytes
@@ -3550,7 +3562,7 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
             {
                 return Err(LocalReplayExecutorError::InvalidState);
             }
-            super::driver::verify_clean_management_receipt(
+            super::driver::verify_clean_management_journal_receipt(
                 &descriptor,
                 request,
                 authority,
@@ -3782,7 +3794,12 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
             return Err(LocalReplayExecutorError::InvalidAuthority);
         }
         let runtime_pvm = authenticated.runtime_pvm;
-        if let ReplayOperation::CleanManage { request, .. } = &input.operation {
+        if let ReplayOperation::CleanManage {
+            request,
+            authority,
+            observed_slot,
+        } = &input.operation
+        {
             if journal_context.is_some() {
                 return Err(LocalReplayExecutorError::InvalidState);
             }
@@ -3806,6 +3823,18 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
             #[cfg(any(not(test), all(test, not(feature = "pvm"))))]
             let returned: crate::agent_sdk::RuntimeTransition =
                 self.execute_agent_wire(&runtime_pvm, self.management_gas, &encoded)?;
+            if *observed_slot > authority.selector.expires_at
+                && (returned.outcome
+                    != crate::agent_sdk::RuntimeOutcome::Management(Err(
+                        crate::agent_sdk::ManagementError::ExpiredBeforeApplication,
+                    ))
+                    || (returned.state.control == before.control
+                        && returned.state.linear == before.linear
+                        && returned.state.merge == before.merge
+                        && returned.state.local == before.local))
+            {
+                return Err(LocalReplayExecutorError::InvalidState);
+            }
             if !super::driver::sdk_management_reply_matches(descriptor, request, &returned.outcome)
                 || returned
                     .state

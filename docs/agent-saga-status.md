@@ -482,20 +482,30 @@ continuations, remaining write/retirement interruption
 boundaries and roots already advanced by the old failing startup. Public Shared
 management remains disabled; bundled artifacts are unchanged.
 
-Receipt-expiry qualification now reproduces the unresolved admission gap:
-an approved Install whose receipt expires before first application fails repeated
-completion without changing either journal or the issuer, but has no terminal
-which can retire its reservation. The owner regression checks that it does not
-mint a policy denial, reissue the receipt or fabricate an application terminal
-(73.92 s with the fixture runtime; full outer-PVM expiry qualification is pending).
+Receipt-expiry admission was a source-confirmed gap. The initial 73.92-second
+owner test was insufficient evidence: its fixture issued approval before retaining
+the actor package, so retries failed the artifact-retention guard before reaching
+expiry admission. The fixture now follows production artifact-before-authorization
+ordering. The candidate host integration now admits authenticated Local/Shared
+Install expiry only on the journal path.
+Preview and replay require the exact expiry outcome and changed durable state;
+ordinary success or an unchanged refusal cannot become an expiry terminal.
+Image-based Local admission retains its original live-window rule. Two native
+filesystem-host tests pass for ordinary rejection and expiry, including reopened
+exact observations and retries after expiry (1.08 s). The host admission test
+and 11 management tests also pass. The corrected owner regression passes
+(75.04 s): ordered expiry produces the exact signed failure, leaves the actor
+directory unchanged, and retries do not move either journal or issuer state.
+It deliberately stops before Authority finalization/retirement; full outer-PVM
+expiry qualification remains pending.
 Do not bypass the clock or widen the issued receipt's window to recover it.
 The candidate standard runtime now has `ExpiredBeforeApplication` (append-only
 management-error wire tag 14). After authenticating the receipt and enforcing
 sequence, epoch, clock and journal-capacity guards, it records only the management
 disposition, without running the Install mutation. Local and Shared runtime tests
 cover forged signatures, unchanged actor state, durable replay and a later valid
-Install. Nine management tests and the SDK suite (251 passed, one ignored) pass,
-along with the default `vosx` build and formatting/diff checks.
+Install. The SDK suite (251 passed, one ignored), default `vosx` build and
+formatting/diff checks pass.
 Candidate signed finality now admits this specific error strictly after receipt
 expiry, authenticating the unchanged receipt at its last valid slot; ordinary
 failures still require a live slot. Issuer recovery preserves the exact result
@@ -505,12 +515,11 @@ installing an actor, rejects substituted signatures/profiles, and survives state
 reload. The issuer suite passes (21 tests), SDK suite passes (251, one ignored),
 Authority suite passes (78, two ignored), and default `vosx` check passes. These
 are native contract/recovery tests, not physical expiry qualification.
-This is not yet a production fix: host receipt admission still rejects expiry,
-and bundled guests are unchanged. Finish by admitting only a proved
-expiry/non-execution outcome at the host and replay boundary, then reproduce
-candidate artifacts and qualify expiry before application plus an already-applied
+This is not yet a production fix: bundled guests are unchanged. Reproduce
+candidate artifacts and qualify finalized/retired expiry before application plus an already-applied
 retry after expiry through the locked filesystem owner. Keep generic errors and
-uncommitted previews ineligible for finality. Logs: `target/shared-install-expiry-*`
+uncommitted previews ineligible for finality. Logs: `target/shared-install-expiry-*`,
+`target/shared-expiry-finality-*` and `target/shared-expiry-host-*`
 in the shared disk-backed build root. This remains inside the existing Shared
 lifecycle gate, not a general cancellation protocol.
 

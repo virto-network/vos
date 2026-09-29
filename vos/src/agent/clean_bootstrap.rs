@@ -26457,7 +26457,7 @@ mod tests {
         }
 
         #[test]
-        fn native_shared_install_expiry_before_application_cannot_mint_terminal() {
+        fn native_shared_install_expiry_before_application_records_exact_failure() {
             check_shared_proposal_and_install_failure(
                 native_bundled_authority_fixture(),
                 true,
@@ -28371,9 +28371,22 @@ mod tests {
                 .unwrap()
                 .fetch_add(1, Ordering::AcqRel);
             if expire_before_install {
-                // Characterize the safety boundary independently of application
-                // failure: a receipt which expires before first execution may
-                // not install, reissue approval, or mint a denial certificate.
+                // Expiry records ordered non-execution, never a policy denial
+                // or renewed permission to install. Authority guest finalization
+                // is qualified separately after rebuilding candidate artifacts.
+                let inspect = crate::agent_sdk::ManagementRequest::InspectActors {
+                    after: None,
+                    limit: crate::agent_sdk::MAX_DIRECTORY_PAGE_ENTRIES as u16,
+                };
+                let actors_before = owner
+                    .host
+                    .lock()
+                    .unwrap()
+                    .inspect_clean_management(locator.agent, &inspect)
+                    .unwrap();
+                // Match production ordering: artifact evidence must exist
+                // before authorization is sealed, not be reconstructed later.
+                install_intent.retain_actor(&ordinary_package).unwrap();
                 let receipt = owner
                     .issue_management_intent_with_admission(
                         &mut install_intent,
@@ -28395,17 +28408,59 @@ mod tests {
                     .journal_position(locator.agent)
                     .unwrap();
                 let system_before = owner.ordered_index_for_test().unwrap();
+                let terminal = owner
+                    .apply_shared_install_from_management_intent(
+                        &mut install_intent,
+                        &ordinary_package,
+                        &mut install_issuer,
+                        &mut install_signer,
+                    )
+                    .unwrap_or_else(|error| {
+                        let observation = owner.host.lock().unwrap().observe_durable_install(
+                            locator.agent, install_intent.intent().unwrap().request(), &receipt);
+                        panic!("expiry application failed: {error:?}; durable observation: {observation:?}");
+                    });
+                let crate::agent::clean_authority_issuer::SignedManagementTerminal::Rejected(
+                    failure,
+                ) = &terminal
+                else {
+                    panic!("expired Install must not apply");
+                };
+                assert_eq!(
+                    failure.error,
+                    crate::agent_sdk::ManagementError::ExpiredBeforeApplication
+                );
+                assert_eq!(failure.receipt, receipt);
+                assert_eq!(failure.failed_at, receipt.selector.expires_at + 1);
+                failure.verify_with(&RawCredentialVerifier).unwrap();
+                let fenced = owner
+                    .host
+                    .lock()
+                    .unwrap()
+                    .journal_position(locator.agent)
+                    .unwrap();
+                assert_ne!(fenced, before);
+                assert_eq!(
+                    owner
+                        .host
+                        .lock()
+                        .unwrap()
+                        .inspect_clean_management(locator.agent, &inspect)
+                        .unwrap(),
+                    actors_before
+                );
                 let issuer_before = install_issuer_store.image.lock().unwrap().clone();
                 for _ in 0..2 {
-                    assert!(
+                    assert_eq!(
                         owner
-                            .complete_shared_install_from_management_intent(
+                            .apply_shared_install_from_management_intent(
                                 &mut install_intent,
                                 &ordinary_package,
                                 &mut install_issuer,
                                 &mut install_signer,
                             )
-                            .is_err()
+                            .unwrap(),
+                        terminal
                     );
                     assert_eq!(
                         owner
@@ -28414,13 +28469,13 @@ mod tests {
                             .unwrap()
                             .journal_position(locator.agent)
                             .unwrap(),
-                        before
+                        fenced
                     );
                     assert_eq!(owner.ordered_index_for_test().unwrap(), system_before);
                     assert_eq!(*install_issuer_store.image.lock().unwrap(), issuer_before);
                     assert!(!install_intent.denial_complete().unwrap());
                     assert!(!install_intent.retirement_complete().unwrap());
-                    assert!(
+                    assert_eq!(
                         install_issuer
                             .recover_observed_terminal(
                                 target,
@@ -28429,8 +28484,8 @@ mod tests {
                                 install_intent.intent().unwrap().call(),
                                 &RawCredentialVerifier
                             )
-                            .unwrap()
-                            .is_none()
+                            .unwrap(),
+                        Some((receipt.clone(), terminal.clone()))
                     );
                     clock.fetch_add(1, Ordering::AcqRel);
                 }

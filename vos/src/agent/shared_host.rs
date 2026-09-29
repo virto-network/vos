@@ -7237,6 +7237,17 @@ mod tests {
     #[test]
     #[cfg(feature = "pvm")]
     fn clean_shared_install_failure_requires_fresh_slot_and_recovers() {
+        check_clean_shared_install_terminal(false);
+    }
+
+    #[test]
+    #[cfg(feature = "pvm")]
+    fn clean_shared_install_expiry_fence_recovers_exact_observation() {
+        check_clean_shared_install_terminal(true);
+    }
+
+    #[cfg(feature = "pvm")]
+    fn check_clean_shared_install_terminal(expired: bool) {
         use super::super::shared_journal_driver::PreparedCleanManagement;
         let runtime = super::super::package_admission::admitted_scripted_runtime_for_test(
             "shared-install-terminal",
@@ -7334,10 +7345,18 @@ mod tests {
         );
         // A distinct signed mutation needs a strictly newer logical slot.
         // Once admitted, the semantic rejection is recorded durably.
-        clock.store(21, Ordering::SeqCst);
-        let expected = crate::agent_sdk::RuntimeOutcome::Management(Err(
-            crate::agent_sdk::ManagementError::AlreadyExists,
-        ));
+        let observed_slot = if expired {
+            receipt.selector.expires_at + 1
+        } else {
+            21
+        };
+        clock.store(observed_slot, Ordering::SeqCst);
+        let error = if expired {
+            crate::agent_sdk::ManagementError::ExpiredBeforeApplication
+        } else {
+            crate::agent_sdk::ManagementError::AlreadyExists
+        };
+        let expected = crate::agent_sdk::RuntimeOutcome::Management(Err(error));
         let prepared = host
             .prepare_clean_management(
                 fixture.agent,
@@ -7355,16 +7374,13 @@ mod tests {
             .unwrap();
         assert_eq!(evidence.authority, receipt.commitment());
         assert_eq!(evidence.request, rejected.replay_commitment());
-        assert_eq!(
-            evidence.result,
-            Err(crate::agent_sdk::ManagementError::AlreadyExists)
-        );
+        assert_eq!(evidence.result, Err(error));
         let observation = host
             .observe_durable_install(fixture.agent, &rejected, &receipt)
             .unwrap();
         assert_eq!(observation.result(), &evidence.result);
         assert_eq!(observation.receipt(), &receipt);
-        assert_eq!(observation.applied_at(), 21);
+        assert_eq!(observation.applied_at(), observed_slot);
         assert!(
             host.observe_durable_install(fixture.agent, &request, &first_receipt)
                 .is_err(),
@@ -7377,7 +7393,7 @@ mod tests {
                 .is_err()
         );
         drop(host);
-        clock.store(40, Ordering::SeqCst);
+        clock.store(receipt.selector.expires_at + 2, Ordering::SeqCst);
         let mut reopened = open_native_clean_host_at_slot(&directory, &fixture, clock);
         assert_eq!(
             reopened

@@ -264,6 +264,37 @@ pub(crate) fn verify_clean_management_receipt(
     Ok(())
 }
 
+/// Journal-only admission for an authenticated expiry fence. The caller must
+/// require an ExpiredBeforeApplication outcome and a changed, durable state
+/// before treating the expired input as an observed terminal. Image admission
+/// deliberately continues to use the live-window verifier above.
+pub(crate) fn verify_clean_management_journal_receipt(
+    descriptor: &crate::agent_sdk::AgentDescriptor,
+    request: &crate::agent_sdk::ManagementRequest,
+    receipt: &crate::agent_sdk::authority::AuthorityReceipt,
+    observed_slot: u64,
+    allow_historical_runtime: bool,
+) -> Result<bool, AgentDriverError> {
+    let expiry = observed_slot > receipt.selector.expires_at
+        && matches!(request, crate::agent_sdk::ManagementRequest::Install(_))
+        && matches!(
+            descriptor.identity.profile,
+            crate::agent_sdk::AgentProfile::Local | crate::agent_sdk::AgentProfile::Shared
+        );
+    verify_clean_management_receipt(
+        descriptor,
+        request,
+        receipt,
+        if expiry {
+            receipt.selector.expires_at
+        } else {
+            observed_slot
+        },
+        allow_historical_runtime,
+    )?;
+    Ok(expiry)
+}
+
 pub(crate) fn validate_sdk_management_artifacts(
     descriptor: &crate::agent_sdk::AgentDescriptor,
     request: &crate::agent_sdk::ManagementRequest,
@@ -6374,6 +6405,93 @@ mod tests {
             signature: [0; 64],
         };
         receipt.signature = signing.sign(&receipt.signing_bytes()).to_bytes();
+
+        // Journal expiry admission is narrower than ordinary authentication:
+        // only Local/Shared Install can enter the non-execution path, and the
+        // unchanged receipt still needs a valid signature and exact binding.
+        let install = super::super::wire::tests::clean_install_request(
+            &descriptor,
+            "expiry-admission",
+            None,
+            0x76,
+            crate::agent_sdk::LaneSet::of(crate::agent_sdk::StateLane::Linear),
+        );
+        let install_request = crate::agent_sdk::ManagementRequest::Install(Box::new(install));
+        let mut install_receipt = receipt.clone();
+        install_receipt.selector.operation = AuthorityOperationKind::InstallActor;
+        install_receipt.selector.runtime_deployment = current_runtime;
+        let (actor, deployment) = clean_management_actor(&install_request).unwrap();
+        install_receipt.selector.actor = Some(actor);
+        install_receipt.selector.actor_deployment = Some(deployment);
+        install_receipt.selector.request = install_request.commitment();
+        install_receipt.signature = signing.sign(&install_receipt.signing_bytes()).to_bytes();
+        for profile in [
+            crate::agent_sdk::AgentProfile::Local,
+            crate::agent_sdk::AgentProfile::Shared,
+        ] {
+            let mut target = descriptor.clone();
+            target.identity.profile = profile;
+            for (slot, expected) in [(1, false), (200, false), (201, true)] {
+                assert_eq!(
+                    verify_clean_management_journal_receipt(
+                        &target,
+                        &install_request,
+                        &install_receipt,
+                        slot,
+                        false
+                    ),
+                    Ok(expected)
+                );
+            }
+            assert!(
+                verify_clean_management_journal_receipt(
+                    &target,
+                    &install_request,
+                    &install_receipt,
+                    0,
+                    false
+                )
+                .is_err()
+            );
+            assert!(
+                verify_clean_management_receipt(
+                    &target,
+                    &install_request,
+                    &install_receipt,
+                    201,
+                    false
+                )
+                .is_err()
+            );
+            let mut forged = install_receipt.clone();
+            forged.signature[0] ^= 1;
+            assert!(
+                verify_clean_management_journal_receipt(
+                    &target,
+                    &install_request,
+                    &forged,
+                    201,
+                    false
+                )
+                .is_err()
+            );
+            assert!(
+                verify_clean_management_journal_receipt(&target, &request, &receipt, 201, true)
+                    .is_err()
+            );
+        }
+        let mut private = descriptor.clone();
+        private.identity.profile = crate::agent_sdk::AgentProfile::Private;
+        assert!(
+            verify_clean_management_journal_receipt(
+                &private,
+                &install_request,
+                &install_receipt,
+                201,
+                false
+            )
+            .is_err()
+        );
 
         let runtime_state = super::super::wire::encode_standard_runtime_state(
             &super::super::standard::StandardRuntimeState {

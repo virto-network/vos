@@ -1249,7 +1249,7 @@ where
         if descriptor.identity.profile != crate::agent_sdk::AgentProfile::Shared {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
-        super::driver::verify_clean_management_receipt(
+        let expiry = super::driver::verify_clean_management_journal_receipt(
             &descriptor,
             request,
             receipt,
@@ -1257,6 +1257,11 @@ where
             false,
         )
         .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        if expiry
+            && evidence.result != Err(crate::agent_sdk::ManagementError::ExpiredBeforeApplication)
+        {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
         // The authenticated Ordered entry binds execution and its state roots.
         // Its identity survives subsequent application work and checkpointing;
         // hashing today's full runtime state would manufacture a different ACK
