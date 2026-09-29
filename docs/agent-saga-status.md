@@ -228,10 +228,41 @@ Earlier red diagnostics are retained under `fixed-system-pending-election-*`;
 they are not qualification. Explicit loopback mesh retry separates connection
 failure from election failure. These tests use the bundled outer runtime but
 scripted Authority/Catalog packages, not the complete candidate system actors.
-Next: execute ordered bootstrap on the elected leader and authenticate follower
-catch-up/restart without duplicate policy mutations. Public orchestration, real
-three-node actor bootstrap, production-store crash recovery and backup remain
-open; this attachment test does not establish any of those gates or throughput.
+That election-only test does not qualify actor bootstrap or throughput.
+
+The next physical regression now drives the elected leader through the complete
+bootstrap phase machine with the actual candidate Authority, signed SAC6 roster,
+bundled outer runtime and three authenticated loopback/file-journal replicas.
+Both followers apply the same final runtime commitment and contain both installed
+actors (15.81 s, `target/fixed-system-candidate-cluster-retry.log`). Catalog remains
+a scripted fixture, and bootstrap/issuer metadata stores remain in-memory; this is
+not released three-node startup or a production-store crash test.
+The regression exposed a proposer-only Merge-seal dependency: management prepared
+the seal locally but its committed command carried only the seal hash. Followers
+now reconstruct a missing clean-management seal only from the exact authenticated
+current genesis/runtime/ordered base/frontier, requiring the resulting seal hash
+to match before any dependency write. Divergent Merge frontiers still fail closed;
+general missing Merge-history acquisition is not implemented by this fix.
+A separate filesystem regression passes successful follower application and
+rejects substituted seal/frontier hashes without advancing journal state
+(`target/fixed-system-seal-negative.log`). No actor authorization is bypassed.
+The cluster run also records two committed-result waits exceeding the unchanged
+1.8-second bound. Pending-owner exact retry completes them; increasing that timeout
+is not the fix or performance qualification. Keep this latency in the customer-path
+measurement backlog. Earlier constructor/clock-fixture and missing-seal failures
+remain recorded in `target/fixed-system-candidate-cluster-*.log`.
+The final candidate cluster rerun passes (18.23 s), as does the candidate singleton
+bootstrap/file-journal reopen with the actual outer PVM (20.71 s):
+`target/fixed-system-seal-candidate_authority_fixed_system_leader_bootstrap.log`
+and `target/fixed-system-seal-candidate_authority_real_bootstrap_reopens_file_journal.log`.
+The `std`-only library check passes (3.25 s),
+`target/fixed-system-seal-std-check.log`. The complete Shared-host regression run
+is not yet counted as passing: its near-ceiling raw-tail attachment test is still
+running (`target/fixed-system-seal-host-regressions.log`).
+Next: authenticate follower lifecycle catch-up/restart without repeating completed
+policy mutations. Followers currently retain their pre-bootstrap metadata and do
+not expose serving owners merely because physical state matches. Public cluster
+orchestration, production-store crash recovery and backup remain open.
 The current full Authority host suite passes: 81 passed, 2 ignored (30.76 s),
 `fixed-roster-guest.ImAzBc/mutation-host-suite.log`.
 The candidate Authority node-table header now supports exactly one or three

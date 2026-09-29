@@ -2476,11 +2476,16 @@ where
     fn stage_current_merge_seal(
         &mut self,
     ) -> Result<super::journal::MergeSealId, SharedJournalDriverError> {
+        self.stage_current_merge_seal_matching(None)
+    }
+
+    fn stage_current_merge_seal_matching(
+        &mut self,
+        expected: Option<super::journal::MergeSealId>,
+    ) -> Result<super::journal::MergeSealId, SharedJournalDriverError> {
         let heads = self.materialization.heads().clone();
         let merge_state = self.materialization.state().merge.clone();
         let state = BlobRef::of_bytes(&merge_state);
-        self.store
-            .put_blob(JournalBlobClass::LaneState, &state, &merge_state)?;
         let manifest = super::journal::LaneStateManifest {
             #[cfg(feature = "experimental-state-blocks")]
             external_root: None,
@@ -2490,9 +2495,8 @@ where
             cursor: super::journal::LaneCursor::Merge {
                 frontier: heads.merge_frontier,
             },
-            state,
+            state: state.clone(),
         };
-        self.store.put(&manifest)?;
         let seal = super::journal::MergeSeal {
             genesis: heads.genesis,
             frontier: heads.merge_frontier,
@@ -2502,6 +2506,15 @@ where
             },
             merge_state: manifest.id(),
         };
+        // A follower can derive this dependency from authenticated local state
+        // only when it exactly matches the committed content address. Never
+        // substitute a newer local Merge frontier or publish mismatched bytes.
+        if expected.is_some_and(|expected| expected != seal.id()) {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        self.store
+            .put_blob(JournalBlobClass::LaneState, &state, &merge_state)?;
+        self.store.put(&manifest)?;
         self.store.put(&seal)?;
         Ok(seal.id())
     }
@@ -3623,6 +3636,21 @@ where
                         artifact_batch,
                         entry,
                     } => {
+                        if let Some(seal) = entry.merge_seal
+                            && matches!(entry.input.operation, ReplayOperation::CleanManage { .. })
+                            && self.store.get::<super::journal::MergeSeal>(seal)?.is_none()
+                        {
+                            let heads = self.materialization.heads();
+                            if entry.genesis != heads.genesis
+                                || entry.input.runtime != heads.runtime
+                                || entry.parent != heads.ordered_head
+                                || heads.ordered_index.checked_add(1) != Some(entry.index)
+                                || entry.merge_frontier != heads.merge_frontier
+                            {
+                                return Err(SharedJournalDriverError::CrossStoreMismatch);
+                            }
+                            self.stage_current_merge_seal_matching(Some(seal))?;
+                        }
                         let expected_clean_artifacts =
                             clean_management_artifact_references(&entry.input.operation);
                         if let Some(expected) = &expected_clean_artifacts {

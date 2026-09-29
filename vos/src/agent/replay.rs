@@ -13832,7 +13832,13 @@ mod aggregate {
     {
         AgentJournalStore::get(store, id)
             .map_err(journal)?
-            .ok_or_else(|| journal(JournalStoreError::MissingObject))
+            .ok_or_else(|| {
+                tracing::debug!(
+                    record_type = core::any::type_name::<R>(),
+                    "required replay record is absent"
+                );
+                journal(JournalStoreError::MissingObject)
+            })
     }
 
     /// Current replay projections carry opaque r19 components. Until they
@@ -13886,7 +13892,10 @@ mod aggregate {
         store
             .load_blob(class, reference)
             .map_err(journal)?
-            .ok_or_else(|| journal(JournalStoreError::MissingObject))
+            .ok_or_else(|| {
+                tracing::debug!(?class, ?reference, "required replay blob is absent");
+                journal(JournalStoreError::MissingObject)
+            })
     }
 
     fn authenticate_artifacts<S, ResolverError, ExecutorError>(

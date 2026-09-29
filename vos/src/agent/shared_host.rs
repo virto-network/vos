@@ -7261,6 +7261,113 @@ mod tests {
     }
 
     #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_management_follower_derives_only_exact_committed_merge_seal() {
+        use super::super::shared_raft::AgentRaftCommand;
+        let fixture = standard_projection_fixture(0x28);
+        let leader_directory = TempDirectory::new("management_seal_proposer");
+        let clock = Arc::new(AtomicU64::new(20));
+        let mut proposer =
+            open_native_clean_host_at_slot(&leader_directory, &fixture, clock.clone());
+        proposer
+            .provision(
+                fixture.provision.clone(),
+                fixture.catalog.clone(),
+                fixture.committee_authority,
+            )
+            .unwrap();
+        let ReplayOperation::CleanManage {
+            request: crate::agent_sdk::ManagementRequest::Create(descriptor),
+            ..
+        } = &fixture.provision.proposal().create().operation
+        else {
+            panic!("Create");
+        };
+        let package = super::super::package_admission::admitted_standard_actor_for_test(
+            "follower-worker",
+            crate::agent_sdk::StateLane::Linear,
+            0x78,
+        );
+        let request = clean_install_request(descriptor.identity.agent, &package);
+        let receipt = clean_management_receipt(descriptor, &request, 2, &key(0x41));
+        let prepared = proposer
+            .prepare_clean_management(
+                fixture.agent,
+                request,
+                receipt,
+                SdkManagementArtifacts::Actor(&package),
+            )
+            .unwrap();
+        let input = prepared.input().unwrap();
+        let commands = prepared.into_commands();
+        assert!(!commands.is_empty());
+        for alteration in 0..3 {
+            let directory = TempDirectory::new("management_seal_follower");
+            let mut follower = open_native_clean_host_at_slot(&directory, &fixture, clock.clone());
+            follower
+                .provision(
+                    fixture.provision.clone(),
+                    fixture.catalog.clone(),
+                    fixture.committee_authority,
+                )
+                .unwrap();
+            let before = follower.journal_position(fixture.agent).unwrap();
+            for (position, payload) in commands.iter().enumerate() {
+                let mut command = AgentRaftCommand::decode(payload).unwrap();
+                if position + 1 == commands.len() {
+                    let AgentRaftCommand::Ordered { entry, .. } = &mut command else {
+                        panic!("Ordered tail");
+                    };
+                    assert!(entry.merge_seal.is_some());
+                    match alteration {
+                        1 => {
+                            entry.merge_seal =
+                                Some(super::super::journal::MergeSealId::new([0xfe; 32]))
+                        }
+                        2 => {
+                            entry.merge_frontier =
+                                super::super::journal::MergeFrontierId::new([0xfd; 32])
+                        }
+                        _ => {}
+                    }
+                }
+                let index = follower.agents[&fixture.agent]
+                    .driver
+                    .ledger()
+                    .append_committed_for_test(
+                        8,
+                        &EntryKind::Data {
+                            payload: command.encode(),
+                        },
+                    )
+                    .unwrap();
+                let outcome = follower.apply_next(fixture.agent);
+                if alteration != 0 && position + 1 == commands.len() {
+                    assert_eq!(outcome, Err(SharedAgentHostError::CorruptResidue));
+                    assert_eq!(follower.journal_position(fixture.agent).unwrap(), before);
+                } else {
+                    assert_eq!(outcome.unwrap(), SharedAgentApplyOutcome::Applied { index });
+                }
+            }
+            if alteration == 0 {
+                assert!(matches!(
+                    follower
+                        .take_clean_ordered_result(fixture.agent, input)
+                        .unwrap(),
+                    crate::agent_sdk::RuntimeOutcome::Management(Ok(_))
+                ));
+                assert_eq!(
+                    follower
+                        .journal_position(fixture.agent)
+                        .unwrap()
+                        .ordered_index,
+                    before.ordered_index + 1
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "pvm")]
     fn check_clean_shared_install_terminal(error: Option<crate::agent_sdk::ManagementError>) {
         use super::super::shared_journal_driver::PreparedCleanManagement;
         let runtime = super::super::package_admission::admitted_scripted_runtime_for_test(

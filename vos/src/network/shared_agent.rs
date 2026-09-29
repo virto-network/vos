@@ -1724,7 +1724,8 @@ impl SharedRouteHandler {
             let payload = prepared
                 .into_payload()
                 .ok_or(SharedAgentHostError::Conflict)?;
-            if futures_executor::block_on(worker.propose(payload)).is_err() {
+            if let Err(error) = futures_executor::block_on(worker.propose(payload)) {
+                tracing::debug!(?error, "clean ordered proposal did not commit");
                 self.ordered_replies.cancel(input);
                 return Err(SharedAgentHostError::Unavailable);
             }
@@ -1736,10 +1737,10 @@ impl SharedRouteHandler {
             .map_err(|_| SharedAgentHostError::Unavailable)?;
         drain_committed(&mut host, self.agent, &self.ordered_replies)?;
         drop(host);
-        let outcome = self
-            .ordered_replies
-            .wait(input)
-            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let outcome = self.ordered_replies.wait(input).map_err(|_| {
+            tracing::debug!("clean ordered committed-result wait failed");
+            SharedAgentHostError::Unavailable
+        })?;
         Ok(CleanOrderedSubmission {
             input,
             outcome,
@@ -4045,7 +4046,12 @@ impl SharedAgentNetworkHost {
                             );
                             return;
                         };
-                        if drain_committed(&mut host, agent, &ordered_replies).is_err() {
+                        if let Err(error) = drain_committed(&mut host, agent, &ordered_replies) {
+                            tracing::warn!(
+                                ?agent,
+                                ?error,
+                                "retiring Shared route after committed replay failure"
+                            );
                             ordered_replies.fail_all();
                             thread_stale.store(true, Ordering::Release);
                             thread_merge_stop.store(true, Ordering::Release);

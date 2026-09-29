@@ -11216,6 +11216,13 @@ mod tests {
         }
 
         fn fixed_system_bootstrap_fixtures() -> Vec<PhysicalFixture> {
+            fixed_system_bootstrap_fixtures_with_authority(None)
+        }
+
+        fn fixed_system_bootstrap_fixtures_with_authority(
+            authority_package: Option<AdmittedActorPackage>,
+        ) -> Vec<PhysicalFixture> {
+            let real_authority = authority_package.is_some();
             let runtime = test_runtime_package(true);
             let receipt_key = SigningKey::from_bytes(&[RECEIPT_SEED; 32]);
             let credential_key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
@@ -11256,7 +11263,8 @@ mod tests {
                 members,
             )
             .unwrap();
-            let authority_package = raw_constructor_actor("system-authority", RECEIPT_SEED);
+            let authority_package = authority_package
+                .unwrap_or_else(|| raw_constructor_actor("system-authority", RECEIPT_SEED));
             let catalog_package =
                 admitted_standard_actor_for_test("root-catalog", StateLane::Linear, 0xa5);
             let authority = authority_binding(agent, &authority_package, &receipt_key);
@@ -11278,15 +11286,25 @@ mod tests {
                     role: ReplicaRole::Voter,
                 })
                 .collect();
-            let authority_request = install_request(agent, &authority_package, 0xa6, Some(vec![0]));
+            let authority_request = install_request(
+                agent,
+                &authority_package,
+                0xa6,
+                Some(if real_authority {
+                    authority_fixture_configuration(&descriptor)
+                } else {
+                    vec![0]
+                }),
+            );
             let catalog_request = install_request(agent, &catalog_package, 0xa8, None);
             validate_actor_install(&descriptor, &authority_request, &authority_package).unwrap();
             validate_actor_install(&descriptor, &catalog_request, &catalog_package).unwrap();
             let (call, _) =
                 credential_call_and_approval(&descriptor, &catalog_request, &credential_key);
+            let logical_slot = real_authority.then(|| Arc::new(AtomicU64::new(LOGICAL_SLOT)));
             let trust: Arc<dyn AgentTrustProvider> = Arc::new(PhysicalTrust {
                 authority: host_authority_binding(&descriptor),
-                logical_slot: None,
+                logical_slot: logical_slot.clone(),
             });
             assert!(!trust.use_native_clean_runtime_for_test());
             let mut certification = None;
@@ -11325,7 +11343,11 @@ mod tests {
                     catalog_package.exact_bytes().to_vec(),
                     catalog_request.clone(),
                     call.clone(),
-                    10_000_000,
+                    if real_authority {
+                        crate::agent::execution::MAX_EXECUTION_GAS
+                    } else {
+                        10_000_000
+                    },
                     &mut signer,
                     &mut certifier,
                     trust.clone(),
@@ -11374,7 +11396,7 @@ mod tests {
                     trust: trust.clone(),
                     merge,
                     finality: Arc::new(AcceptFinality),
-                    logical_slot: None,
+                    logical_slot: logical_slot.clone(),
                 });
             }
             for plan in &plans {
@@ -11427,14 +11449,32 @@ mod tests {
         #[test]
         #[ignore = "uses three authenticated loopback transports and real Raft election"]
         fn fixed_system_pending_attachments_survive_election_without_exposing_owners() {
+            check_fixed_system_pending_cluster(false);
+        }
+
+        #[test]
+        #[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
+        fn candidate_authority_fixed_system_leader_bootstrap_replicates_to_followers() {
+            check_fixed_system_pending_cluster(true);
+        }
+
+        fn check_fixed_system_pending_cluster(complete_leader: bool) {
             if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
                 let _ = tracing_subscriber::fmt()
                     .with_env_filter(
-                        "vos::agent::clean_bootstrap=debug,vos::network=debug,vos_raft=debug",
+                        std::env::var("VOS_TEST_BOOTSTRAP_FILTER").unwrap_or_else(|_| {
+                            "vos::agent=warn,vos::agent::clean_bootstrap=debug,vos::network=debug,vos_raft=debug".into()
+                        }),
                     )
                     .try_init();
             }
-            let fixtures = fixed_system_bootstrap_fixtures();
+            let fixtures = if complete_leader {
+                fixed_system_bootstrap_fixtures_with_authority(Some(
+                    admit_actor_package(&candidate_authority_package()).unwrap(),
+                ))
+            } else {
+                fixed_system_bootstrap_fixtures()
+            };
             let mut networks = Vec::new();
             let mut directories = Vec::new();
             let mut pending = Vec::new();
@@ -11455,7 +11495,10 @@ mod tests {
                 let directory = TestDirectory::new("fixed-system-pending-election");
                 let mut attached = CleanSystemAgentBootstrapOwner::attach_bootstrap_with_admission(
                     BootstrapMemoryStore::default(),
-                    BootstrapMemoryStore::default(),
+                    BootstrapMemoryStore {
+                        bootstrap_clock: fixture.logical_slot.clone(),
+                        ..BootstrapMemoryStore::default()
+                    },
                     IssuerMemoryStore::default(),
                     &mut signer,
                     &fixture.plan,
@@ -11567,6 +11610,73 @@ mod tests {
                     .unwrap()
                     .is_none()
                 );
+            }
+            if complete_leader {
+                let leader = pending.iter().position(is_leader).unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                let completed = loop {
+                    match pending[leader].try_complete(&mut signer) {
+                        Ok(Some(owner)) => break owner,
+                        Err(CleanSystemAgentBootstrapError::Host(
+                            SharedAgentHostError::Unavailable,
+                        )) if std::time::Instant::now() < deadline => {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                        Err(error) => panic!("leader bootstrap did not complete: {error:?}"),
+                        Ok(None) => panic!("leader owner transferred before completion"),
+                    }
+                };
+                assert_eq!(
+                    completed.record.phase(),
+                    CleanSystemAgentBootstrapPhase::Complete
+                );
+                assert_eq!(completed.issuer.sequence_high_water(), 3);
+                assert_eq!(completed.issuer.acknowledged_through(), 3);
+                let agent = HostAgentId(completed.pins.agent.0);
+                let expected = completed
+                    .host
+                    .lock()
+                    .unwrap()
+                    .clean_state_commitment(agent)
+                    .unwrap();
+                for (index, attached) in pending.iter().enumerate() {
+                    if index == leader {
+                        continue;
+                    }
+                    let owner = attached.owner.as_ref().unwrap();
+                    assert!(
+                        wait_until(std::time::Duration::from_secs(30), || {
+                            owner
+                                .host
+                                .lock()
+                                .unwrap()
+                                .clean_state_commitment(agent)
+                                .unwrap()
+                                == expected
+                        }),
+                        "follower did not apply the complete bootstrap state"
+                    );
+                    ensure_actor_installed(
+                        &owner.host,
+                        &attached.plan,
+                        &attached.plan.authority_request,
+                    )
+                    .unwrap();
+                    ensure_actor_installed(
+                        &owner.host,
+                        &attached.plan,
+                        &attached.plan.catalog_request,
+                    )
+                    .unwrap();
+                    // Physical replication alone does not qualify follower
+                    // lifecycle recovery or expose a serving owner.
+                    assert_eq!(
+                        owner.record.phase(),
+                        CleanSystemAgentBootstrapPhase::CreateReceiptIssued
+                    );
+                    assert_eq!(owner.issuer.sequence_high_water(), 1);
+                }
+                drop(completed);
             }
             drop(pending);
             for network in networks {
@@ -14766,6 +14876,12 @@ mod tests {
         #[test]
         #[ignore = "requires AUTHORITY_CANDIDATE_ELF; executes candidate bootstrap and file-journal reopen"]
         fn candidate_authority_real_bootstrap_reopens_file_journal() {
+            let package = candidate_authority_package();
+            let fixture = native_authority_package_fixture(false, &package);
+            check_candidate_authority_real_bootstrap_reopens_file_journal(fixture);
+        }
+
+        fn candidate_authority_package() -> Vec<u8> {
             let elf = std::fs::read(std::env::var("AUTHORITY_CANDIDATE_ELF").unwrap()).unwrap();
             let program = vos_pvm_compiler::link_elf_spi(&elf).unwrap();
             let schema = crate::agent::schema::raw_section_from_elf(&elf).unwrap();
@@ -14791,8 +14907,20 @@ mod tests {
             package
                 .artifacts
                 .sort_unstable_by(|a, b| a.identity.cmp(&b.identity));
-            // The fixture builder signs the complete new program/schema closure.
-            let fixture = native_authority_package_fixture(false, &package.encode().unwrap());
+            // Bind the complete new program/schema closure to the fixture issuer.
+            let key = SigningKey::from_bytes(&[RECEIPT_SEED; 32]);
+            let public_key = key.verifying_key().to_bytes();
+            *package.manifest.signing_mut() = PackageSigning {
+                producer: ProducerId::of_public_key(&public_key),
+                public_key,
+                signature: [0; 64],
+            };
+            package.manifest.signing_mut().signature =
+                key.sign(&package.signing_bytes().unwrap()).to_bytes();
+            package.encode().unwrap()
+        }
+
+        fn check_candidate_authority_real_bootstrap_reopens_file_journal(fixture: PhysicalFixture) {
             let directory = TestDirectory::new("candidate-authority-real-bootstrap");
             let network = network(NODE_SEED);
             let pins = BootstrapMemoryStore::default();
@@ -16009,65 +16137,91 @@ mod tests {
             )
         }
 
+        fn authority_fixture_configuration(descriptor: &AgentDescriptor) -> Vec<u8> {
+            use system_authority::{
+                AuthorityBindingState, AuthorityBlobRow, AuthorityIssuerState,
+                ROOT_BOOTSTRAP_AUTHORIZATION_HIGH_WATER, SystemAuthorityConfiguration,
+            };
+            let (key, _, public, _) = node_material();
+            let principal = PrincipalId::of_public_key(&public);
+            let mut enrollment = crate::agent_sdk::private::NodeEncryptionEnrollment::from_keys(
+                descriptor.identity.space,
+                descriptor.identity.owner,
+                public,
+                [0x41; 32],
+                [1; 64],
+            );
+            enrollment.transport_signature = key.sign(&enrollment.signing_bytes()).to_bytes();
+            let authority = descriptor.authority;
+            let config = SystemAuthorityConfiguration {
+                space: descriptor.identity.space.0,
+                system_agent: descriptor.identity.agent.0,
+                system_runtime_deployment: descriptor.identity.runtime_deployment.0,
+                system_runtime_program: descriptor.identity.runtime_program.0,
+                system_runtime_producer: descriptor.identity.runtime_producer.0,
+                system_transition_producer: descriptor.identity.transition_producer.0,
+                system_runtime_package: AuthorityBlobRow {
+                    hash: descriptor.runtime_package.hash.0,
+                    len: descriptor.runtime_package.len,
+                },
+                binding: AuthorityBindingState {
+                    policy: authority.policy.0,
+                    issuer: AuthorityIssuerState {
+                        principal: authority.issuer.principal.0,
+                        actor: authority.issuer.actor.0,
+                        deployment: authority.issuer.deployment.0,
+                        program: authority.issuer.program.0,
+                        producer: authority.issuer.producer.0,
+                    },
+                    public_key: authority.public_key,
+                    initial_epoch: authority.initial_epoch,
+                },
+                bootstrap_authorization_high_water: ROOT_BOOTSTRAP_AUTHORIZATION_HIGH_WATER,
+                bootstrap_system_agent_creation_nonce: descriptor.creation_nonce.0,
+                bootstrap_principal: descriptor.identity.owner.0,
+                bootstrap_replica_principal: principal.0,
+                bootstrap_credential_public_key: SigningKey::from_bytes(&[CREDENTIAL_SEED; 32])
+                    .verifying_key()
+                    .to_bytes(),
+                bootstrap_credential_kind: 0,
+                bootstrap_node: enrollment.node.0,
+                bootstrap_node_transport_public_key: enrollment.transport_public_key,
+                bootstrap_node_transport_peer_id: enrollment.transport_peer_id,
+                bootstrap_node_encryption_public_key: enrollment.encryption_public_key,
+                bootstrap_node_transport_signature: enrollment.transport_signature,
+                bootstrap_additional_nodes: if descriptor.replicas.len() == 3 {
+                    let mut additional = [0xd2, 0xd3].map(|seed| {
+                        let key = SigningKey::from_bytes(&[seed; 32]);
+                        let mut enrollment =
+                            crate::agent_sdk::private::NodeEncryptionEnrollment::from_keys(
+                                descriptor.identity.space,
+                                descriptor.identity.owner,
+                                key.verifying_key().to_bytes(),
+                                [seed & 0x7f; 32],
+                                [1; 64],
+                            );
+                        enrollment.transport_signature =
+                            key.sign(&enrollment.signing_bytes()).to_bytes();
+                        enrollment
+                    });
+                    additional.sort_by_key(|enrollment| enrollment.node);
+                    Some(
+                        additional.map(|enrollment| system_authority::AuthorityBootstrapNode {
+                            transport_public_key: enrollment.transport_public_key,
+                            encryption_public_key: enrollment.encryption_public_key,
+                            transport_signature: enrollment.transport_signature,
+                        }),
+                    )
+                } else {
+                    None
+                },
+            };
+            assert!(config.is_valid());
+            assert!(config.matches_system_descriptor(descriptor));
+            config.encode()
+        }
+
         fn native_authority_package_fixture(query: bool, package_bytes: &[u8]) -> PhysicalFixture {
-            fn configuration(descriptor: &AgentDescriptor) -> Vec<u8> {
-                use system_authority::{
-                    AuthorityBindingState, AuthorityBlobRow, AuthorityIssuerState,
-                    ROOT_BOOTSTRAP_AUTHORIZATION_HIGH_WATER, SystemAuthorityConfiguration,
-                };
-                let (key, _, public, _) = node_material();
-                let principal = PrincipalId::of_public_key(&public);
-                let mut enrollment = crate::agent_sdk::private::NodeEncryptionEnrollment::from_keys(
-                    descriptor.identity.space,
-                    descriptor.identity.owner,
-                    public,
-                    [0x41; 32],
-                    [1; 64],
-                );
-                enrollment.transport_signature = key.sign(&enrollment.signing_bytes()).to_bytes();
-                let authority = descriptor.authority;
-                let config = SystemAuthorityConfiguration {
-                    space: descriptor.identity.space.0,
-                    system_agent: descriptor.identity.agent.0,
-                    system_runtime_deployment: descriptor.identity.runtime_deployment.0,
-                    system_runtime_program: descriptor.identity.runtime_program.0,
-                    system_runtime_producer: descriptor.identity.runtime_producer.0,
-                    system_transition_producer: descriptor.identity.transition_producer.0,
-                    system_runtime_package: AuthorityBlobRow {
-                        hash: descriptor.runtime_package.hash.0,
-                        len: descriptor.runtime_package.len,
-                    },
-                    binding: AuthorityBindingState {
-                        policy: authority.policy.0,
-                        issuer: AuthorityIssuerState {
-                            principal: authority.issuer.principal.0,
-                            actor: authority.issuer.actor.0,
-                            deployment: authority.issuer.deployment.0,
-                            program: authority.issuer.program.0,
-                            producer: authority.issuer.producer.0,
-                        },
-                        public_key: authority.public_key,
-                        initial_epoch: authority.initial_epoch,
-                    },
-                    bootstrap_authorization_high_water: ROOT_BOOTSTRAP_AUTHORIZATION_HIGH_WATER,
-                    bootstrap_system_agent_creation_nonce: descriptor.creation_nonce.0,
-                    bootstrap_principal: descriptor.identity.owner.0,
-                    bootstrap_replica_principal: principal.0,
-                    bootstrap_credential_public_key: SigningKey::from_bytes(&[CREDENTIAL_SEED; 32])
-                        .verifying_key()
-                        .to_bytes(),
-                    bootstrap_credential_kind: 0,
-                    bootstrap_node: enrollment.node.0,
-                    bootstrap_node_transport_public_key: enrollment.transport_public_key,
-                    bootstrap_node_transport_peer_id: enrollment.transport_peer_id,
-                    bootstrap_node_encryption_public_key: enrollment.encryption_public_key,
-                    bootstrap_node_transport_signature: enrollment.transport_signature,
-                    bootstrap_additional_nodes: None,
-                };
-                assert!(config.matches_system_descriptor(descriptor));
-                assert!(config.is_valid());
-                config.encode()
-            }
             // Re-sign the bundled artifact with this fixture's pinned issuer;
             // the executable PVM, schema and policies are unchanged.
             let mut package = PackageEnvelope::decode(package_bytes).unwrap();
@@ -16084,7 +16238,7 @@ mod tests {
             if query {
                 native_physical_fixture_with_catalog(
                     package,
-                    Some(configuration),
+                    Some(authority_fixture_configuration),
                     crate::agent::package_admission::admitted_standard_query_actor_for_test(
                         "root-catalog",
                         StateLane::Linear,
@@ -16092,7 +16246,10 @@ mod tests {
                     ),
                 )
             } else {
-                native_physical_fixture_with_authority_configuration(package, Some(configuration))
+                native_physical_fixture_with_authority_configuration(
+                    package,
+                    Some(authority_fixture_configuration),
+                )
             }
         }
 
