@@ -8,20 +8,95 @@ implementation branch; do not apply competing fixes on the review worktree.
 
 | Purpose | Branch / checkpoint |
 | --- | --- |
-| Reviewer target | `saga/agents` containing this signed read-recovery follow-up; verify the implementation fast-forward before reviewing |
-| Review range | `0bec4f58..saga/agents` as **one batch**: scoped delegation, exact pending recovery and crash/refusal regressions |
-| Preceding code checkpoint | Shared journal/applied availability `7c1a1b7c`; prior backend follow-up `4ea0271c` |
+| Reviewer target | `saga/agents` containing this common-checkpoint follow-up; verify the implementation fast-forward before reviewing |
+| Review range | `6d2a9b38..saga/agents` as **one batch**: common snapshot authority, physical rebinding and candidate catch-up |
+| Preceding code checkpoint | Scoped read delegation `6d2a9b38`; Shared journal/applied availability `7c1a1b7c`; backend follow-up `4ea0271c` |
 | Prior tested baseline | `62ffbc20`; `master` remains unchanged |
 | Historical startup review | `f1bfa1bd..310ef841`; two findings fixed at `62ffbc20` |
 
-The preceding Shared integration changed 13 files (+4,251 / -198 lines), including
-an 887-line physical lifecycle fixture. The current follow-up is one scoped
-read-recovery batch, not release qualification. The preceding pruning changed 42 files
+The current follow-up is one scoped checkpoint/catch-up batch, not release
+qualification. Physical mutation entrypoints remain test-only while historical
+pending-recovery retention is unresolved. The preceding pruning changed 42 files
 (+1,942 / -43,868 lines). Documentation handoffs are separate. Verify branch
 heads before reviewing, and apply findings
 on the implementation branch. Do not infer publication from a candidate hash.
 This is not a release: batch 1 is not closed, batches 2/3 remain open, production
 multi-node startup/public Shared management remain gated, and Local is image-based.
+
+### Common checkpoints: follow-up from `6d2a9b38`
+
+The new common QC authenticates one exact Ordered projection, full fixed-three
+committee, authority epoch and the preimage of the existing semantic ancestry
+commitment. Independent physical checkpoint cadence must not change subsequent
+Ordered claims. A separate owner signature binds that exact QC to the complete
+AGS3 physical claim, including node/store identity. AGS3 and AGP1 are unchanged;
+generic Raft snapshot bytes remain rejected.
+
+Votes use the existing bounded availability request pool. Each voter reconstructs
+and validates its own durable closure; another node's signed physical metadata is
+not quorum evidence. Typed catch-up validates the source closure and independent
+genesis pins before deriving destination Local state and publishing through its
+own head CAS. Source/destination genesis envelopes may differ only in their
+declared physical replica and locator node; all remaining intent fields must
+match. V2 retains higher terms and full NodeId votes, rejects speculative or
+changed cached membership, and refuses rollback. This first implementation
+refuses any log suffix beyond the target rather than deleting
+entries that may already be committed elsewhere.
+
+Durable ACL1/ACR1 markers cover source compaction and destination import. A
+failure quarantines the live owner until audited reopen; marker retirement
+precedes reinsertion. Fixed-three followers can reattach without waiting to
+become leader, while explicit promotion, pending-management and recovery
+barriers remain enforced.
+
+The crucial remaining gate is recovery retention: positive Authority projection
+ACK intentionally removes guest result/error records. An offline origin may still
+have an uncleared PAP2 that needs the exact prior Invoke/result/ACK history.
+Neither current guest state nor another node's empty pending directory proves
+that recovery is finished. The new boundary-only Query evidence must not be
+extended into a general historical-availability fallback. Production compaction
+and catch-up are therefore not enabled by this checkpoint; shared pending pins
+or bounded certified recovery evidence are still required.
+
+The passing candidate fixture covers a genuinely pruned Raft prefix, a detached
+lagging third voter, exact unacknowledged boundary Query recovery, reopen, subsequent ACK
+and continued common ordering despite different physical checkpoint cadence.
+Each of three crash fixtures interrupts both source and destination after marker
+creation, journal CAS, or ledger installation and completes the same workflow
+after reopen. This is controlled byte export/import, not network
+snapshot streaming, public startup or released-daemon qualification. External
+state-block snapshots/export/reclamation remain unavailable. No tracked guest
+artifact changes are needed for this host-only slice.
+
+Evidence (logs in the shared target below; candidate/recompiler):
+
+| Check | Result / log |
+| --- | --- |
+| Healthy fixed-three checkpoint/catch-up | 1 pass, 55.14 s; `common-snapshot-physical-healthy5.log` |
+| Source and destination crash boundaries | 3 pass, 169.41 s; `common-snapshot-physical-crash-matrix.log` |
+| Prior signed-read recovery matrix | 6 pass, 222.21 s; `common-snapshot-delegation-regressions.log` |
+| Common certificates / V2 ledger | 9 / 34 pass; `common-snapshot-commit-final.log`, `common-snapshot-ledger-final.log` |
+| Shared routes / host | 10 / 31 pass, 1 existing host test ignored; `common-snapshot-route-final.log`, `common-snapshot-host-final.log`; excludes the previously qualified five-minute raw-tail capacity fixture |
+| Journal / shared replay | 105 / 7 pass, 1 existing journal test ignored; `common-snapshot-journal-final.log`, `common-snapshot-replay-final.log` |
+| Protocol / authenticated transport | 16 / 18 pass; `common-snapshot-protocol-final.log`, `common-snapshot-network-final.log` |
+| Feature boundaries | Minimal std-only / ordinary image-core checks and default CLI build pass; `common-snapshot-minimal-final.log`, `common-snapshot-image-final.log`, `common-snapshot-cli-final.log` |
+
+The final experimental test binary is recorded in
+`common-snapshot-tests-build5.log`. Rerun the new physical cases with the
+candidate Authority ELF below, `GREY_PVM=recompiler`, disk-backed `TMPDIR`,
+`RUST_MIN_STACK=16777216`, loopback permissions, and the filter
+`agent::clean_bootstrap::tests::physical::common_checkpoint:: --ignored --test-threads=1`.
+The candidate ELF is unchanged from `6d2a9b38`; no guest rebuild or artifact
+promotion is part of this checkpoint. Total fixture runtimes are not service
+latency or failover bounds. Changed-range Rust formatting, the new physical
+fixture's formatting and `git diff --check` pass; repository-wide formatting
+and unrelated warning cleanup are not part of this batch.
+
+Independent read-only implementation review found no remaining scoped blocker.
+Review particularly the common/physical authority separation, preserved semantic
+ancestry, full-intent replica rebinding, Raft hard-state/configuration guards,
+ambiguous-write quarantine and production gates. This does not sign off the
+historical recovery-retention or public integration gaps above.
 
 ### Signed read recovery: follow-up from `0bec4f58`
 

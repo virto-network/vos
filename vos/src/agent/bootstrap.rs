@@ -228,6 +228,20 @@ pub struct SystemAgentGenesisProvision {
 }
 
 impl SystemAgentGenesisProvision {
+    /// Re-express an already supplied root provision for another declared
+    /// physical replica. This is only archive-envelope reconstruction: it
+    /// grants no replay seal or journal publication authority.
+    pub(crate) fn rebind_replica(
+        &self,
+        replica: AgentReplica,
+    ) -> Result<Self, SystemAgentGenesisBootstrapError> {
+        let mut rebound = self.clone();
+        rebound.proposal.replica = replica;
+        rebound.proposal.locator.node = replica.node;
+        rebound.validate()?;
+        Ok(rebound)
+    }
+
     pub fn new(
         proposal: SystemAgentGenesisProposal,
         root: RootAnchorPins,

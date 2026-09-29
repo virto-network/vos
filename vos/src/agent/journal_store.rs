@@ -7023,7 +7023,12 @@ fn validate_sealed_fence_ancestry<S: AgentJournalStore>(
             } else {
                 OrderedBase::post_genesis()
             };
-            if evidence.checkpoint_base() != replay_boundary {
+            let matches_boundary = match evidence.common_checkpoint() {
+                Some(checkpoint) => current.checkpoint == Some(checkpoint)
+                    && evidence.checkpoint_base().index <= replay_boundary.index,
+                None => evidence.checkpoint_base() == replay_boundary,
+            };
+            if !matches_boundary {
                 return Err(JournalStoreError::NonCanonical);
             }
         }
@@ -8135,6 +8140,105 @@ impl MemoryAgentJournalStore {
         validate_portable_journal_closure(&candidate, image, maximum_index_nodes)?;
         *self = candidate;
         Ok(())
+    }
+
+    /// Pure destination reconstruction for the fixed common checkpoint
+    /// profile. The caller must independently authenticate the source image
+    /// and subsequently replay/validate this result before signing it. This
+    /// in-memory helper grants no filesystem publication authority.
+    pub(crate) fn rebind_common_checkpoint<T: ReplaySealedOrdinaryGenesis>(
+        sealed: &T,
+        source: &PortableJournalCheckpoint,
+        predecessor: &JournalHeads,
+        limits: PortableJournalLimits,
+    ) -> Result<(Self, PortableJournalCheckpoint), JournalStoreError> {
+        source.validate_shape()?;
+        source.validate_limits(limits)?;
+        let initial = sealed.initial_heads();
+        if predecessor.genesis != initial.genesis
+            || predecessor.admission != initial.admission
+            || predecessor.node != initial.node
+            || predecessor.local_revision != 0
+            || predecessor.local_head.is_some()
+            || predecessor.local_invocations != initial.local_invocations
+            || source.heads.genesis != initial.genesis
+            || source.heads.admission != initial.admission
+            || source.heads.runtime != initial.runtime
+            || source.heads.ordered_index < predecessor.ordered_index
+            || (source.heads.ordered_index == predecessor.ordered_index
+                && source.heads.ordered_head != predecessor.ordered_head)
+        {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        let mut candidate = Self::new(initial.runtime.agent, initial.node)?;
+        for blob in &source.blobs {
+            candidate.put_blob(blob.class, &blob.reference, &blob.bytes)?;
+        }
+        candidate.initialize_shared(sealed)?;
+        for object in &source.objects {
+            validate_portable_object(object)?;
+            if object.class == JournalStorageClass::InvocationHistoryNode {
+                candidate
+                    .history_nodes
+                    .insert(InvocationHistoryNodeId(object.id), object.bytes.clone());
+            } else {
+                candidate
+                    .objects
+                    .insert((object.class, object.id), object.bytes.clone());
+            }
+        }
+        let mut checkpoint = candidate
+            .get::<CheckpointManifest>(
+                source
+                    .heads
+                    .checkpoint
+                    .ok_or(JournalStoreError::NonCanonical)?,
+            )?
+            .ok_or(JournalStoreError::MissingObject)?;
+        let mut local = sealed.lane_manifest(PersistedLane::Local);
+        local.runtime = checkpoint.runtime.clone();
+        local
+            .validate()
+            .map_err(|_| JournalStoreError::NonCanonical)?;
+        candidate.put_blob(
+            JournalBlobClass::LaneState,
+            &local.state,
+            &sealed.post_create().local,
+        )?;
+        candidate.put(&local)?;
+        candidate.put(sealed.local_invocations())?;
+        let lane = checkpoint
+            .lanes
+            .iter_mut()
+            .find(|lane| lane.lane == PersistedLane::Local)
+            .ok_or(JournalStoreError::Corrupt)?;
+        lane.node = Some(initial.node);
+        lane.state = local.id();
+        lane.invocations = Some(initial.local_invocations);
+        checkpoint.publication_revision = predecessor.publication_revision;
+        checkpoint
+            .validate()
+            .map_err(|_| JournalStoreError::NonCanonical)?;
+        candidate.put(&checkpoint)?;
+        candidate.persist_historical_heads(predecessor)?;
+        let mut next = source.heads.clone();
+        next.node = initial.node;
+        next.local_invocations = initial.local_invocations;
+        next.local_head = None;
+        next.local_revision = 0;
+        next.publication_revision = predecessor
+            .publication_revision
+            .checked_add(1)
+            .ok_or(JournalStoreError::LimitExceeded)?;
+        next.previous = Some(predecessor.id());
+        next.checkpoint = Some(checkpoint.id());
+        predecessor
+            .validate_successor(&next)
+            .map_err(|_| JournalStoreError::NonCanonical)?;
+        candidate.heads = Some(next.encode());
+        validate_head_targets(&candidate, &next)?;
+        let image = export_portable_journal_checkpoint(&candidate, limits)?;
+        Ok((candidate, image))
     }
 
     #[cfg(test)]
@@ -12327,6 +12431,55 @@ impl FileAgentJournalStore {
         maximum_index_nodes: usize,
     ) -> Result<(), JournalStoreError> {
         self.install_portable_checkpoint_inner(image, maximum_index_nodes, false)
+    }
+
+    /// Install only an opaque replay-validated common checkpoint. The target
+    /// is an exact successor of this destination's real predecessor envelope;
+    /// decoded images and node signatures alone cannot invoke this boundary.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn install_common_checkpoint(
+        &mut self,
+        checkpoint: &super::replay::ValidatedCommonCheckpoint,
+        maximum_index_nodes: usize,
+    ) -> Result<(), JournalStoreError> {
+        self.verify_lock()?;
+        let image = checkpoint.image();
+        let claim = checkpoint.verified().claim();
+        if claim.journal_store().0 != *self.instance_id().as_bytes()
+            || claim.local_node() != self.node
+            || image.heads.id() != claim.journal_heads()
+        {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        let current = self.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+        if current == image.heads {
+            return validate_portable_journal_closure(self, image, maximum_index_nodes);
+        }
+        current
+            .validate_successor(&image.heads)
+            .map_err(|_| JournalStoreError::Conflict)?;
+        if current.ordered_index > image.heads.ordered_index
+            || self.read_fixed::<JournalHeads>("", "heads.next")?.is_some()
+        {
+            return Err(JournalStoreError::Conflict);
+        }
+        for blob in &image.blobs {
+            self.persist_blob(blob.class, &blob.reference, &blob.bytes)?;
+        }
+        for object in &image.objects {
+            self.persist_portable_object(object)?;
+        }
+        validate_head_targets(self, &image.heads)?;
+        let root = self.directory("")?;
+        create_synced_stage_at(root, "heads.next", &image.heads.encode())?;
+        if self.read_fixed::<JournalHeads>("", "heads")?.as_ref() != Some(&current) {
+            return Err(JournalStoreError::Conflict);
+        }
+        rename_file_at(root, "heads.next", "heads")?;
+        root.sync_all()
+            .map_err(|_| JournalStoreError::Unavailable)?;
+        self.verify_lock()?;
+        validate_portable_journal_closure(self, image, maximum_index_nodes)
     }
 
     #[cfg(all(test, target_os = "linux"))]

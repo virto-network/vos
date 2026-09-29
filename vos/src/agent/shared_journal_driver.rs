@@ -40,9 +40,10 @@ use super::replay::{
     prepare_shared_ordered, validate_published_shared_checkpoint,
 };
 use super::shared_commit::{
-    OrderedCommitClaim, SharedAgentPortableSnapshotCertificate, SharedAgentPortableSnapshotClaim,
-    SharedAgentSnapshotCertificate, SharedAgentSnapshotClaim, SharedCommitError,
-    VerifiedSharedAgentPortableSnapshot,
+    OrderedCommitClaim, SharedAgentCommonSnapshotCertificate, SharedAgentCommonSnapshotClaim,
+    SharedAgentLocalSnapshotBinding, SharedAgentPortableSnapshotCertificate,
+    SharedAgentPortableSnapshotClaim, SharedAgentSnapshotCertificate, SharedAgentSnapshotClaim,
+    SharedCommitError, VerifiedSharedAgentPortableSnapshot,
 };
 use super::shared_raft::{
     ARTIFACT_CHUNK_DATA_BYTES, AgentGenerationRouteKey, AgentRaftApplicationErrorV2,
@@ -57,6 +58,33 @@ use crate::service::wire::ServiceWire;
 use crate::service::{BlobRef, Hash, NodeId};
 
 type SharedReplayError = MaterializeError<core::convert::Infallible, LocalReplayExecutorError>;
+
+fn materialize_shared_image<S, E>(
+    store: &mut S,
+    executor: &mut E,
+    ledger: &AgentRaftApplicationLedgerV2,
+) -> Result<ReplayMaterialization, SharedReplayError>
+where
+    S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
+    E: ReplayExecutor<Error = LocalReplayExecutorError>,
+{
+    let authority = ledger.common_snapshot_authority().map_err(|_| {
+        super::replay::ReplayError::Source(
+            super::replay::ReplayMaterializationSourceError::Journal(JournalStoreError::Corrupt),
+        )
+    })?;
+    if let Some((certificate, binding)) = authority {
+        super::replay::materialize_common_checkpoint(
+            store,
+            executor,
+            &NoPrunedOrderedBases,
+            &certificate,
+            &binding,
+        )
+    } else {
+        materialize_current(store, executor, &NoPrunedOrderedBases)
+    }
+}
 
 #[cfg(feature = "experimental-state-blocks")]
 const EXTERNAL_OPERATION_FETCHES: u32 = 10_000;
@@ -1130,13 +1158,12 @@ where
             )
         } else {
             (
-                materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases)?,
+                materialize_shared_image(&mut store, &mut executor, &ledger)?,
                 None,
             )
         };
         #[cfg(not(feature = "experimental-state-blocks"))]
-        let materialization =
-            materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases)?;
+        let materialization = materialize_shared_image(&mut store, &mut executor, &ledger)?;
         report_phase("materialize_current");
         let active = ledger.active_committee()?;
         let route = ledger.generation();
@@ -1347,10 +1374,10 @@ where
                     })
             })
         } else {
-            materialize_current(&mut self.store, &mut executor, &NoPrunedOrderedBases)
+            materialize_shared_image(&mut self.store, &mut executor, &self.ledger)
         };
         #[cfg(not(feature = "experimental-state-blocks"))]
-        let recovered = materialize_current(&mut self.store, &mut executor, &NoPrunedOrderedBases);
+        let recovered = materialize_shared_image(&mut self.store, &mut executor, &self.ledger);
         tracing::debug!(
             setup_us,
             materialize_us = materialize_started.elapsed().as_micros() as u64,
@@ -2399,6 +2426,13 @@ where
         if work.mode != crate::agent_sdk::MethodMode::Query {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
+        if self.materialization.common_checkpoint().is_some()
+            && self
+                .retained_public_invocation(work.invocation, work.mode)?
+                .is_none_or(|(_, input)| input != entry.input.id())
+        {
+            return Ok(None);
+        }
         let outcome = self
             .executor
             .clean_invocation_terminal_outcome(
@@ -3342,6 +3376,7 @@ where
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
         let mut cursor = self.materialization.heads().ordered_head;
+        let mut boundary_retired = false;
         // Exact bootstrap/projection lookup is bounded independently of the
         // complete journal's size. Exceeding that bound is not fresh evidence.
         for _ in 0..1_024 {
@@ -3355,6 +3390,15 @@ where
                 .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
             if entry.id() != id || entry.genesis != self.materialization.heads().genesis {
                 return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+            if matches!(&entry.input.operation,
+                ReplayOperation::CleanAcknowledge { work, .. }
+                    if work.invocation == invocation)
+                || matches!(&entry.input.operation,
+                    ReplayOperation::CleanResume { work, .. }
+                        if work.invocation == invocation)
+            {
+                boundary_retired = true;
             }
             if let ReplayOperation::CleanInvoke {
                 context,
@@ -3383,6 +3427,32 @@ where
         }
         if cursor.is_some() && cursor != self.materialization.replay_boundary().head {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        // A common checkpoint proves its exact boundary input, not arbitrary
+        // earlier requests hidden inside opaque guest state. Authority Query
+        // ACK deliberately leaves no guest marker, so a newer lifecycle step
+        // must not resurrect the boundary Invoke through speculative replay.
+        if mode == crate::agent_sdk::MethodMode::Query
+            && !boundary_retired
+            && let Some((_, entry)) = self.available_common_checkpoint_boundary()?
+            && let ReplayOperation::CleanInvoke {
+                context: RuntimeExecutionContext::Direct,
+                work,
+                authorization,
+                ..
+            } = &entry.input.operation
+            && work.invocation == invocation
+            && work.mode == mode
+            && matches!(authorization, InvocationAuthorization::PublicPreflight(value) if value.matches_work(work))
+        {
+            return Ok(Some((
+                CleanInvocationReplayRequest::Invoke {
+                    context: RuntimeExecutionContext::Direct,
+                    work: work.clone(),
+                    authorization: authorization.clone(),
+                },
+                entry.input.id(),
+            )));
         }
         Ok(None)
     }
@@ -3473,8 +3543,11 @@ where
             }
             return Ok(PreparedCleanOrdered::Retained { input, outcome });
         }
-        if accepted_observed_slot.is_some()
-            && terminal_only
+        let common_query_boundary = matches!(&operation,
+            ReplayOperation::CleanInvoke { work, .. }
+                if work.mode == crate::agent_sdk::MethodMode::Query)
+            && self.materialization.common_checkpoint().is_some();
+        if ((accepted_observed_slot.is_some() && terminal_only) || common_query_boundary)
             && let Some((input, outcome)) =
                 self.retained_terminal_projection_boundary(&operation)?
         {
@@ -3905,8 +3978,9 @@ where
         }
     }
 
-    /// Find only this input's exact retained anchored publication. A current
-    /// state root cannot stand in for a missing historical result binding.
+    /// Find this input's exact retained publication. A common checkpoint can
+    /// replace the retired physical anchor only for its exact Query boundary;
+    /// a newer state root is never evidence for an arbitrary historical input.
     pub(crate) fn available_ordered_claim(
         &self,
         input: ReplayInputId,
@@ -3948,7 +4022,130 @@ where
                 .checked_sub(1)
                 .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
         }
+        if let Some((claim, entry)) = self.available_common_checkpoint_boundary()?
+            && entry.input.id() == input
+            && matches!(&entry.input.operation, ReplayOperation::CleanInvoke {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                work,
+                authorization: crate::agent_sdk::InvocationAuthorization::PublicPreflight(preflight),
+                ..
+            } if work.mode == crate::agent_sdk::MethodMode::Query && preflight.matches_work(work))
+        {
+            return Ok(claim);
+        }
         Err(JournalStoreError::Unavailable.into())
+    }
+
+    /// Recheck the exact locally installed common boundary and the opaque
+    /// state/artifacts needed to recover its Query. This does not inspect
+    /// runtime-private result layouts or certify a pre-boundary request. The
+    /// full checkpoint closure was audited by publication/import and reopen;
+    /// no external blocks or reclamation authority are admitted here.
+    fn available_common_checkpoint_boundary(
+        &self,
+    ) -> Result<Option<(OrderedCommitClaim, OrderedEntry)>, SharedJournalDriverError> {
+        if self.uses_external_state() || self.materialization.common_checkpoint().is_none() {
+            return Ok(None);
+        }
+        let Some((certificate, binding)) = self.ledger.common_snapshot_authority()? else {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        };
+        let physical = binding.claim();
+        binding.verify(&certificate, physical)?;
+        let claim = certificate.claim().ordered();
+        let heads = self.materialization.heads();
+        if self.store.heads()?.as_ref() != Some(heads)
+            || physical.journal_store().0 != *self.store.instance_id().as_bytes()
+            || physical.local_node() != heads.node
+            || claim.ordered() != self.materialization.replay_boundary()
+        {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        validate_published_shared_checkpoint(&self.store, &self.materialization, physical)
+            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        let checkpoint = self
+            .store
+            .get::<super::journal::CheckpointManifest>(physical.checkpoint())?
+            .ok_or(JournalStoreError::Unavailable)?;
+        if checkpoint.merge_frontier != claim.merge_frontier()
+            || checkpoint.merge_fence != claim.merge_fence()
+            || checkpoint.merge_seal != claim.merge_seal()
+            || checkpoint.merge_invocations != claim.merge_invocations()
+            || checkpoint.ordered_invocations != claim.ordered_invocations()
+            || checkpoint.artifacts != claim.artifacts()
+        {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        for (physical_root, projection) in [
+            (physical.control(), claim.control()),
+            (physical.linear(), claim.linear()),
+            (physical.merge(), claim.merge()),
+        ] {
+            let manifest = self
+                .store
+                .get::<super::journal::LaneStateManifest>(physical_root)?
+                .ok_or(JournalStoreError::Unavailable)?;
+            let bytes = self
+                .store
+                .load_blob(JournalBlobClass::LaneState, &manifest.state)?
+                .ok_or(JournalStoreError::Unavailable)?;
+            if manifest.id() != projection.manifest() {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+            projection.verify_state(&bytes)?;
+        }
+        let artifacts = self
+            .store
+            .get::<super::journal::ArtifactClosure>(claim.artifacts())?
+            .ok_or(JournalStoreError::Unavailable)?;
+        if artifacts.genesis != claim.genesis() {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        for reference in &artifacts.artifacts {
+            let bytes = self
+                .store
+                .load_blob(JournalBlobClass::CatalogArtifact, reference)?
+                .ok_or(JournalStoreError::Unavailable)?;
+            if !reference.matches(&bytes) {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+        }
+        for (id, scope) in [
+            (
+                physical.ordered_invocations(),
+                super::journal::InvocationOwnershipScope::Ordered,
+            ),
+            (
+                physical.merge_invocations(),
+                super::journal::InvocationOwnershipScope::Merge,
+            ),
+            (
+                physical.local_invocations(),
+                super::journal::InvocationOwnershipScope::Local(heads.node),
+            ),
+        ] {
+            let manifest = self
+                .store
+                .get::<super::journal::InvocationIndexManifest>(id)?
+                .ok_or(JournalStoreError::Unavailable)?;
+            if manifest.genesis != claim.genesis() || manifest.scope != scope {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+            super::invocation_index::validate_manifest_root(&self.store, id, &manifest)
+                .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        }
+        let entry = self
+            .store
+            .get::<OrderedEntry>(claim.ordered().head.ok_or(JournalStoreError::Unavailable)?)?
+            .ok_or(JournalStoreError::Unavailable)?;
+        if Some(entry.id()) != claim.ordered().head
+            || entry.index != claim.ordered().index
+            || entry.genesis != claim.genesis()
+            || entry.input.runtime != *claim.runtime()
+        {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        Ok(Some((claim.clone(), entry)))
     }
 
     /// Acknowledge only an exact V2 anchor from this generation and physical
@@ -3972,8 +4169,43 @@ where
         let anchor = self
             .ledger
             .ordered_anchor(index)?
-            .filter(|anchor| anchor.term == term && anchor.claim == claim)
-            .ok_or(JournalStoreError::Unavailable)?;
+            .filter(|anchor| anchor.term == term && anchor.claim == claim);
+        let Some(anchor) = anchor else {
+            if let Some((bound, _)) = self.available_common_checkpoint_boundary()?
+                && bound.raft_index() == index
+                && bound.raft_term() == term
+                && bound.commitment() == claim
+            {
+                return Ok(VerifiedSharedOrderedAvailability {
+                    _store: self.store.instance_id(),
+                    _epoch: self.store.validation_epoch(),
+                    _claim: bound,
+                });
+            }
+            // A voter which has not compacted can hold the identical logical
+            // state at a later applied leader-noop foundation. Authenticate
+            // its original anchor and the ledger's complete noop-only suffix;
+            // an append acknowledgement or a larger raw cursor is insufficient.
+            let logical = self.snapshot_boundary_claim()?;
+            let context = self.ledger.snapshot_context(&logical)?;
+            if context.ordered.raft_index() > logical.raft_index()
+                && context.ordered.raft_index() == index
+                && context.ordered.raft_term() == term
+                && context.ordered.commitment() == claim
+            {
+                self.verify_ordered_availability(
+                    logical.raft_index(),
+                    logical.raft_term(),
+                    logical.commitment(),
+                )?;
+                return Ok(VerifiedSharedOrderedAvailability {
+                    _store: self.store.instance_id(),
+                    _epoch: self.store.validation_epoch(),
+                    _claim: context.ordered,
+                });
+            }
+            return Err(JournalStoreError::Unavailable.into());
+        };
         let entry = self
             .store
             .get::<OrderedEntry>(anchor.entry)?
@@ -4000,7 +4232,9 @@ where
         })
     }
 
-    fn snapshot_boundary_claim(&self) -> Result<OrderedCommitClaim, SharedJournalDriverError> {
+    pub(crate) fn snapshot_boundary_claim(
+        &self,
+    ) -> Result<OrderedCommitClaim, SharedJournalDriverError> {
         let heads = self.materialization.heads();
         let entry = heads.ordered_head.ok_or(SharedJournalDriverError::Ledger(
             AgentRaftApplicationErrorV2::SnapshotBoundaryRequired,
@@ -4089,6 +4323,133 @@ where
         &mut self,
     ) -> Result<SharedAgentSnapshotClaim, SharedJournalDriverError> {
         self.prepare_snapshot_candidate().map(|(_, claim)| claim)
+    }
+
+    pub(crate) fn common_snapshot_candidate(
+        &mut self,
+        initial: &RuntimeState,
+    ) -> Result<
+        (
+            SharedAgentCommonSnapshotClaim,
+            SharedAgentSnapshotClaim,
+            super::journal::JournalHeads,
+        ),
+        SharedJournalDriverError,
+    > {
+        super::replay::validate_common_checkpoint_profile(
+            &self.store,
+            &self.materialization,
+            initial,
+        )?;
+        let (plan, physical) = self.prepare_snapshot_candidate()?;
+        plan.validate_common_claim(&physical)?;
+        let common = SharedAgentCommonSnapshotClaim::new(
+            physical.ordered().clone(),
+            physical.active_committee().clone(),
+            physical.authority_epoch(),
+            self.materialization.common_snapshot_ancestry()?,
+        )?;
+        Ok((common, physical, plan.next_heads().clone()))
+    }
+
+    pub(crate) fn require_common_snapshot_profile(
+        &self,
+        initial: &RuntimeState,
+    ) -> Result<(), SharedJournalDriverError> {
+        super::replay::validate_common_checkpoint_profile(
+            &self.store,
+            &self.materialization,
+            initial,
+        )
+        .map_err(Into::into)
+    }
+
+    pub(crate) fn install_common_snapshot(
+        &mut self,
+        certificate: &SharedAgentCommonSnapshotCertificate,
+        binding: &SharedAgentLocalSnapshotBinding,
+        initial: &RuntimeState,
+    ) -> Result<InstalledAgentRaftSnapshotV2, SharedJournalDriverError> {
+        self.install_common_snapshot_inner(certificate, binding, initial, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_common_snapshot_through_journal_for_test(
+        &mut self,
+        certificate: &SharedAgentCommonSnapshotCertificate,
+        binding: &SharedAgentLocalSnapshotBinding,
+        initial: &RuntimeState,
+    ) -> Result<InstalledAgentRaftSnapshotV2, SharedJournalDriverError> {
+        self.install_common_snapshot_inner(certificate, binding, initial, true)
+    }
+
+    fn install_common_snapshot_inner(
+        &mut self,
+        certificate: &SharedAgentCommonSnapshotCertificate,
+        binding: &SharedAgentLocalSnapshotBinding,
+        initial: &RuntimeState,
+        stop_after_journal: bool,
+    ) -> Result<InstalledAgentRaftSnapshotV2, SharedJournalDriverError> {
+        super::replay::validate_common_checkpoint_profile(
+            &self.store,
+            &self.materialization,
+            initial,
+        )?;
+        if let Some(installed) = self.ledger.current_snapshot()?
+            && installed.certificate_commitment == binding.commitment()
+        {
+            binding.verify(certificate, &installed.claim)?;
+            validate_published_shared_checkpoint(
+                &self.store,
+                &self.materialization,
+                &installed.claim,
+            )
+            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+            return self
+                .ledger
+                .install_common_snapshot(certificate, binding, None)
+                .map_err(Into::into);
+        }
+        let logical = self.snapshot_boundary_claim()?;
+        if self.materialization.heads_id() == binding.claim().journal_heads() {
+            // Journal-first recovery may only complete the exact signed local
+            // binding, never reconstruct a different successor checkpoint.
+            validate_published_shared_checkpoint(
+                &self.store,
+                &self.materialization,
+                binding.claim(),
+            )
+            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+            binding.verify(certificate, binding.claim())?;
+        } else {
+            let (plan, expected) = self.prepare_snapshot_candidate()?;
+            plan.validate_common_claim(&expected)?;
+            let verified = binding.verify(certificate, &expected)?;
+            self.materialization = plan.publish_shared(&mut self.store, &verified)?;
+        }
+        super::replay::seed_common_checkpoint_ancestry(
+            &mut self.materialization,
+            certificate,
+            binding,
+        )?;
+        if stop_after_journal {
+            return Err(JournalStoreError::Unavailable.into());
+        }
+        self.ledger
+            .install_common_snapshot(certificate, binding, Some(&logical))
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn common_snapshot_authority(
+        &self,
+    ) -> Result<
+        Option<(
+            SharedAgentCommonSnapshotCertificate,
+            SharedAgentLocalSnapshotBinding,
+        )>,
+        SharedJournalDriverError,
+    > {
+        self.ledger.common_snapshot_authority().map_err(Into::into)
     }
 
     /// Publish and install one exact Agent-specific snapshot. The journal CAS
@@ -4732,6 +5093,158 @@ pub(crate) fn preflight_portable_checkpoint<T: super::replay::ReplaySealedOrdina
     let materialization = materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases)?;
     validate_portable_materialization(&store, &materialization, claim)?;
     Ok(materialization)
+}
+
+pub(crate) fn preflight_common_source<T: super::replay::ReplaySealedOrdinaryGenesis>(
+    sealed: &T,
+    catalog: &[RuntimeBlob],
+    image: &PortableJournalCheckpoint,
+    claim: &SharedAgentSnapshotClaim,
+    maximum_index_nodes: usize,
+    trust: Arc<dyn AgentTrustProvider>,
+    merge: Arc<dyn LocalMergeAuthenticator>,
+    committee: super::genesis::AgentReplicaCommittee,
+) -> Result<(), SharedJournalDriverError> {
+    if image.heads().id() != claim.journal_heads() || merge.node() != claim.local_node() {
+        return Err(SharedJournalDriverError::CrossStoreMismatch);
+    }
+    let mut store = MemoryAgentJournalStore::new(sealed.genesis().runtime().agent, merge.node())?;
+    for blob in catalog {
+        store.put_blob(
+            JournalBlobClass::CatalogArtifact,
+            &blob.reference,
+            &blob.bytes,
+        )?;
+    }
+    store.initialize_shared(sealed)?;
+    store.install_portable_checkpoint(image, maximum_index_nodes)?;
+    let mut executor = StandardLocalReplayExecutor::new_shared(
+        store.catalog_blob_resolver()?,
+        trust,
+        merge,
+        vec![committee],
+    );
+    let materialization = materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases)?;
+    super::replay::validate_common_checkpoint_state(
+        &store,
+        &materialization,
+        claim,
+        sealed.post_create(),
+    )?;
+    Ok(())
+}
+
+pub(crate) struct ReboundCommonCheckpoint {
+    store: MemoryAgentJournalStore,
+    materialization: ReplayMaterialization,
+    image: PortableJournalCheckpoint,
+    initial: RuntimeState,
+}
+
+impl ReboundCommonCheckpoint {
+    pub(crate) fn image(&self) -> &PortableJournalCheckpoint {
+        &self.image
+    }
+
+    pub(crate) fn physical_claim(
+        &self,
+        common: &SharedAgentCommonSnapshotClaim,
+        foundation: &super::shared_raft::CommonSnapshotRestoreFoundation,
+    ) -> Result<SharedAgentSnapshotClaim, SharedJournalDriverError> {
+        let heads = self.image.heads();
+        let checkpoint = self
+            .store
+            .get::<super::journal::CheckpointManifest>(
+                heads.checkpoint.ok_or(JournalStoreError::Corrupt)?,
+            )?
+            .ok_or(JournalStoreError::MissingObject)?;
+        let lane = |kind| {
+            checkpoint
+                .lanes
+                .iter()
+                .find(|lane| lane.lane == kind)
+                .map(|lane| lane.state)
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)
+        };
+        let claim = SharedAgentSnapshotClaim::new(
+            common.ordered().clone(),
+            common.active_committee().clone(),
+            common.authority_epoch(),
+            foundation.journal_store,
+            foundation.boundary_payload_commitment,
+            heads.id(),
+            heads.previous.ok_or(JournalStoreError::Corrupt)?,
+            heads.id(),
+            checkpoint.id(),
+            heads.node,
+            lane(PersistedLane::Control)?,
+            lane(PersistedLane::Linear)?,
+            lane(PersistedLane::Merge)?,
+            lane(PersistedLane::Local)?,
+            heads.ordered_invocations,
+            heads.merge_invocations,
+            heads.local_invocations,
+            checkpoint.artifacts,
+            foundation.retired_audit_root,
+            foundation.committee_evidence_root,
+            None,
+        )?;
+        if foundation.local_node != heads.node {
+            return Err(SharedJournalDriverError::WrongReplica);
+        }
+        super::replay::validate_common_checkpoint_state(
+            &self.store,
+            &self.materialization,
+            &claim,
+            &self.initial,
+        )?;
+        Ok(claim)
+    }
+
+    pub(crate) fn validate(
+        self,
+        verified: super::shared_commit::VerifiedSharedAgentSnapshot,
+    ) -> Result<super::replay::ValidatedCommonCheckpoint, SharedJournalDriverError> {
+        super::replay::validate_common_checkpoint_image(
+            &self.store,
+            &self.materialization,
+            self.image,
+            verified,
+            &self.initial,
+        )
+        .map_err(Into::into)
+    }
+}
+
+pub(crate) fn preflight_common_rebind<T: super::replay::ReplaySealedOrdinaryGenesis>(
+    sealed: &T,
+    image: &PortableJournalCheckpoint,
+    predecessor: &super::journal::JournalHeads,
+    limits: PortableJournalLimits,
+    trust: Arc<dyn AgentTrustProvider>,
+    merge: Arc<dyn LocalMergeAuthenticator>,
+    committee: super::genesis::AgentReplicaCommittee,
+) -> Result<ReboundCommonCheckpoint, SharedJournalDriverError> {
+    let (mut store, image) =
+        MemoryAgentJournalStore::rebind_common_checkpoint(sealed, image, predecessor, limits)?;
+    let mut executor = StandardLocalReplayExecutor::new_shared(
+        store.catalog_blob_resolver()?,
+        trust,
+        merge,
+        vec![committee],
+    );
+    let materialization = materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases)?;
+    super::replay::validate_common_checkpoint_profile(
+        &store,
+        &materialization,
+        sealed.post_create(),
+    )?;
+    Ok(ReboundCommonCheckpoint {
+        store,
+        materialization,
+        image,
+        initial: sealed.post_create().clone(),
+    })
 }
 
 fn validate_portable_materialization<S>(

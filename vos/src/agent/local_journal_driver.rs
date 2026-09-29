@@ -817,6 +817,26 @@ pub trait LocalMergeAuthenticator: Send + Sync {
     ) -> Option<super::shared_commit::ReplicaCommitSignature> {
         None
     }
+
+    /// Sign only an independently reconstructed common Shared checkpoint.
+    /// The exact admitted voter/key checks remain the signer's responsibility.
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    fn sign_common_snapshot_candidate(
+        &self,
+        _candidate: &super::shared_host::VerifiedSharedAgentCommonSnapshotCandidate,
+    ) -> Option<super::shared_commit::ReplicaCommitSignature> {
+        None
+    }
+
+    /// Bind this node's reconstructed physical checkpoint to a verified common
+    /// certificate. This is node-local publication authority, not another vote.
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    fn sign_local_snapshot_candidate(
+        &self,
+        _candidate: &super::shared_host::VerifiedSharedAgentLocalSnapshotCandidate,
+    ) -> Option<super::shared_commit::ReplicaCommitSignature> {
+        None
+    }
 }
 
 /// Why an authenticated node key cannot back Local Merge publications.
@@ -897,6 +917,57 @@ impl LocalMergeAuthenticator for Ed25519NodeMergeAuthenticator {
             return None;
         }
         let signature: [u8; super::authority::ED25519_SIGNATURE_BYTES] = self
+            .keypair
+            .sign(&candidate.signing_message().0)
+            .ok()?
+            .try_into()
+            .ok()?;
+        super::shared_commit::ReplicaCommitSignature::new(self.node, signature).ok()
+    }
+
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    fn sign_common_snapshot_candidate(
+        &self,
+        candidate: &super::shared_host::VerifiedSharedAgentCommonSnapshotCandidate,
+    ) -> Option<super::shared_commit::ReplicaCommitSignature> {
+        let member = candidate
+            .claim()
+            .active_committee()
+            .member_by_node(self.node)?;
+        if member.replica().role != super::ReplicaRole::Voter
+            || member.ed25519_public_key()
+                != &self.keypair.public().try_into_ed25519().ok()?.to_bytes()
+            || member.peer_id() != self.keypair.public().to_peer_id().to_bytes()
+        {
+            return None;
+        }
+        let signature = self
+            .keypair
+            .sign(&candidate.signing_message().0)
+            .ok()?
+            .try_into()
+            .ok()?;
+        super::shared_commit::ReplicaCommitSignature::new(self.node, signature).ok()
+    }
+
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    fn sign_local_snapshot_candidate(
+        &self,
+        candidate: &super::shared_host::VerifiedSharedAgentLocalSnapshotCandidate,
+    ) -> Option<super::shared_commit::ReplicaCommitSignature> {
+        let member = candidate
+            .claim()
+            .active_committee()
+            .member_by_node(self.node)?;
+        if candidate.claim().local_node() != self.node
+            || member.replica().role != super::ReplicaRole::Voter
+            || member.ed25519_public_key()
+                != &self.keypair.public().try_into_ed25519().ok()?.to_bytes()
+            || member.peer_id() != self.keypair.public().to_peer_id().to_bytes()
+        {
+            return None;
+        }
+        let signature = self
             .keypair
             .sign(&candidate.signing_message().0)
             .ok()?

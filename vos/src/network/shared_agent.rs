@@ -31,12 +31,17 @@ use crate::agent::journal::{
     MAX_MERGE_FRONTIER_ENTRIES, MAX_REPLAY_SUFFIX_BYTES, MAX_REPLAY_SUFFIX_ENTRIES, MergeEvent,
     MergeEventId, ReplayInputId,
 };
-use crate::agent::shared_commit::SharedAgentSnapshotCertificate;
+use crate::agent::shared_commit::{
+    SharedAgentCommonSnapshotCertificate, SharedAgentSnapshotCertificate,
+};
 use crate::agent::shared_host::{
     SharedAgentApplyOutcome, SharedAgentHost, SharedAgentHostError, SharedAgentRuntimeProjection,
     SharedAgentStatus, SharedAgentTransportState,
 };
 use crate::agent::shared_journal_driver::SharedMergeObject;
+use crate::agent::shared_raft::{
+    ACTIVE_CONFIG_MAGIC, META_AGENT_ACTIVE_CONFIG, META_AGENT_VOTED_FOR, META_LEGACY_ACTIVE_CONFIG,
+};
 use crate::agent::{ReplicaRole, shared_raft};
 use crate::commit::CommitError;
 use crate::raft::{RAFT_META, RaftLog, RaftMeta};
@@ -51,10 +56,6 @@ use super::agent_protocol::{
 };
 use super::agent_raft_transport::AgentRaftTransport;
 
-const META_AGENT_VOTED_FOR: &str = "agent_node_voted_for_v1";
-const META_AGENT_ACTIVE_CONFIG: &str = "agent_node_active_config_v1";
-const META_LEGACY_ACTIVE_CONFIG: &str = "active_config";
-const ACTIVE_CONFIG_MAGIC: &[u8; 4] = b"ANC1";
 const MAX_AGENT_VOTERS: usize = crate::agent::MAX_AGENT_REPLICAS;
 const MAX_PENDING_ORDERED_REPLIES: usize = 1_024;
 const MAX_MERGE_SYNC_SCAN_EVENTS: usize = MAX_REPLAY_SUFFIX_ENTRIES + MAX_MERGE_FRONTIER_ENTRIES;
@@ -769,6 +770,31 @@ impl AttachmentFingerprint {
             }
     }
 
+    fn requires_promotion_barrier(
+        &self,
+        explicit: bool,
+        implicit_system: bool,
+        recovering: bool,
+        pending_management: bool,
+        management_retirement: bool,
+    ) -> bool {
+        let fixed_three = self.members.len() == 3
+            && self.voters.len() == 3
+            && self
+                .members
+                .iter()
+                .map(|(node, _)| *node)
+                .eq(self.voters.iter().copied())
+            && self.local_role == ReplicaRole::Voter
+            && self.next_committee.is_none()
+            && self.next_voters.is_none()
+            && self.joint_old.is_none();
+        explicit
+            || pending_management
+            || management_retirement
+            || (implicit_system && (recovering || !fixed_three))
+    }
+
     fn owns_raft_worker(&self, local: NodeId) -> bool {
         self.voters.binary_search(&local).is_ok()
             || self
@@ -1008,6 +1034,114 @@ pub(crate) enum CleanManagementSubmission {
 }
 
 impl SharedRouteHandler {
+    /// Collect a fixed-three common checkpoint certificate. Callers retain
+    /// the checkpoint admission gate, but neither host nor proposal locks may
+    /// cross peer I/O. Every signature is checked over the same exact claim.
+    fn collect_common_snapshot_certificate(
+        &self,
+        expected_committee: &AgentReplicaCommittee,
+        signer: &dyn LocalMergeAuthenticator,
+    ) -> Result<SharedAgentCommonSnapshotCertificate, SharedAgentHostError> {
+        let (fingerprint, candidate, signature) = {
+            let mut host = self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            drain_committed(&mut host, self.agent, &self.ordered_replies)?;
+            let status = host
+                .supervisor_attachment_status(self.agent)?
+                .ok_or(SharedAgentHostError::AgentNotFound)?;
+            let fingerprint = AttachmentFingerprint::from_attachment_status(&status)?;
+            if status.transport != SharedAgentTransportState::Attached
+                || fingerprint.protocol_route != self.route
+                || fingerprint.next_committee.is_some()
+                || fingerprint.joint_old.is_some()
+                || fingerprint.voters.len() != 3
+                || fingerprint
+                    .voters
+                    .binary_search(&self.network.agent_node_id())
+                    .is_err()
+                || signer.node().0 != self.network.agent_node_id().0
+            {
+                return Err(SharedAgentHostError::SnapshotCertificateInvalid);
+            }
+            let candidate = host.request_common_snapshot_compaction(self.agent)?;
+            if candidate.claim().active_committee() != expected_committee {
+                return Err(SharedAgentHostError::SnapshotCertificateInvalid);
+            }
+            let signature = signer
+                .sign_common_snapshot_candidate(&candidate)
+                .filter(|signature| signature.signer() == signer.node())
+                .ok_or(SharedAgentHostError::SnapshotCertificateInvalid)?;
+            (fingerprint, candidate, signature)
+        };
+        let local = self.network.agent_node_id();
+        let deadline = Instant::now() + ORDERED_REPLY_WAIT;
+        let mut pending = BTreeMap::new();
+        for &voter in &fingerprint.voters {
+            if voter != local {
+                pending.insert(
+                    voter,
+                    self.network.send_agent_common_snapshot_vote(
+                        voter,
+                        self.route,
+                        candidate.claim().clone(),
+                    ),
+                );
+            }
+        }
+        let certificate = loop {
+            let mut finished = Vec::new();
+            let mut verified = None;
+            for (&voter, response) in &pending {
+                match response.try_recv() {
+                    Ok(Ok(Some(remote))) if remote.signer().0 == voter.0 => {
+                        let mut signatures = vec![signature.clone(), remote];
+                        signatures.sort_unstable_by_key(|signature| signature.signer());
+                        if let Ok(certificate) = SharedAgentCommonSnapshotCertificate::new(
+                            candidate.claim().clone(),
+                            signatures,
+                        ) {
+                            if certificate
+                                .verify(expected_committee, candidate.claim())
+                                .is_ok()
+                            {
+                                verified = Some(certificate);
+                            }
+                        }
+                        finished.push(voter);
+                    }
+                    Ok(_) | Err(std_mpsc::TryRecvError::Disconnected) => finished.push(voter),
+                    Err(std_mpsc::TryRecvError::Empty) => {}
+                }
+            }
+            if let Some(certificate) = verified {
+                break certificate;
+            }
+            for voter in finished {
+                pending.remove(&voter);
+            }
+            if pending.is_empty() || Instant::now() >= deadline {
+                return Err(SharedAgentHostError::Unavailable);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let mut host = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let status = host
+            .supervisor_attachment_status(self.agent)?
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        if status.transport != SharedAgentTransportState::Attached
+            || AttachmentFingerprint::from_attachment_status(&status)? != fingerprint
+        {
+            return Err(SharedAgentHostError::SnapshotCertificateInvalid);
+        }
+        host.verify_common_snapshot_candidate(self.agent, candidate.claim())?;
+        Ok(certificate)
+    }
+
     /// Result delivery requires applied *state* on a majority, not merely a
     /// committed Raft command on a majority. This evidence is ephemeral and
     /// recollected after restart; it is not snapshot/compaction authority.
@@ -2568,6 +2702,34 @@ impl AgentRouteHandler for SharedRouteHandler {
         }
         let recovering = matches!(&frame.message, AgentMessage::ProjectionRecoveryRequest(_));
         match frame.message {
+            AgentMessage::CommonSnapshotVoteRequest(claim) => {
+                let commitment = Hash(claim.commitment().0);
+                let signature = (|| {
+                    let _proposal = self.proposal.try_lock().ok()?;
+                    let mut host = self.host.lock().ok()?;
+                    drain_committed(&mut host, self.agent, &self.ordered_replies).ok()?;
+                    let status = host.supervisor_attachment_status(self.agent).ok()??;
+                    let fingerprint = AttachmentFingerprint::from_attachment_status(&status).ok()?;
+                    if status.transport != SharedAgentTransportState::Attached
+                        || fingerprint.protocol_route != self.route
+                        || fingerprint.next_committee.is_some()
+                        || fingerprint.joint_old.is_some()
+                        || fingerprint.voters.len() != 3
+                        || fingerprint.voters.binary_search(&sender).is_err()
+                        || fingerprint
+                            .voters
+                            .binary_search(&self.network.agent_node_id())
+                            .is_err()
+                    {
+                        return None;
+                    }
+                    host.sign_common_snapshot_candidate(self.agent, &claim).ok()
+                })();
+                Ok(AgentMessage::CommonSnapshotVoteReply {
+                    claim: commitment,
+                    signature,
+                })
+            }
             AgentMessage::AppliedAvailabilityRequest(request) => {
                 let mut host = self.host.lock().map_err(|_| AgentHandlerError)?;
                 let status = host.supervisor_attachment_status(self.agent)
@@ -2800,9 +2962,9 @@ pub struct SharedAgentNetworkHost {
     host: Arc<Mutex<SharedAgentHost>>,
     network: Arc<Network>,
     generations: BTreeMap<crate::service::AgentId, AttachedGeneration>,
-    // System attachments always serialize leader promotion and drain the
-    // recovered physical suffix before publishing a route. Keep that
-    // identity across refresh/checkpoint reattachment, not just bootstrap.
+    // Retain system identity across refresh/checkpoint reattachment so the
+    // applicable promotion and recovery barriers still guard route exposure.
+    // Audited stable-three followers may register before leader promotion.
     system_agents: BTreeSet<crate::service::AgentId>,
     // Exact pending envelopes outlive a volatile route/worker generation.
     // Startup callers must seed these from independently verified durable
@@ -4115,6 +4277,83 @@ impl SharedAgentNetworkHost {
         }
     }
 
+    /// Explicit qualification path only. Automatic multi-voter pruning stays
+    /// disabled until authenticated catch-up and retained-result availability
+    /// have been qualified end to end.
+    #[cfg(test)]
+    pub(crate) fn certified_common_checkpoint_for_admission(
+        &mut self,
+        agent: crate::service::AgentId,
+        work: &InvocationWork,
+        authorization: &InvocationAuthorization,
+        expected_committee: &AgentReplicaCommittee,
+        signer: &dyn LocalMergeAuthenticator,
+    ) -> Result<SharedAgentCommonSnapshotCertificate, SharedAgentHostError> {
+        let started = Instant::now();
+        if expected_committee.members().len() != 3
+            || expected_committee.voter_count() != 3
+            || work.agent.0 != agent.0
+            || !authorization.matches_work(work)
+        {
+            return Err(SharedAgentHostError::SnapshotCertificateInvalid);
+        }
+        self.ensure_reattached(agent)?;
+        let attached = self
+            .generations
+            .get(&agent)
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        let worker = attached
+            .coordinator
+            .worker
+            .as_ref()
+            .ok_or(SharedAgentHostError::Unavailable)?;
+        let barrier = futures_executor::block_on(worker.snapshot())
+            .ok_or(SharedAgentHostError::Unavailable)?;
+        if barrier.role != vos_raft::Role::Leader || barrier.commit_index != barrier.last_log_index
+        {
+            return Err(SharedAgentHostError::Unavailable);
+        }
+        attached
+            .coordinator
+            .reserve_checkpoint_gate(work, authorization)?;
+        let certificate = match attached
+            .coordinator
+            .collect_common_snapshot_certificate(expected_committee, signer)
+        {
+            Ok(certificate) => certificate,
+            Err(error) => {
+                let _ = attached
+                    .coordinator
+                    .release_projection_pair(work, authorization);
+                return Err(error);
+            }
+        };
+        tracing::debug!(
+            elapsed_us = started.elapsed().as_micros(),
+            phase = "quorum",
+            "Common checkpoint phase complete"
+        );
+        self.retire(agent)?;
+        let installed = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .install_common_snapshot(agent, &certificate);
+        tracing::debug!(
+            elapsed_us = started.elapsed().as_micros(), result = ?installed,
+            phase = "install", "Common checkpoint phase complete"
+        );
+        let reattached = self.reattach_current(agent);
+        tracing::debug!(
+            elapsed_us = started.elapsed().as_micros(), result = ?reattached,
+            phase = "reattach", "Common checkpoint phase complete"
+        );
+        match (installed, reattached) {
+            (Ok(_), Ok(())) => Ok(certificate),
+            (Err(error), Ok(())) | (_, Err(error)) => Err(error),
+        }
+    }
+
     fn reattach_current(
         &mut self,
         agent: crate::service::AgentId,
@@ -4167,10 +4406,6 @@ impl SharedAgentNetworkHost {
         if recovering.is_some() && (retirement.is_some() || pending_management.is_some()) {
             return Err(SharedAgentHostError::Conflict);
         }
-        let promotion_barrier = promotion_barrier
-            || self.system_agents.contains(&agent)
-            || retirement.is_some()
-            || pending_management.is_some();
         if self.generations.contains_key(&agent) {
             return Err(SharedAgentHostError::Conflict);
         }
@@ -4288,6 +4523,17 @@ impl SharedAgentNetworkHost {
         if !fingerprint.validates_local(local) {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
+        // A stable fixed-three system route must be reachable before election,
+        // just as during pending-system attachment. Defer only the implicit
+        // system barrier; explicit and durable-operation barriers remain.
+        // Every subsequent ordered submission still requires a local proposer.
+        let promotion_barrier = fingerprint.requires_promotion_barrier(
+            promotion_barrier,
+            self.system_agents.contains(&agent),
+            recovering.is_some(),
+            pending_management.is_some(),
+            retirement.is_some(),
+        );
         let authenticated_snapshot = match status.snapshots {
             crate::agent::shared_host::SharedAgentSnapshotState::None => (0, 0),
             crate::agent::shared_host::SharedAgentSnapshotState::Installed {
@@ -6038,6 +6284,76 @@ mod tests {
         *lifecycle.write().unwrap() = false;
         assert!(acquire_route_activation(&lifecycle, &stale).is_none());
         assert!(lifecycle.try_write().is_ok());
+    }
+
+    #[test]
+    fn fixed_three_reattachment_defers_only_implicit_system_promotion() {
+        let claim = crate::agent::shared_commit::common_snapshot_claim_for_test();
+        let members = claim
+            .active_committee()
+            .members()
+            .iter()
+            .map(|member| {
+                (
+                    NodeId(member.replica().node.0),
+                    PeerId::from_bytes(member.peer_id()).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let voters = members.iter().map(|(node, _)| *node).collect();
+        let base = AttachmentFingerprint {
+            protocol_route: AgentGenerationRoute {
+                space: vos_agent_sdk::SpaceId(claim.ordered().space().0),
+                agent: vos_agent_sdk::AgentId(claim.ordered().agent().0),
+                generation: Hash([3; 32]),
+            },
+            durable_route: shared_raft::AgentRouteKey::new(
+                claim.ordered().space(),
+                claim.ordered().agent(),
+                claim.ordered().genesis(),
+                claim.ordered().admission(),
+                claim.ordered().committee(),
+            )
+            .unwrap(),
+            members,
+            voters,
+            next_committee: None,
+            next_voters: None,
+            joint_old: None,
+            local_role: ReplicaRole::Voter,
+        };
+        assert!(!base.requires_promotion_barrier(false, true, false, false, false));
+        for required in 0..4 {
+            assert!(base.requires_promotion_barrier(
+                required == 0,
+                true,
+                required == 1,
+                required == 2,
+                required == 3,
+            ));
+        }
+        for invalid in 0..6 {
+            let mut changed = base.clone();
+            match invalid {
+                0 => {
+                    changed.members.truncate(1);
+                    changed.voters.truncate(1);
+                }
+                1 => changed.joint_old = Some(changed.voters.clone()),
+                2 => changed.next_committee = Some(claim.active_committee().id()),
+                3 => changed.next_voters = Some(changed.voters.clone()),
+                4 => changed.local_role = ReplicaRole::Observer,
+                5 => {
+                    changed.voters.pop();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                changed.requires_promotion_barrier(false, true, false, false, false),
+                "shape {invalid}"
+            );
+            assert!(!changed.requires_promotion_barrier(false, false, false, false, false));
+        }
     }
 
     #[test]

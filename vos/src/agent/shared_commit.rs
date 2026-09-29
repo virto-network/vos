@@ -44,6 +44,12 @@ const PORTABLE_SNAPSHOT_CLAIM_DOMAIN: &[u8] = b"vos/agent/shared/portable-snapsh
 const PORTABLE_SNAPSHOT_MESSAGE_DOMAIN: &[u8] = b"vos/agent/shared/portable-snapshot-signature/v1";
 const PORTABLE_SNAPSHOT_CERTIFICATE_DOMAIN: &[u8] =
     b"vos/agent/shared/portable-snapshot-certificate/v1";
+const COMMON_SNAPSHOT_CLAIM_DOMAIN: &[u8] = b"vos/agent/shared/common-snapshot-claim/v1";
+const COMMON_SNAPSHOT_MESSAGE_DOMAIN: &[u8] = b"vos/agent/shared/common-snapshot-signature/v1";
+const COMMON_SNAPSHOT_CERTIFICATE_DOMAIN: &[u8] =
+    b"vos/agent/shared/common-snapshot-certificate/v1";
+const LOCAL_SNAPSHOT_BINDING_DOMAIN: &[u8] = b"vos/agent/shared/local-snapshot-binding/v1";
+const LOCAL_SNAPSHOT_MESSAGE_DOMAIN: &[u8] = b"vos/agent/shared/local-snapshot-signature/v1";
 
 /// Maximum complete canonical lane projection.
 pub const MAX_SHARED_LANE_PROJECTION_BYTES: usize = 128;
@@ -74,6 +80,12 @@ pub const MAX_SHARED_AGENT_PORTABLE_SNAPSHOT_CERTIFICATE_BYTES: usize =
     MAX_SHARED_AGENT_PORTABLE_SNAPSHOT_CLAIM_BYTES
         + MAX_REPLICA_COMMIT_SIGNATURES * MAX_REPLICA_COMMIT_SIGNATURE_BYTES
         + 1024;
+pub const MAX_SHARED_AGENT_COMMON_SNAPSHOT_CLAIM_BYTES: usize =
+    MAX_ORDERED_COMMIT_CLAIM_BYTES + super::genesis::MAX_AGENT_REPLICA_COMMITTEE_BYTES + 128;
+pub const MAX_SHARED_AGENT_COMMON_SNAPSHOT_CERTIFICATE_BYTES: usize =
+    MAX_SHARED_AGENT_COMMON_SNAPSHOT_CLAIM_BYTES + 3 * MAX_REPLICA_COMMIT_SIGNATURE_BYTES + 128;
+pub const MAX_SHARED_AGENT_LOCAL_SNAPSHOT_BINDING_BYTES: usize =
+    MAX_SHARED_AGENT_SNAPSHOT_CLAIM_BYTES + MAX_REPLICA_COMMIT_SIGNATURE_BYTES + 128;
 
 /// Exact content-addressed state materialization for one shared lane.
 ///
@@ -1185,6 +1197,407 @@ impl VerifiedSharedAgentSnapshot {
     }
 }
 
+/// Common checkpoint authority for the fixed-three-voter, Ordered-only path.
+/// Voters compare this against independently applied durable state before
+/// signing. Local/active Merge work is excluded by the checked host capability,
+/// not by pretending that foreign physical heads equal local physical heads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedAgentCommonSnapshotClaim {
+    ordered: OrderedCommitClaim,
+    active_committee: AgentReplicaCommittee,
+    authority_epoch: u64,
+    ancestry: SharedAgentCommonSnapshotAncestry,
+}
+
+/// Bounded preimage of the existing Ordered fence-ancestry commitment. Physical
+/// checkpoint cadence must not change the semantic ancestry seen by peers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedAgentCommonSnapshotAncestry {
+    checkpoint_base: OrderedBase,
+    ordered_anchor: Hash,
+}
+
+impl SharedAgentCommonSnapshotAncestry {
+    pub fn new(
+        checkpoint_base: OrderedBase,
+        ordered_anchor: Hash,
+    ) -> Result<Self, SharedCommitError> {
+        if checkpoint_base.validate().is_err() || ordered_anchor == Hash::ZERO {
+            return Err(SharedCommitError::InvalidSnapshotClaim);
+        }
+        Ok(Self {
+            checkpoint_base,
+            ordered_anchor,
+        })
+    }
+    pub const fn checkpoint_base(&self) -> OrderedBase {
+        self.checkpoint_base
+    }
+    pub const fn ordered_anchor(&self) -> Hash {
+        self.ordered_anchor
+    }
+    pub(crate) fn commitment_for(&self, ordered: &OrderedCommitClaim) -> Hash {
+        fn base_bytes(base: OrderedBase) -> [u8; 41] {
+            let mut bytes = [0; 41];
+            bytes[0] = u8::from(base.head.is_some());
+            bytes[1..9].copy_from_slice(&base.index.to_le_bytes());
+            if let Some(head) = base.head {
+                bytes[9..].copy_from_slice(&head.0);
+            }
+            bytes
+        }
+        Hash::digest(
+            b"vos/agent/replay/fence-ancestry-evidence",
+            &[
+                &ordered.genesis().0,
+                &base_bytes(self.checkpoint_base),
+                &base_bytes(ordered.ordered()),
+                &base_bytes(ordered.merge_fence()),
+                &self.ordered_anchor.0,
+            ],
+        )
+    }
+}
+
+impl SharedAgentCommonSnapshotClaim {
+    pub fn new(
+        ordered: OrderedCommitClaim,
+        active_committee: AgentReplicaCommittee,
+        authority_epoch: u64,
+        ancestry: SharedAgentCommonSnapshotAncestry,
+    ) -> Result<Self, SharedCommitError> {
+        let claim = Self {
+            ordered,
+            active_committee,
+            authority_epoch,
+            ancestry,
+        };
+        claim.validate()?;
+        Ok(claim)
+    }
+
+    pub const fn ordered(&self) -> &OrderedCommitClaim {
+        &self.ordered
+    }
+    pub const fn active_committee(&self) -> &AgentReplicaCommittee {
+        &self.active_committee
+    }
+    pub const fn authority_epoch(&self) -> u64 {
+        self.authority_epoch
+    }
+    pub const fn ancestry(&self) -> &SharedAgentCommonSnapshotAncestry {
+        &self.ancestry
+    }
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(COMMON_SNAPSHOT_CLAIM_DOMAIN, &[&self.encode()])
+    }
+
+    pub fn validate(&self) -> Result<(), SharedCommitError> {
+        self.ordered.validate()?;
+        self.active_committee
+            .validate()
+            .map_err(|_| SharedCommitError::InvalidCommittee)?;
+        if self.authority_epoch == 0
+            || self.active_committee.profile() != AgentProfile::Shared
+            || self.active_committee.members().len() != 3
+            || self.active_committee.voter_count() != 3
+            || self.active_committee.space() != self.ordered.space()
+            || self.active_committee.agent() != self.ordered.agent()
+            || self.active_committee.id() != self.ordered.committee()
+            || self.ancestry.checkpoint_base.validate().is_err()
+            || self.ancestry.ordered_anchor == Hash::ZERO
+            || self.ancestry.checkpoint_base.index > self.ordered.ordered().index
+            || (self.ancestry.checkpoint_base.index == self.ordered.ordered().index
+                && self.ancestry.checkpoint_base.head != self.ordered.ordered().head)
+            || self.ancestry.commitment_for(&self.ordered) != self.ordered.fence_ancestry()
+        {
+            return Err(SharedCommitError::InvalidSnapshotClaim);
+        }
+        enforce_encoded_bound(self, MAX_SHARED_AGENT_COMMON_SNAPSHOT_CLAIM_BYTES)
+    }
+
+    /// Common fields only. Physical lane state preimages, indexes and allowed
+    /// checkpoint transformations must additionally be verified by replay.
+    pub(crate) fn matches_physical_scope(&self, physical: &SharedAgentSnapshotClaim) -> bool {
+        self.ordered() == physical.ordered()
+            && self.active_committee() == physical.active_committee()
+            && self.authority_epoch() == physical.authority_epoch()
+            && self.ordered().ordered_invocations() == physical.ordered_invocations()
+            && self.ordered().artifacts() == physical.artifacts()
+    }
+}
+
+impl ServiceWire for SharedAgentCommonSnapshotClaim {
+    const MAGIC: [u8; 4] = *b"AGC1";
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let encoder = &mut Encoder(output);
+        encoder.bytes(&self.ordered.encode());
+        encoder.bytes(&self.active_committee.encode());
+        encoder.u64(self.authority_epoch);
+        encode_ordered_base(encoder, self.ancestry.checkpoint_base);
+        encoder.fixed(&self.ancestry.ordered_anchor.0);
+    }
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_SHARED_AGENT_COMMON_SNAPSHOT_CLAIM_BYTES)?;
+        Self::new(
+            decode_nested::<OrderedCommitClaim>(decoder, MAX_ORDERED_COMMIT_CLAIM_BYTES)?,
+            decode_nested::<AgentReplicaCommittee>(
+                decoder,
+                super::genesis::MAX_AGENT_REPLICA_COMMITTEE_BYTES,
+            )?,
+            decoder.u64()?,
+            SharedAgentCommonSnapshotAncestry::new(
+                decode_ordered_base(decoder)?,
+                Hash(decoder.fixed()?),
+            )
+            .map_err(map_decode_error)?,
+        )
+        .map_err(map_decode_error)
+    }
+}
+
+/// Two distinct admitted voters certify one common state, never two different
+/// node/store-bound AGS3 claims. This alone is not a physical publication token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedAgentCommonSnapshotCertificate {
+    claim: SharedAgentCommonSnapshotClaim,
+    signatures: Vec<ReplicaCommitSignature>,
+}
+
+impl SharedAgentCommonSnapshotCertificate {
+    pub fn new(
+        claim: SharedAgentCommonSnapshotClaim,
+        signatures: Vec<ReplicaCommitSignature>,
+    ) -> Result<Self, SharedCommitError> {
+        let certificate = Self { claim, signatures };
+        certificate.validate_shape()?;
+        Ok(certificate)
+    }
+    pub const fn claim(&self) -> &SharedAgentCommonSnapshotClaim {
+        &self.claim
+    }
+    pub fn signatures(&self) -> &[ReplicaCommitSignature] {
+        &self.signatures
+    }
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(COMMON_SNAPSHOT_CERTIFICATE_DOMAIN, &[&self.encode()])
+    }
+    pub(crate) fn signing_message(committee: AgentReplicaCommitteeId, claim: Hash) -> Hash {
+        Hash::digest(
+            COMMON_SNAPSHOT_MESSAGE_DOMAIN,
+            &[committee.as_bytes(), &claim.0],
+        )
+    }
+    pub fn verify(
+        &self,
+        trusted_committee: &AgentReplicaCommittee,
+        expected: &SharedAgentCommonSnapshotClaim,
+    ) -> Result<VerifiedSharedAgentCommonSnapshot, SharedCommitError> {
+        self.validate_shape()?;
+        expected.validate()?;
+        if expected != &self.claim {
+            return Err(SharedCommitError::WrongSnapshotClaim);
+        }
+        if trusted_committee != self.claim.active_committee() {
+            return Err(SharedCommitError::WrongCommittee);
+        }
+        if self.signatures.len() < trusted_committee.quorum_threshold() {
+            return Err(SharedCommitError::InsufficientQuorum);
+        }
+        let message = Self::signing_message(trusted_committee.id(), self.claim.commitment());
+        for signature in &self.signatures {
+            verify_snapshot_member_signature(trusted_committee, signature, message)?;
+        }
+        Ok(VerifiedSharedAgentCommonSnapshot {
+            claim: self.claim.clone(),
+            certificate_commitment: self.commitment(),
+        })
+    }
+    fn validate_shape(&self) -> Result<(), SharedCommitError> {
+        self.claim.validate()?;
+        if self.signatures.is_empty() {
+            return Err(SharedCommitError::InsufficientQuorum);
+        }
+        if self.signatures.len() > 3 {
+            return Err(SharedCommitError::CertificateTooLarge);
+        }
+        for (index, signature) in self.signatures.iter().enumerate() {
+            signature.validate()?;
+            if index != 0 && self.signatures[index - 1].signer >= signature.signer {
+                return Err(SharedCommitError::NonCanonicalOrder);
+            }
+        }
+        enforce_encoded_bound(self, MAX_SHARED_AGENT_COMMON_SNAPSHOT_CERTIFICATE_BYTES)
+    }
+}
+
+fn verify_snapshot_member_signature(
+    committee: &AgentReplicaCommittee,
+    signature: &ReplicaCommitSignature,
+    message: Hash,
+) -> Result<(), SharedCommitError> {
+    let member = committee
+        .member_by_node(signature.signer)
+        .ok_or(SharedCommitError::UnknownSigner)?;
+    if member.replica().role != ReplicaRole::Voter {
+        return Err(SharedCommitError::ObserverSignature);
+    }
+    if !verify_ed25519(
+        member.ed25519_public_key(),
+        &message.0,
+        &signature.signature,
+    ) {
+        return Err(SharedCommitError::InvalidSignature);
+    }
+    Ok(())
+}
+
+impl ServiceWire for SharedAgentCommonSnapshotCertificate {
+    const MAGIC: [u8; 4] = *b"AGQ4";
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let encoder = &mut Encoder(output);
+        encoder.bytes(&self.claim.encode());
+        encoder.u32(self.signatures.len() as u32);
+        for signature in &self.signatures {
+            encode_replica_signature(encoder, signature);
+        }
+    }
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_SHARED_AGENT_COMMON_SNAPSHOT_CERTIFICATE_BYTES)?;
+        let claim = decode_nested::<SharedAgentCommonSnapshotClaim>(
+            decoder,
+            MAX_SHARED_AGENT_COMMON_SNAPSHOT_CLAIM_BYTES,
+        )?;
+        let count = decoder.u32()? as usize;
+        if count > 3 {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let mut signatures = Vec::with_capacity(count);
+        for _ in 0..count {
+            signatures.push(decode_replica_signature(decoder)?);
+        }
+        Self::new(claim, signatures).map_err(map_decode_error)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct VerifiedSharedAgentCommonSnapshot {
+    claim: SharedAgentCommonSnapshotClaim,
+    certificate_commitment: Hash,
+}
+impl VerifiedSharedAgentCommonSnapshot {
+    pub const fn claim(&self) -> &SharedAgentCommonSnapshotClaim {
+        &self.claim
+    }
+    pub const fn certificate_commitment(&self) -> Hash {
+        self.certificate_commitment
+    }
+}
+
+/// Separately authenticated physical binding to a quorum-certified common
+/// checkpoint. The owner signature binds the entire AGS3 claim and exact QC;
+/// it is not a substitute for quorum agreement on the common state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedAgentLocalSnapshotBinding {
+    common_certificate: Hash,
+    claim: SharedAgentSnapshotClaim,
+    signature: ReplicaCommitSignature,
+}
+impl SharedAgentLocalSnapshotBinding {
+    pub fn new(
+        common_certificate: Hash,
+        claim: SharedAgentSnapshotClaim,
+        signature: ReplicaCommitSignature,
+    ) -> Result<Self, SharedCommitError> {
+        let value = Self {
+            common_certificate,
+            claim,
+            signature,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+    pub const fn common_certificate(&self) -> Hash {
+        self.common_certificate
+    }
+    pub const fn claim(&self) -> &SharedAgentSnapshotClaim {
+        &self.claim
+    }
+    pub const fn signature(&self) -> &ReplicaCommitSignature {
+        &self.signature
+    }
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(LOCAL_SNAPSHOT_BINDING_DOMAIN, &[&self.encode()])
+    }
+    pub(crate) fn signing_message(
+        common_certificate: Hash,
+        physical_claim: Hash,
+        node: NodeId,
+    ) -> Hash {
+        Hash::digest(
+            LOCAL_SNAPSHOT_MESSAGE_DOMAIN,
+            &[&common_certificate.0, &physical_claim.0, &node.0],
+        )
+    }
+    pub fn validate(&self) -> Result<(), SharedCommitError> {
+        self.claim.validate()?;
+        self.signature.validate()?;
+        if self.common_certificate == Hash::ZERO || self.signature.signer != self.claim.local_node()
+        {
+            return Err(SharedCommitError::WrongSnapshotClaim);
+        }
+        enforce_encoded_bound(self, MAX_SHARED_AGENT_LOCAL_SNAPSHOT_BINDING_BYTES)
+    }
+    pub fn verify(
+        &self,
+        certificate: &SharedAgentCommonSnapshotCertificate,
+        expected: &SharedAgentSnapshotClaim,
+    ) -> Result<VerifiedSharedAgentSnapshot, SharedCommitError> {
+        self.validate()?;
+        certificate.verify(expected.active_committee(), certificate.claim())?;
+        if &self.claim != expected
+            || self.common_certificate != certificate.commitment()
+            || !certificate.claim().matches_physical_scope(expected)
+        {
+            return Err(SharedCommitError::WrongSnapshotClaim);
+        }
+        verify_snapshot_member_signature(
+            expected.active_committee(),
+            &self.signature,
+            Self::signing_message(
+                self.common_certificate,
+                self.claim.commitment(),
+                self.claim.local_node(),
+            ),
+        )?;
+        Ok(VerifiedSharedAgentSnapshot {
+            claim: self.claim.clone(),
+            certificate_commitment: self.commitment(),
+        })
+    }
+}
+impl ServiceWire for SharedAgentLocalSnapshotBinding {
+    const MAGIC: [u8; 4] = *b"AGL1";
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let encoder = &mut Encoder(output);
+        encoder.fixed(&self.common_certificate.0);
+        encoder.bytes(&self.claim.encode());
+        encode_replica_signature(encoder, &self.signature);
+    }
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_SHARED_AGENT_LOCAL_SNAPSHOT_BINDING_BYTES)?;
+        Self::new(
+            Hash(decoder.fixed()?),
+            decode_nested::<SharedAgentSnapshotClaim>(
+                decoder,
+                MAX_SHARED_AGENT_SNAPSHOT_CLAIM_BYTES,
+            )?,
+            decode_replica_signature(decoder)?,
+        )
+        .map_err(map_decode_error)
+    }
+}
+
 /// Source-instance-independent identity of one portable Shared recovery point.
 ///
 /// Unlike [`SharedAgentSnapshotClaim`], this claim deliberately contains no
@@ -1956,6 +2369,11 @@ fn verify_ed25519(
 }
 
 #[cfg(test)]
+pub(crate) fn common_snapshot_claim_for_test() -> SharedAgentCommonSnapshotClaim {
+    tests::common_snapshot_claim_fixture()
+}
+
+#[cfg(test)]
 mod tests {
     use alloc::format;
     use alloc::string::String;
@@ -2092,6 +2510,204 @@ mod tests {
     fn certificate(claim: OrderedCommitClaim, signers: &[&SigningKey]) -> ReplicaQuorumCertificate {
         let signatures = signatures(&claim, signers);
         ReplicaQuorumCertificate::new(claim, signatures).unwrap()
+    }
+
+    pub(super) fn common_snapshot_claim_fixture() -> SharedAgentCommonSnapshotClaim {
+        let committee = committee(&[key(1), key(2), key(3)], &[]);
+        let mut ordered = claim(committee.id());
+        let ancestry =
+            SharedAgentCommonSnapshotAncestry::new(OrderedBase::post_genesis(), Hash([0x49; 32]))
+                .unwrap();
+        ordered.fence_ancestry = ancestry.commitment_for(&ordered);
+        SharedAgentCommonSnapshotClaim::new(ordered, committee, 1, ancestry).unwrap()
+    }
+
+    fn common_certificate(
+        claim: SharedAgentCommonSnapshotClaim,
+        signers: &[&SigningKey],
+    ) -> SharedAgentCommonSnapshotCertificate {
+        let message = SharedAgentCommonSnapshotCertificate::signing_message(
+            claim.active_committee().id(),
+            claim.commitment(),
+        );
+        let mut signatures = signers
+            .iter()
+            .map(|key| {
+                ReplicaCommitSignature::new(
+                    NodeId::of_authenticated_peer(&peer_id(key)),
+                    key.sign(&message.0).to_bytes(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(ReplicaCommitSignature::signer);
+        SharedAgentCommonSnapshotCertificate::new(claim, signatures).unwrap()
+    }
+
+    fn physical_common_claim(
+        common: &SharedAgentCommonSnapshotClaim,
+        key: &SigningKey,
+        store: u8,
+    ) -> SharedAgentSnapshotClaim {
+        SharedAgentSnapshotClaim::new(
+            common.ordered().clone(),
+            common.active_committee().clone(),
+            common.authority_epoch(),
+            Hash([store; 32]),
+            Hash([0x51; 32]),
+            JournalHeadsId([0x52; 32]),
+            JournalHeadsId([0x53; 32]),
+            JournalHeadsId([store; 32]),
+            CheckpointId([store; 32]),
+            NodeId::of_authenticated_peer(&peer_id(key)),
+            LaneStateId([0x54; 32]),
+            LaneStateId([0x55; 32]),
+            LaneStateId([0x56; 32]),
+            LaneStateId([store; 32]),
+            common.ordered().ordered_invocations(),
+            common.ordered().merge_invocations(),
+            InvocationIndexId([store; 32]),
+            common.ordered().artifacts(),
+            Hash([0x57; 32]),
+            Hash([0x58; 32]),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn local_binding(
+        certificate: &SharedAgentCommonSnapshotCertificate,
+        claim: SharedAgentSnapshotClaim,
+        key: &SigningKey,
+    ) -> SharedAgentLocalSnapshotBinding {
+        let message = SharedAgentLocalSnapshotBinding::signing_message(
+            certificate.commitment(),
+            claim.commitment(),
+            claim.local_node(),
+        );
+        let signature =
+            ReplicaCommitSignature::new(claim.local_node(), key.sign(&message.0).to_bytes())
+                .unwrap();
+        SharedAgentLocalSnapshotBinding::new(certificate.commitment(), claim, signature).unwrap()
+    }
+
+    #[test]
+    fn common_snapshot_quorum_allows_distinct_authenticated_physical_bindings() {
+        let common = common_snapshot_claim_fixture();
+        let certificate = common_certificate(common.clone(), &[&key(1), &key(2)]);
+        certificate
+            .verify(common.active_committee(), &common)
+            .unwrap();
+        let first = local_binding(
+            &certificate,
+            physical_common_claim(&common, &key(1), 0x61),
+            &key(1),
+        );
+        let second = local_binding(
+            &certificate,
+            physical_common_claim(&common, &key(3), 0x62),
+            &key(3),
+        );
+        assert_ne!(first.claim(), second.claim());
+        for binding in [&first, &second] {
+            let verified = binding.verify(&certificate, binding.claim()).unwrap();
+            assert_eq!(verified.certificate_commitment(), binding.commitment());
+            assert_eq!(
+                SharedAgentLocalSnapshotBinding::decode(&binding.encode()).unwrap(),
+                *binding
+            );
+        }
+        assert_eq!(
+            SharedAgentCommonSnapshotCertificate::decode(&certificate.encode()).unwrap(),
+            certificate
+        );
+        assert_eq!(
+            SharedAgentCommonSnapshotClaim::decode(&common.encode()).unwrap(),
+            common
+        );
+        assert!(first.verify(&certificate, second.claim()).is_err());
+        // Existing authority decoders do not accept the new domains.
+        assert!(SharedAgentSnapshotCertificate::decode(&certificate.encode()).is_err());
+        assert!(SharedAgentPortableSnapshotCertificate::decode(&certificate.encode()).is_err());
+    }
+
+    #[test]
+    fn common_snapshot_rejects_mixed_claims_duplicate_nonvoter_and_under_quorum() {
+        let common = common_snapshot_claim_fixture();
+        let certificate = common_certificate(common.clone(), &[&key(1), &key(2)]);
+        let singleton = common_certificate(common.clone(), &[&key(1)]);
+        assert!(matches!(
+            singleton.verify(common.active_committee(), &common),
+            Err(SharedCommitError::InsufficientQuorum)
+        ));
+        let duplicated = vec![
+            certificate.signatures()[0].clone(),
+            certificate.signatures()[0].clone(),
+        ];
+        assert!(SharedAgentCommonSnapshotCertificate::new(common.clone(), duplicated).is_err());
+        let outsider = common_certificate(common.clone(), &[&key(1), &key(9)]);
+        assert!(outsider.verify(common.active_committee(), &common).is_err());
+        let mut other = common.clone();
+        other.authority_epoch += 1;
+        assert!(
+            certificate
+                .verify(common.active_committee(), &other)
+                .is_err()
+        );
+        let changed = SharedAgentCommonSnapshotCertificate::new(
+            other.clone(),
+            certificate.signatures().to_vec(),
+        )
+        .unwrap();
+        assert!(changed.verify(common.active_committee(), &other).is_err());
+        let mut changed_generation = common.clone();
+        changed_generation.ordered.genesis = AgentJournalGenesisId([0x71; 32]);
+        assert!(
+            certificate
+                .verify(common.active_committee(), &changed_generation)
+                .is_err()
+        );
+        let mut changed_ancestry = common.clone();
+        changed_ancestry.ancestry.ordered_anchor = Hash([0x74; 32]);
+        assert!(changed_ancestry.validate().is_err());
+        assert!(SharedAgentCommonSnapshotClaim::decode(&changed_ancestry.encode()).is_err());
+        let not_fixed_three = committee(&[key(1), key(2)], &[key(3)]);
+        assert!(
+            SharedAgentCommonSnapshotClaim::new(
+                claim(not_fixed_three.id()),
+                not_fixed_three,
+                1,
+                common.ancestry().clone()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn common_snapshot_local_binding_rejects_metadata_and_certificate_substitution() {
+        let common = common_snapshot_claim_fixture();
+        let certificate = common_certificate(common.clone(), &[&key(1), &key(2)]);
+        let binding = local_binding(
+            &certificate,
+            physical_common_claim(&common, &key(1), 0x61),
+            &key(1),
+        );
+        let mut modified = binding.clone();
+        modified.claim.journal_store = Hash([0x72; 32]);
+        assert!(modified.verify(&certificate, modified.claim()).is_err());
+        let other_qc = common_certificate(common.clone(), &[&key(2), &key(3)]);
+        assert!(binding.verify(&other_qc, binding.claim()).is_err());
+        modified = binding.clone();
+        modified.claim.ordered_invocations = InvocationIndexId([0x73; 32]);
+        let signed_wrong_index = local_binding(&certificate, modified.claim, &key(1));
+        assert!(
+            signed_wrong_index
+                .verify(&certificate, signed_wrong_index.claim())
+                .is_err()
+        );
+        let mut trailing = binding.encode();
+        trailing.push(0);
+        assert!(SharedAgentLocalSnapshotBinding::decode(&trailing).is_err());
     }
 
     #[test]

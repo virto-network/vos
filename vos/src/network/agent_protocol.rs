@@ -12,6 +12,11 @@
 use std::fmt;
 use std::io;
 
+use crate::agent::shared_commit::{
+    MAX_REPLICA_COMMIT_SIGNATURE_BYTES, MAX_SHARED_AGENT_COMMON_SNAPSHOT_CLAIM_BYTES,
+    ReplicaCommitSignature, SharedAgentCommonSnapshotClaim,
+};
+use crate::service::wire::ServiceWire;
 use async_trait::async_trait;
 use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::request_response::Codec;
@@ -68,6 +73,8 @@ const TAG_PROJECTION_ACCEPTED: u8 = 0x14;
 const TAG_PROJECTION_RECOVERY_REQUEST: u8 = 0x15;
 const TAG_APPLIED_AVAILABILITY_REQUEST: u8 = 0x16;
 const TAG_APPLIED_AVAILABILITY_REPLY: u8 = 0x17;
+const TAG_COMMON_SNAPSHOT_VOTE_REQUEST: u8 = 0x18;
+const TAG_COMMON_SNAPSHOT_VOTE_REPLY: u8 = 0x19;
 const TAG_RAFT_APPEND_REQUEST: u8 = 0x20;
 const TAG_RAFT_APPEND_REPLY: u8 = 0x21;
 const TAG_RAFT_VOTE_REQUEST: u8 = 0x22;
@@ -403,6 +410,13 @@ pub(crate) enum AgentMessage {
         request: AppliedAvailabilityRequest,
         available: bool,
     },
+    /// A request to independently reconstruct this exact common checkpoint.
+    /// Decoding alone is never permission to sign it.
+    CommonSnapshotVoteRequest(SharedAgentCommonSnapshotClaim),
+    CommonSnapshotVoteReply {
+        claim: Hash,
+        signature: Option<ReplicaCommitSignature>,
+    },
     Raft(RaftMessage),
     Merge(MergeMessage),
 }
@@ -572,6 +586,17 @@ fn message_is_valid(message: &AgentMessage, route: AgentGenerationRoute, sender:
         AgentMessage::ProjectionAccepted { request, .. } => *request != Hash::ZERO,
         AgentMessage::AppliedAvailabilityRequest(request)
         | AgentMessage::AppliedAvailabilityReply { request, .. } => request.is_valid(),
+        AgentMessage::CommonSnapshotVoteRequest(claim) => {
+            claim.validate().is_ok()
+                && claim.ordered().space().0 == route.space.0
+                && claim.ordered().agent().0 == route.agent.0
+        }
+        AgentMessage::CommonSnapshotVoteReply { claim, signature } => {
+            *claim != Hash::ZERO
+                && signature.as_ref().is_none_or(|signature| {
+                    signature.validate().is_ok() && signature.signer().0 == sender.0
+                })
+        }
         AgentMessage::InvokeRequest(request) => {
             request.work.validate()
                 && request.work.space == route.space
@@ -759,6 +784,17 @@ fn encode_message(
             encoder.u8(TAG_APPLIED_AVAILABILITY_REPLY);
             encode_applied_availability_request(encoder, request);
             encoder.bool(*available);
+        }
+        AgentMessage::CommonSnapshotVoteRequest(claim) => {
+            encoder.u8(TAG_COMMON_SNAPSHOT_VOTE_REQUEST);
+            encoder.bytes(&claim.encode());
+        }
+        AgentMessage::CommonSnapshotVoteReply { claim, signature } => {
+            encoder.u8(TAG_COMMON_SNAPSHOT_VOTE_REPLY);
+            encoder.fixed(claim.as_bytes());
+            encoder.option(signature, |encoder, signature| {
+                encoder.bytes(&signature.encode());
+            });
         }
         AgentMessage::InvokeRequest(request) => {
             encoder.u8(TAG_INVOKE_REQUEST);
@@ -1047,6 +1083,21 @@ fn decode_message(decoder: &mut Decoder<'_>) -> Result<AgentMessage, AgentProtoc
         TAG_APPLIED_AVAILABILITY_REPLY => Ok(AgentMessage::AppliedAvailabilityReply {
             request: decode_applied_availability_request(decoder)?,
             available: decoder.bool()?,
+        }),
+        TAG_COMMON_SNAPSHOT_VOTE_REQUEST => Ok(AgentMessage::CommonSnapshotVoteRequest(
+            SharedAgentCommonSnapshotClaim::decode(
+                decoder.bytes_ref_bounded(MAX_SHARED_AGENT_COMMON_SNAPSHOT_CLAIM_BYTES)?,
+            )
+            .map_err(|_| AgentProtocolError::InvalidValue)?,
+        )),
+        TAG_COMMON_SNAPSHOT_VOTE_REPLY => Ok(AgentMessage::CommonSnapshotVoteReply {
+            claim: Hash(decoder.fixed()?),
+            signature: decoder.option(|decoder| {
+                ReplicaCommitSignature::decode(
+                    decoder.bytes_ref_bounded(MAX_REPLICA_COMMIT_SIGNATURE_BYTES)?,
+                )
+                .map_err(|_| DecodeError::NonCanonical)
+            })?,
         }),
         TAG_INVOKE_REQUEST => {
             let work = decode_invocation_work(decoder)?;
@@ -1471,6 +1522,65 @@ mod tests {
 
     fn id<const BYTE: u8>() -> [u8; 32] {
         [BYTE; 32]
+    }
+
+    #[test]
+    fn common_snapshot_vote_wire_is_bounded_canonical_and_sender_bound() {
+        let claim = crate::agent::shared_commit::common_snapshot_claim_for_test();
+        let signer = claim.active_committee().members()[0].replica().node;
+        let route = AgentGenerationRoute {
+            space: SpaceId(claim.ordered().space().0),
+            agent: AgentId(claim.ordered().agent().0),
+            generation: Hash(id::<3>()),
+        };
+        let request = AgentFrame {
+            route,
+            sender: NodeId(signer.0),
+            message: AgentMessage::CommonSnapshotVoteRequest(claim.clone()),
+        };
+        let encoded = request.encode().unwrap();
+        assert!(encoded.len() <= MAX_SHARED_AGENT_COMMON_SNAPSHOT_CLAIM_BYTES + 256);
+        assert_eq!(AgentFrame::decode(&encoded).unwrap(), request);
+        let mut wrong = request.clone();
+        wrong.route.agent = AgentId(id::<99>());
+        assert!(wrong.encode().is_err());
+        let body = 4 + 2 + 4 * 32 + 1;
+        let mut oversized = encoded.clone();
+        oversized[body..body + 4].copy_from_slice(
+            &((MAX_SHARED_AGENT_COMMON_SNAPSHOT_CLAIM_BYTES + 1) as u32).to_le_bytes(),
+        );
+        assert!(AgentFrame::decode(&oversized).is_err());
+        for signature in [
+            None,
+            Some(ReplicaCommitSignature::new(signer, [7; 64]).unwrap()),
+        ] {
+            let response = AgentFrame {
+                message: AgentMessage::CommonSnapshotVoteReply {
+                    claim: Hash(claim.commitment().0),
+                    signature,
+                },
+                ..request.clone()
+            };
+            let encoded = response.encode().unwrap();
+            assert_eq!(AgentFrame::decode(&encoded).unwrap(), response);
+            for end in 0..encoded.len() {
+                assert!(AgentFrame::decode(&encoded[..end]).is_err());
+            }
+            let mut trailing = encoded;
+            trailing.push(0);
+            assert_eq!(
+                AgentFrame::decode(&trailing),
+                Err(AgentProtocolError::TrailingBytes)
+            );
+        }
+        let wrong_signer =
+            ReplicaCommitSignature::new(crate::service::NodeId(id::<98>()), [7; 64]).unwrap();
+        let mut wrong = request;
+        wrong.message = AgentMessage::CommonSnapshotVoteReply {
+            claim: Hash(claim.commitment().0),
+            signature: Some(wrong_signer),
+        };
+        assert!(wrong.encode().is_err());
     }
 
     fn route() -> AgentGenerationRoute {

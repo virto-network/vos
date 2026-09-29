@@ -13,10 +13,11 @@ Clerk with **100,000 retained transfers**. Keep Clerk's kernel, signatures,
 committed roots and exact retry semantics. Do not replace this with a singleton,
 smaller dataset or an experimental-only release without a new user decision.
 
-The current follow-up, based on `0bec4f58`, adds scoped signed read-recovery
-delegation and its crash/refusal regressions. Review it as **one batch** on
-`saga/agents` after the qualified implementation fast-forward. The preceding
-Shared journal/applied-availability checkpoint is `7c1a1b7c`; backend follow-up
+The current follow-up, based on `6d2a9b38`, implements fixed-three common
+checkpoint certification and candidate cross-node catch-up. Review it as **one
+batch** on `saga/agents` after the qualified implementation fast-forward. The
+preceding signed read-delegation checkpoint is `6d2a9b38`; Shared journal/applied
+availability is `7c1a1b7c`; backend follow-up
 `4ea0271c`, pruning `48df3995`, and admission baseline `62ffbc20` retain their
 historical evidence. Fixes continue on `wip/ch08-runtime-directory` before a
 qualified fast-forward. `master` is unchanged; do not push or change it automatically.
@@ -58,6 +59,22 @@ Current evidence, without promoting production startup or changing the finish li
   durable availability of the signed request remain release limitations. The
   survivor fixture receives the frozen query from its harness, not replicated
   discovery of an origin-only PAP2. Production remains gated.
+- Common snapshot votes bind the same shared Ordered state, committee, epoch
+  and exact semantic ancestry. Each node separately signs its own physical
+  checkpoint binding. Existing AGS3/AGP1 formats keep their meaning; no foreign
+  node/store claim is treated as a local publication capability.
+- Candidate catch-up derives destination-local state from admitted genesis,
+  preserves higher Raft term/full NodeId vote, rejects changed or speculative
+  cached membership and rollback, and refuses any unknown log suffix beyond its
+  target. The healthy fixed-three physical workflow and three source/destination
+  crash-boundary fixtures pass: pruned-prefix catch-up, exact boundary Query
+  retry/ACK, reopen and continued common ordering with mixed checkpoint cadence.
+  These are candidate fixtures, not released-daemon qualification.
+  Physical compaction/catch-up entrypoints remain
+  test-only: a local "no pending work" check cannot protect an offline origin's
+  unresolved after-ACK PAP2. Boundary-only Query recovery is not evidence of
+  arbitrary historical reply retention. Production pruning stays disabled until
+  shared recovery pins or bounded certified request/result/ACK evidence exist.
 
 No finish-line change follows from these results. The remaining work stays in
 the three batches below; do not add a parallel plan or treat these as a release.
@@ -147,10 +164,16 @@ do not by themselves qualify Shared capacity or eliminate whole-runtime work.
 - [ ] Collect quorum-certified snapshots/checkpoints and qualify restart/catch-up
   before replay capacity is exhausted. Optional checkpoint skipping is temporary;
   mandatory capacity/certificate guards must continue to fail closed.
-  Existing snapshot claims contain source-local node/store fields; collecting
-  each voter's different local claim is not a quorum certificate. Reuse the
-  current certificate with independent source-evidence verification, then add
-  certified destination rebinding for catch-up before enabling prefix pruning.
+  Use a common-state QC plus a separately signed physical node/store binding;
+  collecting signatures over different local claims is not a quorum certificate.
+  Preserve semantic ancestry independently of physical checkpoint cadence.
+  The candidate image path now passes pruned-prefix catch-up, exact boundary
+  lost-response retry, reopen, continued ordering and source/destination marker,
+  journal and ledger interruption tests. Mutation remains test-only
+  until **all** pending recovery scopes survive retirement, including an offline
+  origin's after-ACK PAP2. Do not replace that gate with a local absence check or
+  weaken exact retry. External block-root closure/export remains a separate
+  integration gate; image catch-up does not qualify the 100,000-transfer workload.
 - [ ] Integrate the existing external-state executor and block store into Shared
   Clerk through a narrow internal executor selection, not a new driver framework.
   The internal driver now supports signed Linear-only Shared Create/Install,

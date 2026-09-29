@@ -10,6 +10,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::time::Duration;
 
+use crate::agent::shared_commit::{ReplicaCommitSignature, SharedAgentCommonSnapshotClaim};
 use futures_channel::oneshot;
 use libp2p::request_response::{self, Message};
 use libp2p::{PeerId, Swarm};
@@ -278,6 +279,11 @@ pub(super) struct PendingMeta {
 }
 
 pub(super) enum PendingAgentReply {
+    CommonSnapshotVote {
+        meta: PendingMeta,
+        claim: Hash,
+        reply: std_mpsc::Sender<Result<Option<ReplicaCommitSignature>, AgentNetworkError>>,
+    },
     AppliedAvailability {
         meta: PendingMeta,
         request: AppliedAvailabilityRequest,
@@ -325,7 +331,8 @@ pub(super) enum PendingAgentReply {
 impl PendingAgentReply {
     fn meta(&self) -> PendingMeta {
         match self {
-            Self::AppliedAvailability { meta, .. }
+            Self::CommonSnapshotVote { meta, .. }
+            | Self::AppliedAvailability { meta, .. }
             | Self::Projection { meta, .. }
             | Self::Invocation { meta, .. }
             | Self::RaftAppend { meta, .. }
@@ -339,6 +346,9 @@ impl PendingAgentReply {
 
     pub(super) fn fail(self, error: AgentNetworkError) {
         match self {
+            Self::CommonSnapshotVote { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
             Self::AppliedAvailability { reply, .. } | Self::Projection { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
@@ -382,6 +392,23 @@ impl PendingAgentReply {
         }
         let message = authenticated.into_frame().message;
         match (self, message) {
+            (
+                Self::CommonSnapshotVote { claim, reply, .. },
+                AgentMessage::CommonSnapshotVoteReply {
+                    claim: response,
+                    signature,
+                },
+            ) => {
+                let _ = reply.send(if response == claim
+                    && signature
+                        .as_ref()
+                        .is_none_or(|signature| signature.signer().0 == meta.target_node.0)
+                {
+                    Ok(signature)
+                } else {
+                    Err(AgentNetworkError::ResponseCorrelationMismatch)
+                });
+            }
             (
                 Self::AppliedAvailability { request, reply, .. },
                 AgentMessage::AppliedAvailabilityReply {
@@ -539,7 +566,9 @@ impl AgentTrafficClass {
         match message {
             AgentMessage::Raft(_) => Self::Raft,
             AgentMessage::AppliedAvailabilityRequest(_)
-            | AgentMessage::AppliedAvailabilityReply { .. } => Self::Availability,
+            | AgentMessage::AppliedAvailabilityReply { .. }
+            | AgentMessage::CommonSnapshotVoteRequest(_)
+            | AgentMessage::CommonSnapshotVoteReply { .. } => Self::Availability,
             _ => Self::Application,
         }
     }
@@ -870,6 +899,50 @@ impl Network {
                         target_peer: peer,
                     },
                     request,
+                    reply,
+                },
+            }),
+            Err(error) => {
+                let _ = reply.send(Err(error));
+            }
+        }
+        receiver
+    }
+
+    /// Request a typed vote over one exact common checkpoint. Authentication
+    /// and correlation here do not replace independent signature verification
+    /// by the certificate collector.
+    pub(crate) fn send_agent_common_snapshot_vote(
+        &self,
+        target: NodeId,
+        route: AgentGenerationRoute,
+        claim: SharedAgentCommonSnapshotClaim,
+    ) -> std_mpsc::Receiver<Result<Option<ReplicaCommitSignature>, AgentNetworkError>> {
+        let (reply, receiver) = std_mpsc::channel();
+        let permit = match self.reserve_agent_outbound(AgentTrafficClass::Availability) {
+            Ok(permit) => permit,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return receiver;
+            }
+        };
+        let commitment = Hash(claim.commitment().0);
+        match self.prepare_agent_request(
+            target,
+            route,
+            AgentMessage::CommonSnapshotVoteRequest(claim),
+        ) {
+            Ok((peer, frame)) => self.queue_agent_request(AgentOutboundRequest {
+                peer,
+                frame,
+                permit,
+                pending: PendingAgentReply::CommonSnapshotVote {
+                    meta: PendingMeta {
+                        route,
+                        target_node: target,
+                        target_peer: peer,
+                    },
+                    claim: commitment,
                     reply,
                 },
             }),
@@ -1253,6 +1326,7 @@ fn is_request(message: &AgentMessage) -> bool {
         message,
         AgentMessage::InvokeRequest(_)
             | AgentMessage::AppliedAvailabilityRequest(_)
+            | AgentMessage::CommonSnapshotVoteRequest(_)
             | AgentMessage::ProjectionRequest(_)
             | AgentMessage::ProjectionRecoveryRequest(_)
             | AgentMessage::Raft(RaftMessage::AppendRequest { .. })
@@ -1267,6 +1341,10 @@ fn is_request(message: &AgentMessage) -> bool {
 
 fn response_matches_request(request: &AgentMessage, response: &AgentMessage) -> bool {
     match (request, response) {
+        (
+            AgentMessage::CommonSnapshotVoteRequest(request),
+            AgentMessage::CommonSnapshotVoteReply { claim, .. },
+        ) => request.commitment().0 == claim.0,
         (
             AgentMessage::AppliedAvailabilityRequest(request),
             AgentMessage::AppliedAvailabilityReply {
@@ -1654,6 +1732,120 @@ mod tests {
             AgentNetworkError::UnknownMember(node(attacker))
         );
         assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn common_snapshot_vote_requires_exact_peer_sender_route_claim_and_signer() {
+        let peer = key(84).public().to_peer_id();
+        let other = key(85).public().to_peer_id();
+        let route = test_route(84);
+        let claim = Hash(id(86));
+        let signature =
+            ReplicaCommitSignature::new(crate::service::NodeId(node(peer).0), [7; 64]).unwrap();
+        for fault in 0..8 {
+            let (reply, result) = std_mpsc::channel();
+            let pending = PendingAgentReply::CommonSnapshotVote {
+                meta: PendingMeta {
+                    route,
+                    target_node: node(peer),
+                    target_peer: peer,
+                },
+                claim,
+                reply,
+            };
+            let mut response = frame(
+                peer,
+                route,
+                AgentMessage::CommonSnapshotVoteReply {
+                    claim: if fault == 2 { Hash(id(87)) } else { claim },
+                    signature: if fault == 1 {
+                        None
+                    } else if fault == 3 {
+                        Some(
+                            ReplicaCommitSignature::new(
+                                crate::service::NodeId(node(other).0),
+                                [7; 64],
+                            )
+                            .unwrap(),
+                        )
+                    } else {
+                        Some(signature.clone())
+                    },
+                },
+            );
+            if fault == 4 {
+                response.route.generation = Hash(id(88));
+            }
+            if fault == 6 {
+                response.sender = node(other);
+            }
+            if fault == 7 {
+                response.message = AgentMessage::ProjectionAccepted {
+                    request: claim,
+                    accepted: true,
+                };
+            }
+            let authenticated =
+                authenticate_sender(if fault == 6 { &other } else { &peer }, response).unwrap();
+            pending.complete(if fault == 5 { other } else { peer }, authenticated);
+            let expected = match fault {
+                0 => Ok(Some(signature.clone())),
+                1 => Ok(None),
+                2 | 3 => Err(AgentNetworkError::ResponseCorrelationMismatch),
+                4 => Err(AgentNetworkError::ResponseRouteMismatch),
+                5 => Err(AgentNetworkError::ResponsePeerMismatch),
+                6 => Err(AgentNetworkError::ResponseSenderMismatch),
+                7 => Err(AgentNetworkError::ResponseTypeMismatch),
+                _ => unreachable!(),
+            };
+            assert_eq!(result.recv().unwrap(), expected, "fault {fault}");
+        }
+    }
+
+    #[test]
+    fn common_snapshot_votes_use_existing_bounded_availability_pool() {
+        let claim = crate::agent::shared_commit::common_snapshot_claim_for_test();
+        let request = AgentMessage::CommonSnapshotVoteRequest(claim.clone());
+        let reply = AgentMessage::CommonSnapshotVoteReply {
+            claim: Hash(claim.commitment().0),
+            signature: None,
+        };
+        assert!(is_request(&request));
+        assert!(!is_request(&reply));
+        assert!(response_matches_request(&request, &reply));
+        for message in [&request, &reply] {
+            assert_eq!(
+                AgentTrafficClass::for_message(message),
+                AgentTrafficClass::Availability
+            );
+        }
+        assert!(!response_matches_request(
+            &request,
+            &AgentMessage::CommonSnapshotVoteReply {
+                claim: Hash(id(99)),
+                signature: None,
+            }
+        ));
+        let pools = new_agent_outbound_permits();
+        let _application = pools
+            .application
+            .clone()
+            .try_acquire_many_owned(MAX_AGENT_OUTBOUND_APPLICATION_REQUESTS as u32)
+            .unwrap();
+        let vote = reserve_agent_outbound_permit(&pools, AgentTrafficClass::Availability).unwrap();
+        assert_eq!(
+            pools.available(AgentTrafficClass::Availability),
+            MAX_AGENT_OUTBOUND_AVAILABILITY_REQUESTS - 1
+        );
+        assert_eq!(
+            pools.available(AgentTrafficClass::Raft),
+            MAX_AGENT_OUTBOUND_RAFT_REQUESTS
+        );
+        drop(vote);
+        assert_eq!(
+            pools.available(AgentTrafficClass::Availability),
+            MAX_AGENT_OUTBOUND_AVAILABILITY_REQUESTS
+        );
     }
 
     #[test]

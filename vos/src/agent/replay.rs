@@ -4470,6 +4470,10 @@ impl ReplaySealedCheckpoint {
 /// must authenticate [`Self::commitment`] with its ordered-snapshot Raft QC.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FenceAncestryEvidence {
+    // Process-local proof metadata, excluded from the stable commitment.
+    // Only a verified common checkpoint can separate physical replay and
+    // semantic ancestry boundaries for a sealed publication.
+    common_checkpoint: Option<CheckpointId>,
     genesis: AgentJournalGenesisId,
     checkpoint_base: OrderedBase,
     canonical_head: OrderedBase,
@@ -4478,11 +4482,28 @@ pub(crate) struct FenceAncestryEvidence {
 }
 
 impl FenceAncestryEvidence {
+    #[cfg(feature = "std")]
+    fn from_common_checkpoint(
+        claim: &super::shared_commit::SharedAgentCommonSnapshotClaim,
+        checkpoint: CheckpointId,
+    ) -> Self {
+        let ordered = claim.ordered();
+        Self {
+            common_checkpoint: Some(checkpoint),
+            genesis: ordered.genesis(),
+            checkpoint_base: claim.ancestry().checkpoint_base(),
+            canonical_head: ordered.ordered(),
+            fence: ordered.merge_fence(),
+            ordered_anchor: claim.ancestry().ordered_anchor(),
+        }
+    }
+
     fn post_genesis(genesis: AgentJournalGenesisId) -> Result<Self, ReplayValidationError> {
         if genesis == AgentJournalGenesisId::ZERO {
             return Err(ReplayError::InvalidFence);
         }
         Ok(Self {
+            common_checkpoint: None,
             genesis,
             checkpoint_base: OrderedBase::post_genesis(),
             canonical_head: OrderedBase::post_genesis(),
@@ -4523,6 +4544,7 @@ impl FenceAncestryEvidence {
         }
         let checkpoint_bytes = ordered_base_evidence_bytes(checkpoint_base);
         Ok(Self {
+            common_checkpoint: None,
             genesis: checkpoint.genesis,
             checkpoint_base,
             canonical_head: checkpoint_base,
@@ -4564,6 +4586,7 @@ impl FenceAncestryEvidence {
         }
         let index = entry.index.to_le_bytes();
         Ok(Self {
+            common_checkpoint: self.common_checkpoint,
             genesis: self.genesis,
             checkpoint_base: self.checkpoint_base,
             canonical_head,
@@ -4581,6 +4604,7 @@ impl FenceAncestryEvidence {
         }
         let base = ordered_base_evidence_bytes(self.canonical_head);
         Ok(Self {
+            common_checkpoint: None,
             genesis: self.genesis,
             checkpoint_base: self.canonical_head,
             canonical_head: self.canonical_head,
@@ -4594,6 +4618,10 @@ impl FenceAncestryEvidence {
 
     pub(crate) const fn genesis(&self) -> AgentJournalGenesisId {
         self.genesis
+    }
+
+    pub(crate) const fn common_checkpoint(&self) -> Option<CheckpointId> {
+        self.common_checkpoint
     }
 
     pub(crate) const fn checkpoint_base(&self) -> OrderedBase {
@@ -5401,6 +5429,9 @@ pub struct ReplayMaterialization {
     artifacts: ArtifactClosure,
     suffix_budget: ReplaySuffixBudget,
     replay_boundary: OrderedBase,
+    /// Present only after a verified common certificate authenticates a
+    /// semantic ancestry base older than this physical checkpoint boundary.
+    common_ancestry_boundary: Option<CertifiedCommonAncestryBoundary>,
     fence_ancestry: FenceAncestryEvidence,
     /// Complete proof index authenticated by `heads.transition_proofs`.
     /// The boundary shadow is replayed to this exact live projection while
@@ -5413,6 +5444,12 @@ pub struct ReplayMaterialization {
     /// while an Applied acknowledgement remains provisional; checkpointing
     /// is forbidden until the two projections converge.
     pending_transition_proof_final_shadow: ReplayTransitionProofShadow,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CertifiedCommonAncestryBoundary {
+    checkpoint: CheckpointId,
+    semantic_base: OrderedBase,
 }
 
 /// Private replay projection of the one-live-proof-per-invocation map.
@@ -5678,6 +5715,35 @@ impl ReplayTransitionProofShadow {
 }
 
 impl ReplayMaterialization {
+    pub(crate) fn common_checkpoint(&self) -> Option<CheckpointId> {
+        self.fence_ancestry.common_checkpoint()
+    }
+
+    fn ancestry_boundary_matches(&self) -> bool {
+        match self.common_ancestry_boundary {
+            None => self.fence_ancestry.checkpoint_base() == self.replay_boundary,
+            Some(boundary) => {
+                self.heads.checkpoint == Some(boundary.checkpoint)
+                    && self.fence_ancestry.common_checkpoint() == Some(boundary.checkpoint)
+                    && self.fence_ancestry.checkpoint_base() == boundary.semantic_base
+                    && boundary.semantic_base.index <= self.replay_boundary.index
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn common_snapshot_ancestry(
+        &self,
+    ) -> Result<super::shared_commit::SharedAgentCommonSnapshotAncestry, JournalStoreError> {
+        if !self.ancestry_boundary_matches() {
+            return Err(JournalStoreError::Corrupt);
+        }
+        super::shared_commit::SharedAgentCommonSnapshotAncestry::new(
+            self.fence_ancestry.checkpoint_base,
+            self.fence_ancestry.ordered_anchor,
+        )
+        .map_err(|_| JournalStoreError::Corrupt)
+    }
     /// Read-only execution gets only authenticated external descriptors at
     /// this exact head. The opaque component bytes are root descriptors, not
     /// a host-side reconstruction of the runtime's private state.
@@ -6710,8 +6776,59 @@ pub(crate) struct PreparedSharedCheckpoint {
     lane_blobs: Vec<(BlobRef, Vec<u8>)>,
 }
 
+/// A complete re-audited destination image. Unlike decoded portable bytes,
+/// this capability has been checked against the exact signed physical binding
+/// and the common state's opaque lane commitments before filesystem writes.
+#[cfg(feature = "std")]
+pub(crate) struct ValidatedCommonCheckpoint {
+    image: super::journal_store::PortableJournalCheckpoint,
+    verified: VerifiedSharedAgentSnapshot,
+}
+
+#[cfg(feature = "std")]
+impl ValidatedCommonCheckpoint {
+    pub(crate) fn image(&self) -> &super::journal_store::PortableJournalCheckpoint {
+        &self.image
+    }
+    pub(crate) fn verified(&self) -> &VerifiedSharedAgentSnapshot {
+        &self.verified
+    }
+}
+
 #[cfg(feature = "std")]
 impl PreparedSharedCheckpoint {
+    pub(crate) fn validate_common_claim(
+        &self,
+        claim: &SharedAgentSnapshotClaim,
+    ) -> Result<(), JournalStoreError> {
+        self.validate_claim(claim)?;
+        let ordered = claim.ordered();
+        let heads = self.successor.heads();
+        let state = self.successor.state();
+        ordered
+            .control()
+            .verify_state(&state.control)
+            .map_err(|_| JournalStoreError::Corrupt)?;
+        ordered
+            .linear()
+            .verify_state(&state.linear)
+            .map_err(|_| JournalStoreError::Corrupt)?;
+        ordered
+            .merge()
+            .verify_state(&state.merge)
+            .map_err(|_| JournalStoreError::Corrupt)?;
+        if ordered.ordered_invocations() != heads.ordered_invocations
+            || ordered.merge_invocations() != heads.merge_invocations
+            || ordered.artifacts() != self.successor.artifacts().id()
+            || ordered.merge_frontier() != heads.merge_frontier
+            || ordered.merge_fence() != heads.merge_fence
+            || ordered.merge_seal() != heads.merge_seal
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        Ok(())
+    }
+
     pub(crate) fn with_transition_proof_batch(
         mut self,
         batch: StagedTransitionProofBatch,
@@ -9440,6 +9557,7 @@ impl ReplaySealedPublication {
             system_authority_write: None,
             transition_proof_batch: None,
             fence_ancestry: FenceAncestryEvidence {
+                common_checkpoint: None,
                 genesis: next.genesis,
                 checkpoint_base,
                 canonical_head,
@@ -9571,6 +9689,7 @@ impl ReplaySealedPublication {
             system_authority_write: None,
             transition_proof_batch: None,
             fence_ancestry: FenceAncestryEvidence {
+                common_checkpoint: None,
                 genesis: next.genesis,
                 checkpoint_base,
                 canonical_head: OrderedBase {
@@ -9649,6 +9768,7 @@ impl ReplaySealedPublication {
             head: next.ordered_head,
         };
         let fence_ancestry = FenceAncestryEvidence {
+            common_checkpoint: None,
             genesis: next.genesis,
             checkpoint_base: canonical_head,
             canonical_head,
@@ -12348,7 +12468,7 @@ fn successor_fence_ancestry(
     let current_base = materialization.ordered_base();
     if !materialization.fence_ancestry.validate()
         || materialization.fence_ancestry.genesis() != materialization.heads.genesis
-        || materialization.fence_ancestry.checkpoint_base() != materialization.replay_boundary
+        || !materialization.ancestry_boundary_matches()
         || materialization.fence_ancestry.canonical_head() != current_base
         || materialization.fence_ancestry.fence() != materialization.heads.merge_fence
         || next.genesis != materialization.heads.genesis
@@ -14019,6 +14139,7 @@ mod aggregate {
         // copying it through each recovery frame before nested guest validation.
         genesis_input: Option<Box<ReplayInput>>,
         fence_ancestry: FenceAncestryEvidence,
+        common_ancestry_boundary: Option<CertifiedCommonAncestryBoundary>,
     }
 
     #[derive(Clone)]
@@ -14471,6 +14592,7 @@ mod aggregate {
         )
         .map_err(lift_validation)?;
         Ok(ReplayBase {
+            common_ancestry_boundary: None,
             #[cfg(feature = "experimental-state-blocks")]
             external_roots,
             state,
@@ -14558,6 +14680,7 @@ mod aggregate {
             }
         }
         Ok(ReplayBase {
+            common_ancestry_boundary: None,
             #[cfg(feature = "experimental-state-blocks")]
             external_roots: BTreeMap::new(),
             state: RuntimeState::default(),
@@ -15871,7 +15994,8 @@ mod aggregate {
         authenticate_artifacts(store, &artifacts)?;
         if !fence_ancestry.validate()
             || fence_ancestry.genesis() != heads.genesis
-            || fence_ancestry.checkpoint_base() != replay_boundary
+            || fence_ancestry.checkpoint_base() != base.common_ancestry_boundary
+                .map(|boundary| boundary.semantic_base).unwrap_or(replay_boundary)
             || fence_ancestry.canonical_head() != canonical_head
             || fence_ancestry.fence() != heads.merge_fence
         {
@@ -15898,6 +16022,7 @@ mod aggregate {
             artifacts,
             suffix_budget: plan.suffix_budget,
             replay_boundary,
+            common_ancestry_boundary: base.common_ancestry_boundary,
             fence_ancestry,
             transition_proofs,
             transition_proof_shadow: current_transition_proof_shadow,
@@ -15927,6 +16052,113 @@ mod aggregate {
             #[cfg(feature = "experimental-state-blocks")]
             None,
         )
+    }
+
+    /// A common-certified checkpoint supplies a node-independent ancestry
+    /// foundation before replaying any retained suffix. Local checkpoint IDs
+    /// must never leak into the next cross-replica Ordered commitment.
+    pub(crate) fn materialize_common_checkpoint<S, E, R>(
+        store: &mut S,
+        executor: &mut E,
+        resolver: &R,
+        certificate: &super::super::shared_commit::SharedAgentCommonSnapshotCertificate,
+        binding: &super::super::shared_commit::SharedAgentLocalSnapshotBinding,
+    ) -> Result<ReplayMaterialization, MaterializeError<R::Error, E::Error>>
+    where
+        S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
+        E: ReplayExecutor,
+        R: OrderedBaseResolver,
+    {
+        binding
+            .verify(certificate, binding.claim())
+            .map_err(|_| ReplayError::InvalidRecord)?;
+        let heads = store
+            .heads()
+            .map_err(journal)?
+            .ok_or_else(|| journal(JournalStoreError::NotInitialized))?;
+        let genesis = require_genesis(store, heads.genesis)?;
+        executor
+            .seed_genesis(&genesis)
+            .map_err(ReplayError::Executor)?;
+        let checkpoint = heads.checkpoint.ok_or(ReplayError::InvalidRecord)?;
+        if checkpoint != binding.claim().checkpoint()
+            || heads.node != binding.claim().local_node()
+            || heads.genesis != certificate.claim().ordered().genesis()
+            || heads.admission != certificate.claim().ordered().admission()
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
+        let mut base = load_checkpoint_base::<S, E, R>(
+            store,
+            executor,
+            &heads,
+            checkpoint,
+            #[cfg(feature = "experimental-state-blocks")]
+            None,
+            #[cfg(feature = "experimental-state-blocks")]
+            None,
+        )?;
+        let ordered = certificate.claim().ordered();
+        let manifest: CheckpointManifest = require_record(store, checkpoint)?;
+        if base.ordered != ordered.ordered()
+            || manifest.runtime != *ordered.runtime()
+            || base.ordered_invocations != ordered.ordered_invocations()
+            || manifest.artifacts != ordered.artifacts()
+            || manifest.merge_frontier != ordered.merge_frontier()
+            || manifest.merge_fence != ordered.merge_fence()
+            || manifest.merge_seal != ordered.merge_seal()
+            || base.merge_invocations != ordered.merge_invocations()
+            || ordered.control().verify_state(&base.state.control).is_err()
+            || ordered.linear().verify_state(&base.state.linear).is_err()
+            || ordered.merge().verify_state(&base.state.merge).is_err()
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
+        base.fence_ancestry =
+            FenceAncestryEvidence::from_common_checkpoint(certificate.claim(), checkpoint);
+        base.common_ancestry_boundary = Some(CertifiedCommonAncestryBoundary {
+            checkpoint,
+            semantic_base: certificate.claim().ancestry().checkpoint_base(),
+        });
+        let plan = build_plan::<S, R, E>(store, &heads, &base)?;
+        let result = execute_plan(
+            store,
+            executor,
+            resolver,
+            heads,
+            base,
+            plan,
+            None,
+            #[cfg(feature = "experimental-state-blocks")]
+            None,
+        )?;
+        validate_published_shared_checkpoint(store, &result, binding.claim())
+            .map_err(|_| ReplayError::InvalidRecord)?;
+        Ok(result)
+    }
+
+    pub(crate) fn seed_common_checkpoint_ancestry(
+        materialization: &mut ReplayMaterialization,
+        certificate: &super::super::shared_commit::SharedAgentCommonSnapshotCertificate,
+        binding: &super::super::shared_commit::SharedAgentLocalSnapshotBinding,
+    ) -> Result<(), JournalStoreError> {
+        binding
+            .verify(certificate, binding.claim())
+            .map_err(|_| JournalStoreError::Corrupt)?;
+        if materialization.heads_id() != binding.claim().journal_heads()
+            || materialization.ordered_base() != certificate.claim().ordered().ordered()
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        materialization.fence_ancestry = FenceAncestryEvidence::from_common_checkpoint(
+            certificate.claim(),
+            binding.claim().checkpoint(),
+        );
+        materialization.common_ancestry_boundary = Some(CertifiedCommonAncestryBoundary {
+            checkpoint: binding.claim().checkpoint(),
+            semantic_base: certificate.claim().ancestry().checkpoint_base(),
+        });
+        Ok(())
     }
 
     /// Opt-in checkpoint recovery with an aggregate external-block audit
@@ -17603,7 +17835,7 @@ mod aggregate {
             || materialization.ordered_base().validate().is_err()
             || !materialization.fence_ancestry.validate()
             || materialization.fence_ancestry.genesis() != materialization.heads.genesis
-            || materialization.fence_ancestry.checkpoint_base() != materialization.replay_boundary
+            || !materialization.ancestry_boundary_matches()
             || materialization.fence_ancestry.canonical_head() != materialization.ordered_base()
             || materialization.fence_ancestry.fence() != materialization.heads.merge_fence
             || materialization.heads.runtime != *materialization.runtime()
@@ -18764,6 +18996,7 @@ mod aggregate {
                 artifacts,
                 suffix_budget,
                 replay_boundary: materialization.replay_boundary,
+                common_ancestry_boundary: materialization.common_ancestry_boundary,
                 fence_ancestry,
                 transition_proofs: materialization.transition_proofs.clone(),
                 transition_proof_shadow: if entry.merge_seal.is_some() {
@@ -19729,6 +19962,7 @@ mod aggregate {
                         artifacts,
                         suffix_budget,
                         replay_boundary: materialization.replay_boundary,
+                        common_ancestry_boundary: materialization.common_ancestry_boundary,
                         fence_ancestry,
                         transition_proofs: materialization.transition_proofs.clone(),
                         transition_proof_shadow: if installing_fence {
@@ -19995,6 +20229,7 @@ mod aggregate {
                 artifacts,
                 suffix_budget,
                 replay_boundary: materialization.replay_boundary,
+                common_ancestry_boundary: materialization.common_ancestry_boundary,
                 fence_ancestry,
                 transition_proofs: materialization.transition_proofs.clone(),
                 transition_proof_shadow: successor_transition_proof_shadow,
@@ -20415,6 +20650,7 @@ mod aggregate {
                 artifacts,
                 suffix_budget,
                 replay_boundary: materialization.replay_boundary,
+                common_ancestry_boundary: materialization.common_ancestry_boundary,
                 fence_ancestry,
                 transition_proofs: materialization.transition_proofs.clone(),
                 transition_proof_shadow: successor_transition_proof_shadow,
@@ -20441,6 +20677,102 @@ mod aggregate {
         let compacted = encode_standard_runtime_state(&runtime.snapshot());
         validate_runtime_state_bound(&compacted)?;
         Ok(compacted)
+    }
+
+    /// Restrict common checkpoint transfer to the fixed image profile whose
+    /// node-private lanes remain exactly the independently admitted genesis.
+    /// Lifecycle fences are retained; an empty Merge DAG need not have no fence.
+    pub(crate) fn validate_common_checkpoint_profile<S: AgentJournalStore>(
+        store: &S,
+        materialization: &ReplayMaterialization,
+        initial: &RuntimeState,
+    ) -> Result<(), JournalStoreError> {
+        let heads = materialization.heads();
+        let empty_merge =
+            InvocationIndexManifest::empty(heads.genesis, InvocationOwnershipScope::Merge);
+        let empty_local = InvocationIndexManifest::empty(
+            heads.genesis,
+            InvocationOwnershipScope::Local(heads.node),
+        );
+        let frontier = store
+            .get::<MergeFrontier>(heads.merge_frontier)?
+            .ok_or(JournalStoreError::MissingObject)?;
+        #[cfg(feature = "experimental-state-blocks")]
+        if heads.runtime.is_external_state() {
+            return Err(JournalStoreError::Unavailable);
+        }
+        if heads.local_revision != 0
+            || heads.local_head.is_some()
+            || heads.merge_invocations != empty_merge.id()
+            || heads.local_invocations != empty_local.id()
+            || frontier.genesis != heads.genesis
+            || !frontier.events.is_empty()
+            || materialization.state().merge != initial.merge
+            || materialization.state().local != initial.local
+        {
+            return Err(JournalStoreError::Unavailable);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_common_checkpoint_state<S>(
+        store: &S,
+        materialization: &ReplayMaterialization,
+        claim: &SharedAgentSnapshotClaim,
+        initial: &RuntimeState,
+    ) -> Result<(), JournalStoreError>
+    where
+        S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
+    {
+        validate_common_checkpoint_profile(store, materialization, initial)?;
+        validate_published_shared_checkpoint(store, materialization, claim)
+            .map_err(|_| JournalStoreError::Corrupt)?;
+        let ordered = claim.ordered();
+        let state = materialization.state();
+        let heads = materialization.heads();
+        ordered
+            .control()
+            .verify_state(&state.control)
+            .map_err(|_| JournalStoreError::Corrupt)?;
+        ordered
+            .linear()
+            .verify_state(&state.linear)
+            .map_err(|_| JournalStoreError::Corrupt)?;
+        ordered
+            .merge()
+            .verify_state(&state.merge)
+            .map_err(|_| JournalStoreError::Corrupt)?;
+        if ordered.runtime() != &heads.runtime
+            || ordered.ordered() != materialization.ordered_base()
+            || ordered.ordered_invocations() != heads.ordered_invocations
+            || ordered.artifacts() != materialization.artifacts().id()
+            || ordered.merge_frontier() != heads.merge_frontier
+            || ordered.merge_invocations() != heads.merge_invocations
+            || ordered.merge_fence() != heads.merge_fence
+            || ordered.merge_seal() != heads.merge_seal
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_common_checkpoint_image<S>(
+        store: &S,
+        materialization: &ReplayMaterialization,
+        image: super::super::journal_store::PortableJournalCheckpoint,
+        verified: VerifiedSharedAgentSnapshot,
+        initial: &RuntimeState,
+    ) -> Result<ValidatedCommonCheckpoint, JournalStoreError>
+    where
+        S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
+    {
+        if image.heads() != materialization.heads()
+            || image.heads().id() != verified.claim().journal_heads()
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        validate_common_checkpoint_state(store, materialization, verified.claim(), initial)?;
+        Ok(ValidatedCommonCheckpoint { image, verified })
     }
 
     /// Build a complete Shared checkpoint and stage its immutable proof-index
@@ -20693,6 +21025,7 @@ mod aggregate {
                 artifacts,
                 suffix_budget: ReplaySuffixBudget::default(),
                 replay_boundary: ordered,
+                common_ancestry_boundary: None,
                 fence_ancestry,
                 transition_proofs: materialization.transition_proofs.clone(),
                 transition_proof_shadow: materialization
@@ -21093,6 +21426,7 @@ mod aggregate {
                 artifacts,
                 suffix_budget: ReplaySuffixBudget::default(),
                 replay_boundary: ordered,
+                common_ancestry_boundary: None,
                 fence_ancestry,
                 transition_proofs: materialization.transition_proofs.clone(),
                 transition_proof_shadow: materialization
@@ -21112,9 +21446,11 @@ mod aggregate {
 #[cfg(feature = "std")]
 #[allow(unused_imports)]
 pub(crate) use aggregate::{
-    MaterializeError, materialize_current, prepare_checkpoint, prepare_local, prepare_merge,
-    prepare_ordered, prepare_shared_checkpoint, prepare_shared_ordered, recover_invocation,
-    validate_published_shared_checkpoint,
+    MaterializeError, materialize_common_checkpoint, materialize_current, prepare_checkpoint,
+    prepare_local, prepare_merge, prepare_ordered, prepare_shared_checkpoint,
+    prepare_shared_ordered, recover_invocation, seed_common_checkpoint_ancestry,
+    validate_common_checkpoint_image, validate_common_checkpoint_profile,
+    validate_common_checkpoint_state, validate_published_shared_checkpoint,
 };
 
 #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]

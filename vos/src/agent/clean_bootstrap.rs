@@ -9483,6 +9483,7 @@ mod tests {
         target_os = "linux"
     ))]
     mod physical {
+        mod common_checkpoint;
         #[cfg(feature = "experimental-state-blocks")]
         mod external_shared;
 
@@ -10152,6 +10153,28 @@ mod tests {
                     self.key.sign(&candidate.signing_message().0).to_bytes(),
                 )
                 .ok()
+            }
+
+            fn sign_common_snapshot_candidate(
+                &self,
+                candidate: &crate::agent::shared_host::VerifiedSharedAgentCommonSnapshotCandidate,
+            ) -> Option<crate::agent::shared_commit::ReplicaCommitSignature> {
+                crate::agent::local_journal_driver::Ed25519NodeMergeAuthenticator::new(
+                    libp2p::identity::Keypair::ed25519_from_bytes(self.key.to_bytes()).ok()?,
+                )
+                .ok()?
+                .sign_common_snapshot_candidate(candidate)
+            }
+
+            fn sign_local_snapshot_candidate(
+                &self,
+                candidate: &crate::agent::shared_host::VerifiedSharedAgentLocalSnapshotCandidate,
+            ) -> Option<crate::agent::shared_commit::ReplicaCommitSignature> {
+                crate::agent::local_journal_driver::Ed25519NodeMergeAuthenticator::new(
+                    libp2p::identity::Keypair::ed25519_from_bytes(self.key.to_bytes()).ok()?,
+                )
+                .ok()?
+                .sign_local_snapshot_candidate(candidate)
             }
         }
 
@@ -12725,6 +12748,20 @@ mod tests {
             projection_failover: Option<ProjectionCrashStage>,
             successor_finishes_first: bool,
         ) {
+            check_fixed_system_pending_cluster_with_checkpoint(
+                complete_leader,
+                projection_failover,
+                successor_finishes_first,
+                None,
+            );
+        }
+
+        fn check_fixed_system_pending_cluster_with_checkpoint(
+            complete_leader: bool,
+            projection_failover: Option<ProjectionCrashStage>,
+            successor_finishes_first: bool,
+            common_checkpoint: Option<common_checkpoint::Exercise>,
+        ) {
             if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
                 let _ = tracing_subscriber::fmt()
                     .with_env_filter(
@@ -12952,6 +12989,35 @@ mod tests {
                         .clean_state_commitment(agent)
                         .unwrap()
                         == expected));
+                }
+                if let Some(exercise) = common_checkpoint {
+                    assert!(projection_failover.is_none());
+                    let mut owners: Vec<Option<MemoryBootstrapOwner>> =
+                        (0..3).map(|_| None).collect();
+                    owners[leader] = Some(completed);
+                    for (index, attached) in pending.iter_mut().enumerate() {
+                        if index != leader {
+                            owners[index] =
+                                Some(attached.try_complete(&mut signer).unwrap().unwrap());
+                        }
+                    }
+                    common_checkpoint::exercise(
+                        leader,
+                        &mut owners,
+                        &fixtures,
+                        &directories,
+                        &bootstrap_stores,
+                        &genesis_providers,
+                        &mut networks,
+                        &mut signer,
+                        exercise,
+                    );
+                    drop(owners);
+                    drop(pending);
+                    for network in networks {
+                        stop_network(network);
+                    }
+                    return;
                 }
                 if let Some(crash_stage) = projection_failover {
                     let mut owners: Vec<Option<MemoryBootstrapOwner>> =

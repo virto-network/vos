@@ -37,9 +37,12 @@ use super::replay::PublishedSharedOrdered;
 #[cfg(feature = "storage")]
 use super::shared_commit::{
     MAX_ORDERED_COMMIT_CLAIM_BYTES, MAX_REPLICA_COMMIT_SIGNATURE_BYTES,
+    MAX_SHARED_AGENT_COMMON_SNAPSHOT_CERTIFICATE_BYTES,
+    MAX_SHARED_AGENT_LOCAL_SNAPSHOT_BINDING_BYTES,
     MAX_SHARED_AGENT_PORTABLE_SNAPSHOT_CERTIFICATE_BYTES,
     MAX_SHARED_AGENT_SNAPSHOT_CERTIFICATE_BYTES, MAX_SHARED_AGENT_SNAPSHOT_CLAIM_BYTES,
-    ReplicaCommitSignature, ReplicaQuorumCertificate, SharedAgentPortableSnapshotCertificate,
+    ReplicaCommitSignature, ReplicaQuorumCertificate, SharedAgentCommonSnapshotCertificate,
+    SharedAgentLocalSnapshotBinding, SharedAgentPortableSnapshotCertificate,
     SharedAgentSnapshotCertificate, SharedAgentSnapshotClaim, VerifiedSharedAgentPortableSnapshot,
 };
 use super::shared_commit::{OrderedCommitClaim, SharedCommitError};
@@ -52,6 +55,14 @@ use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 use crate::service::{AgentId, BlobRef, Hash, NodeId, SpaceId};
 
 const SERVICE_WIRE_HEADER_BYTES: usize = 4 + 32;
+
+/// Full authenticated-node vote used by the clean Agent transport. Shared
+/// checkpoint restore must update it in the same term transaction, not only
+/// the legacy two-byte service-Raft vote carried by `RaftMeta`.
+pub(crate) const META_AGENT_VOTED_FOR: &str = "agent_node_voted_for_v1";
+pub(crate) const META_AGENT_ACTIVE_CONFIG: &str = "agent_node_active_config_v1";
+pub(crate) const META_LEGACY_ACTIVE_CONFIG: &str = "active_config";
+pub(crate) const ACTIVE_CONFIG_MAGIC: &[u8; 4] = b"ANC1";
 
 const ARTIFACT_BATCH_ID_DOMAIN: &[u8] = b"vos/agent/shared/artifact-batch/v1";
 const ARTIFACT_CHUNK_COMMITMENT_DOMAIN: &[u8] = b"vos/agent/shared/artifact-batch-chunk/v1";
@@ -4397,6 +4408,14 @@ mod application_ledger_v2 {
         + MAX_SNAPSHOT_COMMITTEE_EVIDENCE
             * (MAX_AGENT_RAFT_APPLY_META_BYTES + MAX_AGENT_RAFT_PHYSICAL_SLOT_BYTES + 16)
         + 4096;
+    // Adding a narrow authority must not silently enlarge legacy ASR4 bounds.
+    const _: () = assert!(
+        SNAPSHOT_RECORD_MAX_BYTES
+            >= MAX_SHARED_AGENT_SNAPSHOT_CLAIM_BYTES
+                + MAX_SHARED_AGENT_COMMON_SNAPSHOT_CERTIFICATE_BYTES
+                + MAX_SHARED_AGENT_LOCAL_SNAPSHOT_BINDING_BYTES
+                + 4096
+    );
     const RETIRED_AUDIT_ROOT_DOMAIN: &[u8] = b"vos/agent/shared/retired-audit-root/v1";
     const COMMITTEE_EVIDENCE_ROOT_DOMAIN: &[u8] =
         b"vos/agent/shared/snapshot-committee-evidence/v1";
@@ -4703,6 +4722,10 @@ mod application_ledger_v2 {
     enum SnapshotAuthorityV2 {
         Physical(SharedAgentSnapshotCertificate),
         Portable(SharedAgentPortableSnapshotCertificate),
+        Common {
+            certificate: SharedAgentCommonSnapshotCertificate,
+            binding: SharedAgentLocalSnapshotBinding,
+        },
     }
 
     /// One durable, quorum-authenticated snapshot anchor. There is exactly
@@ -4724,11 +4747,31 @@ mod application_ledger_v2 {
             match &self.authority {
                 SnapshotAuthorityV2::Physical(certificate) => certificate.commitment(),
                 SnapshotAuthorityV2::Portable(certificate) => certificate.commitment(),
+                SnapshotAuthorityV2::Common { binding, .. } => binding.commitment(),
             }
         }
 
         fn verify_authority(&self) -> Result<(), AgentRaftApplicationErrorV2> {
             match &self.authority {
+                SnapshotAuthorityV2::Common { certificate, binding } => {
+                    binding.verify(certificate, &self.claim)
+                        .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+                    let foundation = common_restore_foundation(
+                        self.generation, self.journal_store, self.local_node, certificate.commitment(),
+                    );
+                    // Import mode is bound by the signed physical foundation,
+                    // not an independently mutable flag in the ledger row.
+                    if self.claim.boundary_payload_commitment() == foundation.boundary_payload_commitment {
+                        if self.claim.retired_audit_root() != foundation.retired_audit_root
+                            || self.claim.committee_evidence_root() != foundation.committee_evidence_root
+                            || self.claim.previous_snapshot().is_some()
+                            || !self.committee_evidence.is_empty()
+                        {
+                            return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                        }
+                    }
+                    Ok(())
+                }
                 SnapshotAuthorityV2::Physical(certificate) => {
                     if certificate.claim() != &self.claim {
                         return Err(AgentRaftApplicationErrorV2::CorruptLedger);
@@ -4839,6 +4882,11 @@ mod application_ledger_v2 {
                     encoder.u8(1);
                     encoder.bytes(&certificate.encode());
                 }
+                SnapshotAuthorityV2::Common { certificate, binding } => {
+                    encoder.u8(2);
+                    encoder.bytes(&certificate.encode());
+                    encoder.bytes(&binding.encode());
+                }
             }
             encoder.u32(self.committee_evidence.len() as u32);
             for evidence in &self.committee_evidence {
@@ -4869,6 +4917,10 @@ mod application_ledger_v2 {
                     decoder,
                     MAX_SHARED_AGENT_PORTABLE_SNAPSHOT_CERTIFICATE_BYTES,
                 )?),
+                2 => SnapshotAuthorityV2::Common {
+                    certificate: decode_nested::<SharedAgentCommonSnapshotCertificate>(decoder, MAX_SHARED_AGENT_COMMON_SNAPSHOT_CERTIFICATE_BYTES)?,
+                    binding: decode_nested::<SharedAgentLocalSnapshotBinding>(decoder, MAX_SHARED_AGENT_LOCAL_SNAPSHOT_BINDING_BYTES)?,
+                },
                 _ => return Err(DecodeError::InvalidTag),
             };
             let count = decoder.u32()? as usize;
@@ -4927,6 +4979,37 @@ mod application_ledger_v2 {
     pub(crate) struct InstalledAgentRaftSnapshotV2 {
         pub(crate) claim: SharedAgentSnapshotClaim,
         pub(crate) certificate_commitment: Hash,
+    }
+
+    /// Deterministic destination-only metadata for a typed common-state import.
+    /// The complete resulting physical claim still requires its owner's binding
+    /// signature and replay's authenticated source/destination closure checks.
+    pub(crate) struct CommonSnapshotRestoreFoundation {
+        pub(crate) journal_store: Hash,
+        pub(crate) local_node: NodeId,
+        pub(crate) boundary_payload_commitment: Hash,
+        pub(crate) retired_audit_root: Hash,
+        pub(crate) committee_evidence_root: Hash,
+    }
+
+    fn common_restore_foundation(
+        generation: AgentGenerationRouteKey,
+        journal_store: JournalStoreInstanceId,
+        node: NodeId,
+        certificate: Hash,
+    ) -> CommonSnapshotRestoreFoundation {
+        let encoded = generation_storage_key(generation);
+        let parts: &[&[u8]] = &[&encoded, journal_store.as_bytes(), &node.0, &certificate.0];
+        CommonSnapshotRestoreFoundation {
+            journal_store: Hash(*journal_store.as_bytes()),
+            local_node: node,
+            boundary_payload_commitment: Hash::digest(
+                b"vos/agent/shared/common-recovery-foundation/v1",
+                parts,
+            ),
+            retired_audit_root: Hash::digest(b"vos/agent/shared/common-recovery-retired/v1", parts),
+            committee_evidence_root: snapshot_committee_evidence_root(generation, &[]),
+        }
     }
 
     /// Result of an atomic V2 foundation application.
@@ -5510,6 +5593,39 @@ mod application_ledger_v2 {
             certificate: &SharedAgentSnapshotCertificate,
             logical_ordered: Option<&OrderedCommitClaim>,
         ) -> Result<InstalledAgentRaftSnapshotV2, AgentRaftApplicationErrorV2> {
+            self.install_snapshot_authority(
+                certificate.claim(),
+                SnapshotAuthorityV2::Physical(certificate.clone()),
+                logical_ordered,
+            )
+        }
+
+        pub(crate) fn install_common_snapshot(
+            &self,
+            certificate: &SharedAgentCommonSnapshotCertificate,
+            binding: &SharedAgentLocalSnapshotBinding,
+            logical_ordered: Option<&OrderedCommitClaim>,
+        ) -> Result<InstalledAgentRaftSnapshotV2, AgentRaftApplicationErrorV2> {
+            self.validate_common_scope(certificate)?;
+            binding
+                .verify(certificate, binding.claim())
+                .map_err(|_| AgentRaftApplicationErrorV2::SnapshotCertificateInvalid)?;
+            self.install_snapshot_authority(
+                binding.claim(),
+                SnapshotAuthorityV2::Common {
+                    certificate: certificate.clone(),
+                    binding: binding.clone(),
+                },
+                logical_ordered,
+            )
+        }
+
+        fn install_snapshot_authority(
+            &self,
+            claim: &SharedAgentSnapshotClaim,
+            authority: SnapshotAuthorityV2,
+            logical_ordered: Option<&OrderedCommitClaim>,
+        ) -> Result<InstalledAgentRaftSnapshotV2, AgentRaftApplicationErrorV2> {
             let _guard = self
                 .writes
                 .lock()
@@ -5520,11 +5636,8 @@ mod application_ledger_v2 {
                 let transaction = self.database.begin_read()?;
                 if let Some(current) = read_snapshot_in_read(&transaction, key.as_slice())? {
                     let current_index = current.claim.raft_index();
-                    if certificate.claim().raft_index() <= current_index {
-                        if matches!(
-                            &current.authority,
-                            SnapshotAuthorityV2::Physical(existing) if existing == certificate
-                        ) {
+                    if claim.raft_index() <= current_index {
+                        if current.authority == authority && &current.claim == claim {
                             return Ok(InstalledAgentRaftSnapshotV2 {
                                 claim: current.claim.clone(),
                                 certificate_commitment: current.authority_commitment(),
@@ -5543,7 +5656,6 @@ mod application_ledger_v2 {
             let logical_ordered =
                 logical_ordered.ok_or(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired)?;
             let context = self.snapshot_context_unlocked(logical_ordered)?;
-            let claim = certificate.claim();
             if claim.ordered() != &context.ordered
                 || claim.active_committee() != &context.active_committee
                 || claim.authority_epoch() != context.authority_epoch
@@ -5557,17 +5669,17 @@ mod application_ledger_v2 {
             {
                 return Err(AgentRaftApplicationErrorV2::SnapshotReplay);
             }
-            certificate
-                .verify(&context.active_committee, claim)
-                .map_err(|_| AgentRaftApplicationErrorV2::SnapshotCertificateInvalid)?;
             let record = AgentRaftSnapshotRecordV2 {
                 generation: self.generation,
                 journal_store: self.journal_store,
                 local_node: self.local_node,
                 claim: claim.clone(),
-                authority: SnapshotAuthorityV2::Physical(certificate.clone()),
+                authority,
                 committee_evidence: context.committee_evidence,
             };
+            record
+                .verify_authority()
+                .map_err(|_| AgentRaftApplicationErrorV2::SnapshotCertificateInvalid)?;
             record.validate()?;
 
             let transaction = self.database.begin_write()?;
@@ -5641,8 +5753,326 @@ mod application_ledger_v2 {
             transaction.commit()?;
             Ok(InstalledAgentRaftSnapshotV2 {
                 claim: claim.clone(),
-                certificate_commitment: certificate.commitment(),
+                certificate_commitment: record.authority_commitment(),
             })
+        }
+
+        fn validate_common_scope(
+            &self,
+            certificate: &SharedAgentCommonSnapshotCertificate,
+        ) -> Result<(), AgentRaftApplicationErrorV2> {
+            let claim = certificate.claim();
+            certificate
+                .verify(&self.initial_committee, claim)
+                .map_err(|_| AgentRaftApplicationErrorV2::SnapshotCertificateInvalid)?;
+            if claim.active_committee() != &self.initial_committee
+                || claim.authority_epoch() != self.authority.initial_epoch
+                || claim.ordered().space() != self.generation.space
+                || claim.ordered().agent() != self.generation.agent
+                || claim.ordered().genesis() != self.generation.genesis
+                || claim.ordered().admission() != self.generation.admission
+                || self
+                    .initial_committee
+                    .member_by_node(self.local_node)
+                    .is_none()
+            {
+                return Err(AgentRaftApplicationErrorV2::ConfigurationMismatch);
+            }
+            Ok(())
+        }
+
+        pub(crate) fn common_restore_foundation(
+            &self,
+            certificate: &SharedAgentCommonSnapshotCertificate,
+        ) -> Result<CommonSnapshotRestoreFoundation, AgentRaftApplicationErrorV2> {
+            self.validate_common_scope(certificate)?;
+            Ok(common_restore_foundation(
+                self.generation,
+                self.journal_store,
+                self.local_node,
+                certificate.commitment(),
+            ))
+        }
+
+        /// Check before staging or publishing a destination journal. The host
+        /// must retire its Raft worker throughout preflight/publication/install;
+        /// the same checks run again in the final ledger transaction.
+        pub(crate) fn validate_common_restore(
+            &self,
+            certificate: &SharedAgentCommonSnapshotCertificate,
+        ) -> Result<(), AgentRaftApplicationErrorV2> {
+            self.validate_common_scope(certificate)?;
+            let _guard = self
+                .writes
+                .lock()
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            self.audit_recovery()?;
+            // An aborted transaction makes this a non-mutating preflight while
+            // sharing the exact install checks and table snapshot.
+            let transaction = self.database.begin_write()?;
+            self.common_restore_state(&transaction, certificate, None)
+                .map(|_| ())
+        }
+
+        fn common_restore_state(
+            &self,
+            transaction: &redb::WriteTransaction,
+            certificate: &SharedAgentCommonSnapshotCertificate,
+            binding: Option<&SharedAgentLocalSnapshotBinding>,
+        ) -> Result<crate::raft::RaftMeta, AgentRaftApplicationErrorV2> {
+            let key = generation_storage_key(self.generation);
+            ensure_v2_config_in_write(
+                transaction,
+                key.as_slice(),
+                self.generation,
+                self.journal_store,
+                self.local_node,
+                &self.initial_committee,
+                self.authority,
+            )?;
+            let meta = read_meta_in_write(transaction, key.as_slice())?
+                .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+            let state = read_committee_state_in_write(transaction, key.as_slice())?
+                .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+            let expected_state = CommitteeApplicationStateV2::initial(
+                self.generation,
+                self.initial_committee.clone(),
+                self.authority.initial_epoch,
+            );
+            let raft = crate::raft::RaftMeta::load_from_write_transaction(transaction)?;
+            {
+                let table = transaction.open_table(crate::raft::RAFT_META)?;
+                if raft.voted_for.is_some() || table.get(META_LEGACY_ACTIVE_CONFIG)?.is_some() {
+                    return Err(AgentRaftApplicationErrorV2::ConfigurationMismatch);
+                }
+                if let Some(cached) = table.get(META_AGENT_ACTIVE_CONFIG)? {
+                    // The worker can persist speculative membership before
+                    // application. Never retain an unevidenced configuration
+                    // after pruning its log row. Only the canonical initial
+                    // stable record is supported by this fixed-roster import.
+                    let mut initial = ACTIVE_CONFIG_MAGIC.to_vec();
+                    initial.extend_from_slice(&[0, 0]); // no log index, no joint set
+                    initial.extend_from_slice(
+                        &(self.initial_committee.members().len() as u16).to_le_bytes(),
+                    );
+                    for member in self.initial_committee.members() {
+                        initial.extend_from_slice(&member.replica().node.0);
+                    }
+                    let mut genesis_indexed = ACTIVE_CONFIG_MAGIC.to_vec();
+                    genesis_indexed.push(1);
+                    genesis_indexed.extend_from_slice(&0_u64.to_le_bytes());
+                    genesis_indexed.extend_from_slice(&initial[ACTIVE_CONFIG_MAGIC.len() + 1..]);
+                    if cached.value() != initial.as_slice()
+                        && cached.value() != genesis_indexed.as_slice()
+                    {
+                        return Err(AgentRaftApplicationErrorV2::ConfigurationMismatch);
+                    }
+                }
+            }
+            if let Some(vote) = transaction
+                .open_table(crate::raft::RAFT_META)?
+                .get(META_AGENT_VOTED_FOR)?
+            {
+                let bytes: [u8; 32] = vote
+                    .value()
+                    .try_into()
+                    .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+                if bytes == [0; 32] || raft.current_term == 0 {
+                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                }
+            }
+            let target = certificate.claim().ordered().raft_index();
+            let exact_anchor = read_snapshot_in_write(transaction, key.as_slice())?
+                .is_some_and(|current| matches!(current.authority,
+                    SnapshotAuthorityV2::Common { certificate: ref existing, binding: ref existing_binding }
+                    if existing == certificate && binding == Some(existing_binding)
+                        && &current.claim == existing_binding.claim()));
+            if state != expected_state
+                || read_command_reservation_in_write(transaction, key.as_slice())?.is_some()
+                || meta.applied_index > target
+                || raft.commit_index > target
+                || raft.snap_last_index > target
+                || (!exact_anchor
+                    && (meta.applied_index == target
+                        || raft.commit_index == target
+                        || raft.snap_last_index == target))
+                || (exact_anchor && (meta.applied_index != target || raft.last_applied != target))
+            {
+                return Err(AgentRaftApplicationErrorV2::SnapshotReplay);
+            }
+            // A locally uncommitted suffix may already be committed elsewhere.
+            // This initial catch-up path refuses such destinations instead of
+            // truncating entries without the Raft log-matching proof.
+            if transaction
+                .open_table(crate::raft::RAFT_LOG)?
+                .range((
+                    core::ops::Bound::Excluded(target),
+                    core::ops::Bound::Unbounded,
+                ))?
+                .next()
+                .transpose()?
+                .is_some()
+            {
+                return Err(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired);
+            }
+            Ok(raft)
+        }
+
+        /// Install only a locally signed rebind of a common fixed-committee
+        /// checkpoint. Journal closure verification/publication and its crash
+        /// marker belong to the driver; this transaction replaces only the
+        /// already verified ledger foundation, never an unknown log suffix.
+        pub(crate) fn restore_common_snapshot(
+            &self,
+            certificate: &SharedAgentCommonSnapshotCertificate,
+            binding: &SharedAgentLocalSnapshotBinding,
+        ) -> Result<InstalledAgentRaftSnapshotV2, AgentRaftApplicationErrorV2> {
+            let foundation = self.common_restore_foundation(certificate)?;
+            let claim = binding.claim();
+            binding
+                .verify(certificate, claim)
+                .map_err(|_| AgentRaftApplicationErrorV2::SnapshotCertificateInvalid)?;
+            if claim.journal_store() != foundation.journal_store
+                || claim.local_node() != foundation.local_node
+                || claim.boundary_payload_commitment() != foundation.boundary_payload_commitment
+                || claim.retired_audit_root() != foundation.retired_audit_root
+                || claim.committee_evidence_root() != foundation.committee_evidence_root
+                || claim.previous_snapshot().is_some()
+            {
+                return Err(AgentRaftApplicationErrorV2::SnapshotReplay);
+            }
+            let record = AgentRaftSnapshotRecordV2 {
+                generation: self.generation,
+                journal_store: self.journal_store,
+                local_node: self.local_node,
+                claim: claim.clone(),
+                authority: SnapshotAuthorityV2::Common {
+                    certificate: certificate.clone(),
+                    binding: binding.clone(),
+                },
+                committee_evidence: Vec::new(),
+            };
+            record.validate()?;
+            let _guard = self
+                .writes
+                .lock()
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            self.audit_recovery()?;
+            let key = generation_storage_key(self.generation);
+            let transaction = self.database.begin_write()?;
+            let mut raft = self.common_restore_state(&transaction, certificate, Some(binding))?;
+            if let Some(current) = read_snapshot_in_write(&transaction, key.as_slice())? {
+                if current == record {
+                    return Ok(InstalledAgentRaftSnapshotV2 {
+                        claim: claim.clone(),
+                        certificate_commitment: binding.commitment(),
+                    });
+                }
+                if current.claim.raft_index() >= claim.raft_index() {
+                    return Err(AgentRaftApplicationErrorV2::SnapshotStale);
+                }
+            }
+            let ordered_head = claim
+                .ordered()
+                .ordered()
+                .head
+                .ok_or(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired)?;
+            let restored_meta = AgentRaftApplyMetaV2 {
+                generation: self.generation,
+                journal_store: self.journal_store,
+                applied_index: claim.raft_index(),
+                applied_term: claim.raft_term(),
+                raw_payload_commitment: foundation.boundary_payload_commitment,
+                disposition: Some(AgentRaftApplyDispositionV2::Command(
+                    AgentRaftAuditDisposition::OrderedApplied {
+                        entry: ordered_head,
+                        claim: claim.ordered().commitment(),
+                        successor: claim.ordered_successor(),
+                    },
+                )),
+            };
+            restored_meta
+                .validate()
+                .map_err(|_| AgentRaftApplicationErrorV2::SnapshotCertificateInvalid)?;
+            {
+                let mut table = transaction.open_table(APPLY_AUDIT_TABLE_V2)?;
+                let retired = table
+                    .range(key.as_slice()..)?
+                    .take_while(|row| {
+                        row.as_ref().map_or(true, |(stored, _)| {
+                            stored.value().starts_with(key.as_slice())
+                        })
+                    })
+                    .map(|row| row.map(|(stored, _)| stored.value().to_vec()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                for retired in retired {
+                    table.remove(retired.as_slice())?;
+                }
+            }
+            {
+                let mut table = transaction.open_table(crate::raft::RAFT_LOG)?;
+                let retired = table
+                    .range(..=claim.raft_index())?
+                    .map(|row| row.map(|(index, _)| index.value()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                for index in retired {
+                    table.remove(index)?;
+                }
+            }
+            transaction
+                .open_table(APPLY_META_TABLE_V2)?
+                .insert(key.as_slice(), restored_meta.encode().as_slice())?;
+            transaction
+                .open_table(SNAPSHOT_TABLE_V2)?
+                .insert(key.as_slice(), record.encode().as_slice())?;
+            // Hard state is monotonic even when the destination had an election
+            // while offline. Never clear a vote in an unchanged term.
+            if raft.current_term < claim.raft_term() {
+                raft.current_term = claim.raft_term();
+                raft.voted_for = None;
+                transaction
+                    .open_table(crate::raft::RAFT_META)?
+                    .remove(META_AGENT_VOTED_FOR)?;
+            }
+            raft.commit_index = claim.raft_index();
+            raft.last_applied = claim.raft_index();
+            raft.snap_last_index = claim.raft_index();
+            raft.snap_last_term = claim.raft_term();
+            raft.write_in_txn(&transaction)?;
+            transaction.commit()?;
+            self.audit_recovery()?;
+            Ok(InstalledAgentRaftSnapshotV2 {
+                claim: claim.clone(),
+                certificate_commitment: binding.commitment(),
+            })
+        }
+
+        pub(crate) fn common_snapshot_authority(
+            &self,
+        ) -> Result<
+            Option<(
+                SharedAgentCommonSnapshotCertificate,
+                SharedAgentLocalSnapshotBinding,
+            )>,
+            AgentRaftApplicationErrorV2,
+        > {
+            let _guard = self
+                .writes
+                .lock()
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            self.audit_recovery()?;
+            let transaction = self.database.begin_read()?;
+            Ok(read_snapshot_in_read(
+                &transaction,
+                generation_storage_key(self.generation).as_slice(),
+            )?
+            .and_then(|record| match record.authority {
+                SnapshotAuthorityV2::Common {
+                    certificate,
+                    binding,
+                } => Some((certificate, binding)),
+                _ => None,
+            }))
         }
 
         /// Establish one fresh physical Raft generation from a quorum-signed
@@ -8163,7 +8593,7 @@ pub(crate) use application_ledger_v2::{
     AgentNetworkCommitteeState, AgentRaftApplicationErrorV2, AgentRaftApplicationLedgerV2,
     AgentRaftCommandApplyOutcomeV2, AgentRaftFoundationApplyOutcomeV2, AgentRaftJournalAuditV2,
     AgentRaftOrderedJournalAnchorV2, AgentRaftPendingOrderedV2, AgentRaftSnapshotContextV2,
-    InstalledAgentRaftSnapshotV2,
+    CommonSnapshotRestoreFoundation, InstalledAgentRaftSnapshotV2,
 };
 
 #[cfg(test)]
@@ -10133,6 +10563,327 @@ mod tests {
         assert!(history.contains(&initial));
         assert!(history.contains(&next));
         reopened.audit_recovery().unwrap();
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn v2_common_snapshot_restore_preserves_hard_state_and_refuses_unknown_suffix() {
+        use crate::agent::shared_commit::{
+            SharedAgentCommonSnapshotClaim, common_snapshot_claim_for_test,
+        };
+        let fixture = common_snapshot_claim_for_test();
+        let initial = fixture.active_committee().clone();
+        let common = SharedAgentCommonSnapshotClaim::new(
+            fixture.ordered().clone(),
+            initial.clone(),
+            committee_authority_binding().initial_epoch,
+            fixture.ancestry().clone(),
+        )
+        .unwrap();
+        let message = SharedAgentCommonSnapshotCertificate::signing_message(
+            initial.id(),
+            common.commitment(),
+        );
+        let mut signatures = [key(1), key(2)]
+            .iter()
+            .map(|signer| {
+                ReplicaCommitSignature::new(
+                    NodeId::of_authenticated_peer(&peer_id(signer)),
+                    signer.sign(&message.0).to_bytes(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(ReplicaCommitSignature::signer);
+        let certificate = SharedAgentCommonSnapshotCertificate::new(common, signatures).unwrap();
+        let local_key = key(3);
+        let local_node = NodeId::of_authenticated_peer(&peer_id(&local_key));
+        for (has_suffix, previous_term) in [(false, 12), (false, 3), (false, 2), (true, 12)] {
+            let directory = TempDirectory::new(if has_suffix {
+                "common_restore_suffix"
+            } else {
+                "common_restore_hard_state"
+            });
+            let database = Arc::new(Database::create(directory.database()).unwrap());
+            let generation = route(&initial).generation();
+            let store = journal_store(0xc1);
+            let ledger = AgentRaftApplicationLedgerV2::open(
+                Arc::clone(&database),
+                generation,
+                store,
+                local_node,
+                initial.clone(),
+                committee_authority_binding(),
+            )
+            .unwrap();
+            {
+                let mut log = crate::raft::RaftLog::open(Arc::clone(&database)).unwrap();
+                let transaction = database.begin_write().unwrap();
+                if has_suffix {
+                    for _ in 0..=certificate.claim().ordered().raft_index() {
+                        log.append_in_txn(
+                            &transaction,
+                            3,
+                            &encode_agent_raft_entry_kind(&EntryKind::Data {
+                                payload: Vec::new(),
+                            })
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    }
+                }
+                let mut meta =
+                    crate::raft::RaftMeta::load_from_write_transaction(&transaction).unwrap();
+                meta.current_term = previous_term;
+                meta.voted_for = None;
+                meta.write_in_txn(&transaction).unwrap();
+                transaction
+                    .open_table(crate::raft::RAFT_META)
+                    .unwrap()
+                    .insert(META_AGENT_VOTED_FOR, local_node.0.as_slice())
+                    .unwrap();
+                transaction.commit().unwrap();
+            }
+            let foundation = ledger.common_restore_foundation(&certificate).unwrap();
+            let bind = |head: u8| {
+                let ordered = certificate.claim().ordered();
+                let physical = SharedAgentSnapshotClaim::new(
+                    ordered.clone(),
+                    initial.clone(),
+                    certificate.claim().authority_epoch(),
+                    foundation.journal_store,
+                    foundation.boundary_payload_commitment,
+                    successor(head),
+                    successor(0xd2),
+                    successor(head),
+                    CheckpointId([head; 32]),
+                    local_node,
+                    LaneStateId([0xd4; 32]),
+                    LaneStateId([0xd5; 32]),
+                    LaneStateId([0xd6; 32]),
+                    LaneStateId([0xd7; 32]),
+                    ordered.ordered_invocations(),
+                    ordered.merge_invocations(),
+                    InvocationIndexId([0xda; 32]),
+                    ordered.artifacts(),
+                    foundation.retired_audit_root,
+                    foundation.committee_evidence_root,
+                    None,
+                )
+                .unwrap();
+                let message = SharedAgentLocalSnapshotBinding::signing_message(
+                    certificate.commitment(),
+                    physical.commitment(),
+                    local_node,
+                );
+                SharedAgentLocalSnapshotBinding::new(
+                    certificate.commitment(),
+                    physical,
+                    ReplicaCommitSignature::new(local_node, local_key.sign(&message.0).to_bytes())
+                        .unwrap(),
+                )
+                .unwrap()
+            };
+            let binding = bind(0xd1);
+            let before = crate::raft::RaftMeta::load(&database).unwrap();
+            let read_node_vote = || {
+                database
+                    .begin_read()
+                    .unwrap()
+                    .open_table(crate::raft::RAFT_META)
+                    .unwrap()
+                    .get(META_AGENT_VOTED_FOR)
+                    .unwrap()
+                    .map(|value| value.value().to_vec())
+            };
+            if !has_suffix {
+                let node_config = |index: Option<u64>, joint: bool, changed: bool| {
+                    let mut bytes = ACTIVE_CONFIG_MAGIC.to_vec();
+                    bytes.push(u8::from(index.is_some()));
+                    if let Some(index) = index {
+                        bytes.extend_from_slice(&index.to_le_bytes());
+                    }
+                    bytes.push(u8::from(joint));
+                    let mut members = (3_u16).to_le_bytes().to_vec();
+                    for member in initial.members() {
+                        members.extend_from_slice(&member.replica().node.0);
+                    }
+                    if changed {
+                        *members.last_mut().unwrap() ^= 1;
+                    }
+                    if joint {
+                        bytes.extend_from_slice(&members);
+                    }
+                    bytes.extend_from_slice(&members);
+                    bytes
+                };
+                for (key, value) in [
+                    (META_AGENT_ACTIVE_CONFIG, node_config(Some(1), false, false)),
+                    (META_AGENT_ACTIVE_CONFIG, node_config(None, true, false)),
+                    (META_AGENT_ACTIVE_CONFIG, node_config(None, false, true)),
+                    (META_AGENT_ACTIVE_CONFIG, vec![0]),
+                    (META_LEGACY_ACTIVE_CONFIG, vec![1]),
+                    ("voted_for", 42_u16.to_le_bytes().to_vec()),
+                ] {
+                    let transaction = database.begin_write().unwrap();
+                    transaction
+                        .open_table(crate::raft::RAFT_META)
+                        .unwrap()
+                        .insert(key, value.as_slice())
+                        .unwrap();
+                    transaction.commit().unwrap();
+                    assert!(matches!(
+                        ledger.validate_common_restore(&certificate),
+                        Err(AgentRaftApplicationErrorV2::ConfigurationMismatch)
+                    ));
+                    assert!(
+                        ledger
+                            .restore_common_snapshot(&certificate, &binding)
+                            .is_err()
+                    );
+                    assert!(ledger.current_snapshot().unwrap().is_none());
+                    assert_eq!(read_node_vote(), Some(local_node.0.to_vec()));
+                    let transaction = database.begin_write().unwrap();
+                    assert_eq!(
+                        transaction
+                            .open_table(crate::raft::RAFT_META)
+                            .unwrap()
+                            .get(key)
+                            .unwrap()
+                            .unwrap()
+                            .value(),
+                        value.as_slice()
+                    );
+                    transaction
+                        .open_table(crate::raft::RAFT_META)
+                        .unwrap()
+                        .remove(key)
+                        .unwrap();
+                    transaction.commit().unwrap();
+                    assert_eq!(crate::raft::RaftMeta::load(&database).unwrap(), before);
+                }
+                // Both canonical initial representations are harmless: neither
+                // asserts a speculative or pruned membership transition.
+                for index in [None, Some(0)] {
+                    let transaction = database.begin_write().unwrap();
+                    transaction
+                        .open_table(crate::raft::RAFT_META)
+                        .unwrap()
+                        .insert(
+                            META_AGENT_ACTIVE_CONFIG,
+                            node_config(index, false, false).as_slice(),
+                        )
+                        .unwrap();
+                    transaction.commit().unwrap();
+                    ledger.validate_common_restore(&certificate).unwrap();
+                }
+            }
+            if has_suffix {
+                let before_rows = database
+                    .begin_read()
+                    .unwrap()
+                    .open_table(crate::raft::RAFT_LOG)
+                    .unwrap()
+                    .iter()
+                    .unwrap()
+                    .map(|row| {
+                        let (index, bytes) = row.unwrap();
+                        (index.value(), bytes.value().to_vec())
+                    })
+                    .collect::<Vec<_>>();
+                assert!(matches!(
+                    ledger.validate_common_restore(&certificate),
+                    Err(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired)
+                ));
+                assert!(
+                    ledger
+                        .restore_common_snapshot(&certificate, &binding)
+                        .is_err()
+                );
+                assert_eq!(crate::raft::RaftMeta::load(&database).unwrap(), before);
+                assert_eq!(read_node_vote(), Some(local_node.0.to_vec()));
+                assert!(ledger.current_snapshot().unwrap().is_none());
+                let after_rows = database
+                    .begin_read()
+                    .unwrap()
+                    .open_table(crate::raft::RAFT_LOG)
+                    .unwrap()
+                    .iter()
+                    .unwrap()
+                    .map(|row| {
+                        let (index, bytes) = row.unwrap();
+                        (index.value(), bytes.value().to_vec())
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(before_rows, after_rows);
+                continue;
+            }
+            ledger.validate_common_restore(&certificate).unwrap();
+            let installed = ledger
+                .restore_common_snapshot(&certificate, &binding)
+                .unwrap();
+            let after = crate::raft::RaftMeta::load(&database).unwrap();
+            assert_eq!(
+                (after.current_term, after.voted_for),
+                (previous_term.max(3), None)
+            );
+            assert_eq!(
+                read_node_vote(),
+                (previous_term >= 3).then(|| local_node.0.to_vec())
+            );
+            assert_eq!(
+                after.last_applied,
+                certificate.claim().ordered().raft_index()
+            );
+            assert_eq!(
+                ledger
+                    .restore_common_snapshot(&certificate, &binding)
+                    .unwrap(),
+                installed
+            );
+            // Same common QC is not authority for a second physical jump.
+            assert!(ledger.validate_common_restore(&certificate).is_err());
+            assert!(
+                ledger
+                    .restore_common_snapshot(&certificate, &bind(0xd9))
+                    .is_err()
+            );
+            assert_eq!(crate::raft::RaftMeta::load(&database).unwrap(), after);
+            assert_eq!(
+                ledger.common_snapshot_authority().unwrap(),
+                Some((certificate.clone(), binding.clone()))
+            );
+            drop(ledger);
+            let reopened = AgentRaftApplicationLedgerV2::open(
+                Arc::clone(&database),
+                generation,
+                store,
+                local_node,
+                initial.clone(),
+                committee_authority_binding(),
+            )
+            .unwrap();
+            reopened.audit_recovery().unwrap();
+            let next = append_committed_kind(
+                &database,
+                after.current_term,
+                &EntryKind::Data {
+                    payload: Vec::new(),
+                },
+            );
+            assert_eq!(next, after.last_applied + 1);
+            let slot = reopened.next_committed_slot().unwrap().unwrap();
+            reopened.apply_foundation_slot(&slot).unwrap();
+            assert_eq!(
+                reopened.cursor().unwrap().applied(),
+                (next, after.current_term)
+            );
+            assert!(
+                reopened
+                    .restore_common_snapshot(&certificate, &binding)
+                    .is_err()
+            );
+        }
     }
 
     #[cfg(feature = "storage")]
