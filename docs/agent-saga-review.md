@@ -7,14 +7,14 @@ findings for the implementation branch; avoid competing fixes on the review bran
 ## Review boundary
 
 The user requested completing the live plan before the next whole-branch review.
-This batch follows qualified checkpoint `64a687dc`; its source boundary
+This batch follows qualified checkpoint `b8d3a7e3`; its source boundary
 is that checkpoint plus the implementation in the commit containing this guide.
-Use the worktree diff until committed, then `git diff 64a687dc..saga/agents`
+Use the worktree diff until committed, then `git diff b8d3a7e3..saga/agents`
 after verifying promotion and cleanliness. `master` remains `d2378274`.
 The evidence qualifies candidate slices, not a release or customer capacity.
 
-Use `git show 64a687dc:docs/agent-saga-review.md` for the preceding expiry,
-overwrite and signed Clerk matrix. `6d3a4926` remains the earlier reviewed
+Use `git show b8d3a7e3:docs/agent-saga-review.md` for the preceding paired
+checkpoint/retained-reply matrix. `6d3a4926` remains the earlier reviewed
 recovery baseline, not the current work or next whole-branch review range.
 Earlier backend, pruning and lifecycle chronology is in Git, not duplicated here.
 
@@ -24,84 +24,102 @@ qualify customer load, released-daemon operation or artifact promotion.
 
 ## Current batch: invariants to review
 
-External Shared common checkpoint admission requires the genuine fixed-three QC,
-the exact signed local node/store binding, fresh authenticated genesis and the
-current physical foundation. Root-producing runtime/cursor provenance survives
-compaction. The slot opener audits durable and staged endpoints read-only before
-any staged-head action; the driver independently admits its serving pin. Raw
-genesis replay cannot authenticate a later common checkpoint. Marker/journal/ledger
-recovery completes only the exact signed predecessor/target. Missing block or
-physical metadata reads revoke cached availability; restored bytes require a new
-owner audit. The generic storage default refuses external publication unless an
-explicit audited adapter implements it.
+AXJ1 is a streaming storage closure, not a transferable authority envelope. Its
+independently selected source-head ID is checked before callbacks. Count,
+history, per-class payload and wire budgets precede allocations; canonical order,
+typed content hashes, exact mark/key membership, footer totals/archive identity
+and finite-stream EOF must agree. Foreign Heads are bounded metadata only.
+AJB1's format/ceilings and production image Local remain unchanged. The synthetic
+65,537-history-node/blob test proves codec limits are independent of AJB1, not
+100,000 signed Clerk transfers or a rooted external capacity workload.
 
-Ordinary signed Direct Linear/LinearizableQuery retained replies use the existing
-public `InspectInvocation`, never an actor Invoke preview or fabricated historical
-input. The guest must return unchanged state/roots and no block changes. The opaque
-local proof binds physical owner epoch/head, request kind, work/auth commitments,
-trusted inspection clock, authenticated current claim and exact terminal outcome.
-Only explicit `NotReady` means absence. Invalid work/auth, I/O and execution errors
-cannot authorize fresh fallback. Completed ACK still requires a real retirement;
-acknowledged Invoke refuses rerun. Retained authorization is checked at its original
-acceptance, not renewed or rejected merely because it expired later.
+Export requires an actual installed fixed-three common QC/local binding, exact
+current heads/ordered boundary and detached transport. Newer Raft no-ops or
+applied suffixes are refused. Lease and authority checks repeat after streaming.
+Quota refusal does not revoke a healthy pin; physical export failures do.
 
-Strict-current availability is additive. Its authenticated message has the same
-bounded claim payload but distinct tags/pending reply type; historical replies
-cannot satisfy it, and old historical availability remains unchanged. Peers bind
-the exact current C/L/runtime/root projection to an installed QC/local binding or
-an actual current applied anchor. They do not execute another guest. A voter
-majority uses the existing bounded Availability pool. No host/proposal lock crosses
-peer I/O; lifecycle leases remain held. Final fingerprint/root/proof and monotonic
-trusted-clock validation precedes delivery. Legitimate advancement is retryable
-unavailability, not corruption. No historical index or guest ABI change is added.
+Quarantine consumes a fresh, unexposed, intent-bound descriptor-pinned slot and
+stages one typed record at a time. It owns a genuinely different physical store;
+source heads are never published and invalid prefixes never pollute a live
+permanent-history namespace. The read-only source view preserves actual scratch
+instance/epoch, rejects mutators and rechecks initial heads before/after use.
+Full existing root/mark audits precede a successful stage. This gives content
+integrity only, not foreign QC authority or a serving availability token.
 
-The new physical fixtures collect a real network certificate while all voters
-are attached, then isolate Raft and retire followers before source, and publish
-offline. Crash assertions check consumed faults and exact canonical marker/head
-endpoints. They qualify offline publication/recovery, not coordinated live
-checkpoint/catch-up. Earlier failures correctly refused a certificate when the
-remaining live quorum elected during source publication; guards/deadlines are
-unchanged. Signed Clerk bootstrap/accounts/transfer and reference kernel checks
-remain part of every fixture. Public startup, export, catch-up and reclamation
-remain gated; no candidate artifact or experimental Local promotion is included.
+Foreign source replay separately authenticates the sealed roster's QC and the
+original signed source binding. Local physical-store-ID checks remain unchanged;
+no source-ID spoofing or conversion to `ValidatedExternalHead` is allowed.
+Metadata-only rebind preserves certified C/L/M manifests and root-producing
+contexts, replaces only empty destination Local metadata and publication
+envelopes, and fences exact scratch/archive and destination store/epoch/heads.
+Its physical claim is unsigned and cannot publish. The source predecessor
+envelope is retained, not its obsolete root closure. Destination activation must
+independently audit its own predecessor and target.
+
+The healthy fixture uses the genuine network QC, signed Clerk/reference roots,
+disk archive, actual quarantine and independently admitted destination genesis
+and ledger foundation. It proves source/store substitution refusal and unchanged
+destination heads/ledger, **not activation or catch-up**. Existing publication
+fixtures remain offline: workers are isolated/retired after obtaining the real
+quorum. Neither deadlines nor certificate/reservation guards are relaxed.
 
 ## This batch: source-specific qualification
 
 All logs are under `.worktrees/ch08-c2-native/target`. Preserve failures and
-do not inherit older counts after source changes. Final optimized Rust source
-is the tracked diff over `64a687dc` with SHA-256
-`8f5ee40c5b051ef060d5f81f455a098fdde2de1b92ba9c00c346d7597a309b3a`
-(`git diff -- vos/src | sha256sum` before committing). The separate unreferenced
-archive draft is not compiled or qualified by this matrix.
+do not inherit older counts after source changes. Frozen Rust source is the
+complete staged diff over `b8d3a7e3`, including both new child modules, SHA-256
+`717e383dcf382926d5e16307a198673358807ce7a8802d417171b4ec1775e786`
+(`git diff --cached -- vos/src | sha256sum` before committing). Optimized
+qualification is complete for this slice; separate debug evidence is labeled below.
 
 | Check | Evidence and limit |
 | --- | --- |
-| Default optimized build | Passed, 14 m 52 s; `external-common-retained-release-final-build.log`, binary `release/deps/vos-59a730e87ba3c2af`. Default fat LTO/one codegen unit, no overrides. |
-| Healthy external certified checkpoint/reopen | Passed, 62.63 s; `external-common-retained-release-final-certified_checkpoint_reopen_and_continue.log`. Heads/metadata/predecessor/target-block refusal and revoked-pin recovery, raw opener refusal, genuine QC/local bindings and fresh post-checkpoint Invoke/ACK. |
-| Retained replies through two checkpoints | Passed, 47.14 s; `external-common-retained-release-final-retained_reply_survives_two_checkpoints.log`. UnACKed exact reply, authorization expiry, unchanged-slot retry, substitutions, missing blocks, wrong-kind/clock/root proof refusals, real ACK and exact post-second-checkpoint ACK. |
-| Exact marker/journal/ledger cuts | All three passed, 53.21/49.17/49.82 s; `external-common-retained-release-final-checkpoint_recovers_{marker,journal,ledger}_crash.log`. Canonical signed endpoint assertions prove each actual cut, not merely owner absence. |
-| Existing external network/file lifecycle | Passed, 38.37/25.66 s; `external-common-retained-release-final-install_invoke_ack_reopen.log`, `-file-lifecycle.log`. Full outer-PVM signed Clerk, reference roots and lost-response/reopen behavior. |
-| Earlier boundary failures | Preserve `external-common-debug-healthy.log`, `external-common-debug-healthy2.log`, `external-common-retained-debug-healthy.log`. New physical index/term with unchanged logical roots correctly refused the older certificate. |
-| Existing image common checkpoint/recovery | Four cases passed, 37.84/40.13/38.66/37.58 s: compaction/catch-up/reopen and source/destination marker/journal/ledger cuts. `external-common-retained-release-final-candidate_common_checkpoint_*.log`. Default clean-runtime adapter around physical Authority actor, not full outer PVM. |
-| Custody/expiry regressions | Four cases passed: same-leader duplicate retry 54.62 s; expired-unadmitted intent 58.96 s; offline-origin expiry/reopen 156.20 s; competing durable intent 33.26 s. Final logs use the exact `candidate_*` test names. Same adapter boundary as above. |
-| Focused same-source checks | 143 distinct passed, plus one ignored Shared-host case not counted. `external-common-retained-release-final-focused-*.log`: 5 retained classifiers, 2 pin-lifetime negatives, current/historical wire matching, checkpoint provenance/storage refusal, Shared commit/Raft/recovery/staging, image hosts and supervisor. Overlapping filter counts deduplicated. |
-| Bounded availability-pool isolation | Passed, 0.03 s; `external-common-retained-release-final-pool-isolation-selected.log`. Current/historical confirmation still progresses with application outbound capacity exhausted. The earlier ignored-only selector matched zero tests and is not evidence. |
-| Features/CLI | Guest and external-guest checks pass (2.06/2.08 s); external CLI all-target check passes (29.01 s). Ordinary CLI suite passes with loopback permission: 300 passed, 45 ignored, 83.22 s; `external-common-retained-final-vosx-test-loopback.log`. All 16 restricted-run failures were socket bind `PermissionDenied`; preserve `external-common-retained-final-vosx-test.log`, not a pass. |
-| Format/artifacts | All eight tracked Rust files parsed with pinned rustfmt; remaining deltas are identical HEAD formatting debt only. Diff checks and candidate SHA-256 pins pass; no release pins were modified. |
+| Default optimized build | Passed, 13 m 11 s; `external-archive-preflight-release-build.log`, binary `release/deps/vos-59a730e87ba3c2af`. Default fat LTO/one codegen unit, no overrides. |
+| Optimized core regressions | 264 distinct passed across journal store, Shared driver/host/commit/Raft/recovery and supervisor; 3 ignored cases not counted. `external-archive-preflight-release-focused-*.log`. One restricted listener failure passes with loopback permission (`external-archive-preflight-release-shared-host-loopback.log`); preserve the failure. The `recovery_staging` selector matched zero and is not evidence. |
+| Optimized external physical matrix | All 7 passed, 288.13 s; `external-archive-preflight-release-physical.log`. Full outer/inner recompiler, file/network lifecycle, genuine archive/stage/source-audit/destination preflight, marker/journal/ledger checkpoint interruptions and retained reply through two checkpoints. No destination activation or customer-capacity claim. |
+| Optimized image checkpoint/restore | All 4 passed, 130.82 s; `external-archive-preflight-release-image-checkpoints.log`. Common compaction/catch-up/reopen/continue and source/destination marker, journal and ledger interruptions. Default clean-runtime test adapter around physical Authority actor execution, not full outer PVM. |
+| Supported feature builds | Guest-only `agent-runtime` (1.58 s), guest plus `experimental-state-blocks` (1.59 s), and `vosx --all-targets --features experimental-state-blocks` (18.20 s) passed; `external-archive-preflight-check-{guest,external-guest,cli}.log`. Offline, locked dependencies. |
+| Formatting and diff | Both new child modules, physical fixture and Shared host pass pinned rustfmt. Parent journal store/replay/Shared driver retain exactly 1/1/2 baseline hunks from `b8d3a7e3`, byte-identical apart from line positions; no new formatter debt. Staged/unstaged diff checks pass. |
+| Debug build | Passed; `external-archive-preflight-debug-build.log`, 26.17 s. Earlier stage build also passes (103 s). |
+| Streaming codec | 10 passed; `external-archive-preflight-debug-codec.log`. Short I/O, malformed/truncated/duplicate/reordered/oversized frames, wrong source/scope, callback/writer failure, count/key budgets. |
+| Real memory checkpoint codec | 3 passed on export source; `external-archive-debug-memory-{errors,roundtrip}.log`. Storage/codec evidence only, not external roots/scale. |
+| Detached disk storage | 2 passed; `external-archive-preflight-debug-stage.log`. Fresh-slot intent/scope/existing-generation refusal, actual disk closure missing/extra refusal, read-only real-identity view and no exposure/publication. Image fixture, not external authority. |
+| Metadata rebind | 3 passed; `external-archive-preflight-debug-rebind.log`. Common declarations preserved; scope/private-lane/divergent boundary and revision overflow refused. |
+| Image path refusal | Passed on export source; `external-archive-debug-image-refusal.log`. No output or state change from candidate/default image owner. |
+| Genuine external signed preflight | Passed, 80.42 s; `external-archive-preflight-debug-physical-healthy.log`. Full outer native PVM, real source QC/root/store, disk quarantine/source audit, independent destination genesis/foundation and unsigned rebind; both heads and destination ledger unchanged. Earlier export-only fixture (78.64 s) is narrower evidence. |
+| Independent source review | No demonstrated defects in scoped export/stage/source-audit/rebind. Activation/recovery and capacity remain explicitly unqualified. |
 
 Whole-fixture durations are not request latency, throughput or failover bounds.
-The new path adds a read-only inspection for eligible fresh external calls;
-measure that integrated cost. Full closure audits repeat on certified reopen,
-and large-dataset maintenance costs remain unqualified.
+One explicitly traced debug lifecycle passes (46.16 s),
+`external-archive-debug-diagnostic-vm-phases.log`. Transfer Invoke is 734 ms:
+six external executions (two caller inspections, preview, three overlapping
+applies), actor 3–4 ms per preview/apply, outer execution 139–162 ms, quorum
+95 ms. Post-reopen query is 823 ms, actor <1 ms; outer work/first inner-machine
+creation are significant. Seven cold outer preparations occur once per thread;
+later preparation is roughly 3 ms, so repeated compilation on every apply is
+not demonstrated. Do not add overlapping replica durations as serial wall time.
+Approximately 0.3 s remains outside measured VM/quorum buckets; journal/application
+publication, queue/scheduling and validation lack complete attribution.
 
-Quiet single-call network observations on this source: transfer Invoke 854,255 us;
-post-reopen state-root Invoke 812,063 us. These exclude the following ACK and are
-not a distribution, warm/cold comparison, throughput or tuning pass. Both outer
-and inner use the recompiler. Source inspection shows at least four outer runs
-for a fresh routed leader call (directory, retained inspection, preview, apply),
-with independent follower application. VM setup, locks, persistence and quorum
-are not yet fully attributed; the isolated fixture currently lacks a tracing
-subscriber for its existing VM counters. Do not claim the actor or VM dominates.
+Source inspection identifies repeated full ~363 KiB work hashing/encoding,
+actor-material resolution, authorization and runtime-metadata reconstruction.
+Their individual shares are not measured. `outer_slices` counts **all** outer
+host boundaries, not just state-block fetches or actor invocations. No cache/ABI
+redesign or tuning pass follows from this single diagnostic.
+
+An optimized traced lifecycle also passes (32.67 s),
+`external-archive-preflight-release-diagnostic-vm-phases.log`. Transfer Invoke
+is 688 ms and post-reopen `state_root` Invoke 670 ms, each with the same six
+external executions. Actor work is 3.4–4.3 ms and 0.6–0.9 ms respectively,
+versus outer execution of 131–162 ms per actor-bearing execution. Quorum takes
+104/76 ms. Across 192 executions, seven cold outer preparations occur once
+per thread (167–214 ms); warm preparation is median 2.7 ms, p95 3.8 ms.
+Reopened workers' first inner-machine creation adds 59–65 ms separately.
+Approximately 0.21–0.27 s per call remains outside measured VM/quorum buckets;
+this does not identify its individual persistence, queue or validation shares.
+These are instrumented single-sample observations, not a latency distribution,
+stable speedup, or throughput evidence. Quiet optimized phase/load qualification
+and actual retained capacity remain mandatory.
 
 ## Reproduction
 

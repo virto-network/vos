@@ -16268,7 +16268,7 @@ mod aggregate {
         #[cfg(feature = "experimental-state-blocks")] external_genesis: Option<
             &ReplaySealedExternalGenesis,
         >,
-        #[cfg(feature = "experimental-state-blocks")] mut external_budget: Option<
+        #[cfg(feature = "experimental-state-blocks")] external_budget: Option<
             &mut crate::agent_sdk::state_blocks::ReadBudget,
         >,
     ) -> Result<ReplayMaterialization, MaterializeError<R::Error, E::Error>>
@@ -16285,6 +16285,43 @@ mod aggregate {
         {
             return Err(ReplayError::InvalidRecord);
         }
+        materialize_common_checkpoint_contents(
+            store,
+            executor,
+            resolver,
+            heads,
+            certificate,
+            binding,
+            #[cfg(feature = "experimental-state-blocks")]
+            external_genesis,
+            #[cfg(feature = "experimental-state-blocks")]
+            external_budget,
+        )
+    }
+
+    // Content verification is separate from physical-owner admission. Only the
+    // local wrapper above and the foreign archive audit below may call this:
+    // both authenticate the original binding, while only the local wrapper
+    // admits a materialization for its signed physical store identity.
+    fn materialize_common_checkpoint_contents<S, E, R>(
+        store: &mut S,
+        executor: &mut E,
+        resolver: &R,
+        heads: JournalHeads,
+        certificate: &super::super::shared_commit::SharedAgentCommonSnapshotCertificate,
+        binding: &super::super::shared_commit::SharedAgentLocalSnapshotBinding,
+        #[cfg(feature = "experimental-state-blocks")] external_genesis: Option<
+            &ReplaySealedExternalGenesis,
+        >,
+        #[cfg(feature = "experimental-state-blocks")] mut external_budget: Option<
+            &mut crate::agent_sdk::state_blocks::ReadBudget,
+        >,
+    ) -> Result<ReplayMaterialization, MaterializeError<R::Error, E::Error>>
+    where
+        S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
+        E: ReplayExecutor,
+        R: OrderedBaseResolver,
+    {
         let genesis = require_genesis(store, heads.genesis)?;
         executor
             .seed_genesis(&genesis)
@@ -16444,6 +16481,70 @@ mod aggregate {
         // The borrowed seal qualifies only its unchanged initial Merge root,
         // including after checkpoint compaction. No caller state is admitted.
         materialize_current_inner(store, executor, resolver, Some(budget), Some(seal))
+    }
+
+    /// Authenticated foreign checkpoint contents in one private staging store.
+    /// This is neither a validated local head nor a serving capability: the
+    /// source signature names the original store, not this scratch owner.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) struct AuditedExternalArchiveSource {
+        scratch_store: JournalStoreInstanceId,
+        scratch_epoch: u64,
+        materialization: ReplayMaterialization,
+        checkpoint: CheckpointManifest,
+        certificate: super::super::shared_commit::SharedAgentCommonSnapshotCertificate,
+        binding: super::super::shared_commit::SharedAgentLocalSnapshotBinding,
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    impl AuditedExternalArchiveSource {
+        pub(crate) const fn scratch_store(&self) -> JournalStoreInstanceId {
+            self.scratch_store
+        }
+
+        pub(crate) const fn scratch_epoch(&self) -> u64 {
+            self.scratch_epoch
+        }
+
+        pub(crate) fn source_heads(&self) -> &JournalHeads {
+            self.materialization.heads()
+        }
+
+        pub(crate) fn checkpoint(&self) -> &CheckpointManifest {
+            &self.checkpoint
+        }
+
+        pub(crate) fn certificate(
+            &self,
+        ) -> &super::super::shared_commit::SharedAgentCommonSnapshotCertificate {
+            &self.certificate
+        }
+
+        pub(crate) fn binding(
+            &self,
+        ) -> &super::super::shared_commit::SharedAgentLocalSnapshotBinding {
+            &self.binding
+        }
+
+        /// Recheck the scoped read-only source view before deriving metadata.
+        /// This only pins the audited staging identity; it conveys no live
+        /// publication or external-block availability authority.
+        pub(crate) fn require_source<S: AgentJournalStore>(
+            &self,
+            store: &S,
+        ) -> Result<(), JournalStoreError> {
+            if store.instance_id() != self.scratch_store
+                || store.validation_epoch() != self.scratch_epoch
+                || store.heads()?.as_ref() != Some(self.source_heads())
+                || store
+                    .get::<CheckpointManifest>(self.checkpoint.id())?
+                    .as_ref()
+                    != Some(&self.checkpoint)
+            {
+                return Err(JournalStoreError::ScopeMismatch);
+            }
+            Ok(())
+        }
     }
 
     /// A materialization obtained while validating one head of a locked store.
@@ -16614,6 +16715,84 @@ mod aggregate {
             return Err(JournalStoreError::ScopeMismatch);
         }
         Ok(())
+    }
+
+    /// Audit a foreign archive through its private, read-only source view.
+    /// The actual scratch identity is retained, never replaced by the signed
+    /// source store ID. Only the target tree is audited; the captured source
+    /// predecessor authenticates its publication envelope, not an obsolete
+    /// tree closure. No local head or serving capability is returned.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn audit_external_archive_source<S, E, R>(
+        store: &mut S,
+        seal: &ReplaySealedExternalGenesis,
+        heads: &JournalHeads,
+        predecessor: Option<&JournalHeads>,
+        executor: &mut E,
+        resolver: &R,
+        certificate: &super::super::shared_commit::SharedAgentCommonSnapshotCertificate,
+        binding: &super::super::shared_commit::SharedAgentLocalSnapshotBinding,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<AuditedExternalArchiveSource, JournalStoreError>
+    where
+        S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
+        E: ReplayExecutor,
+        R: OrderedBaseResolver,
+    {
+        seal.validate_checkpoint_scope(store, heads)?;
+        let ExternalGenesisAdmission::Shared(trusted) = &seal.admission else {
+            return Err(JournalStoreError::ScopeMismatch);
+        };
+        certificate
+            .verify(trusted.committee(), certificate.claim())
+            .map_err(|_| JournalStoreError::ScopeMismatch)?;
+        binding
+            .verify(certificate, binding.claim())
+            .map_err(|_| JournalStoreError::ScopeMismatch)?;
+        let predecessor = predecessor.ok_or(JournalStoreError::ScopeMismatch)?;
+        if heads.validate().is_err()
+            || heads.id() != binding.claim().journal_heads()
+            || heads.checkpoint != Some(binding.claim().checkpoint())
+            || heads.node != binding.claim().local_node()
+            || heads.genesis != certificate.claim().ordered().genesis()
+            || heads.admission != certificate.claim().ordered().admission()
+            || heads.previous != Some(predecessor.id())
+            || predecessor.id() != binding.claim().checkpoint_predecessor()
+            || predecessor.validate_successor(heads).is_err()
+            || store.heads()?.as_ref() != Some(heads)
+            || store.historical_heads(predecessor.id())?.as_ref() != Some(predecessor)
+        {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        let scratch_store = store.instance_id();
+        let scratch_epoch = store.validation_epoch();
+        let materialization = materialize_common_checkpoint_contents(
+            store,
+            executor,
+            resolver,
+            heads.clone(),
+            certificate,
+            binding,
+            Some(seal),
+            Some(budget),
+        )
+        .map_err(|_| JournalStoreError::Unavailable)?;
+        if materialization.heads() != heads {
+            return Err(JournalStoreError::Corrupt);
+        }
+        let checkpoint = store
+            .get::<CheckpointManifest>(binding.claim().checkpoint())?
+            .ok_or(JournalStoreError::MissingObject)?;
+        let audited = AuditedExternalArchiveSource {
+            scratch_store,
+            scratch_epoch,
+            materialization,
+            checkpoint,
+            certificate: certificate.clone(),
+            binding: binding.clone(),
+        };
+        audited.require_source(store)?;
+        Ok(audited)
     }
 
     /// Certified checkpoint replay seeds common ancestry before its suffix;
@@ -21937,14 +22116,14 @@ pub(crate) use aggregate::materialize_external_checkpoint;
 #[cfg(all(test, feature = "std", feature = "experimental-state-blocks"))]
 pub(crate) use aggregate::materialize_external_genesis;
 #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
-pub(crate) use aggregate::{ExternalJournalCommit, ExternalJournalEntry, RecoveryError};
-#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
 pub(crate) use aggregate::{
-    ValidatedExternalHead, prepare_external_shared_ordered,
-    validate_external_common_checkpoint_head, validate_external_common_checkpoint_profile,
-    validate_external_genesis_head, validate_published_external_shared_checkpoint,
-    verify_external_common_authority,
+    AuditedExternalArchiveSource, ValidatedExternalHead, audit_external_archive_source,
+    prepare_external_shared_ordered, validate_external_common_checkpoint_head,
+    validate_external_common_checkpoint_profile, validate_external_genesis_head,
+    validate_published_external_shared_checkpoint, verify_external_common_authority,
 };
+#[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+pub(crate) use aggregate::{ExternalJournalCommit, ExternalJournalEntry, RecoveryError};
 
 #[cfg(all(feature = "std", feature = "storage"))]
 #[allow(unused_imports)]

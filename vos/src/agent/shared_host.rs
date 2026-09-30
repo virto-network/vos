@@ -3954,6 +3954,87 @@ impl SharedAgentHost {
         Ok(bundle.encode())
     }
 
+    /// Candidate-only detached maintenance. This streams a storage archive,
+    /// not a backup/import bundle or a new checkpoint activation capability.
+    #[cfg(all(test, feature = "experimental-state-blocks"))]
+    pub(crate) fn export_external_common_checkpoint_archive<W: std::io::Write>(
+        &mut self,
+        agent: AgentId,
+        limits: super::journal_store::ExternalArchiveLimits,
+        output: &mut W,
+    ) -> Result<super::journal_store::ExternalArchiveReport, SharedAgentHostError> {
+        let intent = self.require_external_archive_maintenance(agent)?;
+        let _initial = self.common_snapshot_initial_state(agent)?;
+        let report = self
+            .agents
+            .get_mut(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .export_external_common_checkpoint_archive(limits, output)
+            .map_err(map_driver_error)?;
+        if self.require_external_archive_maintenance(agent)? != intent {
+            return Err(SharedAgentHostError::CorruptResidue);
+        }
+        Ok(report)
+    }
+
+    #[cfg(all(test, feature = "experimental-state-blocks"))]
+    fn require_external_archive_maintenance(
+        &mut self,
+        agent: AgentId,
+    ) -> Result<Hash, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        if !matches!(
+            self.execution_selection,
+            SharedExecutionSelection::ExternalLinearCandidates
+        ) {
+            return Err(SharedAgentHostError::PortableBackupUnsupported);
+        }
+        if self.transport_leases.contains_key(&agent) {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let hosted = self
+            .agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        if !hosted.driver.uses_external_state()
+            || !matches!(
+                hosted.intent.authority,
+                SharedGenesisAuthority::AuthorityFinalized(_)
+            )
+        {
+            return Err(SharedAgentHostError::PortableBackupUnsupported);
+        }
+        let namespaces = scan_generation_namespaces(&self.lease)?;
+        let files = *namespaces
+            .get(&agent)
+            .ok_or(SharedAgentHostError::CorruptResidue)?;
+        if files.intent_stage
+            || files.exposed_stage
+            || files.portable_restore
+            || files.portable_restore_stage
+        {
+            // Do not interpret pending route/genesis or paired installation
+            // recovery as a completed detached export boundary.
+            return Err(SharedAgentHostError::Conflict);
+        }
+        if !files.journal
+            || !files.lock
+            || !files.intent
+            || !files.exposed
+            || !files.raft
+            || !files.artifacts
+        {
+            return Err(SharedAgentHostError::CorruptResidue);
+        }
+        let (intent, _) = self.read_intent(agent, files)?;
+        if intent != hosted.intent || !self.read_exposure(agent, intent.id(), files)? {
+            return Err(SharedAgentHostError::CorruptResidue);
+        }
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        Ok(intent.id())
+    }
+
     fn validate_common_source(
         &self,
         bundle: &CommonCheckpointBundle,
@@ -9236,6 +9317,32 @@ mod tests {
             SharedAgentApplyOutcome::Applied { index: 1 }
         );
         let expected = host.show(fixture.agent).unwrap().unwrap();
+        let archive_limits = super::super::journal_store::ExternalArchiveLimits {
+            max_objects: 100,
+            max_blobs: 100,
+            max_history_nodes: 100,
+            max_wire_bytes: 1_000_000,
+        };
+        let mut archive = Vec::new();
+        assert!(matches!(
+            host.agents
+                .get_mut(&fixture.agent)
+                .unwrap()
+                .driver
+                .export_external_common_checkpoint_archive(archive_limits, &mut archive),
+            Err(SharedJournalDriverError::InvalidProfile)
+        ));
+        assert_eq!(
+            host.export_external_common_checkpoint_archive(
+                fixture.agent,
+                archive_limits,
+                &mut archive,
+            )
+            .unwrap_err(),
+            SharedAgentHostError::PortableBackupUnsupported,
+        );
+        assert!(archive.is_empty());
+        assert_eq!(host.show(fixture.agent).unwrap().unwrap(), expected);
         drop(host);
 
         // Selecting the candidate owner never rewrites an image generation's
@@ -9245,6 +9352,17 @@ mod tests {
         assert!(!reopened.uses_external_state(fixture.agent).unwrap());
         assert_eq!(reopened.physical_route(fixture.agent).unwrap(), route);
         assert_eq!(reopened.show(fixture.agent).unwrap().unwrap(), expected);
+        assert_eq!(
+            reopened
+                .export_external_common_checkpoint_archive(
+                    fixture.agent,
+                    archive_limits,
+                    &mut archive,
+                )
+                .unwrap_err(),
+            SharedAgentHostError::PortableBackupUnsupported,
+        );
+        assert!(archive.is_empty());
     }
 
     #[test]

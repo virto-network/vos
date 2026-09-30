@@ -14,7 +14,7 @@ exact retry semantics. A singleton, smaller dataset or experimental-only release
 requires a new user decision.
 
 The user requested completing this plan before the next whole-branch review.
-This batch follows the qualified checkpoint `64a687dc`; its source
+This batch follows the qualified checkpoint `b8d3a7e3`; its source
 boundary is that checkpoint plus the implementation in the commit containing
 this document. The active worktree is `.worktrees/ch08-runtime-directory`.
 Verify actual branch heads and cleanliness before using the checkpoint; do not
@@ -25,55 +25,53 @@ mainline change, artifact promotion or deployment is included.
 supported workflow selects it; **qualified** means its specified acceptance test
 passes on the actual release. These are separate milestones.
 
-## This batch: paired checkpoints and retained replies
+## This batch: streaming archive and detached import preflight
 
-The preceding checkpoint's expiry, overwrite and signed Clerk evidence is in
-`git show 64a687dc:docs/agent-saga-review.md`; those counts are not inherited here.
-Two connected candidate changes are implemented:
+`b8d3a7e3` qualifies paired external checkpoints and current-root retained
+replies. Its source-specific evidence is in
+`git show b8d3a7e3:docs/agent-saga-review.md`; do not inherit its counts here.
+The next connected candidate slice is implemented:
 
-- External Shared checkpoint publication and reopen use the existing common QC,
-  separately signed local store binding and journal-first recovery marker.
-  Predecessor and target closures are audited before publication or staged-head
-  recovery. A raw genesis opener cannot admit a later certified checkpoint.
-  Missing blocks or physical profile metadata revoke the serving pin; restoring
-  bytes does not revive it without a fresh owner audit. Portable export, automatic
-  pruning, public startup and external Local remain gated.
-- Ordinary signed Direct Linear/LinearizableQuery Invoke/ACK retries can inspect
-  the exact retained terminal under the authenticated current root. An opaque
-  proof binds owner epoch, head, request kind, retirement, authorization, trusted
-  inspection clock, current claim and outcome. It never invents an old input ID.
-  A distinct strict-current availability message reuses the bounded quorum pool;
-  historical availability semantics remain unchanged. Final validation after peer
-  I/O rejects root/owner changes and clock regression as retryable unavailability.
-  Completed results still require a real ACK; an acknowledged Invoke cannot rerun.
-  No historical index, guest ABI change, peer VM or new driver framework is added.
+- AXJ1 streams canonical typed objects and scoped blobs with independent
+  object/history/blob/wire limits. It leaves AJB1 and image Local unchanged;
+  AJB1's separate 65,536-object/blob caps cannot represent the approved dataset.
+  Exact source heads are selected before callbacks; foreign predecessor heads
+  remain bounded metadata. Strict ordering, content IDs, counts, membership and
+  archive identity are checked. A report is data, not authority or availability.
+- Export requires a genuinely installed fixed-three common QC/local binding,
+  fresh physical head and detached host. A newer applied suffix or Raft no-op
+  cannot substitute for the certified boundary. Quota refusal does not revoke
+  a healthy pin; physical failures do.
+- Import preflight consumes a fresh, intent-bound descriptor-pinned quarantine
+  slot. One record is staged at a time, followed by the existing external-root
+  audit and exact mark comparison. Invalid prefixes never enter a live permanent
+  history namespace. Source heads are not published, and no exposure, Raft owner
+  or serving pin is created. Failed-stage cleanup remains explicitly scoped.
+- A separate foreign-source audit verifies the admitted roster's genuine QC and
+  original source binding without spoofing scratch identity or weakening local
+  physical-owner checks. Metadata-only rebind preserves Control/Linear/Merge
+  declarations and root-producing contexts; only empty destination Local metadata
+  and publication envelopes change. Its destination claim remains unsigned and
+  cannot activate a head.
 
-All seven external Shared physical fixtures pass on the final default optimized
-build: healthy checkpoint/reopen, exact marker/journal/ledger interruptions,
-retained replies through two checkpoints after authorization expiry, and both
-existing file/network lifecycle cases. They include signed Clerk/reference-root
-checks, missing data and substitution refusal. The final healthy case also proves
-that a failed physical head read revokes the pin after exact byte restoration;
-stale caller/plan mismatches do not revoke healthy pins. All eight selected
-image/checkpoint/custody recovery regressions also pass, along with 143 distinct
-focused checks and the physical bounded-pool regression. Guest and external CLI
-feature checks pass; ordinary CLI tests pass (300, with 45 explicitly ignored).
-This is not service capacity, public cutover or complete release qualification.
+All seven external physical fixtures pass on the default optimized build,
+including the actual signed three-node Clerk, disk export, quarantine, foreign
+audit and independently admitted destination preflight. Both owners' heads
+remain unchanged and the destination ledger stays unactivated. Four image
+checkpoint/restore regressions, 264 distinct focused core tests and supported
+guest/CLI feature checks also pass; the review guide records source-specific
+evidence and its limits. This is not public import, backup/restore,
+100,000-transfer capacity, service load or release qualification.
 
-The fixtures collect a genuine authenticated network quorum, then isolate and
-retire all Raft workers before filesystem publication. Exact crash assertions
-check the signed marker's predecessor/target heads. This qualifies offline
-publication/recovery, not live coordinated checkpoint/catch-up. Keeping the other
-two voters active during source publication correctly refused a certificate after
-a new election advanced its physical foundation; neither deadlines nor certificate
-checks were relaxed. Preserve those failure logs.
-
-Next, complete bounded external checkpoint export/import and detached reclamation
-using existing certificates, public block traversal and recovery markers. Stream
-both canonical typed objects and scoped block records, not a larger whole-memory
-AJB1 image. Its separate 65,536-object and 65,536-blob limits cannot represent the
-approved retained dataset and cumulative invocation history. Qualify actual
-capacity, exact retry and interrupted import before public cutover.
+Next: authenticate a thin external restore marker and separately signed
+destination binding; audit both actual destination endpoints and complete the
+existing journal-first/ledger restore protocol. Preserve fresh
+`validate_common_restore` guards against newer committed **and uncommitted** work.
+Do not relax same-boundary ACL1 compaction guards to permit catch-up. Qualify
+marker/journal/ledger interruptions, exact retry, pending scopes and detached
+reclamation before public cutover. Source archive predecessor metadata does not
+promise the obsolete predecessor tree; destination predecessor roots must be
+audited independently before its CAS.
 
 Public three-node startup/finality, external owner selection, public Shared
 management and pruning remain gated. No current result establishes production
@@ -314,8 +312,8 @@ These are approved targets, not measured capacity or an availability promise.
   budget as application, preventing deterministic invalid-output admission.
   It currently repeats execution for Install/Invoke/ACK; measure that cost before
   optimizing. Recovery budgets cover the legal bounded suffix, not a qualified
-  recovery-time target. Historical roots remain pinned until certified snapshots,
-  reclamation and export are implemented; this cannot qualify unbounded retention.
+  recovery-time target. Historical roots remain pinned until certified snapshot
+  import and reclamation are integrated; this cannot qualify unbounded retention.
 - Qualify sustained minority load: unused requests to a silent voter retain
   availability permits until transport completion/timeout even after another
   voter establishes quorum. Idle-loopback progress is not load qualification.
@@ -357,10 +355,15 @@ These are approved targets, not measured capacity or an availability promise.
   application; followers also apply independently. Both outer and inner machines
   use the recompiler, but prepared code does not reuse invocation memory. Existing
   single-call network samples remain around 0.8 s (transfer 854,255 us; post-reopen
-  state-root 812,063 us on this optimized source), not a capacity result. The
-  isolated external fixture needs explicit tracing initialization before its
-  existing VM phase counters are observable. Queue waits and journal/application
-  persistence are not fully attributed; do not infer the actor or VM dominates.
+  state-root 812,063 us at `b8d3a7e3`), not a capacity result. The fixture now
+  initializes tracing only with an explicit filter. One debug diagnostic shows
+  six external executions per Invoke: two inspections, preview and three overlapping
+  replica applies. Transfer actor execution is 3–4 ms, versus 139–162 ms in each
+  actor-bearing outer execution; the source cause is not function-attributed yet.
+  Cold outer preparation occurs once per worker, including after reopen, not on
+  every apply. Roughly 0.3 s of call time is still outside measured VM/quorum
+  buckets; queue waits and journal/application persistence remain unattributed.
+  These observations are not optimized load results or a tuning pass.
 - Certified reopen currently repeats complete block-closure/replay audits across
   the slot opener and driver. Recovery/maintenance time is unmeasured at the
   approved dataset. Existing GC bounds unlinks, but each pass still audits the

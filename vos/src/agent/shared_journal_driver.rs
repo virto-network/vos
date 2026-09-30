@@ -5500,6 +5500,112 @@ where
         self.ledger.common_snapshot_authority().map_err(Into::into)
     }
 
+    /// Stream storage content only from an exactly installed, detached-owner
+    /// common boundary. The report is not portable authority or availability.
+    #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+    pub(crate) fn export_external_common_checkpoint_archive<W: std::io::Write>(
+        &mut self,
+        limits: super::journal_store::ExternalArchiveLimits,
+        output: &mut W,
+    ) -> Result<super::journal_store::ExternalArchiveReport, SharedJournalDriverError> {
+        let result = (|| {
+            let authority = self.require_external_archive_checkpoint()?;
+            let expected = self.materialization.heads_id();
+            let external = self
+                .external
+                .as_ref()
+                .ok_or(SharedJournalDriverError::InvalidProfile)?;
+            let report = super::journal_store::export_external_journal_checkpoint(
+                &mut self.store,
+                &external.genesis,
+                expected,
+                limits,
+                &mut Self::external_recovery_budget(),
+                output,
+            )?;
+            if report.source_heads != *self.materialization.heads()
+                || report.source_heads.id() != expected
+                || self.require_external_archive_checkpoint()? != authority
+            {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+            Ok(report)
+        })();
+        // Quota refusal and a legitimately newer boundary do not damage a
+        // healthy pin. Physical/export I/O and mismatched durable metadata do;
+        // even an output failure conservatively requires a fresh owner audit.
+        if let Err(error) = &result
+            && !matches!(
+                error,
+                SharedJournalDriverError::InvalidProfile
+                    | SharedJournalDriverError::Store(
+                        JournalStoreError::LimitExceeded | JournalStoreError::Backpressure
+                    )
+                    | SharedJournalDriverError::Ledger(
+                        AgentRaftApplicationErrorV2::SnapshotBoundaryRequired
+                    )
+            )
+            && let Some(external) = &self.external
+        {
+            external.availability.invalidate();
+        }
+        result
+    }
+
+    #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+    fn require_external_archive_checkpoint(
+        &mut self,
+    ) -> Result<
+        (
+            SharedAgentCommonSnapshotCertificate,
+            SharedAgentLocalSnapshotBinding,
+        ),
+        SharedJournalDriverError,
+    > {
+        let genesis = Arc::clone(
+            &self
+                .external
+                .as_ref()
+                .ok_or(SharedJournalDriverError::InvalidProfile)?
+                .genesis,
+        );
+        self.require_common_snapshot_profile(genesis.post_create())?;
+        let committee = self.ledger.active_committee()?;
+        if committee.members().len() != 3
+            || committee.voter_count() != 3
+            || self.ledger.pending_transition()?.is_some()
+        {
+            return Err(SharedJournalDriverError::InvalidProfile);
+        }
+        let (certificate, binding) = self
+            .ledger
+            .common_snapshot_authority()?
+            .ok_or(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired)?;
+        let physical = binding.claim();
+        let (applied, _, reserved) = self.ledger.capacity()?;
+        if physical.journal_heads() != self.materialization.heads_id()
+            || Some(physical.checkpoint()) != self.materialization.common_checkpoint()
+            || certificate.claim().ordered().ordered() != self.materialization.replay_boundary()
+            || certificate.claim().ordered().ordered() != self.materialization.ordered_base()
+            || applied != certificate.claim().ordered().raft_index()
+            || reserved
+        {
+            // Neither an evolved journal suffix nor a newer Raft no-op may
+            // substitute its foundation for this exact installed authority.
+            return Err(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired.into());
+        }
+        certificate.verify(&committee, certificate.claim())?;
+        binding.verify(&certificate, physical)?;
+        if certificate.claim().active_committee() != &committee
+            || certificate.claim().authority_epoch() != self.ledger.authority_epoch()?
+            || certificate.claim().ordered() != &self.current_external_ordered_claim()?
+        {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        self.validate_published_snapshot(physical)?;
+        Ok((certificate, binding))
+    }
+
     /// Publish and install one exact Agent-specific snapshot. The journal CAS
     /// precedes the atomic Raft/audit retirement; restart recognizes the
     /// journal-first intermediate state and accepts only the same certificate.
@@ -6284,6 +6390,340 @@ pub(crate) fn preflight_common_source<T: super::replay::ReplaySealedOrdinaryGene
     Ok(())
 }
 
+/// Metadata candidate only, derived from an authenticated foreign archive.
+/// Neither this plan nor its unsigned physical claim permits publication or
+/// serving. A destination owner must still audit the staged target closure
+/// and validate its separately signed local binding before installing it.
+#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+pub(crate) struct ReboundExternalCommonCheckpoint {
+    archive_identity: Hash,
+    scratch_store: super::shared_raft::JournalStoreInstanceId,
+    scratch_epoch: u64,
+    source_heads: super::journal::JournalHeads,
+    source_checkpoint: super::journal::CheckpointId,
+    certificate: SharedAgentCommonSnapshotCertificate,
+    source_binding: SharedAgentLocalSnapshotBinding,
+    destination_store: super::shared_raft::JournalStoreInstanceId,
+    destination_epoch: u64,
+    predecessor: super::journal::JournalHeads,
+    metadata: ExternalCommonCheckpointMetadata,
+}
+
+#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+struct ExternalCommonCheckpointMetadata {
+    checkpoint: super::journal::CheckpointManifest,
+    local: super::journal::LaneStateManifest,
+    local_invocations: super::journal::InvocationIndexManifest,
+    heads: super::journal::JournalHeads,
+}
+
+#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+impl ReboundExternalCommonCheckpoint {
+    pub(crate) fn certificate(&self) -> &SharedAgentCommonSnapshotCertificate {
+        &self.certificate
+    }
+
+    pub(crate) fn source_binding(&self) -> &SharedAgentLocalSnapshotBinding {
+        &self.source_binding
+    }
+
+    pub(crate) fn checkpoint(&self) -> &super::journal::CheckpointManifest {
+        &self.metadata.checkpoint
+    }
+
+    pub(crate) fn local_manifest(&self) -> &super::journal::LaneStateManifest {
+        &self.metadata.local
+    }
+
+    pub(crate) fn local_invocations(&self) -> &super::journal::InvocationIndexManifest {
+        &self.metadata.local_invocations
+    }
+
+    pub(crate) fn heads(&self) -> &super::journal::JournalHeads {
+        &self.metadata.heads
+    }
+
+    pub(crate) fn predecessor(&self) -> &super::journal::JournalHeads {
+        &self.predecessor
+    }
+
+    /// Identity fencing, not renewed proof of the complete block closure.
+    /// Final destination validation must repeat the external root audit.
+    pub(crate) fn require_current<S: AgentJournalStore>(
+        &self,
+        staged: &mut super::journal_store::StagedExternalArchive,
+        destination: &S,
+        sealed: &super::replay::ReplaySealedExternalGenesis,
+    ) -> Result<(), SharedJournalDriverError> {
+        if staged.report().identity != self.archive_identity
+            || staged.instance_id() != self.scratch_store
+            || staged.validation_epoch() != self.scratch_epoch
+            || staged.report().source_heads != self.source_heads
+            || staged.genesis_id() != self.source_heads.genesis
+            || destination.instance_id() != self.destination_store
+            || destination.validation_epoch() != self.destination_epoch
+            || destination.heads()?.as_ref() != Some(&self.predecessor)
+            || destination.genesis()?.as_ref() != Some(sealed.genesis())
+            || sealed.genesis().id() != self.source_heads.genesis
+        {
+            return Err(JournalStoreError::ScopeMismatch.into());
+        }
+        sealed.validate_checkpoint_scope(destination, &self.predecessor)?;
+        staged.with_source_view(|view| {
+            if view.instance_id() != self.scratch_store
+                || view.validation_epoch() != self.scratch_epoch
+                || view.heads()?.as_ref() != Some(&self.source_heads)
+                || view
+                    .get::<super::journal::CheckpointManifest>(self.source_checkpoint)?
+                    .is_none()
+            {
+                return Err(JournalStoreError::ScopeMismatch);
+            }
+            Ok(())
+        })?;
+        if destination.validation_epoch() != self.destination_epoch
+            || staged.validation_epoch() != self.scratch_epoch
+        {
+            return Err(JournalStoreError::ScopeMismatch.into());
+        }
+        Ok(())
+    }
+
+    /// Build an unsigned destination candidate using the destination ledger's
+    /// foundation. This is deliberately not a verified snapshot capability.
+    pub(crate) fn physical_claim(
+        &self,
+        foundation: &super::shared_raft::CommonSnapshotRestoreFoundation,
+    ) -> Result<SharedAgentSnapshotClaim, SharedJournalDriverError> {
+        if foundation.local_node != self.metadata.heads.node
+            || &foundation.journal_store.0 != self.destination_store.as_bytes()
+        {
+            return Err(SharedJournalDriverError::WrongReplica);
+        }
+        let heads = &self.metadata.heads;
+        let checkpoint = &self.metadata.checkpoint;
+        let common = self.certificate.claim();
+        let lane = |kind| {
+            checkpoint
+                .lanes
+                .iter()
+                .find(|lane| lane.lane == kind)
+                .map(|lane| lane.state)
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)
+        };
+        SharedAgentSnapshotClaim::new(
+            common.ordered().clone(),
+            common.active_committee().clone(),
+            common.authority_epoch(),
+            foundation.journal_store,
+            foundation.boundary_payload_commitment,
+            heads.id(),
+            self.predecessor.id(),
+            heads.id(),
+            checkpoint.id(),
+            heads.node,
+            lane(PersistedLane::Control)?,
+            lane(PersistedLane::Linear)?,
+            lane(PersistedLane::Merge)?,
+            lane(PersistedLane::Local)?,
+            heads.ordered_invocations,
+            heads.merge_invocations,
+            heads.local_invocations,
+            checkpoint.artifacts,
+            foundation.retired_audit_root,
+            foundation.committee_evidence_root,
+            None,
+        )
+        .map_err(Into::into)
+    }
+}
+
+/// Rebind bounded metadata only. The source proof is consumed, rather than
+/// carrying its runtime-state payloads into the plan. No live destination
+/// object, head, checkpoint marker, or serving availability is written here.
+#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+pub(crate) fn preflight_external_common_rebind<S: AgentJournalStore>(
+    source: super::replay::AuditedExternalArchiveSource,
+    staged: &mut super::journal_store::StagedExternalArchive,
+    sealed: &super::replay::ReplaySealedExternalGenesis,
+    destination: &S,
+    predecessor: &super::journal::JournalHeads,
+) -> Result<ReboundExternalCommonCheckpoint, SharedJournalDriverError> {
+    staged.with_source_view(|view| source.require_source(view))?;
+    let initial = sealed
+        .initial_heads()
+        .map_err(|_| JournalStoreError::NonCanonical)?;
+    let common = source.certificate().claim();
+    let committee = common.active_committee();
+    if !sealed.is_shared()
+        || committee.members().len() != 3
+        || committee.voter_count() != 3
+        || committee
+            .member_by_node(initial.node)
+            .is_none_or(|member| member.replica().role != ReplicaRole::Voter)
+        || !sealed.post_create().merge.is_empty()
+        || !sealed.post_create().local.is_empty()
+        || source.scratch_store() != staged.instance_id()
+        || source.scratch_epoch() != staged.validation_epoch()
+        || source.source_heads() != &staged.report().source_heads
+        || staged.genesis_id() != sealed.genesis().id()
+    {
+        return Err(JournalStoreError::ScopeMismatch.into());
+    }
+    let destination_epoch = destination.validation_epoch();
+    if destination.heads()?.as_ref() != Some(predecessor) {
+        return Err(JournalStoreError::Conflict.into());
+    }
+    sealed.validate_checkpoint_scope(destination, predecessor)?;
+    let metadata = rebind_external_common_metadata(
+        &initial,
+        source.source_heads(),
+        source.checkpoint(),
+        predecessor,
+        sealed.lane_manifest(PersistedLane::Local),
+    )?;
+    if metadata.local_invocations != *sealed.local_invocations()
+        || destination.validation_epoch() != destination_epoch
+    {
+        return Err(JournalStoreError::ScopeMismatch.into());
+    }
+    let rebound = ReboundExternalCommonCheckpoint {
+        archive_identity: staged.report().identity,
+        scratch_store: source.scratch_store(),
+        scratch_epoch: source.scratch_epoch(),
+        source_heads: source.source_heads().clone(),
+        source_checkpoint: source.checkpoint().id(),
+        certificate: source.certificate().clone(),
+        source_binding: source.binding().clone(),
+        destination_store: destination.instance_id(),
+        destination_epoch,
+        predecessor: predecessor.clone(),
+        metadata,
+    };
+    rebound.require_current(staged, destination, sealed)?;
+    Ok(rebound)
+}
+
+#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+fn rebind_external_common_metadata(
+    initial: &super::journal::JournalHeads,
+    source: &super::journal::JournalHeads,
+    checkpoint: &super::journal::CheckpointManifest,
+    predecessor: &super::journal::JournalHeads,
+    mut local: super::journal::LaneStateManifest,
+) -> Result<ExternalCommonCheckpointMetadata, JournalStoreError> {
+    use super::journal::{InvocationIndexManifest, InvocationOwnershipScope, LaneCursor};
+
+    for heads in [initial, source, predecessor] {
+        heads
+            .validate()
+            .map_err(|_| JournalStoreError::NonCanonical)?;
+    }
+    checkpoint
+        .validate()
+        .map_err(|_| JournalStoreError::NonCanonical)?;
+    let local_invocations = InvocationIndexManifest::empty(
+        initial.genesis,
+        InvocationOwnershipScope::Local(initial.node),
+    );
+    if !initial.runtime.is_external_state()
+        || predecessor.genesis != initial.genesis
+        || predecessor.admission != initial.admission
+        || predecessor.node != initial.node
+        || predecessor.runtime != initial.runtime
+        || predecessor.local_revision != 0
+        || predecessor.local_head.is_some()
+        || predecessor.local_invocations != local_invocations.id()
+        || source.genesis != initial.genesis
+        || source.admission != initial.admission
+        || source.runtime != initial.runtime
+        || source.local_revision != 0
+        || source.local_head.is_some()
+        || source.local_invocations
+            != InvocationIndexManifest::empty(
+                source.genesis,
+                InvocationOwnershipScope::Local(source.node),
+            )
+            .id()
+        || source.merge_frontier != initial.merge_frontier
+        || source.merge_invocations != initial.merge_invocations
+        || source.ordered_index < predecessor.ordered_index
+        || (source.ordered_index == predecessor.ordered_index
+            && source.ordered_head != predecessor.ordered_head)
+        || source.checkpoint != Some(checkpoint.id())
+        || checkpoint.genesis != source.genesis
+        || checkpoint.admission != source.admission
+        || checkpoint.runtime != source.runtime
+        || checkpoint.publication_revision.checked_add(1) != Some(source.publication_revision)
+        || checkpoint.ordered_index != source.ordered_index
+        || checkpoint.ordered_head != source.ordered_head
+        || checkpoint.merge_frontier != source.merge_frontier
+        || checkpoint.merge_fence != source.merge_fence
+        || checkpoint.merge_seal != source.merge_seal
+        || checkpoint.ordered_invocations != source.ordered_invocations
+        || checkpoint.merge_invocations != source.merge_invocations
+        || checkpoint.transition_proofs != source.transition_proofs
+        || checkpoint.lanes.iter().map(|lane| lane.lane).ne([
+            PersistedLane::Control,
+            PersistedLane::Linear,
+            PersistedLane::Merge,
+            PersistedLane::Local,
+        ])
+        || local.genesis != initial.genesis
+        || local.lane != PersistedLane::Local
+        || local.cursor
+            != (LaneCursor::Local {
+                node: initial.node,
+                revision: 0,
+                head: None,
+            })
+        || local.state != BlobRef::of_bytes(&[])
+        || local.external_root.is_some()
+    {
+        return Err(JournalStoreError::ScopeMismatch);
+    }
+    local.runtime = checkpoint.runtime.clone();
+    local
+        .validate()
+        .map_err(|_| JournalStoreError::NonCanonical)?;
+    let mut checkpoint = checkpoint.clone();
+    let lane = checkpoint
+        .lanes
+        .iter_mut()
+        .find(|lane| lane.lane == PersistedLane::Local)
+        .ok_or(JournalStoreError::ScopeMismatch)?;
+    if lane.node != Some(source.node) || lane.invocations != Some(source.local_invocations) {
+        return Err(JournalStoreError::ScopeMismatch);
+    }
+    lane.node = Some(initial.node);
+    lane.state = local.id();
+    lane.invocations = Some(local_invocations.id());
+    checkpoint.publication_revision = predecessor.publication_revision;
+    checkpoint
+        .validate()
+        .map_err(|_| JournalStoreError::NonCanonical)?;
+    let mut heads = source.clone();
+    heads.node = initial.node;
+    heads.local_invocations = local_invocations.id();
+    heads.local_head = None;
+    heads.local_revision = 0;
+    heads.publication_revision = predecessor
+        .publication_revision
+        .checked_add(1)
+        .ok_or(JournalStoreError::LimitExceeded)?;
+    heads.previous = Some(predecessor.id());
+    heads.checkpoint = Some(checkpoint.id());
+    predecessor
+        .validate_successor(&heads)
+        .map_err(|_| JournalStoreError::NonCanonical)?;
+    Ok(ExternalCommonCheckpointMetadata {
+        checkpoint,
+        local,
+        local_invocations,
+        heads,
+    })
+}
+
 pub(crate) struct ReboundCommonCheckpoint {
     store: MemoryAgentJournalStore,
     materialization: ReplayMaterialization,
@@ -6761,6 +7201,176 @@ fn validate_pending_binding(
         return Err(SharedJournalDriverError::CrossStoreMismatch);
     }
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux", feature = "experimental-state-blocks"))]
+mod external_common_rebind_tests {
+    use super::*;
+    use crate::agent::genesis::AgentGenesisAdmissionId;
+    use crate::agent::journal::{
+        AgentJournalGenesisId, CheckpointId, CheckpointLane, CheckpointManifest, JournalHeads,
+        JournalHeadsId, LaneCursor, LaneStateId, LaneStateManifest, MergeFrontierId,
+        OrderedEntryId, RuntimeBinding,
+    };
+    use crate::service::{AgentId, DeploymentId, ProducerId, ProgramId, SpaceId};
+
+    fn metadata() -> (
+        JournalHeads,
+        JournalHeads,
+        CheckpointManifest,
+        LaneStateManifest,
+    ) {
+        let runtime = RuntimeBinding {
+            space: SpaceId([1; 32]),
+            agent: AgentId([2; 32]),
+            deployment: DeploymentId([3; 32]),
+            program: ProgramId([4; 32]),
+            producer: ProducerId([5; 32]),
+            package: BlobRef::of_bytes(b"external-runtime"),
+            runtime_abi: Hash(crate::agent_sdk::state_execution::STATE_EXECUTION_ABI_ID.0),
+            execution_semantics: Hash(
+                crate::agent_sdk::state_execution::STATE_EXECUTION_SEMANTICS_ID.0,
+            ),
+        };
+        let mut initial = JournalHeads::initial(
+            AgentJournalGenesisId([6; 32]),
+            AgentGenesisAdmissionId::from_bytes([7; 32]),
+            NodeId([8; 32]),
+            MergeFrontierId([9; 32]),
+            runtime,
+        );
+        initial.previous = Some(initial.id());
+        initial.publication_revision = 1;
+        initial.checkpoint = Some(CheckpointId([10; 32]));
+        let local = LaneStateManifest {
+            genesis: initial.genesis,
+            runtime: initial.runtime.clone(),
+            lane: PersistedLane::Local,
+            cursor: LaneCursor::Local {
+                node: initial.node,
+                revision: 0,
+                head: None,
+            },
+            state: BlobRef::of_bytes(&[]),
+            external_root: None,
+        };
+        let mut source = JournalHeads::initial(
+            initial.genesis,
+            initial.admission,
+            NodeId([11; 32]),
+            initial.merge_frontier,
+            initial.runtime.clone(),
+        );
+        source.previous = Some(JournalHeadsId([12; 32]));
+        source.publication_revision = 9;
+        source.ordered_index = 4;
+        source.ordered_head = Some(OrderedEntryId([13; 32]));
+        let checkpoint = CheckpointManifest {
+            clean_management: None,
+            genesis: source.genesis,
+            admission: source.admission,
+            runtime: source.runtime.clone(),
+            publication_revision: 8,
+            ordered_head: source.ordered_head,
+            ordered_index: source.ordered_index,
+            merge_frontier: source.merge_frontier,
+            merge_fence: source.merge_fence,
+            merge_seal: source.merge_seal,
+            ordered_invocations: source.ordered_invocations,
+            merge_invocations: source.merge_invocations,
+            transition_proofs: source.transition_proofs,
+            lanes: [
+                PersistedLane::Control,
+                PersistedLane::Linear,
+                PersistedLane::Merge,
+                PersistedLane::Local,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, lane)| CheckpointLane {
+                lane,
+                node: (lane == PersistedLane::Local).then_some(source.node),
+                state: LaneStateId([index as u8 + 20; 32]),
+                invocations: (lane == PersistedLane::Local).then_some(source.local_invocations),
+            })
+            .collect(),
+            artifacts: super::super::journal::ArtifactClosureId([24; 32]),
+        };
+        source.checkpoint = Some(checkpoint.id());
+        (initial, source, checkpoint, local)
+    }
+
+    #[test]
+    fn metadata_rebind_preserves_common_root_references_and_context() {
+        let (initial, source, checkpoint, local) = metadata();
+        let rebound =
+            rebind_external_common_metadata(&initial, &source, &checkpoint, &initial, local)
+                .unwrap();
+        let mut expected_checkpoint = checkpoint.clone();
+        expected_checkpoint.publication_revision = initial.publication_revision;
+        expected_checkpoint.lanes[3].node = Some(initial.node);
+        expected_checkpoint.lanes[3].state = rebound.local.id();
+        expected_checkpoint.lanes[3].invocations = Some(initial.local_invocations);
+        assert_eq!(rebound.checkpoint, expected_checkpoint);
+        assert_eq!(rebound.checkpoint.lanes[..3], checkpoint.lanes[..3]);
+        let mut expected_heads = source.clone();
+        expected_heads.node = initial.node;
+        expected_heads.local_invocations = initial.local_invocations;
+        expected_heads.publication_revision = 2;
+        expected_heads.previous = Some(initial.id());
+        expected_heads.checkpoint = Some(rebound.checkpoint.id());
+        assert_eq!(rebound.heads, expected_heads);
+        assert_eq!(rebound.local_invocations.id(), initial.local_invocations);
+        assert_eq!(source.checkpoint, Some(checkpoint.id()));
+    }
+
+    #[test]
+    fn metadata_rebind_refuses_scope_and_private_lane_changes() {
+        let (initial, source, checkpoint, local) = metadata();
+        let mut wrong_scope = source.clone();
+        wrong_scope.admission = AgentGenesisAdmissionId::from_bytes([25; 32]);
+        assert!(matches!(
+            rebind_external_common_metadata(
+                &initial,
+                &wrong_scope,
+                &checkpoint,
+                &initial,
+                local.clone(),
+            ),
+            Err(JournalStoreError::ScopeMismatch)
+        ));
+        let mut private = initial.clone();
+        private.local_revision = 1;
+        private.local_head = Some(super::super::journal::LocalEntryId([26; 32]));
+        assert!(matches!(
+            rebind_external_common_metadata(
+                &initial,
+                &source,
+                &checkpoint,
+                &private,
+                local.clone()
+            ),
+            Err(JournalStoreError::ScopeMismatch)
+        ));
+        let mut divergent = initial.clone();
+        divergent.ordered_index = source.ordered_index;
+        divergent.ordered_head = Some(OrderedEntryId([27; 32]));
+        assert!(matches!(
+            rebind_external_common_metadata(&initial, &source, &checkpoint, &divergent, local),
+            Err(JournalStoreError::ScopeMismatch)
+        ));
+    }
+
+    #[test]
+    fn metadata_rebind_refuses_publication_revision_overflow() {
+        let (initial, source, checkpoint, local) = metadata();
+        let mut predecessor = initial.clone();
+        predecessor.publication_revision = u64::MAX;
+        assert!(matches!(
+            rebind_external_common_metadata(&initial, &source, &checkpoint, &predecessor, local),
+            Err(JournalStoreError::LimitExceeded)
+        ));
+    }
 }
 
 #[cfg(all(test, feature = "experimental-state-blocks"))]

@@ -365,6 +365,12 @@ fn external_clerk_lifecycle(with_network: bool, exercise: ExternalNetworkExercis
     };
     use crate::agent_sdk::{InvocationAuthorization, RuntimeExecutionContext};
 
+    if let Ok(filter) = std::env::var("VOS_TEST_BOOTSTRAP_FILTER") {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_thread_ids(true)
+            .try_init();
+    }
     assert!(std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some());
     let target = PathBuf::from(std::env::var_os("CARGO_TARGET_DIR").unwrap());
     let mut fixture = native_candidate_state_authority_fixture(&target);
@@ -2032,6 +2038,457 @@ fn external_network_lifecycle(
                 Arc::new(std::sync::Mutex::new(host))
             })
             .collect();
+        if crash.is_none() && !retained_mode {
+            use crate::agent::journal::JournalStorageClass;
+            use crate::agent::journal_store::{
+                ExternalArchiveLimits, ExternalArchiveRecord, read_external_archive,
+            };
+            // This is a streamed storage closure, not transferable checkpoint
+            // authority. The exact QC/local binding stays independently bound
+            // to this certified source; decoding cannot activate an import.
+            let mut host = hosts[checkpoint_owner].lock().unwrap();
+            let position = host.journal_position(agent).unwrap();
+            let heads_bytes = std::fs::read(journal_root(checkpoint_owner).join("heads")).unwrap();
+            let source_heads = JournalHeads::decode(&heads_bytes).unwrap();
+            let authority = host
+                .common_snapshot_authority_for_test(agent)
+                .unwrap()
+                .unwrap();
+            assert_eq!(authority.0, certificate);
+            authority
+                .1
+                .verify(&certificate, authority.1.claim())
+                .unwrap();
+            assert_eq!(source_heads.id(), authority.1.claim().journal_heads());
+            assert_eq!(
+                source_heads.checkpoint,
+                Some(authority.1.claim().checkpoint())
+            );
+            assert_eq!(source_heads.node, merges[checkpoint_owner].node());
+            assert_eq!(
+                authority.1.claim().journal_store().0,
+                *host
+                    .journal_store_instance_for_test(agent)
+                    .unwrap()
+                    .as_bytes()
+            );
+            let attachment = host.supervisor_attachment_status(agent).unwrap().unwrap();
+            assert_eq!(
+                attachment.transport,
+                crate::agent::shared_host::SharedAgentTransportState::NotAttached
+            );
+            let limits = ExternalArchiveLimits {
+                max_objects: 1_000_000,
+                max_blobs: 1_000_000,
+                max_history_nodes: 1_000_000,
+                max_wire_bytes: 64 * 1024 * 1024 * 1024,
+            };
+            let archive_path = directories[checkpoint_owner]
+                .0
+                .join("external-common-checkpoint.axj");
+            let archive_file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&archive_path)
+                .unwrap();
+            let mut output = std::io::BufWriter::new(archive_file);
+            let exported = host
+                .export_external_common_checkpoint_archive(agent, limits, &mut output)
+                .unwrap();
+            std::io::Write::flush(&mut output).unwrap();
+            drop(output);
+            assert_eq!(exported.source_heads, source_heads);
+            assert_eq!(
+                exported.wire_bytes,
+                std::fs::metadata(&archive_path).unwrap().len()
+            );
+            let mut input = std::io::BufReader::new(std::fs::File::open(&archive_path).unwrap());
+            let mut objects = 0_u64;
+            let mut blobs = 0_u64;
+            let mut history_nodes = 0_u64;
+            let mut state_blocks = 0_u64;
+            let decoded = read_external_archive(&mut input, source_heads.id(), limits, |record| {
+                match record {
+                    ExternalArchiveRecord::Object { class, id, bytes } => {
+                        assert_ne!(
+                            class,
+                            JournalStorageClass::Heads,
+                            "foreign source heads must never enter an immutable staging callback"
+                        );
+                        assert_ne!(id, [0; 32]);
+                        assert!(!bytes.is_empty());
+                        objects += 1;
+                        history_nodes +=
+                            u64::from(class == JournalStorageClass::InvocationHistoryNode);
+                    }
+                    ExternalArchiveRecord::Blob {
+                        class,
+                        reference,
+                        bytes,
+                    } => {
+                        assert!(reference.matches(bytes));
+                        blobs += 1;
+                        state_blocks += u64::from(class == JournalBlobClass::StateBlock);
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(decoded.source_heads, source_heads);
+            assert_eq!(decoded.source_predecessor, exported.source_predecessor);
+            let predecessor = decoded.source_predecessor.as_ref().unwrap();
+            assert_eq!(Some(predecessor.id()), source_heads.previous);
+            assert_eq!(
+                predecessor.id(),
+                authority.1.claim().checkpoint_predecessor()
+            );
+            assert_eq!(predecessor.node, source_heads.node);
+            assert_eq!(
+                decoded.objects,
+                objects + u64::from(decoded.source_predecessor.is_some())
+            );
+            assert_eq!(decoded.blobs, blobs);
+            assert_eq!(decoded.history_nodes, history_nodes);
+            assert_eq!(decoded.objects, exported.objects);
+            assert_eq!(decoded.blobs, exported.blobs);
+            assert_eq!(decoded.history_nodes, exported.history_nodes);
+            assert_eq!(decoded.wire_bytes, exported.wire_bytes);
+            assert_eq!(decoded.keys, exported.keys);
+            assert_eq!(decoded.identity, exported.identity);
+            assert_ne!(decoded.keys, HostHash::ZERO);
+            assert_ne!(decoded.identity, HostHash::ZERO);
+            assert!(
+                objects > 0 && state_blocks > 0,
+                "signed external Clerk archive must contain real typed records and state blocks"
+            );
+            // Quarantine owns a genuinely different physical slot. Import
+            // preflight may authenticate the foreign certificate's contents,
+            // but must not impersonate its store or publish its source heads.
+            let verified =
+                VerifiedAgentGenesisProvision::verify(provision.clone(), finality).unwrap();
+            let source_node = merges[checkpoint_owner].node();
+            let source_seal =
+                LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_external_shared_genesis(
+                    &verified,
+                    committee.member_by_node(source_node).unwrap().replica(),
+                    catalog,
+                    &fixture.trust,
+                    source_node,
+                )
+                .unwrap();
+            let quarantine = TestDirectory::new("external-checkpoint-archive-quarantine");
+            let parent = std::fs::File::open(&quarantine.0).unwrap();
+            let scratch_root = quarantine.0.join(format!("{leaf}.agent"));
+            let scratch_intent = crate::agent::journal_store::external_archive_stage_intent(
+                &source_seal,
+                source_heads.id(),
+            )
+            .unwrap();
+            let scratch_slot = FileLocalAgentJournalSlot::acquire_with_pinned_parents(
+                &scratch_root,
+                scratch_root.with_extension("agent-lock"),
+                source_node,
+                scratch_intent,
+                &parent,
+                &parent,
+            )
+            .unwrap();
+            let mut scratch_input =
+                std::io::BufReader::new(std::fs::File::open(&archive_path).unwrap());
+            let mut scratch_budget = Driver::external_recovery_budget();
+            let mut staged = crate::agent::journal_store::StagedExternalArchive::read(
+                scratch_slot,
+                &source_seal,
+                catalog,
+                source_heads.id(),
+                limits,
+                &mut scratch_budget,
+                &mut scratch_input,
+            )
+            .unwrap();
+            assert_eq!(staged.report().identity, exported.identity);
+            assert_ne!(
+                staged.instance_id().as_bytes(),
+                &authority.1.claim().journal_store().0
+            );
+            let scratch_heads = std::fs::read(scratch_root.join("heads")).unwrap();
+            assert_eq!(scratch_heads, source_seal.initial_heads().unwrap().encode());
+            assert_ne!(scratch_heads, heads_bytes);
+            assert!(!scratch_root.join("heads.next").exists());
+            let predecessor_hex: String = predecessor
+                .id()
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            assert!(
+                !scratch_root
+                    .join("heads-history")
+                    .join(predecessor_hex)
+                    .exists(),
+                "foreign predecessor must remain bounded metadata, never a disk head record"
+            );
+            let report = staged.report().clone();
+            let resolver = staged.catalog_blob_resolver().unwrap();
+            let mut source_executor = StandardLocalReplayExecutor::new_shared(
+                resolver,
+                fixture.trust.clone(),
+                merges[checkpoint_owner].clone(),
+                vec![committee.clone()],
+            );
+            let audited = staged
+                .with_source_view(|view| {
+                    assert_eq!(view.heads()?.as_ref(), Some(&source_heads));
+                    assert_eq!(
+                        view.historical_heads(predecessor.id())?.as_ref(),
+                        Some(predecessor)
+                    );
+                    assert!(
+                        matches!(
+                            crate::agent::replay::validate_external_common_checkpoint_head(
+                                view,
+                                &source_seal,
+                                &source_heads,
+                                &mut source_executor,
+                                &NoPrunedOrderedBases,
+                                &authority.0,
+                                &authority.1,
+                                &mut Driver::external_recovery_budget(),
+                            ),
+                            Err(crate::agent::journal_store::JournalStoreError::ScopeMismatch),
+                        ),
+                        "a scratch owner must never pass the actual physical-source opener"
+                    );
+                    let mut substituted = source_heads.clone();
+                    substituted.publication_revision += 1;
+                    assert!(
+                        crate::agent::replay::audit_external_archive_source(
+                            view,
+                            &source_seal,
+                            &substituted,
+                            report.source_predecessor.as_ref(),
+                            &mut source_executor,
+                            &NoPrunedOrderedBases,
+                            &authority.0,
+                            &authority.1,
+                            &mut Driver::external_recovery_budget(),
+                        )
+                        .is_err()
+                    );
+                    let audited = crate::agent::replay::audit_external_archive_source(
+                        view,
+                        &source_seal,
+                        &source_heads,
+                        report.source_predecessor.as_ref(),
+                        &mut source_executor,
+                        &NoPrunedOrderedBases,
+                        &authority.0,
+                        &authority.1,
+                        &mut Driver::external_recovery_budget(),
+                    )?;
+                    assert_eq!(audited.scratch_store(), view.instance_id());
+                    assert_eq!(audited.scratch_epoch(), view.validation_epoch());
+                    assert_eq!(audited.source_heads(), &source_heads);
+                    assert_eq!(audited.certificate(), &authority.0);
+                    assert_eq!(audited.binding(), &authority.1);
+                    audited.require_source(view)?;
+                    Ok(audited)
+                })
+                .unwrap();
+            let destination_index = (checkpoint_owner + 1) % merges.len();
+            let destination_node = merges[destination_index].node();
+            let destination_seal =
+                LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_external_shared_genesis(
+                    &verified,
+                    committee
+                        .member_by_node(destination_node)
+                        .unwrap()
+                        .replica(),
+                    catalog,
+                    &fixture.trust,
+                    destination_node,
+                )
+                .unwrap();
+            let destination_directory =
+                TestDirectory::new("external-checkpoint-rebind-destination");
+            let destination_parent = std::fs::File::open(&destination_directory.0).unwrap();
+            let destination_root = destination_directory.0.join(format!("{leaf}.agent"));
+            let destination_intent = HostHash::digest(
+                b"vos/test/external-checkpoint-rebind-destination/v1",
+                &[
+                    destination_seal.genesis().id().as_bytes(),
+                    destination_node.as_bytes(),
+                ],
+            );
+            let destination_slot = FileLocalAgentJournalSlot::acquire_with_pinned_parents(
+                &destination_root,
+                destination_root.with_extension("agent-lock"),
+                destination_node,
+                destination_intent,
+                &destination_parent,
+                &destination_parent,
+            )
+            .unwrap();
+            let mut destination_store = destination_slot
+                .open_external_genesis(
+                    &destination_seal,
+                    false,
+                    &mut Driver::external_recovery_budget(),
+                )
+                .unwrap();
+            for blob in catalog {
+                destination_store
+                    .put_blob(
+                        JournalBlobClass::CatalogArtifact,
+                        &blob.reference,
+                        &blob.bytes,
+                    )
+                    .unwrap();
+            }
+            destination_store
+                .initialize_external_local(
+                    &destination_seal,
+                    &mut Driver::external_recovery_budget(),
+                )
+                .unwrap();
+            let destination_predecessor = destination_store.heads().unwrap().unwrap();
+            let rebound = crate::agent::shared_journal_driver::preflight_external_common_rebind(
+                audited,
+                &mut staged,
+                &destination_seal,
+                &destination_store,
+                &destination_predecessor,
+            )
+            .unwrap();
+            assert_eq!(rebound.predecessor(), &destination_predecessor);
+            assert_eq!(rebound.heads().node, destination_node);
+            assert_eq!(rebound.heads().previous, Some(destination_predecessor.id()));
+            assert_eq!(rebound.heads().ordered_head, source_heads.ordered_head);
+            assert_eq!(rebound.heads().ordered_index, source_heads.ordered_index);
+            assert_eq!(rebound.certificate(), &authority.0);
+            assert_eq!(rebound.source_binding(), &authority.1);
+            assert_ne!(rebound.heads().id(), source_heads.id());
+            let source_checkpoint = staged
+                .with_source_view(|view| {
+                    view.get::<crate::agent::journal::CheckpointManifest>(
+                        source_heads.checkpoint.unwrap(),
+                    )?
+                    .ok_or(crate::agent::journal_store::JournalStoreError::MissingObject)
+                })
+                .unwrap();
+            for lane in [
+                crate::agent::journal::PersistedLane::Control,
+                crate::agent::journal::PersistedLane::Linear,
+                crate::agent::journal::PersistedLane::Merge,
+            ] {
+                assert_eq!(
+                    rebound
+                        .checkpoint()
+                        .lanes
+                        .iter()
+                        .find(|entry| entry.lane == lane),
+                    source_checkpoint
+                        .lanes
+                        .iter()
+                        .find(|entry| entry.lane == lane),
+                    "common lane declarations must not be localized or reconstructed",
+                );
+            }
+            let destination_generation = AgentGenerationRouteKey::new(
+                committee.space(),
+                committee.agent(),
+                destination_seal.genesis().id(),
+                destination_seal.admission_record().unwrap().id(),
+            )
+            .unwrap();
+            let destination_ledger = AgentRaftApplicationLedgerV2::open(
+                Arc::new(
+                    redb::Database::create(destination_directory.0.join("raft.redb")).unwrap(),
+                ),
+                destination_generation,
+                destination_store.instance_id(),
+                destination_node,
+                committee.clone(),
+                CommitteeChangeAuthorityBinding::new(
+                    descriptor.authority.policy,
+                    descriptor.authority.issuer,
+                    descriptor.identity.runtime_deployment,
+                    descriptor.authority.public_key,
+                    descriptor.authority.initial_epoch,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let foundation = destination_ledger
+                .common_restore_foundation(rebound.certificate())
+                .unwrap();
+            let unsigned = rebound.physical_claim(&foundation).unwrap();
+            assert_eq!(unsigned.local_node(), destination_node);
+            assert_eq!(
+                &unsigned.journal_store().0,
+                destination_store.instance_id().as_bytes()
+            );
+            assert_eq!(unsigned.journal_heads(), rebound.heads().id());
+            assert_eq!(unsigned.ordered(), authority.0.claim().ordered());
+            rebound
+                .require_current(&mut staged, &destination_store, &destination_seal)
+                .unwrap();
+            assert_eq!(
+                destination_store.heads().unwrap().as_ref(),
+                Some(&destination_predecessor)
+            );
+            assert!(
+                destination_ledger
+                    .common_snapshot_authority()
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!destination_root.join("heads.next").exists());
+            drop(destination_ledger);
+            drop(destination_store);
+            assert_eq!(
+                std::fs::read(scratch_root.join("heads")).unwrap(),
+                scratch_heads
+            );
+            assert!(!scratch_root.join("heads.next").exists());
+            drop(source_executor);
+            drop(staged);
+            let scratch_slot = FileLocalAgentJournalSlot::acquire_with_pinned_parents(
+                &scratch_root,
+                scratch_root.with_extension("agent-lock"),
+                source_node,
+                scratch_intent,
+                &parent,
+                &parent,
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    scratch_slot.open_external_genesis(
+                        &source_seal,
+                        true,
+                        &mut Driver::external_recovery_budget(),
+                    ),
+                    Err(crate::agent::journal_store::JournalStoreError::Corrupt),
+                ),
+                "quarantine must never acquire an exposed-generation lock bit"
+            );
+            assert_eq!(
+                std::fs::read(journal_root(checkpoint_owner).join("heads")).unwrap(),
+                heads_bytes
+            );
+            assert_eq!(host.journal_position(agent).unwrap(), position);
+            assert_eq!(
+                host.common_snapshot_authority_for_test(agent)
+                    .unwrap()
+                    .unwrap(),
+                authority
+            );
+            assert_eq!(
+                host.supervisor_attachment_status(agent).unwrap().unwrap(),
+                attachment
+            );
+        }
         if let Some((retained_work, retained_authorization, retained_outcome)) = retained_reply {
             let InvocationAuthorization::AuthorityReceipt(receipt) = &retained_authorization else {
                 unreachable!()

@@ -113,6 +113,19 @@ use crate::service::SpaceId;
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 use crate::service::{AgentId, BlobRef, Hash, NodeId};
 
+#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+mod external_archive;
+#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+mod external_archive_stage;
+#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+pub(crate) use external_archive::{
+    ExternalArchiveLimits, ExternalArchiveRecord, ExternalArchiveReport, read_external_archive,
+};
+#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+pub(crate) use external_archive_stage::{
+    ExternalArchiveSourceView, StagedExternalArchive, external_archive_stage_intent,
+};
+
 /// Result of one idempotent journal publication.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JournalPublication {
@@ -1940,50 +1953,54 @@ fn decode_journal_blob_class(tag: u8) -> Result<JournalBlobClass, DecodeError> {
 }
 
 fn validate_portable_object(object: &PortableJournalObject) -> Result<(), JournalStoreError> {
-    if object.id == [0; 32] || object.bytes.len() > class_maximum(object.class) {
+    validate_portable_object_bytes(object.class, object.id, &object.bytes)
+}
+
+fn validate_portable_object_bytes(
+    class: JournalStorageClass,
+    id: [u8; 32],
+    bytes: &[u8],
+) -> Result<(), JournalStoreError> {
+    if id == [0; 32] || bytes.len() > class_maximum(class) {
         return Err(JournalStoreError::NonCanonical);
     }
     macro_rules! exact {
-        ($record:ty, $id:expr) => {{ decode_object::<$record>(&object.bytes, $id).map(|_| ()) }};
+        ($record:ty, $id:expr) => {{ decode_object::<$record>(bytes, $id).map(|_| ()) }};
     }
-    match object.class {
+    match class {
         JournalStorageClass::ReplayInput => {
-            exact!(ReplayInput, super::journal::ReplayInputId(object.id))
+            exact!(ReplayInput, super::journal::ReplayInputId(id))
         }
         JournalStorageClass::Genesis => Err(JournalStoreError::InvalidClass),
-        JournalStorageClass::OrderedEntry => exact!(OrderedEntry, OrderedEntryId(object.id)),
-        JournalStorageClass::LocalEntry => exact!(LocalEntry, LocalEntryId(object.id)),
-        JournalStorageClass::MergeEvent => exact!(MergeEvent, MergeEventId(object.id)),
-        JournalStorageClass::MergeFrontier => exact!(MergeFrontier, MergeFrontierId(object.id)),
-        JournalStorageClass::MergeSeal => exact!(MergeSeal, MergeSealId(object.id)),
-        JournalStorageClass::LaneState => exact!(LaneStateManifest, LaneStateId(object.id)),
-        JournalStorageClass::ArtifactClosure => exact!(
-            ArtifactClosure,
-            super::journal::ArtifactClosureId(object.id)
-        ),
+        JournalStorageClass::OrderedEntry => exact!(OrderedEntry, OrderedEntryId(id)),
+        JournalStorageClass::LocalEntry => exact!(LocalEntry, LocalEntryId(id)),
+        JournalStorageClass::MergeEvent => exact!(MergeEvent, MergeEventId(id)),
+        JournalStorageClass::MergeFrontier => exact!(MergeFrontier, MergeFrontierId(id)),
+        JournalStorageClass::MergeSeal => exact!(MergeSeal, MergeSealId(id)),
+        JournalStorageClass::LaneState => exact!(LaneStateManifest, LaneStateId(id)),
+        JournalStorageClass::ArtifactClosure => {
+            exact!(ArtifactClosure, super::journal::ArtifactClosureId(id))
+        }
         JournalStorageClass::InvocationIndex => {
-            exact!(InvocationIndexManifest, InvocationIndexId(object.id))
+            exact!(InvocationIndexManifest, InvocationIndexId(id))
         }
         JournalStorageClass::InvocationIndexNode => {
-            exact!(InvocationIndexNode, InvocationIndexNodeId(object.id))
+            exact!(InvocationIndexNode, InvocationIndexNodeId(id))
         }
-        JournalStorageClass::Checkpoint => exact!(CheckpointManifest, CheckpointId(object.id)),
-        JournalStorageClass::Heads => exact!(JournalHeads, JournalHeadsId(object.id)),
+        JournalStorageClass::Checkpoint => exact!(CheckpointManifest, CheckpointId(id)),
+        JournalStorageClass::Heads => exact!(JournalHeads, JournalHeadsId(id)),
         JournalStorageClass::InvocationOutcome => {
-            exact!(InvocationOutcomeRecord, InvocationOutcomeId(object.id))
+            exact!(InvocationOutcomeRecord, InvocationOutcomeId(id))
         }
         JournalStorageClass::InvocationHistoryNode => {
-            exact!(InvocationHistoryNode, InvocationHistoryNodeId(object.id))
+            exact!(InvocationHistoryNode, InvocationHistoryNodeId(id))
         }
         JournalStorageClass::TransitionProof => exact!(
             JournalTransitionProof,
-            super::journal::TransitionProofEntryId(object.id)
+            super::journal::TransitionProofEntryId(id)
         ),
         JournalStorageClass::TransitionProofIndex => {
-            exact!(
-                TransitionProofIndexManifest,
-                TransitionProofIndexId(object.id)
-            )
+            exact!(TransitionProofIndexManifest, TransitionProofIndexId(id))
         }
     }
 }
@@ -6086,6 +6103,57 @@ fn read_portable_object<S: AgentJournalStore>(
     let object = PortableJournalObject { class, id, bytes };
     validate_portable_object(&object)?;
     Ok(object)
+}
+
+/// Detached maintenance export under one exclusive, freshly audited store
+/// borrow. The archive carries storage integrity and source metadata only;
+/// it does not convey common-checkpoint authority or publish destination heads.
+/// Object/blob/history quotas bound the ID-only mark independently of the
+/// external-root read budget and the encoded wire-byte ceiling.
+#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+pub(crate) fn export_external_journal_checkpoint<S: AgentJournalStore, W: std::io::Write>(
+    store: &mut S,
+    genesis: &super::replay::ReplaySealedExternalGenesis,
+    expected_heads: JournalHeadsId,
+    limits: ExternalArchiveLimits,
+    budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    output: &mut W,
+) -> Result<ExternalArchiveReport, JournalStoreError> {
+    limits.validate()?;
+    let heads = store.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+    if heads.id() != expected_heads {
+        return Err(JournalStoreError::Conflict);
+    }
+    super::replay::with_external_genesis_checkpoint_heads(
+        store,
+        &heads,
+        genesis,
+        budget,
+        |store, availability| {
+            let (_, mut mark) = build_gc_mark_with_availability(
+                store,
+                expected_heads,
+                GcLimits {
+                    max_index_nodes: limits.max_objects,
+                    max_marked_objects: limits.max_objects,
+                    max_marked_blobs: limits.max_blobs,
+                    max_scanned_files: 1,
+                    max_scanned_bytes: 1,
+                    max_unlinks_per_run: 1,
+                },
+                availability,
+            )?;
+            mark_portable_history(store, &heads, &mut mark, limits.max_history_nodes)?;
+            external_archive::write_marked_external_archive(
+                store,
+                &heads,
+                &mark,
+                availability,
+                output,
+                limits,
+            )
+        },
+    )
 }
 
 pub(crate) fn export_portable_journal_checkpoint<S: AgentJournalStore>(
@@ -12538,65 +12606,70 @@ impl FileAgentJournalStore {
         &self,
         object: &PortableJournalObject,
     ) -> Result<(), JournalStoreError> {
-        validate_portable_object(object)?;
+        self.persist_portable_object_bytes(object.class, object.id, &object.bytes)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn persist_portable_object_bytes(
+        &self,
+        class: JournalStorageClass,
+        id: [u8; 32],
+        bytes: &[u8],
+    ) -> Result<(), JournalStoreError> {
+        validate_portable_object_bytes(class, id, bytes)?;
         macro_rules! persist {
             ($record:ty, $id:expr) => {{
-                let record = decode_object::<$record>(&object.bytes, $id)?;
+                let record = decode_object::<$record>(bytes, $id)?;
                 self.persist_object(&record).map(|_| ())
             }};
         }
-        match object.class {
+        match class {
             JournalStorageClass::ReplayInput => {
-                persist!(ReplayInput, super::journal::ReplayInputId(object.id))
+                persist!(ReplayInput, super::journal::ReplayInputId(id))
             }
             JournalStorageClass::Genesis => Err(JournalStoreError::InvalidClass),
-            JournalStorageClass::OrderedEntry => persist!(OrderedEntry, OrderedEntryId(object.id)),
-            JournalStorageClass::LocalEntry => persist!(LocalEntry, LocalEntryId(object.id)),
-            JournalStorageClass::MergeEvent => persist!(MergeEvent, MergeEventId(object.id)),
+            JournalStorageClass::OrderedEntry => persist!(OrderedEntry, OrderedEntryId(id)),
+            JournalStorageClass::LocalEntry => persist!(LocalEntry, LocalEntryId(id)),
+            JournalStorageClass::MergeEvent => persist!(MergeEvent, MergeEventId(id)),
             JournalStorageClass::MergeFrontier => {
-                persist!(MergeFrontier, MergeFrontierId(object.id))
+                persist!(MergeFrontier, MergeFrontierId(id))
             }
-            JournalStorageClass::MergeSeal => persist!(MergeSeal, MergeSealId(object.id)),
+            JournalStorageClass::MergeSeal => persist!(MergeSeal, MergeSealId(id)),
             JournalStorageClass::LaneState => {
-                persist!(LaneStateManifest, LaneStateId(object.id))
+                persist!(LaneStateManifest, LaneStateId(id))
             }
-            JournalStorageClass::ArtifactClosure => persist!(
-                ArtifactClosure,
-                super::journal::ArtifactClosureId(object.id)
-            ),
+            JournalStorageClass::ArtifactClosure => {
+                persist!(ArtifactClosure, super::journal::ArtifactClosureId(id))
+            }
             JournalStorageClass::InvocationIndex => {
-                persist!(InvocationIndexManifest, InvocationIndexId(object.id))
+                persist!(InvocationIndexManifest, InvocationIndexId(id))
             }
             JournalStorageClass::InvocationIndexNode => {
-                persist!(InvocationIndexNode, InvocationIndexNodeId(object.id))
+                persist!(InvocationIndexNode, InvocationIndexNodeId(id))
             }
             JournalStorageClass::Checkpoint => {
-                persist!(CheckpointManifest, CheckpointId(object.id))
+                persist!(CheckpointManifest, CheckpointId(id))
             }
             JournalStorageClass::Heads => {
-                let heads =
-                    decode_object::<JournalHeads>(&object.bytes, JournalHeadsId(object.id))?;
+                let heads = decode_object::<JournalHeads>(bytes, JournalHeadsId(id))?;
                 if heads.node != self.node {
                     return Err(JournalStoreError::ScopeMismatch);
                 }
                 self.persist_historical_heads(&heads).map(|_| ())
             }
             JournalStorageClass::InvocationOutcome => {
-                persist!(InvocationOutcomeRecord, InvocationOutcomeId(object.id))
+                persist!(InvocationOutcomeRecord, InvocationOutcomeId(id))
             }
             JournalStorageClass::InvocationHistoryNode => {
-                let id = InvocationHistoryNodeId(object.id);
-                self.persist_history_node(id, &object.bytes).map(|_| ())
+                let id = InvocationHistoryNodeId(id);
+                self.persist_history_node(id, bytes).map(|_| ())
             }
             JournalStorageClass::TransitionProof => persist!(
                 JournalTransitionProof,
-                super::journal::TransitionProofEntryId(object.id)
+                super::journal::TransitionProofEntryId(id)
             ),
             JournalStorageClass::TransitionProofIndex => {
-                persist!(
-                    TransitionProofIndexManifest,
-                    TransitionProofIndexId(object.id)
-                )
+                persist!(TransitionProofIndexManifest, TransitionProofIndexId(id))
             }
         }
     }
@@ -16396,6 +16469,8 @@ macro_rules! impl_invocation_index_store {
 
 impl_invocation_index_store!(MemoryAgentJournalStore);
 impl_invocation_index_store!(FileAgentJournalStore);
+#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+impl_invocation_index_store!(ExternalArchiveSourceView<'_>);
 
 macro_rules! impl_replay_source {
     ($store:ty) => {
@@ -16458,6 +16533,8 @@ macro_rules! impl_replay_source {
 
 impl_replay_source!(MemoryAgentJournalStore);
 impl_replay_source!(FileAgentJournalStore);
+#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+impl_replay_source!(ExternalArchiveSourceView<'_>);
 
 #[cfg(all(
     test,
@@ -18797,6 +18874,376 @@ mod tests {
             )
             .unwrap();
         (closure.next, closure.manifest)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+    fn image_checkpoint_archive_fixture() -> (MemoryAgentJournalStore, JournalHeads, GcMark) {
+        let genesis = genesis();
+        let config = config();
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        initialize(&mut store, &genesis);
+        let (heads, _) = install_fresh_checkpoint(&mut store, &genesis);
+        let (_, mut mark) = build_gc_mark(&store, heads.id(), gc_limits()).unwrap();
+        mark_portable_history(&store, &heads, &mut mark, gc_limits().max_index_nodes).unwrap();
+        (store, heads, mark)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+    fn archive_test_limits() -> ExternalArchiveLimits {
+        ExternalArchiveLimits {
+            max_objects: gc_limits().max_marked_objects,
+            max_blobs: gc_limits().max_marked_blobs,
+            max_history_nodes: gc_limits().max_marked_objects,
+            max_wire_bytes: 64 * 1024 * 1024,
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+    #[test]
+    fn memory_image_checkpoint_streaming_archive_roundtrip_metadata_only() {
+        // A real image checkpoint exercises codec/storage integration, not
+        // external-root availability, production activation or dataset scale.
+        let (store, heads, mark) = image_checkpoint_archive_fixture();
+        let mut bytes = Vec::new();
+        let written = external_archive::write_marked_external_archive(
+            &store,
+            &heads,
+            &mark,
+            None,
+            &mut bytes,
+            archive_test_limits(),
+        )
+        .unwrap();
+        let mut objects = 0;
+        let mut blobs = 0;
+        let read = read_external_archive(
+            &mut bytes.as_slice(),
+            heads.id(),
+            archive_test_limits(),
+            |record| {
+                match record {
+                    ExternalArchiveRecord::Object { class, id, bytes } => {
+                        assert_ne!(class, JournalStorageClass::Heads);
+                        assert!(mark.objects.contains(&(class, id)));
+                        assert!(!bytes.is_empty());
+                        objects += 1;
+                    }
+                    ExternalArchiveRecord::Blob {
+                        class,
+                        reference,
+                        bytes,
+                    } => {
+                        assert_eq!(
+                            mark.blobs.get(&(class, reference.hash)),
+                            Some(&reference.len)
+                        );
+                        assert!(reference.matches(bytes));
+                        blobs += 1;
+                    }
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(read.source_heads, heads);
+        assert_eq!(
+            read.source_predecessor.as_ref().map(JournalHeads::id),
+            heads.previous
+        );
+        assert_eq!(read.objects, objects + u64::from(heads.previous.is_some()));
+        assert_eq!(read.blobs, blobs);
+        assert_eq!(read.wire_bytes, bytes.len() as u64);
+        assert_eq!(read.identity, written.identity);
+        external_archive::validate_external_archive_mark(&read, &mark).unwrap();
+        assert_eq!(store.heads().unwrap().as_ref(), Some(&heads));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+    #[test]
+    fn memory_image_checkpoint_archive_quotas_and_stale_head_refuse_without_mutation() {
+        let (store, heads, mark) = image_checkpoint_archive_fixture();
+        let mut output = Vec::new();
+        let mut limits = archive_test_limits();
+        limits.max_objects = mark.objects.len() - 1;
+        limits.max_history_nodes = limits.max_objects;
+        assert_eq!(
+            external_archive::write_marked_external_archive(
+                &store,
+                &heads,
+                &mark,
+                None,
+                &mut output,
+                limits,
+            )
+            .unwrap_err(),
+            JournalStoreError::LimitExceeded
+        );
+        assert!(output.is_empty());
+        limits = archive_test_limits();
+        limits.max_blobs = mark.blobs.len() - 1;
+        assert_eq!(
+            external_archive::write_marked_external_archive(
+                &store,
+                &heads,
+                &mark,
+                None,
+                &mut output,
+                limits,
+            )
+            .unwrap_err(),
+            JournalStoreError::LimitExceeded
+        );
+        assert!(output.is_empty());
+        let mut stale = heads.clone();
+        stale.publication_revision += 1;
+        assert_eq!(
+            external_archive::write_marked_external_archive(
+                &store,
+                &stale,
+                &mark,
+                None,
+                &mut output,
+                archive_test_limits(),
+            )
+            .unwrap_err(),
+            JournalStoreError::Conflict
+        );
+        assert!(output.is_empty());
+        limits = archive_test_limits();
+        limits.max_wire_bytes = 200;
+        assert_eq!(
+            external_archive::write_marked_external_archive(
+                &store,
+                &heads,
+                &mark,
+                None,
+                &mut output,
+                limits,
+            )
+            .unwrap_err(),
+            JournalStoreError::LimitExceeded
+        );
+        assert_eq!(store.heads().unwrap().as_ref(), Some(&heads));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+    #[test]
+    fn memory_image_checkpoint_archive_refused_write_leaves_heads_unchanged() {
+        struct Refused;
+        impl std::io::Write for Refused {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::PermissionDenied.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (store, heads, mark) = image_checkpoint_archive_fixture();
+        assert_eq!(
+            external_archive::write_marked_external_archive(
+                &store,
+                &heads,
+                &mark,
+                None,
+                &mut Refused,
+                archive_test_limits(),
+            )
+            .unwrap_err(),
+            JournalStoreError::Unavailable
+        );
+        assert_eq!(store.heads().unwrap().as_ref(), Some(&heads));
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    #[test]
+    fn external_archive_stage_fresh_slot_scope_refuses_before_generation_creation() {
+        let sealed = crate::agent::replay::tests::admitted_local_genesis(0xd1);
+        let directory = TestDirectory::new("archive-stage-slot-refusal");
+        let slot = acquire_production_local_slot(&directory, &sealed);
+        assert!(!slot.generation_exists());
+        assert_eq!(
+            external_archive_stage::validate_fresh_stage_slot(
+                &slot,
+                sealed.genesis().runtime().agent,
+                sealed.replica().node,
+                Hash([0x7b; 32]),
+            ),
+            Err(JournalStoreError::ScopeMismatch)
+        );
+        assert_eq!(
+            external_archive_stage::validate_fresh_stage_slot(
+                &slot,
+                AgentId([0x7b; 32]),
+                sealed.replica().node,
+                slot.intent(),
+            ),
+            Err(JournalStoreError::ScopeMismatch)
+        );
+        assert!(!directory.agent_root(slot.agent()).exists());
+        external_archive_stage::validate_fresh_stage_slot(
+            &slot,
+            slot.agent(),
+            slot.node(),
+            slot.intent(),
+        )
+        .unwrap();
+        let store = slot.open(&sealed, false).unwrap();
+        assert!(store.heads().unwrap().is_none());
+        drop(store);
+        let existing = acquire_production_local_slot(&directory, &sealed);
+        assert_eq!(
+            external_archive_stage::validate_fresh_stage_slot(
+                &existing,
+                existing.agent(),
+                existing.node(),
+                existing.intent(),
+            ),
+            Err(JournalStoreError::Conflict)
+        );
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    #[test]
+    fn external_archive_stage_disk_image_closure_rejects_missing_and_extra_without_exposure() {
+        // Image content exercises real quarantine disk writes/read-only views,
+        // not external Shared authority or production import activation.
+        for mode in 0..3 {
+            let sealed = crate::agent::replay::tests::admitted_local_genesis(0xd2);
+            let package = b"replay-runtime-package";
+            let mut source = MemoryAgentJournalStore::new(
+                sealed.genesis().runtime().agent,
+                sealed.replica().node,
+            )
+            .unwrap();
+            source
+                .put_blob(
+                    JournalBlobClass::CatalogArtifact,
+                    &sealed.genesis().runtime().package,
+                    package,
+                )
+                .unwrap();
+            source.initialize_shared(&sealed).unwrap();
+            let (heads, _) = install_fresh_checkpoint(&mut source, sealed.genesis());
+            let (_, mut mark) = build_gc_mark(&source, heads.id(), gc_limits()).unwrap();
+            mark_portable_history(&source, &heads, &mut mark, gc_limits().max_index_nodes).unwrap();
+            if mode == 1 {
+                assert!(
+                    mark.blobs
+                        .remove(&(
+                            JournalBlobClass::LaneState,
+                            BlobRef::of_bytes(b"gc-checkpoint-state").hash,
+                        ))
+                        .is_some()
+                );
+            } else if mode == 2 {
+                let bytes = b"inert-extra-archive-blob";
+                let reference = BlobRef::of_bytes(bytes);
+                source
+                    .put_blob(JournalBlobClass::CatalogArtifact, &reference, bytes)
+                    .unwrap();
+                mark.blob(JournalBlobClass::CatalogArtifact, &reference)
+                    .unwrap();
+            }
+            let mut archive = Vec::new();
+            external_archive::write_marked_external_archive(
+                &source,
+                &heads,
+                &mark,
+                None,
+                &mut archive,
+                archive_test_limits(),
+            )
+            .unwrap();
+            let directory = TestDirectory::new("archive-stage-image-quarantine");
+            let mut store = acquire_production_local_slot(&directory, &sealed)
+                .open(&sealed, false)
+                .unwrap();
+            store
+                .put_blob(
+                    JournalBlobClass::CatalogArtifact,
+                    &sealed.genesis().runtime().package,
+                    package,
+                )
+                .unwrap();
+            store.initialize_local(&sealed).unwrap();
+            let initial = store.heads().unwrap().unwrap();
+            let report = read_external_archive(
+                &mut archive.as_slice(),
+                heads.id(),
+                archive_test_limits(),
+                |record| match record {
+                    ExternalArchiveRecord::Object { class, id, bytes } => {
+                        assert_ne!(class, JournalStorageClass::Heads);
+                        store.persist_portable_object_bytes(class, id, bytes)
+                    }
+                    ExternalArchiveRecord::Blob {
+                        class,
+                        reference,
+                        bytes,
+                    } => store.persist_blob(class, reference, bytes).map(|_| ()),
+                },
+            )
+            .unwrap();
+            let mut view = external_archive_stage::ExternalArchiveSourceView::from_store_report(
+                &store, &report,
+            )
+            .unwrap();
+            assert_eq!(view.instance_id(), store.instance_id());
+            assert_eq!(view.validation_epoch(), store.validation_epoch());
+            assert_eq!(view.heads().unwrap().as_ref(), Some(&heads));
+            assert_eq!(
+                view.put_blob(
+                    JournalBlobClass::CatalogArtifact,
+                    &BlobRef::of_bytes(b"refused"),
+                    b"refused"
+                ),
+                Err(JournalStoreError::Unavailable)
+            );
+            assert_eq!(
+                view.finish_reverified_open(),
+                Err(JournalStoreError::Unavailable)
+            );
+            let validated =
+                build_gc_mark(&view, heads.id(), gc_limits()).and_then(|(_, mut expected)| {
+                    mark_portable_history(
+                        &view,
+                        &heads,
+                        &mut expected,
+                        gc_limits().max_index_nodes,
+                    )?;
+                    external_archive::validate_external_archive_mark(&report, &expected)
+                });
+            match mode {
+                0 => validated.unwrap(),
+                1 => assert_eq!(validated, Err(JournalStoreError::MissingObject)),
+                2 => assert_eq!(validated, Err(JournalStoreError::NonCanonical)),
+                _ => unreachable!(),
+            }
+            assert_eq!(store.heads().unwrap().as_ref(), Some(&initial));
+            assert!(
+                store
+                    .read_fixed::<JournalHeads>("", "heads.next")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                !verify_local_stable_lock(
+                    &store._stable_lock,
+                    &store.stable_lock_nonce,
+                    PRODUCTION_LOCAL_INTENT
+                )
+                .unwrap()
+            );
+        }
     }
 
     fn first_ordered(genesis: &AgentJournalGenesis, heads: &JournalHeads) -> OrderedEntry {
