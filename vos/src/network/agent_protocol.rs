@@ -93,6 +93,8 @@ const TAG_RAFT_INSTALL_SNAPSHOT_REQUEST: u8 = 0x24;
 const TAG_RAFT_INSTALL_SNAPSHOT_REPLY: u8 = 0x25;
 const TAG_RAFT_STATUS_REQUEST: u8 = 0x26;
 const TAG_RAFT_STATUS_REPLY: u8 = 0x27;
+const TAG_CURRENT_APPLIED_AVAILABILITY_REQUEST: u8 = 0x28;
+const TAG_CURRENT_APPLIED_AVAILABILITY_REPLY: u8 = 0x29;
 const TAG_MERGE_FETCH_HEADS: u8 = 0x30;
 const TAG_MERGE_HEADS: u8 = 0x31;
 const TAG_MERGE_FETCH_NODE: u8 = 0x32;
@@ -420,6 +422,14 @@ pub(crate) enum AgentMessage {
         request: AppliedAvailabilityRequest,
         available: bool,
     },
+    /// Availability of this exact current authenticated runtime root, not a
+    /// historical publication. The requester separately proves its retained
+    /// reply through guest inspection under that root.
+    CurrentAppliedAvailabilityRequest(AppliedAvailabilityRequest),
+    CurrentAppliedAvailabilityReply {
+        request: AppliedAvailabilityRequest,
+        available: bool,
+    },
     /// A request to independently reconstruct this exact common checkpoint.
     /// Decoding alone is never permission to sign it.
     CommonSnapshotVoteRequest(SharedAgentCommonSnapshotClaim),
@@ -616,7 +626,9 @@ fn message_is_valid(message: &AgentMessage, route: AgentGenerationRoute, sender:
         }
         AgentMessage::ProjectionAccepted { request, .. } => *request != Hash::ZERO,
         AgentMessage::AppliedAvailabilityRequest(request)
-        | AgentMessage::AppliedAvailabilityReply { request, .. } => request.is_valid(),
+        | AgentMessage::AppliedAvailabilityReply { request, .. }
+        | AgentMessage::CurrentAppliedAvailabilityRequest(request)
+        | AgentMessage::CurrentAppliedAvailabilityReply { request, .. } => request.is_valid(),
         AgentMessage::CommonSnapshotVoteRequest(claim) => {
             claim.validate().is_ok()
                 && claim.ordered().space().0 == route.space.0
@@ -836,6 +848,15 @@ fn encode_message(
         }
         AgentMessage::AppliedAvailabilityReply { request, available } => {
             encoder.u8(TAG_APPLIED_AVAILABILITY_REPLY);
+            encode_applied_availability_request(encoder, request);
+            encoder.bool(*available);
+        }
+        AgentMessage::CurrentAppliedAvailabilityRequest(request) => {
+            encoder.u8(TAG_CURRENT_APPLIED_AVAILABILITY_REQUEST);
+            encode_applied_availability_request(encoder, request);
+        }
+        AgentMessage::CurrentAppliedAvailabilityReply { request, available } => {
+            encoder.u8(TAG_CURRENT_APPLIED_AVAILABILITY_REPLY);
             encode_applied_availability_request(encoder, request);
             encoder.bool(*available);
         }
@@ -1167,6 +1188,17 @@ fn decode_message(decoder: &mut Decoder<'_>) -> Result<AgentMessage, AgentProtoc
             request: decode_applied_availability_request(decoder)?,
             available: decoder.bool()?,
         }),
+        TAG_CURRENT_APPLIED_AVAILABILITY_REQUEST => {
+            Ok(AgentMessage::CurrentAppliedAvailabilityRequest(
+                decode_applied_availability_request(decoder)?,
+            ))
+        }
+        TAG_CURRENT_APPLIED_AVAILABILITY_REPLY => {
+            Ok(AgentMessage::CurrentAppliedAvailabilityReply {
+                request: decode_applied_availability_request(decoder)?,
+                available: decoder.bool()?,
+            })
+        }
         TAG_COMMON_SNAPSHOT_VOTE_REQUEST => Ok(AgentMessage::CommonSnapshotVoteRequest(
             SharedAgentCommonSnapshotClaim::decode(
                 decoder.bytes_ref_bounded(MAX_SHARED_AGENT_COMMON_SNAPSHOT_CLAIM_BYTES)?,
@@ -2007,6 +2039,109 @@ mod tests {
             AgentFrame::decode(&vec![0; MAX_FRAME_BYTES + 1]),
             Err(AgentProtocolError::LimitExceeded)
         );
+    }
+
+    #[test]
+    fn current_applied_availability_is_canonical_and_distinct_from_history() {
+        let request = AppliedAvailabilityRequest {
+            raft_index: u64::MAX,
+            raft_term: u64::MAX,
+            claim: Hash(id::<4>()),
+        };
+        let frame = AgentFrame {
+            route: route(),
+            sender: node(&peer(80)),
+            message: AgentMessage::CurrentAppliedAvailabilityRequest(request),
+        };
+        let tag_offset = 4 + 2 + 4 * 32;
+        let field_offset = tag_offset + 1;
+        let encoded = frame.encode().unwrap();
+        let historical = AgentFrame {
+            message: AgentMessage::AppliedAvailabilityRequest(request),
+            ..frame.clone()
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(encoded.len(), field_offset + 8 + 8 + 32);
+        assert_ne!(encoded[tag_offset], historical[tag_offset]);
+        assert_eq!(&encoded[..tag_offset], &historical[..tag_offset]);
+        assert_eq!(&encoded[field_offset..], &historical[field_offset..]);
+        for message in [
+            AgentMessage::CurrentAppliedAvailabilityRequest(request),
+            AgentMessage::CurrentAppliedAvailabilityReply {
+                request,
+                available: false,
+            },
+            AgentMessage::CurrentAppliedAvailabilityReply {
+                request,
+                available: true,
+            },
+        ] {
+            let is_reply = matches!(
+                message,
+                AgentMessage::CurrentAppliedAvailabilityReply { .. }
+            );
+            let candidate = AgentFrame {
+                message,
+                ..frame.clone()
+            };
+            let bytes = candidate.encode().unwrap();
+            assert_eq!(bytes.len(), encoded.len() + usize::from(is_reply));
+            assert_eq!(AgentFrame::decode(&bytes).unwrap(), candidate);
+            for end in 0..bytes.len() {
+                assert!(AgentFrame::decode(&bytes[..end]).is_err());
+            }
+            for (offset, length) in [(0, 8), (8, 8), (16, 32)] {
+                let mut invalid = bytes.clone();
+                invalid[field_offset + offset..field_offset + offset + length].fill(0);
+                assert_eq!(
+                    AgentFrame::decode(&invalid),
+                    Err(AgentProtocolError::InvalidValue)
+                );
+            }
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            assert_eq!(
+                AgentFrame::decode(&trailing),
+                Err(AgentProtocolError::TrailingBytes)
+            );
+            if is_reply {
+                let mut invalid = bytes;
+                *invalid.last_mut().unwrap() = 2;
+                assert!(AgentFrame::decode(&invalid).is_err());
+            }
+        }
+        for invalid in [
+            AppliedAvailabilityRequest {
+                raft_index: 0,
+                ..request
+            },
+            AppliedAvailabilityRequest {
+                raft_term: 0,
+                ..request
+            },
+            AppliedAvailabilityRequest {
+                claim: Hash::ZERO,
+                ..request
+            },
+        ] {
+            for message in [
+                AgentMessage::CurrentAppliedAvailabilityRequest(invalid),
+                AgentMessage::CurrentAppliedAvailabilityReply {
+                    request: invalid,
+                    available: true,
+                },
+            ] {
+                assert_eq!(
+                    AgentFrame {
+                        message,
+                        ..frame.clone()
+                    }
+                    .encode(),
+                    Err(AgentProtocolError::InvalidValue)
+                );
+            }
+        }
     }
 
     #[test]

@@ -5852,7 +5852,7 @@ impl ReplayMaterialization {
     /// root's producing runtime/revision. This constructs a record, not an
     /// availability certificate or permission to publish it.
     #[cfg(feature = "std")]
-    fn checkpoint_lane(
+    pub(crate) fn checkpoint_lane(
         &self,
         genesis: &AgentJournalGenesis,
         lane: PersistedLane,
@@ -6194,7 +6194,7 @@ impl ExternalCheckpointValidation<'_> {
 }
 
 #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
-impl<'store, S: super::journal_store::AuditedCheckpointStore> AuditedExternalCheckpoint<'store, S> {
+impl<'store, S: AgentJournalStore> AuditedExternalCheckpoint<'store, S> {
     pub(crate) fn publish(
         self,
     ) -> Result<
@@ -6204,7 +6204,10 @@ impl<'store, S: super::journal_store::AuditedCheckpointStore> AuditedExternalChe
             Vec<ReplayExecutionResult>,
         ),
         JournalStoreError,
-    > {
+    >
+    where
+        S: super::journal_store::AuditedCheckpointStore,
+    {
         self.publish_using(|store, publication, availability| {
             store.publish_audited_checkpoint(publication, availability)
         })
@@ -6767,8 +6770,9 @@ impl<'store, S: AgentJournalStore> ReplayPreparedPublication<'store, S> {
 
 /// Owned Shared checkpoint plan. Candidate construction may stage the
 /// immutable predecessor-head snapshot and compact proof-index object needed
-/// by the eventual CAS. Lane blobs and the mutable head remain untouched;
-/// only a quorum-verified snapshot capability may publish them.
+/// by the eventual CAS. External voting may also stage immutable descriptor
+/// blobs for a borrowed root audit. Only a quorum-verified snapshot capability
+/// may publish the mutable head.
 #[cfg(feature = "std")]
 pub(crate) struct PreparedSharedCheckpoint {
     sealed: ReplaySealedPublication,
@@ -6797,6 +6801,137 @@ impl ValidatedCommonCheckpoint {
 
 #[cfg(feature = "std")]
 impl PreparedSharedCheckpoint {
+    /// Re-audit a maintenance candidate before this replica votes. Only
+    /// immutable descriptor blobs are staged; this returns no reusable block
+    /// availability capability and does not change the journal head.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn audit_external_shared<S: AgentJournalStore>(
+        self,
+        store: &mut S,
+        genesis: &ReplaySealedExternalGenesis,
+        pin: &SharedExternalAvailability,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<Self, JournalStoreError> {
+        let lane_blobs = self.lane_blobs.clone();
+        let audited = self.audit_external_shared_inner(store, genesis, pin, budget)?;
+        let ReplayPreparedPublication {
+            sealed, successor, ..
+        } = audited.prepared;
+        Ok(Self {
+            sealed,
+            successor,
+            lane_blobs,
+        })
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    fn audit_external_shared_inner<'store, S: AgentJournalStore>(
+        self,
+        store: &'store mut S,
+        genesis: &ReplaySealedExternalGenesis,
+        pin: &SharedExternalAvailability,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<AuditedExternalCheckpoint<'store, S>, JournalStoreError> {
+        if !genesis.is_shared()
+            || pin.is_poisoned()
+            || pin.store != store.instance_id()
+            || pin.epoch != store.validation_epoch()
+            || pin.heads != self.sealed.expected
+        {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        let durable_heads = store.heads().map_err(|error| {
+            pin.invalidate();
+            error
+        })?;
+        if durable_heads.map(|heads| heads.id()) != Some(pin.heads) {
+            // A stale plan was refused above without touching availability.
+            // This mismatch instead concerns the admitted owner's physical head.
+            pin.invalidate();
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        aggregate::validate_external_common_checkpoint_profile(store, &self.successor, genesis)
+            .map_err(|error| {
+                // The profile also reads physical genesis/frontier metadata.
+                // Failed reads revoke availability before the block audit starts.
+                if matches!(
+                    error,
+                    JournalStoreError::MissingObject
+                        | JournalStoreError::Corrupt
+                        | JournalStoreError::Unavailable
+                        | JournalStoreError::NonCanonical
+                ) {
+                    pin.invalidate();
+                }
+                error
+            })?;
+        for (reference, bytes) in &self.lane_blobs {
+            store.put_blob(JournalBlobClass::LaneState, reference, bytes)?;
+        }
+        ReplayPreparedPublication {
+            store,
+            sealed: self.sealed,
+            successor: self.successor,
+            executions: Vec::new(),
+        }
+        .audit_external_checkpoint_from_genesis(genesis, budget)
+        .map_err(|error| {
+            // Once the physical audit starts, failed I/O or malformed/missing
+            // closure revokes cached availability. A caller's exhausted audit
+            // budget alone does not prove the admitted root became unavailable.
+            if error != JournalStoreError::LimitExceeded {
+                pin.invalidate();
+            }
+            error
+        })
+    }
+
+    /// Publish a quorum-bound external checkpoint under the same exclusive
+    /// borrow as both root audits. An ambiguous CAS revokes the old serving pin;
+    /// only an exact durable success may replace it with the new checkpoint pin.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn publish_external_shared<S: AgentJournalStore>(
+        self,
+        store: &mut S,
+        verified: &VerifiedSharedAgentSnapshot,
+        genesis: &ReplaySealedExternalGenesis,
+        pin: &mut SharedExternalAvailability,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<ReplayMaterialization, JournalStoreError> {
+        self.validate_common_claim(verified.claim())?;
+        let ExternalGenesisAdmission::Shared(trusted) = &genesis.admission else {
+            return Err(JournalStoreError::ScopeMismatch);
+        };
+        if store.instance_id().as_bytes() != &verified.claim().journal_store().0
+            || trusted.committee() != verified.claim().active_committee()
+        {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        let audited = self.audit_external_shared_inner(store, genesis, pin, budget)?;
+        let checkpoint_lanes = audited.lanes.clone();
+        let store_id = audited.prepared.store.instance_id();
+        let epoch = audited.prepared.store.validation_epoch();
+        pin.poisoned = true;
+        let (publication, successor, _) =
+            audited.publish_using(|store, publication, availability| {
+                let result = store.publish_external_shared_checkpoint(publication, availability)?;
+                if !result.heads_advanced && store.heads()?.as_ref() != Some(publication.next()) {
+                    return Err(JournalStoreError::Corrupt);
+                }
+                Ok(result)
+            })?;
+        let _ = publication;
+        *pin = SharedExternalAvailability {
+            store: store_id,
+            epoch,
+            heads: successor.heads_id(),
+            checkpoint_lanes,
+            poisoned: false,
+            invalidated: core::sync::atomic::AtomicBool::new(false),
+        };
+        Ok(successor)
+    }
+
     pub(crate) fn validate_common_claim(
         &self,
         claim: &SharedAgentSnapshotClaim,
@@ -7004,8 +7139,17 @@ impl SharedExternalAvailability {
             || self.store != store.instance_id()
             || self.epoch != store.validation_epoch()
             || self.heads != materialization.heads_id()
-            || store.heads()?.as_ref() != Some(materialization.heads())
         {
+            return Err(JournalStoreError::Unavailable);
+        }
+        let durable_heads = store.heads().map_err(|error| {
+            self.invalidate();
+            error
+        })?;
+        if durable_heads.as_ref() != Some(materialization.heads()) {
+            // Caller identity/head mismatches above do not revoke a healthy
+            // pin. Failed physical reads require a fresh independent owner audit.
+            self.invalidate();
             return Err(JournalStoreError::Unavailable);
         }
         Ok(())
@@ -14400,6 +14544,9 @@ mod aggregate {
         #[cfg(feature = "experimental-state-blocks")] external_genesis: Option<
             &ReplaySealedExternalLocalGenesis,
         >,
+        #[cfg(feature = "experimental-state-blocks")] external_common: Option<
+            &super::super::shared_commit::SharedAgentCommonSnapshotCertificate,
+        >,
     ) -> Result<ReplayBase, MaterializeError<R::Error, E::Error>>
     where
         S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
@@ -14604,15 +14751,19 @@ mod aggregate {
             // Local cursor. Its identity is not common Ordered ancestry. Only
             // the exact sealed genesis checkpoint may start the Shared chain;
             // later Shared checkpoints still require a separate certificate.
-            let initial = seal.initial_checkpoint().map_err(lift_validation)?;
-            if checkpoint != initial
-                || checkpoint_id != initial.id()
-                || ordered != OrderedBase::post_genesis()
-                || checkpoint.merge_fence != OrderedBase::post_genesis()
-            {
-                return Err(ReplayError::InvalidFence);
+            if let Some(certificate) = external_common {
+                FenceAncestryEvidence::from_common_checkpoint(certificate.claim(), checkpoint_id)
+            } else {
+                let initial = seal.initial_checkpoint().map_err(lift_validation)?;
+                if checkpoint != initial
+                    || checkpoint_id != initial.id()
+                    || ordered != OrderedBase::post_genesis()
+                    || checkpoint.merge_fence != OrderedBase::post_genesis()
+                {
+                    return Err(ReplayError::InvalidFence);
+                }
+                FenceAncestryEvidence::post_genesis(checkpoint.genesis).map_err(lift_validation)?
             }
-            FenceAncestryEvidence::post_genesis(checkpoint.genesis).map_err(lift_validation)?
         } else {
             fence_ancestry
         };
@@ -16089,13 +16240,51 @@ mod aggregate {
         E: ReplayExecutor,
         R: OrderedBaseResolver,
     {
-        binding
-            .verify(certificate, binding.claim())
-            .map_err(|_| ReplayError::InvalidRecord)?;
         let heads = store
             .heads()
             .map_err(journal)?
             .ok_or_else(|| journal(JournalStoreError::NotInitialized))?;
+        materialize_common_checkpoint_heads(
+            store,
+            executor,
+            resolver,
+            heads,
+            certificate,
+            binding,
+            #[cfg(feature = "experimental-state-blocks")]
+            None,
+            #[cfg(feature = "experimental-state-blocks")]
+            None,
+        )
+    }
+
+    fn materialize_common_checkpoint_heads<S, E, R>(
+        store: &mut S,
+        executor: &mut E,
+        resolver: &R,
+        heads: JournalHeads,
+        certificate: &super::super::shared_commit::SharedAgentCommonSnapshotCertificate,
+        binding: &super::super::shared_commit::SharedAgentLocalSnapshotBinding,
+        #[cfg(feature = "experimental-state-blocks")] external_genesis: Option<
+            &ReplaySealedExternalGenesis,
+        >,
+        #[cfg(feature = "experimental-state-blocks")] mut external_budget: Option<
+            &mut crate::agent_sdk::state_blocks::ReadBudget,
+        >,
+    ) -> Result<ReplayMaterialization, MaterializeError<R::Error, E::Error>>
+    where
+        S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
+        E: ReplayExecutor,
+        R: OrderedBaseResolver,
+    {
+        binding
+            .verify(certificate, binding.claim())
+            .map_err(|_| ReplayError::InvalidRecord)?;
+        if heads.validate().is_err()
+            || store.instance_id().as_bytes() != &binding.claim().journal_store().0
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
         let genesis = require_genesis(store, heads.genesis)?;
         executor
             .seed_genesis(&genesis)
@@ -16114,9 +16303,11 @@ mod aggregate {
             &heads,
             checkpoint,
             #[cfg(feature = "experimental-state-blocks")]
-            None,
+            external_budget.as_deref_mut(),
             #[cfg(feature = "experimental-state-blocks")]
-            None,
+            external_genesis,
+            #[cfg(feature = "experimental-state-blocks")]
+            external_genesis.map(|_| certificate),
         )?;
         let ordered = certificate.claim().ordered();
         let manifest: CheckpointManifest = require_record(store, checkpoint)?;
@@ -16150,8 +16341,29 @@ mod aggregate {
             plan,
             None,
             #[cfg(feature = "experimental-state-blocks")]
-            None,
+            external_budget.as_deref_mut(),
         )?;
+        #[cfg(feature = "experimental-state-blocks")]
+        if let Some(seal) = external_genesis {
+            validate_external_common_checkpoint_profile(store, &result, seal).map_err(journal)?;
+            with_external_genesis_checkpoint_heads(
+                store,
+                result.heads(),
+                seal,
+                external_budget.ok_or(ReplayError::InvalidRecord)?,
+                |store, availability| {
+                    validate_published_shared_checkpoint_inner(
+                        store,
+                        &result,
+                        binding.claim(),
+                        availability,
+                    )
+                    .map_err(|_| JournalStoreError::Corrupt)
+                },
+            )
+            .map_err(journal)?;
+            return Ok(result);
+        }
         validate_published_shared_checkpoint(store, &result, binding.claim())
             .map_err(|_| ReplayError::InvalidRecord)?;
         Ok(result)
@@ -16242,10 +16454,45 @@ mod aggregate {
         store: JournalStoreInstanceId,
         validation_epoch: u64,
         materialization: ReplayMaterialization,
+        common_authority: Option<(Hash, Hash)>,
     }
 
     #[cfg(feature = "experimental-state-blocks")]
     impl ValidatedExternalHead {
+        pub(crate) fn into_external_common_shared_availability<S: AgentJournalStore>(
+            self,
+            store: &S,
+            seal: &ReplaySealedExternalGenesis,
+            certificate: &super::super::shared_commit::SharedAgentCommonSnapshotCertificate,
+            binding: &super::super::shared_commit::SharedAgentLocalSnapshotBinding,
+        ) -> Result<(ReplayMaterialization, SharedExternalAvailability), JournalStoreError>
+        {
+            verify_external_common_authority(
+                store,
+                seal,
+                self.materialization.heads(),
+                certificate,
+                binding,
+            )?;
+            if self.common_authority != Some((certificate.commitment(), binding.commitment()))
+                || self.store != store.instance_id()
+                || self.validation_epoch != store.validation_epoch()
+                || store.heads()?.as_ref() != Some(self.materialization.heads())
+            {
+                return Err(JournalStoreError::ScopeMismatch);
+            }
+            validate_external_common_checkpoint_profile(store, &self.materialization, seal)?;
+            let pin = SharedExternalAvailability {
+                store: self.store,
+                epoch: self.validation_epoch,
+                heads: self.materialization.heads.id(),
+                checkpoint_lanes: external_checkpoint_lanes(store, self.materialization.heads())?,
+                poisoned: false,
+                invalidated: core::sync::atomic::AtomicBool::new(false),
+            };
+            Ok((self.materialization, pin))
+        }
+
         pub(crate) fn into_shared_availability<S: AgentJournalStore>(
             self,
             store: &S,
@@ -16336,6 +16583,79 @@ mod aggregate {
             store: store.instance_id(),
             validation_epoch: store.validation_epoch(),
             materialization: recovered,
+            common_authority: None,
+        })
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn verify_external_common_authority<S: AgentJournalStore>(
+        store: &S,
+        seal: &ReplaySealedExternalGenesis,
+        heads: &JournalHeads,
+        certificate: &super::super::shared_commit::SharedAgentCommonSnapshotCertificate,
+        binding: &super::super::shared_commit::SharedAgentLocalSnapshotBinding,
+    ) -> Result<(), JournalStoreError> {
+        seal.validate_checkpoint_scope(store, heads)?;
+        let ExternalGenesisAdmission::Shared(trusted) = &seal.admission else {
+            return Err(JournalStoreError::ScopeMismatch);
+        };
+        certificate
+            .verify(trusted.committee(), certificate.claim())
+            .map_err(|_| JournalStoreError::ScopeMismatch)?;
+        binding
+            .verify(certificate, binding.claim())
+            .map_err(|_| JournalStoreError::ScopeMismatch)?;
+        if store.instance_id().as_bytes() != &binding.claim().journal_store().0
+            || heads.checkpoint != Some(binding.claim().checkpoint())
+            || heads.node != binding.claim().local_node()
+            || heads.genesis != certificate.claim().ordered().genesis()
+            || heads.admission != certificate.claim().ordered().admission()
+        {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        Ok(())
+    }
+
+    /// Certified checkpoint replay seeds common ancestry before its suffix;
+    /// both descriptors and every retained external block are audited while
+    /// borrowing the exact pinned store. No serving capability escapes until
+    /// the caller confirms this selected head is durable.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn validate_external_common_checkpoint_head<S, E, R>(
+        store: &mut S,
+        seal: &ReplaySealedExternalGenesis,
+        heads: &JournalHeads,
+        executor: &mut E,
+        resolver: &R,
+        certificate: &super::super::shared_commit::SharedAgentCommonSnapshotCertificate,
+        binding: &super::super::shared_commit::SharedAgentLocalSnapshotBinding,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<ValidatedExternalHead, JournalStoreError>
+    where
+        S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
+        E: ReplayExecutor,
+        R: OrderedBaseResolver,
+    {
+        verify_external_common_authority(store, seal, heads, certificate, binding)?;
+        let materialization = materialize_common_checkpoint_heads(
+            store,
+            executor,
+            resolver,
+            heads.clone(),
+            certificate,
+            binding,
+            Some(seal),
+            Some(budget),
+        )
+        .map_err(|_| JournalStoreError::Unavailable)?;
+        if materialization.heads() != heads {
+            return Err(JournalStoreError::Corrupt);
+        }
+        Ok(ValidatedExternalHead {
+            store: store.instance_id(),
+            validation_epoch: store.validation_epoch(),
+            materialization,
+            common_authority: Some((certificate.commitment(), binding.commitment())),
         })
     }
 
@@ -17068,6 +17388,8 @@ mod aggregate {
                 external_budget.as_deref_mut(),
                 #[cfg(feature = "experimental-state-blocks")]
                 external_genesis,
+                #[cfg(feature = "experimental-state-blocks")]
+                None,
             )?,
             None => load_genesis_base::<S, E, R>(store, &heads)?,
         };
@@ -17129,6 +17451,8 @@ mod aggregate {
                 executor,
                 &heads,
                 checkpoint,
+                #[cfg(feature = "experimental-state-blocks")]
+                None,
                 #[cfg(feature = "experimental-state-blocks")]
                 None,
                 #[cfg(feature = "experimental-state-blocks")]
@@ -20699,6 +21023,46 @@ mod aggregate {
         Ok(compacted)
     }
 
+    /// The candidate-only external Shared profile retains genesis's untouched
+    /// node-private lanes and the exact root-producing Linear declaration.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn validate_external_common_checkpoint_profile<S: AgentJournalStore>(
+        store: &S,
+        materialization: &ReplayMaterialization,
+        genesis: &ReplaySealedExternalGenesis,
+    ) -> Result<(), JournalStoreError> {
+        let heads = materialization.heads();
+        genesis.validate_checkpoint_scope(store, heads)?;
+        let empty_merge =
+            InvocationIndexManifest::empty(heads.genesis, InvocationOwnershipScope::Merge);
+        let empty_local = InvocationIndexManifest::empty(
+            heads.genesis,
+            InvocationOwnershipScope::Local(heads.node),
+        );
+        let frontier = store
+            .get::<MergeFrontier>(heads.merge_frontier)?
+            .ok_or(JournalStoreError::MissingObject)?;
+        let root = materialization
+            .external_roots
+            .get(&PersistedLane::Linear)
+            .ok_or(JournalStoreError::ScopeMismatch)?;
+        if !genesis.is_shared()
+            || !heads.runtime.is_external_state()
+            || materialization.external_roots.len() != 1
+            || root.runtime != heads.runtime
+            || heads.local_revision != 0
+            || heads.local_head.is_some()
+            || heads.merge_invocations != empty_merge.id()
+            || heads.local_invocations != empty_local.id()
+            || frontier != *genesis.empty_frontier()
+            || materialization.state.merge != genesis.post_create().merge
+            || materialization.state.local != genesis.post_create().local
+        {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        Ok(())
+    }
+
     /// Restrict common checkpoint transfer to the fixed image profile whose
     /// node-private lanes remain exactly the independently admitted genesis.
     /// Lifecycle fences are retained; an empty Merge DAG need not have no fence.
@@ -21073,6 +21437,26 @@ mod aggregate {
     where
         S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
     {
+        validate_published_shared_checkpoint_inner(
+            store,
+            materialization,
+            claim,
+            #[cfg(feature = "experimental-state-blocks")]
+            None,
+        )
+    }
+
+    fn validate_published_shared_checkpoint_inner<S>(
+        store: &S,
+        materialization: &ReplayMaterialization,
+        claim: &SharedAgentSnapshotClaim,
+        #[cfg(feature = "experimental-state-blocks")] availability: Option<
+            &ExternalCheckpointValidation<'_>,
+        >,
+    ) -> Result<(), MaterializeError<core::convert::Infallible, core::convert::Infallible>>
+    where
+        S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
+    {
         let current = materialization.heads();
         let checkpoint: CheckpointManifest = require_record(store, claim.checkpoint())?;
         if checkpoint.id() != claim.checkpoint()
@@ -21091,7 +21475,24 @@ mod aggregate {
         let mut roots = [None; 4];
         let mut local_cursor = None;
         for lane in &checkpoint.lanes {
-            let manifest = require_opaque_lane_state(store, lane.state)?;
+            let manifest: LaneStateManifest = require_record(store, lane.state)?;
+            if manifest.validate().is_err() {
+                return Err(ReplayError::InvalidRecord);
+            }
+            #[cfg(feature = "experimental-state-blocks")]
+            if manifest.external_root.is_some()
+                && (!checkpoint.runtime.is_external_state()
+                    || lane.lane != PersistedLane::Linear
+                    || !availability.is_some_and(|availability| {
+                        availability.permits_lane(
+                            store.instance_id(),
+                            claim.checkpoint(),
+                            lane.state,
+                        )
+                    }))
+            {
+                return Err(ReplayError::InvalidRecord);
+            }
             let state = require_blob(store, JournalBlobClass::LaneState, &manifest.state)?;
             let expected = match lane.lane {
                 PersistedLane::Control
@@ -21198,6 +21599,61 @@ mod aggregate {
             return Err(ReplayError::InvalidRecord);
         }
         Ok(())
+    }
+
+    /// Revalidate journal-first publication using a live owner pin and a fresh
+    /// borrowed checkpoint-root audit, never decoded descriptor availability.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn validate_published_external_shared_checkpoint<S>(
+        store: &mut S,
+        materialization: &ReplayMaterialization,
+        claim: &SharedAgentSnapshotClaim,
+        genesis: &ReplaySealedExternalGenesis,
+        pin: &SharedExternalAvailability,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<(), JournalStoreError>
+    where
+        S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
+    {
+        pin.require_current(store, materialization)?;
+        validate_external_common_checkpoint_profile(store, materialization, genesis).map_err(
+            |error| {
+                if matches!(
+                    error,
+                    JournalStoreError::MissingObject
+                        | JournalStoreError::Corrupt
+                        | JournalStoreError::Unavailable
+                        | JournalStoreError::NonCanonical
+                ) {
+                    pin.invalidate();
+                }
+                error
+            },
+        )?;
+        if store.instance_id().as_bytes() != &claim.journal_store().0 {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        with_external_genesis_checkpoint_heads(
+            store,
+            materialization.heads(),
+            genesis,
+            budget,
+            |store, availability| {
+                validate_published_shared_checkpoint_inner(
+                    store,
+                    materialization,
+                    claim,
+                    availability,
+                )
+                .map_err(|_| JournalStoreError::Corrupt)
+            },
+        )
+        .map_err(|error| {
+            if error != JournalStoreError::LimitExceeded {
+                pin.invalidate();
+            }
+            error
+        })
     }
 
     pub(crate) fn prepare_checkpoint<'store, S>(
@@ -21484,7 +21940,10 @@ pub(crate) use aggregate::materialize_external_genesis;
 pub(crate) use aggregate::{ExternalJournalCommit, ExternalJournalEntry, RecoveryError};
 #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
 pub(crate) use aggregate::{
-    ValidatedExternalHead, prepare_external_shared_ordered, validate_external_genesis_head,
+    ValidatedExternalHead, prepare_external_shared_ordered,
+    validate_external_common_checkpoint_head, validate_external_common_checkpoint_profile,
+    validate_external_genesis_head, validate_published_external_shared_checkpoint,
+    verify_external_common_authority,
 };
 
 #[cfg(all(feature = "std", feature = "storage"))]
@@ -29659,6 +30118,126 @@ pub(crate) mod tests {
             .unwrap();
         assert!(store.initialize_ordinary_for_test(&sealed).unwrap());
         store
+    }
+
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    #[test]
+    fn shared_external_pin_refuses_stale_materialization_without_revocation() {
+        let mut store = initialized_replay_store();
+        let mut executor = ExactCreateRejectInvocations::default();
+        let materialized =
+            materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        // Synthetic pins test lifetime/refusal only, not external root admission.
+        let pin = SharedExternalAvailability {
+            store: store.instance_id(),
+            epoch: store.validation_epoch(),
+            heads: materialized.heads_id(),
+            checkpoint_lanes: BTreeSet::new(),
+            poisoned: false,
+            invalidated: core::sync::atomic::AtomicBool::new(false),
+        };
+        pin.require_current(&store, &materialized).unwrap();
+        let mut stale = materialized.clone();
+        stale.heads.merge_frontier = MergeFrontierId([0x91; 32]);
+        stale.heads_id = stale.heads.id();
+        assert_ne!(stale.heads_id(), materialized.heads_id());
+        assert_eq!(
+            pin.require_current(&store, &stale),
+            Err(JournalStoreError::Unavailable),
+        );
+        assert!(!pin.is_poisoned());
+        pin.require_current(&store, &materialized).unwrap();
+
+        store.replace_heads_for_external_fixture(stale.heads());
+        assert_eq!(
+            pin.require_current(&store, &materialized),
+            Err(JournalStoreError::Unavailable),
+        );
+        assert!(pin.is_poisoned());
+        store.replace_heads_for_external_fixture(materialized.heads());
+        assert_eq!(store.heads().unwrap().as_ref(), Some(materialized.heads()));
+        assert_eq!(
+            pin.require_current(&store, &materialized),
+            Err(JournalStoreError::Unavailable),
+            "restoring exact physical heads cannot revive a revoked pin",
+        );
+    }
+
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    #[test]
+    fn shared_external_pin_missing_heads_remains_revoked_after_restoration() {
+        let mut source = initialized_replay_store();
+        let mut executor = ExactCreateRejectInvocations::default();
+        let materialized =
+            materialize_current(&mut source, &mut executor, &NoPrunedOrderedBases).unwrap();
+        let mut missing =
+            MemoryAgentJournalStore::new(materialized.runtime().agent, materialized.heads().node)
+                .unwrap();
+        // This negative pin is not root authority; only its head-read lifetime
+        // is exercised against a store with the same Agent/node and no heads.
+        let pin = SharedExternalAvailability {
+            store: missing.instance_id(),
+            epoch: missing.validation_epoch(),
+            heads: materialized.heads_id(),
+            checkpoint_lanes: BTreeSet::new(),
+            poisoned: false,
+            invalidated: core::sync::atomic::AtomicBool::new(false),
+        };
+        assert_eq!(missing.heads().unwrap(), None);
+        assert_eq!(
+            pin.require_current(&missing, &materialized),
+            Err(JournalStoreError::Unavailable),
+        );
+        assert!(pin.is_poisoned());
+        missing.replace_heads_for_external_fixture(materialized.heads());
+        assert_eq!(
+            missing.heads().unwrap().as_ref(),
+            Some(materialized.heads())
+        );
+        assert_eq!(
+            pin.require_current(&missing, &materialized),
+            Err(JournalStoreError::Unavailable),
+            "a failed physical head read requires fresh independent admission",
+        );
+    }
+
+    #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
+    #[test]
+    fn generic_shared_checkpoint_storage_requires_an_explicit_audited_adapter() {
+        let mut store = initialized_replay_store();
+        let mut executor = ExactCreateRejectInvocations::default();
+        let materialized =
+            materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        let prepared = prepare_checkpoint(&mut store, &materialized).unwrap();
+        let publication = prepared.sealed.clone();
+        drop(prepared);
+        let mut unsupported = LinearReplayStore {
+            inner: store,
+            heads: materialized.heads().clone(),
+            history_nodes: BTreeMap::new(),
+        };
+        let lanes = BTreeSet::new();
+        // Synthetic availability is confined to this negative storage-seam
+        // test. Merely implementing ordinary publication cannot opt an adapter
+        // into certified external checkpoint publication.
+        let validation = ExternalCheckpointValidation {
+            mutation: None,
+            store: unsupported.instance_id(),
+            predecessor: publication.expected(),
+            successor: publication.next().id(),
+            predecessor_checkpoint: materialized.heads().checkpoint,
+            successor_checkpoint: publication.next().checkpoint.unwrap(),
+            predecessor_lanes: &lanes,
+            successor_lanes: &lanes,
+        };
+        assert_eq!(
+            unsupported.publish_external_shared_checkpoint(&publication, &validation),
+            Err(JournalStoreError::Unavailable),
+        );
+        assert_eq!(
+            unsupported.heads().unwrap().as_ref(),
+            Some(materialized.heads())
+        );
     }
 
     #[cfg(feature = "std")]

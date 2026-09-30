@@ -4,7 +4,7 @@
 use super::*;
 use crate::agent::clean_management_intent::{CleanManagementIntent, CleanManagementIntentSlot};
 use crate::agent::genesis::VerifiedAgentGenesisProvision;
-use crate::agent::journal::{CanonicalJournalRecord, ReplayOperation};
+use crate::agent::journal::{CanonicalJournalRecord, JournalHeads, ReplayOperation};
 use crate::agent::journal_store::{
     AgentJournalStore, CatalogBlobResolverFactory, FileAgentJournalStore,
     FileLocalAgentJournalSlot, JournalBlobClass, MemoryAgentJournalStore,
@@ -296,16 +296,68 @@ fn enroll_replica(owner: &mut MemoryBootstrapOwner, node_key: &SigningKey, nonce
 #[test]
 #[ignore = "requires compiled external runtime/Authority, CLERK_AGENT_PACKAGE and physical outer PVM"]
 fn three_file_replicas_external_clerk_install_invoke_ack_reopen() {
-    external_clerk_lifecycle(false);
+    external_clerk_lifecycle(false, ExternalNetworkExercise::LostResponse);
 }
 
 #[test]
 #[ignore = "requires compiled external runtime/Authority, CLERK_AGENT_PACKAGE and authenticated loopback"]
 fn three_network_replicas_external_clerk_install_invoke_ack_reopen() {
-    external_clerk_lifecycle(true);
+    external_clerk_lifecycle(true, ExternalNetworkExercise::LostResponse);
 }
 
-fn external_clerk_lifecycle(with_network: bool) {
+#[derive(Clone, Copy)]
+enum ExternalNetworkExercise {
+    LostResponse,
+    Checkpoint(Option<crate::agent::shared_host::CommonCheckpointCrashStage>),
+    RetainedCheckpoint,
+}
+
+#[test]
+#[ignore = "requires compiled external runtime/Authority, CLERK_AGENT_PACKAGE and authenticated loopback"]
+fn three_network_replicas_external_clerk_certified_checkpoint_reopen_and_continue() {
+    external_clerk_lifecycle(true, ExternalNetworkExercise::Checkpoint(None));
+}
+
+#[test]
+#[ignore = "requires compiled external runtime/Authority, CLERK_AGENT_PACKAGE and authenticated loopback"]
+fn three_network_replicas_external_clerk_retained_reply_survives_two_checkpoints() {
+    external_clerk_lifecycle(true, ExternalNetworkExercise::RetainedCheckpoint);
+}
+
+#[test]
+#[ignore = "requires compiled external runtime/Authority, CLERK_AGENT_PACKAGE and authenticated loopback"]
+fn three_network_replicas_external_clerk_checkpoint_recovers_marker_crash() {
+    external_clerk_lifecycle(
+        true,
+        ExternalNetworkExercise::Checkpoint(Some(
+            crate::agent::shared_host::CommonCheckpointCrashStage::Marker,
+        )),
+    );
+}
+
+#[test]
+#[ignore = "requires compiled external runtime/Authority, CLERK_AGENT_PACKAGE and authenticated loopback"]
+fn three_network_replicas_external_clerk_checkpoint_recovers_journal_crash() {
+    external_clerk_lifecycle(
+        true,
+        ExternalNetworkExercise::Checkpoint(Some(
+            crate::agent::shared_host::CommonCheckpointCrashStage::Journal,
+        )),
+    );
+}
+
+#[test]
+#[ignore = "requires compiled external runtime/Authority, CLERK_AGENT_PACKAGE and authenticated loopback"]
+fn three_network_replicas_external_clerk_checkpoint_recovers_ledger_crash() {
+    external_clerk_lifecycle(
+        true,
+        ExternalNetworkExercise::Checkpoint(Some(
+            crate::agent::shared_host::CommonCheckpointCrashStage::Ledger,
+        )),
+    );
+}
+
+fn external_clerk_lifecycle(with_network: bool, exercise: ExternalNetworkExercise) {
     use crate::actors::value::{Msg, TAG_DYNAMIC, Value};
     use crate::agent::driver::SdkManagementArtifacts;
     use crate::agent::package_admission::{
@@ -558,6 +610,7 @@ fn external_clerk_lifecycle(with_network: bool) {
             prepared.catalog(),
             &finality,
             harness.network.clone(),
+            exercise,
         );
         harness.stop();
         return;
@@ -945,6 +998,7 @@ fn external_network_lifecycle(
     catalog: &[crate::agent::execution::RuntimeBlob],
     finality: &ReplayVerifiedAgentGenesisFinality,
     authority_network: Arc<Network>,
+    exercise: ExternalNetworkExercise,
 ) {
     use crate::actors::value::{Msg, TAG_DYNAMIC, Value};
     use crate::agent::driver::SdkManagementArtifacts;
@@ -1548,7 +1602,928 @@ fn external_network_lifecycle(
         }),
         "transfer/root Invoke and ACK claims must converge on all three replicas"
     );
-    let completed = completed.unwrap();
+    let mut completed = completed.unwrap();
+    let retained_mode = matches!(exercise, ExternalNetworkExercise::RetainedCheckpoint);
+    let mut retained_reply = None;
+    if retained_mode {
+        let (retained_work, authorization) = clerk_call(
+            "state_root",
+            Vec::new(),
+            MethodMode::LinearizableQuery,
+            member,
+            0xed,
+        );
+        let InvocationAuthorization::AuthorityReceipt(mut receipt) = authorization else {
+            unreachable!()
+        };
+        let accepted_slot = fixture
+            .logical_slot
+            .as_ref()
+            .unwrap()
+            .load(Ordering::Acquire);
+        receipt.selector.valid_from = accepted_slot;
+        receipt.selector.expires_at = accepted_slot + 2;
+        receipt.signature = SigningKey::from_bytes(&[RECEIPT_SEED; 32])
+            .sign(&receipt.signing_bytes())
+            .to_bytes();
+        let retained_authorization = InvocationAuthorization::AuthorityReceipt(receipt);
+        let retained_input = crate::agent::journal::ReplayInput {
+            runtime: provision.proposal().create().runtime.clone(),
+            operation: ReplayOperation::CleanInvoke {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                work: retained_work.clone(),
+                authorization: retained_authorization.clone(),
+                observed_slot: accepted_slot,
+            },
+        }
+        .id();
+        let outcome = external_network_on_leader(&attached, agent, |owner| {
+            owner.supervisor_invoke(
+                identity,
+                retained_work.clone(),
+                retained_authorization.clone(),
+            )
+        });
+        let RuntimeOutcome::Completed(Ok(reply)) = &outcome else {
+            panic!("external retained invocation: {outcome:?}");
+        };
+        assert_eq!(
+            Value::decode(&reply.reply),
+            Value::Bytes(reference.root().to_vec())
+        );
+        let mut retained_claims = None;
+        assert!(
+            wait_until(std::time::Duration::from_secs(15), || {
+                let Some(states) = hosts
+                    .iter()
+                    .map(|host| {
+                        let mut host = host.lock().unwrap();
+                        Some((
+                            host.journal_position(agent).ok()?,
+                            host.available_ordered_claim(agent, retained_input).ok()?,
+                        ))
+                    })
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    return false;
+                };
+                if states.iter().all(|state| state == &states[0])
+                    && states[0].0.ordered_index == completed.0.ordered_index + 1
+                {
+                    retained_claims = Some(states[0].clone());
+                    true
+                } else {
+                    false
+                }
+            }),
+            "fresh retained Invoke must genuinely commit identical claims on all three replicas"
+        );
+        completed.0 = retained_claims.unwrap().0;
+        retained_reply = Some((retained_work, retained_authorization, outcome));
+    }
+    let checkpoint_crash = match exercise {
+        ExternalNetworkExercise::Checkpoint(crash) => Some(crash),
+        ExternalNetworkExercise::RetainedCheckpoint => Some(None),
+        ExternalNetworkExercise::LostResponse => None,
+    };
+    if let Some(crash) = checkpoint_crash {
+        // The existing customer calls are ACKed before retirement; the retained
+        // mode adds one explicit unacknowledged result. The lost-response path
+        // stays separate, and all-ACKed/crash cases do not claim old ordinary
+        // replies retain availability after physical compaction.
+        drop(attached);
+        let leaf: String = agent.0.iter().map(|byte| format!("{byte:02x}")).collect();
+        let journal_root = |index: usize| directories[index].host().join(format!("{leaf}.agent"));
+        if crash.is_none() && !retained_mode {
+            let mut host = hosts[0].lock().unwrap();
+            let position = host.journal_position(agent).unwrap();
+            let path = journal_root(0).join("heads");
+            let heads = std::fs::read(&path).unwrap();
+            let parked = directories[0].0.join("parked-checkpoint-heads");
+            std::fs::rename(&path, &parked).unwrap();
+            assert!(host.request_common_snapshot_compaction(agent).is_err());
+            assert!(!path.exists(), "head refusal must not repair missing heads");
+            std::fs::rename(&parked, &path).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), heads);
+            assert_eq!(host.journal_position(agent).unwrap(), position);
+            assert!(
+                host.available_ordered_claim(agent, root_input).is_err(),
+                "restoring heads must not revive a failed serving pin"
+            );
+            drop(host);
+            drop(hosts);
+            hosts = (0..keys.len())
+                .map(|index| Arc::new(std::sync::Mutex::new(open(index, true).unwrap())))
+                .collect();
+        }
+        if crash.is_none() && !retained_mode {
+            let mut host = hosts[0].lock().unwrap();
+            let position = host.journal_position(agent).unwrap();
+            let heads = std::fs::read(journal_root(0).join("heads")).unwrap();
+            let decoded = JournalHeads::decode(&heads).unwrap();
+            let frontier: String = decoded
+                .merge_frontier
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            let path = journal_root(0)
+                .join("records/merge-frontiers")
+                .join(frontier);
+            let parked = directories[0].0.join("parked-checkpoint-frontier");
+            std::fs::rename(&path, &parked).unwrap();
+            assert!(host.request_common_snapshot_compaction(agent).is_err());
+            assert_eq!(host.journal_position(agent).unwrap(), position);
+            assert_eq!(std::fs::read(journal_root(0).join("heads")).unwrap(), heads);
+            assert!(
+                !path.exists(),
+                "metadata refusal must not repair missing frontier"
+            );
+            std::fs::rename(&parked, &path).unwrap();
+            assert!(
+                host.available_ordered_claim(agent, root_input).is_err(),
+                "restoring frontier bytes must not revive a failed serving pin"
+            );
+            drop(host);
+            // Metadata reads precede the root-block audit. Only a new owner
+            // may establish availability again after either physical failure.
+            drop(hosts);
+            hosts = (0..keys.len())
+                .map(|index| Arc::new(std::sync::Mutex::new(open(index, true).unwrap())))
+                .collect();
+        }
+        if crash.is_none() && !retained_mode {
+            let mut host = hosts[0].lock().unwrap();
+            let block = external_current_root_block(&mut host, agent);
+            let path = journal_root(0).join("lane-state/blocks").join(block);
+            let parked = directories[0].0.join("parked-checkpoint-predecessor-block");
+            let position = host.journal_position(agent).unwrap();
+            let heads = std::fs::read(journal_root(0).join("heads")).unwrap();
+            std::fs::rename(&path, &parked).unwrap();
+            assert!(host.request_common_snapshot_compaction(agent).is_err());
+            assert_eq!(host.journal_position(agent).unwrap(), position);
+            assert_eq!(std::fs::read(journal_root(0).join("heads")).unwrap(), heads);
+            assert!(
+                !path.exists(),
+                "candidate refusal must not repair missing state"
+            );
+            std::fs::rename(&parked, &path).unwrap();
+            assert!(
+                host.available_ordered_claim(agent, root_input).is_err(),
+                "restoring predecessor bytes must not revive a failed serving pin"
+            );
+        }
+        // Restoration requires a fresh full owner audit, not revival of a
+        // serving availability token invalidated by the failed candidate.
+        drop(hosts);
+        hosts = (0..keys.len())
+            .map(|index| Arc::new(std::sync::Mutex::new(open(index, true).unwrap())))
+            .collect();
+        attached = attach(&hosts);
+        let (checkpoint_work, checkpoint_authorization) = clerk_call(
+            "state_root",
+            Vec::new(),
+            MethodMode::LinearizableQuery,
+            member,
+            0xeb,
+        );
+        let committee = provision.replicas().clone();
+        let mut certificate = None;
+        let mut checkpoint_owner = None;
+        assert!(
+            wait_until(std::time::Duration::from_secs(30), || {
+                let Some(index) = attached
+                    .iter()
+                    .position(|owner| owner.bootstrap_is_local_leader(agent).unwrap_or(false))
+                else {
+                    return false;
+                };
+                // Logical roots alone do not establish a common physical
+                // foundation: a reopened leader may have committed a no-op.
+                // Every eventual recipient must reconstruct the exact same
+                // current claim before collecting the real quorum.
+                let Some(boundaries) = hosts
+                    .iter()
+                    .map(|host| {
+                        host.lock()
+                            .unwrap()
+                            .request_common_snapshot_compaction(agent)
+                            .ok()
+                            .map(|candidate| candidate.claim().clone())
+                    })
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    return false;
+                };
+                if !boundaries.iter().all(|claim| claim == &boundaries[index]) {
+                    return false;
+                }
+                match attached[index].collect_common_checkpoint_for_admission(
+                    agent,
+                    &checkpoint_work,
+                    &checkpoint_authorization,
+                    &committee,
+                    merges[index].as_ref(),
+                ) {
+                    Ok(certified) => {
+                        certificate = Some(certified);
+                        checkpoint_owner = Some(index);
+                        true
+                    }
+                    Err(SharedAgentHostError::Unavailable) => false,
+                    Err(error) => panic!("external checkpoint admission: {error:?}"),
+                }
+            }),
+            "external checkpoint did not obtain an authenticated physical quorum"
+        );
+        let checkpoint_owner = checkpoint_owner.unwrap();
+        let certificate = certificate.unwrap();
+        certificate.verify(&committee, certificate.claim()).unwrap();
+        assert_eq!(certificate.signatures().len(), 2);
+        // Freeze only after a genuine authenticated network quorum. Otherwise
+        // the two live followers could elect while the source publishes its
+        // fully audited closure, changing the certificate's exact foundation.
+        external_freeze_checkpoint_workers(&mut attached, agent, checkpoint_owner);
+        drop(attached);
+        {
+            let mut host = hosts[checkpoint_owner].lock().unwrap();
+            if let Some(stage) = crash {
+                let before = std::fs::read(journal_root(checkpoint_owner).join("heads")).unwrap();
+                host.set_common_checkpoint_crash_for_test(stage);
+                assert!(matches!(
+                    host.install_common_snapshot(agent, &certificate),
+                    Err(SharedAgentHostError::Unavailable)
+                ));
+                assert!(host.show(agent).unwrap().is_none());
+                assert!(
+                    !host.common_checkpoint_crash_pending_for_test(),
+                    "publication failed before the selected crash stage was consumed"
+                );
+                let (predecessor, target) = host
+                    .common_checkpoint_install_endpoints_for_test(agent)
+                    .unwrap()
+                    .expect("selected crash must retain its exact ACL1 marker");
+                assert_eq!(predecessor.encode(), before);
+                assert_ne!(predecessor, target);
+                let durable = JournalHeads::decode(
+                    &std::fs::read(journal_root(checkpoint_owner).join("heads")).unwrap(),
+                )
+                .unwrap();
+                match stage {
+                    crate::agent::shared_host::CommonCheckpointCrashStage::Marker => {
+                        assert_eq!(durable, predecessor)
+                    }
+                    crate::agent::shared_host::CommonCheckpointCrashStage::Journal
+                    | crate::agent::shared_host::CommonCheckpointCrashStage::Ledger => {
+                        assert_eq!(durable, target)
+                    }
+                }
+            } else {
+                host.install_common_snapshot(agent, &certificate).unwrap();
+            }
+        }
+        if crash.is_some() {
+            drop(hosts);
+            hosts = (0..keys.len())
+                .map(|index| Arc::new(std::sync::Mutex::new(open(index, true).unwrap())))
+                .collect();
+            assert_eq!(
+                hosts[checkpoint_owner]
+                    .lock()
+                    .unwrap()
+                    .common_snapshot_authority_for_test(agent)
+                    .unwrap()
+                    .unwrap()
+                    .0,
+                certificate,
+            );
+        }
+        let target_block =
+            external_current_root_block(&mut hosts[checkpoint_owner].lock().unwrap(), agent);
+        for index in 0..keys.len() {
+            if index != checkpoint_owner && crash.is_none() && !retained_mode {
+                let mut host = hosts[index].lock().unwrap();
+                // Reconstruct this voter's target closure before testing its
+                // exact target block. Missing data cannot publish either head.
+                host.request_common_snapshot_compaction(agent).unwrap();
+                let path = journal_root(index)
+                    .join("lane-state/blocks")
+                    .join(&target_block);
+                let parked = directories[index].0.join("parked-checkpoint-target-block");
+                let position = host.journal_position(agent).unwrap();
+                let heads = std::fs::read(journal_root(index).join("heads")).unwrap();
+                std::fs::rename(&path, &parked).unwrap();
+                assert!(host.install_common_snapshot(agent, &certificate).is_err());
+                assert_eq!(host.journal_position(agent).unwrap(), position);
+                assert_eq!(
+                    std::fs::read(journal_root(index).join("heads")).unwrap(),
+                    heads
+                );
+                assert!(
+                    !path.exists(),
+                    "installation refusal must not repair missing state"
+                );
+                std::fs::rename(&parked, &path).unwrap();
+                assert!(
+                    host.available_ordered_claim(agent, root_input).is_err(),
+                    "restoring target bytes must not revive a failed serving pin"
+                );
+                drop(host);
+                // Restored bytes do not revive the failed open's availability
+                // pin. Only a fresh, independently audited owner can retry.
+                drop(hosts);
+                hosts = (0..keys.len())
+                    .map(|replica| Arc::new(std::sync::Mutex::new(open(replica, true).unwrap())))
+                    .collect();
+            }
+            let mut host = hosts[index].lock().unwrap();
+            if let Err(error) = host.install_common_snapshot(agent, &certificate) {
+                let local = host
+                    .request_common_snapshot_compaction(agent)
+                    .map(|candidate| candidate.claim().clone());
+                panic!(
+                    "external checkpoint recipient index={index} error={error:?} expected={:?} local={local:?}",
+                    certificate.claim()
+                );
+            }
+            let (actual, binding) = host
+                .common_snapshot_authority_for_test(agent)
+                .unwrap()
+                .unwrap();
+            assert_eq!(actual, certificate);
+            binding.verify(&certificate, binding.claim()).unwrap();
+            assert_eq!(binding.claim().local_node(), merges[index].node());
+            assert_eq!(
+                binding.claim().journal_store().0,
+                *host
+                    .journal_store_instance_for_test(agent)
+                    .unwrap()
+                    .as_bytes()
+            );
+            assert_eq!(binding.claim().ordered(), certificate.claim().ordered());
+            assert_eq!(host.journal_position(agent).unwrap(), completed.0);
+        }
+        let raw_intent = hosts[0]
+            .lock()
+            .unwrap()
+            .shared_genesis_intent_for_test(agent)
+            .unwrap();
+        drop(hosts);
+        let scope = crate::agent::host::AgentHostScope {
+            space: HostSpaceId(descriptor.identity.space.0),
+            node: merges[0].node(),
+        };
+        let authority_root = crate::agent::host::agent_host_authority_root_path(
+            &directories[0].host(),
+            &directories[0].lock(),
+            scope,
+        )
+        .unwrap();
+        let verified = VerifiedAgentGenesisProvision::verify(provision.clone(), finality).unwrap();
+        let sealed =
+            LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_external_shared_genesis(
+                &verified,
+                committee
+                    .member_by_node(merges[0].node())
+                    .unwrap()
+                    .replica(),
+                catalog,
+                &fixture.trust,
+                merges[0].node(),
+            )
+            .unwrap();
+        let heads = std::fs::read(journal_root(0).join("heads")).unwrap();
+        let raw_slot = FileLocalAgentJournalSlot::acquire_with_pinned_parents(
+            journal_root(0),
+            authority_root.join(format!("{leaf}.agent-lock")),
+            merges[0].node(),
+            raw_intent,
+            &std::fs::File::open(directories[0].host()).unwrap(),
+            &std::fs::File::open(authority_root).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            raw_slot
+                .open_external_journal_with_executor(
+                    &sealed,
+                    |store| Ok(StandardLocalReplayExecutor::new_shared(
+                        store.catalog_blob_resolver()?,
+                        fixture.trust.clone(),
+                        merges[0].clone(),
+                        vec![committee.clone()],
+                    )),
+                    &NoPrunedOrderedBases,
+                    &mut budget(),
+                )
+                .is_err(),
+            "raw replay must not authenticate a quorum-certified external checkpoint"
+        );
+        assert_eq!(std::fs::read(journal_root(0).join("heads")).unwrap(), heads);
+        hosts = (0..keys.len())
+            .map(|index| {
+                let mut host = open(index, true).unwrap();
+                let (actual, binding) = host
+                    .common_snapshot_authority_for_test(agent)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(actual, certificate);
+                binding.verify(&certificate, binding.claim()).unwrap();
+                assert_eq!(host.journal_position(agent).unwrap(), completed.0);
+                Arc::new(std::sync::Mutex::new(host))
+            })
+            .collect();
+        if let Some((retained_work, retained_authorization, retained_outcome)) = retained_reply {
+            let InvocationAuthorization::AuthorityReceipt(receipt) = &retained_authorization else {
+                unreachable!()
+            };
+            fixture
+                .logical_slot
+                .as_ref()
+                .unwrap()
+                .store(receipt.selector.expires_at + 1, Ordering::Release);
+            let retained_request = CleanInvocationReplayRequest::Invoke {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                work: retained_work.clone(),
+                authorization: retained_authorization.clone(),
+            };
+            let ack_request = CleanInvocationReplayRequest::Acknowledge {
+                work: retained_work.clone(),
+                authorization: retained_authorization.clone(),
+            };
+            for host in &hosts {
+                let mut host = host.lock().unwrap();
+                let proof = host
+                    .inspect_external_retained_reply(agent, &retained_request)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(proof.outcome(), &retained_outcome);
+                assert_eq!(proof.claim(), certificate.claim().ordered());
+                assert_eq!(host.journal_position(agent).unwrap(), completed.0);
+            }
+            {
+                let mut host = hosts[0].lock().unwrap();
+                let mut altered_work = retained_work.clone();
+                altered_work.gas -= 1;
+                let altered = CleanInvocationReplayRequest::Invoke {
+                    context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                    work: altered_work,
+                    authorization: retained_authorization.clone(),
+                };
+                assert!(
+                    host.inspect_external_retained_reply(agent, &altered)
+                        .is_err()
+                );
+                let mut altered_authorization = retained_authorization.clone();
+                let InvocationAuthorization::AuthorityReceipt(altered_receipt) =
+                    &mut altered_authorization
+                else {
+                    unreachable!()
+                };
+                altered_receipt.signature[0] ^= 1;
+                let altered = CleanInvocationReplayRequest::Invoke {
+                    context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                    work: retained_work.clone(),
+                    authorization: altered_authorization,
+                };
+                assert!(
+                    host.inspect_external_retained_reply(agent, &altered)
+                        .is_err()
+                );
+                assert_eq!(host.journal_position(agent).unwrap(), completed.0);
+                let path = journal_root(0)
+                    .join("lane-state/blocks")
+                    .join(external_current_root_block(&mut host, agent));
+                let parked = directories[0].0.join("parked-retained-inspection-block");
+                let heads = std::fs::read(journal_root(0).join("heads")).unwrap();
+                std::fs::rename(&path, &parked).unwrap();
+                assert!(
+                    host.inspect_external_retained_reply(agent, &retained_request)
+                        .is_err()
+                );
+                assert_eq!(std::fs::read(journal_root(0).join("heads")).unwrap(), heads);
+                assert_eq!(host.journal_position(agent).unwrap(), completed.0);
+                assert!(!path.exists());
+                std::fs::rename(&parked, &path).unwrap();
+                assert!(
+                    host.inspect_external_retained_reply(agent, &retained_request)
+                        .is_err(),
+                    "restoring bytes must not revive an invalidated retained-reply pin"
+                );
+            }
+            drop(hosts);
+            hosts = (0..keys.len())
+                .map(|index| Arc::new(std::sync::Mutex::new(open(index, true).unwrap())))
+                .collect();
+            attached = attach(&hosts);
+            assert_eq!(
+                external_network_on_leader(&attached, agent, |owner| {
+                    owner.supervisor_invoke(
+                        identity,
+                        retained_work.clone(),
+                        retained_authorization.clone(),
+                    )
+                }),
+                retained_outcome,
+                "expired exact Invoke must return the retained reply through current-root quorum"
+            );
+            for host in &hosts {
+                assert_eq!(
+                    host.lock().unwrap().journal_position(agent).unwrap(),
+                    completed.0,
+                    "retained Invoke must not append a new execution"
+                );
+            }
+            let proof_owner = attached
+                .iter()
+                .position(|owner| owner.bootstrap_is_local_leader(agent).unwrap_or(false))
+                .unwrap();
+            let pre_ack_proof = {
+                let mut host = hosts[proof_owner].lock().unwrap();
+                let proof = host
+                    .inspect_external_retained_reply(agent, &retained_request)
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    host.revalidate_external_retained_reply(agent, &ack_request, &proof)
+                        .is_err(),
+                    "an Invoke proof cannot stand in for an ACK proof"
+                );
+                let clock = fixture.logical_slot.as_ref().unwrap();
+                let inspected_slot = clock.load(Ordering::Acquire);
+                assert!(inspected_slot - 1 > receipt.selector.valid_from);
+                clock.store(inspected_slot - 1, Ordering::Release);
+                assert!(
+                    matches!(
+                        host.revalidate_external_retained_reply(agent, &retained_request, &proof),
+                        Err(SharedAgentHostError::Unavailable)
+                    ),
+                    "trusted clock regression must require a fresh inspection"
+                );
+                clock.store(inspected_slot, Ordering::Release);
+                assert_eq!(
+                    host.revalidate_external_retained_reply(agent, &retained_request, &proof)
+                        .unwrap(),
+                    retained_outcome,
+                );
+                assert_eq!(host.journal_position(agent).unwrap(), completed.0);
+                proof
+            };
+            let acknowledgement = external_network_on_leader(&attached, agent, |owner| {
+                owner.supervisor_acknowledge(
+                    identity,
+                    retained_work.clone(),
+                    retained_authorization.clone(),
+                )
+            });
+            assert!(matches!(
+                &acknowledgement,
+                RuntimeOutcome::Acknowledged(Ok(_))
+            ));
+            let retirement_input = crate::agent::journal::ReplayInput {
+                runtime: provision.proposal().create().runtime.clone(),
+                operation: ReplayOperation::CleanAcknowledge {
+                    context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                    expected_live: None,
+                    work: crate::agent_sdk::InvocationRetirement::from_work(&retained_work),
+                    authorization: retained_authorization.clone(),
+                },
+            }
+            .id();
+            let mut acknowledged = None;
+            assert!(
+                wait_until(std::time::Duration::from_secs(15), || {
+                    let Some(states) = hosts
+                        .iter()
+                        .map(|host| {
+                            let mut host = host.lock().unwrap();
+                            if !host
+                                .retained_positive_clean_acknowledgement(
+                                    agent,
+                                    &retained_work,
+                                    &retained_authorization,
+                                )
+                                .ok()?
+                            {
+                                return None;
+                            }
+                            Some((
+                                host.journal_position(agent).ok()?,
+                                host.available_ordered_claim(agent, retirement_input).ok()?,
+                            ))
+                        })
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        return false;
+                    };
+                    if states.iter().all(|state| state == &states[0])
+                        && states[0].0.ordered_index == completed.0.ordered_index + 1
+                    {
+                        acknowledged = Some(states[0].clone());
+                        true
+                    } else {
+                        false
+                    }
+                }),
+                "real retained-result ACK must commit exactly one slot and identical replica claims"
+            );
+            let acknowledged = acknowledged.unwrap();
+            assert!(
+                hosts[proof_owner]
+                    .lock()
+                    .unwrap()
+                    .revalidate_external_retained_reply(agent, &retained_request, &pre_ack_proof)
+                    .is_err(),
+                "a real ACK root advance must revoke the previously inspected Invoke proof"
+            );
+            let (checkpoint_work, checkpoint_authorization) = clerk_call(
+                "state_root",
+                Vec::new(),
+                MethodMode::LinearizableQuery,
+                member,
+                0xee,
+            );
+            let mut second_certificate = None;
+            let mut second_owner = None;
+            assert!(
+                wait_until(std::time::Duration::from_secs(30), || {
+                    let Some(index) = attached
+                        .iter()
+                        .position(|owner| owner.bootstrap_is_local_leader(agent).unwrap_or(false))
+                    else {
+                        return false;
+                    };
+                    let Some(boundaries) = hosts
+                        .iter()
+                        .map(|host| {
+                            host.lock()
+                                .unwrap()
+                                .request_common_snapshot_compaction(agent)
+                                .ok()
+                                .map(|candidate| candidate.claim().clone())
+                        })
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        return false;
+                    };
+                    if !boundaries.iter().all(|claim| claim == &boundaries[index]) {
+                        return false;
+                    }
+                    match attached[index].collect_common_checkpoint_for_admission(
+                        agent,
+                        &checkpoint_work,
+                        &checkpoint_authorization,
+                        &committee,
+                        merges[index].as_ref(),
+                    ) {
+                        Ok(certified) => {
+                            second_certificate = Some(certified);
+                            second_owner = Some(index);
+                            true
+                        }
+                        Err(SharedAgentHostError::Unavailable) => false,
+                        Err(error) => panic!("second retained checkpoint: {error:?}"),
+                    }
+                }),
+                "ACK-retaining checkpoint must obtain an exact physical quorum"
+            );
+            let second_certificate = second_certificate.unwrap();
+            second_certificate
+                .verify(&committee, second_certificate.claim())
+                .unwrap();
+            assert_eq!(second_certificate.signatures().len(), 2);
+            let second_owner = second_owner.unwrap();
+            external_freeze_checkpoint_workers(&mut attached, agent, second_owner);
+            drop(attached);
+            hosts[second_owner]
+                .lock()
+                .unwrap()
+                .install_common_snapshot(agent, &second_certificate)
+                .unwrap();
+            for (index, host) in hosts.iter().enumerate() {
+                let mut host = host.lock().unwrap();
+                host.install_common_snapshot(agent, &second_certificate)
+                    .unwrap();
+                let (actual, binding) = host
+                    .common_snapshot_authority_for_test(agent)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(actual, second_certificate);
+                binding
+                    .verify(&second_certificate, binding.claim())
+                    .unwrap();
+                assert_eq!(binding.claim().local_node(), merges[index].node());
+                assert_eq!(
+                    binding.claim().journal_store().0,
+                    *host
+                        .journal_store_instance_for_test(agent)
+                        .unwrap()
+                        .as_bytes()
+                );
+                assert_eq!(
+                    binding.claim().ordered(),
+                    second_certificate.claim().ordered()
+                );
+                assert_eq!(host.journal_position(agent).unwrap(), acknowledged.0);
+            }
+            drop(hosts);
+            hosts = (0..keys.len())
+                .map(|index| {
+                    let mut host = open(index, true).unwrap();
+                    assert_eq!(
+                        host.common_snapshot_authority_for_test(agent)
+                            .unwrap()
+                            .unwrap()
+                            .0,
+                        second_certificate
+                    );
+                    assert_eq!(host.journal_position(agent).unwrap(), acknowledged.0);
+                    Arc::new(std::sync::Mutex::new(host))
+                })
+                .collect();
+            for host in &hosts {
+                let mut host = host.lock().unwrap();
+                let proof = host
+                    .inspect_external_retained_reply(agent, &ack_request)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(proof.outcome(), &acknowledgement);
+                assert_eq!(proof.claim(), second_certificate.claim().ordered());
+                assert!(
+                    host.inspect_external_retained_reply(agent, &retained_request)
+                        .is_err(),
+                    "retired Invoke must not be mistaken for unseen work"
+                );
+            }
+            attached = attach(&hosts);
+            assert_eq!(
+                external_network_on_leader(&attached, agent, |owner| {
+                    owner.supervisor_acknowledge(
+                        identity,
+                        retained_work.clone(),
+                        retained_authorization.clone(),
+                    )
+                }),
+                acknowledgement,
+                "exact expired ACK must retain its complete positive outcome after a second checkpoint"
+            );
+            let mut refused = None;
+            assert!(
+                wait_until(std::time::Duration::from_secs(30), || {
+                    let Some(owner) = attached
+                        .iter()
+                        .find(|owner| owner.bootstrap_is_local_leader(agent).unwrap_or(false))
+                    else {
+                        return false;
+                    };
+                    match owner.supervisor_invoke(
+                        identity,
+                        retained_work.clone(),
+                        retained_authorization.clone(),
+                    ) {
+                        Err(SharedAgentHostError::Unavailable) => false,
+                        result => {
+                            refused = Some(result);
+                            true
+                        }
+                    }
+                }),
+                "retired Invoke must reach a terminal refusal, not merely remain unavailable"
+            );
+            assert!(matches!(
+                refused.unwrap(),
+                Err(_) | Ok(RuntimeOutcome::Completed(Err(_)))
+            ));
+            for host in &hosts {
+                assert_eq!(
+                    host.lock().unwrap().journal_position(agent).unwrap(),
+                    acknowledged.0,
+                    "exact ACK retry and retired Invoke must not append slots"
+                );
+            }
+            drop(attached);
+            drop(hosts);
+            for network in networks.into_iter().skip(1) {
+                stop_network(network);
+            }
+            return;
+        }
+        attached = attach(&hosts);
+        let (continued_work, continued_authorization) = clerk_call(
+            "state_root",
+            Vec::new(),
+            MethodMode::LinearizableQuery,
+            member,
+            0xec,
+        );
+        let continued_input = crate::agent::journal::ReplayInput {
+            runtime: provision.proposal().create().runtime.clone(),
+            operation: ReplayOperation::CleanInvoke {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                work: continued_work.clone(),
+                authorization: continued_authorization.clone(),
+                observed_slot: material.observed_slot,
+            },
+        }
+        .id();
+        let continued_ack = crate::agent::journal::ReplayInput {
+            runtime: provision.proposal().create().runtime.clone(),
+            operation: ReplayOperation::CleanAcknowledge {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                expected_live: None,
+                work: crate::agent_sdk::InvocationRetirement::from_work(&continued_work),
+                authorization: continued_authorization.clone(),
+            },
+        }
+        .id();
+        let continued = external_network_on_leader(&attached, agent, |owner| {
+            owner.supervisor_invoke(
+                identity,
+                continued_work.clone(),
+                continued_authorization.clone(),
+            )
+        });
+        let RuntimeOutcome::Completed(Ok(reply)) = continued else {
+            panic!("external post-checkpoint Clerk invocation: {continued:?}");
+        };
+        assert_eq!(
+            Value::decode(&reply.reply),
+            Value::Bytes(reference.root().to_vec())
+        );
+        assert!(matches!(
+            external_network_on_leader(&attached, agent, |owner| {
+                owner.supervisor_acknowledge(
+                    identity,
+                    continued_work.clone(),
+                    continued_authorization.clone(),
+                )
+            }),
+            RuntimeOutcome::Acknowledged(Ok(_))
+        ));
+        let mut continued_claims = None;
+        assert!(
+            wait_until(std::time::Duration::from_secs(15), || {
+                let Some(states) = hosts
+                    .iter()
+                    .map(|host| {
+                        let mut host = host.lock().unwrap();
+                        if !host
+                            .retained_positive_clean_acknowledgement(
+                                agent,
+                                &continued_work,
+                                &continued_authorization,
+                            )
+                            .ok()?
+                        {
+                            return None;
+                        }
+                        Some((
+                            host.journal_position(agent).ok()?,
+                            host.available_ordered_claim(agent, continued_input).ok()?,
+                            host.available_ordered_claim(agent, continued_ack).ok()?,
+                        ))
+                    })
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    return false;
+                };
+                if states.iter().all(|state| state == &states[0])
+                    && states[0].0.ordered_index == completed.0.ordered_index + 2
+                {
+                    continued_claims = Some(states[0].clone());
+                    true
+                } else {
+                    false
+                }
+            }),
+            "fresh post-checkpoint Invoke/ACK must converge on complete replica claims"
+        );
+        let continued_claims = continued_claims.unwrap();
+        drop(attached);
+        drop(hosts);
+        for index in 0..keys.len() {
+            let mut host = open(index, true).unwrap();
+            assert_eq!(
+                host.common_snapshot_authority_for_test(agent)
+                    .unwrap()
+                    .unwrap()
+                    .0,
+                certificate
+            );
+            assert_eq!(
+                (
+                    host.journal_position(agent).unwrap(),
+                    host.available_ordered_claim(agent, continued_input)
+                        .unwrap(),
+                    host.available_ordered_claim(agent, continued_ack).unwrap()
+                ),
+                continued_claims
+            );
+        }
+        for network in networks.into_iter().skip(1) {
+            stop_network(network);
+        }
+        return;
+    }
     drop(attached);
     drop(hosts);
     for index in 0..keys.len() {
@@ -1582,6 +2557,43 @@ fn external_network_lifecycle(
     for network in networks.into_iter().skip(1) {
         stop_network(network);
     }
+}
+
+fn external_current_root_block(host: &mut SharedAgentHost, agent: HostAgentId) -> String {
+    let lanes = host.external_inspection_lanes_for_test(agent).unwrap();
+    assert_eq!(
+        lanes.len(),
+        1,
+        "this fixture admits only external Linear state"
+    );
+    let descriptor = lanes[0].base;
+    let block = descriptor
+        .bind(descriptor.context(), descriptor.commitment())
+        .unwrap()
+        .root()
+        .unwrap();
+    block
+        .hash()
+        .0
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn external_freeze_checkpoint_workers(
+    attached: &mut [crate::network::SharedAgentNetworkHost],
+    agent: HostAgentId,
+    source: usize,
+) {
+    for owner in attached.iter() {
+        owner.set_raft_isolated_for_test(agent, true).unwrap();
+    }
+    for (index, owner) in attached.iter_mut().enumerate() {
+        if index != source {
+            owner.retire_attachment_for_test(agent).unwrap();
+        }
+    }
+    attached[source].retire_attachment_for_test(agent).unwrap();
 }
 
 fn external_network_on_leader(

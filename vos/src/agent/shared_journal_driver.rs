@@ -202,6 +202,57 @@ where
     }
 }
 
+/// Select external checkpoint authority only from the independently audited
+/// paired ledger. A bare external genesis still admits its initial checkpoint
+/// only; persisted later roots cannot select their own recovery authority.
+#[cfg(feature = "experimental-state-blocks")]
+fn materialize_external_shared_current<S, E>(
+    store: &mut S,
+    executor: &mut E,
+    ledger: &AgentRaftApplicationLedgerV2,
+    genesis: &super::replay::ReplaySealedExternalGenesis,
+    budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+) -> Result<
+    (
+        ReplayMaterialization,
+        super::replay::SharedExternalAvailability,
+    ),
+    SharedJournalDriverError,
+>
+where
+    S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
+    E: ReplayExecutor<Error = LocalReplayExecutorError>,
+{
+    let heads = store.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+    if let Some((certificate, binding)) = ledger.common_snapshot_authority()? {
+        let validated = super::replay::validate_external_common_checkpoint_head(
+            store,
+            genesis,
+            &heads,
+            executor,
+            &NoPrunedOrderedBases,
+            &certificate,
+            &binding,
+            budget,
+        )?;
+        validated
+            .into_external_common_shared_availability(store, genesis, &certificate, &binding)
+            .map_err(Into::into)
+    } else {
+        let validated = super::replay::validate_external_genesis_head(
+            store,
+            genesis,
+            &heads,
+            executor,
+            &NoPrunedOrderedBases,
+            budget,
+        )?;
+        validated
+            .into_shared_availability(store, genesis)
+            .map_err(Into::into)
+    }
+}
+
 #[cfg(feature = "experimental-state-blocks")]
 const EXTERNAL_OPERATION_FETCHES: u32 = 10_000;
 #[cfg(feature = "experimental-state-blocks")]
@@ -216,8 +267,8 @@ fn external_recovery_limits() -> (u32, u64) {
     // Genesis starts from empty roots, so every tree node is emitted in one
     // bounded change. Chunk references may repeat across leaves, requiring up
     // to a full maximum value read per emitted node. Reserve two base audits.
-    // Shared external compaction/import is closed and the pin requires this
-    // exact genesis checkpoint, never a later arbitrary root.
+    // Common external checkpoints additionally require a separately audited
+    // ledger certificate and local binding; raw genesis opens stay initial-only.
     let chunks =
         state_tree::MAX_TREE_VALUE_BYTES.div_ceil(state_blocks::MAX_STATE_BLOCK_BYTES) as u32;
     let genesis_fetches = 2 * blocks * (1 + chunks);
@@ -237,6 +288,108 @@ pub(crate) struct VerifiedSharedOrderedAvailability {
     _store: super::shared_raft::JournalStoreInstanceId,
     _epoch: u64,
     _claim: OrderedCommitClaim,
+}
+
+/// Exact retained guest disposition inspected at the current authenticated
+/// external head. This is deliberately not a historical replay-input token or
+/// a transferable quorum certificate. Peer I/O requires fresh revalidation by
+/// this same live physical owner before its outcome may be delivered.
+#[cfg(feature = "experimental-state-blocks")]
+pub(crate) struct RetainedExternalReplyProof {
+    store: super::shared_raft::JournalStoreInstanceId,
+    epoch: u64,
+    heads: super::journal::JournalHeadsId,
+    inspection_slot: u64,
+    acknowledge: bool,
+    retirement: crate::agent_sdk::Hash,
+    authorization: crate::agent_sdk::Hash,
+    claim: OrderedCommitClaim,
+    outcome: crate::agent_sdk::RuntimeOutcome,
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+impl RetainedExternalReplyProof {
+    pub(crate) const fn claim(&self) -> &OrderedCommitClaim {
+        &self.claim
+    }
+
+    pub(crate) const fn outcome(&self) -> &crate::agent_sdk::RuntimeOutcome {
+        &self.outcome
+    }
+
+    pub(crate) const fn heads(&self) -> super::journal::JournalHeadsId {
+        self.heads
+    }
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+fn retained_external_request_kind(request: &CleanInvocationReplayRequest) -> Option<bool> {
+    use crate::agent_sdk::{InvocationAuthorization, MethodMode, RuntimeExecutionContext};
+    if !matches!(
+        request.work().mode,
+        MethodMode::Linear | MethodMode::LinearizableQuery
+    ) || !matches!(
+        request.authorization(),
+        InvocationAuthorization::AuthorityReceipt(_)
+    ) {
+        return None;
+    }
+    match request {
+        CleanInvocationReplayRequest::Invoke {
+            context: RuntimeExecutionContext::Direct,
+            ..
+        } => Some(false),
+        CleanInvocationReplayRequest::Acknowledge { .. } => Some(true),
+        _ => None,
+    }
+}
+
+/// Only the guest's explicit absent result can fall back to fresh admission.
+/// A retained result on ACK still needs a real Ordered retirement; an already
+/// acknowledged Invoke must never be rerun as unseen application work.
+#[cfg(feature = "experimental-state-blocks")]
+fn retained_external_reply_outcome(
+    retirement: &crate::agent_sdk::InvocationRetirement,
+    authorization: crate::agent_sdk::Hash,
+    acknowledge: bool,
+    outcome: crate::agent_sdk::RuntimeOutcome,
+) -> Result<Option<crate::agent_sdk::RuntimeOutcome>, SharedJournalDriverError> {
+    use crate::agent_sdk::{InvocationError, RuntimeOutcome};
+    let invalid = || SharedJournalDriverError::Executor(LocalReplayExecutorError::InvalidRequest);
+    match &outcome {
+        RuntimeOutcome::Completed(Err(InvocationError::NotReady)) => Ok(None),
+        RuntimeOutcome::Completed(Ok(reply))
+            if reply.invocation == retirement.invocation
+                && reply.actor == retirement.actor
+                && reply.incarnation == retirement.incarnation
+                && reply.deployment == retirement.deployment
+                && reply.mode == retirement.mode
+                && reply.lane == retirement.mode.write_lane()
+                && reply.gas_remaining <= retirement.gas =>
+        {
+            Ok((!acknowledge).then_some(outcome))
+        }
+        RuntimeOutcome::Completed(Err(error)) if error.is_durable_exact_outcome() => {
+            Ok((!acknowledge).then_some(outcome))
+        }
+        RuntimeOutcome::Acknowledged(Ok(reply))
+            if reply.validate()
+                && reply.invocation == retirement.invocation
+                && reply.actor == retirement.actor
+                && reply.incarnation == retirement.incarnation
+                && reply.deployment == retirement.deployment
+                && reply.mode == retirement.mode
+                && reply.work == retirement.commitment()
+                && reply.authorization == authorization =>
+        {
+            if acknowledge {
+                Ok(Some(outcome))
+            } else {
+                Err(invalid())
+            }
+        }
+        _ => Err(invalid()),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1258,17 +1411,13 @@ where
         report_phase("executor_setup");
         #[cfg(feature = "experimental-state-blocks")]
         let (materialization, external) = if let Some(genesis) = external_genesis {
-            let heads = store.heads()?.ok_or(JournalStoreError::NotInitialized)?;
-            let validated = super::replay::validate_external_genesis_head(
+            let (materialization, availability) = materialize_external_shared_current(
                 &mut store,
-                &genesis,
-                &heads,
                 &mut executor,
-                &NoPrunedOrderedBases,
+                &ledger,
+                &genesis,
                 &mut Self::external_recovery_budget(),
             )?;
-            let (materialization, availability) =
-                validated.into_shared_availability(&store, &genesis)?;
             (
                 materialization,
                 Some(SharedExternalOwner {
@@ -1324,18 +1473,36 @@ where
         let audit = ledger.journal_audit()?;
         report_phase("profile_and_ledger_audit");
         if let Some(snapshot) = &audit.snapshot {
-            validate_published_shared_checkpoint(&store, &materialization, &snapshot.claim)
-                .map_err(|error| {
-                    tracing::warn!(
-                        ?error,
-                        checkpoint_matches =
-                            materialization.heads().checkpoint == Some(snapshot.claim.checkpoint()),
-                        current_ordered_index = materialization.heads().ordered_index,
-                        snapshot_ordered_index = snapshot.claim.ordered().ordered().index,
-                        "Shared journal open checkpoint validation failed"
-                    );
-                    SharedJournalDriverError::CrossStoreMismatch
-                })?;
+            #[cfg(feature = "experimental-state-blocks")]
+            let validated = if let Some(external) = &external {
+                super::replay::validate_published_external_shared_checkpoint(
+                    &mut store,
+                    &materialization,
+                    &snapshot.claim,
+                    &external.genesis,
+                    &external.availability,
+                    &mut Self::external_recovery_budget(),
+                )
+                .map_err(SharedJournalDriverError::from)
+            } else {
+                validate_published_shared_checkpoint(&store, &materialization, &snapshot.claim)
+                    .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)
+            };
+            #[cfg(not(feature = "experimental-state-blocks"))]
+            let validated =
+                validate_published_shared_checkpoint(&store, &materialization, &snapshot.claim)
+                    .map_err(|_| SharedJournalDriverError::CrossStoreMismatch);
+            validated.map_err(|error| {
+                tracing::warn!(
+                    ?error,
+                    checkpoint_matches =
+                        materialization.heads().checkpoint == Some(snapshot.claim.checkpoint()),
+                    current_ordered_index = materialization.heads().ordered_index,
+                    snapshot_ordered_index = snapshot.claim.ordered().ordered().index,
+                    "Shared journal open checkpoint validation failed"
+                );
+                SharedJournalDriverError::CrossStoreMismatch
+            })?;
         }
         report_phase("published_checkpoint_validation");
         reconcile_journal_ledger(&store, &materialization, ledger.journal_store(), &audit)
@@ -1468,39 +1635,28 @@ where
         let setup_us = started.elapsed().as_micros() as u64;
         let materialize_started = std::time::Instant::now();
         #[cfg(feature = "experimental-state-blocks")]
-        let recovered = if let Some(external) = &self.external {
-            let heads = self
-                .store
-                .heads()?
-                .ok_or(JournalStoreError::NotInitialized)?;
-            super::replay::validate_external_genesis_head(
+        let (recovered, recovered_availability) = if let Some(external) = &self.external {
+            let recovered = materialize_external_shared_current(
                 &mut self.store,
-                &external.genesis,
-                &heads,
                 &mut executor,
-                &NoPrunedOrderedBases,
+                &self.ledger,
+                &external.genesis,
                 &mut Self::external_recovery_budget(),
-            )
-            .map_err(|error| {
-                MaterializeError::Source(super::replay::ReplayMaterializationSourceError::Journal(
-                    error,
-                ))
-            })
-            .and_then(|validated| {
-                validated
-                    .into_shared_availability(&self.store, &external.genesis)
-                    .map(|(recovered, _)| recovered)
-                    .map_err(|error| {
-                        MaterializeError::Source(
-                            super::replay::ReplayMaterializationSourceError::Journal(error),
-                        )
-                    })
-            })
+            );
+            match recovered {
+                Ok((recovered, availability)) => (Ok(recovered), Some(availability)),
+                Err(error) => (Err(error), None),
+            }
         } else {
-            materialize_shared_image(&mut self.store, &mut executor, &self.ledger)
+            (
+                materialize_shared_image(&mut self.store, &mut executor, &self.ledger)
+                    .map_err(SharedJournalDriverError::from),
+                None,
+            )
         };
         #[cfg(not(feature = "experimental-state-blocks"))]
-        let recovered = materialize_shared_image(&mut self.store, &mut executor, &self.ledger);
+        let recovered = materialize_shared_image(&mut self.store, &mut executor, &self.ledger)
+            .map_err(SharedJournalDriverError::from);
         tracing::debug!(
             setup_us,
             materialize_us = materialize_started.elapsed().as_micros() as u64,
@@ -1517,6 +1673,23 @@ where
         validate_replayed_recovery(&self.ledger, &executor)?;
         let audit = self.ledger.journal_audit()?;
         if let Some(snapshot) = &audit.snapshot {
+            #[cfg(feature = "experimental-state-blocks")]
+            if let Some(external) = &self.external {
+                super::replay::validate_published_external_shared_checkpoint(
+                    &mut self.store,
+                    &recovered,
+                    &snapshot.claim,
+                    &external.genesis,
+                    recovered_availability
+                        .as_ref()
+                        .ok_or(SharedJournalDriverError::CrossStoreMismatch)?,
+                    &mut Self::external_recovery_budget(),
+                )?;
+            } else {
+                validate_published_shared_checkpoint(&self.store, &recovered, &snapshot.claim)
+                    .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+            }
+            #[cfg(not(feature = "experimental-state-blocks"))]
             validate_published_shared_checkpoint(&self.store, &recovered, &snapshot.claim)
                 .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
         }
@@ -3152,6 +3325,100 @@ where
             .map_err(Into::into)
     }
 
+    /// Inspect only retained acceptance at this current head. The guest owns
+    /// the original authorization/time checks; the host supplies its trusted
+    /// inspection clock, never a caller-selected acceptance slot. No Invoke,
+    /// fake historical input, state publication, or original actor gas runs.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn inspect_external_retained_reply(
+        &self,
+        request: &CleanInvocationReplayRequest,
+    ) -> Result<Option<RetainedExternalReplyProof>, SharedJournalDriverError> {
+        if self.external.is_none() {
+            return Ok(None);
+        }
+        let Some(acknowledge) = retained_external_request_kind(request) else {
+            return Ok(None);
+        };
+        let retirement = crate::agent_sdk::InvocationRetirement::from_work(request.work());
+        if !retirement.validate()
+            || retirement.gas > super::execution::MAX_EXECUTION_GAS
+            || !request.authorization().matches_retirement(&retirement)
+        {
+            return Err(LocalReplayExecutorError::InvalidRequest.into());
+        }
+        let claim = self.current_external_ordered_claim()?;
+        let heads = self.materialization.heads_id();
+        let authorization = request.authorization().commitment();
+        let inspection_slot = self.executor.current_logical_slot()?;
+        let transition =
+            self.execute_external_work(crate::agent_sdk::RuntimeWork::InspectInvocation {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                state: super::replay::sdk_runtime_state(self.materialization.state()),
+                invocation: Box::new(retirement.clone()),
+                authorization: Box::new(request.authorization().clone()),
+                observed_slot: inspection_slot,
+            })?;
+        let Some(outcome) = retained_external_reply_outcome(
+            &retirement,
+            authorization,
+            acknowledge,
+            transition.outcome,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(RetainedExternalReplyProof {
+            store: self.store.instance_id(),
+            epoch: self.store.validation_epoch(),
+            heads,
+            inspection_slot,
+            acknowledge,
+            retirement: retirement.commitment(),
+            authorization,
+            claim,
+            outcome,
+        }))
+    }
+
+    /// Revalidate the opaque local proof after quorum I/O. An evolved head,
+    /// reopened owner, changed lifecycle stage, or substituted authorization
+    /// is a refusal, never permission to deliver a stale result or rerun it.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn revalidate_external_retained_reply(
+        &self,
+        request: &CleanInvocationReplayRequest,
+        proof: &RetainedExternalReplyProof,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedJournalDriverError> {
+        let retirement = crate::agent_sdk::InvocationRetirement::from_work(request.work());
+        if retained_external_request_kind(request) != Some(proof.acknowledge)
+            || !retirement.validate()
+            || retirement.gas > super::execution::MAX_EXECUTION_GAS
+            || !request.authorization().matches_retirement(&retirement)
+            || proof.retirement != retirement.commitment()
+            || proof.authorization != request.authorization().commitment()
+        {
+            return Err(LocalReplayExecutorError::InvalidRequest.into());
+        }
+        if proof.store != self.store.instance_id()
+            || proof.epoch != self.store.validation_epoch()
+            || proof.heads != self.materialization.heads_id()
+            || self.current_external_ordered_claim()? != proof.claim
+            || self.executor.current_logical_slot()? < proof.inspection_slot
+        {
+            // A legitimate head/owner advance or clock regression during peer
+            // I/O requires fresh inspection, not a corruption disposition.
+            return Err(JournalStoreError::Unavailable.into());
+        }
+        retained_external_reply_outcome(
+            &retirement,
+            proof.authorization,
+            proof.acknowledge,
+            proof.outcome.clone(),
+        )?
+        .ok_or(SharedJournalDriverError::CrossStoreMismatch)
+    }
+
     #[cfg(feature = "experimental-state-blocks")]
     fn execute_external_work(
         &self,
@@ -4686,6 +4953,146 @@ where
         Ok((claim.clone(), entry))
     }
 
+    /// Authenticate a strict current external projection, not a retained old
+    /// anchor with merely smaller indexes. The per-open pin supplies physical
+    /// root availability; this check binds its exact state to either the
+    /// installed common QC/local binding or an actually applied current row.
+    #[cfg(feature = "experimental-state-blocks")]
+    fn current_external_ordered_claim(
+        &self,
+    ) -> Result<OrderedCommitClaim, SharedJournalDriverError> {
+        let owner = self
+            .external
+            .as_ref()
+            .ok_or(SharedJournalDriverError::InvalidProfile)?;
+        let validate = || {
+            owner
+                .availability
+                .require_current(&self.store, &self.materialization)?;
+            let claim = self.snapshot_boundary_claim()?;
+            let heads = self.materialization.heads();
+            let committee = self.ledger.active_committee()?;
+            if self.store.instance_id() != self.ledger.journal_store()
+                || claim.genesis() != owner.genesis.genesis().id()
+                || claim.genesis() != heads.genesis
+                || claim.admission() != heads.admission
+                || claim.space() != heads.runtime.space
+                || claim.agent() != heads.runtime.agent
+                || claim.runtime() != self.materialization.runtime()
+                || claim.committee() != committee.id()
+                || claim.ordered() != self.materialization.ordered_base()
+                || claim.merge_frontier() != heads.merge_frontier
+                || claim.merge_fence() != heads.merge_fence
+                || claim.merge_seal() != heads.merge_seal
+                || claim.ordered_invocations() != heads.ordered_invocations
+                || claim.merge_invocations() != heads.merge_invocations
+                || claim.artifacts() != self.materialization.artifacts().id()
+            {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+            for (lane, projection) in [
+                (PersistedLane::Control, claim.control()),
+                (PersistedLane::Linear, claim.linear()),
+                (PersistedLane::Merge, claim.merge()),
+            ] {
+                let bytes = super::replay::state_component(self.materialization.state(), lane);
+                let manifest = self
+                    .materialization
+                    .checkpoint_lane(owner.genesis.genesis(), lane, bytes)
+                    .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+                if manifest.id() != projection.manifest() {
+                    return Err(SharedJournalDriverError::CrossStoreMismatch);
+                }
+                projection.verify_state(bytes)?;
+            }
+            if let Some((certificate, binding)) = self.ledger.common_snapshot_authority()?
+                && certificate.claim().ordered() == &claim
+            {
+                certificate.verify(&committee, certificate.claim())?;
+                let physical = binding.claim();
+                binding.verify(&certificate, physical)?;
+                let local = self
+                    .materialization
+                    .checkpoint_lane(
+                        owner.genesis.genesis(),
+                        PersistedLane::Local,
+                        &self.materialization.state().local,
+                    )
+                    .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+                if physical.journal_store().0 != *self.store.instance_id().as_bytes()
+                    || physical.local_node() != heads.node
+                    || physical.journal_heads() != self.materialization.heads_id()
+                    || Some(physical.checkpoint()) != self.materialization.common_checkpoint()
+                    || claim.ordered() != self.materialization.replay_boundary()
+                    || physical.local_invocations() != heads.local_invocations
+                    || physical.local() != local.id()
+                {
+                    return Err(SharedJournalDriverError::CrossStoreMismatch);
+                }
+                return Ok(claim);
+            }
+            let anchor = self
+                .ledger
+                .ordered_anchor(claim.raft_index())?
+                .filter(|anchor| {
+                    anchor.term == claim.raft_term()
+                        && anchor.claim == claim.commitment()
+                        && Some(anchor.entry) == heads.ordered_head
+                })
+                .ok_or(JournalStoreError::Unavailable)?;
+            let entry = self
+                .store
+                .get::<OrderedEntry>(anchor.entry)?
+                .ok_or(JournalStoreError::Unavailable)?;
+            let mut chain = BTreeMap::new();
+            chain.insert(anchor.entry, entry);
+            validate_ordered_anchor(&self.store, &chain, self.ledger.journal_store(), &anchor)?;
+            let binding = self
+                .store
+                .shared_ordered_commit(anchor.entry)?
+                .ok_or(JournalStoreError::Unavailable)?;
+            if binding.claim() != &claim {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+            Ok(claim)
+        };
+        // These inputs all originate in this pinned owner, not a peer's
+        // requested claim. Missing/corrupt physical metadata cannot leave its
+        // cached root-availability capability usable after a failed audit.
+        let result = validate();
+        if result.is_err() {
+            owner.availability.invalidate();
+        }
+        result
+    }
+
+    /// Distinct from historical availability: attest only this exact current
+    /// pinned state. A larger applied cursor or an available past claim is not
+    /// evidence that peers hold the root used by a retained-result inspection.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn verify_current_ordered_availability(
+        &self,
+        index: u64,
+        term: u64,
+        claim: Hash,
+    ) -> Result<VerifiedSharedOrderedAvailability, SharedJournalDriverError> {
+        if index == 0 || term == 0 || claim == Hash::ZERO {
+            return Err(JournalStoreError::Unavailable.into());
+        }
+        let current = self.current_external_ordered_claim()?;
+        if current.raft_index() != index
+            || current.raft_term() != term
+            || current.commitment() != claim
+        {
+            return Err(JournalStoreError::Unavailable.into());
+        }
+        Ok(VerifiedSharedOrderedAvailability {
+            _store: self.store.instance_id(),
+            _epoch: self.store.validation_epoch(),
+            _claim: current,
+        })
+    }
+
     /// Acknowledge only an exact V2 anchor from this generation and physical
     /// store. External state additionally requires the per-open audited pin;
     /// every later publication extends it only after durable closure writes.
@@ -4809,12 +5216,38 @@ where
         ),
         SharedJournalDriverError,
     > {
-        // Historical external availability currently pins the entire verified
-        // suffix. Compaction requires a separate complete root pinning proof.
+        // External roots are admitted only by the paired common certificate
+        // path, never by the Agent-specific image checkpoint interface.
         #[cfg(feature = "experimental-state-blocks")]
         if self.external.is_some() {
             return Err(JournalStoreError::Unavailable.into());
         }
+        self.prepare_snapshot_candidate_inner()
+    }
+
+    fn prepare_common_snapshot_candidate(
+        &mut self,
+        initial: &RuntimeState,
+    ) -> Result<
+        (
+            super::replay::PreparedSharedCheckpoint,
+            SharedAgentSnapshotClaim,
+        ),
+        SharedJournalDriverError,
+    > {
+        self.require_common_snapshot_profile(initial)?;
+        self.prepare_snapshot_candidate_inner()
+    }
+
+    fn prepare_snapshot_candidate_inner(
+        &mut self,
+    ) -> Result<
+        (
+            super::replay::PreparedSharedCheckpoint,
+            SharedAgentSnapshotClaim,
+        ),
+        SharedJournalDriverError,
+    > {
         let heads = self.materialization.heads();
         let entry = heads.ordered_head.ok_or(SharedJournalDriverError::Ledger(
             AgentRaftApplicationErrorV2::SnapshotBoundaryRequired,
@@ -4828,6 +5261,17 @@ where
         })?;
         let plan = prepare_shared_checkpoint(&mut self.store, &self.materialization)
             .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        #[cfg(feature = "experimental-state-blocks")]
+        let plan = if let Some(external) = &self.external {
+            plan.audit_external_shared(
+                &mut self.store,
+                &external.genesis,
+                &external.availability,
+                &mut Self::external_recovery_budget(),
+            )?
+        } else {
+            plan
+        };
         let (control, linear, merge, local) = plan
             .lane_roots()
             .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
@@ -4882,12 +5326,7 @@ where
         ),
         SharedJournalDriverError,
     > {
-        super::replay::validate_common_checkpoint_profile(
-            &self.store,
-            &self.materialization,
-            initial,
-        )?;
-        let (plan, physical) = self.prepare_snapshot_candidate()?;
+        let (plan, physical) = self.prepare_common_snapshot_candidate(initial)?;
         plan.validate_common_claim(&physical)?;
         let mut common = SharedAgentCommonSnapshotClaim::new(
             physical.ordered().clone(),
@@ -4905,12 +5344,66 @@ where
         &self,
         initial: &RuntimeState,
     ) -> Result<(), SharedJournalDriverError> {
+        #[cfg(feature = "experimental-state-blocks")]
+        if let Some(external) = &self.external {
+            if initial != external.genesis.post_create()
+                || !super::replay::validates_shared_create_committee(
+                    &external.genesis.genesis().create,
+                    &self.ledger.active_committee()?,
+                )
+            {
+                return Err(SharedJournalDriverError::InvalidProfile);
+            }
+            external
+                .availability
+                .require_current(&self.store, &self.materialization)?;
+            return super::replay::validate_external_common_checkpoint_profile(
+                &self.store,
+                &self.materialization,
+                &external.genesis,
+            )
+            .map_err(|error| {
+                // Physical profile metadata is part of the serving closure.
+                // A failed read must revoke the pin before candidate staging,
+                // just as the subsequent external root audit does.
+                if matches!(
+                    error,
+                    JournalStoreError::MissingObject
+                        | JournalStoreError::Corrupt
+                        | JournalStoreError::Unavailable
+                        | JournalStoreError::NonCanonical
+                ) {
+                    external.availability.invalidate();
+                }
+                error.into()
+            });
+        }
         super::replay::validate_common_checkpoint_profile(
             &self.store,
             &self.materialization,
             initial,
         )
         .map_err(Into::into)
+    }
+
+    fn validate_published_snapshot(
+        &mut self,
+        claim: &SharedAgentSnapshotClaim,
+    ) -> Result<(), SharedJournalDriverError> {
+        #[cfg(feature = "experimental-state-blocks")]
+        if let Some(external) = &self.external {
+            return super::replay::validate_published_external_shared_checkpoint(
+                &mut self.store,
+                &self.materialization,
+                claim,
+                &external.genesis,
+                &external.availability,
+                &mut Self::external_recovery_budget(),
+            )
+            .map_err(Into::into);
+        }
+        validate_published_shared_checkpoint(&self.store, &self.materialization, claim)
+            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)
     }
 
     pub(crate) fn install_common_snapshot(
@@ -4939,21 +5432,12 @@ where
         initial: &RuntimeState,
         stop_after_journal: bool,
     ) -> Result<InstalledAgentRaftSnapshotV2, SharedJournalDriverError> {
-        super::replay::validate_common_checkpoint_profile(
-            &self.store,
-            &self.materialization,
-            initial,
-        )?;
+        self.require_common_snapshot_profile(initial)?;
         if let Some(installed) = self.ledger.current_snapshot()?
             && installed.certificate_commitment == binding.commitment()
         {
             binding.verify(certificate, &installed.claim)?;
-            validate_published_shared_checkpoint(
-                &self.store,
-                &self.materialization,
-                &installed.claim,
-            )
-            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+            self.validate_published_snapshot(&installed.claim)?;
             return self
                 .ledger
                 .install_common_snapshot(certificate, binding, None)
@@ -4969,18 +5453,27 @@ where
         if self.materialization.heads_id() == binding.claim().journal_heads() {
             // Journal-first recovery may only complete the exact signed local
             // binding, never reconstruct a different successor checkpoint.
-            validate_published_shared_checkpoint(
-                &self.store,
-                &self.materialization,
-                binding.claim(),
-            )
-            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+            self.validate_published_snapshot(binding.claim())?;
             binding.verify(certificate, binding.claim())?;
         } else {
-            let (plan, expected) = self.prepare_snapshot_candidate()?;
+            let (plan, expected) = self.prepare_common_snapshot_candidate(initial)?;
             plan.validate_common_claim(&expected)?;
             let verified = binding.verify(certificate, &expected)?;
-            self.materialization = plan.publish_shared(&mut self.store, &verified)?;
+            #[cfg(feature = "experimental-state-blocks")]
+            let published = if let Some(external) = &mut self.external {
+                plan.publish_external_shared(
+                    &mut self.store,
+                    &verified,
+                    &external.genesis,
+                    &mut external.availability,
+                    &mut Self::external_recovery_budget(),
+                )?
+            } else {
+                plan.publish_shared(&mut self.store, &verified)?
+            };
+            #[cfg(not(feature = "experimental-state-blocks"))]
+            let published = plan.publish_shared(&mut self.store, &verified)?;
+            self.materialization = published;
         }
         super::replay::seed_common_checkpoint_ancestry(
             &mut self.materialization,
@@ -6268,6 +6761,215 @@ fn validate_pending_binding(
         return Err(SharedJournalDriverError::CrossStoreMismatch);
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "experimental-state-blocks"))]
+mod retained_external_reply_tests {
+    use super::retained_external_reply_outcome;
+    use crate::agent_sdk::{
+        Hash, InvocationAcknowledgement, InvocationError, InvocationObservation, InvocationReply,
+        InvocationRetirement, InvocationStatus, MethodMode, RuntimeOutcome,
+    };
+
+    fn fixture() -> (
+        InvocationRetirement,
+        Hash,
+        InvocationReply,
+        InvocationAcknowledgement,
+    ) {
+        let registration = super::super::shared_recovery::recovery_registration_for_test(1, 7);
+        let mut retirement = InvocationRetirement::from_work(registration.request().work());
+        retirement.mode = MethodMode::Linear;
+        assert!(retirement.validate());
+        let authorization = Hash([0x93; 32]);
+        let reply = InvocationReply {
+            invocation: retirement.invocation,
+            actor: retirement.actor,
+            incarnation: retirement.incarnation,
+            deployment: retirement.deployment,
+            mode: retirement.mode,
+            lane: retirement.mode.write_lane(),
+            status: InvocationStatus::Done,
+            reply: vec![1, 2, 3],
+            gas_remaining: retirement.gas,
+            observation: InvocationObservation::default(),
+        };
+        let acknowledgement = InvocationAcknowledgement {
+            invocation: retirement.invocation,
+            actor: retirement.actor,
+            incarnation: retirement.incarnation,
+            deployment: retirement.deployment,
+            mode: retirement.mode,
+            work: retirement.commitment(),
+            authorization,
+        };
+        (retirement, authorization, reply, acknowledgement)
+    }
+
+    #[test]
+    fn absence_is_distinct_from_retained_terminal_failure() {
+        let (retirement, authorization, _, _) = fixture();
+        for acknowledge in [false, true] {
+            assert!(
+                retained_external_reply_outcome(
+                    &retirement,
+                    authorization,
+                    acknowledge,
+                    RuntimeOutcome::Completed(Err(InvocationError::NotReady)),
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+        let retained = RuntimeOutcome::Completed(Err(InvocationError::NotFound));
+        assert_eq!(
+            retained_external_reply_outcome(&retirement, authorization, false, retained.clone())
+                .unwrap(),
+            Some(retained.clone()),
+        );
+        assert!(
+            retained_external_reply_outcome(&retirement, authorization, true, retained)
+                .unwrap()
+                .is_none(),
+            "a completed failure still requires a real retirement ACK",
+        );
+    }
+
+    #[test]
+    fn retained_complete_invoke_is_exact_and_complete_ack_needs_publication() {
+        let (retirement, authorization, reply, _) = fixture();
+        let retained = RuntimeOutcome::Completed(Ok(reply));
+        assert_eq!(
+            retained_external_reply_outcome(&retirement, authorization, false, retained.clone())
+                .unwrap(),
+            Some(retained.clone()),
+        );
+        assert!(
+            retained_external_reply_outcome(&retirement, authorization, true, retained)
+                .unwrap()
+                .is_none(),
+        );
+    }
+
+    #[test]
+    fn reply_identity_lane_and_original_gas_are_bound() {
+        let (retirement, authorization, reply, _) = fixture();
+        let mut changed = Vec::new();
+        let mut wrong = reply.clone();
+        wrong.actor = crate::agent_sdk::ActorId([0x98; 32]);
+        changed.push(wrong);
+        let mut wrong = reply.clone();
+        wrong.mode = MethodMode::LinearizableQuery;
+        changed.push(wrong);
+        let mut wrong = reply.clone();
+        wrong.lane = None;
+        changed.push(wrong);
+        let mut wrong = reply.clone();
+        wrong.gas_remaining = retirement.gas + 1;
+        changed.push(wrong);
+        for reply in changed {
+            for acknowledge in [false, true] {
+                assert!(
+                    retained_external_reply_outcome(
+                        &retirement,
+                        authorization,
+                        acknowledge,
+                        RuntimeOutcome::Completed(Ok(reply.clone())),
+                    )
+                    .is_err(),
+                );
+            }
+        }
+        let mut query = retirement;
+        query.mode = MethodMode::LinearizableQuery;
+        let mut query_reply = reply;
+        query_reply.mode = query.mode;
+        query_reply.lane = None;
+        assert!(
+            retained_external_reply_outcome(
+                &query,
+                authorization,
+                false,
+                RuntimeOutcome::Completed(Ok(query_reply)),
+            )
+            .unwrap()
+            .is_some(),
+        );
+    }
+
+    #[test]
+    fn acknowledged_invoke_cannot_fall_back_to_fresh_execution() {
+        let (retirement, authorization, _, acknowledgement) = fixture();
+        let retained = RuntimeOutcome::Acknowledged(Ok(acknowledgement));
+        assert_eq!(
+            retained_external_reply_outcome(&retirement, authorization, true, retained.clone())
+                .unwrap(),
+            Some(retained.clone()),
+        );
+        assert!(
+            retained_external_reply_outcome(&retirement, authorization, false, retained).is_err(),
+        );
+        let mut changed = acknowledgement;
+        changed.work = Hash([0x94; 32]);
+        assert!(
+            retained_external_reply_outcome(
+                &retirement,
+                authorization,
+                true,
+                RuntimeOutcome::Acknowledged(Ok(changed)),
+            )
+            .is_err(),
+        );
+        let mut changed = acknowledgement;
+        changed.authorization = Hash([0x95; 32]);
+        assert!(
+            retained_external_reply_outcome(
+                &retirement,
+                authorization,
+                true,
+                RuntimeOutcome::Acknowledged(Ok(changed)),
+            )
+            .is_err(),
+        );
+        let mut changed = acknowledgement;
+        changed.actor = crate::agent_sdk::ActorId([0x96; 32]);
+        assert!(
+            retained_external_reply_outcome(
+                &retirement,
+                authorization,
+                true,
+                RuntimeOutcome::Acknowledged(Ok(changed)),
+            )
+            .is_err(),
+        );
+    }
+
+    #[test]
+    fn authorization_and_inspection_errors_are_never_absence() {
+        let (retirement, authorization, _, _) = fixture();
+        for error in [
+            InvocationError::InvalidAuthorization,
+            InvocationError::DivergentInvocation,
+            InvocationError::NotCreated,
+        ] {
+            for acknowledge in [false, true] {
+                for outcome in [
+                    RuntimeOutcome::Completed(Err(error)),
+                    RuntimeOutcome::Acknowledged(Err(error)),
+                ] {
+                    assert!(
+                        retained_external_reply_outcome(
+                            &retirement,
+                            authorization,
+                            acknowledge,
+                            outcome,
+                        )
+                        .is_err(),
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

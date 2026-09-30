@@ -1409,6 +1409,36 @@ impl SharedAgentHost {
     }
 
     #[cfg(test)]
+    pub(crate) fn common_checkpoint_crash_pending_for_test(&self) -> bool {
+        self.common_checkpoint_crash.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn common_checkpoint_install_endpoints_for_test(
+        &mut self,
+        agent: AgentId,
+    ) -> Result<
+        Option<(super::journal::JournalHeads, super::journal::JournalHeads)>,
+        SharedAgentHostError,
+    > {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        let Some(bytes) =
+            read_host_record_pair(&self.portable_restore_path(agent), MAX_COMMON_RESTORE_BYTES)?
+        else {
+            return Ok(None);
+        };
+        let record = CommonInstallRecord::decode(&bytes)
+            .map_err(|_| SharedAgentHostError::CorruptResidue)?;
+        if record.encode() != bytes
+            || record.target.runtime.agent != agent
+            || record.target.node != self.scope().node
+        {
+            return Err(SharedAgentHostError::CorruptResidue);
+        }
+        Ok(Some((record.predecessor, record.target)))
+    }
+
+    #[cfg(test)]
     fn common_checkpoint_crash_at(
         &mut self,
         stage: CommonCheckpointCrashStage,
@@ -3580,6 +3610,60 @@ impl SharedAgentHost {
             .map_err(map_driver_error)
     }
 
+    /// Strict current-root availability is distinct from historical publication
+    /// availability. A newer serving pin cannot attest an older retained root.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn verify_current_ordered_availability(
+        &mut self,
+        agent: AgentId,
+        index: u64,
+        term: u64,
+        claim: crate::service::Hash,
+    ) -> Result<(), SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .verify_current_ordered_availability(index, term, claim)
+            .map(|_available| ())
+            .map_err(map_driver_error)
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn inspect_external_retained_reply(
+        &mut self,
+        agent: AgentId,
+        request: &super::shared_journal_driver::CleanInvocationReplayRequest,
+    ) -> Result<
+        Option<super::shared_journal_driver::RetainedExternalReplyProof>,
+        SharedAgentHostError,
+    > {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .inspect_external_retained_reply(request)
+            .map_err(map_driver_error)
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn revalidate_external_retained_reply(
+        &mut self,
+        agent: AgentId,
+        request: &super::shared_journal_driver::CleanInvocationReplayRequest,
+        proof: &super::shared_journal_driver::RetainedExternalReplyProof,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .revalidate_external_retained_reply(request, proof)
+            .map_err(map_driver_error)
+    }
+
     pub(crate) fn raft_database(
         &self,
         agent: AgentId,
@@ -3830,6 +3914,11 @@ impl SharedAgentHost {
             .agents
             .get(&agent)
             .ok_or(SharedAgentHostError::AgentNotFound)?;
+        if hosted.driver.uses_external_state() {
+            // External checkpoint publication/reopen does not yet authorize
+            // portable transfer or retention/reclamation of its block closure.
+            return Err(SharedAgentHostError::PortableBackupUnsupported);
+        }
         let (certificate, binding) = hosted
             .driver
             .common_snapshot_authority()
@@ -4122,13 +4211,12 @@ impl SharedAgentHost {
         if intent.id() != record.intent || !self.read_exposure(agent, intent.id(), files)? {
             return Err(SharedAgentHostError::CorruptResidue);
         }
-        if !matches!(
-            intent.authority,
-            SharedGenesisAuthority::SystemBootstrap { .. }
-        ) {
-            return Err(SharedAgentHostError::PortableBackupUnsupported);
-        }
         let sealed = self.verify_and_prepare(&intent)?;
+        self.require_common_snapshot_genesis(&intent, &sealed)?;
+        #[cfg(feature = "experimental-state-blocks")]
+        if let PreparedSharedGenesis::ExternalAuthorityFinalized(external) = &sealed {
+            return self.resume_external_common_install(agent, files, record, intent, external);
+        }
         let (journal_parent, authority_parent) = self
             .lease
             .clone_generation_parents()
@@ -4217,6 +4305,148 @@ impl SharedAgentHost {
         hosted
             .driver
             .install_common_snapshot(&record.certificate, &record.binding, sealed.post_create())
+            .map_err(map_driver_error)?;
+        Ok(hosted)
+    }
+
+    #[cfg(all(test, feature = "experimental-state-blocks"))]
+    fn resume_external_common_install(
+        &mut self,
+        agent: AgentId,
+        files: GenerationFiles,
+        record: &CommonInstallRecord,
+        intent: SharedGenesisIntent,
+        external: &Arc<super::replay::ReplaySealedExternalGenesis>,
+    ) -> Result<HostedSharedAgent, SharedAgentHostError> {
+        let sealed = PreparedSharedGenesis::ExternalAuthorityFinalized(Arc::clone(external));
+        let (journal_parent, authority_parent) = self
+            .lease
+            .clone_generation_parents()
+            .map_err(map_outer_lease_error)?;
+        let slot = FileLocalAgentJournalSlot::acquire_with_pinned_parents(
+            self.journal_path(agent),
+            self.journal_lock_path(agent),
+            self.scope().node,
+            intent.id(),
+            &journal_parent,
+            &authority_parent,
+        )
+        .map_err(|_| SharedAgentHostError::CorruptResidue)?;
+        let ledger = self.open_generation_ledger(&intent, &sealed, slot.instance_id(), true)?;
+        if record.binding.claim().journal_store().0 != *slot.instance_id().as_bytes()
+            || record.binding.claim().local_node() != self.scope().node
+            || record.certificate.claim().active_committee() != intent.committee()
+            || record.certificate.claim().authority_epoch()
+                != intent.committee_authority.initial_epoch()
+        {
+            return Err(SharedAgentHostError::SnapshotCertificateInvalid);
+        }
+        let installed = ledger
+            .common_snapshot_authority()
+            .map_err(map_ledger_error)?;
+        let exact_installed = installed.as_ref().is_some_and(|(certificate, binding)| {
+            certificate == &record.certificate && binding == &record.binding
+        });
+        if !exact_installed {
+            // A signed marker is not permission to discard a later durable
+            // suffix. Check its entire physical ledger foundation before the
+            // opener may promote or clean any staged journal endpoint.
+            let context = ledger
+                .snapshot_context(&record.logical)
+                .map_err(map_ledger_error)?;
+            let claim = record.binding.claim();
+            let recovery_matches = match (
+                record.certificate.claim().recovery_manifest(),
+                context.recovery_manifest.as_ref(),
+            ) {
+                (Some(expected), Some(manifest)) => expected == manifest.commitment(),
+                (None, manifest) => manifest.is_none_or(|manifest| manifest.is_empty()),
+                _ => false,
+            };
+            if claim.ordered() != &context.ordered
+                || claim.active_committee() != &context.active_committee
+                || claim.authority_epoch() != context.authority_epoch
+                || claim.boundary_payload_commitment() != context.boundary_payload_commitment
+                || claim.ordered_successor() != context.ordered_successor
+                || claim.retired_audit_root() != context.retired_audit_root
+                || claim.committee_evidence_root() != context.committee_evidence_root
+                || claim.previous_snapshot() != context.previous_snapshot
+                || !recovery_matches
+            {
+                return Err(SharedAgentHostError::SnapshotCertificateInvalid);
+            }
+        }
+        let mut budget = FileSharedDriver::external_recovery_budget();
+        let (mut store, _, validated) = slot
+            .open_external_shared_checkpoint_with_executor(
+                external,
+                |store| {
+                    if store.instance_id() != ledger.journal_store() {
+                        return Err(super::journal_store::JournalStoreError::ScopeMismatch);
+                    }
+                    let executor =
+                        super::local_journal_driver::StandardLocalReplayExecutor::new_shared(
+                            store.catalog_blob_resolver()?,
+                            Arc::clone(&self.trust),
+                            Arc::clone(&self.merge),
+                            ledger
+                                .committee_history()
+                                .map_err(|_| super::journal_store::JournalStoreError::Corrupt)?,
+                        );
+                    Ok((executor, installed.clone()))
+                },
+                &super::replay::NoPrunedOrderedBases,
+                &mut budget,
+                Some((
+                    &record.certificate,
+                    &record.binding,
+                    &record.predecessor,
+                    &record.target,
+                )),
+            )
+            .map_err(|_| SharedAgentHostError::CorruptResidue)?;
+        let heads = store
+            .heads()
+            .map_err(|_| SharedAgentHostError::CorruptResidue)?
+            .ok_or(SharedAgentHostError::CorruptResidue)?;
+        if heads != record.predecessor && heads != record.target {
+            return Err(SharedAgentHostError::CorruptResidue);
+        }
+        if heads == record.target {
+            let (materialization, availability) = validated
+                .into_external_common_shared_availability(
+                    &store,
+                    external,
+                    &record.certificate,
+                    &record.binding,
+                )
+                .map_err(|_| SharedAgentHostError::CorruptResidue)?;
+            super::replay::validate_published_external_shared_checkpoint(
+                &mut store,
+                &materialization,
+                record.binding.claim(),
+                external,
+                &availability,
+                &mut budget,
+            )
+            .map_err(|_| SharedAgentHostError::CorruptResidue)?;
+            ledger
+                .install_common_snapshot(
+                    &record.certificate,
+                    &record.binding,
+                    Some(&record.logical),
+                )
+                .map_err(map_ledger_error)?;
+        } else if exact_installed {
+            // Ledger-first authority cannot coexist with its old journal head.
+            return Err(SharedAgentHostError::CorruptResidue);
+        }
+        drop(store);
+        drop(ledger);
+        let mut hosted = self.open_generation(intent, &sealed, true, files, None)?;
+        hosted
+            .driver
+            .install_common_snapshot(&record.certificate, &record.binding, external.post_create())
             .map_err(map_driver_error)?;
         Ok(hosted)
     }
@@ -4625,14 +4855,8 @@ impl SharedAgentHost {
             .agents
             .get(&agent)
             .ok_or(SharedAgentHostError::AgentNotFound)?;
-        let SharedGenesisAuthority::SystemBootstrap { committee, .. } = &hosted.intent.authority
-        else {
-            return Err(SharedAgentHostError::PortableBackupUnsupported);
-        };
-        if committee.members().len() != 3 || committee.voter_count() != 3 {
-            return Err(SharedAgentHostError::PortableBackupUnsupported);
-        }
         let sealed = self.verify_and_prepare(&hosted.intent)?;
+        self.require_common_snapshot_genesis(&hosted.intent, &sealed)?;
         if hosted.driver.materialization().runtime() != sealed.genesis().runtime() {
             return Err(SharedAgentHostError::PortableBackupUnsupported);
         }
@@ -4643,9 +4867,44 @@ impl SharedAgentHost {
         Ok(sealed.post_create().clone())
     }
 
+    /// Common checkpoints remain restricted to the fixed system image or an
+    /// explicitly selected, Authority-finalized external Linear candidate.
+    /// Ordinary image Agents and decoded external descriptor bytes cannot opt
+    /// into either profile by themselves.
+    fn require_common_snapshot_genesis(
+        &self,
+        intent: &SharedGenesisIntent,
+        sealed: &PreparedSharedGenesis,
+    ) -> Result<(), SharedAgentHostError> {
+        let supported = match sealed {
+            PreparedSharedGenesis::SystemBootstrap(_) => matches!(
+                intent.authority,
+                SharedGenesisAuthority::SystemBootstrap { .. }
+            ),
+            #[cfg(feature = "experimental-state-blocks")]
+            PreparedSharedGenesis::ExternalAuthorityFinalized(external) => {
+                external.is_shared()
+                    && matches!(
+                        self.execution_selection,
+                        SharedExecutionSelection::ExternalLinearCandidates
+                    )
+                    && matches!(
+                        intent.authority,
+                        SharedGenesisAuthority::AuthorityFinalized(_)
+                    )
+            }
+            PreparedSharedGenesis::AuthorityFinalized(_) => false,
+        };
+        let committee = intent.committee();
+        if !supported || committee.members().len() != 3 || committee.voter_count() != 3 {
+            return Err(SharedAgentHostError::PortableBackupUnsupported);
+        }
+        Ok(())
+    }
+
     /// Independently reconstruct this replica's common checkpoint boundary.
-    /// The first common profile is the fixed-three-voter system image; external
-    /// block snapshots and arbitrary node-private histories remain unavailable.
+    /// Only the fixed-three-voter system image and explicitly selected external
+    /// Linear candidates qualify; arbitrary node-private histories do not.
     pub fn request_common_snapshot_compaction(
         &mut self,
         agent: AgentId,
@@ -4694,6 +4953,54 @@ impl SharedAgentHost {
         self.merge
             .sign_common_snapshot_candidate(&candidate)
             .ok_or(SharedAgentHostError::SnapshotCertificateInvalid)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn common_snapshot_authority_for_test(
+        &mut self,
+        agent: AgentId,
+    ) -> Result<
+        Option<(
+            SharedAgentCommonSnapshotCertificate,
+            SharedAgentLocalSnapshotBinding,
+        )>,
+        SharedAgentHostError,
+    > {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .common_snapshot_authority()
+            .map_err(map_driver_error)
+    }
+
+    #[cfg(all(test, feature = "experimental-state-blocks"))]
+    pub(crate) fn external_inspection_lanes_for_test(
+        &mut self,
+        agent: AgentId,
+    ) -> Result<Vec<crate::agent_sdk::state_execution::ExternalLaneWork>, SharedAgentHostError>
+    {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .materialization()
+            .external_inspection_lanes()
+            .map_err(|_| SharedAgentHostError::Unavailable)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared_genesis_intent_for_test(
+        &mut self,
+        agent: AgentId,
+    ) -> Result<Hash, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        self.agents
+            .get(&agent)
+            .map(|hosted| hosted.intent.id())
+            .ok_or(SharedAgentHostError::AgentNotFound)
     }
 
     /// Each voter binds the common certificate to its own reconstructed store.
@@ -4986,6 +5293,59 @@ impl SharedAgentHost {
         }
     }
 
+    fn open_generation_ledger(
+        &self,
+        intent: &SharedGenesisIntent,
+        sealed: &PreparedSharedGenesis,
+        journal_store: super::shared_raft::JournalStoreInstanceId,
+        externally_exposed: bool,
+    ) -> Result<AgentRaftApplicationLedgerV2, SharedAgentHostError> {
+        let agent = intent.agent()?;
+        let generation = AgentGenerationRouteKey::new(
+            self.scope().space,
+            agent,
+            sealed.genesis().id(),
+            sealed.admission_record().id(),
+        )
+        .map_err(|_| SharedAgentHostError::InvalidProvision)?;
+        validate_database_path(&self.raft_path(agent), externally_exposed)?;
+        let database = Arc::new(
+            Database::create(self.raft_path(agent))
+                .map_err(|_| SharedAgentHostError::Unavailable)?,
+        );
+        let ledger = AgentRaftApplicationLedgerV2::open(
+            database,
+            generation,
+            journal_store,
+            self.scope().node,
+            intent.committee().clone(),
+            intent.committee_authority,
+        )
+        .map_err(map_ledger_error)?;
+        #[cfg(not(test))]
+        {
+            #[cfg(feature = "experimental-state-blocks")]
+            let external_candidate = matches!(
+                (self.execution_selection, sealed),
+                (
+                    SharedExecutionSelection::ExternalLinearCandidates,
+                    PreparedSharedGenesis::ExternalAuthorityFinalized(_)
+                )
+            );
+            #[cfg(not(feature = "experimental-state-blocks"))]
+            let external_candidate = false;
+            if !external_candidate
+                && ledger
+                    .common_snapshot_authority()
+                    .map_err(map_ledger_error)?
+                    .is_some()
+            {
+                return Err(SharedAgentHostError::PortableBackupUnsupported);
+            }
+        }
+        Ok(ledger)
+    }
+
     fn open_generation(
         &mut self,
         intent: SharedGenesisIntent,
@@ -5030,6 +5390,8 @@ impl SharedAgentHost {
             )
             .map_err(|_| SharedAgentHostError::CorruptResidue)?;
         }
+        #[cfg(feature = "experimental-state-blocks")]
+        let mut external_ledger = None;
         let store_result = match sealed {
             #[cfg(feature = "experimental-state-blocks")]
             PreparedSharedGenesis::ExternalAuthorityFinalized(external) => {
@@ -5037,23 +5399,38 @@ impl SharedAgentHost {
                     return Err(SharedAgentHostError::PortableBackupUnsupported);
                 }
                 if externally_exposed {
+                    // The stable slot identity is known before a journal head
+                    // is admitted. Read its exact installed common authority
+                    // from the generation-bound ledger, never from file names.
+                    let ledger =
+                        self.open_generation_ledger(&intent, sealed, slot.instance_id(), true)?;
                     // Construct the verifier from this exact locked namespace;
                     // both durable and staged external heads are audited before
                     // a store or network route becomes available.
-                    slot.open_external_journal_with_executor(
+                    let result = slot.open_external_shared_checkpoint_with_executor(
                         external,
                         |store| {
-                            Ok(super::local_journal_driver::StandardLocalReplayExecutor::new_shared(
+                            if store.instance_id() != ledger.journal_store() {
+                                return Err(super::journal_store::JournalStoreError::ScopeMismatch);
+                            }
+                            let committees = ledger.committee_history()
+                                .map_err(|_| super::journal_store::JournalStoreError::Corrupt)?;
+                            let authority = ledger.common_snapshot_authority()
+                                .map_err(|_| super::journal_store::JournalStoreError::Corrupt)?;
+                            let executor = super::local_journal_driver::StandardLocalReplayExecutor::new_shared(
                                 store.catalog_blob_resolver()?,
                                 Arc::clone(&self.trust),
                                 Arc::clone(&self.merge),
-                                vec![intent.committee().clone()],
-                            ))
+                                committees,
+                            );
+                            Ok((executor, authority))
                         },
                         &super::replay::NoPrunedOrderedBases,
                         &mut FileSharedDriver::external_recovery_budget(),
-                    )
-                    .map(|(store, _, _)| store)
+                        None,
+                    );
+                    external_ledger = Some(ledger);
+                    result.map(|(store, _, _)| store)
                 } else {
                     slot.open_external_genesis(
                         external,
@@ -5096,26 +5473,19 @@ impl SharedAgentHost {
         )
         .map_err(|_| SharedAgentHostError::InvalidProvision)?;
         let raft_path = self.raft_path(agent);
-        validate_database_path(&raft_path, externally_exposed)?;
-        let database =
-            Arc::new(Database::create(&raft_path).map_err(|_| SharedAgentHostError::Unavailable)?);
-        let ledger = AgentRaftApplicationLedgerV2::open(
-            database,
-            generation,
-            store.instance_id(),
-            scope.node,
-            intent.committee().clone(),
-            intent.committee_authority,
-        )
-        .map_err(map_ledger_error)?;
-        #[cfg(not(test))]
-        if ledger
-            .common_snapshot_authority()
-            .map_err(map_ledger_error)?
-            .is_some()
-        {
-            return Err(SharedAgentHostError::PortableBackupUnsupported);
-        }
+        #[cfg(feature = "experimental-state-blocks")]
+        let ledger = match external_ledger {
+            Some(ledger) => ledger,
+            None => self.open_generation_ledger(
+                &intent,
+                sealed,
+                store.instance_id(),
+                externally_exposed,
+            )?,
+        };
+        #[cfg(not(feature = "experimental-state-blocks"))]
+        let ledger =
+            self.open_generation_ledger(&intent, sealed, store.instance_id(), externally_exposed)?;
         if portable_already_activated {
             let recovery = portable_restore.ok_or(SharedAgentHostError::CorruptResidue)?;
             ledger

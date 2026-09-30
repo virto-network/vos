@@ -1187,10 +1187,10 @@ pub(crate) fn trace_common_checkpoint_material_for_test(
 }
 
 /// Result of one authenticated clean Ordered submission through the live
-/// Raft worker. `new_slot == false` is possible only when the bounded durable
-/// journal suffix proved the exact request was already committed.
+/// Raft worker. A retained external response is proved against the current
+/// authenticated root, not assigned a fabricated historical input identity.
 pub(crate) struct CleanOrderedSubmission {
-    pub(crate) input: ReplayInputId,
+    pub(crate) input: Option<ReplayInputId>,
     pub(crate) outcome: RuntimeOutcome,
     pub(crate) new_slot: bool,
 }
@@ -2232,6 +2232,20 @@ impl SharedRouteHandler {
         };
         #[cfg(test)]
         trace("local_material");
+        self.collect_applied_availability(fingerprint, local, request, false, started)
+    }
+
+    /// The current-root mode is additive: historical replies still attest
+    /// their original publications, while retained inspection needs this exact
+    /// current state available on a voter majority.
+    fn collect_applied_availability(
+        &self,
+        fingerprint: AttachmentFingerprint,
+        local: NodeId,
+        request: AppliedAvailabilityRequest,
+        current_root: bool,
+        started: Instant,
+    ) -> Result<(), SharedAgentHostError> {
         // No host/proposal mutex may cross peer I/O: each voter needs its
         // independent apply handler to reach and attest this exact state.
         let mut available = BTreeSet::from([local]);
@@ -2239,21 +2253,18 @@ impl SharedRouteHandler {
         let mut pending = BTreeMap::new();
         while !has_applied_availability_quorum(&fingerprint.voters, &available) {
             if Instant::now() >= deadline {
-                #[cfg(test)]
-                trace(&format!(
-                    "deadline available={} pending={}",
-                    available.len(),
-                    pending.len()
-                ));
                 return Err(SharedAgentHostError::Unavailable);
             }
             for &voter in &fingerprint.voters {
                 if !available.contains(&voter) && !pending.contains_key(&voter) {
-                    pending.insert(
-                        voter,
+                    let reply = if current_root {
                         self.network
-                            .send_agent_applied_availability(voter, self.route, request),
-                    );
+                            .send_agent_current_applied_availability(voter, self.route, request)
+                    } else {
+                        self.network
+                            .send_agent_applied_availability(voter, self.route, request)
+                    };
+                    pending.insert(voter, reply);
                 }
             }
             let mut finished = Vec::new();
@@ -2263,13 +2274,7 @@ impl SharedRouteHandler {
                         available.insert(voter);
                         finished.push(voter);
                     }
-                    Ok(response) => {
-                        #[cfg(test)]
-                        trace(&format!("refused voter={voter:?} response={response:?}"));
-                        #[cfg(not(test))]
-                        let _ = response;
-                        finished.push(voter);
-                    }
+                    Ok(_) => finished.push(voter),
                     Err(std_mpsc::TryRecvError::Disconnected) => finished.push(voter),
                     Err(std_mpsc::TryRecvError::Empty) => {}
                 }
@@ -2293,23 +2298,73 @@ impl SharedRouteHandler {
         if AttachmentFingerprint::from_attachment_status(&status)? != fingerprint {
             return Err(SharedAgentHostError::Unavailable);
         }
-        host.verify_ordered_availability(
-            self.agent,
-            request.raft_index,
-            request.raft_term,
-            crate::service::Hash(request.claim.0),
-        )
-        .map_err(|error| {
-            #[cfg(test)]
-            trace(&format!("final_local_error={error:?}"));
-            error
-        })?;
+        if current_root {
+            #[cfg(feature = "experimental-state-blocks")]
+            host.verify_current_ordered_availability(
+                self.agent,
+                request.raft_index,
+                request.raft_term,
+                crate::service::Hash(request.claim.0),
+            )?;
+            #[cfg(not(feature = "experimental-state-blocks"))]
+            return Err(SharedAgentHostError::Unavailable);
+        } else {
+            host.verify_ordered_availability(
+                self.agent,
+                request.raft_index,
+                request.raft_term,
+                crate::service::Hash(request.claim.0),
+            )?;
+        }
         tracing::debug!(
-            agent = ?self.agent, input = ?input, voters = available.len(),
+            agent = ?self.agent, ?request, current_root, voters = available.len(),
             elapsed_us = started.elapsed().as_micros(),
             "Shared result applied-availability quorum"
         );
         Ok(())
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    fn require_retained_external_availability(
+        &self,
+        request: &crate::agent::shared_journal_driver::CleanInvocationReplayRequest,
+        proof: &crate::agent::shared_journal_driver::RetainedExternalReplyProof,
+    ) -> Result<RuntimeOutcome, SharedAgentHostError> {
+        let started = Instant::now();
+        let (fingerprint, local, availability) = {
+            let mut host = self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            let status = host
+                .supervisor_attachment_status(self.agent)?
+                .ok_or(SharedAgentHostError::AgentNotFound)?;
+            let fingerprint = AttachmentFingerprint::from_attachment_status(&status)?;
+            let local = NodeId(host.scope().node.0);
+            if fingerprint.protocol_route != self.route
+                || fingerprint.next_committee.is_some()
+                || fingerprint.joint_old.is_some()
+                || fingerprint.voters.len() != 3
+                || fingerprint.voters.binary_search(&local).is_err()
+                || proof.claim().committee() != fingerprint.durable_route.committee()
+            {
+                return Err(SharedAgentHostError::Unavailable);
+            }
+            host.revalidate_external_retained_reply(self.agent, request, proof)?;
+            let availability = AppliedAvailabilityRequest {
+                raft_index: proof.claim().raft_index(),
+                raft_term: proof.claim().raft_term(),
+                claim: Hash(proof.claim().commitment().0),
+            };
+            (fingerprint, local, availability)
+        };
+        self.collect_applied_availability(fingerprint, local, availability, true, started)?;
+        // The same guest-proved head and exact request must still be live at
+        // delivery. Root advancement during peer I/O is a retry, not a new read.
+        self.host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .revalidate_external_retained_reply(self.agent, request, proof)
     }
 
     fn has_local_proposer(&self, worker: &vos_raft::WorkerHandle<NodeId>) -> bool {
@@ -3152,6 +3207,20 @@ impl SharedRouteHandler {
             } else {
                 None
             };
+            #[cfg(feature = "experimental-state-blocks")]
+            if matches!(clock, InvocationClock::Current)
+                && reservation.is_none()
+                && let Some(proof) = host.inspect_external_retained_reply(self.agent, &request)?
+            {
+                drop(host);
+                drop(proposal);
+                let outcome = self.require_retained_external_availability(&request, &proof)?;
+                return Ok(CleanOrderedSubmission {
+                    input: None,
+                    outcome,
+                    new_slot: false,
+                });
+            }
             let prepared = if matches!(clock, InvocationClock::Bootstrap) {
                 host.prepare_bootstrap_invocation(self.agent, request)?
             } else if matches!(clock, InvocationClock::PersistedManagement(_)) {
@@ -3177,7 +3246,7 @@ impl SharedRouteHandler {
                 drop(proposal);
                 self.require_ordered_availability(input)?;
                 return Ok(CleanOrderedSubmission {
-                    input,
+                    input: Some(input),
                     outcome,
                     new_slot: false,
                 });
@@ -3221,7 +3290,7 @@ impl SharedRouteHandler {
         drop(proposal);
         self.require_ordered_availability(input)?;
         Ok(CleanOrderedSubmission {
-            input,
+            input: Some(input),
             outcome,
             new_slot: true,
         })
@@ -3395,6 +3464,25 @@ impl SharedRouteHandler {
                     let mut host = self.host.lock().map_err(|_| AgentHandlerError)?;
                     drain_committed(&mut host, self.agent, &self.ordered_replies)
                         .map_err(|_| AgentHandlerError)?;
+                    #[cfg(feature = "experimental-state-blocks")]
+                    {
+                        let exact = crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Invoke {
+                            context: RuntimeExecutionContext::Direct,
+                            work: work.clone(),
+                            authorization: authorization.clone(),
+                        };
+                        if let Some(proof) = host
+                            .inspect_external_retained_reply(self.agent, &exact)
+                            .map_err(|_| AgentHandlerError)?
+                        {
+                            drop(host);
+                            drop(proposal);
+                            let outcome = self
+                                .require_retained_external_availability(&exact, &proof)
+                                .map_err(|_| AgentHandlerError)?;
+                            return Ok(reply_for_outcome(correlation, outcome));
+                        }
+                    }
                     let prepared = host
                         .prepare_clean_ordered(self.agent, work.clone(), authorization)
                         .map_err(|_| AgentHandlerError)?;
@@ -3908,6 +3996,38 @@ impl AgentRouteHandler for SharedRouteHandler {
                     claim: commitment,
                     signature,
                 })
+            }
+            AgentMessage::CurrentAppliedAvailabilityRequest(request) => {
+                let mut host = self.host.lock().map_err(|_| AgentHandlerError)?;
+                let status = host
+                    .supervisor_attachment_status(self.agent)
+                    .map_err(|_| AgentHandlerError)?
+                    .ok_or(AgentHandlerError)?;
+                let fingerprint = AttachmentFingerprint::from_attachment_status(&status)
+                    .map_err(|_| AgentHandlerError)?;
+                let local = NodeId(host.scope().node.0);
+                let current_voter = fingerprint.protocol_route == self.route
+                    && fingerprint.next_committee.is_none()
+                    && fingerprint.joint_old.is_none()
+                    && fingerprint.voters.len() == 3
+                    && fingerprint.voters.binary_search(&sender).is_ok()
+                    && fingerprint.voters.binary_search(&local).is_ok();
+                #[cfg(feature = "experimental-state-blocks")]
+                let available = current_voter
+                    && host
+                        .verify_current_ordered_availability(
+                            self.agent,
+                            request.raft_index,
+                            request.raft_term,
+                            crate::service::Hash(request.claim.0),
+                        )
+                        .is_ok();
+                #[cfg(not(feature = "experimental-state-blocks"))]
+                let available = {
+                    let _ = current_voter;
+                    false
+                };
+                Ok(AgentMessage::CurrentAppliedAvailabilityReply { request, available })
             }
             AgentMessage::AppliedAvailabilityRequest(request) => {
                 #[cfg(test)]
@@ -6274,6 +6394,48 @@ impl SharedAgentNetworkHost {
         expected_committee: &AgentReplicaCommittee,
         signer: &dyn LocalMergeAuthenticator,
     ) -> Result<SharedAgentCommonSnapshotCertificate, SharedAgentHostError> {
+        self.certified_common_checkpoint_for_admission_inner(
+            agent,
+            work,
+            authorization,
+            expected_committee,
+            signer,
+            true,
+        )
+    }
+
+    /// Qualification-only collection cut. The fixture retires every voter at
+    /// this certified foundation before testing filesystem publication. Retiring
+    /// only the source would let the other two commit a new election boundary.
+    #[cfg(test)]
+    pub(crate) fn collect_common_checkpoint_for_admission(
+        &mut self,
+        agent: crate::service::AgentId,
+        work: &InvocationWork,
+        authorization: &InvocationAuthorization,
+        expected_committee: &AgentReplicaCommittee,
+        signer: &dyn LocalMergeAuthenticator,
+    ) -> Result<SharedAgentCommonSnapshotCertificate, SharedAgentHostError> {
+        self.certified_common_checkpoint_for_admission_inner(
+            agent,
+            work,
+            authorization,
+            expected_committee,
+            signer,
+            false,
+        )
+    }
+
+    #[cfg(test)]
+    fn certified_common_checkpoint_for_admission_inner(
+        &mut self,
+        agent: crate::service::AgentId,
+        work: &InvocationWork,
+        authorization: &InvocationAuthorization,
+        expected_committee: &AgentReplicaCommittee,
+        signer: &dyn LocalMergeAuthenticator,
+        install: bool,
+    ) -> Result<SharedAgentCommonSnapshotCertificate, SharedAgentHostError> {
         let started = Instant::now();
         if expected_committee.members().len() != 3
             || expected_committee.voter_count() != 3
@@ -6297,7 +6459,14 @@ impl SharedAgentNetworkHost {
         if barrier.role != vos_raft::Role::Leader || barrier.commit_index != barrier.last_log_index
         {
             if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
-                eprintln!("common_checkpoint barrier_refusal node={:?} role={:?} term={} commit={} last={}", self.network.agent_node_id(), barrier.role, barrier.current_term, barrier.commit_index, barrier.last_log_index);
+                eprintln!(
+                    "common_checkpoint barrier_refusal node={:?} role={:?} term={} commit={} last={}",
+                    self.network.agent_node_id(),
+                    barrier.role,
+                    barrier.current_term,
+                    barrier.commit_index,
+                    barrier.last_log_index
+                );
             }
             return Err(SharedAgentHostError::Unavailable);
         }
@@ -6321,6 +6490,9 @@ impl SharedAgentNetworkHost {
             phase = "quorum",
             "Common checkpoint phase complete"
         );
+        if !install {
+            return Ok(certificate);
+        }
         self.retire(agent)?;
         let installed = self
             .host

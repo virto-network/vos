@@ -305,6 +305,11 @@ pub(super) enum PendingAgentReply {
         request: AppliedAvailabilityRequest,
         reply: std_mpsc::Sender<Result<bool, AgentNetworkError>>,
     },
+    CurrentAppliedAvailability {
+        meta: PendingMeta,
+        request: AppliedAvailabilityRequest,
+        reply: std_mpsc::Sender<Result<bool, AgentNetworkError>>,
+    },
     Projection {
         meta: PendingMeta,
         request: Hash,
@@ -352,6 +357,7 @@ impl PendingAgentReply {
             | Self::RecoveryExpiry { meta, .. }
             | Self::RecoveryRegistration { meta, .. }
             | Self::AppliedAvailability { meta, .. }
+            | Self::CurrentAppliedAvailability { meta, .. }
             | Self::Projection { meta, .. }
             | Self::Invocation { meta, .. }
             | Self::RaftAppend { meta, .. }
@@ -369,6 +375,7 @@ impl PendingAgentReply {
                 let _ = reply.send(Err(error));
             }
             Self::AppliedAvailability { reply, .. }
+            | Self::CurrentAppliedAvailability { reply, .. }
             | Self::RecoveryExpiry { reply, .. }
             | Self::Projection { reply, .. }
             | Self::RecoveryRegistration { reply, .. } => {
@@ -464,6 +471,13 @@ impl PendingAgentReply {
             (
                 Self::AppliedAvailability { request, reply, .. },
                 AgentMessage::AppliedAvailabilityReply {
+                    request: response,
+                    available,
+                },
+            )
+            | (
+                Self::CurrentAppliedAvailability { request, reply, .. },
+                AgentMessage::CurrentAppliedAvailabilityReply {
                     request: response,
                     available,
                 },
@@ -619,6 +633,8 @@ impl AgentTrafficClass {
             AgentMessage::Raft(_) => Self::Raft,
             AgentMessage::AppliedAvailabilityRequest(_)
             | AgentMessage::AppliedAvailabilityReply { .. }
+            | AgentMessage::CurrentAppliedAvailabilityRequest(_)
+            | AgentMessage::CurrentAppliedAvailabilityReply { .. }
             | AgentMessage::CommonSnapshotVoteRequest(_)
             | AgentMessage::CommonSnapshotVoteReply { .. }
             | AgentMessage::RecoveryExpiryVoteRequest(_)
@@ -947,6 +963,49 @@ impl Network {
                 frame,
                 permit,
                 pending: PendingAgentReply::AppliedAvailability {
+                    meta: PendingMeta {
+                        route,
+                        target_node: target,
+                        target_peer: peer,
+                    },
+                    request,
+                    reply,
+                },
+            }),
+            Err(error) => {
+                let _ = reply.send(Err(error));
+            }
+        }
+        receiver
+    }
+
+    /// Ask an exact authenticated voter about this current root only. A
+    /// historical availability response cannot satisfy this request, and a
+    /// positive reply remains one vote rather than a delivery certificate.
+    pub(crate) fn send_agent_current_applied_availability(
+        &self,
+        target: NodeId,
+        route: AgentGenerationRoute,
+        request: AppliedAvailabilityRequest,
+    ) -> std_mpsc::Receiver<Result<bool, AgentNetworkError>> {
+        let (reply, receiver) = std_mpsc::channel();
+        let permit = match self.reserve_agent_outbound(AgentTrafficClass::Availability) {
+            Ok(permit) => permit,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return receiver;
+            }
+        };
+        match self.prepare_agent_request(
+            target,
+            route,
+            AgentMessage::CurrentAppliedAvailabilityRequest(request),
+        ) {
+            Ok((peer, frame)) => self.queue_agent_request(AgentOutboundRequest {
+                peer,
+                frame,
+                permit,
+                pending: PendingAgentReply::CurrentAppliedAvailability {
                     meta: PendingMeta {
                         route,
                         target_node: target,
@@ -1502,6 +1561,7 @@ fn is_request(message: &AgentMessage) -> bool {
         message,
         AgentMessage::InvokeRequest(_)
             | AgentMessage::AppliedAvailabilityRequest(_)
+            | AgentMessage::CurrentAppliedAvailabilityRequest(_)
             | AgentMessage::CommonSnapshotVoteRequest(_)
             | AgentMessage::RecoveryRegistrationRequest(_)
             | AgentMessage::RecoveryExpiryRequest { .. }
@@ -1541,6 +1601,12 @@ fn response_matches_request(request: &AgentMessage, response: &AgentMessage) -> 
         (
             AgentMessage::AppliedAvailabilityRequest(request),
             AgentMessage::AppliedAvailabilityReply {
+                request: response, ..
+            },
+        )
+        | (
+            AgentMessage::CurrentAppliedAvailabilityRequest(request),
+            AgentMessage::CurrentAppliedAvailabilityReply {
                 request: response, ..
             },
         ) => request == response,
@@ -2387,6 +2453,168 @@ mod tests {
     }
 
     #[test]
+    fn current_applied_availability_requires_exact_identity_claim_and_mode() {
+        let peer = key(86).public().to_peer_id();
+        let other_peer = key(87).public().to_peer_id();
+        let route = test_route(86);
+        let request = AppliedAvailabilityRequest {
+            raft_index: 7,
+            raft_term: 3,
+            claim: Hash(id(88)),
+        };
+        for fault in 0..12 {
+            let (reply, result) = std_mpsc::channel();
+            let pending = PendingAgentReply::CurrentAppliedAvailability {
+                meta: PendingMeta {
+                    route,
+                    target_node: node(peer),
+                    target_peer: peer,
+                },
+                request,
+                reply,
+            };
+            let mut echoed = request;
+            match fault {
+                2 => echoed.raft_index += 1,
+                3 => echoed.raft_term += 1,
+                4 => echoed.claim = Hash(id(89)),
+                _ => {}
+            }
+            let mut response = frame(
+                peer,
+                route,
+                AgentMessage::CurrentAppliedAvailabilityReply {
+                    request: echoed,
+                    available: fault != 1,
+                },
+            );
+            match fault {
+                5 => response.route.space = SpaceId(id(90)),
+                6 => response.route.agent = AgentId(id(90)),
+                7 => response.route.generation = Hash(id(90)),
+                9 => response.sender = node(other_peer),
+                10 => {
+                    response.message = AgentMessage::Raft(RaftMessage::AppendReply {
+                        term: request.raft_term,
+                        success: true,
+                        match_index: request.raft_index,
+                    })
+                }
+                11 => {
+                    response.message = AgentMessage::AppliedAvailabilityReply {
+                        request,
+                        available: true,
+                    }
+                }
+                _ => {}
+            }
+            let authenticated =
+                authenticate_sender(if fault == 9 { &other_peer } else { &peer }, response)
+                    .unwrap();
+            pending.complete(if fault == 8 { other_peer } else { peer }, authenticated);
+            let expected = match fault {
+                0 => Ok(true),
+                1 => Ok(false),
+                2..=4 => Err(AgentNetworkError::ResponseCorrelationMismatch),
+                5..=7 => Err(AgentNetworkError::ResponseRouteMismatch),
+                8 => Err(AgentNetworkError::ResponsePeerMismatch),
+                9 => Err(AgentNetworkError::ResponseSenderMismatch),
+                10 | 11 => Err(AgentNetworkError::ResponseTypeMismatch),
+                _ => unreachable!(),
+            };
+            assert_eq!(result.recv().unwrap(), expected, "fault {fault}");
+        }
+        let (reply, result) = std_mpsc::channel();
+        PendingAgentReply::AppliedAvailability {
+            meta: PendingMeta {
+                route,
+                target_node: node(peer),
+                target_peer: peer,
+            },
+            request,
+            reply,
+        }
+        .complete(
+            peer,
+            authenticate_sender(
+                &peer,
+                frame(
+                    peer,
+                    route,
+                    AgentMessage::CurrentAppliedAvailabilityReply {
+                        request,
+                        available: true,
+                    },
+                ),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            result.recv().unwrap(),
+            Err(AgentNetworkError::ResponseTypeMismatch)
+        );
+    }
+
+    #[test]
+    fn current_applied_availability_is_non_execution_traffic_with_exact_response_matching() {
+        let claim = AppliedAvailabilityRequest {
+            raft_index: 9,
+            raft_term: 2,
+            claim: Hash(id(91)),
+        };
+        let request = AgentMessage::CurrentAppliedAvailabilityRequest(claim);
+        assert!(is_request(&request));
+        assert_eq!(
+            AgentTrafficClass::for_message(&request),
+            AgentTrafficClass::Availability
+        );
+        for available in [false, true] {
+            let reply = AgentMessage::CurrentAppliedAvailabilityReply {
+                request: claim,
+                available,
+            };
+            assert!(!is_request(&reply));
+            assert_eq!(
+                AgentTrafficClass::for_message(&reply),
+                AgentTrafficClass::Availability
+            );
+            assert!(response_matches_request(&request, &reply));
+            let historical = AgentMessage::AppliedAvailabilityReply {
+                request: claim,
+                available,
+            };
+            assert!(!response_matches_request(&request, &historical));
+            assert!(!response_matches_request(
+                &AgentMessage::AppliedAvailabilityRequest(claim),
+                &reply
+            ));
+        }
+        for wrong in [
+            AppliedAvailabilityRequest {
+                raft_index: 10,
+                ..claim
+            },
+            AppliedAvailabilityRequest {
+                raft_term: 3,
+                ..claim
+            },
+            AppliedAvailabilityRequest {
+                claim: Hash(id(92)),
+                ..claim
+            },
+        ] {
+            assert!(!response_matches_request(
+                &request,
+                &AgentMessage::CurrentAppliedAvailabilityReply {
+                    request: wrong,
+                    available: true
+                },
+            ));
+        }
+        assert!(!response_matches_request(&request, &request));
+    }
+
+    #[test]
     fn projection_acceptance_requires_exact_peer_route_and_query_correlation() {
         let peer = key(80).public().to_peer_id();
         let route = test_route(81);
@@ -3215,8 +3443,18 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        for available in [false, true] {
-            let route = test_route(if available { 98 } else { 99 });
+        for (current, available) in [(false, false), (false, true), (true, false), (true, true)] {
+            let route = test_route(match (current, available) {
+                (false, true) => 98,
+                (false, false) => 99,
+                (true, true) => 100,
+                (true, false) => 101,
+            });
+            let send = if current {
+                Network::send_agent_current_applied_availability
+            } else {
+                Network::send_agent_applied_availability
+            };
             for network in [&sender, &receiver] {
                 network
                     .register_agent_route(
@@ -3224,9 +3462,10 @@ mod tests {
                         members.clone(),
                         Arc::new(StaticHandler {
                             calls: calls.clone(),
-                            response: Some(AgentMessage::AppliedAvailabilityReply {
-                                request,
-                                available,
+                            response: Some(if current {
+                                AgentMessage::CurrentAppliedAvailabilityReply { request, available }
+                            } else {
+                                AgentMessage::AppliedAvailabilityReply { request, available }
                             }),
                             delay: None,
                         }),
@@ -3234,30 +3473,29 @@ mod tests {
                     .unwrap();
             }
             assert_eq!(
-                sender
-                    .send_agent_applied_availability(receiver.agent_node_id(), route, request)
+                send(&sender, receiver.agent_node_id(), route, request)
                     .recv_timeout(Duration::from_secs(5))
                     .unwrap(),
                 Ok(available),
             );
             assert_eq!(
-                sender
-                    .send_agent_applied_availability(
-                        receiver.agent_node_id(),
-                        route,
-                        AppliedAvailabilityRequest {
-                            raft_index: 0,
-                            ..request
-                        }
-                    )
-                    .recv_timeout(Duration::from_secs(1))
-                    .unwrap(),
+                send(
+                    &sender,
+                    receiver.agent_node_id(),
+                    route,
+                    AppliedAvailabilityRequest {
+                        raft_index: 0,
+                        ..request
+                    }
+                )
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
                 Err(AgentNetworkError::InvalidRequest(
                     AgentProtocolError::InvalidValue
                 )),
             );
         }
-        assert_eq!(*calls.lock().unwrap(), vec![sender.agent_node_id(); 2]);
+        assert_eq!(*calls.lock().unwrap(), vec![sender.agent_node_id(); 4]);
         assert_eq!(
             sender
                 .agent_outbound_permits

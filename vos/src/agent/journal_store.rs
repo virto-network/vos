@@ -1020,6 +1020,18 @@ pub trait AgentJournalStore:
     ) -> Result<JournalPublication, JournalStoreError> {
         Err(JournalStoreError::Unavailable)
     }
+
+    /// Maintenance-only external checkpoint CAS. A generic Shared driver
+    /// cannot enable this path on a storage adapter lacking a real borrowed
+    /// predecessor/successor availability audit.
+    #[cfg(feature = "experimental-state-blocks")]
+    fn publish_external_shared_checkpoint(
+        &mut self,
+        _publication: &ReplaySealedPublication,
+        _availability: &ExternalCheckpointValidation<'_>,
+    ) -> Result<JournalPublication, JournalStoreError> {
+        Err(JournalStoreError::Unavailable)
+    }
 }
 
 /// Unforgeable authority to remove one catalog blob created while journal
@@ -8847,6 +8859,15 @@ impl MemoryAgentJournalStore {
 
 impl AgentJournalStore for MemoryAgentJournalStore {
     #[cfg(feature = "experimental-state-blocks")]
+    fn publish_external_shared_checkpoint(
+        &mut self,
+        publication: &ReplaySealedPublication,
+        availability: &ExternalCheckpointValidation<'_>,
+    ) -> Result<JournalPublication, JournalStoreError> {
+        AuditedCheckpointStore::publish_audited_checkpoint(self, publication, availability)
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
     fn publish_available_shared(
         &mut self,
         publication: &ReplaySealedPublication,
@@ -11071,6 +11092,12 @@ impl FileAgentJournalSlot {
 
 #[cfg(target_os = "linux")]
 impl FileLocalAgentJournalSlot {
+    /// Immutable identity derived from this pinned stable lock, available before
+    /// any journal head is admitted. It does not grant publication authority.
+    pub(crate) const fn instance_id(&self) -> JournalStoreInstanceId {
+        self.instance_id
+    }
+
     /// Acquire an ordinary Local slot only after Host has made the exact
     /// creation intent durable.  Consequently a missing stable lock may be
     /// created, while a lock without that host-owned intent never reaches
@@ -11472,6 +11499,159 @@ impl FileLocalAgentJournalSlot {
         if store.heads()?.is_none() {
             return Err(JournalStoreError::NotInitialized);
         }
+        Ok((
+            store,
+            executor.ok_or(JournalStoreError::NotInitialized)?,
+            durable.ok_or(JournalStoreError::NotInitialized)?,
+        ))
+    }
+
+    /// Open a certified external Shared head. An independently authenticated
+    /// install marker may resolve only its exact staged target, after both
+    /// endpoint closures have been checked read-only under this slot's lock.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn open_external_shared_checkpoint_with_executor<
+        E: super::replay::ReplayExecutor,
+        R: super::replay::OrderedBaseResolver,
+    >(
+        self,
+        sealed: &super::replay::ReplaySealedExternalGenesis,
+        executor_from_store: impl FnOnce(
+            &FileAgentJournalStore,
+        ) -> Result<
+            (
+                E,
+                Option<(
+                    super::shared_commit::SharedAgentCommonSnapshotCertificate,
+                    super::shared_commit::SharedAgentLocalSnapshotBinding,
+                )>,
+            ),
+            JournalStoreError,
+        >,
+        resolver: &R,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+        installing: Option<(
+            &super::shared_commit::SharedAgentCommonSnapshotCertificate,
+            &super::shared_commit::SharedAgentLocalSnapshotBinding,
+            &JournalHeads,
+            &JournalHeads,
+        )>,
+    ) -> Result<
+        (
+            FileAgentJournalStore,
+            E,
+            super::replay::ValidatedExternalHead,
+        ),
+        JournalStoreError,
+    > {
+        let mut make = Some(executor_from_store);
+        let mut executor = None;
+        let mut authority = None;
+        let mut durable = None;
+        let mut staged_target = None;
+        let mut first = true;
+        let store = self.open_with_head_validation(sealed, true, |store, heads| {
+            if first {
+                let (built, installed) = make.take().ok_or(JournalStoreError::Corrupt)?(store)?;
+                executor = Some(built);
+                authority = installed;
+                if let Some((certificate, binding, predecessor, target)) = installing {
+                    super::replay::verify_external_common_authority(
+                        store,
+                        sealed,
+                        target,
+                        certificate,
+                        binding,
+                    )?;
+                    if predecessor.id() != binding.claim().checkpoint_predecessor()
+                        || target.id() != binding.claim().journal_heads()
+                        || predecessor.id() == target.id()
+                        || predecessor.genesis != target.genesis
+                        || predecessor.admission != target.admission
+                        || predecessor.node != target.node
+                        || (heads != predecessor && heads != target)
+                        || store
+                            .read_fixed::<JournalHeads>("", "heads.next")?
+                            .as_ref()
+                            .is_some_and(|staged| staged != target)
+                    {
+                        return Err(JournalStoreError::ScopeMismatch);
+                    }
+                    // The QC signs the exact predecessor head. Even when the
+                    // ledger already installed the target, its old external
+                    // closure must remain available before cleanup or serving.
+                    super::replay::with_external_genesis_checkpoint_heads(
+                        store,
+                        predecessor,
+                        sealed,
+                        budget,
+                        |_, _| Ok(()),
+                    )?;
+                }
+            }
+            let selected = installing
+                .filter(|(_, _, _, target)| heads == *target)
+                .map(|(certificate, binding, _, _)| (certificate, binding))
+                .or_else(|| {
+                    authority
+                        .as_ref()
+                        .map(|(certificate, binding)| (certificate, binding))
+                });
+            let validated = if let Some((certificate, binding)) = selected {
+                super::replay::validate_external_common_checkpoint_head(
+                    store,
+                    sealed,
+                    heads,
+                    executor.as_mut().ok_or(JournalStoreError::Corrupt)?,
+                    resolver,
+                    certificate,
+                    binding,
+                    budget,
+                )?
+            } else {
+                super::replay::validate_external_genesis_head(
+                    store,
+                    sealed,
+                    heads,
+                    executor.as_mut().ok_or(JournalStoreError::Corrupt)?,
+                    resolver,
+                    budget,
+                )?
+            };
+            if first {
+                durable = Some(validated);
+                first = false;
+            } else if installing.is_some() {
+                staged_target = Some(validated);
+            }
+            Ok(())
+        })?;
+        if let Some((_, _, predecessor, target)) = installing {
+            let current = store.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+            let staged = store.read_fixed::<JournalHeads>("", "heads.next")?;
+            // Repeat exact endpoint checks under the same pinned directory
+            // immediately before mutation, after both read-only audits.
+            if (current != *predecessor && current != *target)
+                || staged.as_ref().is_some_and(|staged| staged != target)
+            {
+                return Err(JournalStoreError::Conflict);
+            }
+            if staged.is_some() {
+                let validated = staged_target.take().ok_or(JournalStoreError::Corrupt)?;
+                let directory = store.directory("")?;
+                sync_regular_file_at(directory, "heads.next")?;
+                if current == *predecessor {
+                    rename_file_at(directory, "heads.next", "heads")?;
+                } else {
+                    unlink_file_at(directory, "heads.next")?;
+                }
+                directory
+                    .sync_all()
+                    .map_err(|_| JournalStoreError::Unavailable)?;
+                durable = Some(validated);
+            }
+        }
+        store.verify_lock()?;
         Ok((
             store,
             executor.ok_or(JournalStoreError::NotInitialized)?,
@@ -15606,6 +15786,23 @@ impl InvocationHistoryStore for FileAgentJournalStore {
 }
 
 impl AgentJournalStore for FileAgentJournalStore {
+    #[cfg(feature = "experimental-state-blocks")]
+    fn publish_external_shared_checkpoint(
+        &mut self,
+        publication: &ReplaySealedPublication,
+        availability: &ExternalCheckpointValidation<'_>,
+    ) -> Result<JournalPublication, JournalStoreError> {
+        #[cfg(target_os = "linux")]
+        {
+            AuditedCheckpointStore::publish_audited_checkpoint(self, publication, availability)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (publication, availability);
+            Err(JournalStoreError::Unavailable)
+        }
+    }
+
     #[cfg(feature = "experimental-state-blocks")]
     fn publish_available_shared(
         &mut self,

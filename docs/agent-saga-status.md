@@ -14,8 +14,8 @@ exact retry semantics. A singleton, smaller dataset or experimental-only release
 requires a new user decision.
 
 The user requested completing this plan before the next whole-branch review.
-This qualified batch follows the reviewed baseline `6d3a4926`; its source
-boundary is that baseline plus the implementation in the commit containing
+This batch follows the qualified checkpoint `64a687dc`; its source
+boundary is that checkpoint plus the implementation in the commit containing
 this document. The active worktree is `.worktrees/ch08-runtime-directory`.
 Verify actual branch heads and cleanliness before using the checkpoint; do not
 infer promotion from these docs. `master` remains `d2378274`; no automatic push,
@@ -25,62 +25,55 @@ mainline change, artifact promotion or deployment is included.
 supported workflow selects it; **qualified** means its specified acceptance test
 passes on the actual release. These are separate milestones.
 
-## This batch: candidate qualification completed
+## This batch: paired checkpoints and retained replies
 
-Three connected changes are implemented and qualified on the same corrected
-optimized source, without claiming release closure:
+The preceding checkpoint's expiry, overwrite and signed Clerk evidence is in
+`git show 64a687dc:docs/agent-saga-review.md`; those counts are not inherited here.
+Two connected candidate changes are implemented:
 
-- Explicit quorum expiry spans the recovery manifest, Raft ledger, filesystem
-  owner, authenticated transport and exact pending-record cleanup. An audited,
-  cached expiry floor survives terminal-slot replacement. The quiet corrected
-  default-release fixture passes (130.05 s), covering offline origin, minority
-  noncleanup, actual follower RPC expiry, genuine two-of-three common checkpoint
-  certification, exact terminal/floor export-import and pending-record preservation/
-  reopen cleanup. This qualifies the tested candidate slice, not public startup.
-- Timed-out registration exclusion is released only after a stable applied
-  higher-term overwrite proves the original append absent. Its optimized real
-  election/retry fixture passes (57.80 s); completion uses the real peer handler
-  because this harness has no node-loop projection dispatcher. Competing durable
-  intent preservation (25.94 s) and same-leader timeout/duplicate-row recovery
-  (51.58 s) also pass.
-- External Shared candidate owners join the real network path. Common genesis
-  ancestry is selected only after exact authenticated external genesis-checkpoint
-  validation; Local/image replay and complete claim equality retain their checks.
-  Use fresh candidate stores: old unpromoted journals with replica-local shared
-  ancestry are not migrated. The full-outer three-network lifecycle passes
-  (33.92 s): signed Clerk bootstrap, two accounts and settled transfer, exact
-  lost-response/reopen retry, ACK, reference kernel root and complete claims on
-  all three replicas. The three-file lifecycle also passes (23.86 s), including
-  missing-block refusal. Neither qualifies public startup, retained-data growth,
-  load or external checkpoint/catch-up.
+- External Shared checkpoint publication and reopen use the existing common QC,
+  separately signed local store binding and journal-first recovery marker.
+  Predecessor and target closures are audited before publication or staged-head
+  recovery. A raw genesis opener cannot admit a later certified checkpoint.
+  Missing blocks or physical profile metadata revoke the serving pin; restoring
+  bytes does not revive it without a fresh owner audit. Portable export, automatic
+  pruning, public startup and external Local remain gated.
+- Ordinary signed Direct Linear/LinearizableQuery Invoke/ACK retries can inspect
+  the exact retained terminal under the authenticated current root. An opaque
+  proof binds owner epoch, head, request kind, retirement, authorization, trusted
+  inspection clock, current claim and outcome. It never invents an old input ID.
+  A distinct strict-current availability message reuses the bounded quorum pool;
+  historical availability semantics remain unchanged. Final validation after peer
+  I/O rejects root/owner changes and clock regression as retryable unavailability.
+  Completed results still require a real ACK; an acknowledged Invoke cannot rerun.
+  No historical index, guest ABI change, peer VM or new driver framework is added.
 
-The corrected default release build passes (14m03s), all **188 focused optimized
-tests** pass with none ignored, and the conditional-prefix worker regression
-passes. Supported guest, external guest and production `vosx` feature checks
-pass. Logs and exact test boundaries are in the review guide; full customer
-workflow and service qualification remain open.
-The independent full formatter-output recheck parses all 16 changed Rust files
-and finds no formatting debt intersecting changed code; `git diff --check`
-passes. Baseline-only formatting remains untouched.
+All seven external Shared physical fixtures pass on the final default optimized
+build: healthy checkpoint/reopen, exact marker/journal/ledger interruptions,
+retained replies through two checkpoints after authorization expiry, and both
+existing file/network lifecycle cases. They include signed Clerk/reference-root
+checks, missing data and substitution refusal. The final healthy case also proves
+that a failed physical head read revokes the pin after exact byte restoration;
+stale caller/plan mismatches do not revoke healthy pins. All eight selected
+image/checkpoint/custody recovery regressions also pass, along with 143 distinct
+focused checks and the physical bounded-pool regression. Guest and external CLI
+feature checks pass; ordinary CLI tests pass (300, with 45 explicitly ignored).
+This is not service capacity, public cutover or complete release qualification.
 
-The earlier optimized expiry failure identified redundant capacity audits and
-overlapping retries, not an authorization/binding refusal. The scoped correction
-reuses one full audit within a locked call and excludes concurrent expiry attempts
-per Agent. The final quiet optimized fixture passes without changing deadlines,
-quorum, freshness or proof requirements. Its bounded exact checkpoint retry is
-test-only. Keep the earlier failed release/debug evidence; whole-fixture durations
-are not request-latency or service-capacity measurements.
+The fixtures collect a genuine authenticated network quorum, then isolate and
+retire all Raft workers before filesystem publication. Exact crash assertions
+check the signed marker's predecessor/target heads. This qualifies offline
+publication/recovery, not live coordinated checkpoint/catch-up. Keeping the other
+two voters active during source publication correctly refused a certificate after
+a new election advanced its physical foundation; neither deadlines nor certificate
+checks were relaxed. Preserve those failure logs.
 
-After committing this coherent batch and verifying the `saga/agents` checkpoint,
-continue certified external checkpoint/catch-up using
-existing certificates, typed block traversal and recovery markers. Initially
-checkpoint only with ordinary Clerk results acknowledged. Common-ledger
-installation removes historical Raft anchors: retained Ordered blobs alone do
-not prove old ordinary replies available. The selected retention design is a
-typed, exact-request-bound guest inspection proof under the current common root, using
-the existing inspection contract; no historical index or guest ABI change.
-It is unimplemented and unqualified. A new checkpoint certificate alone cannot
-substitute for the old result claim.
+Next, complete bounded external checkpoint export/import and detached reclamation
+using existing certificates, public block traversal and recovery markers. Stream
+both canonical typed objects and scoped block records, not a larger whole-memory
+AJB1 image. Its separate 65,536-object and 65,536-blob limits cannot represent the
+approved retained dataset and cumulative invocation history. Qualify actual
+capacity, exact retry and interrupted import before public cutover.
 
 Public three-node startup/finality, external owner selection, public Shared
 management and pruning remain gated. No current result establishes production
@@ -203,8 +196,10 @@ do not by themselves qualify Shared capacity or eliminate whole-runtime work.
   reopen, ordering and marker/journal/ledger interruptions. Mutation remains test-only
   until **all** pending recovery scopes survive retirement, including an offline
   origin's after-ACK PAP2. Do not replace that gate with a local absence check or
-  weaken exact retry. Ordinary retained replies need authenticated proof across
-  compaction. External block-root closure/export remains a separate integration
+  weaken exact retry. Ordinary retained replies now have a candidate current-root
+  proof; optimized physical qualification passes, public qualification remains
+  pending. External block-root
+  closure/export remains a separate integration
   gate; image catch-up does not qualify the 100,000-transfer workload.
 - [ ] Integrate the existing external-state executor and block store into Shared
   Clerk through a narrow internal executor selection, not a new driver framework.
@@ -226,8 +221,10 @@ do not by themselves qualify Shared capacity or eliminate whole-runtime work.
   traversal, not host decoding of private runtime/actor state. Full import/recovery
   audits must not become ordinary-request whole-state scans. The current portable
   bundle's 65,536-blob ceiling cannot hold approximately 200,000 rows (roughly
-  400,000 Patricia structural blocks before chunks); qualify export sizing and
-  peak memory without lowering the approved workload.
+  400,000 Patricia structural blocks before chunks). Cumulative acknowledged
+  invocation history can also exceed its separate 65,536-object ceiling.
+  Stream both kinds with explicit per-record/count/byte limits; qualify archive
+  sizing and peak memory without lowering the approved workload.
 - [ ] Expose public Shared Create/Install/Invoke with resumable, schema-aware CLI
   commands using existing management/request mechanisms. Preserve signed terminal
   failure finality and exact request identities; qualify the implemented terminal
@@ -350,12 +347,25 @@ These are approved targets, not measured capacity or an availability promise.
   reconciles it. Unadmitted WAL cleanup after loss of the retained exact terminal
   remains gated; the floor alone cannot clear it. None of these limits is closed
   by refusing expired new admission.
-- Common checkpoint installation removes historical ordinary result anchors.
-  ACK-before-checkpoint fixtures do not qualify retained ordinary replies across
-  compaction. The selected typed current-root guest inspection must bind the
-  exact old request/outcome; it is not implemented, and a newer common-root
-  certificate alone is not that proof. Do not add a historical index or new
-  guest ABI as a parallel workstream.
+- Current-root retained inspection is implemented and passes the optimized
+  physical two-checkpoint fixture; public qualification remains pending. It
+  binds exact old work/auth/outcome and fresh majority availability, not merely
+  a newer certificate. Fresh eligible external calls currently perform an extra
+  read-only inspection before preview/execution; measure this integrated cost.
+- A fresh supervisor Invoke currently performs at least four outer runs:
+  directory inspection, retained-result inspection, terminal preview and leader
+  application; followers also apply independently. Both outer and inner machines
+  use the recompiler, but prepared code does not reuse invocation memory. Existing
+  single-call network samples remain around 0.8 s (transfer 854,255 us; post-reopen
+  state-root 812,063 us on this optimized source), not a capacity result. The
+  isolated external fixture needs explicit tracing initialization before its
+  existing VM phase counters are observable. Queue waits and journal/application
+  persistence are not fully attributed; do not infer the actor or VM dominates.
+- Certified reopen currently repeats complete block-closure/replay audits across
+  the slot opener and driver. Recovery/maintenance time is unmeasured at the
+  approved dataset. Existing GC bounds unlinks, but each pass still audits the
+  reachable tree and scans/stats/sorts the namespace. Keep it detached and measure
+  peak metadata memory and repeated-pass latency; do not put it on request paths.
 - Native full-memory snapshots and cloning still scale with the guest address
   span, not touched pages, and can materialize a large flat image. Sparse snapshot
   behavior must not be assumed for the native mapping. Instruction attribution
