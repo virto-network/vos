@@ -1045,6 +1045,27 @@ pub trait AgentJournalStore:
     ) -> Result<JournalPublication, JournalStoreError> {
         Err(JournalStoreError::Unavailable)
     }
+
+    /// Catch-up publication requires common authority as well as both actual
+    /// destination root audits. Raw heads and a maintenance root audit alone
+    /// cannot enable this path on an arbitrary storage adapter.
+    #[cfg(feature = "experimental-state-blocks")]
+    fn publish_external_common_restore(
+        &mut self,
+        _publication: &super::replay::ExternalCommonRestorePublication,
+        _availability: &ExternalCheckpointValidation<'_>,
+    ) -> Result<JournalPublication, JournalStoreError> {
+        Err(JournalStoreError::Unavailable)
+    }
+
+    #[cfg(all(test, feature = "experimental-state-blocks"))]
+    fn publish_external_common_restore_through_heads_stage_for_test(
+        &mut self,
+        _publication: &super::replay::ExternalCommonRestorePublication,
+        _availability: &ExternalCheckpointValidation<'_>,
+    ) -> Result<JournalPublication, JournalStoreError> {
+        Err(JournalStoreError::Unavailable)
+    }
 }
 
 /// Unforgeable authority to remove one catalog blob created while journal
@@ -12735,6 +12756,84 @@ impl FileAgentJournalStore {
         validate_portable_journal_closure(self, image, maximum_index_nodes)
     }
 
+    /// Publish only the exact destination endpoints authenticated under one
+    /// exclusive replay borrow. All immutable target dependencies were staged
+    /// before this call; no decoded archive or source head reaches this CAS.
+    #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+    fn publish_external_common_restore_inner<F>(
+        &mut self,
+        publication: &super::replay::ExternalCommonRestorePublication,
+        availability: &ExternalCheckpointValidation<'_>,
+        mut publication_point: F,
+    ) -> Result<JournalPublication, JournalStoreError>
+    where
+        F: FnMut(PublicationPoint) -> Result<(), JournalStoreError>,
+    {
+        self.verify_lock()?;
+        self.ensure_no_gc_pending()?;
+        publication.require_store(self)?;
+        let predecessor = publication.predecessor();
+        let target = publication.target();
+        if predecessor.node != self.node
+            || target.node != self.node
+            || target.runtime.agent != self.agent
+            || predecessor.validate_successor(target).is_err()
+            || !availability.matches_heads(self.instance_id(), predecessor)
+            || !availability.matches_heads(self.instance_id(), target)
+        {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        let current = self
+            .read_fixed::<JournalHeads>("", "heads")?
+            .ok_or(JournalStoreError::NotInitialized)?;
+        let staged = self.read_fixed::<JournalHeads>("", "heads.next")?;
+        if (current != *predecessor && current != *target)
+            || staged.as_ref().is_some_and(|staged| staged != target)
+        {
+            return Err(JournalStoreError::Conflict);
+        }
+        validate_head_targets_with_availability(self, predecessor, Some(availability))?;
+        validate_head_targets_with_availability(self, target, Some(availability))?;
+        if current == *target {
+            if staged.is_some()
+                || self.historical_heads(predecessor.id())?.as_ref() != Some(predecessor)
+            {
+                return Err(JournalStoreError::Corrupt);
+            }
+            return Ok(JournalPublication {
+                object_created: false,
+                heads_advanced: false,
+            });
+        }
+        let object_created = self.persist_historical_heads(predecessor)?;
+        publication_point(PublicationPoint::ObjectDurable)?;
+        let directory = self.directory("")?;
+        if staged.is_some() {
+            sync_regular_file_at(directory, "heads.next")?;
+        } else {
+            create_synced_stage_at(directory, "heads.next", &target.encode())?;
+        }
+        publication_point(PublicationPoint::HeadsStaged)?;
+        publication.require_store(self)?;
+        if self.read_fixed::<JournalHeads>("", "heads")?.as_ref() != Some(predecessor)
+            || self.read_fixed::<JournalHeads>("", "heads.next")?.as_ref() != Some(target)
+        {
+            return Err(JournalStoreError::Conflict);
+        }
+        rename_file_at(directory, "heads.next", "heads")?;
+        directory
+            .sync_all()
+            .map_err(|_| JournalStoreError::Unavailable)?;
+        publication_point(PublicationPoint::HeadsDurable)?;
+        self.verify_lock()?;
+        publication.require_store(self)?;
+        validate_head_targets_with_availability(self, target, Some(availability))?;
+        Ok(JournalPublication {
+            object_created,
+            heads_advanced: true,
+        })
+    }
+
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn stage_portable_checkpoint_for_test(
         &mut self,
@@ -15859,6 +15958,46 @@ impl InvocationHistoryStore for FileAgentJournalStore {
 }
 
 impl AgentJournalStore for FileAgentJournalStore {
+    #[cfg(feature = "experimental-state-blocks")]
+    fn publish_external_common_restore(
+        &mut self,
+        publication: &super::replay::ExternalCommonRestorePublication,
+        availability: &ExternalCheckpointValidation<'_>,
+    ) -> Result<JournalPublication, JournalStoreError> {
+        #[cfg(target_os = "linux")]
+        {
+            self.publish_external_common_restore_inner(publication, availability, |_| Ok(()))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (publication, availability);
+            Err(JournalStoreError::Unavailable)
+        }
+    }
+
+    #[cfg(all(test, feature = "experimental-state-blocks"))]
+    fn publish_external_common_restore_through_heads_stage_for_test(
+        &mut self,
+        publication: &super::replay::ExternalCommonRestorePublication,
+        availability: &ExternalCheckpointValidation<'_>,
+    ) -> Result<JournalPublication, JournalStoreError> {
+        #[cfg(target_os = "linux")]
+        {
+            self.publish_external_common_restore_inner(publication, availability, |point| {
+                if point == PublicationPoint::HeadsStaged {
+                    Err(JournalStoreError::Unavailable)
+                } else {
+                    Ok(())
+                }
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (publication, availability);
+            Err(JournalStoreError::Unavailable)
+        }
+    }
+
     #[cfg(feature = "experimental-state-blocks")]
     fn publish_external_shared_checkpoint(
         &mut self,
@@ -19243,6 +19382,123 @@ mod tests {
                 )
                 .unwrap()
             );
+        }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    #[test]
+    fn external_archive_stage_resume_slot_preserves_only_unexposed_initial() {
+        // Ordinary image genesis isolates the disk-slot preflight, not the
+        // external Shared constructor or foreign checkpoint authority.
+        let sealed = crate::agent::replay::tests::admitted_local_genesis(0xd4);
+        let directory = TestDirectory::new("archive-stage-resume-initial");
+        let slot = acquire_production_local_slot(&directory, &sealed);
+        let initial = sealed.initial_heads();
+        assert_eq!(
+            external_archive_stage::validate_resume_stage_slot(
+                &slot,
+                &initial,
+                PRODUCTION_LOCAL_INTENT,
+            ),
+            Err(JournalStoreError::Conflict)
+        );
+        let mut store = slot.open(&sealed, false).unwrap();
+        store
+            .put_blob(
+                JournalBlobClass::CatalogArtifact,
+                &sealed.genesis().runtime().package,
+                b"replay-runtime-package",
+            )
+            .unwrap();
+        store.initialize_local(&sealed).unwrap();
+        let root = store.root().to_path_buf();
+        drop(store);
+        let slot = acquire_production_local_slot(&directory, &sealed);
+        let before = file_tree_snapshot(&root);
+        external_archive_stage::validate_resume_stage_slot(
+            &slot,
+            &initial,
+            PRODUCTION_LOCAL_INTENT,
+        )
+        .unwrap();
+        assert_eq!(
+            external_archive_stage::validate_resume_stage_slot(&slot, &initial, Hash([0x7c; 32]),),
+            Err(JournalStoreError::ScopeMismatch)
+        );
+        let foreign = JournalHeads {
+            node: NodeId([0x7d; 32]),
+            ..initial
+        };
+        assert_eq!(
+            external_archive_stage::validate_resume_stage_slot(
+                &slot,
+                &foreign,
+                PRODUCTION_LOCAL_INTENT,
+            ),
+            Err(JournalStoreError::ScopeMismatch)
+        );
+        assert_eq!(file_tree_snapshot(&root), before);
+        assert!(!slot.exposure_committed);
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    #[test]
+    fn external_archive_stage_resume_slot_refuses_staged_advanced_or_exposed_before_open() {
+        // Every refused case is captured before the opener could repair or
+        // remove a staged entry. Missing heads also cannot initialize a resume.
+        for mode in 0..5 {
+            let sealed = crate::agent::replay::tests::admitted_local_genesis(0xd5);
+            let directory = TestDirectory::new("archive-stage-resume-refusal");
+            let mut store = acquire_production_local_slot(&directory, &sealed)
+                .open(&sealed, false)
+                .unwrap();
+            store
+                .put_blob(
+                    JournalBlobClass::CatalogArtifact,
+                    &sealed.genesis().runtime().package,
+                    b"replay-runtime-package",
+                )
+                .unwrap();
+            store.initialize_local(&sealed).unwrap();
+            let initial = store.heads().unwrap().unwrap();
+            let root = store.root().to_path_buf();
+            match mode {
+                0 => fs::write(root.join("heads.next"), initial.encode()).unwrap(),
+                1 => fs::write(root.join("heads.next"), b"malformed-stage").unwrap(),
+                2 => {
+                    let advanced = JournalHeads {
+                        publication_revision: initial.publication_revision + 1,
+                        previous: Some(initial.id()),
+                        ..initial.clone()
+                    };
+                    fs::write(root.join("heads"), advanced.encode()).unwrap();
+                }
+                3 => store
+                    .commit_local_exposure(&sealed, PRODUCTION_LOCAL_INTENT)
+                    .unwrap(),
+                4 => fs::remove_file(root.join("heads")).unwrap(),
+                _ => unreachable!(),
+            }
+            drop(store);
+            let slot = acquire_production_local_slot(&directory, &sealed);
+            let before = file_tree_snapshot(&root);
+            assert!(
+                external_archive_stage::validate_resume_stage_slot(
+                    &slot,
+                    &initial,
+                    PRODUCTION_LOCAL_INTENT,
+                )
+                .is_err()
+            );
+            assert_eq!(file_tree_snapshot(&root), before);
         }
     }
 

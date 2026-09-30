@@ -6419,6 +6419,10 @@ struct ExternalCommonCheckpointMetadata {
 
 #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
 impl ReboundExternalCommonCheckpoint {
+    pub(crate) fn source_heads(&self) -> &super::journal::JournalHeads {
+        &self.source_heads
+    }
+
     pub(crate) fn certificate(&self) -> &SharedAgentCommonSnapshotCertificate {
         &self.certificate
     }
@@ -6445,6 +6449,26 @@ impl ReboundExternalCommonCheckpoint {
 
     pub(crate) fn predecessor(&self) -> &super::journal::JournalHeads {
         &self.predecessor
+    }
+
+    /// Immutable destination metadata only. The authenticated source closure
+    /// and both actual destination endpoints still require auditing before a
+    /// separately signed binding can permit publication.
+    pub(crate) fn stage_metadata<S: TransitionProofPublicationStore>(
+        &self,
+        staged: &mut super::journal_store::StagedExternalArchive,
+        destination: &mut S,
+        sealed: &super::replay::ReplaySealedExternalGenesis,
+    ) -> Result<(), SharedJournalDriverError> {
+        self.require_current(staged, destination, sealed)?;
+        // Root/head validation follows this exact historical envelope even
+        // before CAS. Reuse the owner-checked immutable predecessor staging;
+        // this does not advance heads or authenticate a foreign predecessor.
+        destination.stage_proof_predecessor(&self.predecessor)?;
+        destination.put(&self.metadata.local)?;
+        destination.put(&self.metadata.local_invocations)?;
+        destination.put(&self.metadata.checkpoint)?;
+        self.require_current(staged, destination, sealed)
     }
 
     /// Identity fencing, not renewed proof of the complete block closure.

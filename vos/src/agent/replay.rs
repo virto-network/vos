@@ -16795,6 +16795,202 @@ mod aggregate {
         Ok(audited)
     }
 
+    /// Exact destination publication authority obtained from a common QC and
+    /// separately signed local binding. Unlike a decoded head or a bare root
+    /// audit, this token can authorize a catch-up head swap. It is consumed
+    /// only while its actual destination remains exclusively borrowed.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) struct ExternalCommonRestorePublication {
+        store: JournalStoreInstanceId,
+        epoch: u64,
+        predecessor: JournalHeads,
+        target: JournalHeads,
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    impl ExternalCommonRestorePublication {
+        pub(crate) fn predecessor(&self) -> &JournalHeads {
+            &self.predecessor
+        }
+
+        pub(crate) fn target(&self) -> &JournalHeads {
+            &self.target
+        }
+
+        pub(crate) fn require_store<S: AgentJournalStore>(
+            &self,
+            store: &S,
+        ) -> Result<(), JournalStoreError> {
+            if store.instance_id() != self.store || store.validation_epoch() != self.epoch {
+                return Err(JournalStoreError::ScopeMismatch);
+            }
+            Ok(())
+        }
+    }
+
+    /// Both actual destination endpoint closures remain audited under this
+    /// exclusive borrow through publication. No serving materialization or
+    /// availability pin escapes; ledger restore and certified reopen are still
+    /// mandatory after the head CAS.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) struct AuditedExternalCommonRestore<'store, S: AgentJournalStore> {
+        store: &'store mut S,
+        publication: ExternalCommonRestorePublication,
+        predecessor_lanes: BTreeSet<LaneStateId>,
+        target_lanes: BTreeSet<LaneStateId>,
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    impl<S: AgentJournalStore> AuditedExternalCommonRestore<'_, S> {
+        pub(crate) fn publish(self) -> Result<JournalPublication, JournalStoreError> {
+            self.publish_using(|store, publication, availability| {
+                store.publish_external_common_restore(publication, availability)
+            })
+        }
+
+        #[cfg(test)]
+        pub(crate) fn publish_through_heads_stage_for_test(
+            self,
+        ) -> Result<JournalPublication, JournalStoreError> {
+            self.publish_using(|store, publication, availability| {
+                store.publish_external_common_restore_through_heads_stage_for_test(
+                    publication,
+                    availability,
+                )
+            })
+        }
+
+        fn publish_using(
+            self,
+            publish: impl FnOnce(
+                &mut S,
+                &ExternalCommonRestorePublication,
+                &ExternalCheckpointValidation<'_>,
+            ) -> Result<JournalPublication, JournalStoreError>,
+        ) -> Result<JournalPublication, JournalStoreError> {
+            let Self {
+                store,
+                publication,
+                predecessor_lanes,
+                target_lanes,
+            } = self;
+            publication.require_store(store)?;
+            let availability = ExternalCheckpointValidation {
+                mutation: None,
+                store: store.instance_id(),
+                predecessor: publication.predecessor.id(),
+                successor: publication.target.id(),
+                predecessor_checkpoint: publication.predecessor.checkpoint,
+                successor_checkpoint: publication
+                    .target
+                    .checkpoint
+                    .ok_or(JournalStoreError::NonCanonical)?,
+                predecessor_lanes: &predecessor_lanes,
+                successor_lanes: &target_lanes,
+            };
+            let result = publish(store, &publication, &availability)?;
+            publication.require_store(store)?;
+            if store.heads()?.as_ref() != Some(&publication.target) {
+                return Err(JournalStoreError::Corrupt);
+            }
+            Ok(result)
+        }
+    }
+
+    /// Authenticate a catch-up target at the real destination, after its
+    /// closure has been copied but before any mutable head is published.
+    /// Source-only archive proofs cannot construct this capability. The host
+    /// must separately retain recovery authority and enforce fresh ledger
+    /// restore guards before publication or staged-head promotion.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn audit_external_common_restore<'store, S, E, R>(
+        store: &'store mut S,
+        seal: &ReplaySealedExternalGenesis,
+        predecessor: &JournalHeads,
+        target: &JournalHeads,
+        executor: &mut E,
+        resolver: &R,
+        certificate: &super::super::shared_commit::SharedAgentCommonSnapshotCertificate,
+        binding: &super::super::shared_commit::SharedAgentLocalSnapshotBinding,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<AuditedExternalCommonRestore<'store, S>, JournalStoreError>
+    where
+        S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
+        E: ReplayExecutor,
+        R: OrderedBaseResolver,
+    {
+        verify_external_common_authority(store, seal, target, certificate, binding)?;
+        let current = store.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+        if predecessor.id() != binding.claim().checkpoint_predecessor()
+            || target.id() != binding.claim().journal_heads()
+            || predecessor.validate_successor(target).is_err()
+            || predecessor.local_revision != 0
+            || predecessor.local_head.is_some()
+            || predecessor.local_invocations != seal.local_invocations().id()
+            || predecessor.merge_invocations != seal.merge_invocations().id()
+            || (current != *predecessor && current != *target)
+            || (current == *target
+                && store.historical_heads(predecessor.id())?.as_ref() != Some(predecessor))
+        {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        let store_id = store.instance_id();
+        let epoch = store.validation_epoch();
+        with_external_genesis_checkpoint_heads(store, predecessor, seal, budget, |store, _| {
+            let checkpoint = store
+                .get::<CheckpointManifest>(
+                    predecessor
+                        .checkpoint
+                        .ok_or(JournalStoreError::NonCanonical)?,
+                )?
+                .ok_or(JournalStoreError::MissingObject)?;
+            for lane in [PersistedLane::Merge, PersistedLane::Local] {
+                if checkpoint
+                    .lanes
+                    .iter()
+                    .find(|entry| entry.lane == lane)
+                    .is_none_or(|entry| entry.state != seal.lane_manifest(lane).id())
+                {
+                    return Err(JournalStoreError::ScopeMismatch);
+                }
+            }
+            Ok(())
+        })?;
+        // The existing physical-owner validator authenticates the certified
+        // target's runtime, roots, ancestry and profile. Its replay result is
+        // deliberately not retained as a serving cursor across ledger restore.
+        validate_external_common_checkpoint_head(
+            store,
+            seal,
+            target,
+            executor,
+            resolver,
+            certificate,
+            binding,
+            budget,
+        )?;
+        let predecessor_lanes = external_checkpoint_lanes(store, predecessor)?;
+        let target_lanes = external_checkpoint_lanes(store, target)?;
+        if predecessor_lanes.len() != 1
+            || store.instance_id() != store_id
+            || store.validation_epoch() != epoch
+            || store.heads()?.as_ref() != Some(&current)
+        {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        Ok(AuditedExternalCommonRestore {
+            store,
+            publication: ExternalCommonRestorePublication {
+                store: store_id,
+                epoch,
+                predecessor: predecessor.clone(),
+                target: target.clone(),
+            },
+            predecessor_lanes,
+            target_lanes,
+        })
+    }
+
     /// Certified checkpoint replay seeds common ancestry before its suffix;
     /// both descriptors and every retained external block are audited while
     /// borrowing the exact pinned store. No serving capability escapes until
@@ -22117,7 +22313,8 @@ pub(crate) use aggregate::materialize_external_checkpoint;
 pub(crate) use aggregate::materialize_external_genesis;
 #[cfg(all(feature = "std", feature = "experimental-state-blocks"))]
 pub(crate) use aggregate::{
-    AuditedExternalArchiveSource, ValidatedExternalHead, audit_external_archive_source,
+    AuditedExternalArchiveSource, AuditedExternalCommonRestore, ExternalCommonRestorePublication,
+    ValidatedExternalHead, audit_external_archive_source, audit_external_common_restore,
     prepare_external_shared_ordered, validate_external_common_checkpoint_head,
     validate_external_common_checkpoint_profile, validate_external_genesis_head,
     validate_published_external_shared_checkpoint, verify_external_common_authority,

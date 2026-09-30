@@ -14,7 +14,7 @@ exact retry semantics. A singleton, smaller dataset or experimental-only release
 requires a new user decision.
 
 The user requested completing this plan before the next whole-branch review.
-This batch follows the qualified checkpoint `b8d3a7e3`; its source
+This batch follows the qualified archive/preflight checkpoint `49be3bda`; its source
 boundary is that checkpoint plus the implementation in the commit containing
 this document. The active worktree is `.worktrees/ch08-runtime-directory`.
 Verify actual branch heads and cleanliness before using the checkpoint; do not
@@ -25,12 +25,32 @@ mainline change, artifact promotion or deployment is included.
 supported workflow selects it; **qualified** means its specified acceptance test
 passes on the actual release. These are separate milestones.
 
-## This batch: streaming archive and detached import preflight
+## This batch: typed destination restore
 
-`b8d3a7e3` qualifies paired external checkpoints and current-root retained
-replies. Its source-specific evidence is in
-`git show b8d3a7e3:docs/agent-saga-review.md`; do not inherit its counts here.
-The next connected candidate slice is implemented:
+`49be3bda` qualifies streaming archive and detached import preflight; use
+`git show 49be3bda:docs/agent-saga-review.md` for its exact evidence.
+The connected candidate implementation adds exact unexposed quarantine resume,
+bounded source-closure promotion under the opaque source-audit/rebind plan, and
+a destination publication capability that audits both actual endpoint trees.
+It preserves source physical identity checks and returns no serving pin.
+Binding-aware ledger preflight permits only the exact installed anchor on retry,
+while refusing later committed **or uncommitted** work before head promotion.
+
+The healthy physical fixture qualifies typed destination CAS, certified ledger
+restore, real file-owner reopen, signed Clerk Invoke/ACK and another reopen on
+the default optimized build. All seven external physical fixtures, four image
+checkpoint/restore cases and 266 distinct core regressions pass. Missing actual
+endpoint blocks refuse without repair; exact staged-head and post-ledger retries
+are tested. This is not automatic host-marker recovery,
+network catch-up, public import, reclamation or a released customer workflow.
+The earlier streaming/preflight boundary is summarized below; do not inherit its
+test counts for these changes; the review guide owns this source's evidence.
+
+### Qualified archive/preflight foundation
+
+`49be3bda` added this foundation on top of paired external checkpoints and
+current-root retained replies at `b8d3a7e3`. Historical source-specific evidence
+lives in those commits' review guides, not duplicated counts here:
 
 - AXJ1 streams canonical typed objects and scoped blobs with independent
   object/history/blob/wire limits. It leaves AJB1 and image Local unchanged;
@@ -54,19 +74,11 @@ The next connected candidate slice is implemented:
   and publication envelopes change. Its destination claim remains unsigned and
   cannot activate a head.
 
-All seven external physical fixtures pass on the default optimized build,
-including the actual signed three-node Clerk, disk export, quarantine, foreign
-audit and independently admitted destination preflight. Both owners' heads
-remain unchanged and the destination ledger stays unactivated. Four image
-checkpoint/restore regressions, 264 distinct focused core tests and supported
-guest/CLI feature checks also pass; the review guide records source-specific
-evidence and its limits. This is not public import, backup/restore,
-100,000-transfer capacity, service load or release qualification.
-
-Next: authenticate a thin external restore marker and separately signed
-destination binding; audit both actual destination endpoints and complete the
-existing journal-first/ledger restore protocol. Preserve fresh
-`validate_common_restore` guards against newer committed **and uncommitted** work.
+Next: integrate the tested destination binding, endpoint audits and journal-first/
+ledger restore into a thin authenticated durable external restore marker and
+actual host restart/reattachment. Preserve fresh `validate_common_restore`
+admission and `validate_bound_common_restore` retry guards against newer committed
+**and uncommitted** work.
 Do not relax same-boundary ACL1 compaction guards to permit catch-up. Qualify
 marker/journal/ledger interruptions, exact retry, pending scopes and detached
 reclamation before public cutover. Source archive predecessor metadata does not

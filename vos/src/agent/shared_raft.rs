@@ -6652,6 +6652,39 @@ mod application_ledger_v2 {
                 .map(|_| ())
         }
 
+        /// Recovery preflight for a separately authenticated physical binding.
+        /// Unlike first admission, this permits only the exact already-installed
+        /// anchor at equality, while retaining every later-suffix/reservation
+        /// guard before a journal stage can be promoted.
+        pub(crate) fn validate_bound_common_restore(
+            &self,
+            certificate: &SharedAgentCommonSnapshotCertificate,
+            binding: &SharedAgentLocalSnapshotBinding,
+        ) -> Result<(), AgentRaftApplicationErrorV2> {
+            let foundation = self.common_restore_foundation(certificate)?;
+            let claim = binding.claim();
+            binding
+                .verify(certificate, claim)
+                .map_err(|_| AgentRaftApplicationErrorV2::SnapshotCertificateInvalid)?;
+            if claim.journal_store() != foundation.journal_store
+                || claim.local_node() != foundation.local_node
+                || claim.boundary_payload_commitment() != foundation.boundary_payload_commitment
+                || claim.retired_audit_root() != foundation.retired_audit_root
+                || claim.committee_evidence_root() != foundation.committee_evidence_root
+                || claim.previous_snapshot().is_some()
+            {
+                return Err(AgentRaftApplicationErrorV2::SnapshotReplay);
+            }
+            let _guard = self
+                .writes
+                .lock()
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            self.audit_recovery()?;
+            let transaction = self.database.begin_write()?;
+            self.common_restore_state(&transaction, certificate, Some(binding))
+                .map(|_| ())
+        }
+
         fn common_restore_state(
             &self,
             transaction: &redb::WriteTransaction,
@@ -13753,6 +13786,44 @@ mod tests {
             );
             // Same common QC is not authority for a second physical jump.
             assert!(ledger.validate_common_restore(&certificate).is_err());
+            ledger
+                .validate_bound_common_restore(&certificate, &binding)
+                .unwrap();
+            assert!(
+                ledger
+                    .validate_bound_common_restore(&certificate, &bind(0xd9))
+                    .is_err()
+            );
+            // Equality with an installed certificate is not permission to
+            // discard even a locally uncommitted later log entry.
+            let mut log = crate::raft::RaftLog::open(Arc::clone(&database)).unwrap();
+            let transaction = database.begin_write().unwrap();
+            let uncommitted = log
+                .append_in_txn(
+                    &transaction,
+                    after.current_term,
+                    &encode_agent_raft_entry_kind(&EntryKind::Data {
+                        payload: Vec::new(),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+            assert!(matches!(
+                ledger.validate_bound_common_restore(&certificate, &binding),
+                Err(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired)
+            ));
+            assert_eq!(crate::raft::RaftMeta::load(&database).unwrap(), after);
+            let transaction = database.begin_write().unwrap();
+            transaction
+                .open_table(crate::raft::RAFT_LOG)
+                .unwrap()
+                .remove(uncommitted)
+                .unwrap();
+            transaction.commit().unwrap();
+            ledger
+                .validate_bound_common_restore(&certificate, &binding)
+                .unwrap();
             assert!(
                 ledger
                     .restore_common_snapshot(&certificate, &bind(0xd9), &recovery)
@@ -13851,6 +13922,11 @@ mod tests {
                 },
             );
             assert_eq!(next, after.last_applied + 1);
+            assert!(
+                reopened
+                    .validate_bound_common_restore(&certificate, &binding)
+                    .is_err()
+            );
             let slot = reopened.next_committed_slot().unwrap().unwrap();
             reopened.apply_foundation_slot(&slot).unwrap();
             assert_eq!(

@@ -274,6 +274,14 @@ pub struct VerifiedSharedAgentLocalSnapshotCandidate {
 }
 
 impl VerifiedSharedAgentLocalSnapshotCandidate {
+    #[cfg(test)]
+    pub(crate) fn from_reconstructed_for_test(
+        common_certificate: Hash,
+        claim: SharedAgentSnapshotClaim,
+    ) -> Self {
+        Self::from_reconstructed(common_certificate, claim)
+    }
+
     fn from_reconstructed(common_certificate: Hash, claim: SharedAgentSnapshotClaim) -> Self {
         let message = SharedAgentLocalSnapshotBinding::signing_message(
             common_certificate,
@@ -5053,6 +5061,20 @@ impl SharedAgentHost {
             .ok_or(SharedAgentHostError::AgentNotFound)?
             .driver
             .common_snapshot_authority()
+            .map_err(map_driver_error)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn common_snapshot_recovery_manifest_for_test(
+        &mut self,
+        agent: AgentId,
+    ) -> Result<Option<super::shared_recovery::SharedRecoveryManifest>, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .common_snapshot_recovery_manifest()
             .map_err(map_driver_error)
     }
 
