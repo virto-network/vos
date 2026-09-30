@@ -51,11 +51,24 @@ impl std::error::Error for AgentRaftTransportError {}
 pub(crate) struct AgentRaftTransport {
     network: Arc<Network>,
     route: AgentGenerationRoute,
+    #[cfg(test)]
+    isolated: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AgentRaftTransport {
     pub(crate) fn new(network: Arc<Network>, route: AgentGenerationRoute) -> Self {
-        Self { network, route }
+        Self {
+            network,
+            route,
+            #[cfg(test)]
+            isolated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_isolation(mut self, isolated: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.isolated = isolated;
+        self
     }
 
     fn append_fits(&self, message: &RaftMessage) -> Result<bool, AgentRaftTransportError> {
@@ -82,6 +95,10 @@ impl Transport<NodeId> for AgentRaftTransport {
         peer: NodeId,
         request: AppendEntriesReq<NodeId>,
     ) -> Result<AppendEntriesResp, Self::Error> {
+        #[cfg(test)]
+        if self.isolated.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(AgentRaftTransportError::NoReply);
+        }
         let mut entries = request
             .entries
             .into_iter()
@@ -140,6 +157,10 @@ impl Transport<NodeId> for AgentRaftTransport {
         peer: NodeId,
         request: RequestVoteReq<NodeId>,
     ) -> Result<RequestVoteResp, Self::Error> {
+        #[cfg(test)]
+        if self.isolated.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(AgentRaftTransportError::NoReply);
+        }
         let response = receive(self.network.send_agent_raft_vote(
             peer,
             self.route,
@@ -163,6 +184,10 @@ impl Transport<NodeId> for AgentRaftTransport {
         peer: NodeId,
         request: PreVoteReq<NodeId>,
     ) -> Result<PreVoteResp, Self::Error> {
+        #[cfg(test)]
+        if self.isolated.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(AgentRaftTransportError::NoReply);
+        }
         let response = receive(self.network.send_agent_raft_vote(
             peer,
             self.route,
@@ -186,6 +211,10 @@ impl Transport<NodeId> for AgentRaftTransport {
         peer: NodeId,
         request: InstallSnapshotReq<NodeId>,
     ) -> Result<InstallSnapshotResp, Self::Error> {
+        #[cfg(test)]
+        if self.isolated.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(AgentRaftTransportError::NoReply);
+        }
         let response = receive(self.network.send_agent_raft_install_snapshot(
             peer,
             self.route,

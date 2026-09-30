@@ -69,8 +69,9 @@ git show 62ffbc20:docs/agent-recovery-contract.md
 
 Current recipes are owned by `justfile`: `build-agent-recovery-fixture` builds
 the custom scripted guest; `test-local-agent-recovery` builds candidate guests
-and runs the Local suite; `test-shared-agent-publication` supplies the full physical
-Shared gate. Follow the [review guide](agent-saga-review.md) for disk-backed build
+and runs the Local suite; `test-shared-agent-publication` supplies the singleton
+physical publication regression, not the released three-node lifecycle or
+external-state qualification. Follow the [review guide](agent-saga-review.md) for disk-backed build
 and temporary directories. Rebuild guests for the source/ABI being tested; old
 passing logs or native-outer tests are not substitutes for physical qualification.
 
@@ -80,3 +81,7 @@ Nothing is patched after admission. It is a fixture, not an authenticating or
 deployable runtime; preserve the independent normal custom runtime as the public
 contract example. Shared replay and broader release acceptance retain their own
 gates and cannot be qualified by this Local recovery contract alone.
+
+Host-side quorum expiry of a delegated read is separate recovery metadata. It
+does not fabricate a guest result or alter this management-history ABI contract;
+its integration and qualification status belong to the live checklist.

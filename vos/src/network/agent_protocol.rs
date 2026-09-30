@@ -17,7 +17,8 @@ use crate::agent::shared_commit::{
     ReplicaCommitSignature, SharedAgentCommonSnapshotClaim,
 };
 use crate::agent::shared_recovery::{
-    MAX_SHARED_RECOVERY_REGISTRATION_BYTES, SharedRecoveryRegistration,
+    MAX_SHARED_RECOVERY_EXPIRY_CLAIM_BYTES, MAX_SHARED_RECOVERY_REGISTRATION_BYTES,
+    SharedRecoveryExpiryClaim, SharedRecoveryRegistration,
 };
 use crate::service::wire::ServiceWire;
 use async_trait::async_trait;
@@ -80,6 +81,10 @@ const TAG_COMMON_SNAPSHOT_VOTE_REQUEST: u8 = 0x18;
 const TAG_COMMON_SNAPSHOT_VOTE_REPLY: u8 = 0x19;
 const TAG_RECOVERY_REGISTRATION_REQUEST: u8 = 0x1a;
 const TAG_RECOVERY_REGISTRATION_REPLY: u8 = 0x1b;
+const TAG_RECOVERY_EXPIRY_VOTE_REQUEST: u8 = 0x1c;
+const TAG_RECOVERY_EXPIRY_VOTE_REPLY: u8 = 0x1d;
+const TAG_RECOVERY_EXPIRY_REQUEST: u8 = 0x1e;
+const TAG_RECOVERY_EXPIRY_REPLY: u8 = 0x1f;
 const TAG_RAFT_APPEND_REQUEST: u8 = 0x20;
 const TAG_RAFT_APPEND_REPLY: u8 = 0x21;
 const TAG_RAFT_VOTE_REQUEST: u8 = 0x22;
@@ -429,6 +434,20 @@ pub(crate) enum AgentMessage {
         registration: Hash,
         applied: bool,
     },
+    RecoveryExpiryVoteRequest(SharedRecoveryExpiryClaim),
+    RecoveryExpiryVoteReply {
+        claim: Hash,
+        signature: Option<ReplicaCommitSignature>,
+    },
+    /// Request a terminal fence for an already admitted exact request; this
+    /// never authorizes invocation and never reports a synthetic guest ACK.
+    RecoveryExpiryRequest {
+        request: Hash,
+    },
+    RecoveryExpiryReply {
+        request: Hash,
+        applied: bool,
+    },
     Raft(RaftMessage),
     Merge(MergeMessage),
 }
@@ -618,6 +637,20 @@ fn message_is_valid(message: &AgentMessage, route: AgentGenerationRoute, sender:
         AgentMessage::RecoveryRegistrationReply { registration, .. } => {
             *registration != Hash::ZERO
         }
+        AgentMessage::RecoveryExpiryVoteRequest(claim) => {
+            claim.validate().is_ok()
+                && claim.generation().space().0 == route.space.0
+                && claim.generation().agent().0 == route.agent.0
+                && claim.generation().replication_id() == route.generation.0
+        }
+        AgentMessage::RecoveryExpiryVoteReply { claim, signature } => {
+            *claim != Hash::ZERO
+                && signature.as_ref().is_none_or(|signature| {
+                    signature.validate().is_ok() && signature.signer().0 == sender.0
+                })
+        }
+        AgentMessage::RecoveryExpiryRequest { request }
+        | AgentMessage::RecoveryExpiryReply { request, .. } => *request != Hash::ZERO,
         AgentMessage::InvokeRequest(request) => {
             request.work.validate()
                 && request.work.space == route.space
@@ -824,6 +857,26 @@ fn encode_message(
         AgentMessage::RecoveryRegistrationReply { registration, applied } => {
             encoder.u8(TAG_RECOVERY_REGISTRATION_REPLY);
             encoder.fixed(registration.as_bytes());
+            encoder.bool(*applied);
+        }
+        AgentMessage::RecoveryExpiryVoteRequest(claim) => {
+            encoder.u8(TAG_RECOVERY_EXPIRY_VOTE_REQUEST);
+            encoder.bytes(&claim.encode());
+        }
+        AgentMessage::RecoveryExpiryVoteReply { claim, signature } => {
+            encoder.u8(TAG_RECOVERY_EXPIRY_VOTE_REPLY);
+            encoder.fixed(claim.as_bytes());
+            encoder.option(signature, |encoder, signature| {
+                encoder.bytes(&signature.encode())
+            });
+        }
+        AgentMessage::RecoveryExpiryRequest { request } => {
+            encoder.u8(TAG_RECOVERY_EXPIRY_REQUEST);
+            encoder.fixed(request.as_bytes());
+        }
+        AgentMessage::RecoveryExpiryReply { request, applied } => {
+            encoder.u8(TAG_RECOVERY_EXPIRY_REPLY);
+            encoder.fixed(request.as_bytes());
             encoder.bool(*applied);
         }
         AgentMessage::InvokeRequest(request) => {
@@ -1137,6 +1190,28 @@ fn decode_message(decoder: &mut Decoder<'_>) -> Result<AgentMessage, AgentProtoc
         )),
         TAG_RECOVERY_REGISTRATION_REPLY => Ok(AgentMessage::RecoveryRegistrationReply {
             registration: Hash(decoder.fixed()?),
+            applied: decoder.bool()?,
+        }),
+        TAG_RECOVERY_EXPIRY_VOTE_REQUEST => Ok(AgentMessage::RecoveryExpiryVoteRequest(
+            SharedRecoveryExpiryClaim::decode(
+                decoder.bytes_ref_bounded(MAX_SHARED_RECOVERY_EXPIRY_CLAIM_BYTES)?,
+            )
+            .map_err(|_| AgentProtocolError::InvalidValue)?,
+        )),
+        TAG_RECOVERY_EXPIRY_VOTE_REPLY => Ok(AgentMessage::RecoveryExpiryVoteReply {
+            claim: Hash(decoder.fixed()?),
+            signature: decoder.option(|decoder| {
+                ReplicaCommitSignature::decode(
+                    decoder.bytes_ref_bounded(MAX_REPLICA_COMMIT_SIGNATURE_BYTES)?,
+                )
+                .map_err(|_| DecodeError::NonCanonical)
+            })?,
+        }),
+        TAG_RECOVERY_EXPIRY_REQUEST => Ok(AgentMessage::RecoveryExpiryRequest {
+            request: Hash(decoder.fixed()?),
+        }),
+        TAG_RECOVERY_EXPIRY_REPLY => Ok(AgentMessage::RecoveryExpiryReply {
+            request: Hash(decoder.fixed()?),
             applied: decoder.bool()?,
         }),
         TAG_INVOKE_REQUEST => {
@@ -1547,6 +1622,29 @@ where
 }
 
 #[cfg(test)]
+pub(super) fn recovery_expiry_claim_for_test() -> SharedRecoveryExpiryClaim {
+    let registration = crate::agent::shared_recovery::recovery_registration_for_test(1, 9);
+    let committee = crate::agent::shared_commit::common_snapshot_claim_for_test()
+        .active_committee()
+        .clone();
+    let mut manifest = crate::agent::shared_recovery::SharedRecoveryManifest::new(
+        registration.generation(),
+        committee,
+    )
+    .unwrap();
+    manifest.apply_registration(&registration, 1, 3).unwrap();
+    manifest
+        .expiry_claim(
+            registration.request(),
+            1,
+            3,
+            crate::agent::journal::OrderedBase::post_genesis(),
+            20,
+        )
+        .unwrap()
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
@@ -1562,6 +1660,118 @@ mod tests {
 
     fn id<const BYTE: u8>() -> [u8; 32] {
         [BYTE; 32]
+    }
+
+    #[test]
+    fn recovery_expiry_wire_is_canonical_bounded_and_route_bound() {
+        let claim = recovery_expiry_claim_for_test();
+        let generation = claim.generation();
+        let sender = NodeId(claim.committee().members()[0].replica().node.0);
+        let frame = AgentFrame {
+            route: AgentGenerationRoute {
+                space: SpaceId(generation.space().0),
+                agent: AgentId(generation.agent().0),
+                generation: Hash(generation.replication_id()),
+            },
+            sender,
+            message: AgentMessage::RecoveryExpiryVoteRequest(claim.clone()),
+        };
+        for field in 0..3 {
+            let mut wrong = frame.clone();
+            match field {
+                0 => wrong.route.space = SpaceId(id::<99>()),
+                1 => wrong.route.agent = AgentId(id::<99>()),
+                _ => wrong.route.generation = Hash(id::<99>()),
+            }
+            assert!(wrong.encode().is_err());
+        }
+        let encoded = frame.encode().unwrap();
+        let body = 4 + 2 + 4 * 32 + 1;
+        let mut oversized = encoded.clone();
+        oversized[body..body + 4]
+            .copy_from_slice(&((MAX_SHARED_RECOVERY_EXPIRY_CLAIM_BYTES + 1) as u32).to_le_bytes());
+        assert!(AgentFrame::decode(&oversized).is_err());
+        for message in [
+            frame.message.clone(),
+            AgentMessage::RecoveryExpiryRequest {
+                request: Hash(claim.request().0),
+            },
+            AgentMessage::RecoveryExpiryReply {
+                request: Hash(claim.request().0),
+                applied: false,
+            },
+            AgentMessage::RecoveryExpiryReply {
+                request: Hash(claim.request().0),
+                applied: true,
+            },
+            AgentMessage::RecoveryExpiryVoteReply {
+                claim: Hash(claim.commitment().0),
+                signature: None,
+            },
+            AgentMessage::RecoveryExpiryVoteReply {
+                claim: Hash(claim.commitment().0),
+                signature: Some(
+                    ReplicaCommitSignature::new(crate::service::NodeId(sender.0), [7; 64]).unwrap(),
+                ),
+            },
+        ] {
+            let item = AgentFrame {
+                message,
+                ..frame.clone()
+            };
+            let bytes = item.encode().unwrap();
+            assert!(bytes.len() <= MAX_SHARED_RECOVERY_EXPIRY_CLAIM_BYTES + 256);
+            assert_eq!(AgentFrame::decode(&bytes).unwrap(), item);
+            for end in 0..bytes.len() {
+                assert!(AgentFrame::decode(&bytes[..end]).is_err());
+            }
+            let mut trailing = bytes;
+            trailing.push(0);
+            assert_eq!(
+                AgentFrame::decode(&trailing),
+                Err(AgentProtocolError::TrailingBytes)
+            );
+        }
+        for message in [
+            AgentMessage::RecoveryExpiryRequest {
+                request: Hash::ZERO,
+            },
+            AgentMessage::RecoveryExpiryReply {
+                request: Hash::ZERO,
+                applied: true,
+            },
+            AgentMessage::RecoveryExpiryVoteReply {
+                claim: Hash::ZERO,
+                signature: None,
+            },
+            AgentMessage::RecoveryExpiryVoteReply {
+                claim: Hash(claim.commitment().0),
+                signature: Some(
+                    ReplicaCommitSignature::new(crate::service::NodeId(id::<98>()), [7; 64])
+                        .unwrap(),
+                ),
+            },
+        ] {
+            assert!(
+                AgentFrame {
+                    message,
+                    ..frame.clone()
+                }
+                .encode()
+                .is_err()
+            );
+        }
+        let mut noncanonical = AgentFrame {
+            message: AgentMessage::RecoveryExpiryReply {
+                request: Hash(claim.request().0),
+                applied: true,
+            },
+            ..frame
+        }
+        .encode()
+        .unwrap();
+        *noncanonical.last_mut().unwrap() = 2;
+        assert!(AgentFrame::decode(&noncanonical).is_err());
     }
 
     #[test]

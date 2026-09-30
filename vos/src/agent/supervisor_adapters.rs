@@ -4524,6 +4524,7 @@ fn map_shared_host_error(error: super::shared_host::SharedAgentHostError) -> Age
         }
         SharedAgentHostError::CapacityExhausted
         | SharedAgentHostError::Conflict
+        | SharedAgentHostError::ProjectionExpired
         | SharedAgentHostError::InvalidProvision => AgentRouteError::Rejected,
         _ => AgentRouteError::Unavailable,
     }
@@ -4547,6 +4548,7 @@ fn map_shared_projection_error(error: super::shared_host::SharedAgentHostError) 
 fn map_authority_read_error(error: super::shared_host::SharedAgentHostError) -> AgentRouteError {
     match error {
         super::shared_host::SharedAgentHostError::Unavailable => AgentRouteError::NotReady,
+        super::shared_host::SharedAgentHostError::ProjectionExpired => AgentRouteError::Rejected,
         _ => AgentRouteError::Unavailable,
     }
 }
@@ -4682,6 +4684,20 @@ pub fn dispatch_encoded_acknowledgement(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+    #[test]
+    fn shared_projection_expiry_is_terminal_route_rejection() {
+        use crate::agent::shared_host::SharedAgentHostError as Error;
+        assert_eq!(
+            map_shared_host_error(Error::ProjectionExpired),
+            AgentRouteError::Rejected
+        );
+        assert_eq!(
+            map_authority_read_error(Error::ProjectionExpired),
+            AgentRouteError::Rejected
+        );
+    }
 
     #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
     #[test]

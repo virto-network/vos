@@ -1,113 +1,104 @@
 # Agent saga: review entry point
 
 This is the sole reviewer handoff. [The live checklist](agent-saga-status.md)
-owns release scope and deferred work. Review read-only; return findings for the
-implementation branch rather than applying competing fixes on the review branch.
+owns release scope, open gates and deferred work. Review read-only and return
+findings for the implementation branch; avoid competing fixes on the review branch.
 
-## Checkpoint boundary
+## Review boundary
 
-| Purpose | Branch / boundary |
+The user requested completing the live plan before the next whole-branch review.
+This batch follows reviewed baseline `6d3a4926`; its qualified source boundary
+is that baseline plus the implementation in the commit containing this guide.
+Use the worktree diff until committed, then `git diff 6d3a4926..saga/agents`
+after verifying promotion and cleanliness. `master` remains `d2378274`.
+The evidence qualifies candidate slices, not a release or customer capacity.
+
+Use `git show 6d3a4926:docs/agent-saga-review.md` for the baseline's source-specific
+test matrix and two reviewed fixes. `git diff 6c1bab2a..6d3a4926` is a historical
+review-fix range, not the current work or next whole-branch review range.
+Earlier backend, pruning and lifecycle chronology is in Git, not duplicated here.
+
+Production Local remains image-based. Public fixed-three Shared startup/finality,
+management, external ownership and pruning remain gated. Candidate tests do not
+qualify customer load, released-daemon operation or artifact promotion.
+
+## Current batch: invariants to review
+
+Explicit expiry is a separate host recovery terminal for an admitted delegated
+read with **no committed Invoke or published effect**. It never fabricates an
+Invoke/ACK, renews authorization or clears evidence based on time alone. Two
+authenticated voters bind the exact request, complete preterminal manifest,
+committee, trusted time, semantic Ordered predecessor and physical prefix.
+Existing Invoke evidence or an unresolved suffix refuses expiry.
+
+The driver authenticates its expiry floor on open and advances it through verified
+application. Hot manifest reads must agree with that floor. An exact applied
+terminal or byte-identical certified baseline authorizes pending-record cleanup;
+a peer boolean does not. Durable PAP2 cleanup checks the full query/work/auth and
+optional signed owner registration under proposal exclusion. Competing unadmitted
+WAL bytes stay unchanged. Owner-only replacement requires durable prior cleanup.
+The floor fences old admission after terminal replacement, but does not preserve
+an indefinite archive of old receipts or authorize clearing an unadmitted WAL.
+
+Timed-out registration exclusion is released only after a stable applied prefix
+proves an actual higher-term overwrite of that exact append. Preserve the prior
+owner's reservation and original WAL. An admitted same-work request keeps custody;
+missing/compacted rows and timeout alone do not prove overwrite.
+
+External Shared candidate ownership uses the existing signed Linear-only contract.
+Common genesis ancestry requires the exact authenticated initial external
+checkpoint; do not normalize later claims or weaken majority availability.
+Fresh stores are required for candidates created before that correction.
+Durable block closure must precede root publication; missing blocks invalidate
+serving availability. Public startup/Local selection retain their existing gates.
+
+The network fixture now exercises signed Clerk bootstrap, two accounts and a
+settled transfer, exact lost-response/reopen retry, ACK and reference kernel-root
+comparison. That slice passes on this batch's corrected optimized source;
+it does not qualify the customer workload.
+The next external checkpoint slice initially requires ordinary Clerk results to
+be acknowledged. Compaction removes historical Raft anchors: retained Ordered
+blobs and a new common-root certificate alone cannot authenticate old ordinary
+reply availability. The selected retention design is typed, exact-request-bound guest
+inspection under the current common root, using the existing inspection contract
+without a historical index or guest ABI change. It remains unimplemented and
+unqualified; a newer certificate alone is not proof of the exact old outcome.
+
+Candidate `ProjectionExpired` now maps to the existing nonretryable route
+rejection, not retryable transport unavailability. Its focused optimized regression
+passes; public integration is pending qualification. No new public API variant
+is required. This remains part of the existing promotion gate.
+
+## This batch: completed source-specific qualification
+
+All logs below are under `.worktrees/ch08-c2-native/target`. Preserve failures
+and do not inherit older counts after source changes.
+
+| Check | Evidence and limit |
 | --- | --- |
-| Reviewed baseline | `6c1bab2a`, the pending-read custody checkpoint |
-| Implementation | `wip/ch08-runtime-directory`, synchronized with this checkpoint; apply later findings here |
-| Reviewer target | `git diff 6c1bab2a..saga/agents`; verify the branch head first |
-| Scope | Repeated-input evidence/retry admission and expired unadmitted registration; no production cutover |
-| Mainline | `master` remains `d2378274`; no automatic push or mainline change |
-
-This is a qualified review-fix checkpoint, not a release. Verify both branch
-heads and clean working trees before review. Production multi-node startup,
-public Shared management and pruning remain gated; production Local stays
-image-based. No guest ABI, artifact pin or execution-authority change is included.
-
-The previous batch's design, 16 exact-release physical fixtures and 238 focused
-passes are historical baseline evidence, not qualification of these changes:
-`git show 6c1bab2a:docs/agent-saga-review.md`. Do not duplicate that chronology here.
-
-## Two review fixes
-
-### Repeated input must not replace canonical recovery evidence
-
-Custody keeps the first physically validated terminal Invoke and first positive
-ACK. A later valid Ordered entry can repeat the same input and return a different
-result, including a negative ACK; it must neither overwrite the original capsule
-nor release its delivery obligation. Physical evidence is checked against the
-exact Ordered position and input, using a bounded position-keyed result cache,
-not the latest result for that input. Retained response lookup prefers the proven
-capsule over a later repeated-input result.
-
-Same-key reservation and already-reserved submission now independently require a
-fresh quiescent committed/applied prefix under the per-Agent proposal guard.
-An ambiguous uncommitted append retains its exclusion; a second caller cannot
-append behind it merely because both callers already hold the same key.
-The worker barrier is sampled again after draining committed work. Catch-up,
-election or tail movement between samples is retryable unavailability, with the
-reservation retained; a contradictory applied cursor against a stable sample
-still fails as corruption.
-
-This prevents invalid retries; it does **not** repair an old raw log containing
-the same immutable Ordered entry at different Raft positions. Existing physical
-publication binding still rejects that history. The regression repeats the same
-ReplayInput in a new valid successor Ordered entry after the original commits;
-it does not weaken those bindings or manufacture a publication.
-
-### Unadmitted custody needs fresh delegation or exact execution evidence
-
-Before a new owner registration mutates a reservation or appends a row, the
-leader checks the original scoped delegation against current trusted time, or
-requires exact retained terminal Invoke/positive-ACK evidence. It repeats the
-check after validation/encoding immediately before append. A custody-only slot
-is not execution evidence and does not waive freshness for another owner.
-
-An exact already-applied owner registration remains an idempotent retry after
-expiry. That does not authorize unseen execution or permit custody release.
-An expired competing unadmitted WAL stays byte-identical and cannot acquire the
-leader's exclusion or block a different fresh request by registering itself.
-
-Review particularly: exact position/outcome binding after reopen; first-response
-precedence; negative ACK non-retirement; both reservation and submission barriers;
-freshness at append; and the distinction between applied custody and execution
-authority. Existing legacy recovery, owner-only replacement, reservation ownership
-and fresh post-peer-I/O evidence checks must remain intact.
-
-## Qualification status
-
-The earlier timeout fixture incorrectly reused an immutable Ordered entry at a
-new Raft position and was correctly rejected. Its failure remains in
-`custody-review-debug2-candidate_registered_same_leader_timeout_and_duplicate_rows_survive_reopen.log`.
-The corrected fixture first proves timeout retries append nothing, then commits
-valid repeated-input successor entries; qualification is below.
-
-The first optimized matrix passed 17 of 18 cases. The former-leader pre-Invoke
-case exposed a stale worker-snapshot comparison after successful follower
-catch-up (`custody-review-physical-delegation.log`: 7 passed, 1 failed).
-Post-drain barrier revalidation addresses that race without relaxing equality,
-admission or deadlines. All 11 targeted final-source physical reruns pass. The
-seven other checkpoint/custody cases remain explicitly earlier-source evidence; they
-must not be counted as a full final-source 18-case rerun.
-
-Do not inherit baseline counts or treat ignored/socket-restricted tests as passes.
-
-| Check | Source-specific evidence |
-| --- | --- |
-| Exact-release build and focused units | Final build passed in 12m00s; 278 passed, 4 existing ignored, including all 35 Local journal tests and the deterministic barrier-drift test; `custody-review-final-release-build.log`, `custody-review-final-release-*.log` |
-| Same-leader timeout, valid repeated inputs and reopen | Final source passed, 41.36 s; `custody-review-final-physical-candidate_registered_same_leader_timeout_and_duplicate_rows_survive_reopen.log` |
-| Expired competing unadmitted intent, exact-release rerun | Final source passed, 45.33 s; `custody-review-final-physical-candidate_expired_unadmitted_intent_cannot_acquire_custody_after_election.log` |
-| Final-source delegation and follower-delivery regressions | All 8 delegation/compatibility cases passed, 172.13 s; `custody-review-final-physical-delegation.log`. Follower delivery passed, 171.88 s; `custody-review-final-physical-candidate_registered_follower_delivery_survives_leader_reads_and_repeated_checkpoints.log`. |
-| Previous checkpoint/custody physical regressions | 8 passed in 649.62 s immediately before the barrier-race correction; `custody-review-physical-common.log`. Follower delivery was rerun above; the other 7 are earlier-source evidence only. |
-| Supported feature checks, default CLI and daemon smoke | Final minimal std and no-std experimental runtime passed; CLI 300 passed / 45 existing ignored (80.46 s); smoke 2 passed (13.87 s); `custody-review-final-feature-*.log`, `custody-review-final-cli.log`, `custody-review-final-shutdown-smoke.log` |
-| Changed-range formatting and whitespace | Six Rust files pass changed-range rustfmt checks; `git diff --check` passes; baseline formatting left untouched |
+| Corrected default release build | Passed, 14m03s; `expiry-corrected-release-build.log`, binary `release/deps/vos-59a730e87ba3c2af`. Includes the call-local audit reuse, per-Agent expiry singleflight, terminal routing and bounded fixture retry. Physical qualification is separate. |
+| Focused optimized matrix | All 188 passed, none ignored; `expiry-corrected-unit-*.log`. Recovery manifest, Raft ledger, staging, protocol/network/shared transport, Local driver/keyed paths, supervisor and exact host/mapper/replay regressions. |
+| Supported feature checks and conditional prefix | Guest `agent-runtime` 6.76 s; external guest 1.95 s; production `vosx` with external feature 23.50 s. `expiry-corrected-check-guest.log`, `-guest-external.log`, `-vosx.log`; compile checks, not deployed CLI qualification. Conditional-prefix worker regression: one passed, `expiry-corrected-worker-prefix.log`. |
+| Corrected optimized expiry/offline-origin/minority/common-import | Passed, 130.05 s; `expiry-corrected-release-offline.log`, quiet with diagnostics disabled. Covers offline expiry, minority noncleanup, actual follower RPC expiry, genuine two-of-three common certificate retry, exact terminal/floor export-import, pending-record preservation and reopen cleanup. This is candidate-slice qualification, not complete release qualification. |
+| Competing durable intent | Passed, 25.94 s; `expiry-corrected-release-candidate_expired_dependency_preserves_competing_durable_intent.log`. Exact unadmitted WAL survives the admitted dependency's terminal recovery. |
+| Overwritten registration | Passed, 57.80 s; `expiry-corrected-release-candidate_overwritten_registration_releases_remote_exclusion_without_reattachment.log`. Real election/registration RPC; completion uses the peer handler because this fixture lacks the node-loop dispatcher. |
+| Same-leader timeout and duplicate rows | Passed, 51.58 s; `expiry-corrected-release-candidate_registered_same_leader_timeout_and_duplicate_rows_survive_reopen.log`. Exact custody survives repeated rows and reopen. |
+| Signed full-outer three-network Clerk lifecycle | Passed, 33.92 s; `expiry-corrected-release-three_network_replicas_external_clerk_install_invoke_ack_reopen.log`. Signed bootstrap, two accounts and settled transfer match the reference kernel root; exact lost-response/reopen retry, ACK and complete three-replica claims pass. |
+| Three-file external lifecycle/missing block | Passed, 23.86 s; `expiry-corrected-release-three_file_replicas_external_clerk_install_invoke_ack_reopen.log`. Complete claim comparison, reopen and missing-block refusal. |
+| Pre-correction optimized expiry failure | Failed, 94.93 s; `expiry-resume-release-offline.log`. Successful votes at about 1.25–1.30 s were delayed by redundant capacity audits to 2.23–2.29 s beyond the unchanged 1.8-s wait; retries amplified the queue. The correction preserves deadlines, quorum, freshness and proof requirements. |
+| Effective formatting/whitespace | Full formatter-output comparison parses all 16 changed Rust files, including the new expiry fixture, and finds no hunks intersecting changed code; `git diff --check` passes. Baseline-only debt is preserved; narrow hunk ranges alone are insufficient. |
 
 Whole-fixture durations are not request latency, throughput or failover bounds.
-Whole-manifest decoding/signature/provenance costs remain unqualified. The earlier
-call-local proof reuse and staged writer publication do not establish capacity.
-
-The pre-existing `std storage` without-network embedding build still has missing
-network-gated route-adapter symbols. It is outside the approved v1 host/CLI
-combination and is not silently counted as a supported passing feature check.
+The final network fixture samples bootstrap/account Invoke+ACK at 819/732/809 ms,
+transfer Invoke at 655,052 us and post-reopen `state_root` Invoke at 694,568 us.
+The latter samples exclude ACK and reopen time; these are single samples, not a
+load result or latency distribution. The optimized passes do not qualify all
+pending scopes or public lifecycle. Preserve earlier failure logs without
+inheriting their source-specific outcomes.
 
 ## Reproduction
 
-Use the implementation worktree and disk-backed temporary storage, not `/tmp`:
+Use the implementation worktree and disk-backed temporary storage:
 
 ```sh
 export CARGO_TARGET_DIR=/home/daniel/src/virto/vos/.worktrees/ch08-c2-native/target
@@ -120,46 +111,49 @@ export AUTHORITY_CANDIDATE_ELF="$CARGO_TARGET_DIR/agent-state-authority/riscv64e
 export GREY_PVM=recompiler
 cargo +nightly-2025-05-09 test --release --offline --locked -p vos \
   --features 'agent-runtime storage network http-ingress experimental-state-blocks' \
-  --lib agent::clean_bootstrap::tests::physical::common_checkpoint:: \
+  --lib agent::clean_bootstrap::tests::physical::recovery_expiry:: \
   -- --ignored --test-threads=1 --nocapture
 ```
 
-The common-checkpoint filter includes the two new regressions as well as the
-previous custody and common-checkpoint cases. Run the same command with filter
-`agent::clean_bootstrap::tests::physical::candidate_projection_` for the six
-delegation cases and two stale-registration/legacy-execution races.
+Run physical qualification separately from compilation, with loopback socket
+permission. The common-checkpoint filter includes overwrite and earlier custody
+regressions. For external lifecycle use
+`agent::clean_bootstrap::tests::physical::external_shared::` and additionally set:
 
-Loopback fixtures need socket permission. Do not overlap physical qualification
-with compilation. Verify the Authority candidate SHA-256:
-`a88872c5de59d97905ccfb043268fa8ef6aea5a1c0e354b9c7c3255fed05e2ed`.
-Another digest at the same path cannot inherit evidence. This is the unchanged
-signed-delegation candidate, not bundled-artifact promotion. Release pins belong
-to `support/production-artifacts.toml` and `vosx/build.rs`.
+```sh
+export VOS_AGENT_PROFILE_REFINE_MACHINES=1
+export VOS_AGENT_DISABLE_REFINE_ATTRIBUTION=1
+export CLERK_AGENT_PACKAGE="$CARGO_TARGET_DIR/clerk-agent-canonical/clerk-ledger.vos"
+```
 
-The default fixture uses the native clean-runtime test adapter around physical
-Authority actor execution. Full outer-PVM execution additionally requires
-`VOS_AGENT_PROFILE_REFINE_MACHINES=1`; disable instruction attribution with
-`VOS_AGENT_DISABLE_REFINE_ATTRIBUTION=1` for timings. The default fixture cannot
-substitute for full-outer-PVM or released-daemon qualification.
+Pinned candidate SHA-256 values:
 
-For diagnosis only, enable `VOS_TEST_BOOTSTRAP_DIAGNOSTICS=1`,
-`VOS_SHARED_RECOVERY_TIMING=1` and the fixture tracing filter. Diagnostic builds
-with `profile.release.lto=false` and `profile.release.codegen-units=16` are not
-the default release and must be labeled separately.
+- Authority: `a88872c5de59d97905ccfb043268fa8ef6aea5a1c0e354b9c7c3255fed05e2ed`.
+- External runtime, `agent-state-standard/riscv64em-vos/release/agent_runtime.elf`:
+  `6511822a0f9d5b46bad657ac233786e0b5bcc75033262ec135d567bb747b25f0`.
+- Canonical Clerk package:
+  `628a9aafd357214b927d7165b82b01459269c553b2ec3244524b73d3eaf4be7c`.
 
-## Remaining release boundary
+Changed artifacts cannot inherit earlier evidence. Production pins remain in
+`support/production-artifacts.toml` and `vosx/build.rs`; candidate tests do not
+promote them. Default Authority fixtures use the native clean-runtime test adapter
+around physical actor execution. Full outer-PVM execution requires the flag above
+and remains a separate qualification boundary.
 
-The [live checklist](agent-saga-status.md) retains the release gates. In particular,
-post-admission expired-unseen terminal resolution, legacy/management recovery
-across pruning, and whole-manifest performance are **not qualified by these fixes**.
-Registration timeout followed by overwrite still needs its stated liveness
-qualification; preserving an unadmitted exclusion is not proof of recovery.
+For diagnosis use `VOS_TEST_BOOTSTRAP_DIAGNOSTICS=1`,
+`VOS_SHARED_RECOVERY_TIMING=1` and a narrow tracing filter. Phase diagnostics
+are test-only and can affect timing while locks are held. Quiet optimized tests
+are required before latency claims. Builds overriding release LTO/codegen are
+diagnostic builds and must not be labeled the default release.
 
-External Shared root closure/export/reclamation, public lifecycle, Clerk with
-100,000 retained transfers, released workload/failure/backup/restore, soak and
-reproducible artifacts remain open. External nodes will be supplied later;
-local tooling/tests do not close that hardware acceptance gate. No release date
-or completion percentage is established.
+## Remaining review/release gates
+
+The live checklist retains all mandatory gates: complete pending-scope recovery
+across pruning, external root closure/export/reclamation, public lifecycle,
+100,000 retained transfers, load/overload/failover/backup/restore, soak and
+reproducible artifacts. External nodes are supplied later; local tooling/tests do
+not close hardware acceptance. Public external Local, migration, dynamic
+membership and other deferred capabilities remain outside v1.
 
 Return severity, location, violated invariant, concrete scenario and regression.
 Separate demonstrated defects from unqualified release gates.

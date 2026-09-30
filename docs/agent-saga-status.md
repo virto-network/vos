@@ -1,164 +1,136 @@
 # Agent saga: v1 release checklist
 
-This is the single live plan. [Review instructions and checkpoint evidence](agent-saga-review.md)
-are the sole reviewer entry point. History is in Git, not a parallel set of plans.
-A passing internal checkpoint is not a release. No completion percentage or
+This is the single live plan. [The review guide](agent-saga-review.md) is the
+sole reviewer entry point. Historical evidence lives in Git, not parallel plans.
+A passing internal checkpoint is not a release; no completion percentage or
 release date is established.
 
-## Finish line and current position
+## Approved finish line and current position
 
-The approved target is a usable **Linux x86-64, fixed authenticated three-node
-Shared deployment**, production **image-based Local Agents**, and one Shared
-Clerk with **100,000 retained transfers**. Keep Clerk's kernel, signatures,
-committed roots and exact retry semantics. Do not replace this with a singleton,
-smaller dataset or an experimental-only release without a new user decision.
+A usable **Linux x86-64, fixed authenticated three-node Shared deployment**,
+production **image-based Local Agents**, and one Shared Clerk with **100,000
+retained transfers**. Preserve Clerk's kernel, signatures, committed roots and
+exact retry semantics. A singleton, smaller dataset or experimental-only release
+requires a new user decision.
 
-The review-fix checkpoint is `6c1bab2a..saga/agents`. It addresses repeated-input
-evidence/retry admission and expired unadmitted registration, including a
-catch-up barrier race exposed by qualification. `wip/ch08-runtime-directory` and
-`saga/agents` share this checkpoint; verify the heads before review. This is
-**one scoped review-fix batch**, not production startup or service qualification.
-Preceding signed read delegation is `6d2a9b38`; Shared journal/applied availability
-is `7c1a1b7c`; backend follow-up `4ea0271c`, pruning
-`48df3995`, and admission baseline `62ffbc20` retain their
-historical evidence. Findings continue on the implementation branch before a
-qualified fast-forward. `master` is unchanged; do not push or change it automatically.
+The user requested completing this plan before the next whole-branch review.
+This qualified batch follows the reviewed baseline `6d3a4926`; its source
+boundary is that baseline plus the implementation in the commit containing
+this document. The active worktree is `.worktrees/ch08-runtime-directory`.
+Verify actual branch heads and cleanliness before using the checkpoint; do not
+infer promotion from these docs. `master` remains `d2378274`; no automatic push,
+mainline change, artifact promotion or deployment is included.
 
-Status vocabulary: **implemented** means source and focused tests exist;
-**integrated** means the supported workflow selects it; **qualified** means its
-specified acceptance test passes on the actual release. These are not synonyms.
+**Implemented** means source and focused tests exist; **integrated** means the
+supported workflow selects it; **qualified** means its specified acceptance test
+passes on the actual release. These are separate milestones.
 
-Current evidence, without promoting production startup or changing the finish line:
+## This batch: candidate qualification completed
 
-- Independent review reproduced a recompiler gas-parity bug when re-invoking
-  a terminal inner machine. The reviewed fix preserves reference funding;
-  276 PVM tests and 20 vectors pass, plus the no-default-features check.
-- The normal custom-linear guest now has 36 exact-input backend comparisons
-  across Local/Shared lifecycle, retained results, retries and scheduling.
-  This closes the missing custom-layout test coverage, not service qualification.
-- Shared external integration uses the existing signed Linear-only runtime
-  capabilities. Physical Create/Clerk Install produce identical state on three
-  replica identities without normalizing node-local roots or changing the ABI.
-  The internal journal now passes Create/Install/Invoke, lost-response reopen,
-  ACK/reopen and missing-block refusal across three independent file owners.
-  This uses committed-slot fixtures, not three released daemons or Clerk transfers.
-- Transport result delivery now requires exact applied availability on a voter
-  majority, with an independent bounded request pool. External blocks are durable
-  before head publication; detected missing data invalidates the serving pin.
-  The external driver and transport are not yet joined through public startup.
-- Review-driven fixes align physical preview with committed replay, retain exact
-  declared Merge-root fencing, cover legal suffix recovery budgets, and preserve
-  singleton-image snapshot retries. These are correctness fixes, not throughput
-  evidence. Direct external operations currently execute preview plus application.
-- The user-approved scoped, expiring signed read delegation (2026-09-29) binds
-  the query to its generation, committee and original preflight slot; unseen
-  admission independently checks the current trusted clock. Candidate physical
-  tests now complete a pre-Invoke read with its original attesting Network shut
-  down, preserve both reopen orderings, and refuse invalid delegation/generic
-  ingress bypasses. Legacy reads remain committed-only and byte-compatible.
-  This is an opt-in candidate path, not automatic production read delegation.
-- Expired, unseen pending reads stay fail-closed. The `6d2a9b38` survivor fixture
-  receives the frozen query from its harness; the current custody batch adds
-  replicated discovery after registration is applied. Origin loss before that
-  admission and safe terminal resolution remain limitations. Production stays gated.
-- Common snapshot votes bind the same shared Ordered state, committee, epoch
-  and exact semantic ancestry. Each node separately signs its own physical
-  checkpoint binding. Existing AGS3/AGP1 formats keep their meaning; no foreign
-  node/store claim is treated as a local publication capability.
-- Candidate catch-up derives destination-local state from admitted genesis,
-  preserves higher Raft term/full NodeId vote, rejects changed or speculative
-  cached membership and rollback, and refuses any unknown log suffix beyond its
-  target. The healthy fixed-three physical workflow and three source/destination
-  crash-boundary fixtures pass: pruned-prefix catch-up, exact boundary Query
-  retry/ACK, reopen and continued common ordering with mixed checkpoint cadence.
-  These are candidate fixtures, not released-daemon qualification.
-  Physical compaction/catch-up entrypoints remain
-  test-only: a local "no pending work" check cannot protect an offline origin's
-  unresolved after-ACK PAP2. Boundary-only Query recovery is not evidence of
-  arbitrary historical reply retention. Production pruning stays disabled until
-  all pending scopes have qualified recovery evidence, not only delegated reads.
+Three connected changes are implemented and qualified on the same corrected
+optimized source, without claiming release closure:
 
-Custody retains at most one recovery slot per physical owner in the
-fixed-three committee, not per query attestor. Registration retains
-the exact signed request and original work/preflight in the existing Raft log
-before claiming recoverable admission. Physically verified terminal Invoke and
-positive ACK evidence enrich the slot; common checkpoints bind and carry it.
-Forwarding followers also need a delivery obligation because their original
-response can otherwise disappear after the leader's local cleanup. An owner
-may replace only its own completed slot, using a signed monotonic sequence after
-its prior PAP2 is durably clear. Keep the last completed slot until replacement,
-avoiding a separate release round on every read while retaining a fixed bound.
-This adds one registration round for Authority reads, not ordinary actor calls.
-The local PAP2 write is a registration intent, not recoverable admission: an
-origin lost before quorum registration can still leave a request undiscoverable
-to survivors. This slice conservatively admits one distinct unfinished delegated
-read per system Agent; separate owner holds for that exact read share its result.
-Recovery may finish an admitted read directly from shared custody while retaining
-a different, unadmitted local intent unchanged. Neither path relaxes execution
-authorization or treats a registration signature as proof of its result.
-This batch adds no guest ABI or private-state decoding. Delegation expiry is never
-permission to drop evidence; expired-unseen cancellation and unsupported
-management/legacy obligations remain explicit pruning gates until qualified.
+- Explicit quorum expiry spans the recovery manifest, Raft ledger, filesystem
+  owner, authenticated transport and exact pending-record cleanup. An audited,
+  cached expiry floor survives terminal-slot replacement. The quiet corrected
+  default-release fixture passes (130.05 s), covering offline origin, minority
+  noncleanup, actual follower RPC expiry, genuine two-of-three common checkpoint
+  certification, exact terminal/floor export-import and pending-record preservation/
+  reopen cleanup. This qualifies the tested candidate slice, not public startup.
+- Timed-out registration exclusion is released only after a stable applied
+  higher-term overwrite proves the original append absent. Its optimized real
+  election/retry fixture passes (57.80 s); completion uses the real peer handler
+  because this harness has no node-loop projection dispatcher. Competing durable
+  intent preservation (25.94 s) and same-leader timeout/duplicate-row recovery
+  (51.58 s) also pass.
+- External Shared candidate owners join the real network path. Common genesis
+  ancestry is selected only after exact authenticated external genesis-checkpoint
+  validation; Local/image replay and complete claim equality retain their checks.
+  Use fresh candidate stores: old unpromoted journals with replica-local shared
+  ancestry are not migrated. The full-outer three-network lifecycle passes
+  (33.92 s): signed Clerk bootstrap, two accounts and settled transfer, exact
+  lost-response/reopen retry, ACK, reference kernel root and complete claims on
+  all three replicas. The three-file lifecycle also passes (23.86 s), including
+  missing-block refusal. Neither qualifies public startup, retained-data growth,
+  load or external checkpoint/catch-up.
 
-Final-source optimized evidence: 278 focused tests pass with four existing
-ignored, plus 11 physical cases (two new review regressions, eight delegation/
-compatibility cases and follower delivery across checkpoints/reopen). Seven
-other checkpoint/custody cases passed immediately before the final barrier-race
-correction; they are earlier-source evidence, not a full final-source 18-case
-rerun. CLI 300 active tests, two daemon smoke tests and supported feature checks
-also pass. A late first custody slot is refused after an exact legacy Invoke or
-positive ACK. A racing signed intent remains unchanged
-while exact legacy recovery finishes, and clears only after proven positive ACK.
-These fixtures use the native clean-runtime test adapter around physical Authority
-execution; full outer-PVM and released-daemon qualification remain separate gates.
+The corrected default release build passes (14m03s), all **188 focused optimized
+tests** pass with none ignored, and the conditional-prefix worker regression
+passes. Supported guest, external guest and production `vosx` feature checks
+pass. Logs and exact test boundaries are in the review guide; full customer
+workflow and service qualification remain open.
+The independent full formatter-output recheck parses all 16 changed Rust files
+and finds no formatting debt intersecting changed code; `git diff --check`
+passes. Baseline-only formatting remains untouched.
 
-The follow-up preserves the first terminal Invoke and first positive ACK while
-checking physical replay by exact Ordered position, not the latest input cache.
-Later valid repeated inputs cannot replace canonical custody or its response;
-negative ACK rows do not release it. Same-key reservation and already-reserved
-submission both recheck the committed/applied prefix. A fresh post-drain worker
-sample distinguishes legitimate catch-up from a contradictory stable cursor;
-changed samples return retryable unavailability without releasing the reservation.
-New registration requires fresh delegation or exact retained execution evidence
-before append/reservation
-mutation; retrying an existing admitted registration remains idempotent.
-No guest format, artifact or execution-authority change is included.
+The earlier optimized expiry failure identified redundant capacity audits and
+overlapping retries, not an authorization/binding refusal. The scoped correction
+reuses one full audit within a locked call and excludes concurrent expiry attempts
+per Agent. The final quiet optimized fixture passes without changing deadlines,
+quorum, freshness or proof requirements. Its bounded exact checkpoint retry is
+test-only. Keep the earlier failed release/debug evidence; whole-fixture durations
+are not request-latency or service-capacity measurements.
 
-This prevents a second immutable Ordered entry from being proposed behind an
-unresolved append. It does not repair old raw logs already containing the same
-immutable entry at two Raft positions: those violate the existing physical
-publication binding and must still fail closed. Valid repeated inputs use new
-Ordered entries. Keep this distinction explicit in reviewer evidence.
+After committing this coherent batch and verifying the `saga/agents` checkpoint,
+continue certified external checkpoint/catch-up using
+existing certificates, typed block traversal and recovery markers. Initially
+checkpoint only with ordinary Clerk results acknowledged. Common-ledger
+installation removes historical Raft anchors: retained Ordered blobs alone do
+not prove old ordinary replies available. The selected retention design is a
+typed, exact-request-bound guest inspection proof under the current common root, using
+the existing inspection contract; no historical index or guest ABI change.
+It is unimplemented and unqualified. A new checkpoint certificate alone cannot
+substitute for the old result claim.
 
-Next scoped step: qualify reconciliation when a registration append times out
-and is later overwritten before commitment. The coordinator conservatively retains its exact
-volatile projection exclusion; without an owner retry, reattachment may be needed
-to release that exclusion. This is a liveness limitation of an unadmitted intent,
-not evidence that an admitted request or result was lost. The current policy unit
-tests establish retained exclusion, not a physical append-overwrite recovery test.
+Public three-node startup/finality, external owner selection, public Shared
+management and pruning remain gated. No current result establishes production
+cutover, customer capacity or the complete customer workflow.
 
-No finish-line change follows from these results. The remaining work stays in
-the three batches below; do not add a parallel plan or treat these as a release.
+## Recovery requirements
 
-| Area | Current checkpoint evidence | Remaining release boundary |
-| --- | --- | --- |
-| Admission and recovery | Baseline `62ffbc20` binds complete imported-plan certification and rejects unsupported rosters before writes; mixed-generation recovery P1 resolved | Review checkpoint findings; remaining three-node crash boundaries |
-| Fixed three-node bootstrap | Baseline common certified genesis, physical startup/reopen and post-Invoke leader-loss fixtures pass | Production startup remains gated; actual three-process daemon/HTTP qualification is pending |
-| Local execution | Image path retained; final default/reference Local suites and actual default-selected image daemon pass; public external Local removed | Exact-release performance, recovery and backup qualification |
-| External actor storage | Internal fixed-three-voter Linear-only Shared executor/finality and three-file Clerk query/recovery slice pass; prior Local Clerk transfer fixture passes on both backends | Public Shared owner/startup/route integration, network availability/catch-up, retained growth, reclamation and export |
-| VM backend | Outer/inner recompiler integrated; Linux x86-64 Agent default and explicit interpreter pass focused differential/physical checks; bounded preparation caches and post-cache phase measurements recorded; custom-runtime differential and terminal-reuse fix pass | Exact-release resource/cold-warm qualification and service capacity |
-| Customer workflow | Ordinary Shared production finality and public management are unavailable | Released Shared Create/Install/Invoke, Shared Clerk and usable CLI orchestration |
-| Operations | Historical source-specific tests exist; current backup is registry-only | Load, overload, failover, Agent backup/restore, soak and reproducible release artifacts |
+Custody retains at most one signed slot per physical owner in the fixed-three
+committee. Registration commits the exact request, work and original preflight
+before recoverable admission. PAP2 alone is an intent: origin loss before quorum
+registration can leave a request undiscoverable. Admit one distinct unfinished
+delegated read per system Agent; separate holders of that exact read share its
+result. This adds a registration round for Authority reads, not ordinary calls.
+
+Preserve the first physically verified terminal Invoke and first positive ACK.
+Later valid repeated inputs cannot replace their evidence/response; negative
+ACKs do not retire custody. Verify the exact Ordered position rather than the
+latest outcome for an input. Reservation and submission require fresh committed/
+applied barriers. Movement during validation is retryable unavailability; a
+contradictory stable cursor is corruption. Old logs assigning one immutable
+Ordered entry to multiple Raft positions remain invalid.
+
+New registration requires fresh delegation or exact retained execution evidence.
+An already-applied registration can retry after expiry without authorizing unseen
+execution. Recovery may finish an admitted dependency while retaining a different
+unadmitted local intent unchanged. Owner-only monotonic replacement requires the
+previous PAP2 to be durably clear.
+
+The user approved explicit expiry finality on 2026-09-30. A quorum-certified
+terminal proves **no committed Invoke or published effect**, not that a VM preview
+never ran. It retains the exact request/proof and is distinct from Invoke/ACK.
+Signers bind the manifest, committee, trusted time and semantic/physical prefix.
+Existing Invoke evidence and ambiguous suffixes refuse expiry. Clock expiry
+alone never permits execution, evidence deletion or durable cleanup. Historical
+no-expiry bytes remain unchanged; new host recovery envelopes are versioned
+without a guest ABI change.
+
+The certified floor fences stale admission after holder replacement or clock
+regression. It is not an indefinite archive of the original terminal and cannot
+clear an unadmitted WAL by itself. Candidate `ProjectionExpired` now maps to the
+existing nonretryable route rejection instead of transport unavailability. Its
+focused optimized regression passes; public integration remains unqualified. No
+new public API variant is needed. Production authenticators presently create
+legacy reads without this delegation.
 
 ## Batch 1 — Simplify and qualify the recompiler
 
-Checkpoint `48df3995` implements pruning and outer/inner recompiler integration, with
-focused differential, physical lifecycle, Clerk and feature-build evidence.
-Agent execution now selects the recompiler by default on Linux x86-64, with an
-explicit interpreter override. Final focused default/reference, CLI and actual
-image-daemon checks pass; this is scoped checkpoint evidence, not a release.
-Initial optimized phase measurements show real but bounded gains; exact-release
-and cold/warm customer-workflow qualification remain open. See the [candidate evidence](agent-saga-review.md).
+Linux x86-64 Agents select the recompiler by default with an explicit interpreter
+override. Backend/lifecycle checkpoint evidence is historical; exact-release
+customer-workflow phase measurements remain open.
 
 - [x] Establish the tested `62ffbc20` review-fix baseline on `saga/agents` before
   promoting later changes. Retain this commit as the recovery reference for pruning.
@@ -200,9 +172,7 @@ and cold/warm customer-workflow qualification remain open. See the [candidate ev
   permissions, host-call suspension/resume and commitments, including standard
   and genuinely different custom-runtime layouts. Run physical lifecycle/recovery
   tests and supported feature builds after pruning and backend changes.
-  Exact standard-runtime comparisons and both custom-runtime physical suites pass.
-  The continuation adds 36 exact custom-runtime comparisons; core feature checks,
-  CLI build and focused integrated host reruns pass. The final released-artifact
+  Standard/custom-runtime checkpoint evidence exists; the final released-artifact
   matrix remains a batch 3 gate.
 
 Exit: a scoped, tested checkpoint with actual phase timings. Recompiler speedups
@@ -215,31 +185,27 @@ do not by themselves qualify Shared capacity or eliminate whole-runtime work.
   Keep unsupported production paths gated until their admission/recovery is proved.
 - [ ] Qualify leader loss before Invoke commit and the remaining ACK/metadata-clear
   crash matrix. Preserve exact retry, fresh authorization, reservation ownership
-  and unpublished recovery. The current candidate custody/checkpoint/delegation
-  follow-up passes 11 final-source optimized fixtures, including both new review
-  regressions, follower delivery and all eight delegation/compatibility cases.
-  Seven additional checkpoint/custody cases are explicitly earlier-source
-  evidence. This does not qualify all pending scopes, full outer-PVM execution
-  or production startup.
+  and unpublished recovery. Historical custody/checkpoint/delegation fixtures do
+  not qualify all pending scopes, full outer-PVM execution or production startup.
   Signed delegation is an explicit candidate-only opt-in: legacy authenticators
   still emit ordinary reads. Delegated SSH attestors must be current voters with
   authenticated committee keys. Applied custody now retains delegated signed
-  requests for offline-origin discovery. Finish expired-unseen terminal resolution
-  and qualify every pending scope before production; neither local absence nor
-  a timeout releases PAP2.
+  requests for offline-origin discovery. Expired-unseen terminal resolution passes
+  the candidate offline/quorum/import fixture; qualify every pending scope before
+  production. Neither local absence nor a timeout releases PAP2.
 - [ ] Collect quorum-certified snapshots/checkpoints and qualify restart/catch-up
   before replay capacity is exhausted. Optional checkpoint skipping is temporary;
   mandatory capacity/certificate guards must continue to fail closed.
   Use a common-state QC plus a separately signed physical node/store binding;
   collecting signatures over different local claims is not a quorum certificate.
   Preserve semantic ancestry independently of physical checkpoint cadence.
-  The candidate image path now passes pruned-prefix catch-up, exact boundary
-  lost-response retry, reopen, continued ordering and source/destination marker,
-  journal and ledger interruption tests. Mutation remains test-only
+  Image candidate fixtures cover pruned-prefix catch-up, exact boundary retry,
+  reopen, ordering and marker/journal/ledger interruptions. Mutation remains test-only
   until **all** pending recovery scopes survive retirement, including an offline
   origin's after-ACK PAP2. Do not replace that gate with a local absence check or
-  weaken exact retry. External block-root closure/export remains a separate
-  integration gate; image catch-up does not qualify the 100,000-transfer workload.
+  weaken exact retry. Ordinary retained replies need authenticated proof across
+  compaction. External block-root closure/export remains a separate integration
+  gate; image catch-up does not qualify the 100,000-transfer workload.
 - [ ] Integrate the existing external-state executor and block store into Shared
   Clerk through a narrow internal executor selection, not a new driver framework.
   The internal driver now supports signed Linear-only Shared Create/Install,
@@ -251,16 +217,21 @@ do not by themselves qualify Shared capacity or eliminate whole-runtime work.
   under Shared quorum rules, including missing blocks, minority failure and
   catch-up. Preserve provenance, exact predecessor checks and retry atomicity.
   Missing data is unavailable state, never an absent row or successful execution.
-  Local file-owner and authenticated transport checks pass independently; the
-  integrated external network/minority/catch-up workflow is still required.
+  The full-outer signed network and three-file lifecycle slices pass on this
+  batch's optimized source. Integrated external minority behavior and catch-up
+  remain unqualified.
 - [ ] Bound reclamation and root-pinned export. Retain authoritative, pending,
   checkpoint, retry/recovery and backup roots. Maintenance-window reclamation is
   acceptable; unbounded historical retention is not. Use public block closure
   traversal, not host decoding of private runtime/actor state. Full import/recovery
-  audits must not become ordinary-request whole-state scans.
+  audits must not become ordinary-request whole-state scans. The current portable
+  bundle's 65,536-blob ceiling cannot hold approximately 200,000 rows (roughly
+  400,000 Patricia structural blocks before chunks); qualify export sizing and
+  peak memory without lowering the approved workload.
 - [ ] Expose public Shared Create/Install/Invoke with resumable, schema-aware CLI
   commands using existing management/request mechanisms. Preserve signed terminal
-  failure finality and exact request identities.
+  failure finality and exact request identities; qualify the implemented terminal
+  expiry rejection mapping before promotion.
 - [ ] Verify first-use Space UX: bundled packages prepared automatically,
   authenticated HTTP/SSH defaults, system actors installed before readiness.
   User-created arbitrary Agents are not automatically provisioned.
@@ -363,20 +334,28 @@ These are approved targets, not measured capacity or an availability promise.
   reuse one freshly audited view within each proof call, and skip locking for
   empty Merge advertisements. Validation after peer I/O stays fresh; nonempty import,
   durability, authorization and deadline guards remain unchanged.
-  Focused corruption/interleaving tests and all four new exact-release custody
-  fixtures pass after call-local proof reuse and a startup-auto-cleanup fixture
-  correction. The legacy after-Invoke compatibility regression and racing signed
-  intents are covered by the final eight passing delegation fixtures. Measurements
-  and reproduction live in the review guide; these candidate recovery tests do not
-  qualify service capacity or the remaining production recovery scopes.
-- Expiry after custody admission remains unresolved; a remote owner's unfinished
-  registration also retains the leader's projection reservation until positive
-  ACK. Expiry never authorizes execution of unseen work or discarding custody.
+  Historical candidate recovery evidence is not service capacity or complete
+  production recovery qualification. Current debug timing and optimized checks
+  are tracked above; retain fresh validation after peer I/O.
+- Certified expiry after custody admission passes the optimized offline-origin,
+  follower-RPC and common-import fixture above; complete public integration and
+  pending-scope qualification remain open. A remote owner's
+  unfinished registration retains the leader's projection reservation until
+  positive ACK or an applied, verified expiry terminal. Clock expiry alone never
+  authorizes execution of unseen work or discarding custody.
   Legacy/mixed-version stale intents can outlive all owner replacements and
   pruning; retained-history legacy checks alone cannot prevent such an old read
   from registering again. Keep this with the legacy pending-scope pruning gate.
   A registration reply can time out while its append later applies; exact retry
-  reconciles it. None of these limits is closed by refusing expired new admission.
+  reconciles it. Unadmitted WAL cleanup after loss of the retained exact terminal
+  remains gated; the floor alone cannot clear it. None of these limits is closed
+  by refusing expired new admission.
+- Common checkpoint installation removes historical ordinary result anchors.
+  ACK-before-checkpoint fixtures do not qualify retained ordinary replies across
+  compaction. The selected typed current-root guest inspection must bind the
+  exact old request/outcome; it is not implemented, and a newer common-root
+  certificate alone is not that proof. Do not add a historical index or new
+  guest ABI as a parallel workstream.
 - Native full-memory snapshots and cloning still scale with the guest address
   span, not touched pages, and can materialize a large flat image. Sparse snapshot
   behavior must not be assumed for the native mapping. Instruction attribution
@@ -407,8 +386,10 @@ These are approved targets, not measured capacity or an availability promise.
 
 ## Evidence and working rules
 
-The [review guide](agent-saga-review.md) records the tested `62ffbc20` fixes,
-candidate fixture limitations and reproducible commands. Artifact identities
+The [review guide](agent-saga-review.md) records current source-specific evidence,
+candidate fixture limitations and reproducible commands. Reviewed baseline
+evidence is recoverable with `git show 6d3a4926:docs/agent-saga-review.md`.
+Artifact identities
 come from `support/production-artifacts.toml` and `vosx/build.rs`, not this plan.
 Released image ABI remains r19; SAC6 Authority is a candidate, not a repinned release.
 

@@ -62,6 +62,9 @@ pub enum ProposeError {
     /// This worker is currently `Follower` or `Candidate`. The
     /// caller must retry against the cluster's leader.
     NotLeader,
+    /// A conditional proposal's leader, term, or log-prefix expectation
+    /// changed before the worker processed it. No entry was appended.
+    PrefixChanged,
     /// Storage write failed on the append. The error payload is
     /// erased to `()` because the worker doesn't carry the
     /// storage error type out — match the unit value or use a
@@ -229,6 +232,14 @@ pub enum RaftMsg<N: NodeId> {
     /// Append a new entry to the leader's log.
     Propose {
         payload: Vec<u8>,
+        reply: oneshot::Sender<Result<u64, ProposeError>>,
+    },
+    /// Append only while the sampled leader term and log prefix still match.
+    ProposeIfPrefix {
+        payload: Vec<u8>,
+        term: u64,
+        last_index: u64,
+        commit_index: u64,
         reply: oneshot::Sender<Result<u64, ProposeError>>,
     },
     /// Linearizable-read index request. Resolves to the leader's
@@ -644,6 +655,28 @@ impl<N: NodeId> WorkerHandle<N> {
         let (tx, rx) = oneshot::channel();
         self.inbox
             .send(RaftMsg::Propose { payload, reply: tx })
+            .map_err(|_| ProposeError::NotLeader)?;
+        rx.await.unwrap_or(Err(ProposeError::NotLeader))
+    }
+
+    /// Atomically check a leader snapshot and append in the same serialized
+    /// mailbox turn. Success reports append, not quorum commitment.
+    pub async fn propose_if_prefix(
+        &self,
+        payload: Vec<u8>,
+        term: u64,
+        last_index: u64,
+        commit_index: u64,
+    ) -> Result<u64, ProposeError> {
+        let (tx, rx) = oneshot::channel();
+        self.inbox
+            .send(RaftMsg::ProposeIfPrefix {
+                payload,
+                term,
+                last_index,
+                commit_index,
+                reply: tx,
+            })
             .map_err(|_| ProposeError::NotLeader)?;
         rx.await.unwrap_or(Err(ProposeError::NotLeader))
     }
@@ -1986,6 +2019,24 @@ async fn handle_msg<N, S, T, C, R, A>(
         }
         RaftMsg::Propose { payload, reply } => {
             let r = handle_propose(state, payload).await;
+            let _ = reply.send(r);
+        }
+        RaftMsg::ProposeIfPrefix {
+            payload,
+            term,
+            last_index,
+            commit_index,
+            reply,
+        } => {
+            let r = if state.role != Role::Leader
+                || state.meta.current_term != term
+                || state.storage.last_index() != last_index
+                || state.meta.commit_index != commit_index
+            {
+                Err(ProposeError::PrefixChanged)
+            } else {
+                handle_propose(state, payload).await
+            };
             let _ = reply.send(r);
         }
         RaftMsg::ReadIndex { timeout, reply } => {
@@ -5374,6 +5425,107 @@ mod tests {
         assert_eq!(snap.last_log_index, 2);
         assert_eq!(snap.commit_index, 2);
 
+        worker.shutdown();
+    }
+
+    #[test]
+    fn conditional_proposal_rejects_changed_prefix_without_appending() {
+        let mut config = cfg(0xAAAA, alloc::vec![0xAAAA]);
+        config.election_timeout_ms = (10, 30);
+        let worker = Worker::spawn_with(
+            MemStorage::<u16>::new(),
+            Arc::new(RecordingTransport::default()),
+            config,
+            (),
+            StdClock,
+            StdRng::from_entropy(),
+        );
+        let handle = worker.handler();
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        let prefix = loop {
+            let snapshot = block_on(handle.snapshot()).unwrap();
+            if snapshot.role == Role::Leader {
+                break snapshot;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        for (term, last, committed) in [
+            (
+                prefix.current_term + 1,
+                prefix.last_log_index,
+                prefix.commit_index,
+            ),
+            (
+                prefix.current_term,
+                prefix.last_log_index + 1,
+                prefix.commit_index,
+            ),
+            (
+                prefix.current_term,
+                prefix.last_log_index,
+                prefix.commit_index + 1,
+            ),
+        ] {
+            assert!(matches!(
+                block_on(handle.propose_if_prefix(alloc::vec![7], term, last, committed)),
+                Err(ProposeError::PrefixChanged)
+            ));
+            let current = block_on(handle.snapshot()).unwrap();
+            assert_eq!(current.last_log_index, prefix.last_log_index);
+            assert_eq!(current.commit_index, prefix.commit_index);
+        }
+        assert_eq!(
+            block_on(handle.propose_if_prefix(
+                alloc::vec![8],
+                prefix.current_term,
+                prefix.last_log_index,
+                prefix.commit_index
+            ))
+            .unwrap(),
+            prefix.last_log_index + 1
+        );
+        assert!(matches!(
+            block_on(handle.propose_if_prefix(
+                alloc::vec![9],
+                prefix.current_term,
+                prefix.last_log_index,
+                prefix.commit_index
+            )),
+            Err(ProposeError::PrefixChanged)
+        ));
+        assert_eq!(
+            block_on(handle.snapshot()).unwrap().last_log_index,
+            prefix.last_log_index + 1
+        );
+        worker.shutdown();
+
+        let mut config = cfg(0xAAAA, alloc::vec![0xAAAA, 0xBBBB]);
+        config.election_timeout_ms = (10_000, 20_000);
+        let worker = Worker::spawn_with(
+            MemStorage::<u16>::new(),
+            Arc::new(RecordingTransport::default()),
+            config,
+            (),
+            StdClock,
+            StdRng::from_entropy(),
+        );
+        let handle = worker.handler();
+        let prefix = block_on(handle.snapshot()).unwrap();
+        assert_eq!(prefix.role, Role::Follower);
+        assert!(matches!(
+            block_on(handle.propose_if_prefix(
+                alloc::vec![1],
+                prefix.current_term,
+                prefix.last_log_index,
+                prefix.commit_index
+            )),
+            Err(ProposeError::PrefixChanged)
+        ));
+        assert_eq!(
+            block_on(handle.snapshot()).unwrap().last_log_index,
+            prefix.last_log_index
+        );
         worker.shutdown();
     }
 

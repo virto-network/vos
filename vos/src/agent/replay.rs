@@ -14591,6 +14591,31 @@ mod aggregate {
             },
         )
         .map_err(lift_validation)?;
+        let fence_ancestry = FenceAncestryEvidence::from_published_local_checkpoint(
+            heads,
+            checkpoint_id,
+            &checkpoint,
+        )
+        .map_err(lift_validation)?;
+        #[cfg(feature = "experimental-state-blocks")]
+        let fence_ancestry = if let Some(seal) = external_genesis.filter(|seal| seal.is_shared()) {
+            // External genesis needs a physical checkpoint to authenticate its
+            // block closure, but that checkpoint also contains this replica's
+            // Local cursor. Its identity is not common Ordered ancestry. Only
+            // the exact sealed genesis checkpoint may start the Shared chain;
+            // later Shared checkpoints still require a separate certificate.
+            let initial = seal.initial_checkpoint().map_err(lift_validation)?;
+            if checkpoint != initial
+                || checkpoint_id != initial.id()
+                || ordered != OrderedBase::post_genesis()
+                || checkpoint.merge_fence != OrderedBase::post_genesis()
+            {
+                return Err(ReplayError::InvalidFence);
+            }
+            FenceAncestryEvidence::post_genesis(checkpoint.genesis).map_err(lift_validation)?
+        } else {
+            fence_ancestry
+        };
         Ok(ReplayBase {
             common_ancestry_boundary: None,
             #[cfg(feature = "experimental-state-blocks")]
@@ -14610,12 +14635,7 @@ mod aggregate {
             local_invocations,
             transition_proof_boundary: transition_proofs,
             genesis_input: None,
-            fence_ancestry: FenceAncestryEvidence::from_published_local_checkpoint(
-                heads,
-                checkpoint_id,
-                &checkpoint,
-            )
-            .map_err(lift_validation)?,
+            fence_ancestry,
         })
     }
 

@@ -3014,26 +3014,63 @@ where
         }
         report_phase("drain_committed_entries");
         let host = Arc::new(Mutex::new(shared_host));
-        // A crash may follow the exact positive Ack but precede clearing PAP.
-        // Prove that terminal boundary directly from authenticated replay and
+        // A crash may follow a positive ACK or certified expiry before clearing
+        // PAP. Prove that terminal boundary directly from authenticated replay and
         // clear it while no route or suffix-consuming worker is reachable.
         // This avoids burying the only Ack proof under a startup checkpoint.
         if let Some(pending) = record.pending_projection.clone() {
             let (work, authorization) = pending
                 .invocation()
                 .ok_or_else(|| rejected(CleanSystemAgentBootstrapRejection::DivergentRecord))?;
-            if host
-                .lock()
-                .map_err(|_| {
+            let terminal = {
+                let mut host = host.lock().map_err(|_| {
                     CleanSystemAgentBootstrapError::Host(SharedAgentHostError::Unavailable)
-                })?
-                .retained_positive_clean_acknowledgement(
-                    crate::service::AgentId(plan.pins.agent.0),
-                    work,
-                    authorization,
-                )
-                .map_err(CleanSystemAgentBootstrapError::Host)?
-            {
+                })?;
+                let expired = if pending.delegated_projection().is_some() {
+                    let manifest = host
+                        .recovery_manifest(crate::service::AgentId(plan.pins.agent.0))
+                        .map_err(CleanSystemAgentBootstrapError::Host)?;
+                    let AuthorityReadRequest::Projection(query) = &pending.query else {
+                        return Err(rejected(
+                            CleanSystemAgentBootstrapRejection::DivergentRecord,
+                        ));
+                    };
+                    let matched = manifest.slots().iter().any(|slot| {
+                        slot.expiry().is_some()
+                            && slot.registration().query() == query
+                            && slot.registration().work() == work
+                            && slot.registration().authorization() == authorization
+                    });
+                    if matched
+                        && let Some(registration) = pending
+                            .registration(manifest.generation(), manifest.committee().id())
+                            .map_err(CleanSystemAgentBootstrapError::Host)?
+                    {
+                        registration
+                            .verify(manifest.generation(), manifest.committee())
+                            .map_err(|_| {
+                                rejected(CleanSystemAgentBootstrapRejection::DivergentRecord)
+                            })?;
+                        if registration.owner().0 != plan.pins.node.0 {
+                            return Err(rejected(
+                                CleanSystemAgentBootstrapRejection::DivergentRecord,
+                            ));
+                        }
+                    }
+                    matched
+                } else {
+                    false
+                };
+                expired
+                    || host
+                        .retained_positive_clean_acknowledgement(
+                            crate::service::AgentId(plan.pins.agent.0),
+                            work,
+                            authorization,
+                        )
+                        .map_err(CleanSystemAgentBootstrapError::Host)?
+            };
+            if terminal {
                 let mut cleared = record.clone();
                 cleared.pending_projection = None;
                 commit_bootstrap_record(&mut record_store, &cleared)?;
@@ -3384,6 +3421,12 @@ where
                         work,
                     )
                     .map_err(CleanSystemAgentBootstrapError::Host)?;
+                return Ok(());
+            }
+            if self
+                .finish_expired_projection(&pending, true)
+                .map_err(CleanSystemAgentBootstrapError::Host)?
+            {
                 return Ok(());
             }
             let (work, authorization) = pending
@@ -7982,7 +8025,7 @@ where
         let owner = crate::service::NodeId(self.pins.node.0);
         let (sequence, previous) = match manifest.slot(owner) {
             None => (1, None),
-            Some(slot) if slot.is_acknowledged() => (
+            Some(slot) if slot.is_terminal() => (
                 slot.sequence()
                     .checked_add(1)
                     .ok_or(SharedAgentHostError::CapacityExhausted)?,
@@ -8084,11 +8127,24 @@ where
                 let manifest = self._network_host.projection_recovery_manifest(agent)?;
                 let now = self.host.lock().map_err(|_| SharedAgentHostError::Unavailable)?
                     .current_logical_slot(agent)?;
+                if let Some(slot) = manifest.slots().iter().find(|slot| {
+                    !slot.is_terminal()
+                        && slot.invoke().is_none()
+                        && slot.registration().query().recovery.is_some_and(|scope| {
+                            now.max(manifest.expiry_floor()) >= scope.expires_at
+                        })
+                }) {
+                    self._network_host.expire_projection_recovery(
+                        agent,
+                        slot.registration().request().request_commitment(),
+                    )?;
+                    return Ok(true);
+                }
                 if let Some(query) = manifest.slots().iter().find_map(|slot| {
                     let registration = slot.registration();
                     let query = registration.query();
                     (registration.owner().0 != self.pins.node.0
-                        && !slot.is_acknowledged()
+                        && !slot.is_terminal()
                         && query.recovery.is_some_and(|scope| slot.invoke().is_some() || scope.admits_at(now)))
                         .then(|| query.clone())
                 }) {
@@ -8112,6 +8168,9 @@ where
             commit_bootstrap_record(&mut self.record_store, &self.record)
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
             return self.execute_pending_authority_projection().map(|_| true);
+        }
+        if self.finish_expired_projection(&pending, true)? {
+            return Ok(true);
         }
         self.recover_registered_projection_dependency(&pending)?;
         let (work, authorization) = pending
@@ -8207,7 +8266,7 @@ where
             .slots()
             .iter()
             .find(|slot| {
-                !slot.is_acknowledged()
+                !slot.is_terminal()
                     && (slot.registration().work() != intent.work()
                         || slot.registration().authorization() != intent.authorization())
             })
@@ -8215,6 +8274,28 @@ where
         else {
             return Ok(());
         };
+        let now = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .current_logical_slot(agent)?;
+        if dependency
+            .query()
+            .recovery
+            .is_some_and(|scope| now.max(manifest.expiry_floor()) >= scope.expires_at)
+            && manifest
+                .slots()
+                .iter()
+                .any(|slot| slot.registration() == &dependency && slot.invoke().is_none())
+        {
+            self._network_host
+                .reserve_registered_projection_dependency(agent, &intent, &dependency)?;
+            self._network_host
+                .expire_projection_recovery(agent, dependency.request().request_commitment())?;
+            self._network_host
+                .reconcile_completed_projection_dependency(agent, &intent)?;
+            return Ok(());
+        }
         // The lifecycle-held WAL must still be the exact durable candidate.
         // It remains untouched throughout help, including any error/crash.
         if self.record.pending_projection.as_ref() != Some(pending)
@@ -8387,6 +8468,18 @@ where
         &self,
         work: &super::sdk::InvocationWork,
     ) -> Result<Option<Vec<u8>>, SharedAgentHostError> {
+        if self.pins.replicas.members().len() == 3 {
+            let manifest = self
+                ._network_host
+                .projection_recovery_manifest(crate::service::AgentId(self.pins.agent.0))?;
+            if manifest
+                .slots()
+                .iter()
+                .any(|slot| slot.registration().work() == work && slot.expiry().is_some())
+            {
+                return Err(SharedAgentHostError::ProjectionExpired);
+            }
+        }
         let Some(outcome) = self
             ._network_host
             .retained_projection(crate::service::AgentId(self.pins.agent.0), work)?
@@ -8474,6 +8567,9 @@ where
         if let Some(pending) = &self.record.pending_projection {
             return if pending.query == query {
                 let pending = pending.clone();
+                if self.finish_expired_projection(&pending, true)? {
+                    return Err(SharedAgentHostError::ProjectionExpired);
+                }
                 let (work, authorization) = pending
                     .invocation()
                     .ok_or(SharedAgentHostError::ScopeMismatch)?;
@@ -8772,6 +8868,98 @@ where
         self.execute_authority_projection_work(pending, true)
     }
 
+    /// Only an applied, audited quorum terminal can retire an expired read.
+    /// A local wall-clock timeout, missing result or failed registration cannot.
+    fn finish_expired_projection(
+        &mut self,
+        pending: &PendingAuthorityProjection,
+        local_pending: bool,
+    ) -> Result<bool, SharedAgentHostError> {
+        if pending.management_anchor.is_some() || pending.delegated_projection().is_none() {
+            return Ok(false);
+        }
+        let agent = crate::service::AgentId(self.pins.agent.0);
+        let manifest = self._network_host.projection_recovery_manifest(agent)?;
+        let (work, authorization) = pending
+            .invocation()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let AuthorityReadRequest::Projection(query) = &pending.query else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        let Some(slot) = manifest.slots().iter().find(|slot| {
+            slot.registration().query() == query
+                && slot.registration().work() == work
+                && slot.registration().authorization() == authorization
+        }) else {
+            return Ok(false);
+        };
+        if slot.invoke().is_some() {
+            return Ok(false);
+        }
+        let request = slot.registration().request().request_commitment();
+        if slot.expiry().is_none() {
+            let now = self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .current_logical_slot(agent)?;
+            if now.max(manifest.expiry_floor())
+                < query
+                    .recovery
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?
+                    .expires_at
+            {
+                return Ok(false);
+            }
+            self._network_host
+                .expire_projection_recovery(agent, request)?;
+        }
+        if local_pending {
+            // An exact local intent may have lost custody admission to another
+            // owner, or predate the registration trailer. The quorum terminal
+            // still covers this full query/work/authorization; this never
+            // asserts an unsigned local hold or advances another owner's slot.
+            if let Some(registration) =
+                pending.registration(manifest.generation(), manifest.committee().id())?
+            {
+                registration
+                    .verify(manifest.generation(), manifest.committee())
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                if registration.owner().0 != self.pins.node.0
+                    || registration.request().request_commitment() != request
+                {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+            }
+            if self.record.pending_projection.as_ref() != Some(pending) {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            if self
+                .record_store
+                .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                != Some(self.record.encode())
+            {
+                return Err(SharedAgentHostError::Unavailable);
+            }
+            let mut record = self.record.clone();
+            record.pending_projection = None;
+            let store = &mut self.record_store;
+            self._network_host.complete_expired_projection_pair(
+                agent,
+                work,
+                authorization,
+                request,
+                || {
+                    commit_bootstrap_record(store, &record)
+                        .map_err(|_| SharedAgentHostError::Unavailable)
+                },
+            )?;
+            self.record = record;
+        }
+        Ok(true)
+    }
+
     fn execute_authority_projection_work(
         &mut self,
         pending: PendingAuthorityProjection,
@@ -8781,6 +8969,9 @@ where
         let started = std::time::Instant::now();
         if !pending.validate() || pending.query.authority() != self.authority_target() {
             return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if self.finish_expired_projection(&pending, local_pending)? {
+            return Err(SharedAgentHostError::ProjectionExpired);
         }
         if local_pending {
             self.register_pending_projection(&pending)?;
@@ -9953,6 +10144,7 @@ mod tests {
         mod common_checkpoint;
         #[cfg(feature = "experimental-state-blocks")]
         mod external_shared;
+        mod recovery_expiry;
 
         use alloc::boxed::Box;
         use core::num::NonZeroU64;
@@ -10631,6 +10823,17 @@ mod tests {
                 )
                 .ok()?
                 .sign_common_snapshot_candidate(candidate)
+            }
+
+            fn sign_recovery_expiry_candidate(
+                &self,
+                candidate: &crate::agent::shared_host::VerifiedSharedRecoveryExpiryCandidate,
+            ) -> Option<crate::agent::shared_commit::ReplicaCommitSignature> {
+                crate::agent::local_journal_driver::Ed25519NodeMergeAuthenticator::new(
+                    libp2p::identity::Keypair::ed25519_from_bytes(self.key.to_bytes()).ok()?,
+                )
+                .ok()?
+                .sign_recovery_expiry_candidate(candidate)
             }
 
             fn sign_local_snapshot_candidate(

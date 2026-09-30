@@ -1,6 +1,6 @@
 //! Real Authority publication followed by three independently locked external
-//! Shared journals. Raft commands enter through the existing committed-slot
-//! harness: this qualifies application/recovery, not transport or election.
+//! Shared journals. The file fixture isolates application/recovery; the network
+//! fixture uses the candidate host, authenticated Raft and applied availability.
 use super::*;
 use crate::agent::clean_management_intent::{CleanManagementIntent, CleanManagementIntentSlot};
 use crate::agent::genesis::VerifiedAgentGenesisProvision;
@@ -192,7 +192,7 @@ fn enroll_replica(owner: &mut MemoryBootstrapOwner, node_key: &SigningKey, nonce
     let credential = CredentialId::of_public_key(&public);
     let (attestor, _, _, node) = node_material();
     let mut query = AuthorityProjectionQuery {
-            recovery: None,
+        recovery: None,
         authority: owner.authority_target(),
         credential,
         nonce: Hash([nonce; 32]),
@@ -296,6 +296,16 @@ fn enroll_replica(owner: &mut MemoryBootstrapOwner, node_key: &SigningKey, nonce
 #[test]
 #[ignore = "requires compiled external runtime/Authority, CLERK_AGENT_PACKAGE and physical outer PVM"]
 fn three_file_replicas_external_clerk_install_invoke_ack_reopen() {
+    external_clerk_lifecycle(false);
+}
+
+#[test]
+#[ignore = "requires compiled external runtime/Authority, CLERK_AGENT_PACKAGE and authenticated loopback"]
+fn three_network_replicas_external_clerk_install_invoke_ack_reopen() {
+    external_clerk_lifecycle(true);
+}
+
+fn external_clerk_lifecycle(with_network: bool) {
     use crate::actors::value::{Msg, TAG_DYNAMIC, Value};
     use crate::agent::driver::SdkManagementArtifacts;
     use crate::agent::package_admission::{
@@ -537,6 +547,21 @@ fn three_file_replicas_external_clerk_install_invoke_ack_reopen() {
             &mut publication_reply,
         )
         .unwrap();
+    if with_network {
+        external_network_lifecycle(
+            &harness.fixture,
+            &descriptor,
+            &runtime,
+            &clerk,
+            &keys,
+            record.provision(),
+            prepared.catalog(),
+            &finality,
+            harness.network.clone(),
+        );
+        harness.stop();
+        return;
+    }
     let verified =
         VerifiedAgentGenesisProvision::verify(record.provision().clone(), &finality).unwrap();
     let authority = CommitteeChangeAuthorityBinding::new(
@@ -639,7 +664,19 @@ fn three_file_replicas_external_clerk_install_invoke_ack_reopen() {
     }
     let (install_input, commands) = install_plan.unwrap();
     apply(&mut drivers, commands);
+    let install_claim = drivers[0].available_ordered_claim(install_input).unwrap();
     for driver in &mut drivers {
+        assert_eq!(
+            driver.available_ordered_claim(install_input).unwrap(),
+            install_claim
+        );
+        driver
+            .verify_ordered_availability(
+                install_claim.raft_index(),
+                install_claim.raft_term(),
+                install_claim.commitment(),
+            )
+            .unwrap();
         assert!(matches!(
             driver.take_clean_ordered_result(install_input).unwrap(),
             RuntimeOutcome::Management(Ok(ManagementReply::Installed(_)))
@@ -789,6 +826,17 @@ fn three_file_replicas_external_clerk_install_invoke_ack_reopen() {
     for (driver, state) in drivers.iter_mut().zip(states) {
         assert_eq!(driver.materialization().state(), &state);
         assert_eq!(
+            driver.available_ordered_claim(install_input).unwrap(),
+            install_claim
+        );
+        driver
+            .verify_ordered_availability(
+                install_claim.raft_index(),
+                install_claim.raft_term(),
+                install_claim.commitment(),
+            )
+            .unwrap();
+        assert_eq!(
             driver
                 .replay_durable_clean_terminal(invoke.clone())
                 .unwrap(),
@@ -885,4 +933,683 @@ fn three_file_replicas_external_clerk_install_invoke_ack_reopen() {
         .verify_ordered_availability(claim.raft_index(), claim.raft_term(), claim.commitment())
         .unwrap();
     harness.stop();
+}
+
+fn external_network_lifecycle(
+    fixture: &PhysicalFixture,
+    descriptor: &AgentDescriptor,
+    runtime: &crate::agent::package_admission::AdmittedStateRuntimePackage,
+    clerk: &crate::agent::package_admission::AdmittedActorPackage,
+    keys: &[SigningKey],
+    provision: &crate::agent::genesis::AgentGenesisProvision,
+    catalog: &[crate::agent::execution::RuntimeBlob],
+    finality: &ReplayVerifiedAgentGenesisFinality,
+    authority_network: Arc<Network>,
+) {
+    use crate::actors::value::{Msg, TAG_DYNAMIC, Value};
+    use crate::agent::driver::SdkManagementArtifacts;
+    use crate::network::SharedAgentNetworkHost;
+    use crate::network::shared_agent::CleanManagementSubmission;
+
+    let agent = HostAgentId(descriptor.identity.agent.0);
+    let authority = CommitteeChangeAuthorityBinding::new(
+        descriptor.authority.policy,
+        descriptor.authority.issuer,
+        descriptor.identity.runtime_deployment,
+        descriptor.authority.public_key,
+        descriptor.authority.initial_epoch,
+    )
+    .unwrap();
+    let directories: Vec<_> = keys
+        .iter()
+        .map(|_| TestDirectory::new("external-shared-network-owner"))
+        .collect();
+    let merges: Vec<Arc<dyn LocalMergeAuthenticator>> = keys
+        .iter()
+        .map(|key| {
+            Arc::new(
+                crate::agent::local_journal_driver::Ed25519NodeMergeAuthenticator::new(
+                    libp2p::identity::Keypair::ed25519_from_bytes(key.to_bytes()).unwrap(),
+                )
+                .unwrap(),
+            ) as Arc<dyn LocalMergeAuthenticator>
+        })
+        .collect();
+    let open = |index: usize, candidate: bool| {
+        let scope = crate::agent::host::AgentHostScope {
+            space: HostSpaceId(descriptor.identity.space.0),
+            node: merges[index].node(),
+        };
+        let proof: Arc<dyn AgentGenesisFinalityVerifier> = Arc::new(finality.clone());
+        if candidate {
+            SharedAgentHost::open_external_candidates(
+                directories[index].host(),
+                directories[index].lock(),
+                scope,
+                fixture.trust.clone(),
+                merges[index].clone(),
+                proof,
+                None,
+            )
+        } else {
+            SharedAgentHost::open(
+                directories[index].host(),
+                directories[index].lock(),
+                scope,
+                fixture.trust.clone(),
+                merges[index].clone(),
+                proof,
+            )
+        }
+    };
+    let mut hosts: Vec<_> = (0..keys.len())
+        .map(|index| {
+            let mut host = open(index, true).unwrap();
+            let status = host
+                .provision_replay_verified(provision.clone(), catalog.to_vec(), authority, finality)
+                .unwrap();
+            assert!(host.uses_external_state(agent).unwrap());
+            assert_eq!(status.replicas.len(), 3);
+            assert!(status.engines.control_raft && status.engines.linear_raft);
+            assert!(!status.engines.merge && !status.engines.local);
+            let route = host.physical_route(agent).unwrap();
+            assert_eq!(route.generation, status.generation);
+            assert_eq!(route.replication_id, status.replication_id);
+            assert!(route.raft_database.is_file());
+            Arc::new(std::sync::Mutex::new(host))
+        })
+        .collect();
+    let networks: Vec<_> = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            if index == 0 {
+                // The actual Authority owner is on this voter. Attach the new
+                // generation to its existing authenticated transport, not a
+                // second simultaneous transport impersonating the same PeerId.
+                return authority_network.clone();
+            }
+            let keypair = libp2p::identity::Keypair::ed25519_from_bytes(key.to_bytes()).unwrap();
+            let peer = keypair.public().to_peer_id();
+            Arc::new(Network::start(NetworkConfig {
+                keypair,
+                local_prefix: crate::network::derive_node_prefix(&peer),
+                listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+                bootstrap: Vec::new(),
+                auto_dial_mdns: false,
+            }))
+        })
+        .collect();
+    assert!(wait_until(std::time::Duration::from_secs(5), || networks
+        .iter()
+        .skip(1)
+        .all(|network| !network.listen_addrs().is_empty())));
+    let mut last_dial = None;
+    assert!(
+        wait_until(std::time::Duration::from_secs(15), || {
+            if networks
+                .iter()
+                .all(|network| network.connected_peers().len() == 2)
+            {
+                return true;
+            }
+            if last_dial.is_none_or(|last: std::time::Instant| {
+                last.elapsed() >= std::time::Duration::from_millis(250)
+            }) {
+                for (index, network) in networks.iter().enumerate() {
+                    for target in networks.iter().skip(index + 1) {
+                        network.connect(target.listen_addrs()[0].clone());
+                    }
+                }
+                last_dial = Some(std::time::Instant::now());
+            }
+            false
+        }),
+        "external candidate authenticated mesh did not connect"
+    );
+    let attach = |hosts: &[Arc<std::sync::Mutex<SharedAgentHost>>]| -> Vec<_> {
+        hosts
+            .iter()
+            .zip(&networks)
+            .map(|(host, network)| {
+                SharedAgentNetworkHost::attach(host.clone(), network.clone()).unwrap()
+            })
+            .collect()
+    };
+    let mut attached = attach(&hosts);
+    let install = install_request(descriptor.identity.agent, clerk, 0x71, None);
+    let ManagementRequest::Install(install_actor) = &install else {
+        unreachable!()
+    };
+    let actor = install_actor.entry.actor;
+    let ReplayOperation::CleanManage {
+        authority: create_receipt,
+        ..
+    } = &provision.proposal().create().operation
+    else {
+        unreachable!()
+    };
+    let mut receipt = create_receipt.clone();
+    receipt.selector.operation = install.authority_operation().unwrap();
+    (receipt.selector.actor, receipt.selector.actor_deployment) =
+        install.authority_actor_selector();
+    receipt.selector.request = install.commitment();
+    receipt.selector.decision_sequence += 1;
+    receipt.selector.expires_at += 100;
+    receipt.signature = SigningKey::from_bytes(&[RECEIPT_SEED; 32])
+        .sign(&receipt.signing_bytes())
+        .to_bytes();
+    fixture
+        .logical_slot
+        .as_ref()
+        .unwrap()
+        .fetch_add(1, Ordering::AcqRel);
+    let installed = external_network_on_leader(&attached, agent, |owner| {
+        owner
+            .manage_clean(
+                agent,
+                install.clone(),
+                receipt.clone(),
+                SdkManagementArtifacts::Actor(clerk),
+            )
+            .map(|result| match result {
+                CleanManagementSubmission::Applied { outcome, .. } => outcome,
+                CleanManagementSubmission::Denied { outcome, .. } => {
+                    panic!("external network Install denied: {outcome:?}")
+                }
+            })
+    });
+    assert!(matches!(
+        installed,
+        RuntimeOutcome::Management(Ok(ManagementReply::Installed(_)))
+    ));
+    assert!(wait_until(std::time::Duration::from_secs(15), || hosts
+        .iter()
+        .all(|host| {
+            host.lock()
+                .unwrap()
+                .journal_position(agent)
+                .unwrap()
+                .ordered_index
+                == 1
+        })));
+    let material = hosts[0]
+        .lock()
+        .unwrap()
+        .supervisor_invocation_material(agent, actor)
+        .unwrap();
+    let identity =
+        crate::agent::supervisor_adapters::physical_material_identity(&material).unwrap();
+    let mut availability = vec![material.program, material.schema, material.policies];
+    availability.extend(material.installation_data);
+    availability.sort_by(|left, right| left.reference.cmp(&right.reference));
+    let mut message = vec![TAG_DYNAMIC];
+    message.extend(Msg::new("journal_id").encode());
+    let work = InvocationWork {
+        space: descriptor.identity.space,
+        agent: descriptor.identity.agent,
+        runtime_deployment: runtime.deployment(),
+        invocation: InvocationId([0xe1; 32]),
+        actor,
+        incarnation: material.actor.incarnation,
+        deployment: clerk.deployment(),
+        program: clerk.program(),
+        mode: MethodMode::LinearizableQuery,
+        origin: InvocationOrigin::anonymous(),
+        roles: InvocationRoleClaims::none(),
+        message,
+        installation_data: material.actor.entry.installation_data,
+        availability,
+        gas: 100_000_000,
+        recovery_only: false,
+    };
+    receipt.selector.operation = crate::agent_sdk::authority::AuthorityOperationKind::InvokeActor;
+    receipt.selector.request = work.commitment();
+    receipt.selector.decision_sequence = 0;
+    receipt.selector.acknowledged_through = 0;
+    receipt.signature = SigningKey::from_bytes(&[RECEIPT_SEED; 32])
+        .sign(&receipt.signing_bytes())
+        .to_bytes();
+    let authorization = InvocationAuthorization::AuthorityReceipt(receipt);
+    // Use the signed package's roles for the Clerk kernel workflow. The
+    // Authority receipt binds each exact call independently of the embedded
+    // registrar/debit signatures, which the physical Clerk guest must verify.
+    let policy = ActorMethodPolicyArtifact::decode(clerk.method_policy_bytes()).unwrap();
+    let clerk_role = |method: &str| {
+        let AuthorizationPolicySelector::ActorRole(role) = policy
+            .methods
+            .iter()
+            .find(|entry| entry.name == method)
+            .unwrap_or_else(|| panic!("missing signed Clerk {method} policy"))
+            .authorization_policy
+        else {
+            panic!("Clerk {method} must require its signed actor role");
+        };
+        role
+    };
+    let operator = clerk_role("bootstrap");
+    assert_eq!(clerk_role("create_account"), operator);
+    assert_eq!(clerk_role("apply_transfer"), operator);
+    let member = clerk_role("state_root");
+    let clerk_call = |method: &str,
+                      args: Vec<(&str, Value)>,
+                      mode: MethodMode,
+                      role: crate::agent_sdk::RoleId,
+                      invocation: u8| {
+        let mut call = work.clone();
+        call.invocation = InvocationId([invocation; 32]);
+        call.mode = mode;
+        call.gas = crate::agent::execution::MAX_EXECUTION_GAS;
+        call.origin.principal = Some(PrincipalId([0xe3; 32]));
+        call.roles.actor = Some(role);
+        let mut message = Msg::new(method);
+        for (name, value) in args {
+            message = message.with(name, value);
+        }
+        call.message = vec![TAG_DYNAMIC];
+        call.message.extend(message.encode());
+        let InvocationAuthorization::AuthorityReceipt(mut signed_receipt) = authorization.clone()
+        else {
+            unreachable!()
+        };
+        signed_receipt.selector.request = call.commitment();
+        signed_receipt.signature = SigningKey::from_bytes(&[RECEIPT_SEED; 32])
+            .sign(&signed_receipt.signing_bytes())
+            .to_bytes();
+        (
+            call,
+            InvocationAuthorization::AuthorityReceipt(signed_receipt),
+        )
+    };
+    use cipher_clerk::helpers::{MemLedger, MemOracle};
+    use cipher_clerk::prelude::{
+        Account, CreateAccount, EventStatus, Keypair, Layer, LedgerState, Transfer,
+    };
+    let mut reference = MemLedger::new();
+    let mut reference_oracle = MemOracle::new();
+    let registrar = Keypair::generate();
+    let journal_id = reference.bootstrap_journal(registrar.public, 1);
+    let alice_key = Keypair::generate();
+    let bob_key = Keypair::generate();
+    let alice = Account::asset(journal_id, alice_key.public, 840, 100);
+    let bob = Account::liability(journal_id, bob_key.public, 840, 200);
+    let creates = [
+        CreateAccount::signed(alice.clone(), &registrar.secret),
+        CreateAccount::signed(bob.clone(), &registrar.secret),
+    ];
+    let mut setup = vec![(
+        "bootstrap",
+        vec![
+            ("journal_id", Value::Bytes(journal_id.0.to_vec())),
+            (
+                "registrar_pubkey",
+                Value::Bytes(registrar.public.0.to_vec()),
+            ),
+            ("code", Value::U32(1)),
+        ],
+        0xe6,
+    )];
+    for (index, create) in creates.iter().enumerate() {
+        let timestamp = 500_000 + index as u64;
+        let expected = cipher_clerk::apply_account_creations(
+            &mut reference,
+            core::slice::from_ref(create),
+            &mut reference_oracle,
+            timestamp,
+        );
+        assert_eq!(expected[0].status, EventStatus::Created);
+        setup.push((
+            "create_account",
+            vec![
+                (
+                    "create_account_bytes",
+                    Value::Bytes(
+                        crate::rkyv::to_bytes::<crate::rkyv::rancor::Error>(create)
+                            .unwrap()
+                            .to_vec(),
+                    ),
+                ),
+                ("batch_seed_timestamp", Value::U64(timestamp)),
+            ],
+            0xe7 + index as u8,
+        ));
+    }
+    for (method, args, invocation) in setup {
+        let (call, authorization) =
+            clerk_call(method, args, MethodMode::Linear, operator, invocation);
+        let started = std::time::Instant::now();
+        let outcome = external_network_on_leader(&attached, agent, |owner| {
+            owner.supervisor_invoke(identity, call.clone(), authorization.clone())
+        });
+        let RuntimeOutcome::Completed(Ok(reply)) = &outcome else {
+            panic!("external network Clerk {method}: {outcome:?}")
+        };
+        assert_eq!(
+            Value::decode(&reply.reply),
+            Value::Bytes(vec![0]),
+            "Clerk {method} must return Status::Ok"
+        );
+        assert!(matches!(
+            external_network_on_leader(&attached, agent, |owner| {
+                owner.supervisor_acknowledge(identity, call.clone(), authorization.clone())
+            }),
+            RuntimeOutcome::Acknowledged(Ok(_))
+        ));
+        eprintln!(
+            "clerk_shared_network_call method={method} invoke_ack_elapsed_us={}",
+            started.elapsed().as_micros()
+        );
+    }
+    let amount = reference_oracle.commit(17);
+    let transfer = Transfer::builder(journal_id)
+        .debit(&alice, Layer::Settled, amount)
+        .credit(&bob, Layer::Settled, amount)
+        .signed_with(&[(&alice, &alice_key.secret)]);
+    let (value, blinding) = reference_oracle.openings.get(&amount.0).copied().unwrap();
+    let openings = vec![cipher_clerk::state::Opening {
+        amount,
+        value,
+        blinding,
+    }];
+    let expected_transfer = cipher_clerk::apply_batch(
+        &mut reference,
+        core::slice::from_ref(&transfer),
+        &mut reference_oracle,
+        1_000_000,
+    );
+    assert_eq!(expected_transfer[0].status, EventStatus::Created);
+    // The existing lost-response/reopen lifecycle now protects a mutation:
+    // retrying this exact signed debit must recover its one committed result.
+    let (work, authorization) = clerk_call(
+        "apply_transfer",
+        vec![
+            (
+                "transfer_bytes",
+                Value::Bytes(
+                    crate::rkyv::to_bytes::<crate::rkyv::rancor::Error>(&transfer)
+                        .unwrap()
+                        .to_vec(),
+                ),
+            ),
+            (
+                "openings_bytes",
+                Value::Bytes(
+                    crate::rkyv::to_bytes::<crate::rkyv::rancor::Error>(&openings)
+                        .unwrap()
+                        .to_vec(),
+                ),
+            ),
+            ("batch_seed_timestamp", Value::U64(1_000_000)),
+        ],
+        MethodMode::Linear,
+        operator,
+        0xe9,
+    );
+    let input = crate::agent::journal::ReplayInput {
+        runtime: provision.proposal().create().runtime.clone(),
+        operation: ReplayOperation::CleanInvoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+            work: work.clone(),
+            authorization: authorization.clone(),
+            observed_slot: material.observed_slot,
+        },
+    }
+    .id();
+    let ack_input = crate::agent::journal::ReplayInput {
+        runtime: provision.proposal().create().runtime.clone(),
+        operation: ReplayOperation::CleanAcknowledge {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+            expected_live: None,
+            work: crate::agent_sdk::InvocationRetirement::from_work(&work),
+            authorization: authorization.clone(),
+        },
+    }
+    .id();
+    let before = hosts[0].lock().unwrap().journal_position(agent).unwrap();
+    let invoke_started = std::time::Instant::now();
+    let result = external_network_on_leader(&attached, agent, |owner| {
+        owner.supervisor_invoke(identity, work.clone(), authorization.clone())
+    });
+    eprintln!(
+        "clerk_shared_network_call method=apply_transfer invoke_elapsed_us={}",
+        invoke_started.elapsed().as_micros()
+    );
+    let RuntimeOutcome::Completed(Ok(reply)) = &result else {
+        panic!("external network Invoke: {result:?}")
+    };
+    assert_eq!(
+        Value::decode(&reply.reply),
+        Value::Bytes(vec![0]),
+        "the debit-signed settled transfer must return Clerk Status::Ok"
+    );
+    let mut expected = None;
+    assert!(
+        wait_until(std::time::Duration::from_secs(15), || {
+            let Some(states) = hosts
+                .iter()
+                .map(|host| {
+                    let mut host = host.lock().unwrap();
+                    let claim = host.available_ordered_claim(agent, input).ok()?;
+                    Some((host.journal_position(agent).unwrap(), claim))
+                })
+                .collect::<Option<Vec<_>>>()
+            else {
+                return false;
+            };
+            if states.iter().all(|state| state == &states[0])
+                && states[0].0.ordered_index > before.ordered_index
+            {
+                expected = Some(states[0].clone());
+                true
+            } else {
+                false
+            }
+        }),
+        "external Invoke did not converge on all three independently published roots"
+    );
+    let expected = expected.unwrap();
+    drop(attached);
+    drop(hosts);
+    for index in 0..keys.len() {
+        assert!(
+            matches!(
+                open(index, false),
+                Err(SharedAgentHostError::InvalidProvision)
+            ),
+            "public image owner must not infer an external executor from persisted files"
+        );
+    }
+    hosts = (0..keys.len())
+        .map(|index| {
+            let mut host = open(index, true).unwrap();
+            assert!(host.uses_external_state(agent).unwrap());
+            assert_eq!(
+                (
+                    host.journal_position(agent).unwrap(),
+                    host.available_ordered_claim(agent, input).unwrap()
+                ),
+                expected
+            );
+            Arc::new(std::sync::Mutex::new(host))
+        })
+        .collect();
+    attached = attach(&hosts);
+    assert_eq!(
+        external_network_on_leader(&attached, agent, |owner| {
+            owner.supervisor_invoke(identity, work.clone(), authorization.clone())
+        }),
+        result,
+        "lost response retry must recover the exact physical result"
+    );
+    for host in &hosts {
+        assert_eq!(
+            host.lock().unwrap().journal_position(agent).unwrap(),
+            expected.0,
+            "retained retry must not append another Ordered invocation"
+        );
+    }
+    assert!(matches!(
+        external_network_on_leader(&attached, agent, |owner| {
+            owner.supervisor_acknowledge(identity, work.clone(), authorization.clone())
+        }),
+        RuntimeOutcome::Acknowledged(Ok(_))
+    ));
+    assert!(wait_until(std::time::Duration::from_secs(15), || hosts
+        .iter()
+        .all(|host| {
+            host.lock()
+                .unwrap()
+                .retained_positive_clean_acknowledgement(agent, &work, &authorization)
+                .unwrap()
+        })));
+    let (root_work, root_authorization) = clerk_call(
+        "state_root",
+        Vec::new(),
+        MethodMode::LinearizableQuery,
+        member,
+        0xea,
+    );
+    let root_started = std::time::Instant::now();
+    let root_outcome = external_network_on_leader(&attached, agent, |owner| {
+        owner.supervisor_invoke(identity, root_work.clone(), root_authorization.clone())
+    });
+    eprintln!(
+        "clerk_shared_network_call method=state_root phase=post_reopen invoke_elapsed_us={}",
+        root_started.elapsed().as_micros()
+    );
+    let RuntimeOutcome::Completed(Ok(root_reply)) = &root_outcome else {
+        panic!("external network Clerk state_root: {root_outcome:?}")
+    };
+    assert_eq!(
+        Value::decode(&root_reply.reply),
+        Value::Bytes(reference.root().to_vec()),
+        "Shared Clerk must preserve the signed transfer's reference kernel root"
+    );
+    let root_input = crate::agent::journal::ReplayInput {
+        runtime: provision.proposal().create().runtime.clone(),
+        operation: ReplayOperation::CleanInvoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+            work: root_work.clone(),
+            authorization: root_authorization.clone(),
+            observed_slot: material.observed_slot,
+        },
+    }
+    .id();
+    let root_ack_input = crate::agent::journal::ReplayInput {
+        runtime: provision.proposal().create().runtime.clone(),
+        operation: ReplayOperation::CleanAcknowledge {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+            expected_live: None,
+            work: crate::agent_sdk::InvocationRetirement::from_work(&root_work),
+            authorization: root_authorization.clone(),
+        },
+    }
+    .id();
+    assert!(matches!(
+        external_network_on_leader(&attached, agent, |owner| {
+            owner.supervisor_acknowledge(identity, root_work.clone(), root_authorization.clone())
+        }),
+        RuntimeOutcome::Acknowledged(Ok(_))
+    ));
+    let mut completed = None;
+    assert!(
+        wait_until(std::time::Duration::from_secs(15), || {
+            let Some(states) = hosts
+                .iter()
+                .map(|host| {
+                    let mut host = host.lock().unwrap();
+                    if !host
+                        .retained_positive_clean_acknowledgement(
+                            agent,
+                            &root_work,
+                            &root_authorization,
+                        )
+                        .ok()?
+                    {
+                        return None;
+                    }
+                    Some((
+                        host.journal_position(agent).ok()?,
+                        host.available_ordered_claim(agent, ack_input).ok()?,
+                        host.available_ordered_claim(agent, root_input).ok()?,
+                        host.available_ordered_claim(agent, root_ack_input).ok()?,
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()
+            else {
+                return false;
+            };
+            if states.iter().all(|state| state == &states[0]) {
+                completed = Some(states[0].clone());
+                true
+            } else {
+                false
+            }
+        }),
+        "transfer/root Invoke and ACK claims must converge on all three replicas"
+    );
+    let completed = completed.unwrap();
+    drop(attached);
+    drop(hosts);
+    for index in 0..keys.len() {
+        let mut host = open(index, true).unwrap();
+        assert!(host.uses_external_state(agent).unwrap());
+        assert!(
+            host.retained_positive_clean_acknowledgement(agent, &work, &authorization)
+                .unwrap()
+        );
+        assert!(
+            host.retained_positive_clean_acknowledgement(agent, &root_work, &root_authorization,)
+                .unwrap()
+        );
+        let acknowledged = host.available_ordered_claim(agent, ack_input).unwrap();
+        assert_eq!(
+            (
+                host.journal_position(agent).unwrap(),
+                acknowledged.clone(),
+                host.available_ordered_claim(agent, root_input).unwrap(),
+                host.available_ordered_claim(agent, root_ack_input).unwrap(),
+            ),
+            completed,
+            "reopen must preserve the complete claims binding the public Clerk root"
+        );
+        assert!(acknowledged.ordered().index > expected.1.ordered().index);
+        assert_ne!(
+            acknowledged.linear().manifest(),
+            expected.1.linear().manifest()
+        );
+    }
+    for network in networks.into_iter().skip(1) {
+        stop_network(network);
+    }
+}
+
+fn external_network_on_leader(
+    attached: &[crate::network::SharedAgentNetworkHost],
+    agent: HostAgentId,
+    mut operation: impl FnMut(
+        &crate::network::SharedAgentNetworkHost,
+    ) -> Result<RuntimeOutcome, SharedAgentHostError>,
+) -> RuntimeOutcome {
+    let mut result = None;
+    assert!(
+        wait_until(std::time::Duration::from_secs(30), || {
+            let Some(owner) = attached
+                .iter()
+                .find(|owner| owner.bootstrap_is_local_leader(agent).unwrap_or(false))
+            else {
+                return false;
+            };
+            match operation(owner) {
+                Ok(outcome) => {
+                    result = Some(outcome);
+                    true
+                }
+                Err(SharedAgentHostError::Unavailable) => false,
+                Err(error) => panic!("external network lifecycle admission: {error:?}"),
+            }
+        }),
+        "external network lifecycle did not complete through its current leader"
+    );
+    result.unwrap()
 }

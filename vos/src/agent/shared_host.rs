@@ -38,6 +38,8 @@ use super::journal::{
     AgentJournalGenesisId, CanonicalJournalRecord, MAX_JOURNAL_RECORD_BYTES, MergeEvent,
     MergeEventId, MergeFrontierId, OrderedEntryId, RuntimeBinding,
 };
+#[cfg(feature = "experimental-state-blocks")]
+use super::journal_store::CatalogBlobResolverFactory;
 use super::journal_store::{
     AgentJournalStore, FileAgentJournalStore, FileLocalAgentJournalSlot,
     MAX_PORTABLE_JOURNAL_BLOBS, MAX_PORTABLE_JOURNAL_IMAGE_BYTES, MAX_PORTABLE_JOURNAL_OBJECTS,
@@ -112,6 +114,7 @@ type FileSharedDriver = SharedJournalAgentDriver<FileAgentJournalStore, FileShar
 #[non_exhaustive]
 pub enum SharedAgentHostError {
     Unavailable,
+    ProjectionExpired,
     DirectoryInUse,
     InvalidScope,
     ScopeMismatch,
@@ -226,6 +229,22 @@ impl VerifiedSharedAgentSnapshotCandidate {
 pub struct VerifiedSharedAgentCommonSnapshotCandidate {
     claim: SharedAgentCommonSnapshotClaim,
     message: Hash,
+}
+
+/// Signing capability minted only from a fresh audited applied prefix and
+/// the host's trusted clock. A decoded expiry claim is not this capability.
+#[derive(Clone, Debug)]
+pub struct VerifiedSharedRecoveryExpiryCandidate {
+    claim: super::shared_recovery::SharedRecoveryExpiryClaim,
+}
+
+impl VerifiedSharedRecoveryExpiryCandidate {
+    pub const fn claim(&self) -> &super::shared_recovery::SharedRecoveryExpiryClaim {
+        &self.claim
+    }
+    pub fn signing_message(&self) -> Hash {
+        self.claim.signing_message()
+    }
 }
 
 impl VerifiedSharedAgentCommonSnapshotCandidate {
@@ -1166,6 +1185,8 @@ fn portable_root_pins_commitment(root_pins: &RootAnchorPins) -> Hash {
 enum PreparedSharedGenesis {
     AuthorityFinalized(super::replay::ReplaySealedSharedGenesis),
     SystemBootstrap(super::replay::ReplaySealedGenesis),
+    #[cfg(feature = "experimental-state-blocks")]
+    ExternalAuthorityFinalized(Arc<super::replay::ReplaySealedExternalGenesis>),
 }
 
 impl PreparedSharedGenesis {
@@ -1173,6 +1194,8 @@ impl PreparedSharedGenesis {
         match self {
             Self::AuthorityFinalized(sealed) => sealed.genesis(),
             Self::SystemBootstrap(sealed) => sealed.genesis(),
+            #[cfg(feature = "experimental-state-blocks")]
+            Self::ExternalAuthorityFinalized(sealed) => sealed.genesis(),
         }
     }
 
@@ -1180,6 +1203,11 @@ impl PreparedSharedGenesis {
         match self {
             Self::AuthorityFinalized(sealed) => sealed.admission_record(),
             Self::SystemBootstrap(sealed) => sealed.admission_record(),
+            #[cfg(feature = "experimental-state-blocks")]
+            Self::ExternalAuthorityFinalized(sealed) => {
+                ReplaySealedOrdinaryGenesis::admission_record(sealed.as_ref())
+                    .expect("Shared external genesis has finalized admission")
+            }
         }
     }
 }
@@ -1193,6 +1221,8 @@ impl super::replay::ReplaySealedOrdinaryGenesis for PreparedSharedGenesis {
         match self {
             Self::AuthorityFinalized(sealed) => sealed.post_create(),
             Self::SystemBootstrap(sealed) => sealed.post_create(),
+            #[cfg(feature = "experimental-state-blocks")]
+            Self::ExternalAuthorityFinalized(sealed) => sealed.post_create(),
         }
     }
 
@@ -1200,6 +1230,8 @@ impl super::replay::ReplaySealedOrdinaryGenesis for PreparedSharedGenesis {
         match self {
             Self::AuthorityFinalized(sealed) => sealed.empty_frontier(),
             Self::SystemBootstrap(sealed) => sealed.empty_frontier(),
+            #[cfg(feature = "experimental-state-blocks")]
+            Self::ExternalAuthorityFinalized(sealed) => sealed.empty_frontier(),
         }
     }
 
@@ -1207,6 +1239,8 @@ impl super::replay::ReplaySealedOrdinaryGenesis for PreparedSharedGenesis {
         match self {
             Self::AuthorityFinalized(sealed) => sealed.ordered_invocations(),
             Self::SystemBootstrap(sealed) => sealed.ordered_invocations(),
+            #[cfg(feature = "experimental-state-blocks")]
+            Self::ExternalAuthorityFinalized(sealed) => sealed.ordered_invocations(),
         }
     }
 
@@ -1214,6 +1248,8 @@ impl super::replay::ReplaySealedOrdinaryGenesis for PreparedSharedGenesis {
         match self {
             Self::AuthorityFinalized(sealed) => sealed.merge_invocations(),
             Self::SystemBootstrap(sealed) => sealed.merge_invocations(),
+            #[cfg(feature = "experimental-state-blocks")]
+            Self::ExternalAuthorityFinalized(sealed) => sealed.merge_invocations(),
         }
     }
 
@@ -1221,6 +1257,8 @@ impl super::replay::ReplaySealedOrdinaryGenesis for PreparedSharedGenesis {
         match self {
             Self::AuthorityFinalized(sealed) => sealed.local_invocations(),
             Self::SystemBootstrap(sealed) => sealed.local_invocations(),
+            #[cfg(feature = "experimental-state-blocks")]
+            Self::ExternalAuthorityFinalized(sealed) => sealed.local_invocations(),
         }
     }
 
@@ -1228,6 +1266,8 @@ impl super::replay::ReplaySealedOrdinaryGenesis for PreparedSharedGenesis {
         match self {
             Self::AuthorityFinalized(sealed) => sealed.artifacts(),
             Self::SystemBootstrap(sealed) => sealed.artifacts(),
+            #[cfg(feature = "experimental-state-blocks")]
+            Self::ExternalAuthorityFinalized(sealed) => sealed.artifacts(),
         }
     }
 
@@ -1235,6 +1275,8 @@ impl super::replay::ReplaySealedOrdinaryGenesis for PreparedSharedGenesis {
         match self {
             Self::AuthorityFinalized(sealed) => sealed.replica(),
             Self::SystemBootstrap(sealed) => sealed.replica(),
+            #[cfg(feature = "experimental-state-blocks")]
+            Self::ExternalAuthorityFinalized(sealed) => sealed.replica(),
         }
     }
 
@@ -1242,6 +1284,8 @@ impl super::replay::ReplaySealedOrdinaryGenesis for PreparedSharedGenesis {
         match self {
             Self::AuthorityFinalized(sealed) => sealed.admission_commitment(),
             Self::SystemBootstrap(sealed) => sealed.admission_commitment(),
+            #[cfg(feature = "experimental-state-blocks")]
+            Self::ExternalAuthorityFinalized(sealed) => sealed.admission_commitment(),
         }
     }
 
@@ -1252,6 +1296,8 @@ impl super::replay::ReplaySealedOrdinaryGenesis for PreparedSharedGenesis {
         match self {
             Self::AuthorityFinalized(sealed) => sealed.lane_manifest(lane),
             Self::SystemBootstrap(sealed) => sealed.lane_manifest(lane),
+            #[cfg(feature = "experimental-state-blocks")]
+            Self::ExternalAuthorityFinalized(sealed) => sealed.lane_manifest(lane),
         }
     }
 
@@ -1259,6 +1305,10 @@ impl super::replay::ReplaySealedOrdinaryGenesis for PreparedSharedGenesis {
         match self {
             Self::AuthorityFinalized(sealed) => sealed.initial_heads(),
             Self::SystemBootstrap(sealed) => sealed.initial_heads(),
+            #[cfg(feature = "experimental-state-blocks")]
+            Self::ExternalAuthorityFinalized(sealed) => {
+                ReplaySealedOrdinaryGenesis::initial_heads(sealed.as_ref())
+            }
         }
     }
 
@@ -1269,6 +1319,10 @@ impl super::replay::ReplaySealedOrdinaryGenesis for PreparedSharedGenesis {
             }
             Self::SystemBootstrap(sealed) => {
                 super::replay::ReplaySealedOrdinaryGenesis::validates_post_create_state(sealed)
+            }
+            #[cfg(feature = "experimental-state-blocks")]
+            Self::ExternalAuthorityFinalized(sealed) => {
+                ReplaySealedOrdinaryGenesis::validates_post_create_state(sealed.as_ref())
             }
         }
     }
@@ -1285,8 +1339,27 @@ impl super::replay::ReplaySealedOrdinaryGenesis for PreparedSharedGenesis {
             Self::SystemBootstrap(sealed) => {
                 super::replay::ReplaySealedOrdinaryGenesis::validate_seal(sealed)
             }
+            #[cfg(feature = "experimental-state-blocks")]
+            Self::ExternalAuthorityFinalized(sealed) => sealed.validate_seal(),
         }
     }
+
+    fn genesis_checkpoint(&self) -> Option<super::journal::CheckpointManifest> {
+        match self {
+            #[cfg(feature = "experimental-state-blocks")]
+            Self::ExternalAuthorityFinalized(sealed) => sealed.genesis_checkpoint(),
+            _ => None,
+        }
+    }
+}
+
+/// Process-selected admission mode, never inferred from files on disk. The
+/// candidate mode still requires the signed Linear-only external contract.
+#[derive(Clone, Copy)]
+enum SharedExecutionSelection {
+    ImageOnly,
+    #[cfg(feature = "experimental-state-blocks")]
+    ExternalLinearCandidates,
 }
 
 struct HostedSharedAgent {
@@ -1317,6 +1390,7 @@ pub struct SharedAgentHost {
     merge: Arc<dyn LocalMergeAuthenticator>,
     finality: Arc<dyn AgentGenesisFinalityVerifier>,
     root_pins: Option<RootAnchorPins>,
+    execution_selection: SharedExecutionSelection,
     // Unserved generations: the complete startup set when deferred_open is
     // true, or individually staged live Creates while existing Agents serve.
     deferred_generations: BTreeMap<AgentId, GenerationFiles>,
@@ -1427,7 +1501,47 @@ impl SharedAgentHost {
         finality: Arc<dyn AgentGenesisFinalityVerifier>,
         root_pins: Option<RootAnchorPins>,
     ) -> Result<Self, SharedAgentHostError> {
-        Self::open_with_lease_and_root_mode(lease, trust, merge, finality, root_pins, None)
+        Self::open_with_lease_and_root_mode(
+            lease,
+            trust,
+            merge,
+            finality,
+            root_pins,
+            None,
+            SharedExecutionSelection::ImageOnly,
+        )
+    }
+
+    /// Internal, unpromoted fixed-three candidate owner. The caller must select
+    /// this mode again on reopen; persisted external files cannot opt a public
+    /// image-only owner into a different executor. System bootstrap remains
+    /// image-backed and ordinary external admissions retain their signed ABI,
+    /// Linear-only capability checks and real Authority finality.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn open_external_candidates(
+        root: impl Into<PathBuf>,
+        stable_lock_path: impl Into<PathBuf>,
+        scope: AgentHostScope,
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+        finality: Arc<dyn AgentGenesisFinalityVerifier>,
+        root_pins: Option<RootAnchorPins>,
+    ) -> Result<Self, SharedAgentHostError> {
+        if let Some(pins) = &root_pins {
+            pins.validate()
+                .map_err(|_| SharedAgentHostError::InvalidProvision)?;
+        }
+        let lease = AgentHostRootLease::acquire(root, stable_lock_path, scope)
+            .map_err(map_outer_lease_error)?;
+        Self::open_with_lease_and_root_mode(
+            lease,
+            trust,
+            merge,
+            finality,
+            root_pins,
+            None,
+            SharedExecutionSelection::ExternalLinearCandidates,
+        )
     }
 
     /// Internal startup phase: retain the outer lease while opening only the
@@ -1458,6 +1572,7 @@ impl SharedAgentHost {
             finality,
             Some(root_pins),
             Some(system_agent),
+            SharedExecutionSelection::ImageOnly,
         )
     }
 
@@ -1468,6 +1583,7 @@ impl SharedAgentHost {
         finality: Arc<dyn AgentGenesisFinalityVerifier>,
         root_pins: Option<RootAnchorPins>,
         only_system: Option<AgentId>,
+        execution_selection: SharedExecutionSelection,
     ) -> Result<Self, SharedAgentHostError> {
         if lease.scope().validate().is_err() || merge.node() != lease.scope().node {
             return Err(SharedAgentHostError::InvalidScope);
@@ -1482,6 +1598,7 @@ impl SharedAgentHost {
             merge,
             finality,
             root_pins,
+            execution_selection,
             deferred_generations: BTreeMap::new(),
             deferred_open: only_system.is_some(),
             #[cfg(test)]
@@ -2857,6 +2974,137 @@ impl SharedAgentHost {
             .driver
             .validate_recovery_registration(registration)
             .map_err(map_driver_error)
+    }
+
+    pub(crate) fn prepare_recovery_expiry(
+        &mut self,
+        agent: AgentId,
+        request: Hash,
+    ) -> Result<VerifiedSharedRecoveryExpiryCandidate, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        let now = self
+            .current_logical_slot(agent)?
+            .max(self.recovery_expiry_floor(agent)?);
+        let (index, term, ordered, manifest) = self
+            .agents
+            .get_mut(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .recovery_expiry_context()
+            .map_err(map_driver_error)?;
+        let registration = manifest
+            .slots()
+            .iter()
+            .find(|slot| slot.registration().request().request_commitment() == request)
+            .ok_or(SharedAgentHostError::ScopeMismatch)?
+            .registration();
+        let claim = manifest
+            .expiry_claim(registration.request(), index, term, ordered, now)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        Ok(VerifiedSharedRecoveryExpiryCandidate { claim })
+    }
+
+    /// Sign the exact capability just reconstructed under this host's exclusive
+    /// access. The route still checks its before/after Raft barrier and freshly
+    /// verifies the prefix again after collecting peer votes.
+    pub(crate) fn prepare_signed_recovery_expiry(
+        &mut self,
+        agent: AgentId,
+        request: Hash,
+    ) -> Result<
+        (
+            VerifiedSharedRecoveryExpiryCandidate,
+            ReplicaCommitSignature,
+        ),
+        SharedAgentHostError,
+    > {
+        let candidate = self.prepare_recovery_expiry(agent, request)?;
+        let signature = self
+            .merge
+            .sign_recovery_expiry_candidate(&candidate)
+            .ok_or(SharedAgentHostError::SnapshotCertificateInvalid)?;
+        Ok((candidate, signature))
+    }
+
+    pub(crate) fn verify_recovery_expiry(
+        &mut self,
+        agent: AgentId,
+        claim: &super::shared_recovery::SharedRecoveryExpiryClaim,
+    ) -> Result<VerifiedSharedRecoveryExpiryCandidate, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        let now = self
+            .current_logical_slot(agent)?
+            .max(self.recovery_expiry_floor(agent)?);
+        let (index, term, ordered, manifest) = self
+            .agents
+            .get_mut(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .recovery_expiry_context()
+            .map_err(map_driver_error)?;
+        if now < claim.observed_slot()
+            || index != claim.prefix_index()
+            || term != claim.prefix_term()
+            || ordered != claim.ordered()
+        {
+            #[cfg(test)]
+            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                eprintln!(
+                    "recovery_expiry_binding node={:?} now={now}/{} prefix={index}/{term} expected={}/{} ordered={ordered:?}/{:?}",
+                    self.merge.node(),
+                    claim.observed_slot(),
+                    claim.prefix_index(),
+                    claim.prefix_term(),
+                    claim.ordered(),
+                );
+            }
+            return Err(SharedAgentHostError::Unavailable);
+        }
+        manifest
+            .validate_expiry_claim(claim)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        Ok(VerifiedSharedRecoveryExpiryCandidate {
+            claim: claim.clone(),
+        })
+    }
+
+    pub(crate) fn sign_recovery_expiry(
+        &mut self,
+        agent: AgentId,
+        claim: &super::shared_recovery::SharedRecoveryExpiryClaim,
+    ) -> Result<ReplicaCommitSignature, SharedAgentHostError> {
+        let candidate = self.verify_recovery_expiry(agent, claim)?;
+        self.merge
+            .sign_recovery_expiry_candidate(&candidate)
+            .ok_or(SharedAgentHostError::SnapshotCertificateInvalid)
+    }
+
+    pub(crate) fn recovery_expiry_terminal(
+        &mut self,
+        agent: AgentId,
+        request: Hash,
+    ) -> Result<Option<super::shared_recovery::SharedRecoveryExpiryTerminal>, SharedAgentHostError>
+    {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        self.agents
+            .get_mut(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .recovery_expiry_terminal(request)
+            .map_err(map_driver_error)
+    }
+
+    pub(crate) fn recovery_expiry_floor(
+        &mut self,
+        agent: AgentId,
+    ) -> Result<u64, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        Ok(self
+            .agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .recovery_expiry_floor())
     }
 
     pub(crate) fn retained_terminal_projection_invoke(
@@ -4678,6 +4926,26 @@ impl SharedAgentHost {
                     .replicas()
                     .member_by_node(self.scope().node)
                     .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                #[cfg(feature = "experimental-state-blocks")]
+                if verified
+                    .provision()
+                    .proposal()
+                    .create()
+                    .runtime
+                    .is_external_state()
+                {
+                    if !matches!(
+                        self.execution_selection,
+                        SharedExecutionSelection::ExternalLinearCandidates
+                    ) {
+                        return Err(SharedAgentHostError::InvalidProvision);
+                    }
+                    return LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_external_shared_genesis(
+                        &verified, member.replica(), &intent.catalog, &self.trust, self.scope().node,
+                    )
+                    .map(|sealed| PreparedSharedGenesis::ExternalAuthorityFinalized(Arc::new(sealed)))
+                    .map_err(|_| SharedAgentHostError::InvalidProvision);
+                }
                 LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_shared_genesis(
                     &verified,
                     member.replica(),
@@ -4762,9 +5030,41 @@ impl SharedAgentHost {
             )
             .map_err(|_| SharedAgentHostError::CorruptResidue)?;
         }
-        let mut store = slot
-            .open(sealed, externally_exposed)
-            .map_err(|_| SharedAgentHostError::CorruptResidue)?;
+        let store_result = match sealed {
+            #[cfg(feature = "experimental-state-blocks")]
+            PreparedSharedGenesis::ExternalAuthorityFinalized(external) => {
+                if portable_restore.is_some() {
+                    return Err(SharedAgentHostError::PortableBackupUnsupported);
+                }
+                if externally_exposed {
+                    // Construct the verifier from this exact locked namespace;
+                    // both durable and staged external heads are audited before
+                    // a store or network route becomes available.
+                    slot.open_external_journal_with_executor(
+                        external,
+                        |store| {
+                            Ok(super::local_journal_driver::StandardLocalReplayExecutor::new_shared(
+                                store.catalog_blob_resolver()?,
+                                Arc::clone(&self.trust),
+                                Arc::clone(&self.merge),
+                                vec![intent.committee().clone()],
+                            ))
+                        },
+                        &super::replay::NoPrunedOrderedBases,
+                        &mut FileSharedDriver::external_recovery_budget(),
+                    )
+                    .map(|(store, _, _)| store)
+                } else {
+                    slot.open_external_genesis(
+                        external,
+                        false,
+                        &mut FileSharedDriver::external_recovery_budget(),
+                    )
+                }
+            }
+            _ => slot.open(sealed, externally_exposed),
+        };
+        let mut store = store_result.map_err(|_| SharedAgentHostError::CorruptResidue)?;
         let state = (store.genesis(), store.heads());
         let state = match state {
             (Ok(genesis), Ok(heads)) => (genesis, heads),
@@ -4853,14 +5153,39 @@ impl SharedAgentHost {
                         Arc::clone(&self.merge),
                     )
                 }
+                #[cfg(feature = "experimental-state-blocks")]
+                PreparedSharedGenesis::ExternalAuthorityFinalized(sealed) => {
+                    FileSharedDriver::create_external_unexposed(
+                        store,
+                        artifacts,
+                        ledger,
+                        Arc::clone(sealed),
+                        &intent.catalog,
+                        Arc::clone(&self.trust),
+                        Arc::clone(&self.merge),
+                    )
+                }
             },
-            (Some(_), Some(_)) => FileSharedDriver::open_shared_unexposed(
-                store,
-                artifacts,
-                ledger,
-                Arc::clone(&self.trust),
-                Arc::clone(&self.merge),
-            ),
+            (Some(_), Some(_)) => match sealed {
+                #[cfg(feature = "experimental-state-blocks")]
+                PreparedSharedGenesis::ExternalAuthorityFinalized(sealed) => {
+                    FileSharedDriver::open_external(
+                        store,
+                        artifacts,
+                        ledger,
+                        Arc::clone(&self.trust),
+                        Arc::clone(&self.merge),
+                        Arc::clone(sealed),
+                    )
+                }
+                _ => FileSharedDriver::open_shared_unexposed(
+                    store,
+                    artifacts,
+                    ledger,
+                    Arc::clone(&self.trust),
+                    Arc::clone(&self.merge),
+                ),
+            },
             (None, Some(_)) => return Err(SharedAgentHostError::CorruptResidue),
         }
         .map_err(map_driver_error)?;
@@ -4875,6 +5200,17 @@ impl SharedAgentHost {
             }
             PreparedSharedGenesis::SystemBootstrap(sealed) => {
                 driver.commit_exposure(sealed, intent.id())
+            }
+            #[cfg(feature = "experimental-state-blocks")]
+            PreparedSharedGenesis::ExternalAuthorityFinalized(sealed) => {
+                if externally_exposed {
+                    // Exposed slot open already checked the durable stable-lock
+                    // marker and replayed the current roots. The genesis-only
+                    // publication check must not be applied to a later head.
+                    Ok(())
+                } else {
+                    driver.commit_external_genesis_exposure(sealed, intent.id())
+                }
             }
         }
         .map_err(map_driver_error)?;
@@ -5641,6 +5977,24 @@ mod tests {
                 .claim()
                 .active_committee()
                 .member_by_node(self.node())?;
+            if member.replica().role != ReplicaRole::Voter
+                || member.ed25519_public_key() != &self.0.verifying_key().to_bytes()
+                || member.peer_id() != peer_id(&self.0)
+            {
+                return None;
+            }
+            ReplicaCommitSignature::new(
+                self.node(),
+                self.0.sign(&candidate.signing_message().0).to_bytes(),
+            )
+            .ok()
+        }
+
+        fn sign_recovery_expiry_candidate(
+            &self,
+            candidate: &VerifiedSharedRecoveryExpiryCandidate,
+        ) -> Option<ReplicaCommitSignature> {
+            let member = candidate.claim().committee().member_by_node(self.node())?;
             if member.replica().role != ReplicaRole::Voter
                 || member.ed25519_public_key() != &self.0.verifying_key().to_bytes()
                 || member.peer_id() != peer_id(&self.0)
@@ -7176,6 +7530,167 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn prepared_expiry_signing_keeps_clock_and_fresh_prefix_guards() {
+        use super::super::shared_raft::AgentRaftCommand;
+        use super::super::shared_recovery::{
+            SharedRecoveryRegistration, SharedRecoveryRegistrationRequest,
+            recovery_registration_for_test,
+        };
+        use crate::actors::codec::Encode as _;
+        use crate::agent_sdk::wire::CanonicalWire as _;
+
+        let directory = TempDirectory::new("prepared_expiry_signing");
+        let runtime = super::super::package_admission::admitted_scripted_runtime_for_test(
+            "prepared-expiry-runtime",
+            0x75,
+            vec![super::super::package_admission::ScriptedRuntimeCase {
+                input: vec![0],
+                output: vec![0],
+                copies: Vec::new(),
+            }],
+        );
+        let fixture = standard_projection_fixture_with_replicas(
+            0x3b,
+            runtime,
+            &[
+                (0x31, ReplicaRole::Voter),
+                (0x32, ReplicaRole::Voter),
+                (0x33, ReplicaRole::Voter),
+            ],
+            false,
+        );
+        let clock = Arc::new(AtomicU64::new(20));
+        let mut host = open_native_clean_host_at_slot(&directory, &fixture, Arc::clone(&clock));
+        host.provision(
+            fixture.provision.clone(),
+            fixture.catalog.clone(),
+            fixture.committee_authority,
+        )
+        .unwrap();
+        let route = host.agents[&fixture.agent].driver.active_route().unwrap();
+        let template = recovery_registration_for_test(1, 7);
+        let mut query = template.query().clone();
+        query.authority.space = fixture.descriptor.identity.space;
+        query.authority.system_agent = fixture.descriptor.identity.agent;
+        query.authority.system_runtime_deployment = fixture.descriptor.identity.runtime_deployment;
+        let scope = query.recovery.as_mut().unwrap();
+        scope.generation = crate::agent_sdk::Hash(route.generation().replication_id());
+        scope.committee = crate::agent_sdk::Hash(*route.committee().as_bytes());
+        let signature = key(7).sign(&query.signing_bytes()).to_bytes();
+        let crate::agent_sdk::authority::AuthorityIngressAuthentication::ApiCredentialSignature {
+            signature: stored,
+            ..
+        } = &mut query.authentication
+        else {
+            panic!("credential-authenticated fixture")
+        };
+        *stored = signature;
+        let mut work = template.work().clone();
+        work.space = query.authority.space;
+        work.agent = query.authority.system_agent;
+        work.runtime_deployment = query.authority.system_runtime_deployment;
+        work.invocation = query.expected_invocation();
+        work.message = vec![crate::actors::value::TAG_DYNAMIC];
+        work.message.extend(
+            crate::actors::value::Msg::new("credential_projection")
+                .with(
+                    "query",
+                    crate::actors::value::Value::Bytes(query.encode().unwrap()),
+                )
+                .encode(),
+        );
+        let authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+            crate::agent_sdk::PublicPreflight::for_work(&work, 10),
+        );
+        let request = SharedRecoveryRegistrationRequest::new(
+            route.generation(),
+            route.committee(),
+            host.scope().node,
+            1,
+            None,
+            query,
+            work,
+            authorization,
+        )
+        .unwrap();
+        let signature = fixture.replica_keys[0]
+            .sign(&request.signing_message().0)
+            .to_bytes();
+        let registration = SharedRecoveryRegistration::new(
+            request,
+            ReplicaCommitSignature::new(host.scope().node, signature).unwrap(),
+        )
+        .unwrap();
+        host.agents[&fixture.agent]
+            .driver
+            .ledger()
+            .append_committed_for_test(
+                7,
+                &EntryKind::Data {
+                    payload: AgentRaftCommand::RegisterRecovery {
+                        route,
+                        registration: registration.clone(),
+                    }
+                    .encode(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            host.apply_next(fixture.agent).unwrap(),
+            SharedAgentApplyOutcome::Applied { index: 1 }
+        );
+        let request = registration.request().request_commitment();
+        clock.store(19, Ordering::SeqCst);
+        assert!(matches!(
+            host.prepare_signed_recovery_expiry(fixture.agent, request),
+            Err(SharedAgentHostError::ScopeMismatch)
+        ));
+        clock.store(20, Ordering::SeqCst);
+        let (candidate, signature) = host
+            .prepare_signed_recovery_expiry(fixture.agent, request)
+            .unwrap();
+        assert_eq!(candidate.claim().request(), request);
+        assert_eq!(candidate.claim().prefix_index(), 1);
+        assert_eq!(candidate.claim().prefix_term(), 7);
+        assert_eq!(candidate.claim().observed_slot(), 20);
+        assert_eq!(signature.signer(), host.scope().node);
+        assert_eq!(
+            signature.signature(),
+            &fixture.replica_keys[0]
+                .sign(&candidate.signing_message().0)
+                .to_bytes()
+        );
+        assert_eq!(
+            host.sign_recovery_expiry(fixture.agent, candidate.claim())
+                .unwrap(),
+            signature
+        );
+        host.agents[&fixture.agent]
+            .driver
+            .ledger()
+            .append_committed_for_test(
+                7,
+                &EntryKind::Data {
+                    payload: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            host.apply_next(fixture.agent).unwrap(),
+            SharedAgentApplyOutcome::Applied { index: 2 }
+        );
+        assert_eq!(
+            host.sign_recovery_expiry(fixture.agent, candidate.claim()),
+            Err(SharedAgentHostError::Unavailable)
+        );
+        let (next, _) = host
+            .prepare_signed_recovery_expiry(fixture.agent, request)
+            .unwrap();
+        assert_eq!(next.claim().prefix_index(), 2);
+    }
+
     #[test]
     fn filesystem_host_provisions_applies_committed_slot_and_reopens_exact_generation() {
         let directory = TempDirectory::new("provision_reopen_apply");
@@ -8306,6 +8821,63 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "experimental-state-blocks")]
+    fn external_candidate_owner_preserves_image_routes_and_public_reopen() {
+        let directory = TempDirectory::new("external_candidate_image_owner");
+        let fixture = fixture(0x2b);
+        let node = fixture.provision.replicas().members()[0].replica().node;
+        let key = fixture
+            .replica_keys
+            .iter()
+            .find(|key| NodeId::of_authenticated_peer(&peer_id(key)) == node)
+            .unwrap()
+            .clone();
+        let mut host = SharedAgentHost::open_external_candidates(
+            directory.root(),
+            directory.lock(),
+            AgentHostScope {
+                space: fixture.space,
+                node,
+            },
+            Arc::new(StaticTrust(fixture.authority.clone())),
+            Arc::new(SigningMerge(key)),
+            Arc::new(AcceptFinality),
+            None,
+        )
+        .unwrap();
+        let provisioned = host
+            .provision(
+                fixture.provision.clone(),
+                fixture.catalog.clone(),
+                fixture.committee_authority,
+            )
+            .unwrap();
+        assert!(!host.uses_external_state(fixture.agent).unwrap());
+        let route = host.physical_route(fixture.agent).unwrap();
+        assert_eq!(route.generation, provisioned.generation);
+        host.agents
+            .get_mut(&fixture.agent)
+            .unwrap()
+            .driver
+            .append_ordered_for_test(7, authorized_management(&fixture, 2, 0xb1))
+            .unwrap();
+        assert_eq!(
+            host.apply_next(fixture.agent).unwrap(),
+            SharedAgentApplyOutcome::Applied { index: 1 }
+        );
+        let expected = host.show(fixture.agent).unwrap().unwrap();
+        drop(host);
+
+        // Selecting the candidate owner never rewrites an image generation's
+        // identity, admission or storage layout. Ordinary public recovery of
+        // that same generation still uses the image executor.
+        let mut reopened = open_host(&directory, &fixture);
+        assert!(!reopened.uses_external_state(fixture.agent).unwrap());
+        assert_eq!(reopened.physical_route(fixture.agent).unwrap(), route);
+        assert_eq!(reopened.show(fixture.agent).unwrap().unwrap(), expected);
+    }
+
+    #[test]
     fn pending_shared_binding_before_head_publication_reopens_and_applies_once() {
         for (include_anchor, prefix_slots) in [(false, 0), (true, 0), (false, 1), (true, 1)] {
             let directory = TempDirectory::new("pending_binding_before_heads");
@@ -9391,6 +9963,7 @@ mod tests {
             Arc::new(RejectFinality),
             None,
             Some(AgentId([0xf1; 32])),
+            SharedExecutionSelection::ImageOnly,
         )
         .unwrap();
         assert!(host.list().unwrap().is_empty());

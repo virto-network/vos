@@ -26,6 +26,9 @@ pub(super) enum Exercise {
     ContendedIntent,
     ExpiredContendedIntent,
     SameLeaderRetry,
+    OverwrittenRegistration,
+    ExpiredCustody,
+    ExpiredContendedCustody,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +106,17 @@ fn candidate_registered_same_leader_timeout_and_duplicate_rows_survive_reopen() 
 
 #[test]
 #[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
+fn candidate_overwritten_registration_releases_remote_exclusion_without_reattachment() {
+    check_fixed_system_pending_cluster_with_checkpoint(
+        true,
+        None,
+        false,
+        Some(Exercise::OverwrittenRegistration),
+    );
+}
+
+#[test]
+#[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
 fn candidate_common_checkpoint_recovers_source_and_destination_marker_crashes() {
     check_fixed_system_pending_cluster_with_checkpoint(
         true,
@@ -134,7 +148,7 @@ fn candidate_common_checkpoint_recovers_source_and_destination_ledger_crashes() 
     );
 }
 
-fn reopen_owner(
+pub(super) fn reopen_owner(
     fixture: &PhysicalFixture,
     directory: &TestDirectory,
     stores: &(
@@ -197,7 +211,7 @@ fn query(owner: &MemoryBootstrapOwner, index: usize, nonce: u8) -> AuthorityProj
     query
 }
 
-fn delegated_query(
+pub(super) fn delegated_query(
     owner: &MemoryBootstrapOwner,
     index: usize,
     nonce: u8,
@@ -229,7 +243,7 @@ fn delegated_query(
     query
 }
 
-fn restart_network(index: usize) -> Arc<Network> {
+pub(super) fn restart_network(index: usize) -> Arc<Network> {
     let keypair =
         libp2p::identity::Keypair::ed25519_from_bytes([[NODE_SEED, 0xd2, 0xd3][index]; 32])
             .unwrap();
@@ -473,6 +487,274 @@ fn exercise_contended_intent(
     }
     // The enclosing fixture needs only live handles for its normal cleanup.
     *networks = live_networks.into_iter().flatten().collect();
+}
+
+fn exercise_overwritten_registration(
+    leader: usize,
+    owners: &mut [Option<MemoryBootstrapOwner>],
+    fixtures: &[PhysicalFixture],
+    networks: &[Arc<Network>],
+) {
+    let agent = HostAgentId(fixtures[leader].plan.pins.agent.0);
+    let origin = (leader + 1) % 3;
+    let owner = owners[origin].as_mut().unwrap();
+    let query = delegated_query(owner, origin, 0xf4);
+    let mut pending = owner.prepare_authority_projection(query.clone()).unwrap();
+    owner
+        .prepare_projection_recovery_registration(&mut pending)
+        .unwrap();
+    let (work, authorization) = pending.invocation().unwrap();
+    owner
+        ._network_host
+        .reserve_forwarded_projection_pair(agent, work, authorization)
+        .unwrap();
+    owner.record.pending_projection = Some(pending.clone());
+    commit_bootstrap_record(&mut owner.record_store, &owner.record).unwrap();
+    let saved_record = owner.record.encode();
+    let initial = owner
+        ._network_host
+        .projection_recovery_manifest(agent)
+        .unwrap();
+    let registration = pending
+        .registration(initial.generation(), initial.committee().id())
+        .unwrap()
+        .unwrap();
+
+    let original = owners[leader].as_ref().unwrap();
+    let before = original
+        ._network_host
+        .projection_admission_state_for_test(agent)
+        .unwrap();
+    assert_eq!(before.0, before.1);
+    assert!(before.2.is_none());
+    assert!(original.record.pending_projection.is_none());
+    let (route, database) = {
+        let host = original.host.lock().unwrap();
+        let status = host.supervisor_attachment_status(agent).unwrap().unwrap();
+        (
+            AgentGenerationRoute {
+                space: original.pins.space,
+                agent: original.pins.agent,
+                generation: Hash(status.replication_id),
+            },
+            host.raft_database(agent).unwrap(),
+        )
+    };
+    // Keep the actual owner, coordinator and application RPC live. Only Raft
+    // traffic is cut, so the timed-out remote append really loses an election.
+    original
+        ._network_host
+        .set_raft_isolated_for_test(agent, true)
+        .unwrap();
+    let reply = networks[origin]
+        .send_agent_recovery_registration(original.pins.node, route, registration.clone())
+        .recv_timeout(std::time::Duration::from_secs(10));
+    assert!(!matches!(reply, Ok(Ok(true))));
+    let attempt = original
+        ._network_host
+        .pending_registration_append_for_test(agent)
+        .unwrap()
+        .unwrap();
+    assert_eq!(attempt.0, before.0 + 1);
+    let uncommitted = original
+        ._network_host
+        .projection_admission_state_for_test(agent)
+        .unwrap();
+    assert_eq!(uncommitted.0, attempt.0);
+    assert_eq!(uncommitted.1, before.1);
+    assert!(uncommitted.2.is_some());
+    let raw = crate::raft::RaftLog::open(database.clone())
+        .unwrap()
+        .entries(attempt.0, attempt.0)
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(raw.term, attempt.1);
+    let vos_raft::EntryKind::Data { payload } =
+        crate::agent::shared_raft::decode_agent_raft_entry_kind(&raw.payload).unwrap()
+    else {
+        panic!("registration must be a real Raft data append");
+    };
+    let crate::agent::shared_raft::AgentRaftCommand::RegisterRecovery {
+        registration: actual,
+        ..
+    } = crate::agent::shared_raft::AgentRaftCommand::decode(&payload).unwrap()
+    else {
+        panic!("timed-out row must retain the exact registration");
+    };
+    assert_eq!(actual, registration);
+
+    assert!(wait_until(std::time::Duration::from_secs(30), || owners
+        .iter()
+        .enumerate()
+        .any(|(index, owner)| {
+            index != leader
+                && owner
+                    .as_ref()
+                    .unwrap()
+                    ._network_host
+                    .bootstrap_is_local_leader(agent)
+                    .unwrap_or(false)
+        })));
+    for (index, owner) in owners.iter().enumerate() {
+        if index != leader {
+            assert_eq!(
+                owner
+                    .as_ref()
+                    .unwrap()
+                    ._network_host
+                    .projection_recovery_manifest(agent)
+                    .unwrap(),
+                initial
+            );
+        }
+    }
+    original
+        ._network_host
+        .set_raft_isolated_for_test(agent, false)
+        .unwrap();
+    assert!(wait_until(std::time::Duration::from_secs(30), || {
+        let state = original
+            ._network_host
+            .projection_admission_state_for_test(agent)
+            .unwrap();
+        let replacement = crate::raft::RaftLog::open(database.clone())
+            .unwrap()
+            .entries(attempt.0, attempt.0)
+            .unwrap()
+            .pop();
+        state.0 == state.1
+            && state.1 >= attempt.0
+            && replacement
+                .is_some_and(|entry| entry.term > raw.term && entry.payload != raw.payload)
+    }));
+    assert_eq!(
+        original
+            ._network_host
+            .projection_recovery_manifest(agent)
+            .unwrap(),
+        initial
+    );
+    // Reconciliation must release only the remote append's volatile exclusion.
+    // A fresh local WAL can progress without dropping or reattaching this owner.
+    let original = owners[leader].as_mut().unwrap();
+    let fresh = delegated_query(original, leader, 0xf5);
+    let mut fresh_pending = original
+        .prepare_authority_projection(fresh.clone())
+        .unwrap();
+    original
+        .prepare_projection_recovery_registration(&mut fresh_pending)
+        .unwrap();
+    let (fresh_work, fresh_auth) = fresh_pending.invocation().unwrap();
+    original
+        ._network_host
+        .reserve_forwarded_projection_pair(agent, fresh_work, fresh_auth)
+        .unwrap();
+    assert!(
+        original
+            ._network_host
+            .pending_registration_append_for_test(agent)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        original
+            ._network_host
+            .projection_recovery_manifest(agent)
+            .unwrap(),
+        initial
+    );
+    original.record.pending_projection = Some(fresh_pending);
+    commit_bootstrap_record(&mut original.record_store, &original.record).unwrap();
+
+    let owner = owners[origin].as_mut().unwrap();
+    assert_eq!(owner.record.encode(), saved_record);
+    assert_eq!(
+        owner
+            .record_store
+            .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
+            .unwrap(),
+        Some(saved_record)
+    );
+    let before_ordered = owner.ordered_index_for_test().unwrap();
+    // This harness has authenticated registration RPCs and real Raft traffic,
+    // but no node-loop ProjectionRequest dispatcher. Use the actual elected
+    // owner's peer handler, first resolving the original still-durable WAL.
+    // The overwritten leader's exclusion has already been proved released.
+    for (index, request) in [(origin, query), (leader, fresh)] {
+        let sender = fixtures[index].plan.pins.node;
+        assert!(wait_until(std::time::Duration::from_secs(30), || {
+            match owners[index].as_ref().unwrap().register_pending_projection(
+                owners[index]
+                    .as_ref()
+                    .unwrap()
+                    .record
+                    .pending_projection
+                    .as_ref()
+                    .unwrap(),
+            ) {
+                Ok(()) => true,
+                Err(SharedAgentHostError::Unavailable) => false,
+                Err(error) => panic!("exact origin registration failed: {error:?}"),
+            }
+        }));
+        assert!(wait_until(std::time::Duration::from_secs(30), || {
+            let Some(current) = owners.iter().position(|owner| {
+                owner
+                    .as_ref()
+                    .unwrap()
+                    ._network_host
+                    .bootstrap_is_local_leader(agent)
+                    .unwrap_or(false)
+            }) else {
+                return false;
+            };
+            match owners[current]
+                .as_mut()
+                .unwrap()
+                .invoke_peer_authority_projection(request.clone(), false, sender)
+            {
+                Ok(response) => {
+                    let projection =
+                        crate::agent_sdk::authority::AuthorityCredentialProjection::decode(
+                            &response,
+                        )
+                        .unwrap();
+                    assert_eq!(projection.query, request);
+                    true
+                }
+                Err(SharedAgentHostError::Unavailable) => false,
+                Err(error) => panic!("exact peer query failed: {error:?}"),
+            }
+        }));
+        let owner = owners[index].as_mut().unwrap();
+        assert!(wait_until(std::time::Duration::from_secs(30), || {
+            match owner.recover_pending_authority_projection() {
+                Ok(_) => true,
+                Err(SharedAgentHostError::Unavailable) => false,
+                Err(error) => panic!("exact origin cleanup failed: {error:?}"),
+            }
+        }));
+        assert!(owner.record.pending_projection.is_none());
+        assert_eq!(
+            owner.ordered_index_for_test().unwrap(),
+            before_ordered + if index == origin { 2 } else { 4 }
+        );
+    }
+    let final_manifest = owners[leader]
+        .as_ref()
+        .unwrap()
+        ._network_host
+        .projection_recovery_manifest(agent)
+        .unwrap();
+    for index in [leader, origin] {
+        assert!(
+            final_manifest
+                .slot(HostNodeId(fixtures[index].plan.pins.node.0))
+                .unwrap()
+                .is_acknowledged()
+        );
+    }
 }
 
 fn exercise_same_leader_retry(
@@ -1284,6 +1566,27 @@ pub(super) fn exercise(
     signer: &mut CountingSigner,
     exercise: Exercise,
 ) {
+    if let Exercise::ExpiredContendedCustody = exercise {
+        super::recovery_expiry::exercise_contended(leader, owners, fixtures, networks);
+        return;
+    }
+    if let Exercise::ExpiredCustody = exercise {
+        super::recovery_expiry::exercise(
+            leader,
+            owners,
+            fixtures,
+            directories,
+            stores,
+            providers,
+            networks,
+            signer,
+        );
+        return;
+    }
+    if let Exercise::OverwrittenRegistration = exercise {
+        exercise_overwritten_registration(leader, owners, fixtures, networks);
+        return;
+    }
     if let Exercise::SameLeaderRetry = exercise {
         exercise_same_leader_retry(
             leader,
@@ -1331,6 +1634,9 @@ pub(super) fn exercise(
         Exercise::ContendedIntent => unreachable!(),
         Exercise::ExpiredContendedIntent => unreachable!(),
         Exercise::SameLeaderRetry => unreachable!(),
+        Exercise::OverwrittenRegistration => unreachable!(),
+        Exercise::ExpiredCustody => unreachable!(),
+        Exercise::ExpiredContendedCustody => unreachable!(),
     };
     let agent = HostAgentId(fixtures[leader].plan.pins.agent.0);
     let lagger = (leader + 1) % 3;

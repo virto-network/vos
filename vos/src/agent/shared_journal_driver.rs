@@ -53,8 +53,8 @@ use super::shared_raft::{
     CommittedSharedRaftSlot, InstalledAgentRaftSnapshotV2,
 };
 use super::shared_recovery::{
-    SharedRecoveryManifest, SharedRecoveryObservation, SharedRecoveryRegistration,
-    VerifiedSharedRecoveryObservation,
+    SharedRecoveryExpiryTerminal, SharedRecoveryManifest, SharedRecoveryObservation,
+    SharedRecoveryRegistration, VerifiedSharedRecoveryObservation,
 };
 use super::wire::RuntimeState;
 use super::{AgentProfile, ReplicaRole};
@@ -1127,6 +1127,10 @@ where
     local_node: NodeId,
     replay_trust: Arc<dyn AgentTrustProvider>,
     replay_merge: Arc<dyn LocalMergeAuthenticator>,
+    /// Reconstructed from the certified baseline and exact applied suffix on
+    /// open; advanced only by successful expiry application. Mutable manifest
+    /// bytes cannot lower or invent this trusted admission floor on hot reads.
+    recovery_expiry_floor: u64,
     #[cfg(feature = "experimental-state-blocks")]
     external: Option<SharedExternalOwner>,
 }
@@ -1342,6 +1346,7 @@ where
         report_phase("reconcile_journal_ledger");
         store.finish_reverified_open()?;
         report_phase("finish_reverified_open");
+        let recovery_expiry_floor = ledger.authenticated_recovery_expiry_floor()?;
         Ok(Self {
             store,
             artifacts,
@@ -1351,13 +1356,14 @@ where
             local_node,
             replay_trust: trust,
             replay_merge: merge,
+            recovery_expiry_floor,
             #[cfg(feature = "experimental-state-blocks")]
             external,
         })
     }
 
     #[cfg(feature = "experimental-state-blocks")]
-    fn external_recovery_budget() -> crate::agent_sdk::state_blocks::ReadBudget {
+    pub(crate) fn external_recovery_budget() -> crate::agent_sdk::state_blocks::ReadBudget {
         let (fetches, bytes) = external_recovery_limits();
         crate::agent_sdk::state_blocks::ReadBudget::new(fetches, bytes)
     }
@@ -2391,6 +2397,19 @@ where
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         };
         if recovering && self.retained_positive_clean_acknowledgement(work, authorization)? {
+            return Ok((0, 0));
+        }
+        if recovering
+            && self.verified_recovery_manifest()?.is_some_and(|manifest| {
+                manifest.slots().iter().any(|slot| {
+                    slot.expiry().is_some()
+                        && slot.registration().work() == work
+                        && slot.registration().authorization() == authorization
+                })
+            })
+        {
+            // Certified expiry needs only durable host cleanup, not VM rows.
+            // An expired clock without this exact applied proof saves nothing.
             return Ok((0, 0));
         }
 
@@ -4212,6 +4231,49 @@ where
         }
     }
 
+    pub(crate) fn recovery_expiry_context(
+        &mut self,
+    ) -> Result<
+        (
+            u64,
+            u64,
+            super::journal::OrderedBase,
+            SharedRecoveryManifest,
+        ),
+        SharedJournalDriverError,
+    > {
+        let (index, term, ordered, manifest) = self.ledger.recovery_expiry_context()?;
+        // The ledger has already authenticated this manifest and its complete
+        // physical prefix in one read snapshot. Check its driver provenance
+        // directly instead of mixing that prefix with a second manifest read.
+        // The caller retains the host lock and brackets signing with its Raft
+        // barrier; publication also freshly revalidates the certified prefix.
+        let manifest = self
+            .verified_recovery_manifest_from_read(Some(manifest))?
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        if ordered != self.materialization.ordered_base() {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        Ok((index, term, ordered, manifest))
+    }
+
+    pub(crate) const fn recovery_expiry_floor(&self) -> u64 {
+        self.recovery_expiry_floor
+    }
+
+    pub(crate) fn recovery_expiry_terminal(
+        &mut self,
+        request: Hash,
+    ) -> Result<Option<SharedRecoveryExpiryTerminal>, SharedJournalDriverError> {
+        Ok(self.verified_recovery_manifest()?.and_then(|manifest| {
+            manifest.slots().iter().find_map(|slot| {
+                (slot.registration().request().request_commitment() == request)
+                    .then(|| slot.expiry().cloned())
+                    .flatten()
+            })
+        }))
+    }
+
     /// Mutable capsule bytes are not authenticated by their registration
     /// signature. Recheck at most six observations against either the exact
     /// certified baseline or this open owner's independently replayed result
@@ -4227,6 +4289,13 @@ where
         &self,
         manifest: Option<SharedRecoveryManifest>,
     ) -> Result<Option<SharedRecoveryManifest>, SharedJournalDriverError> {
+        if manifest
+            .as_ref()
+            .map_or(0, SharedRecoveryManifest::expiry_floor)
+            != self.recovery_expiry_floor
+        {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
         let Some(manifest) = manifest else {
             return Ok(None);
         };
@@ -4245,6 +4314,9 @@ where
         manifest: &SharedRecoveryManifest,
         baseline: Option<&SharedRecoveryManifest>,
     ) -> Result<(), SharedJournalDriverError> {
+        if manifest.expiry_floor() != self.recovery_expiry_floor {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
         for slot in manifest.slots() {
             if baseline.is_some_and(|baseline| {
                 baseline.slots().iter().any(|certified| {
@@ -4281,6 +4353,24 @@ where
                 return Err(SharedJournalDriverError::CrossStoreMismatch);
             }
             self.ledger.validate_recovery_observation(observation)?;
+        }
+        let mut verified_expiry = Vec::new();
+        for terminal in manifest.slots().iter().filter_map(|slot| slot.expiry()) {
+            if verified_expiry.contains(&terminal) {
+                continue;
+            }
+            // A pruned terminal must be retained byte-for-byte in the certified
+            // baseline. A matching request alone cannot authenticate its proof.
+            if !baseline.is_some_and(|baseline| {
+                baseline
+                    .slots()
+                    .iter()
+                    .filter_map(|slot| slot.expiry())
+                    .any(|certified| certified == terminal)
+            }) {
+                self.ledger.validate_recovery_expiry(terminal)?;
+            }
+            verified_expiry.push(terminal);
         }
         Ok(())
     }
@@ -5186,6 +5276,7 @@ where
                     command.entry().command(),
                     AgentRaftCommand::PrepareCommitteeChange(_)
                         | AgentRaftCommand::RegisterRecovery { .. }
+                        | AgentRaftCommand::ExpireRecovery { .. }
                 ) =>
             {
                 let outcome = match self.ledger.apply_foundation_slot(&slot)? {
@@ -5199,11 +5290,19 @@ where
                 if matches!(
                     command.entry().command(),
                     AgentRaftCommand::RegisterRecovery { .. }
+                        | AgentRaftCommand::ExpireRecovery { .. }
                 ) {
                     // Registration is fixed-roster metadata: application
                     // requires no pending transition and the initial active
                     // committee, then retains that exact committee state.
                     self.ledger.audit_recovery()?;
+                    if let AgentRaftCommand::ExpireRecovery { certificate, .. } =
+                        command.entry().command()
+                    {
+                        self.recovery_expiry_floor = self
+                            .recovery_expiry_floor
+                            .max(certificate.claim().observed_slot());
+                    }
                 } else {
                     self.executor
                         .replace_shared_committees(self.ledger.committee_history()?);
@@ -5383,7 +5482,8 @@ where
                         command_outcome(completion, index)
                     }
                     AgentRaftCommand::PrepareCommitteeChange(_)
-                    | AgentRaftCommand::RegisterRecovery { .. } => unreachable!(),
+                    | AgentRaftCommand::RegisterRecovery { .. }
+                    | AgentRaftCommand::ExpireRecovery { .. } => unreachable!(),
                 }
             }
         };
@@ -5543,6 +5643,55 @@ impl
         merge: Arc<dyn LocalMergeAuthenticator>,
     ) -> Result<Self, SharedJournalDriverError> {
         Self::open(store, artifacts, ledger, trust, merge)
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn create_external_unexposed(
+        mut store: super::journal_store::FileAgentJournalStore,
+        artifacts: FileSharedArtifactStager,
+        ledger: AgentRaftApplicationLedgerV2,
+        sealed: Arc<super::replay::ReplaySealedExternalGenesis>,
+        catalog: &[RuntimeBlob],
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+    ) -> Result<Self, SharedJournalDriverError> {
+        if !sealed.is_shared() {
+            return Err(SharedJournalDriverError::InvalidProfile);
+        }
+        for blob in catalog {
+            store.put_blob(
+                JournalBlobClass::CatalogArtifact,
+                &blob.reference,
+                &blob.bytes,
+            )?;
+        }
+        store.initialize_external_local(&sealed, &mut Self::external_recovery_budget())?;
+        store.sync_unexposed_generation()?;
+        Self::open_external(store, artifacts, ledger, trust, merge, sealed)
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn commit_external_genesis_exposure(
+        &mut self,
+        sealed: &super::replay::ReplaySealedExternalGenesis,
+        intent: crate::service::Hash,
+    ) -> Result<(), SharedJournalDriverError> {
+        let external = self
+            .external
+            .as_ref()
+            .ok_or(SharedJournalDriverError::InvalidProfile)?;
+        if external.genesis.genesis() != sealed.genesis() {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        external
+            .availability
+            .require_current(&self.store, &self.materialization)?;
+        self.store.commit_external_genesis_exposure(
+            sealed,
+            intent,
+            &mut Self::external_recovery_budget(),
+        )?;
+        Ok(())
     }
 
     pub(crate) fn commit_exposure<T: super::replay::ReplaySealedOrdinaryGenesis>(
