@@ -8,125 +8,102 @@ implementation branch rather than applying competing fixes on the review branch.
 
 | Purpose | Branch / boundary |
 | --- | --- |
-| Reviewer target | `saga/agents`; review the custody batch with `git diff 7c850160..saga/agents` |
-| Implementation | `wip/ch08-runtime-directory`, synchronized at this checkpoint; apply later findings here |
-| Review scope | One bounded pending-read custody batch; candidate fixtures qualified, production gates unchanged |
+| Reviewed baseline | `6c1bab2a`, the pending-read custody checkpoint |
+| Implementation | `wip/ch08-runtime-directory`, synchronized with this checkpoint; apply later findings here |
+| Reviewer target | `git diff 6c1bab2a..saga/agents`; verify the branch head first |
+| Scope | Repeated-input evidence/retry admission and expired unadmitted registration; no production cutover |
 | Mainline | `master` remains `d2378274`; no automatic push or mainline change |
 
-Verify branch heads and working-tree status before reviewing. Candidate tests or
-document changes do not establish publication to `saga/agents`. Production
-multi-node startup/public Shared management and pruning remain gated; Local
-stays image-based. This is not release or throughput qualification.
+This is a qualified review-fix checkpoint, not a release. Verify both branch
+heads and clean working trees before review. Production multi-node startup,
+public Shared management and pruning remain gated; production Local stays
+image-based. No guest ABI, artifact pin or execution-authority change is included.
 
-## Current batch: pending-read custody across checkpoints
+The previous batch's design, 16 exact-release physical fixtures and 238 focused
+passes are historical baseline evidence, not qualification of these changes:
+`git show 6c1bab2a:docs/agent-saga-review.md`. Do not duplicate that chronology here.
 
-The previous checkpoint preserves a boundary Query and supports authenticated
-pruned-prefix catch-up. That does not protect an offline origin whose uncleared
-PAP2 still needs an older Invoke/result/positive-ACK sequence. Guest ACK removes
-retained results; an empty local pending directory cannot justify pruning.
+## Two review fixes
 
-The follow-up uses at most three slots, one per physical pending-record owner in
-the fixed committee. Each signed registration binds generation, full committee,
-monotonic owner sequence, exact completed predecessor, signed query, and original
-work/preflight/artifacts. PAP2 is an unadmitted WAL intent: recoverable admission
-requires the exact registration to be applied through Raft.
+### Repeated input must not replace canonical recovery evidence
 
-Physically validated Invoke and positive ACK evidence enrich a slot. The owner's
-next signed registration replaces only its own completed slot after durable local
-cleanup. Keeping the completed slot avoids a separate release round per read.
-Forwarding followers retain their own delivery obligation. Several owners may
-hold the same read; this slice allows only one distinct unfinished delegated
-read per system Agent.
+Custody keeps the first physically validated terminal Invoke and first positive
+ACK. A later valid Ordered entry can repeat the same input and return a different
+result, including a negative ACK; it must neither overwrite the original capsule
+nor release its delivery obligation. Physical evidence is checked against the
+exact Ordered position and input, using a bounded position-keyed result cache,
+not the latest result for that input. Retained response lookup prefers the proven
+capsule over a later repeated-input result.
 
-Custody is not execution authority. Original signatures/material, fresh delegated
-admission, physical execution provenance and exact retry remain mandatory. A
-losing, unadmitted local WAL stays intact while its node finishes another admitted
-request from shared custody. Legacy reads and management/GenesisDecision remain
-outside this protocol; expired-unseen cancellation is not implemented. Production
-emitters still use legacy reads. This host-only batch repins no guest artifacts.
+Same-key reservation and already-reserved submission now independently require a
+fresh quiescent committed/applied prefix under the per-Agent proposal guard.
+An ambiguous uncommitted append retains its exclusion; a second caller cannot
+append behind it merely because both callers already hold the same key.
+The worker barrier is sampled again after draining committed work. Catch-up,
+election or tail movement between samples is retryable unavailability, with the
+reservation retained; a contradictory applied cursor against a stable sample
+still fails as corruption.
 
-### Review focus
+This prevents invalid retries; it does **not** repair an old raw log containing
+the same immutable Ordered entry at different Raft positions. Existing physical
+publication binding still rejects that history. The regression repeats the same
+ReplayInput in a new valid successor Ordered entry after the original commits;
+it does not weaken those bindings or manufacture a publication.
 
-- AGC2 authenticates the exact manifest; AGC1 semantics stay unchanged. ACB2
-  carries the certified baseline, never a newer live manifest. ASR4 retains
-  baseline custody and typed metadata boundaries.
-- Common authority remains distinct from each node/store's physical binding.
-  Catch-up requires independent genesis/full-intent validation, exact scope,
-  rollback/raw-suffix refusal and higher-term/full-vote preservation.
-- Live evidence derives from exact applied registration/Ordered rows and
-  independently validated execution, or the installed certified baseline.
-  Slot decoding or an owner's signature alone proves no result.
-- PAP2/PPR1 cleanup, registration retry, follower delivery and competing-WAL
-  help retain exact reservation ownership through leadership changes.
-  Neither expiry nor local absence releases custody.
-- A legacy Invoke or positive ACK cannot acquire its first custody slot afterward.
-  A racing signed local intent remains byte-identical while a proposal-locked,
-  quiescent applied-prefix check proves exact legacy recovery. This is not custody
-  admission; normal positive-ACK cleanup is still required. Existing same-request
-  custody still requires every delivery owner's hold.
-- Preparing manifest updates outside the database writer requires exact
-  predecessor comparisons inside atomic publication. Preserve physical-row,
-  reservation, committee, cursor and worker-metadata checks. Never refold a
-  historical duplicate into a newer owner slot.
-- Candidate construction reuses one fresh audited read view within a call;
-  post-peer-I/O validation stays fresh. Empty Merge frontiers skip no-op import
-  locking; nonempty imports retain every existing guard.
+### Unadmitted custody needs fresh delegation or exact execution evidence
 
-### Qualification status
+Before a new owner registration mutates a reservation or appends a row, the
+leader checks the original scoped delegation against current trusted time, or
+requires exact retained terminal Invoke/positive-ACK evidence. It repeats the
+check after validation/encoding immediately before append. A custody-only slot
+is not execution evidence and does not waive freshness for another owner.
 
-The final default-release run passes all **16 physical fixtures**: four new
-custody cases, four previous common checkpoints, six previous delegation cases,
-and two signed-intent/legacy-execution races. Custody covers offline-origin
-discovery, post-ACK/pre-cleanup recovery, follower delivery, and competing
-unadmitted WALs.
-The first three include three checkpoint/import cycles and source/destination
-Marker, Journal and Ledger crash boundaries.
+An exact already-applied owner registration remains an idempotent retry after
+expiry. That does not authorize unseen execution or permit custody release.
+An expired competing unadmitted WAL stays byte-identical and cannot acquire the
+leader's exclusion or block a different fresh request by registering itself.
 
-Qualification caught and fixed a legacy compatibility regression: adding first
-custody after a legacy Invoke left its later ACK without Invoke evidence. Both
-reopen orderings now pass. Two additional races persist signed intents before
-legacy execution, then prove recovery without a new Invoke, incomplete custody,
-or premature WAL cleanup. Existing same-request custody still requires each
-delivery owner's hold. Earlier failing evidence remains in
-`recovery-slots-release-delegation3.log`; it is not counted as qualification.
+Review particularly: exact position/outcome binding after reopen; first-response
+precedence; negative ACK non-retirement; both reservation and submission barriers;
+freshness at append; and the distinction between applied custody and execution
+authority. Existing legacy recovery, owner-only replacement, reservation ownership
+and fresh post-peer-I/O evidence checks must remain intact.
 
-Final source-specific evidence; logs are in the shared target. The default-release
-build (`recovery-slots-release-tests-build4.log`) passed in 13m27s. Physical fixtures
-are not full outer-PVM, released-daemon, load or general release qualification.
+## Qualification status
 
-| Check | Evidence |
+The earlier timeout fixture incorrectly reused an immutable Ordered entry at a
+new Raft position and was correctly rejected. Its failure remains in
+`custody-review-debug2-candidate_registered_same_leader_timeout_and_duplicate_rows_survive_reopen.log`.
+The corrected fixture first proves timeout retries append nothing, then commits
+valid repeated-input successor entries; qualification is below.
+
+The first optimized matrix passed 17 of 18 cases. The former-leader pre-Invoke
+case exposed a stale worker-snapshot comparison after successful follower
+catch-up (`custody-review-physical-delegation.log`: 7 passed, 1 failed).
+Post-drain barrier revalidation addresses that race without relaxing equality,
+admission or deadlines. All 11 targeted final-source physical reruns pass. The
+seven other checkpoint/custody cases remain explicitly earlier-source evidence; they
+must not be counted as a full final-source 18-case rerun.
+
+Do not inherit baseline counts or treat ignored/socket-restricted tests as passes.
+
+| Check | Source-specific evidence |
 | --- | --- |
-| Final exact-release focused units | 238 passed, 4 existing ignored across manifest, certificate, ledger, driver, protocol, network, routes, host, journal, replay, PAP trailer, cache bound, empty-Merge lock and no-op snapshots; `recovery-slots-final4-release-*.log` |
-| Final exact-release new custody fixtures | 4 passed, 604.03 s; `recovery-slots-release-custody4.log` |
-| Final exact-release previous common checkpoints | 4 passed, 138.81 s; `recovery-slots-release-common4.log` |
-| Final exact-release delegation and compatibility races | 8 passed, 192.62 s; `recovery-slots-release-delegation4.log` |
-| Final default CLI and daemon smoke | 300 passed, 45 existing ignored (91.51 s); smoke 2 passed (14.61 s); `recovery-slots-final4-cli.log`, `recovery-slots-final4-shutdown-smoke.log` |
-| Final feature boundary | Minimal std-only and no-std experimental runtime passed; `recovery-slots-final4-feature-*.log`; full host exact-release build passed |
-| Formatting and whitespace | Changed-range rustfmt checks pass for all 12 Rust files, including the new module; `git diff --check` passes; unrelated baseline formatting is untouched |
+| Exact-release build and focused units | Final build passed in 12m00s; 278 passed, 4 existing ignored, including all 35 Local journal tests and the deterministic barrier-drift test; `custody-review-final-release-build.log`, `custody-review-final-release-*.log` |
+| Same-leader timeout, valid repeated inputs and reopen | Final source passed, 41.36 s; `custody-review-final-physical-candidate_registered_same_leader_timeout_and_duplicate_rows_survive_reopen.log` |
+| Expired competing unadmitted intent, exact-release rerun | Final source passed, 45.33 s; `custody-review-final-physical-candidate_expired_unadmitted_intent_cannot_acquire_custody_after_election.log` |
+| Final-source delegation and follower-delivery regressions | All 8 delegation/compatibility cases passed, 172.13 s; `custody-review-final-physical-delegation.log`. Follower delivery passed, 171.88 s; `custody-review-final-physical-candidate_registered_follower_delivery_survives_leader_reads_and_repeated_checkpoints.log`. |
+| Previous checkpoint/custody physical regressions | 8 passed in 649.62 s immediately before the barrier-race correction; `custody-review-physical-common.log`. Follower delivery was rerun above; the other 7 are earlier-source evidence only. |
+| Supported feature checks, default CLI and daemon smoke | Final minimal std and no-std experimental runtime passed; CLI 300 passed / 45 existing ignored (80.46 s); smoke 2 passed (13.87 s); `custody-review-final-feature-*.log`, `custody-review-final-cli.log`, `custody-review-final-shutdown-smoke.log` |
+| Changed-range formatting and whitespace | Six Rust files pass changed-range rustfmt checks; `git diff --check` passes; baseline formatting left untouched |
 
-An exploratory storage-without-network build failed ten missing route-adapter
-symbols (`recovery-slots-final-feature-std-storage.log`). The affected code is
-unchanged from `7c850160`: host methods lack the networking gate already required
-by their adapter definitions. This is a recorded pre-existing embedding defect,
-not a passed feature check or an approved v1 host combination. No unrelated fix
-is included; the v1 default host/CLI includes networking.
+Whole-fixture durations are not request latency, throughput or failover bounds.
+Whole-manifest decoding/signature/provenance costs remain unqualified. The earlier
+call-local proof reuse and staged writer publication do not establish capacity.
 
-The physical runs exposed two costs worth fixing within this batch. Manifest
-validation held the database writer also needed by Raft heartbeats; preparing
-outside that writer now uses exact atomic predecessor comparisons. Archived
-response proofs also repeated live/baseline validation. One fresh call-local
-audited view now reuses that evidence without caching it across calls or peer
-I/O. The 1.8 s collection deadline and final fresh validation are unchanged.
-
-Earlier failures remain recorded in `recovery-slots-release-discovery1.log`,
-`recovery-slots-debug-discovery{5,7,8}.log`,
-`recovery-slots-release-custody2.log` and
-`recovery-slots-debug-follower-reuse2.log`. Earlier diagnostic writer waits reached
-155–298 ms, and repeated local/peer proof work exceeded the unchanged 1.8 s
-collection window. The final optimized custody fixtures pass after these scoped
-fixes. That is functional evidence, not a controlled speedup benchmark:
-whole-fixture completion and meeting a proof-collection deadline do not establish
-request percentiles, failover bounds or service capacity.
+The pre-existing `std storage` without-network embedding build still has missing
+network-gated route-adapter symbols. It is outside the approved v1 host/CLI
+combination and is not silently counted as a supported passing feature check.
 
 ## Reproduction
 
@@ -147,9 +124,10 @@ cargo +nightly-2025-05-09 test --release --offline --locked -p vos \
   -- --ignored --test-threads=1 --nocapture
 ```
 
-Run the same command with filter
+The common-checkpoint filter includes the two new regressions as well as the
+previous custody and common-checkpoint cases. Run the same command with filter
 `agent::clean_bootstrap::tests::physical::candidate_projection_` for the six
-previous delegation cases and two stale-registration race regressions.
+delegation cases and two stale-registration/legacy-execution races.
 
 Loopback fixtures need socket permission. Do not overlap physical qualification
 with compilation. Verify the Authority candidate SHA-256:
@@ -162,33 +140,26 @@ The default fixture uses the native clean-runtime test adapter around physical
 Authority actor execution. Full outer-PVM execution additionally requires
 `VOS_AGENT_PROFILE_REFINE_MACHINES=1`; disable instruction attribution with
 `VOS_AGENT_DISABLE_REFINE_ATTRIBUTION=1` for timings. The default fixture cannot
-substitute for that separate full-outer-PVM release gate or released daemons.
+substitute for full-outer-PVM or released-daemon qualification.
 
 For diagnosis only, enable `VOS_TEST_BOOTSTRAP_DIAGNOSTICS=1`,
-`VOS_SHARED_RECOVERY_TIMING=1` and the fixture tracing filter.
-The diagnostic optimized build uses `profile.release.lto=false` and
-`profile.release.codegen-units=16`, distinct from default release.
-Whole-fixture times are not request latencies, percentiles or failover bounds.
+`VOS_SHARED_RECOVERY_TIMING=1` and the fixture tracing filter. Diagnostic builds
+with `profile.release.lto=false` and `profile.release.codegen-units=16` are not
+the default release and must be labeled separately.
 
-## Prior checkpoints and remaining release boundary
+## Remaining release boundary
 
-Historical detail and old artifact identities live in Git, not duplicated active
-instructions: `git show 7c850160:docs/agent-saga-review.md`.
+The [live checklist](agent-saga-status.md) retains the release gates. In particular,
+post-admission expired-unseen terminal resolution, legacy/management recovery
+across pruning, and whole-manifest performance are **not qualified by these fixes**.
+Registration timeout followed by overwrite still needs its stated liveness
+qualification; preserving an unadmitted exclusion is not proof of recovery.
 
-| Checkpoint | Preserved evidence / purpose |
-| --- | --- |
-| `7c850160` | Common/physical authority separation, pruned-prefix catch-up, healthy physical workflow, three source/destination crash cases, six delegated-recovery regressions |
-| `6d2a9b38` | Scoped signed delegation; offline-origin exact completion with a harness-supplied request, not autonomous origin-WAL discovery |
-| `7c1a1b7c` | Shared journal/external availability and three-file Create/Install/Invoke/ACK recovery, not public startup |
-| `4ea0271c` / `48df3995` | Recompiler/default-reference integration, custom-runtime parity, bounded preparation and unsupported-path removal, not service capacity |
-| `62ffbc20` | Complete imported-plan certification and pre-write unsupported-roster rejection; both prior startup findings fixed |
-
-The [live checklist](agent-saga-status.md) retains all release gates: complete
-pending-recovery coverage, expired-unseen resolution, external root snapshots/
-export/reclamation, public Shared lifecycle and Clerk with 100,000 retained
-transfers, released workload/failure/backup/restore, soak and reproducible artifacts.
-External nodes will be supplied later; tooling/local evidence cannot close those
-gates. No completion percentage or release date is established.
+External Shared root closure/export/reclamation, public lifecycle, Clerk with
+100,000 retained transfers, released workload/failure/backup/restore, soak and
+reproducible artifacts remain open. External nodes will be supplied later;
+local tooling/tests do not close that hardware acceptance gate. No release date
+or completion percentage is established.
 
 Return severity, location, violated invariant, concrete scenario and regression.
 Separate demonstrated defects from unqualified release gates.

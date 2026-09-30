@@ -906,15 +906,26 @@ impl SharedRecoveryManifest {
             if !observation.matches(slot.registration.request()) {
                 continue;
             }
+            if observation.claim().committee() != slot.registration.committee() {
+                return Err(SharedRecoveryError::ScopeMismatch);
+            }
             let target = if observation.is_acknowledgement() {
                 &mut slot.acknowledgement
             } else {
                 &mut slot.invoke
             };
             match target {
-                Some(previous) if previous != observation => {
+                Some(previous)
+                    if previous != observation
+                        && (observation.raft_index <= previous.raft_index
+                            || observation.raft_term < previous.raft_term) =>
+                {
                     return Err(SharedRecoveryError::Conflict);
                 }
+                // Custody retains the first terminal Invoke and first
+                // positive ACK. Later committed retries have their own
+                // physical evidence, but cannot replace this capsule even
+                // when execution legitimately returns a different outcome.
                 Some(_) => {}
                 None => {
                     *target = Some(observation.clone());
@@ -1671,6 +1682,56 @@ mod tests {
         reply.reply.push(1);
         assert_eq!(state.observe(&changed), Err(SharedRecoveryError::Conflict));
         assert_eq!(state, before);
+    }
+
+    #[test]
+    fn repeated_positions_keep_first_invoke_and_positive_ack_capsule() {
+        let first = registration(1, 9);
+        let mut state = manifest();
+        state.apply_registration(&first, 1, 3).unwrap();
+        state.observe(&observation(&first, 2, false)).unwrap();
+        state.observe(&observation(&first, 3, true)).unwrap();
+        state.apply_registration(&registration(2, 9), 4, 3).unwrap();
+        let canonical = state.clone();
+        for (index, ack) in [(5, false), (6, true), (7, false), (8, true)] {
+            let mut repeated = observation(&first, index, ack);
+            if index == 7 {
+                repeated.0.outcome = RuntimeOutcome::Completed(Err(sdk::InvocationError::NotFound));
+            }
+            assert!(!state.observe(&repeated).unwrap());
+            assert_eq!(state, canonical);
+        }
+        assert_eq!(
+            SharedRecoveryManifest::decode(&state.encode()).unwrap(),
+            canonical
+        );
+        let mut foreign = observation(&first, 9, false);
+        let old = foreign.0.claim();
+        foreign.0.claim = OrderedCommitClaim::new(
+            old.genesis(),
+            old.admission(),
+            AgentReplicaCommitteeId::from_bytes([0xff; 32]),
+            old.raft_index(),
+            old.raft_term(),
+            old.ordered(),
+            old.merge_frontier(),
+            old.merge().clone(),
+            old.merge_invocations(),
+            old.runtime().clone(),
+            old.control().clone(),
+            old.linear().clone(),
+            old.ordered_invocations(),
+            old.artifacts(),
+            old.merge_fence(),
+            old.sealed_merge().cloned(),
+            old.fence_ancestry(),
+        )
+        .unwrap();
+        assert_eq!(
+            state.observe(&foreign),
+            Err(SharedRecoveryError::ScopeMismatch)
+        );
+        assert_eq!(state, canonical);
     }
 
     #[test]

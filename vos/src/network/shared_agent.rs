@@ -1159,6 +1159,54 @@ fn has_projection_recovery_custody(
     })
 }
 
+fn quiescent_projection_commit(
+    role: vos_raft::Role,
+    committed: u64,
+    last: u64,
+    retaining_existing_pair: bool,
+) -> Result<u64, SharedAgentHostError> {
+    if committed != last
+        || !(role == vos_raft::Role::Leader
+            || (retaining_existing_pair && role == vos_raft::Role::Follower))
+    {
+        return Err(SharedAgentHostError::Unavailable);
+    }
+    Ok(committed)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProjectionBarrier {
+    role: vos_raft::Role,
+    term: u64,
+    committed: u64,
+    last: u64,
+}
+
+impl From<&vos_raft::WorkerSnapshot<NodeId>> for ProjectionBarrier {
+    fn from(snapshot: &vos_raft::WorkerSnapshot<NodeId>) -> Self {
+        Self {
+            role: snapshot.role,
+            term: snapshot.current_term,
+            committed: snapshot.commit_index,
+            last: snapshot.last_log_index,
+        }
+    }
+}
+
+impl ProjectionBarrier {
+    fn validate_applied(self, current: Self, applied: u64) -> Result<(), SharedAgentHostError> {
+        // Raft can advance while the caller waits for the host or drains its
+        // committed rows. Such progress invalidates the sample, not the store.
+        if self != current {
+            return Err(SharedAgentHostError::Unavailable);
+        }
+        if applied != self.committed {
+            return Err(SharedAgentHostError::CorruptResidue);
+        }
+        Ok(())
+    }
+}
+
 impl SharedRouteHandler {
     fn register_projection_recovery(
         &self,
@@ -1184,18 +1232,22 @@ impl SharedRouteHandler {
         }
         let barrier = futures_executor::block_on(worker.snapshot())
             .ok_or(SharedAgentHostError::Unavailable)?;
-        if barrier.role != vos_raft::Role::Leader || barrier.commit_index != barrier.last_log_index
-        {
-            return Err(SharedAgentHostError::Unavailable);
-        }
+        quiescent_projection_commit(
+            barrier.role,
+            barrier.commit_index,
+            barrier.last_log_index,
+            false,
+        )?;
         let mut host = self
             .host
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
         drain_committed(&mut host, self.agent, &self.ordered_replies)?;
-        if host.capacity(self.agent)?.0 != barrier.commit_index {
-            return Err(SharedAgentHostError::CorruptResidue);
-        }
+        let applied = host.capacity(self.agent)?.0;
+        let current = futures_executor::block_on(worker.snapshot())
+            .ok_or(SharedAgentHostError::Unavailable)?;
+        ProjectionBarrier::from(&barrier)
+            .validate_applied(ProjectionBarrier::from(&current), applied)?;
         let status = host
             .supervisor_attachment_status(self.agent)?
             .ok_or(SharedAgentHostError::AgentNotFound)?;
@@ -1219,6 +1271,13 @@ impl SharedRouteHandler {
         {
             return Ok(());
         }
+        self.validate_delegated_projection_locked(
+            &mut host,
+            registration.query(),
+            registration.work(),
+            registration.authorization(),
+            NodeId(registration.owner().0),
+        )?;
         if !has_projection_recovery_custody(
             &manifest,
             registration.work(),
@@ -1261,9 +1320,20 @@ impl SharedRouteHandler {
         command
             .validate()
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let payload = command.encode();
+        // Capacity and proof validation may cross the signed time window.
+        // Only exact execution evidence, not a custody-only slot or old WAL,
+        // permits acquiring a new owner hold after that window has closed.
+        self.validate_delegated_projection_locked(
+            &mut host,
+            registration.query(),
+            registration.work(),
+            registration.authorization(),
+            NodeId(registration.owner().0),
+        )?;
         let held_pair = proposal.begin_recovery_registration(key)?;
         drop(host);
-        futures_executor::block_on(worker.propose(command.encode()))
+        futures_executor::block_on(worker.propose(payload))
             .map_err(|_| SharedAgentHostError::Unavailable)?;
         let deadline = Instant::now() + ORDERED_REPLY_WAIT;
         loop {
@@ -1621,32 +1691,41 @@ impl SharedRouteHandler {
         if proposal.management_retirement.is_some() || proposal.management_pending.is_some() {
             return Err(SharedAgentHostError::Conflict);
         }
-        match proposal.projection_pair {
-            Some(existing) if existing == key => return Ok(()),
+        let already_reserved = match proposal.projection_pair {
+            Some(existing) if existing == key => true,
             Some(_) => return Err(SharedAgentHostError::Conflict),
-            None => {}
-        }
+            None => false,
+        };
         let worker = self
             .worker
             .as_ref()
             .ok_or(SharedAgentHostError::TransportNotAttached)?;
-        if !self.has_local_proposer(worker) {
+        if !already_reserved && !self.has_local_proposer(worker) {
             return Err(SharedAgentHostError::Unavailable);
         }
         let barrier = futures_executor::block_on(worker.snapshot())
             .ok_or(SharedAgentHostError::Unavailable)?;
-        if barrier.role != vos_raft::Role::Leader || barrier.commit_index != barrier.last_log_index
-        {
-            return Err(SharedAgentHostError::Unavailable);
-        }
+        quiescent_projection_commit(
+            barrier.role,
+            barrier.commit_index,
+            barrier.last_log_index,
+            already_reserved,
+        )?;
         let mut host = self
             .host
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
         drain_committed(&mut host, self.agent, &self.ordered_replies)?;
         let (applied_slots, remaining_slots, _) = host.capacity(self.agent)?;
-        if applied_slots != barrier.commit_index {
-            return Err(SharedAgentHostError::CorruptResidue);
+        let current = futures_executor::block_on(worker.snapshot())
+            .ok_or(SharedAgentHostError::Unavailable)?;
+        ProjectionBarrier::from(&barrier)
+            .validate_applied(ProjectionBarrier::from(&current), applied_slots)?;
+        if already_reserved {
+            // An old exclusion is not proof that its previous append applied.
+            // Preserve it on any barrier failure; followers may retain the
+            // exact key but still cannot submit locally without leadership.
+            return Ok(());
         }
         if let Some(query) = crate::agent::clean_bootstrap::projection_query_from_work(work)
             && query.recovery.is_some()
@@ -2332,15 +2411,18 @@ impl SharedRouteHandler {
         if !self.has_local_proposer(worker) {
             return Err(SharedAgentHostError::Unavailable);
         }
-        let anchor_barrier = if matches!(clock, InvocationClock::PersistedManagement(_)) {
+        let ordered_barrier = if matches!(clock, InvocationClock::PersistedManagement(_))
+            || matches!(reservation, Some(ReservedSubmission::Projection(_)))
+        {
             let barrier = futures_executor::block_on(worker.snapshot())
                 .ok_or(SharedAgentHostError::Unavailable)?;
-            if barrier.role != vos_raft::Role::Leader
-                || barrier.commit_index != barrier.last_log_index
-            {
-                return Err(SharedAgentHostError::Unavailable);
-            }
-            Some(barrier.commit_index)
+            quiescent_projection_commit(
+                barrier.role,
+                barrier.commit_index,
+                barrier.last_log_index,
+                false,
+            )?;
+            Some(ProjectionBarrier::from(&barrier))
         } else {
             None
         };
@@ -2350,6 +2432,12 @@ impl SharedRouteHandler {
                 .lock()
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
             drain_committed(&mut host, self.agent, &self.ordered_replies)?;
+            if let Some(barrier) = ordered_barrier {
+                let applied = host.capacity(self.agent)?.0;
+                let current = futures_executor::block_on(worker.snapshot())
+                    .ok_or(SharedAgentHostError::Unavailable)?;
+                barrier.validate_applied(ProjectionBarrier::from(&current), applied)?;
+            }
             let delegated_projection =
                 crate::agent::clean_bootstrap::projection_query_from_work(request.work())
                     .filter(|query| query.recovery.is_some())
@@ -2374,7 +2462,7 @@ impl SharedRouteHandler {
             }
             let anchored_input = if let InvocationClock::PersistedManagement(anchor) = clock {
                 let (applied_slots, remaining_slots, _) = host.capacity(self.agent)?;
-                if applied_slots != anchor_barrier.unwrap() {
+                if applied_slots != ordered_barrier.unwrap().committed {
                     return Err(SharedAgentHostError::CorruptResidue);
                 }
                 let crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Invoke {
@@ -3434,6 +3522,182 @@ impl Drop for TransportAttachReservation {
 }
 
 impl SharedAgentNetworkHost {
+    #[cfg(test)]
+    pub(crate) fn projection_admission_state_for_test(
+        &self,
+        agent: crate::service::AgentId,
+    ) -> Result<(u64, u64, Option<([u8; 32], [u8; 32], [u8; 32])>), SharedAgentHostError> {
+        let attached = self
+            .generations
+            .get(&agent)
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        let proposal = attached
+            .coordinator
+            .proposal
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let worker = attached
+            .coordinator
+            .worker
+            .as_ref()
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        let snapshot = futures_executor::block_on(worker.snapshot())
+            .ok_or(SharedAgentHostError::Unavailable)?;
+        Ok((
+            snapshot.last_log_index,
+            snapshot.commit_index,
+            proposal
+                .projection_pair
+                .map(|key| (key.invocation.0, key.work.0, key.authorization.0)),
+        ))
+    }
+
+    /// Qualification only: repeat an applied input in a new, valid Ordered
+    /// successor. Reusing the old immutable entry at another Raft position
+    /// would violate its publication binding instead of exercising replay.
+    #[cfg(test)]
+    pub(crate) fn append_repeated_projection_for_test(
+        &self,
+        agent: crate::service::AgentId,
+        work: &InvocationWork,
+        authorization: &InvocationAuthorization,
+        acknowledgement: bool,
+    ) -> Result<u64, SharedAgentHostError> {
+        use crate::agent::journal::{OrderedEntry, ReplayOperation};
+        let attached = self
+            .generations
+            .get(&agent)
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        let live = attached
+            .lifecycle
+            .read()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if !*live || attached.stale.load(Ordering::Acquire) {
+            return Err(SharedAgentHostError::TransportNotAttached);
+        }
+        let _proposal = attached
+            .coordinator
+            .proposal
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let worker = attached
+            .coordinator
+            .worker
+            .as_ref()
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        let snapshot = futures_executor::block_on(worker.snapshot())
+            .ok_or(SharedAgentHostError::Unavailable)?;
+        let committed = quiescent_projection_commit(
+            snapshot.role,
+            snapshot.commit_index,
+            snapshot.last_log_index,
+            false,
+        )?;
+        let mut host = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        drain_committed(&mut host, agent, &attached.coordinator.ordered_replies)?;
+        if host.capacity(agent)?.0 != committed {
+            return Err(SharedAgentHostError::Unavailable);
+        }
+        let status = host
+            .supervisor_attachment_status(agent)?
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        if status.transport != SharedAgentTransportState::Attached
+            || AttachmentFingerprint::from_attachment_status(&status)? != attached.fingerprint
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let position = host.journal_position(agent)?;
+        let database = host.raft_database(agent)?;
+        let log = RaftLog::open(database).map_err(|_| SharedAgentHostError::CorruptResidue)?;
+        let end = snapshot
+            .last_log_index
+            .checked_add(1)
+            .ok_or(SharedAgentHostError::CorruptResidue)?;
+        let entries = log
+            .entries(snapshot.last_log_index, end)
+            .map_err(|_| SharedAgentHostError::CorruptResidue)?;
+        let [entry] = entries.as_slice() else {
+            return Err(SharedAgentHostError::CorruptResidue);
+        };
+        let EntryKind::Data { payload } = shared_raft::decode_agent_raft_entry_kind(&entry.payload)
+            .map_err(|_| SharedAgentHostError::CorruptResidue)?
+        else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        let command = shared_raft::AgentRaftCommand::decode(&payload)
+            .map_err(|_| SharedAgentHostError::CorruptResidue)?;
+        let shared_raft::AgentRaftCommand::Ordered {
+            route,
+            artifact_batch: None,
+            entry,
+        } = &command
+        else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        if *route != attached.fingerprint.durable_route || command.encode() != payload {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let matches = match &entry.input.operation {
+            ReplayOperation::CleanInvoke {
+                work: original,
+                authorization: original_auth,
+                ..
+            } if !acknowledgement => original == work && original_auth == authorization,
+            ReplayOperation::CleanAcknowledge {
+                work: original,
+                authorization: original_auth,
+                ..
+            } if acknowledgement => {
+                *original == crate::agent_sdk::InvocationRetirement::from_work(work)
+                    && original_auth == authorization
+            }
+            _ => false,
+        };
+        if !matches
+            || position.genesis != entry.genesis
+            || position.ordered_index != entry.index
+            || position.ordered_head != Some(entry.id())
+            || position.merge_frontier != entry.merge_frontier
+            || entry.merge_seal.is_some()
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let repeated = shared_raft::AgentRaftCommand::Ordered {
+            route: *route,
+            artifact_batch: None,
+            entry: OrderedEntry {
+                genesis: entry.genesis,
+                index: entry
+                    .index
+                    .checked_add(1)
+                    .ok_or(SharedAgentHostError::CorruptResidue)?,
+                parent: Some(entry.id()),
+                merge_frontier: entry.merge_frontier,
+                merge_seal: None,
+                input: entry.input.clone(),
+            },
+        };
+        repeated
+            .validate()
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let payload = repeated.encode();
+        let after = futures_executor::block_on(worker.snapshot())
+            .ok_or(SharedAgentHostError::Unavailable)?;
+        if after.current_term != snapshot.current_term
+            || after.role != snapshot.role
+            || after.commit_index != snapshot.commit_index
+            || after.last_log_index != snapshot.last_log_index
+        {
+            return Err(SharedAgentHostError::Unavailable);
+        }
+        drop(host);
+        futures_executor::block_on(worker.propose(payload))
+            .map_err(|_| SharedAgentHostError::Unavailable)
+    }
+
     #[cfg(test)]
     pub(crate) fn assert_late_registration_refused_for_test(
         &self,
@@ -6752,6 +7016,83 @@ mod tests {
 
     use super::*;
     use crate::raft::RAFT_LOG;
+
+    #[test]
+    fn projection_retries_require_a_quiescent_prefix_without_losing_their_key() {
+        let registration = crate::agent::shared_recovery::recovery_registration_for_test(1, 9);
+        let key = ProjectionPairKey::new(registration.work(), registration.authorization());
+        let mut proposal = ProposalAdmission::default();
+        proposal.begin_recovery_registration(key).unwrap();
+        for role in [vos_raft::Role::Leader, vos_raft::Role::Follower] {
+            assert_eq!(
+                quiescent_projection_commit(role, 11, 12, true),
+                Err(SharedAgentHostError::Unavailable)
+            );
+            assert_eq!(proposal.projection_pair, Some(key));
+            assert_eq!(quiescent_projection_commit(role, 12, 12, true), Ok(12));
+        }
+        for role in [
+            vos_raft::Role::Follower,
+            vos_raft::Role::Candidate,
+            vos_raft::Role::PreCandidate,
+        ] {
+            assert_eq!(
+                quiescent_projection_commit(role, 12, 12, false),
+                Err(SharedAgentHostError::Unavailable)
+            );
+        }
+        assert_eq!(
+            quiescent_projection_commit(vos_raft::Role::Leader, 12, 12, false),
+            Ok(12)
+        );
+        assert_eq!(proposal.projection_pair, Some(key));
+    }
+
+    #[test]
+    fn projection_barrier_progress_is_retryable_but_stable_mismatch_is_corrupt() {
+        let registration = crate::agent::shared_recovery::recovery_registration_for_test(1, 9);
+        let key = ProjectionPairKey::new(registration.work(), registration.authorization());
+        let mut proposal = ProposalAdmission::default();
+        proposal.begin_recovery_registration(key).unwrap();
+        let before = ProjectionBarrier {
+            role: vos_raft::Role::Follower,
+            term: 2,
+            committed: 30,
+            last: 30,
+        };
+        for current in [
+            ProjectionBarrier {
+                committed: 33,
+                last: 33,
+                ..before
+            },
+            ProjectionBarrier { last: 31, ..before },
+            ProjectionBarrier { term: 3, ..before },
+            ProjectionBarrier {
+                role: vos_raft::Role::Leader,
+                ..before
+            },
+        ] {
+            // Applied rows may already reflect the newer commit, or the
+            // worker may have advanced after the drain returned Idle.
+            for applied in [before.committed, current.committed] {
+                assert_eq!(
+                    before.validate_applied(current, applied),
+                    Err(SharedAgentHostError::Unavailable)
+                );
+                assert_eq!(proposal.projection_pair, Some(key));
+            }
+        }
+        for applied in [before.committed - 1, before.committed + 1] {
+            assert_eq!(
+                before.validate_applied(before, applied),
+                Err(SharedAgentHostError::CorruptResidue)
+            );
+            assert_eq!(proposal.projection_pair, Some(key));
+        }
+        assert_eq!(before.validate_applied(before, before.committed), Ok(()));
+        assert_eq!(proposal.projection_pair, Some(key));
+    }
 
     #[test]
     fn recovery_custody_requires_exact_work_and_authorization() {

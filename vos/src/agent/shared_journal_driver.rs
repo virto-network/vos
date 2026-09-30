@@ -74,12 +74,33 @@ fn validate_replayed_recovery<R: CatalogBlobResolver>(
     ledger: &AgentRaftApplicationLedgerV2,
     executor: &StandardLocalReplayExecutor<R>,
 ) -> Result<(), SharedJournalDriverError> {
-    for observation in ledger.recovery_observations()? {
-        if executor
-            .clean_ordered_result(observation.input_id())
-            .as_ref()
-            != Some(observation.outcome())
-        {
+    let evidence = ledger.recovery_replay_evidence()?;
+    validate_recovery_replay_evidence(&evidence, |entry, input| {
+        executor.clean_ordered_result_at(entry, input)
+    })
+}
+
+fn validate_recovery_replay_evidence(
+    evidence: &[(
+        super::journal::OrderedEntryId,
+        ReplayInputId,
+        Option<crate::agent_sdk::RuntimeOutcome>,
+    )],
+    outcome_at: impl Fn(
+        super::journal::OrderedEntryId,
+        ReplayInputId,
+    ) -> Option<crate::agent_sdk::RuntimeOutcome>,
+) -> Result<(), SharedJournalDriverError> {
+    for (entry, input, recorded) in evidence {
+        let replayed = outcome_at(*entry, *input);
+        let matches = match recorded {
+            Some(expected) => replayed.as_ref() == Some(expected),
+            None => matches!(
+                replayed,
+                Some(crate::agent_sdk::RuntimeOutcome::Acknowledged(Err(_)))
+            ),
+        };
+        if !matches {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
     }
@@ -127,6 +148,31 @@ fn certified_live_recovery_observation<'a>(
         .flatten()
         .any(|certified| certified == observation)
         .then_some(observation)
+}
+
+/// The manifest has already passed this owner's exact provenance checks.
+/// A later ordinary retry outcome must never replace the certified first
+/// Invoke response returned under its retained input/availability claim.
+fn retained_acknowledged_projection_outcome(
+    manifest: Option<&SharedRecoveryManifest>,
+    work: &crate::agent_sdk::InvocationWork,
+    authorization: &crate::agent_sdk::InvocationAuthorization,
+    input: ReplayInputId,
+    legacy: impl FnOnce() -> Option<crate::agent_sdk::RuntimeOutcome>,
+) -> Option<crate::agent_sdk::RuntimeOutcome> {
+    manifest
+        .and_then(|manifest| {
+            manifest.slots().iter().find_map(|slot| {
+                (slot.registration().work() == work
+                    && slot.registration().authorization() == authorization
+                    && slot.is_acknowledged())
+                .then(|| slot.invoke())
+                .flatten()
+                .filter(|observation| observation.input_id() == input)
+            })
+        })
+        .map(|observation| observation.outcome().clone())
+        .or_else(legacy)
 }
 
 fn materialize_shared_image<S, E>(
@@ -3479,21 +3525,14 @@ where
         // Ordinary retry lookup intentionally stops at a newer ACK. This
         // result-only path uses the authenticated Invoke input located above,
         // but only after proving that exact ACK; it never retries the Invoke.
-        let outcome = match self.executor.clean_ordered_result(input) {
-            Some(outcome) => outcome,
-            None => manifest
-                .as_ref()
-                .and_then(|manifest| {
-                    manifest
-                        .slots()
-                        .iter()
-                        .flat_map(|slot| [slot.invoke(), slot.acknowledgement()])
-                        .flatten()
-                        .find(|observation| observation.input_id() == input)
-                })
-                .map(|observation| observation.outcome().clone())
-                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?,
-        };
+        let outcome = retained_acknowledged_projection_outcome(
+            manifest.as_ref(),
+            expected,
+            request.authorization(),
+            input,
+            || self.executor.clean_ordered_result(input),
+        )
+        .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
         if !matches!(outcome, crate::agent_sdk::RuntimeOutcome::Completed(_)) {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
@@ -4231,7 +4270,11 @@ where
             }
             if self
                 .executor
-                .clean_ordered_result(observation.input_id())
+                .clean_ordered_result_at(
+                    observation.claim().ordered().head
+                        .ok_or(SharedJournalDriverError::CrossStoreMismatch)?,
+                    observation.input_id(),
+                )
                 .as_ref()
                 != Some(observation.outcome())
             {
@@ -4690,6 +4733,9 @@ where
         let context = self
             .ledger
             .snapshot_candidate_context(heads, binding.as_ref().map(|binding| binding.claim()))?;
+        validate_recovery_replay_evidence(&context.recovery_replay_evidence, |entry, input| {
+            self.executor.clean_ordered_result_at(entry, input)
+        })?;
         let plan = prepare_shared_checkpoint(&mut self.store, &self.materialization)
             .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
         let (control, linear, merge, local) = plan
@@ -5311,14 +5357,19 @@ where
                         let observation = if self.ledger.recovery_input_registered(&entry.input)? {
                             let outcome = self
                                 .executor
-                                .clean_ordered_result(entry.input.id())
+                                .clean_ordered_result_at(entry.id(), entry.input.id())
                                 .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
-                            Some(
+                            if matches!(outcome, crate::agent_sdk::RuntimeOutcome::Acknowledged(Err(_))) {
+                                // Negative ACKs do not retire custody. Their
+                                // exact absence is rechecked against physical
+                                // replay on reopen; they are ordinary applies.
+                                None
+                            } else { Some(
                                 VerifiedSharedRecoveryObservation::from_published(
                                     &published, entry, outcome,
                                 )
                                 .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?,
-                            )
+                            ) }
                         } else {
                             None
                         };
@@ -6072,6 +6123,138 @@ fn validate_pending_binding(
 
 #[cfg(test)]
 mod keyed_actor_cursor_tests {
+
+    #[test]
+    fn acknowledged_projection_prefers_first_capsule_over_later_input_outcome() {
+        use super::super::shared_recovery::{
+            SharedRecoveryManifest, recovery_observation_for_test, recovery_registration_for_test,
+        };
+        let registration = recovery_registration_for_test(1, 7);
+        let committee = super::super::shared_commit::common_snapshot_claim_for_test()
+            .active_committee()
+            .clone();
+        let mut manifest =
+            SharedRecoveryManifest::new(registration.generation(), committee).unwrap();
+        manifest.apply_registration(&registration, 1, 3).unwrap();
+        let first = recovery_observation_for_test(&registration, 2, false);
+        let ack = recovery_observation_for_test(&registration, 3, true);
+        manifest.observe(&first).unwrap();
+        manifest.observe(&ack).unwrap();
+        let later = crate::agent_sdk::RuntimeOutcome::Completed(Err(
+            crate::agent_sdk::InvocationError::NotFound,
+        ));
+        let selected = super::retained_acknowledged_projection_outcome(
+            Some(&manifest),
+            registration.work(),
+            registration.authorization(),
+            first.observation().input_id(),
+            || panic!("canonical capsule must win over latest outcome"),
+        );
+        assert_eq!(selected, Some(first.observation().outcome().clone()));
+        assert_eq!(
+            super::retained_acknowledged_projection_outcome(
+                None,
+                registration.work(),
+                registration.authorization(),
+                first.observation().input_id(),
+                || Some(later.clone()),
+            ),
+            Some(later)
+        );
+        let foreign = recovery_registration_for_test(2, 8);
+        assert_eq!(
+            super::retained_acknowledged_projection_outcome(
+                Some(&manifest),
+                foreign.work(),
+                foreign.authorization(),
+                first.observation().input_id(),
+                || None,
+            ),
+            None
+        );
+        assert_eq!(
+            super::retained_acknowledged_projection_outcome(
+                Some(&manifest),
+                registration.work(),
+                registration.authorization(),
+                super::super::journal::ReplayInputId([0xff; 32]),
+                || None,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn recovery_replay_checks_each_position_and_requires_negative_ack_for_absence() {
+        use super::super::journal::{OrderedEntryId, ReplayInputId};
+        use crate::agent_sdk::{InvocationError, RuntimeOutcome};
+        let first = OrderedEntryId([1; 32]);
+        let second = OrderedEntryId([2; 32]);
+        let third = OrderedEntryId([3; 32]);
+        let invoke = ReplayInputId([4; 32]);
+        let ack = ReplayInputId([5; 32]);
+        let first_outcome = RuntimeOutcome::Completed(Err(InvocationError::Suspended));
+        let repeated_outcome = RuntimeOutcome::Completed(Err(InvocationError::NotFound));
+        let negative = RuntimeOutcome::Acknowledged(Err(InvocationError::NotFound));
+        let evidence = vec![
+            (first, invoke, Some(first_outcome.clone())),
+            (second, invoke, Some(repeated_outcome.clone())),
+            (third, ack, None),
+        ];
+        let exact = std::collections::BTreeMap::from([
+            ((first, invoke), first_outcome),
+            ((second, invoke), repeated_outcome.clone()),
+            ((third, ack), negative),
+        ]);
+        super::validate_recovery_replay_evidence(&evidence, |entry, input| {
+            exact.get(&(entry, input)).cloned()
+        })
+        .unwrap();
+        // A latest-by-input answer cannot stand in for the first occurrence.
+        assert!(
+            super::validate_recovery_replay_evidence(&evidence, |_, input| {
+                (input == invoke).then(|| repeated_outcome.clone())
+            })
+            .is_err()
+        );
+        let mut wrong_position = exact.clone();
+        wrong_position.remove(&(first, invoke));
+        assert!(
+            super::validate_recovery_replay_evidence(&evidence, |entry, input| wrong_position
+                .get(&(entry, input))
+                .cloned())
+            .is_err()
+        );
+        let mut wrong_input = exact.clone();
+        let outcome = wrong_input.remove(&(first, invoke)).unwrap();
+        wrong_input.insert((first, ack), outcome);
+        assert!(
+            super::validate_recovery_replay_evidence(&evidence, |entry, input| wrong_input
+                .get(&(entry, input))
+                .cloned())
+            .is_err()
+        );
+
+        let registration = super::super::shared_recovery::recovery_registration_for_test(1, 7);
+        let positive =
+            super::super::shared_recovery::recovery_observation_for_test(&registration, 10, true);
+        let mut missing_positive = exact.clone();
+        missing_positive.insert((third, ack), positive.observation().outcome().clone());
+        assert!(
+            super::validate_recovery_replay_evidence(&evidence, |entry, input| missing_positive
+                .get(&(entry, input))
+                .cloned())
+            .is_err()
+        );
+        let mut missing_result = exact;
+        missing_result.remove(&(third, ack));
+        assert!(
+            super::validate_recovery_replay_evidence(&evidence, |entry, input| missing_result
+                .get(&(entry, input))
+                .cloned())
+            .is_err()
+        );
+    }
     use super::exclusive_actor_predecessor;
 
     #[test]

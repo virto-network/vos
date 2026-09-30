@@ -24,6 +24,8 @@ pub(super) enum Exercise {
     Crash(CommonCheckpointCrashStage),
     Recovery(RecoveryBoundary),
     ContendedIntent,
+    ExpiredContendedIntent,
+    SameLeaderRetry,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +76,28 @@ fn candidate_registered_request_precedes_competing_unadmitted_wal_after_election
         None,
         false,
         Some(Exercise::ContendedIntent),
+    );
+}
+
+#[test]
+#[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
+fn candidate_expired_unadmitted_intent_cannot_acquire_custody_after_election() {
+    check_fixed_system_pending_cluster_with_checkpoint(
+        true,
+        None,
+        false,
+        Some(Exercise::ExpiredContendedIntent),
+    );
+}
+
+#[test]
+#[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
+fn candidate_registered_same_leader_timeout_and_duplicate_rows_survive_reopen() {
+    check_fixed_system_pending_cluster_with_checkpoint(
+        true,
+        None,
+        false,
+        Some(Exercise::SameLeaderRetry),
     );
 }
 
@@ -231,6 +255,7 @@ fn exercise_contended_intent(
     owners: &mut [Option<MemoryBootstrapOwner>],
     fixtures: &[PhysicalFixture],
     networks: &mut Vec<Arc<Network>>,
+    expire_other: bool,
 ) {
     let agent = HostAgentId(fixtures[leader].plan.pins.agent.0);
     let mut intents = Vec::new();
@@ -368,8 +393,354 @@ fn exercise_contended_intent(
             .slot(HostNodeId(fixtures[other].plan.pins.node.0))
             .is_none()
     );
+    if expire_other {
+        let expired_owner = owners[other].as_ref().unwrap();
+        let expired_record = expired_owner.record.encode();
+        let AuthorityReadRequest::Projection(expired_query) = &intents[other].query else {
+            unreachable!()
+        };
+        for fixture in fixtures {
+            fixture.logical_slot.as_ref().unwrap().store(
+                expired_query.recovery.unwrap().expires_at,
+                Ordering::Release,
+            );
+        }
+        let leader_before = owners[successor]
+            .as_ref()
+            .unwrap()
+            ._network_host
+            .projection_admission_state_for_test(agent)
+            .unwrap();
+        assert_eq!(leader_before.0, leader_before.1);
+        assert!(leader_before.2.is_none());
+        // A rejected local WAL is not shared custody. Its owner must not
+        // poison the leader's admission after the signed window has closed.
+        assert!(
+            owners[other]
+                .as_mut()
+                .unwrap()
+                .recover_pending_authority_projection()
+                .is_err()
+        );
+        let leader_owner = owners[successor].as_ref().unwrap();
+        assert_eq!(
+            leader_owner
+                ._network_host
+                .projection_admission_state_for_test(agent)
+                .unwrap(),
+            leader_before
+        );
+        assert_eq!(
+            leader_owner
+                ._network_host
+                .projection_recovery_manifest(agent)
+                .unwrap(),
+            manifest
+        );
+        let expired_owner = owners[other].as_ref().unwrap();
+        assert_eq!(expired_owner.record.encode(), expired_record);
+        assert_eq!(
+            expired_owner
+                .record_store
+                .clone()
+                .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
+                .unwrap(),
+            Some(expired_record)
+        );
+        let fresh = delegated_query(leader_owner, successor, 0xf1);
+        let sender = leader_owner.pins.node;
+        assert!(
+            owners[successor]
+                .as_mut()
+                .unwrap()
+                .invoke_peer_authority_projection(fresh.clone(), false, sender)
+                .is_ok()
+        );
+        let after = owners[successor]
+            .as_ref()
+            .unwrap()
+            ._network_host
+            .projection_recovery_manifest(agent)
+            .unwrap();
+        let fresh_slot = after.slot(HostNodeId(sender.0)).unwrap();
+        assert_eq!(fresh_slot.registration().query(), &fresh);
+        assert!(fresh_slot.is_acknowledged());
+        assert!(
+            after
+                .slot(HostNodeId(fixtures[other].plan.pins.node.0))
+                .is_none()
+        );
+    }
     // The enclosing fixture needs only live handles for its normal cleanup.
     *networks = live_networks.into_iter().flatten().collect();
+}
+
+fn exercise_same_leader_retry(
+    leader: usize,
+    owners: &mut [Option<MemoryBootstrapOwner>],
+    fixtures: &[PhysicalFixture],
+    directories: &[TestDirectory],
+    stores: &[(
+        BootstrapMemoryStore,
+        BootstrapMemoryStore,
+        IssuerMemoryStore,
+    )],
+    providers: &[Arc<MemoryProvider>],
+    networks: &mut Vec<Arc<Network>>,
+    signer: &mut CountingSigner,
+) {
+    let agent = HostAgentId(fixtures[leader].plan.pins.agent.0);
+    let slow = (leader + 1) % 3;
+    let offline = (leader + 2) % 3;
+    let owner = owners[leader].as_mut().unwrap();
+    let request = delegated_query(owner, leader, 0xf2);
+    let mut pending = owner.prepare_authority_projection(request).unwrap();
+    owner
+        .prepare_projection_recovery_registration(&mut pending)
+        .unwrap();
+    let (work, authorization) = pending.invocation().unwrap();
+    let work = work.clone();
+    let authorization = authorization.clone();
+    owner
+        ._network_host
+        .reserve_projection_pair(agent, &work, &authorization, false)
+        .unwrap();
+    owner.record.pending_projection = Some(pending.clone());
+    commit_bootstrap_record(&mut owner.record_store, &owner.record).unwrap();
+    owner.register_pending_projection(&pending).unwrap();
+    let initial = owner
+        ._network_host
+        .projection_recovery_manifest(agent)
+        .unwrap();
+    let holder = HostNodeId(owner.pins.node.0);
+    let identity = owner
+        .pending_authority_projection_identity(&pending, true)
+        .unwrap();
+    let saved_record = owner.record.encode();
+    let before_ordered = owner.ordered_index_for_test().unwrap();
+    for owner in owners.iter().flatten() {
+        assert!(wait_until(std::time::Duration::from_secs(30), || owner
+            ._network_host
+            .projection_recovery_manifest(agent)
+            .is_ok_and(|manifest| manifest == initial)));
+    }
+    drop(owners[offline].take());
+    let mut live_networks: Vec<_> = networks.drain(..).map(Some).collect();
+    stop_network(live_networks[offline].take().unwrap());
+    let slow_database = owners[slow]
+        .as_ref()
+        .unwrap()
+        .host
+        .lock()
+        .unwrap()
+        .raft_database(agent)
+        .unwrap();
+    let mut canonical_invoke = None;
+    for acknowledgement in [false, true] {
+        let owner = owners[leader].as_mut().unwrap();
+        let before = owner
+            ._network_host
+            .projection_admission_state_for_test(agent)
+            .unwrap();
+        assert_eq!(before.0, before.1);
+        assert!(before.2.is_some());
+        // Hold the real follower database writer, not a fake reply. With the
+        // other voter offline, the first command cannot commit before its
+        // response waiter expires. The blocked follower cannot start elections.
+        let blocked_writer = slow_database.begin_write().unwrap();
+        let started = std::time::Instant::now();
+        let timed_out = if acknowledgement {
+            owner.supervisor_acknowledge_reserved(identity, work.clone(), authorization.clone())
+        } else {
+            owner.supervisor_invoke_terminal_reserved(identity, work.clone(), authorization.clone())
+        };
+        assert!(timed_out.is_err());
+        assert!(started.elapsed() >= std::time::Duration::from_millis(1_800));
+        // Bootstrap readiness is deliberately false while this prefix is
+        // uncommitted. The repeated-input append below independently requires the same
+        // worker to remain the actual Raft leader, not merely route-ready.
+        let uncommitted = owner
+            ._network_host
+            .projection_admission_state_for_test(agent)
+            .unwrap();
+        assert_eq!(uncommitted.0, before.0 + 1);
+        assert_eq!(uncommitted.1, before.1);
+        assert_eq!(uncommitted.2, before.2);
+        // Reusing the key must recheck the raw prefix; so must submission by
+        // a caller that already took its reservation before the timed-out call.
+        assert!(
+            owner
+                ._network_host
+                .reserve_projection_pair(agent, &work, &authorization, true,)
+                .is_err()
+        );
+        let retry = if acknowledgement {
+            owner.supervisor_acknowledge_reserved(identity, work.clone(), authorization.clone())
+        } else {
+            owner.supervisor_invoke_terminal_reserved(identity, work.clone(), authorization.clone())
+        };
+        assert!(retry.is_err());
+        assert_eq!(
+            owner
+                ._network_host
+                .projection_admission_state_for_test(agent)
+                .unwrap(),
+            uncommitted
+        );
+        assert_eq!(owner.record.encode(), saved_record);
+        assert_eq!(
+            owner
+                .record_store
+                .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
+                .unwrap(),
+            Some(saved_record.clone())
+        );
+        drop(blocked_writer);
+        for owner in owners.iter().flatten() {
+            assert!(wait_until(std::time::Duration::from_secs(30), || {
+                owner
+                    .host
+                    .lock()
+                    .unwrap()
+                    .capacity(agent)
+                    .is_ok_and(|capacity| capacity.0 >= before.0 + 1)
+            }));
+        }
+        // Admission now prevents an append while the original is uncommitted.
+        // Independently qualify committed replay of the same input at a new
+        // valid Ordered position. Reassigning the original immutable Ordered
+        // entry to another Raft index would violate its publication binding,
+        // rather than represent a runtime retry.
+        let duplicate_index = owners[leader]
+            .as_ref()
+            .unwrap()
+            ._network_host
+            .append_repeated_projection_for_test(agent, &work, &authorization, acknowledgement)
+            .unwrap();
+        assert_eq!(duplicate_index, before.0 + 2);
+        for owner in owners.iter().flatten() {
+            assert!(wait_until(std::time::Duration::from_secs(30), || {
+                owner
+                    ._network_host
+                    .projection_recovery_manifest(agent)
+                    .is_ok_and(|manifest| {
+                        owner
+                            .host
+                            .lock()
+                            .unwrap()
+                            .capacity(agent)
+                            .is_ok_and(|capacity| capacity.0 >= duplicate_index)
+                            && manifest.slot(holder).is_some_and(|slot| {
+                                slot.invoke().is_some() && slot.is_acknowledged() == acknowledgement
+                            })
+                    })
+            }));
+            let manifest = owner
+                ._network_host
+                .projection_recovery_manifest(agent)
+                .unwrap();
+            let slot = manifest.slot(holder).unwrap();
+            let evidence = if acknowledgement {
+                slot.acknowledgement()
+            } else {
+                slot.invoke()
+            }
+            .unwrap();
+            assert_eq!(
+                evidence.raft_index(),
+                before.0 + 1,
+                "custody must retain the first physical observation"
+            );
+            if acknowledgement {
+                assert_eq!(slot.invoke(), canonical_invoke.as_ref());
+            }
+        }
+        if !acknowledgement {
+            canonical_invoke = owners[leader]
+                .as_ref()
+                .unwrap()
+                ._network_host
+                .projection_recovery_manifest(agent)
+                .unwrap()
+                .slot(holder)
+                .unwrap()
+                .invoke()
+                .cloned();
+        }
+    }
+    drop(slow_database);
+    let owner = owners[leader].as_mut().unwrap();
+    let final_duplicate_index = owner
+        ._network_host
+        .projection_admission_state_for_test(agent)
+        .unwrap()
+        .0;
+    let expected = owner
+        ._network_host
+        .projection_recovery_manifest(agent)
+        .unwrap();
+    let response = owner.committed_projection_response(&work).unwrap().unwrap();
+    assert_eq!(owner.ordered_index_for_test().unwrap(), before_ordered + 4);
+    assert!(owner.recover_pending_authority_projection().unwrap());
+    assert!(owner.record.pending_projection.is_none());
+    assert_eq!(owner.ordered_index_for_test().unwrap(), before_ordered + 4);
+    live_networks[offline] = Some(restart_network(offline));
+    for index in 0..3 {
+        if index != offline {
+            live_networks[offline]
+                .as_ref()
+                .unwrap()
+                .connect(live_networks[index].as_ref().unwrap().listen_addrs()[0].clone());
+        }
+    }
+    owners[offline] = Some(reopen_owner(
+        &fixtures[offline],
+        &directories[offline],
+        &stores[offline],
+        providers[offline].clone(),
+        live_networks[offline].as_ref().unwrap().clone(),
+        signer,
+    ));
+    for owner in owners.iter().flatten() {
+        assert!(wait_until(std::time::Duration::from_secs(30), || owner
+            ._network_host
+            .projection_recovery_manifest(agent)
+            .is_ok_and(|manifest| manifest == expected
+                && owner.host.lock().unwrap().capacity(agent).is_ok_and(
+                    |capacity| capacity.0 >= final_duplicate_index
+                ))));
+        assert_eq!(
+            owner.committed_projection_response(&work).unwrap(),
+            Some(response.clone())
+        );
+    }
+    // Reopening both original active owners must reproduce first-position
+    // evidence even though their latest applied rows were duplicate copies.
+    for index in [slow, leader] {
+        drop(owners[index].take());
+        owners[index] = Some(reopen_owner(
+            &fixtures[index],
+            &directories[index],
+            &stores[index],
+            providers[index].clone(),
+            live_networks[index].as_ref().unwrap().clone(),
+            signer,
+        ));
+        let owner = owners[index].as_ref().unwrap();
+        assert_eq!(
+            owner
+                ._network_host
+                .projection_recovery_manifest(agent)
+                .unwrap(),
+            expected
+        );
+        assert!(owner.host.lock().unwrap().capacity(agent).unwrap().0 >= final_duplicate_index);
+        assert_eq!(
+            owner.committed_projection_response(&work).unwrap(),
+            Some(response.clone())
+        );
+    }
+    *networks = live_networks.into_iter().map(Option::unwrap).collect();
 }
 
 fn exercise_registered_recovery(
@@ -913,8 +1284,30 @@ pub(super) fn exercise(
     signer: &mut CountingSigner,
     exercise: Exercise,
 ) {
-    if let Exercise::ContendedIntent = exercise {
-        exercise_contended_intent(leader, owners, fixtures, networks);
+    if let Exercise::SameLeaderRetry = exercise {
+        exercise_same_leader_retry(
+            leader,
+            owners,
+            fixtures,
+            directories,
+            stores,
+            providers,
+            networks,
+            signer,
+        );
+        return;
+    }
+    if matches!(
+        exercise,
+        Exercise::ContendedIntent | Exercise::ExpiredContendedIntent
+    ) {
+        exercise_contended_intent(
+            leader,
+            owners,
+            fixtures,
+            networks,
+            matches!(exercise, Exercise::ExpiredContendedIntent),
+        );
         return;
     }
     if let Exercise::Recovery(boundary) = exercise {
@@ -936,6 +1329,8 @@ pub(super) fn exercise(
         Exercise::Crash(stage) => Some(stage),
         Exercise::Recovery(_) => unreachable!(),
         Exercise::ContendedIntent => unreachable!(),
+        Exercise::ExpiredContendedIntent => unreachable!(),
+        Exercise::SameLeaderRetry => unreachable!(),
     };
     let agent = HostAgentId(fixtures[leader].plan.pins.agent.0);
     let lagger = (leader + 1) % 3;

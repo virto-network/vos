@@ -5236,9 +5236,16 @@ mod application_ledger_v2 {
     }
 
     /// Read-only ledger contribution to an exact journal checkpoint claim.
+    pub(crate) type RecoveryReplayEvidence = Vec<(
+        OrderedEntryId,
+        crate::agent::journal::ReplayInputId,
+        Option<crate::agent_sdk::RuntimeOutcome>,
+    )>;
+
     #[derive(Clone, Debug)]
     pub(crate) struct AgentRaftSnapshotContextV2 {
         pub(crate) recovery_manifest: Option<SharedRecoveryManifest>,
+        pub(crate) recovery_replay_evidence: RecoveryReplayEvidence,
         boundary_disposition: AgentRaftApplyDispositionV2,
         /// Exact logical Ordered projection rebound only for this snapshot to
         /// the latest authenticated physical foundation.
@@ -5262,6 +5269,8 @@ mod application_ledger_v2 {
         snapshot: Option<AgentRaftSnapshotRecordV2>,
         recovery: Option<SharedRecoveryManifest>,
         reservation_pending: bool,
+        // Collected only for reopen/snapshot proof, never retained across calls.
+        recovery_replay_evidence: RecoveryReplayEvidence,
     }
 
     impl AuditedRecoveryView {
@@ -5695,6 +5704,15 @@ mod application_ledger_v2 {
                 .collect()
         }
 
+        pub(crate) fn recovery_replay_evidence(
+            &self,
+        ) -> Result<RecoveryReplayEvidence, AgentRaftApplicationErrorV2> {
+            let transaction = self.database.begin_read()?;
+            Ok(self
+                .audit_recovery_in_read_with_evidence(&transaction, true)?
+                .recovery_replay_evidence)
+        }
+
         /// Exact bounded hot-read proof. This does not authenticate outcome
         /// bytes by itself: the driver also compares its fresh replay cache.
         pub(crate) fn validate_recovery_observation(
@@ -5935,7 +5953,7 @@ mod application_ledger_v2 {
                 .lock()
                 .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
             let transaction = self.database.begin_read()?;
-            let audited = self.audit_recovery_in_read(&transaction)?;
+            let audited = self.audit_recovery_in_read_with_evidence(&transaction, true)?;
             self.snapshot_context_from_audit(&transaction, ordered, audited)
         }
 
@@ -5951,7 +5969,7 @@ mod application_ledger_v2 {
                 .lock()
                 .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
             let transaction = self.database.begin_read()?;
-            let audited = self.audit_recovery_in_read(&transaction)?;
+            let audited = self.audit_recovery_in_read_with_evidence(&transaction, true)?;
             let entry = heads
                 .ordered_head
                 .ok_or(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired)?;
@@ -5992,6 +6010,7 @@ mod application_ledger_v2 {
                 snapshot: previous,
                 recovery,
                 reservation_pending,
+                recovery_replay_evidence,
             } = audited;
             if state.pending.is_some()
                 || reservation_pending
@@ -6119,6 +6138,7 @@ mod application_ledger_v2 {
                     .disposition
                     .ok_or(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired)?,
                 recovery_manifest: recovery,
+                recovery_replay_evidence,
                 ordered,
                 active_committee: state.active,
                 authority_epoch: state.authority_epoch,
@@ -7356,7 +7376,12 @@ mod application_ledger_v2 {
                 }
                 _ => false,
             };
-            if matches_recovery != observation.is_some() {
+            let is_acknowledgement = matches!(reserved.committed().command(),
+                AgentRaftCommand::Ordered { entry, .. }
+                    if matches!(entry.input.operation, ReplayOperation::CleanAcknowledge { .. }));
+            if (!matches_recovery && observation.is_some())
+                || (matches_recovery && observation.is_none() && !is_acknowledgement)
+            {
                 return Err(AgentRaftApplicationErrorV2::InvalidCommandDisposition);
             }
             let (manifest, observation) = if let Some(observation) = observation {
@@ -7989,6 +8014,14 @@ mod application_ledger_v2 {
             &self,
             transaction: &redb::ReadTransaction,
         ) -> Result<AuditedRecoveryView, AgentRaftApplicationErrorV2> {
+            self.audit_recovery_in_read_with_evidence(transaction, false)
+        }
+
+        fn audit_recovery_in_read_with_evidence(
+            &self,
+            transaction: &redb::ReadTransaction,
+            collect_replay_evidence: bool,
+        ) -> Result<AuditedRecoveryView, AgentRaftApplicationErrorV2> {
             let started = std::time::Instant::now();
             let key = generation_storage_key(self.generation);
             ensure_v2_config_in_read(
@@ -8085,6 +8118,7 @@ mod application_ledger_v2 {
                 .and_then(|record| record.recovery_manifest())
                 .cloned();
             let mut observed_recovery_rows = 0_usize;
+            let mut recovery_replay_evidence = Vec::new();
             let mut expected_index = raft.snap_last_index.saturating_add(1);
             let mut previous_term = raft.snap_last_term;
             let mut last_record = None;
@@ -8151,8 +8185,23 @@ mod application_ledger_v2 {
                         let matches = replayed_recovery
                             .as_ref()
                             .is_some_and(|manifest| recovery_input_matches(manifest, &entry.input));
-                        if matches != observation.is_some() {
+                        let is_acknowledgement = matches!(
+                            entry.input.operation,
+                            ReplayOperation::CleanAcknowledge { .. }
+                        );
+                        if (!matches && observation.is_some())
+                            || (matches && observation.is_none() && !is_acknowledgement)
+                        {
                             return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                        }
+                        if matches && collect_replay_evidence {
+                            // Only the driver can turn this structural audit
+                            // into execution evidence. None requires exactly
+                            // Acknowledged(Err) at this physical occurrence.
+                            recovery_replay_evidence.push((
+                                entry.id(), entry.input.id(),
+                                observation.as_ref().map(|value| value.outcome().clone()),
+                            ));
                         }
                         if let Some(observation) = observation {
                             observation
@@ -8274,6 +8323,7 @@ mod application_ledger_v2 {
                 snapshot,
                 recovery: live_recovery,
                 reservation_pending,
+                recovery_replay_evidence,
             })
         }
 
@@ -9810,10 +9860,11 @@ mod application_ledger_v2 {
         ) {
             let index = ledger.cursor().unwrap().applied_index + 1;
             let prototype = recovery_observation_for_test(registration, index, acknowledge);
+            let prior_ordered = ledger.journal_audit().unwrap().ordered;
             let entry = OrderedEntry {
                 genesis: registration.generation().genesis(),
-                index: 1,
-                parent: None,
+                index: prior_ordered.len() as u64 + 1,
+                parent: prior_ordered.last().map(|anchor| anchor.entry),
                 merge_frontier: prototype.observation().claim().merge_frontier(),
                 merge_seal: None,
                 input: prototype.observation().input().clone(),
@@ -10135,6 +10186,116 @@ mod application_ledger_v2 {
                     assert_eq!(durable_rows(&ledger), before);
                 }
             }
+        }
+
+        #[test]
+        fn repeated_recovery_invokes_and_acknowledgements_keep_canonical_capsule_on_reopen() {
+            let (_directory, ledger, registration) = fixture("repeated_recovery_evidence");
+            let initial = append_registration(&ledger, &registration);
+            ledger.apply_foundation_slot(&initial).unwrap();
+            let first_invoke = reserve_observation(&ledger, &registration, false);
+            ledger
+                .complete_reserved_command(&first_invoke.0, first_invoke.1, Some(&first_invoke.2))
+                .unwrap();
+            // A negative ACK is an ordinary committed row, not custody
+            // evidence. The driver must later authenticate its exact outcome.
+            let negative_before = reserve_observation(&ledger, &registration, true);
+            ledger
+                .complete_reserved_command(&negative_before.0, negative_before.1, None)
+                .unwrap();
+            assert!(
+                !ledger
+                    .recovery_manifest()
+                    .unwrap()
+                    .slot(registration.owner())
+                    .unwrap()
+                    .is_acknowledged()
+            );
+            let first_ack = reserve_observation(&ledger, &registration, true);
+            ledger
+                .complete_reserved_command(&first_ack.0, first_ack.1, Some(&first_ack.2))
+                .unwrap();
+            let canonical = ledger.recovery_manifest().unwrap();
+
+            let repeated_invoke = reserve_observation(&ledger, &registration, false);
+            let original = repeated_invoke.2.observation();
+            let different = VerifiedSharedRecoveryObservation::from_validated_replay(
+                original.raft_index(),
+                original.raft_term(),
+                original.claim(),
+                original.input(),
+                &crate::agent_sdk::RuntimeOutcome::Completed(Err(
+                    crate::agent_sdk::InvocationError::NotFound,
+                )),
+            )
+            .unwrap();
+            ledger
+                .complete_reserved_command(&repeated_invoke.0, repeated_invoke.1, Some(&different))
+                .unwrap();
+            let repeated_ack = reserve_observation(&ledger, &registration, true);
+            ledger
+                .complete_reserved_command(&repeated_ack.0, repeated_ack.1, Some(&repeated_ack.2))
+                .unwrap();
+            let negative_after = reserve_observation(&ledger, &registration, true);
+            ledger
+                .complete_reserved_command(&negative_after.0, negative_after.1, None)
+                .unwrap();
+            assert_eq!(ledger.recovery_manifest().unwrap(), canonical);
+            let evidence = ledger.recovery_replay_evidence().unwrap();
+            let observations = ledger.recovery_observations().unwrap();
+            let absent: Vec<_> = evidence
+                .iter()
+                .filter_map(|(entry, input, outcome)| outcome.is_none().then_some((*entry, *input)))
+                .collect();
+            assert_eq!(observations.len(), 4);
+            assert!(observations.contains(first_invoke.2.observation()));
+            assert!(observations.contains(first_ack.2.observation()));
+            assert!(observations.contains(different.observation()));
+            assert!(observations.contains(repeated_ack.2.observation()));
+            assert_eq!(
+                absent,
+                vec![
+                    (
+                        negative_before
+                            .2
+                            .observation()
+                            .claim()
+                            .ordered()
+                            .head
+                            .unwrap(),
+                        negative_before.2.observation().input_id()
+                    ),
+                    (
+                        negative_after
+                            .2
+                            .observation()
+                            .claim()
+                            .ordered()
+                            .head
+                            .unwrap(),
+                        negative_after.2.observation().input_id()
+                    ),
+                ]
+            );
+            assert_ne!(
+                first_invoke.2.observation().claim().ordered().head,
+                different.observation().claim().ordered().head
+            );
+            let reopened = AgentRaftApplicationLedgerV2::open(
+                ledger.database.clone(),
+                ledger.generation,
+                ledger.journal_store,
+                ledger.local_node,
+                ledger.initial_committee.clone(),
+                ledger.authority,
+            )
+            .unwrap();
+            assert_eq!(reopened.recovery_manifest().unwrap(), canonical);
+            assert_eq!(reopened.recovery_replay_evidence().unwrap(), evidence);
+            let context = reopened
+                .snapshot_context(negative_after.2.observation().claim())
+                .unwrap();
+            assert_eq!(context.recovery_replay_evidence, evidence);
         }
 
         #[test]

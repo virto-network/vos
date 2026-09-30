@@ -30,8 +30,8 @@ use super::invocation_index::{InvocationIndexLookup, InvocationIndexes};
 use super::journal::{
     CanonicalJournalRecord, InvocationOutcomeAnchor, InvocationOwnershipKey,
     InvocationOwnershipScope, InvocationResultState, LaneCursor, LocalEntry, MergeEvent,
-    MergeEventId, MergeFrontier, MergeFrontierId, MergeSeal, OrderedEntry, PersistedLane,
-    ReplayInput, ReplayInputId, ReplayOperation, RuntimeBinding,
+    MergeEventId, MergeFrontier, MergeFrontierId, MergeSeal, OrderedEntry, OrderedEntryId,
+    PersistedLane, ReplayInput, ReplayInputId, ReplayOperation, RuntimeBinding,
 };
 use super::journal_store::{
     AgentJournalStore, CatalogBlobResolver, CatalogBlobResolverFactory, JournalBlobClass,
@@ -1289,6 +1289,13 @@ pub(crate) enum LocalSettledAcknowledgementResult {
     Divergent,
 }
 
+/// The ordinary handoff is latest-by-input; custody evidence instead names
+/// an exact Ordered occurrence. Shared Ordered outcomes live only once here.
+enum RecentCleanResult {
+    Ordered(OrderedEntryId),
+    Unpositioned(crate::agent_sdk::RuntimeOutcome),
+}
+
 /// Exact Standard-runtime replay executor backed by an immutable catalog
 /// resolver snapshot.
 pub(crate) struct StandardLocalReplayExecutor<R> {
@@ -1304,8 +1311,11 @@ pub(crate) struct StandardLocalReplayExecutor<R> {
     management_gas: Gas,
     last_management_result: Option<(ReplayInputId, Result<LifecycleReply, LifecycleError>)>,
     pending_clean_invocation_results: BTreeMap<ReplayInputId, crate::agent_sdk::RuntimeOutcome>,
-    recent_clean_ordered_results: BTreeMap<ReplayInputId, crate::agent_sdk::RuntimeOutcome>,
+    recent_clean_ordered_results: BTreeMap<ReplayInputId, RecentCleanResult>,
     recent_clean_ordered_order: VecDeque<ReplayInputId>,
+    positioned_clean_results:
+        BTreeMap<(OrderedEntryId, ReplayInputId), crate::agent_sdk::RuntimeOutcome>,
+    positioned_clean_order: VecDeque<(OrderedEntryId, ReplayInputId)>,
     recent_clean_management_results: BTreeMap<ReplayInputId, crate::agent_sdk::RuntimeOutcome>,
     recent_clean_management_order: VecDeque<ReplayInputId>,
     clean_genesis_descriptor: Option<crate::agent_sdk::AgentDescriptor>,
@@ -2097,7 +2107,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             return Err(LocalReplayExecutorError::InvalidState);
         }
         self.pending_transition_proof = pending_transition_proof;
-        self.record_clean_invocation_result(input.id(), returned.outcome);
+        self.record_clean_invocation_result_at(position, input.id(), returned.outcome);
         Ok(ReplayTransition {
             state,
             disposition,
@@ -2226,6 +2236,8 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             pending_clean_invocation_results: BTreeMap::new(),
             recent_clean_ordered_results: BTreeMap::new(),
             recent_clean_ordered_order: VecDeque::new(),
+            positioned_clean_results: BTreeMap::new(),
+            positioned_clean_order: VecDeque::new(),
             recent_clean_management_results: BTreeMap::new(),
             recent_clean_management_order: VecDeque::new(),
             clean_genesis_descriptor: None,
@@ -2264,6 +2276,8 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             pending_clean_invocation_results: BTreeMap::new(),
             recent_clean_ordered_results: BTreeMap::new(),
             recent_clean_ordered_order: VecDeque::new(),
+            positioned_clean_results: BTreeMap::new(),
+            positioned_clean_order: VecDeque::new(),
             recent_clean_management_results: BTreeMap::new(),
             recent_clean_management_order: VecDeque::new(),
             clean_genesis_descriptor: None,
@@ -2710,13 +2724,71 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         &self,
         input: ReplayInputId,
     ) -> Option<crate::agent_sdk::RuntimeOutcome> {
-        self.recent_clean_ordered_results.get(&input).cloned()
+        match self.recent_clean_ordered_results.get(&input)? {
+            RecentCleanResult::Ordered(entry) => self.clean_ordered_result_at(*entry, input),
+            RecentCleanResult::Unpositioned(outcome) => Some(outcome.clone()),
+        }
+    }
+
+    pub(crate) fn clean_ordered_result_at(
+        &self,
+        entry: OrderedEntryId,
+        input: ReplayInputId,
+    ) -> Option<crate::agent_sdk::RuntimeOutcome> {
+        self.positioned_clean_results.get(&(entry, input)).cloned()
+    }
+
+    fn record_clean_invocation_result_at(
+        &mut self,
+        position: ReplayPosition,
+        input: ReplayInputId,
+        result: crate::agent_sdk::RuntimeOutcome,
+    ) {
+        let ReplayPosition::Ordered { id, .. } = position else {
+            self.record_clean_invocation_result(input, result);
+            return;
+        };
+        if self.profile != AgentProfile::Shared {
+            self.record_clean_invocation_result(input, result);
+            return;
+        }
+        let key = (id, input);
+        if !self.positioned_clean_results.contains_key(&key) {
+            if self.positioned_clean_results.len() == MAX_PENDING_CLEAN_INVOCATION_RESULTS
+                && let Some(evicted) = self.positioned_clean_order.pop_front()
+            {
+                self.positioned_clean_results.remove(&evicted);
+                if matches!(self.recent_clean_ordered_results.get(&evicted.1),
+                    Some(RecentCleanResult::Ordered(entry)) if *entry == evicted.0)
+                {
+                    self.recent_clean_ordered_results.remove(&evicted.1);
+                    self.recent_clean_ordered_order
+                        .retain(|input| *input != evicted.1);
+                }
+            }
+            self.positioned_clean_order.push_back(key);
+        }
+        self.record_clean_result_handoff(input, result.clone(), RecentCleanResult::Ordered(id));
+        self.positioned_clean_results.insert(key, result);
     }
 
     fn record_clean_invocation_result(
         &mut self,
         input: ReplayInputId,
         result: crate::agent_sdk::RuntimeOutcome,
+    ) {
+        self.record_clean_result_handoff(
+            input,
+            result.clone(),
+            RecentCleanResult::Unpositioned(result),
+        );
+    }
+
+    fn record_clean_result_handoff(
+        &mut self,
+        input: ReplayInputId,
+        result: crate::agent_sdk::RuntimeOutcome,
+        recent: RecentCleanResult,
     ) {
         if !self.pending_clean_invocation_results.contains_key(&input)
             && self.pending_clean_invocation_results.len() == MAX_PENDING_CLEAN_INVOCATION_RESULTS
@@ -2728,9 +2800,9 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             }
         }
         self.pending_clean_invocation_results
-            .insert(input, result.clone());
+            .insert(input, result);
         if let Some(cached) = self.recent_clean_ordered_results.get_mut(&input) {
-            *cached = result;
+            *cached = recent;
             return;
         }
         if self.recent_clean_ordered_results.len() == MAX_PENDING_CLEAN_INVOCATION_RESULTS
@@ -2739,7 +2811,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             self.recent_clean_ordered_results.remove(&evicted);
         }
         self.recent_clean_ordered_order.push_back(input);
-        self.recent_clean_ordered_results.insert(input, result);
+        self.recent_clean_ordered_results.insert(input, recent);
     }
 
     fn record_clean_management_result(
@@ -3626,7 +3698,7 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
         if let crate::agent_sdk::RuntimeOutcome::Management(_) = outcome {
             self.record_clean_management_result(input.id(), outcome);
         } else {
-            self.record_clean_invocation_result(input.id(), outcome);
+            self.record_clean_invocation_result_at(position, input.id(), outcome);
         }
         self.external_execution = Some(execution);
         Ok(transition)
@@ -9711,6 +9783,85 @@ mod tests {
             },
             lifecycle_fault: None,
         }
+    }
+
+    #[test]
+    fn shared_ordered_result_provenance_survives_repeated_inputs_and_other_handoffs() {
+        let mut driver = standard_test_driver();
+        let executor = &mut driver.core.executor;
+        executor.profile = AgentProfile::Shared;
+        let input = ReplayInputId([0x41; 32]);
+        let first = OrderedEntryId([0x51; 32]);
+        let second = OrderedEntryId([0x52; 32]);
+        let outcome_a = crate::agent_sdk::RuntimeOutcome::Completed(Err(
+            crate::agent_sdk::InvocationError::NotFound,
+        ));
+        let outcome_b = crate::agent_sdk::RuntimeOutcome::Completed(Err(
+            crate::agent_sdk::InvocationError::Suspended,
+        ));
+        let position = |id| ReplayPosition::Ordered {
+            id,
+            index: 1,
+            merge_frontier: MergeFrontierId([0x61; 32]),
+            merge_seal: None,
+        };
+        executor.record_clean_invocation_result_at(position(first), input, outcome_a.clone());
+        executor.record_clean_invocation_result_at(position(second), input, outcome_b.clone());
+        assert_eq!(
+            executor.clean_ordered_result(input),
+            Some(outcome_b.clone())
+        );
+        assert_eq!(
+            executor.clean_ordered_result_at(first, input),
+            Some(outcome_a.clone())
+        );
+        assert_eq!(
+            executor.clean_ordered_result_at(second, input),
+            Some(outcome_b.clone())
+        );
+        assert_eq!(
+            executor.clean_ordered_result_at(first, ReplayInputId([0x42; 32])),
+            None
+        );
+        for value in 0..=MAX_PENDING_CLEAN_INVOCATION_RESULTS {
+            let mut id = [0x71; 32];
+            id[..8].copy_from_slice(&(value as u64).to_le_bytes());
+            executor.record_clean_invocation_result(ReplayInputId(id), outcome_a.clone());
+        }
+        assert_eq!(
+            executor.clean_ordered_result_at(first, input),
+            Some(outcome_a.clone())
+        );
+        assert_eq!(
+            executor.clean_ordered_result_at(second, input),
+            Some(outcome_b.clone())
+        );
+        // Restore the ordinary latest pointer, then evict A from the exact
+        // FIFO without removing the pointer to the newer B occurrence.
+        executor.record_clean_invocation_result_at(position(second), input, outcome_b.clone());
+        for value in 0..MAX_PENDING_CLEAN_INVOCATION_RESULTS - 1 {
+            let mut id = [0x81; 32];
+            id[..8].copy_from_slice(&(value as u64).to_le_bytes());
+            executor.record_clean_invocation_result_at(
+                position(OrderedEntryId(id)),
+                ReplayInputId(id),
+                outcome_a.clone(),
+            );
+        }
+        assert_eq!(executor.clean_ordered_result_at(first, input), None);
+        assert_eq!(
+            executor.clean_ordered_result_at(second, input),
+            Some(outcome_b.clone())
+        );
+        assert_eq!(executor.clean_ordered_result(input), Some(outcome_b));
+        assert_eq!(
+            executor.positioned_clean_results.len(),
+            MAX_PENDING_CLEAN_INVOCATION_RESULTS
+        );
+        assert_eq!(
+            executor.positioned_clean_order.len(),
+            MAX_PENDING_CLEAN_INVOCATION_RESULTS
+        );
     }
 
     #[test]

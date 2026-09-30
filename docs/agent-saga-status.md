@@ -13,15 +13,15 @@ Clerk with **100,000 retained transfers**. Keep Clerk's kernel, signatures,
 committed roots and exact retry semantics. Do not replace this with a singleton,
 smaller dataset or an experimental-only release without a new user decision.
 
-The reviewable custody checkpoint is `7c850160..saga/agents`, based on the
-common-checkpoint/catch-up baseline. It qualifies bounded pending-read recovery
-retention across pruning in candidate physical fixtures, not production startup
-or service capacity. This is **one batch**, with findings applied on the
-implementation branch. Preceding signed read delegation is `6d2a9b38`; Shared
-journal/applied availability is `7c1a1b7c`; backend follow-up `4ea0271c`, pruning
+The review-fix checkpoint is `6c1bab2a..saga/agents`. It addresses repeated-input
+evidence/retry admission and expired unadmitted registration, including a
+catch-up barrier race exposed by qualification. `wip/ch08-runtime-directory` and
+`saga/agents` share this checkpoint; verify the heads before review. This is
+**one scoped review-fix batch**, not production startup or service qualification.
+Preceding signed read delegation is `6d2a9b38`; Shared journal/applied availability
+is `7c1a1b7c`; backend follow-up `4ea0271c`, pruning
 `48df3995`, and admission baseline `62ffbc20` retain their
-historical evidence. `wip/ch08-runtime-directory` and `saga/agents` share this
-checkpoint; subsequent fixes continue on the implementation branch before a
+historical evidence. Findings continue on the implementation branch before a
 qualified fast-forward. `master` is unchanged; do not push or change it automatically.
 
 Status vocabulary: **implemented** means source and focused tests exist;
@@ -78,7 +78,7 @@ Current evidence, without promoting production startup or changing the finish li
   arbitrary historical reply retention. Production pruning stays disabled until
   all pending scopes have qualified recovery evidence, not only delegated reads.
 
-This checkpoint implements at most one recovery slot per physical owner in the
+Custody retains at most one recovery slot per physical owner in the
 fixed-three committee, not per query attestor. Registration retains
 the exact signed request and original work/preflight in the existing Raft log
 before claiming recoverable admission. Physically verified terminal Invoke and
@@ -100,16 +100,38 @@ This batch adds no guest ABI or private-state decoding. Delegation expiry is nev
 permission to drop evidence; expired-unseen cancellation and unsupported
 management/legacy obligations remain explicit pruning gates until qualified.
 
-Final exact-release evidence: all 16 physical custody/checkpoint/delegation cases
-pass, including both persisted-intent/legacy-execution races; 238 focused tests
-pass with four existing ignored. A late first custody slot is refused after an
-exact legacy Invoke or positive ACK. A racing signed intent remains unchanged
+Final-source optimized evidence: 278 focused tests pass with four existing
+ignored, plus 11 physical cases (two new review regressions, eight delegation/
+compatibility cases and follower delivery across checkpoints/reopen). Seven
+other checkpoint/custody cases passed immediately before the final barrier-race
+correction; they are earlier-source evidence, not a full final-source 18-case
+rerun. CLI 300 active tests, two daemon smoke tests and supported feature checks
+also pass. A late first custody slot is refused after an exact legacy Invoke or
+positive ACK. A racing signed intent remains unchanged
 while exact legacy recovery finishes, and clears only after proven positive ACK.
 These fixtures use the native clean-runtime test adapter around physical Authority
 execution; full outer-PVM and released-daemon qualification remain separate gates.
 
-TODO: qualify reconciliation when a registration append times out and is later
-overwritten before commitment. The coordinator conservatively retains its exact
+The follow-up preserves the first terminal Invoke and first positive ACK while
+checking physical replay by exact Ordered position, not the latest input cache.
+Later valid repeated inputs cannot replace canonical custody or its response;
+negative ACK rows do not release it. Same-key reservation and already-reserved
+submission both recheck the committed/applied prefix. A fresh post-drain worker
+sample distinguishes legitimate catch-up from a contradictory stable cursor;
+changed samples return retryable unavailability without releasing the reservation.
+New registration requires fresh delegation or exact retained execution evidence
+before append/reservation
+mutation; retrying an existing admitted registration remains idempotent.
+No guest format, artifact or execution-authority change is included.
+
+This prevents a second immutable Ordered entry from being proposed behind an
+unresolved append. It does not repair old raw logs already containing the same
+immutable entry at two Raft positions: those violate the existing physical
+publication binding and must still fail closed. Valid repeated inputs use new
+Ordered entries. Keep this distinction explicit in reviewer evidence.
+
+Next scoped step: qualify reconciliation when a registration append times out
+and is later overwritten before commitment. The coordinator conservatively retains its exact
 volatile projection exclusion; without an owner retry, reattachment may be needed
 to release that exclusion. This is a liveness limitation of an unadmitted intent,
 not evidence that an admitted request or result was lost. The current policy unit
@@ -194,9 +216,11 @@ do not by themselves qualify Shared capacity or eliminate whole-runtime work.
 - [ ] Qualify leader loss before Invoke commit and the remaining ACK/metadata-clear
   crash matrix. Preserve exact retry, fresh authorization, reservation ownership
   and unpublished recovery. The current candidate custody/checkpoint/delegation
-  matrix passes all 16 exact-release fixtures, including six prior delegation
-  cases and two signed-intent/legacy-execution races. This does not qualify all
-  pending scopes, full outer-PVM execution or production startup.
+  follow-up passes 11 final-source optimized fixtures, including both new review
+  regressions, follower delivery and all eight delegation/compatibility cases.
+  Seven additional checkpoint/custody cases are explicitly earlier-source
+  evidence. This does not qualify all pending scopes, full outer-PVM execution
+  or production startup.
   Signed delegation is an explicit candidate-only opt-in: legacy authenticators
   still emit ordinary reads. Delegated SSH attestors must be current voters with
   authenticated committee keys. Applied custody now retains delegated signed
@@ -345,6 +369,14 @@ These are approved targets, not measured capacity or an availability promise.
   intents are covered by the final eight passing delegation fixtures. Measurements
   and reproduction live in the review guide; these candidate recovery tests do not
   qualify service capacity or the remaining production recovery scopes.
+- Expiry after custody admission remains unresolved; a remote owner's unfinished
+  registration also retains the leader's projection reservation until positive
+  ACK. Expiry never authorizes execution of unseen work or discarding custody.
+  Legacy/mixed-version stale intents can outlive all owner replacements and
+  pruning; retained-history legacy checks alone cannot prevent such an old read
+  from registering again. Keep this with the legacy pending-scope pruning gate.
+  A registration reply can time out while its append later applies; exact retry
+  reconciles it. None of these limits is closed by refusing expired new admission.
 - Native full-memory snapshots and cloning still scale with the guest address
   span, not touched pages, and can materialize a large flat image. Sparse snapshot
   behavior must not be assumed for the native mapping. Instruction attribution
