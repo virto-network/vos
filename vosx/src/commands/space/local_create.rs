@@ -98,18 +98,8 @@ pub(crate) fn create_local(
         "Local Create requires a nonzero loopback endpoint"
     );
     let identity = CleanOperatorIdentitySigner::new(operator)?;
-    let runtime = crate::bundled::root_signed_agent_runtime_package(operator)?;
-    let authority_package = crate::bundled::root_signed_actor_package(
-        crate::bundled::system_authority_package_template_for_storage(storage)?,
-        "system-authority",
-        operator,
-    )?;
-    let (authority, _) = super::clean_startup::derive_system_authority_target(
-        space,
-        identity.raw_public_key(),
-        &runtime,
-        &authority_package,
-    )?;
+    let authority =
+        super::clean_startup::client_system_authority_target(data, space, operator, node_public)?;
     let root = data.join("agent-client");
     let _root = ensure_private_directory(&root)?;
     let claims = root.join("credentials");
@@ -158,9 +148,9 @@ pub(crate) fn create_local(
             let expires = now
                 .checked_add(3600)
                 .ok_or_else(|| anyhow::anyhow!("validity window overflow"))?;
-            let bytes = prepare_fresh(
+            let bytes = prepare_fresh_for_authority(
                 operator,
-                space,
+                authority,
                 node_public,
                 nonce,
                 sequence,
@@ -278,6 +268,76 @@ pub(super) fn post_binary_response(
     denial_maximum: Option<usize>,
     access_token: Option<&str>,
 ) -> anyhow::Result<(u16, Vec<u8>)> {
+    post_binary_response_inner(
+        address,
+        path,
+        status,
+        bytes,
+        maximum,
+        denial_maximum,
+        access_token,
+        None,
+        None,
+    )
+}
+
+/// Node-local warm handoff alone binds its unchanged OGAR body to the selected
+/// member. This routing header grants no authorization; the owner checks it
+/// before native admission or storage publication.
+#[cfg(feature = "experimental-state-blocks")]
+pub(super) fn post_shared_member_admission_response(
+    address: std::net::SocketAddr,
+    bytes: &[u8],
+    expected_node: vos::agent::sdk::NodeId,
+    maximum: usize,
+) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(expected_node.0 != [0; 32], "invalid target member node");
+    post_binary_response_inner(
+        address,
+        "/_vos/agents/shared/admit",
+        200,
+        bytes,
+        maximum,
+        None,
+        None,
+        None,
+        Some(expected_node),
+    )
+    .map(|(_, bytes)| bytes)
+}
+
+/// Shared Install alone has a separately verified signed terminal failure.
+/// Its caller must bind 201/403/422 to SIR1 before retaining or completing it.
+#[cfg(feature = "experimental-state-blocks")]
+pub(super) fn post_shared_install_response(
+    address: std::net::SocketAddr,
+    bytes: &[u8],
+) -> anyhow::Result<(u16, Vec<u8>)> {
+    let maximum = vos::agent::local_lifecycle::SharedInstallSubmission::MAX_RESPONSE_BYTES;
+    post_binary_response_inner(
+        address,
+        "/_vos/agents/shared/install",
+        201,
+        bytes,
+        maximum,
+        Some(maximum),
+        None,
+        Some(maximum),
+        None,
+    )
+}
+
+fn post_binary_response_inner(
+    address: std::net::SocketAddr,
+    path: &'static str,
+    status: u16,
+    bytes: &[u8],
+    maximum: usize,
+    denial_maximum: Option<usize>,
+    access_token: Option<&str>,
+    signed_install_failure_maximum: Option<usize>,
+    _expected_member_node: Option<vos::agent::sdk::NodeId>,
+) -> anyhow::Result<(u16, Vec<u8>)> {
     use std::io::Read as _;
     use std::time::Duration;
     anyhow::ensure!(
@@ -296,20 +356,33 @@ pub(super) fn post_binary_response(
         Some(token) => request.set("Authorization", &format!("Bearer {token}")),
         None => request,
     };
+    #[cfg(feature = "experimental-state-blocks")]
+    let request = match _expected_member_node {
+        Some(node) => request.set(
+            vos::agent::local_lifecycle::SharedMemberAdmissionSubmission::TARGET_NODE_HEADER,
+            &hex::encode(node.0),
+        ),
+        None => request,
+    };
     let response = request.send_bytes(bytes);
     let response = match response {
         Ok(response) => response,
         Err(ureq::Error::Status(403, response)) if denial_maximum.is_some() => response,
+        Err(ureq::Error::Status(422, response)) if signed_install_failure_maximum.is_some() => {
+            response
+        }
         Err(error) => return Err(error.into()),
     };
     let actual_status = response.status();
-    let maximum = if actual_status == 403 {
-        denial_maximum.unwrap_or(maximum)
-    } else {
-        maximum
+    let maximum = match actual_status {
+        403 => denial_maximum.unwrap_or(maximum),
+        422 => signed_install_failure_maximum.unwrap_or(maximum),
+        _ => maximum,
     };
     anyhow::ensure!(
-        actual_status == status || (denial_maximum.is_some() && actual_status == 403),
+        actual_status == status
+            || (denial_maximum.is_some() && actual_status == 403)
+            || (signed_install_failure_maximum.is_some() && actual_status == 422),
         "Agent control expected HTTP {status}, received {}",
         response.status()
     );
@@ -561,6 +634,7 @@ fn validate_credential_response_for(
 /// The node's public key is sufficient; never load its private transport key.
 /// The caller must discover/check live state and allocate sequence/nonce before
 /// this call, then publish the resulting bytes before sending.
+#[cfg(test)]
 pub(crate) fn prepare_fresh(
     operator: &Keypair,
     space: vos::agent::sdk::SpaceId,
@@ -570,9 +644,45 @@ pub(crate) fn prepare_fresh(
     valid_from: u64,
     expires_at: u64,
 ) -> anyhow::Result<LocalCreateSubmission> {
+    let runtime = crate::bundled::root_signed_agent_runtime_package(operator)?;
+    let package = crate::bundled::root_signed_actor_package(
+        crate::bundled::system_authority_package_template(),
+        "system-authority",
+        operator,
+    )?;
+    let authority = super::clean_startup::derive_system_authority_target(
+        space,
+        CleanOperatorIdentitySigner::new(operator)?.raw_public_key(),
+        &runtime,
+        &package,
+    )?
+    .0;
+    prepare_fresh_for_authority(
+        operator,
+        authority,
+        node_public,
+        nonce,
+        sequence,
+        valid_from,
+        expires_at,
+    )
+}
+
+/// The System identity may come from a certified common bootstrap, but Local
+/// Create always signs the existing image-runtime descriptor and package.
+pub(crate) fn prepare_fresh_for_authority(
+    operator: &Keypair,
+    authority: AuthorityActorTarget,
+    node_public: [u8; 32],
+    nonce: vos::agent::sdk::Hash,
+    sequence: NonZeroU64,
+    valid_from: u64,
+    expires_at: u64,
+) -> anyhow::Result<LocalCreateSubmission> {
     use vos::agent::sdk::{
         AgentId, AgentIdentity, AgentProfile, AgentReplica, ProducerId, ReplicaRole,
     };
+    let space = authority.space;
     let signer = CleanOperatorIdentitySigner::new(operator)?;
     anyhow::ensure!(
         node_public != signer.raw_public_key(),
@@ -582,17 +692,6 @@ pub(crate) fn prepare_fresh(
         .map_err(|_| anyhow::anyhow!("invalid node public key"))?;
     let node_peer = libp2p::identity::PublicKey::from(node_key).to_peer_id();
     let runtime = crate::bundled::root_signed_agent_runtime_package(operator)?;
-    let authority_package = crate::bundled::root_signed_actor_package(
-        crate::bundled::system_authority_package_template(),
-        "system-authority",
-        operator,
-    )?;
-    let (authority, _) = super::clean_startup::derive_system_authority_target(
-        space,
-        signer.raw_public_key(),
-        &runtime,
-        &authority_package,
-    )?;
     let descriptor = AgentDescriptor {
         identity: AgentIdentity {
             space,
@@ -987,9 +1086,6 @@ pub(crate) mod tests {
     /// A host-signed certificate fixture, not a claim of Authority execution.
     /// Native vos tests separately prove the runtime/retirement preconditions.
     pub(crate) fn denial_fixture() -> (Vec<u8>, Vec<u8>) {
-        use vos::actors::codec::Encode as _;
-        use vos::agent::sdk::wire::CanonicalWire as _;
-        use vos::agent::sdk::*;
         let (operator, authority, descriptor, runtime) = fixture();
         let submission = prepare(
             &operator,
@@ -1003,6 +1099,24 @@ pub(crate) mod tests {
         .unwrap();
         let request = submission.encode();
         let (descriptor, call, _) = submission.into_parts();
+        let intent = denial_for_create(&operator, descriptor, call);
+        LocalCreateSubmission::decode(&request)
+            .unwrap()
+            .verify_denial(&intent)
+            .unwrap();
+        (request, intent)
+    }
+
+    /// Signature/codec fixture only: no claim of native policy execution.
+    pub(crate) fn denial_for_create(
+        operator: &Keypair,
+        descriptor: AgentDescriptor,
+        call: AuthorityCredentialCall,
+    ) -> Vec<u8> {
+        use vos::actors::codec::Encode as _;
+        use vos::agent::sdk::wire::CanonicalWire as _;
+        use vos::agent::sdk::*;
+        let authority = call.authority;
         let mut message = vec![vos::actors::value::TAG_DYNAMIC];
         message.extend(
             vos::actors::value::Msg::new("authorize")
@@ -1079,11 +1193,7 @@ pub(crate) mod tests {
         let signature = operator.sign(&message).unwrap();
         intent[..4].copy_from_slice(b"CND1");
         intent.extend_from_slice(&signature);
-        LocalCreateSubmission::decode(&request)
-            .unwrap()
-            .verify_denial(&intent)
-            .unwrap();
-        (request, intent)
+        intent
     }
 
     #[test]

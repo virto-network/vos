@@ -92,7 +92,7 @@ impl<R: BlockReader + ?Sized> StateBlockHost<'_, R> {
             RuntimeWork::Manage { .. } | RuntimeWork::Resume { .. } => {
                 return Err(BlockPvmError::InvalidRequest);
             }
-            RuntimeWork::InspectInvocation { .. } => {
+            RuntimeWork::InspectInvocation { .. } | RuntimeWork::Observe { .. } => {
                 return Err(BlockPvmError::InvalidRequest);
             }
         };
@@ -555,6 +555,7 @@ impl<S: super::replay::ScopedBlockReader + ?Sized> MultiLaneStateBlockHost<'_, S
             // admitted package supplies its deployment; journal replay must
             // separately authenticate the original invocation and yield.
             RuntimeWork::Resume { state, .. } => (None, runtime.deployment(), state),
+            RuntimeWork::Observe { .. } => return Err(BlockPvmError::InvalidRequest),
         };
         if !matches!(
             request,

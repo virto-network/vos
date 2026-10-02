@@ -89,6 +89,19 @@ const MAX_COMMON_RESTORE_BYTES: usize = MAX_COMMON_CHECKPOINT_BUNDLE_BYTES
     + super::shared_commit::MAX_SHARED_AGENT_LOCAL_SNAPSHOT_BINDING_BYTES
     + MAX_JOURNAL_RECORD_BYTES;
 
+#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+mod external_maintenance;
+#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+mod external_restore;
+#[cfg(all(feature = "network", target_os = "linux"))]
+mod forwarded_management;
+#[cfg(all(
+    feature = "network",
+    target_os = "linux",
+    feature = "experimental-state-blocks"
+))]
+mod member_genesis;
+
 /// Hard discovery bound for one Shared host root.
 pub const MAX_SHARED_HOST_AGENTS: usize = 4096;
 /// The intent retains one complete finalized provision and its exact genesis
@@ -114,7 +127,6 @@ type FileSharedDriver = SharedJournalAgentDriver<FileAgentJournalStore, FileShar
 #[non_exhaustive]
 pub enum SharedAgentHostError {
     Unavailable,
-    ProjectionExpired,
     DirectoryInUse,
     InvalidScope,
     ScopeMismatch,
@@ -231,19 +243,60 @@ pub struct VerifiedSharedAgentCommonSnapshotCandidate {
     message: Hash,
 }
 
-/// Signing capability minted only from a fresh audited applied prefix and
-/// the host's trusted clock. A decoded expiry claim is not this capability.
+/// Scoped retention signing capability, reconstructed under the actual System
+/// host owner. It neither approves nor delegates its retained management work.
 #[derive(Clone, Debug)]
-pub struct VerifiedSharedRecoveryExpiryCandidate {
-    claim: super::shared_recovery::SharedRecoveryExpiryClaim,
+pub struct VerifiedSharedManagementRecoveryRegistrationCandidate {
+    request: super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest,
+    committee: AgentReplicaCommittee,
 }
 
-impl VerifiedSharedRecoveryExpiryCandidate {
-    pub const fn claim(&self) -> &super::shared_recovery::SharedRecoveryExpiryClaim {
-        &self.claim
+impl VerifiedSharedManagementRecoveryRegistrationCandidate {
+    pub(crate) const fn request(
+        &self,
+    ) -> &super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest {
+        &self.request
+    }
+    pub const fn generation(&self) -> AgentGenerationRouteKey {
+        self.request.generation()
+    }
+    pub const fn committee(&self) -> &AgentReplicaCommittee {
+        &self.committee
+    }
+    pub const fn owner(&self) -> NodeId {
+        self.request.owner()
     }
     pub fn signing_message(&self) -> Hash {
-        self.claim.signing_message()
+        self.request.signing_message()
+    }
+}
+
+/// Exact all-ACK scope selected by the System owner. The native caller must
+/// additionally have durably cleared its lifecycle intent before requesting
+/// this terminal pledge; positive runtime ACKs alone never establish that fact.
+#[derive(Clone, Debug)]
+pub struct VerifiedSharedManagementRecoveryReleaseCandidate {
+    request: super::shared_recovery::management::SharedManagementRecoveryReleaseRequest,
+    committee: AgentReplicaCommittee,
+}
+
+impl VerifiedSharedManagementRecoveryReleaseCandidate {
+    pub(crate) const fn request(
+        &self,
+    ) -> &super::shared_recovery::management::SharedManagementRecoveryReleaseRequest {
+        &self.request
+    }
+    pub const fn generation(&self) -> AgentGenerationRouteKey {
+        self.request.generation()
+    }
+    pub const fn committee(&self) -> &AgentReplicaCommittee {
+        &self.committee
+    }
+    pub const fn owner(&self) -> NodeId {
+        self.request.owner()
+    }
+    pub fn signing_message(&self) -> Hash {
+        self.request.signing_message()
     }
 }
 
@@ -1364,7 +1417,7 @@ impl super::replay::ReplaySealedOrdinaryGenesis for PreparedSharedGenesis {
 /// Process-selected admission mode, never inferred from files on disk. The
 /// candidate mode still requires the signed Linear-only external contract.
 #[derive(Clone, Copy)]
-enum SharedExecutionSelection {
+pub(crate) enum SharedExecutionSelection {
     ImageOnly,
     #[cfg(feature = "experimental-state-blocks")]
     ExternalLinearCandidates,
@@ -1435,6 +1488,18 @@ impl SharedAgentHost {
         else {
             return Ok(None);
         };
+        #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+        if bytes.starts_with(&external_restore::ExternalCommonRestoreRecord::MAGIC) {
+            let record = external_restore::ExternalCommonRestoreRecord::decode(&bytes)
+                .map_err(|_| SharedAgentHostError::CorruptResidue)?;
+            if record.encode() != bytes
+                || record.target.runtime.agent != agent
+                || record.target.node != self.scope().node
+            {
+                return Err(SharedAgentHostError::CorruptResidue);
+            }
+            return Ok(Some((record.predecessor, record.target)));
+        }
         let record = CommonInstallRecord::decode(&bytes)
             .map_err(|_| SharedAgentHostError::CorruptResidue)?;
         if record.encode() != bytes
@@ -1595,6 +1660,58 @@ impl SharedAgentHost {
         root_pins: RootAnchorPins,
         system_agent: AgentId,
     ) -> Result<Self, SharedAgentHostError> {
+        Self::open_system_first_with_selection(
+            root,
+            stable_lock_path,
+            scope,
+            trust,
+            merge,
+            finality,
+            root_pins,
+            system_agent,
+            SharedExecutionSelection::ImageOnly,
+        )
+    }
+
+    /// Explicit external ordinary-Shared selection with the same system-first
+    /// finality barrier. The selected System bootstrap remains image-backed;
+    /// no persisted ordinary root selects its own executor or skips recovery.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn open_external_shared_system_first(
+        root: impl Into<PathBuf>,
+        stable_lock_path: impl Into<PathBuf>,
+        scope: AgentHostScope,
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+        finality: Arc<dyn AgentGenesisFinalityVerifier>,
+        root_pins: RootAnchorPins,
+        system_agent: AgentId,
+    ) -> Result<Self, SharedAgentHostError> {
+        Self::open_system_first_with_selection(
+            root,
+            stable_lock_path,
+            scope,
+            trust,
+            merge,
+            finality,
+            root_pins,
+            system_agent,
+            SharedExecutionSelection::ExternalLinearCandidates,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_system_first_with_selection(
+        root: impl Into<PathBuf>,
+        stable_lock_path: impl Into<PathBuf>,
+        scope: AgentHostScope,
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+        finality: Arc<dyn AgentGenesisFinalityVerifier>,
+        root_pins: RootAnchorPins,
+        system_agent: AgentId,
+        execution_selection: SharedExecutionSelection,
+    ) -> Result<Self, SharedAgentHostError> {
         root_pins
             .validate()
             .map_err(|_| SharedAgentHostError::InvalidProvision)?;
@@ -1610,7 +1727,7 @@ impl SharedAgentHost {
             finality,
             Some(root_pins),
             Some(system_agent),
-            SharedExecutionSelection::ImageOnly,
+            execution_selection,
         )
     }
 
@@ -1645,6 +1762,17 @@ impl SharedAgentHost {
         for (agent, mut files) in files {
             if only_system.is_some_and(|system| agent != system) {
                 host.deferred_generations.insert(agent, files);
+                continue;
+            }
+            #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+            if let Some(record) = host.read_external_common_restore(agent, files)? {
+                let finality = Arc::clone(&host.finality);
+                let hosted =
+                    host.resume_external_common_restore(agent, files, &record, finality.as_ref())?;
+                retire_host_record(&host.portable_restore_path(agent))?;
+                if host.agents.insert(agent, hosted).is_some() {
+                    return Err(SharedAgentHostError::CorruptResidue);
+                }
                 continue;
             }
             #[cfg(test)]
@@ -1758,6 +1886,12 @@ impl SharedAgentHost {
     ) -> Result<HostedSharedAgent, SharedAgentHostError> {
         if !self.deferred_generations.contains_key(&agent) || self.agents.contains_key(&agent) {
             return Err(SharedAgentHostError::Conflict);
+        }
+        #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+        if let Some(record) = self.read_external_common_restore(agent, files)? {
+            let hosted = self.resume_external_common_restore(agent, files, &record, finality)?;
+            retire_host_record(&self.portable_restore_path(agent))?;
+            return Ok(hosted);
         }
         let recovery = self.read_portable_restore(agent, files)?;
         let (intent, encoded) = if let Some(recovery) = &recovery {
@@ -2212,19 +2346,34 @@ impl SharedAgentHost {
         &mut self,
         agent: AgentId,
         finality: &super::clean_bootstrap::ReplayVerifiedAgentGenesisFinality,
+        retained: super::clean_bootstrap::ReplayVerifiedAgentGenesisFinalitySet,
     ) -> Result<(), SharedAgentHostError> {
         if self.deferred_open {
             return Err(SharedAgentHostError::Conflict);
         }
         self.lease.validate_live().map_err(map_outer_lease_error)?;
+        // Retaining a live proof must never replace another serving Agent's
+        // authority with an incomplete set. Only owner-minted exact proofs can
+        // enter this opaque set; archive decoding supplies no such capability.
+        for hosted in self.agents.values() {
+            if let SharedGenesisAuthority::AuthorityFinalized(provision) = &hosted.intent.authority
+            {
+                retained
+                    .verify_finalized(provision)
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            }
+        }
         if let Some(existing) = self.agents.get(&agent) {
             let SharedGenesisAuthority::AuthorityFinalized(provision) = &existing.intent.authority
             else {
                 return Err(SharedAgentHostError::ScopeMismatch);
             };
-            return finality
+            finality
                 .verify_finalized(provision)
-                .map_err(|_| SharedAgentHostError::ScopeMismatch);
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            self.lease.validate_live().map_err(map_outer_lease_error)?;
+            self.finality = Arc::new(retained);
+            return Ok(());
         }
         let current = scan_generation_namespaces(&self.lease)?;
         if current.keys().any(|agent| {
@@ -2236,7 +2385,14 @@ impl SharedAgentHost {
             .get(&agent)
             .ok_or(SharedAgentHostError::CorruptResidue)?;
         let hosted = self.open_deferred_generation(agent, files, finality)?;
+        let SharedGenesisAuthority::AuthorityFinalized(provision) = &hosted.intent.authority else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        retained
+            .verify_finalized(provision)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
         self.lease.validate_live().map_err(map_outer_lease_error)?;
+        self.finality = Arc::new(retained);
         self.agents.insert(agent, hosted);
         self.deferred_generations.remove(&agent);
         Ok(())
@@ -2283,6 +2439,113 @@ impl SharedAgentHost {
             .driver
             .capacity()
             .map_err(map_driver_error)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capacity_audits_for_test(
+        &self,
+        agent: AgentId,
+    ) -> Result<usize, SharedAgentHostError> {
+        Ok(self
+            .agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .ledger()
+            .capacity_audits_for_test())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn management_preflight_audits_for_test(
+        &self,
+        agent: AgentId,
+    ) -> Result<usize, SharedAgentHostError> {
+        Ok(self
+            .agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .ledger()
+            .management_preflight_audits_for_test())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn common_recovery_audits_for_test(
+        &self,
+        agent: AgentId,
+    ) -> Result<usize, SharedAgentHostError> {
+        Ok(self
+            .agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .ledger()
+            .common_recovery_audits_for_test())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_common_candidate_reuses_audited_manifest_for_test(
+        &mut self,
+        agent: AgentId,
+    ) {
+        // This helper is used with the genuine host mutex held. Its counters
+        // measure one fresh candidate audit and the absence of a redundant
+        // raw live-manifest read, not the number of all provenance reads.
+        let position = self.journal_position(agent).unwrap();
+        let manifest = self.recovery_manifest(agent).unwrap();
+        assert!(manifest.has_pending_management());
+        let counts = self.agents[&agent]
+            .driver
+            .ledger()
+            .common_candidate_reads_for_test();
+        let candidate = self.request_common_snapshot_compaction(agent).unwrap();
+        let after = self.agents[&agent]
+            .driver
+            .ledger()
+            .common_candidate_reads_for_test();
+        assert_eq!(after.0 - counts.0, 1);
+        assert_eq!(after.1 - counts.1, 0);
+        assert_eq!(
+            candidate.claim().recovery_manifest(),
+            Some(manifest.commitment())
+        );
+        assert_eq!(self.journal_position(agent).unwrap(), position);
+        assert_eq!(self.recovery_manifest(agent).unwrap(), manifest);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_terminal_retirement_reuses_manifest_for_test(
+        &mut self,
+        agent: AgentId,
+        envelopes: [&crate::agent_sdk::RuntimeWork; 2],
+        expected_entries: usize,
+        check_corruption: bool,
+    ) {
+        self.agents
+            .get_mut(&agent)
+            .unwrap()
+            .driver
+            .assert_terminal_retirement_reuses_manifest_for_test(
+                envelopes,
+                expected_entries,
+                check_corruption,
+            );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_management_budget_rechecks_common_closure_for_test(
+        &self,
+        agent: AgentId,
+        pending: &[(
+            &super::clean_management_intent::ManagementJournalAnchor,
+            &crate::agent_sdk::RuntimeWork,
+        )],
+    ) {
+        self.agents
+            .get(&agent)
+            .unwrap()
+            .driver
+            .assert_management_budget_rechecks_common_closure_for_test(pending);
     }
 
     /// Read only the authenticated generation/committee attachment facts.
@@ -2410,6 +2673,51 @@ impl SharedAgentHost {
             .driver
             .physical_invocation_material(actor)
             .map_err(map_driver_error)
+    }
+
+    /// Observe only the installed Authority on an authenticated System image.
+    /// Call under the network owner's fresh, generation-pinned read barrier;
+    /// never expose this as an ordinary public invocation or replay operation.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn observe_system_authority(
+        &self,
+        agent: AgentId,
+        work: &crate::agent_sdk::InvocationWork,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedAgentHostError> {
+        let hosted = self
+            .agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        if !matches!(
+            hosted.intent.authority,
+            SharedGenesisAuthority::SystemBootstrap { .. }
+        ) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        hosted
+            .driver
+            .observe_system_authority(work)
+            .map_err(map_driver_error)
+    }
+
+    /// Validate the exact still-owned filesystem root before readonly guest
+    /// execution. This updates only lease validation, never durable state.
+    pub(crate) fn validate_observation_owner(
+        &mut self,
+        agent: AgentId,
+    ) -> Result<(), SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        let hosted = self
+            .agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        if !matches!(
+            hosted.intent.authority,
+            SharedGenesisAuthority::SystemBootstrap { .. }
+        ) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        Ok(())
     }
 
     /// Audit every locally attached Shared generation against one complete
@@ -2856,35 +3164,6 @@ impl SharedAgentHost {
             .map_err(map_driver_error)
     }
 
-    pub(crate) fn projection_pair_fits(
-        &self,
-        agent: AgentId,
-        work: &crate::agent_sdk::InvocationWork,
-        authorization: &crate::agent_sdk::InvocationAuthorization,
-    ) -> Result<bool, SharedAgentHostError> {
-        self.agents
-            .get(&agent)
-            .ok_or(SharedAgentHostError::AgentNotFound)?
-            .driver
-            .projection_pair_fits(work, authorization)
-            .map_err(map_driver_error)
-    }
-
-    pub(crate) fn projection_admission_requirement(
-        &self,
-        agent: AgentId,
-        work: &crate::agent_sdk::InvocationWork,
-        authorization: &crate::agent_sdk::InvocationAuthorization,
-        recovering: bool,
-    ) -> Result<Option<usize>, SharedAgentHostError> {
-        self.agents
-            .get(&agent)
-            .ok_or(SharedAgentHostError::AgentNotFound)?
-            .driver
-            .projection_admission_requirement(work, authorization, recovering)
-            .map_err(map_driver_error)
-    }
-
     pub(crate) fn management_retirement_admission_requirement(
         &self,
         agent: AgentId,
@@ -2927,6 +3206,22 @@ impl SharedAgentHost {
             .map_err(map_driver_error)
     }
 
+    /// Singleton persisted submission only: consume the budget and anchored
+    /// decision together before any prepare, drain or admission guard release.
+    pub(crate) fn management_pending_admission_with_input(
+        &self,
+        agent: AgentId,
+        anchor: &super::clean_management_intent::ManagementJournalAnchor,
+        envelope: &crate::agent_sdk::RuntimeWork,
+    ) -> Result<(Option<usize>, Option<super::journal::ReplayInputId>), SharedAgentHostError> {
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .management_pending_admission_with_input(anchor, envelope)
+            .map_err(map_driver_error)
+    }
+
     pub(crate) fn management_recovery_admission_requirement(
         &self,
         agent: AgentId,
@@ -2958,18 +3253,43 @@ impl SharedAgentHost {
             .map_err(map_driver_error)
     }
 
-    pub(crate) fn projection_admission_records(
+    /// Aggregate replay budget for every retained System management family,
+    /// including remote owners absent from this process's volatile intent map.
+    pub(crate) fn management_retention_admission_requirement(
+        &mut self,
+        agent: AgentId,
+        incoming: Option<
+            &super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest,
+        >,
+    ) -> Result<Option<usize>, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        let hosted = self
+            .agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        if !matches!(
+            &hosted.intent.authority,
+            SharedGenesisAuthority::SystemBootstrap { .. }
+        ) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        hosted
+            .driver
+            .management_retention_admission_requirement(incoming)
+            .map_err(map_driver_error)
+    }
+
+    pub(crate) fn retained_positive_or_terminal_projection(
         &self,
         agent: AgentId,
         work: &crate::agent_sdk::InvocationWork,
         authorization: &crate::agent_sdk::InvocationAuthorization,
-        recovering: bool,
-    ) -> Result<usize, SharedAgentHostError> {
+    ) -> Result<bool, SharedAgentHostError> {
         self.agents
             .get(&agent)
             .ok_or(SharedAgentHostError::AgentNotFound)?
             .driver
-            .projection_admission_records(work, authorization, recovering)
+            .retained_positive_or_terminal_projection(work, authorization)
             .map_err(map_driver_error)
     }
 
@@ -2987,6 +3307,23 @@ impl SharedAgentHost {
             .map_err(map_driver_error)
     }
 
+    /// Sealed genesis classification, available before network registration.
+    /// An ordinary Authority-finalized Shared Agent cannot acquire this role.
+    pub(crate) fn is_system_bootstrap_agent(
+        &mut self,
+        agent: AgentId,
+    ) -> Result<bool, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        let hosted = self
+            .agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        Ok(matches!(
+            &hosted.intent.authority,
+            SharedGenesisAuthority::SystemBootstrap { .. }
+        ))
+    }
+
     pub(crate) fn recovery_manifest(
         &mut self,
         agent: AgentId,
@@ -3000,149 +3337,204 @@ impl SharedAgentHost {
             .map_err(map_driver_error)
     }
 
-    pub(crate) fn validate_recovery_registration(
+    /// Immutable admitted management recovery scope only.
+    /// Every retained request still repeats fresh physical admission under its guards.
+    pub(crate) fn management_recovery_scope(
         &mut self,
         agent: AgentId,
-        registration: &super::shared_recovery::SharedRecoveryRegistration,
+    ) -> Result<(AgentRouteKey, AgentReplicaCommittee), SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        let hosted = self
+            .agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        if !matches!(
+            &hosted.intent.authority,
+            SharedGenesisAuthority::SystemBootstrap { .. }
+        ) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        Ok((
+            hosted.driver.active_route().map_err(map_driver_error)?,
+            hosted.driver.active_committee().map_err(map_driver_error)?,
+        ))
+    }
+
+    pub(crate) fn validate_management_recovery_registration(
+        &mut self,
+        agent: AgentId,
+        registration: &super::shared_recovery::management::SharedManagementRecoveryRegistration,
     ) -> Result<(), SharedAgentHostError> {
         self.lease.validate_live().map_err(map_outer_lease_error)?;
-        self.agents
+        let hosted = self
+            .agents
             .get(&agent)
-            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        if !matches!(
+            &hosted.intent.authority,
+            SharedGenesisAuthority::SystemBootstrap { .. }
+        ) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        hosted
             .driver
-            .validate_recovery_registration(registration)
+            .validate_management_recovery_registration(registration)
             .map_err(map_driver_error)
     }
 
-    pub(crate) fn prepare_recovery_expiry(
+    /// Caller retains settled proposal/host exclusion. This is only a
+    /// nonpublishing admission check, never a signing or replay exception.
+    pub(crate) fn validate_new_management_invocation_clock(
         &mut self,
         agent: AgentId,
-        request: Hash,
-    ) -> Result<VerifiedSharedRecoveryExpiryCandidate, SharedAgentHostError> {
+        request: &super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest,
+    ) -> Result<(), SharedAgentHostError> {
         self.lease.validate_live().map_err(map_outer_lease_error)?;
-        let now = self
-            .current_logical_slot(agent)?
-            .max(self.recovery_expiry_floor(agent)?);
-        let (index, term, ordered, manifest) = self
+        let hosted = self
             .agents
-            .get_mut(&agent)
-            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        if !matches!(
+            &hosted.intent.authority,
+            SharedGenesisAuthority::SystemBootstrap { .. }
+        ) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        hosted
             .driver
-            .recovery_expiry_context()
-            .map_err(map_driver_error)?;
-        let registration = manifest
-            .slots()
-            .iter()
-            .find(|slot| slot.registration().request().request_commitment() == request)
-            .ok_or(SharedAgentHostError::ScopeMismatch)?
-            .registration();
-        let claim = manifest
-            .expiry_claim(registration.request(), index, term, ordered, now)
-            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-        Ok(VerifiedSharedRecoveryExpiryCandidate { claim })
+            .validate_new_management_invocation_clock(request)
+            .map_err(map_driver_error)
     }
 
-    /// Sign the exact capability just reconstructed under this host's exclusive
-    /// access. The route still checks its before/after Raft barrier and freshly
-    /// verifies the prefix again after collecting peer votes.
-    pub(crate) fn prepare_signed_recovery_expiry(
+    pub(crate) fn validate_management_recovery_release(
         &mut self,
         agent: AgentId,
-        request: Hash,
+        release: &super::shared_recovery::management::SharedManagementRecoveryRelease,
+    ) -> Result<(), SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        let hosted = self
+            .agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        if !matches!(
+            &hosted.intent.authority,
+            SharedGenesisAuthority::SystemBootstrap { .. }
+        ) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        hosted
+            .driver
+            .validate_management_recovery_release(release)
+            .map_err(map_driver_error)
+    }
+
+    /// Called before the native owner writes this immutable member to its
+    /// management intent. Proposal ordering and the durable intent obligation
+    /// remain at the native boundary, not in this typed signing seam.
+    pub(crate) fn prepare_signed_management_recovery_registration(
+        &mut self,
+        agent: AgentId,
+        request: &super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest,
     ) -> Result<
         (
-            VerifiedSharedRecoveryExpiryCandidate,
+            VerifiedSharedManagementRecoveryRegistrationCandidate,
             ReplicaCommitSignature,
         ),
         SharedAgentHostError,
     > {
-        let candidate = self.prepare_recovery_expiry(agent, request)?;
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        let hosted = self
+            .agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        let route = hosted.driver.active_route().map_err(map_driver_error)?;
+        let committee = hosted.driver.active_committee().map_err(map_driver_error)?;
+        if !matches!(
+            &hosted.intent.authority,
+            SharedGenesisAuthority::SystemBootstrap { .. }
+        ) || request.owner() != self.scope().node
+            || request.owner() != self.merge.node()
+            || request.generation() != route.generation()
+            || request.committee() != committee.id()
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        hosted
+            .driver
+            .validate_management_recovery_registration_request(request)
+            .map_err(map_driver_error)?;
+        hosted
+            .driver
+            .validate_new_management_invocation_clock(request)
+            .map_err(map_driver_error)?;
+        let candidate = VerifiedSharedManagementRecoveryRegistrationCandidate {
+            request: request.clone(),
+            committee,
+        };
         let signature = self
             .merge
-            .sign_recovery_expiry_candidate(&candidate)
+            .sign_management_recovery_registration(&candidate)
             .ok_or(SharedAgentHostError::SnapshotCertificateInvalid)?;
+        super::shared_recovery::management::SharedManagementRecoveryRegistration::new(
+            request.clone(),
+            signature.clone(),
+        )
+        .and_then(|registration| registration.verify(route.generation(), candidate.committee()))
+        .map_err(|_| SharedAgentHostError::SnapshotCertificateInvalid)?;
         Ok((candidate, signature))
     }
 
-    pub(crate) fn verify_recovery_expiry(
+    /// Native-only terminal pledge: the caller must have durably cleared the
+    /// exact lifecycle intent first. This host additionally checks the current
+    /// exact scope, all first positive ACKs and actual owner/voter bindings.
+    /// There is no network release-signing endpoint or clock-only release.
+    pub(crate) fn prepare_signed_management_recovery_release(
         &mut self,
         agent: AgentId,
-        claim: &super::shared_recovery::SharedRecoveryExpiryClaim,
-    ) -> Result<VerifiedSharedRecoveryExpiryCandidate, SharedAgentHostError> {
+        request: &super::shared_recovery::management::SharedManagementRecoveryReleaseRequest,
+    ) -> Result<
+        (
+            VerifiedSharedManagementRecoveryReleaseCandidate,
+            ReplicaCommitSignature,
+        ),
+        SharedAgentHostError,
+    > {
         self.lease.validate_live().map_err(map_outer_lease_error)?;
-        let now = self
-            .current_logical_slot(agent)?
-            .max(self.recovery_expiry_floor(agent)?);
-        let (index, term, ordered, manifest) = self
-            .agents
-            .get_mut(&agent)
-            .ok_or(SharedAgentHostError::AgentNotFound)?
-            .driver
-            .recovery_expiry_context()
-            .map_err(map_driver_error)?;
-        if now < claim.observed_slot()
-            || index != claim.prefix_index()
-            || term != claim.prefix_term()
-            || ordered != claim.ordered()
-        {
-            #[cfg(test)]
-            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
-                eprintln!(
-                    "recovery_expiry_binding node={:?} now={now}/{} prefix={index}/{term} expected={}/{} ordered={ordered:?}/{:?}",
-                    self.merge.node(),
-                    claim.observed_slot(),
-                    claim.prefix_index(),
-                    claim.prefix_term(),
-                    claim.ordered(),
-                );
-            }
-            return Err(SharedAgentHostError::Unavailable);
-        }
-        manifest
-            .validate_expiry_claim(claim)
-            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-        Ok(VerifiedSharedRecoveryExpiryCandidate {
-            claim: claim.clone(),
-        })
-    }
-
-    pub(crate) fn sign_recovery_expiry(
-        &mut self,
-        agent: AgentId,
-        claim: &super::shared_recovery::SharedRecoveryExpiryClaim,
-    ) -> Result<ReplicaCommitSignature, SharedAgentHostError> {
-        let candidate = self.verify_recovery_expiry(agent, claim)?;
-        self.merge
-            .sign_recovery_expiry_candidate(&candidate)
-            .ok_or(SharedAgentHostError::SnapshotCertificateInvalid)
-    }
-
-    pub(crate) fn recovery_expiry_terminal(
-        &mut self,
-        agent: AgentId,
-        request: Hash,
-    ) -> Result<Option<super::shared_recovery::SharedRecoveryExpiryTerminal>, SharedAgentHostError>
-    {
-        self.lease.validate_live().map_err(map_outer_lease_error)?;
-        self.agents
-            .get_mut(&agent)
-            .ok_or(SharedAgentHostError::AgentNotFound)?
-            .driver
-            .recovery_expiry_terminal(request)
-            .map_err(map_driver_error)
-    }
-
-    pub(crate) fn recovery_expiry_floor(
-        &mut self,
-        agent: AgentId,
-    ) -> Result<u64, SharedAgentHostError> {
-        self.lease.validate_live().map_err(map_outer_lease_error)?;
-        Ok(self
+        let hosted = self
             .agents
             .get(&agent)
-            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        let route = hosted.driver.active_route().map_err(map_driver_error)?;
+        let committee = hosted.driver.active_committee().map_err(map_driver_error)?;
+        if !matches!(
+            &hosted.intent.authority,
+            SharedGenesisAuthority::SystemBootstrap { .. }
+        ) || request.owner() != self.scope().node
+            || request.owner() != self.merge.node()
+            || request.generation() != route.generation()
+            || request.committee() != committee.id()
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        hosted
             .driver
-            .recovery_expiry_floor())
+            .validate_management_recovery_release_request(request)
+            .map_err(map_driver_error)?;
+        let candidate = VerifiedSharedManagementRecoveryReleaseCandidate {
+            request: request.clone(),
+            committee,
+        };
+        let signature = self
+            .merge
+            .sign_management_recovery_release(&candidate)
+            .ok_or(SharedAgentHostError::SnapshotCertificateInvalid)?;
+        super::shared_recovery::management::SharedManagementRecoveryRelease::new(
+            request.clone(),
+            signature.clone(),
+        )
+        .and_then(|release| release.verify(route.generation(), candidate.committee()))
+        .map_err(|_| SharedAgentHostError::SnapshotCertificateInvalid)?;
+        Ok((candidate, signature))
     }
 
     pub(crate) fn retained_terminal_projection_invoke(
@@ -3269,20 +3661,6 @@ impl SharedAgentHost {
             .ok_or(SharedAgentHostError::AgentNotFound)?
             .driver
             .prepare_bootstrap_invocation(request)
-            .map_err(map_driver_error)
-    }
-
-    pub(crate) fn prepare_reserved_projection_operation(
-        &self,
-        agent: AgentId,
-        request: super::shared_journal_driver::CleanInvocationReplayRequest,
-        terminal_only: bool,
-    ) -> Result<super::shared_journal_driver::PreparedCleanOrdered, SharedAgentHostError> {
-        self.agents
-            .get(&agent)
-            .ok_or(SharedAgentHostError::AgentNotFound)?
-            .driver
-            .prepare_reserved_projection_operation(request, terminal_only)
             .map_err(map_driver_error)
     }
 
@@ -3986,7 +4364,7 @@ impl SharedAgentHost {
         Ok(report)
     }
 
-    #[cfg(all(test, feature = "experimental-state-blocks"))]
+    #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
     fn require_external_archive_maintenance(
         &mut self,
         agent: AgentId,
@@ -5970,6 +6348,9 @@ fn map_ledger_error(error: AgentRaftApplicationErrorV2) -> SharedAgentHostError 
         AgentRaftApplicationErrorV2::SnapshotEvidenceLimit => {
             SharedAgentHostError::SnapshotEvidenceLimit
         }
+        AgentRaftApplicationErrorV2::RecoveryPrefixUnsettled { .. } => {
+            SharedAgentHostError::Unavailable
+        }
         AgentRaftApplicationErrorV2::ConfigurationMismatch
         | AgentRaftApplicationErrorV2::WrongGeneration
         | AgentRaftApplicationErrorV2::WrongLocalReplica
@@ -5990,6 +6371,32 @@ fn map_artifact_error(error: SharedArtifactStagerError) -> SharedAgentHostError 
 
 fn install_host_record(path: &Path, bytes: &[u8]) -> Result<(), SharedAgentHostError> {
     install_immutable_file(path, bytes).map_err(map_artifact_error)
+}
+
+fn sync_host_record_pair(path: &Path, bytes: &[u8]) -> Result<(), SharedAgentHostError> {
+    if read_host_record_pair(path, bytes.len().saturating_add(1))?.as_deref() != Some(bytes) {
+        return Err(SharedAgentHostError::CorruptResidue);
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(SharedAgentHostError::CorruptResidue)?;
+    let staged = path.with_file_name(format!("{name}.next"));
+    for retained in [path, &staged] {
+        match fs::symlink_metadata(retained) {
+            Ok(_) => super::shared_journal_driver::sync_exact_immutable_file(retained, bytes)
+                .map_err(map_artifact_error)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(SharedAgentHostError::Unavailable),
+        }
+    }
+    fs::File::open(path.parent().ok_or(SharedAgentHostError::CorruptResidue)?)
+        .and_then(|parent| parent.sync_all())
+        .map_err(|_| SharedAgentHostError::Unavailable)?;
+    if read_host_record_pair(path, bytes.len().saturating_add(1))?.as_deref() != Some(bytes) {
+        return Err(SharedAgentHostError::CorruptResidue);
+    }
+    Ok(())
 }
 
 fn retire_host_record(path: &Path) -> Result<(), SharedAgentHostError> {
@@ -6294,6 +6701,26 @@ mod tests {
     const PEER_ID_PREFIX: [u8; 6] = [0x00, 0x24, 0x08, 0x01, 0x12, 0x20];
 
     #[test]
+    fn management_moving_prefix_is_retryable_but_structural_barrier_stays_corrupt() {
+        assert_eq!(
+            map_ledger_error(AgentRaftApplicationErrorV2::RecoveryPrefixUnsettled {
+                applied: 34,
+                committed: 35,
+                last: 35,
+            }),
+            SharedAgentHostError::Unavailable
+        );
+        assert_eq!(
+            map_ledger_error(AgentRaftApplicationErrorV2::TransitionBarrier),
+            SharedAgentHostError::CorruptResidue
+        );
+        assert_eq!(
+            map_ledger_error(AgentRaftApplicationErrorV2::CorruptLedger),
+            SharedAgentHostError::CorruptResidue
+        );
+    }
+
+    #[test]
     fn merge_store_capacity_errors_have_one_stable_host_projection() {
         for error in [
             super::super::journal_store::JournalStoreError::Backpressure,
@@ -6336,6 +6763,40 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn retained_host_marker_sync_preserves_exact_stage_and_refuses_ambiguity() {
+        let directory = TempDirectory::new("retained_marker_sync");
+        let canonical = directory.0.join("restore");
+        let stage = directory.0.join("restore.next");
+        let bytes = b"exact retained recovery authority";
+        fs::write(&stage, bytes).unwrap();
+        // Model a readable complete stage after interrupted publication. Sync
+        // must establish durability without cleanup or namespace promotion.
+        sync_host_record_pair(&canonical, bytes).unwrap();
+        assert!(!canonical.exists());
+        assert_eq!(fs::read(&stage).unwrap(), bytes);
+        assert!(sync_host_record_pair(&canonical, b"substitution").is_err());
+        assert_eq!(fs::read(&stage).unwrap(), bytes);
+
+        fs::hard_link(&stage, &canonical).unwrap();
+        sync_host_record_pair(&canonical, bytes).unwrap();
+        assert!(stage.exists());
+        // The existing publisher can then complete its exact hard-link retry.
+        install_host_record(&canonical, bytes).unwrap();
+        assert!(!stage.exists());
+        sync_host_record_pair(&canonical, bytes).unwrap();
+        assert_eq!(fs::read(&canonical).unwrap(), bytes);
+
+        fs::write(&stage, bytes).unwrap();
+        assert!(sync_host_record_pair(&canonical, bytes).is_err());
+        assert!(install_host_record(&canonical, bytes).is_err());
+        assert_eq!(fs::read(&canonical).unwrap(), bytes);
+        assert_eq!(fs::read(&stage).unwrap(), bytes);
+        fs::remove_file(&stage).unwrap();
+        std::os::unix::fs::symlink(&canonical, &stage).unwrap();
+        assert!(sync_host_record_pair(&canonical, bytes).is_err());
     }
 
     struct StaticTrust(AgentAuthorityBinding);
@@ -6450,24 +6911,6 @@ mod tests {
                 .claim()
                 .active_committee()
                 .member_by_node(self.node())?;
-            if member.replica().role != ReplicaRole::Voter
-                || member.ed25519_public_key() != &self.0.verifying_key().to_bytes()
-                || member.peer_id() != peer_id(&self.0)
-            {
-                return None;
-            }
-            ReplicaCommitSignature::new(
-                self.node(),
-                self.0.sign(&candidate.signing_message().0).to_bytes(),
-            )
-            .ok()
-        }
-
-        fn sign_recovery_expiry_candidate(
-            &self,
-            candidate: &VerifiedSharedRecoveryExpiryCandidate,
-        ) -> Option<ReplicaCommitSignature> {
-            let member = candidate.claim().committee().member_by_node(self.node())?;
             if member.replica().role != ReplicaRole::Voter
                 || member.ed25519_public_key() != &self.0.verifying_key().to_bytes()
                 || member.peer_id() != peer_id(&self.0)
@@ -8003,165 +8446,149 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "pvm")]
+    #[cfg(feature = "network")]
     #[test]
-    fn prepared_expiry_signing_keeps_clock_and_fresh_prefix_guards() {
-        use super::super::shared_raft::AgentRaftCommand;
-        use super::super::shared_recovery::{
-            SharedRecoveryRegistration, SharedRecoveryRegistrationRequest,
-            recovery_registration_for_test,
+    fn management_retention_signer_requires_exact_owner_admitted_peer_and_key() {
+        use super::super::local_journal_driver::Ed25519NodeMergeAuthenticator;
+        use super::super::shared_recovery::management::{
+            SharedManagementRecoveryRegistration, SharedManagementRecoveryRegistrationRequest,
+            SharedManagementRecoveryRelease, SharedManagementRecoveryReleaseRequest,
+            completed_management_slot_for_test,
         };
-        use crate::actors::codec::Encode as _;
-        use crate::agent_sdk::wire::CanonicalWire as _;
+        let scope = super::super::shared_recovery::management_manifest_for_test();
+        let slot = completed_management_slot_for_test();
+        let registration = VerifiedSharedManagementRecoveryRegistrationCandidate {
+            request: slot.registration().request().clone(),
+            committee: scope.committee().clone(),
+        };
+        let terminal = VerifiedSharedManagementRecoveryReleaseCandidate {
+            request: SharedManagementRecoveryReleaseRequest::for_slot(&slot).unwrap(),
+            committee: scope.committee().clone(),
+        };
+        let signer = Ed25519NodeMergeAuthenticator::new(
+            libp2p::identity::Keypair::ed25519_from_bytes([1; 32]).unwrap(),
+        )
+        .unwrap();
+        let signature = signer
+            .sign_management_recovery_registration(&registration)
+            .unwrap();
+        SharedManagementRecoveryRegistration::new(registration.request().clone(), signature)
+            .unwrap()
+            .verify(scope.generation(), scope.committee())
+            .unwrap();
+        let signature = signer.sign_management_recovery_release(&terminal).unwrap();
+        SharedManagementRecoveryRelease::new(terminal.request().clone(), signature)
+            .unwrap()
+            .verify(scope.generation(), scope.committee())
+            .unwrap();
+        for key in [2, 4] {
+            let other = Ed25519NodeMergeAuthenticator::new(
+                libp2p::identity::Keypair::ed25519_from_bytes([key; 32]).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                other
+                    .sign_management_recovery_registration(&registration)
+                    .is_none()
+            );
+            assert!(other.sign_management_recovery_release(&terminal).is_none());
+        }
+        let mut substituted = registration.clone();
+        substituted.request = SharedManagementRecoveryRegistrationRequest::new(
+            scope.generation(),
+            super::super::genesis::AgentReplicaCommitteeId::from_bytes([0x91; 32]),
+            registration.owner(),
+            registration.request.origin_owner(),
+            1,
+            None,
+            registration.request().members().to_vec(),
+        )
+        .unwrap();
+        assert!(
+            signer
+                .sign_management_recovery_registration(&substituted)
+                .is_none()
+        );
+        let unsupported = SigningMerge(key(1));
+        assert!(
+            unsupported
+                .sign_management_recovery_registration(&registration)
+                .is_none()
+        );
+        assert!(
+            unsupported
+                .sign_management_recovery_release(&terminal)
+                .is_none()
+        );
+    }
 
-        let directory = TempDirectory::new("prepared_expiry_signing");
-        let runtime = super::super::package_admission::admitted_scripted_runtime_for_test(
-            "prepared-expiry-runtime",
-            0x75,
-            vec![super::super::package_admission::ScriptedRuntimeCase {
-                input: vec![0],
-                output: vec![0],
-                copies: Vec::new(),
-            }],
-        );
-        let fixture = standard_projection_fixture_with_replicas(
-            0x3b,
-            runtime,
-            &[
-                (0x31, ReplicaRole::Voter),
-                (0x32, ReplicaRole::Voter),
-                (0x33, ReplicaRole::Voter),
-            ],
-            false,
-        );
-        let clock = Arc::new(AtomicU64::new(20));
-        let mut host = open_native_clean_host_at_slot(&directory, &fixture, Arc::clone(&clock));
+    #[test]
+    fn management_retention_host_refuses_ordinary_authority_finalized_generation() {
+        use super::super::shared_recovery::management::{
+            SharedManagementRecoveryMember, SharedManagementRecoveryRegistrationRequest,
+            completed_management_slot_for_test,
+        };
+        let directory = TempDirectory::new("management_retention_ordinary_refusal");
+        let fixture = fixture(0x18);
+        let mut host = open_host(&directory, &fixture);
         host.provision(
             fixture.provision.clone(),
             fixture.catalog.clone(),
             fixture.committee_authority,
         )
         .unwrap();
-        let route = host.agents[&fixture.agent].driver.active_route().unwrap();
-        let template = recovery_registration_for_test(1, 7);
-        let mut query = template.query().clone();
-        query.authority.space = fixture.descriptor.identity.space;
-        query.authority.system_agent = fixture.descriptor.identity.agent;
-        query.authority.system_runtime_deployment = fixture.descriptor.identity.runtime_deployment;
-        let scope = query.recovery.as_mut().unwrap();
-        scope.generation = crate::agent_sdk::Hash(route.generation().replication_id());
-        scope.committee = crate::agent_sdk::Hash(*route.committee().as_bytes());
-        let signature = key(7).sign(&query.signing_bytes()).to_bytes();
-        let crate::agent_sdk::authority::AuthorityIngressAuthentication::ApiCredentialSignature {
-            signature: stored,
-            ..
-        } = &mut query.authentication
-        else {
-            panic!("credential-authenticated fixture")
-        };
-        *stored = signature;
-        let mut work = template.work().clone();
-        work.space = query.authority.space;
-        work.agent = query.authority.system_agent;
-        work.runtime_deployment = query.authority.system_runtime_deployment;
-        work.invocation = query.expected_invocation();
-        work.message = vec![crate::actors::value::TAG_DYNAMIC];
-        work.message.extend(
-            crate::actors::value::Msg::new("credential_projection")
-                .with(
-                    "query",
-                    crate::actors::value::Value::Bytes(query.encode().unwrap()),
-                )
-                .encode(),
-        );
+        let driver = &host.agents[&fixture.agent].driver;
+        let route = driver.active_route().unwrap();
+        let runtime = driver.materialization().runtime().clone();
+        let ordered = driver.materialization().ordered_base();
+        let before = driver.materialization().heads_id();
+        let mut work = completed_management_slot_for_test().members()[0]
+            .work()
+            .clone();
+        work.space = crate::agent_sdk::SpaceId(runtime.space.0);
+        work.agent = crate::agent_sdk::AgentId(runtime.agent.0);
+        work.runtime_deployment = crate::agent_sdk::DeploymentId(runtime.deployment.0);
         let authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
             crate::agent_sdk::PublicPreflight::for_work(&work, 10),
         );
-        let request = SharedRecoveryRegistrationRequest::new(
+        let member = SharedManagementRecoveryMember::new(
+            None,
+            super::super::clean_management_intent::ManagementJournalAnchor {
+                genesis: route.generation().genesis(),
+                admission: route.generation().admission(),
+                runtime: runtime.commitment(),
+                ordered,
+            },
+            crate::agent_sdk::RuntimeWork::Invoke {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                state: crate::agent_sdk::RuntimeState::default(),
+                invocation: Box::new(work),
+                authorization: Box::new(authorization),
+                observed_slot: 10,
+            },
+        )
+        .unwrap();
+        let request = SharedManagementRecoveryRegistrationRequest::new(
             route.generation(),
             route.committee(),
             host.scope().node,
+            host.scope().node,
             1,
             None,
-            query,
-            work,
-            authorization,
+            vec![member],
         )
         .unwrap();
-        let signature = fixture.replica_keys[0]
-            .sign(&request.signing_message().0)
-            .to_bytes();
-        let registration = SharedRecoveryRegistration::new(
-            request,
-            ReplicaCommitSignature::new(host.scope().node, signature).unwrap(),
-        )
-        .unwrap();
-        host.agents[&fixture.agent]
-            .driver
-            .ledger()
-            .append_committed_for_test(
-                7,
-                &EntryKind::Data {
-                    payload: AgentRaftCommand::RegisterRecovery {
-                        route,
-                        registration: registration.clone(),
-                    }
-                    .encode(),
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            host.apply_next(fixture.agent).unwrap(),
-            SharedAgentApplyOutcome::Applied { index: 1 }
-        );
-        let request = registration.request().request_commitment();
-        clock.store(19, Ordering::SeqCst);
         assert!(matches!(
-            host.prepare_signed_recovery_expiry(fixture.agent, request),
+            host.prepare_signed_management_recovery_registration(fixture.agent, &request),
             Err(SharedAgentHostError::ScopeMismatch)
         ));
-        clock.store(20, Ordering::SeqCst);
-        let (candidate, signature) = host
-            .prepare_signed_recovery_expiry(fixture.agent, request)
-            .unwrap();
-        assert_eq!(candidate.claim().request(), request);
-        assert_eq!(candidate.claim().prefix_index(), 1);
-        assert_eq!(candidate.claim().prefix_term(), 7);
-        assert_eq!(candidate.claim().observed_slot(), 20);
-        assert_eq!(signature.signer(), host.scope().node);
         assert_eq!(
-            signature.signature(),
-            &fixture.replica_keys[0]
-                .sign(&candidate.signing_message().0)
-                .to_bytes()
+            host.agents[&fixture.agent]
+                .driver
+                .materialization()
+                .heads_id(),
+            before
         );
-        assert_eq!(
-            host.sign_recovery_expiry(fixture.agent, candidate.claim())
-                .unwrap(),
-            signature
-        );
-        host.agents[&fixture.agent]
-            .driver
-            .ledger()
-            .append_committed_for_test(
-                7,
-                &EntryKind::Data {
-                    payload: Vec::new(),
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            host.apply_next(fixture.agent).unwrap(),
-            SharedAgentApplyOutcome::Applied { index: 2 }
-        );
-        assert_eq!(
-            host.sign_recovery_expiry(fixture.agent, candidate.claim()),
-            Err(SharedAgentHostError::Unavailable)
-        );
-        let (next, _) = host
-            .prepare_signed_recovery_expiry(fixture.agent, request)
-            .unwrap();
-        assert_eq!(next.claim().prefix_index(), 2);
     }
 
     #[test]
@@ -10441,6 +10868,18 @@ mod tests {
 
     #[test]
     fn deferred_generations_keep_lease_and_require_finality_before_exposure() {
+        check_deferred_generations_with_selection(SharedExecutionSelection::ImageOnly);
+    }
+
+    #[test]
+    #[cfg(feature = "experimental-state-blocks")]
+    fn external_shared_system_first_preserves_image_and_deferred_finality() {
+        check_deferred_generations_with_selection(
+            SharedExecutionSelection::ExternalLinearCandidates,
+        );
+    }
+
+    fn check_deferred_generations_with_selection(execution_selection: SharedExecutionSelection) {
         struct RejectFinality;
         impl AgentGenesisFinalityVerifier for RejectFinality {
             fn verify_finalized(
@@ -10473,7 +10912,7 @@ mod tests {
             Arc::new(RejectFinality),
             None,
             Some(AgentId([0xf1; 32])),
-            SharedExecutionSelection::ImageOnly,
+            execution_selection,
         )
         .unwrap();
         assert!(host.list().unwrap().is_empty());
@@ -10519,6 +10958,11 @@ mod tests {
                 .is_err()
         );
         assert!(host.show(fixture.agent).unwrap().is_some());
+        #[cfg(feature = "experimental-state-blocks")]
+        assert!(
+            !host.uses_external_state(fixture.agent).unwrap(),
+            "explicit ordinary external selection must not reinterpret an image generation"
+        );
         drop(host);
         assert_eq!(open_host(&directory, &fixture).len(), 1);
     }
@@ -10701,18 +11145,12 @@ mod tests {
 
     #[cfg(feature = "pvm")]
     #[test]
-    fn terminal_projection_invoke_at_authenticated_boundary_reopens_without_replacement() {
-        check_terminal_projection_at_authenticated_boundary(false);
-    }
-
-    #[cfg(all(feature = "pvm", feature = "network"))]
-    #[test]
-    fn singleton_image_routes_exact_snapshot_retained_projection() {
-        check_terminal_projection_at_authenticated_boundary(true);
+    fn terminal_public_query_at_authenticated_boundary_reopens_without_replacement() {
+        check_terminal_public_query_at_authenticated_boundary();
     }
 
     #[cfg(feature = "pvm")]
-    fn check_terminal_projection_at_authenticated_boundary(routed: bool) {
+    fn check_terminal_public_query_at_authenticated_boundary() {
         use super::super::shared_journal_driver::{
             CleanInvocationReplayRequest, PreparedCleanOrdered,
         };
@@ -10813,11 +11251,56 @@ mod tests {
         let authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
             crate::agent_sdk::PublicPreflight::for_work(&work, 20),
         );
-        assert_eq!(
-            host.projection_admission_requirement(fixture.agent, &work, &authorization, false,)
-                .unwrap(),
-            Some(2),
-        );
+        let check_retained_result = |host: &mut SharedAgentHost, expected| {
+            let position = host.journal_position(fixture.agent).unwrap();
+            // Each selector freshly verifies the exact retained lifecycle,
+            // independently of every earlier fixture phase.
+            let reads = host.agents[&fixture.agent]
+                .driver
+                .ledger()
+                .common_candidate_reads_for_test()
+                .1;
+            assert_eq!(
+                host.retained_positive_or_terminal_projection(fixture.agent, &work, &authorization)
+                    .unwrap(),
+                expected != 2,
+            );
+            assert_eq!(
+                host.agents[&fixture.agent]
+                    .driver
+                    .ledger()
+                    .common_candidate_reads_for_test()
+                    .1
+                    - reads,
+                1,
+            );
+            let changed = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+                crate::agent_sdk::PublicPreflight::for_work(&work, 21),
+            );
+            let reads = host.agents[&fixture.agent]
+                .driver
+                .ledger()
+                .common_candidate_reads_for_test()
+                .1;
+            assert!(
+                !matches!(
+                    host.retained_positive_or_terminal_projection(fixture.agent, &work, &changed),
+                    Ok(true)
+                ),
+                "a different immutable authorization cannot borrow retained ACK/Invoke evidence"
+            );
+            assert_eq!(
+                host.agents[&fixture.agent]
+                    .driver
+                    .ledger()
+                    .common_candidate_reads_for_test()
+                    .1
+                    - reads,
+                1,
+            );
+            assert_eq!(host.journal_position(fixture.agent).unwrap(), position);
+        };
+        check_retained_result(&mut host, 2);
         let prepared = host
             .prepare_clean_ordered(fixture.agent, work.clone(), authorization.clone())
             .unwrap();
@@ -10835,11 +11318,8 @@ mod tests {
                 index: invoke_index,
             },
         );
-        assert_eq!(
-            host.projection_admission_requirement(fixture.agent, &work, &authorization, true,)
-                .unwrap(),
-            Some(1),
-        );
+        // A separate calculation must observe the newly applied Invoke.
+        check_retained_result(&mut host, 1);
 
         assert_eq!(
             host.observe_durable_install(fixture.agent, &install, &receipt)
@@ -10887,21 +11367,15 @@ mod tests {
         drop(host);
 
         let mut host = open_native_clean_host(&directory, &fixture);
-        assert_eq!(
-            host.projection_admission_requirement(fixture.agent, &work, &authorization, true,)
-                .unwrap(),
-            Some(1),
-        );
+        // Ordinary public Query retry must preserve certified boundary recovery.
+        check_retained_result(&mut host, 1);
         let retry = host.agents[&fixture.agent]
             .driver
-            .prepare_reserved_projection_operation(
-                CleanInvocationReplayRequest::Invoke {
-                    context: crate::agent_sdk::RuntimeExecutionContext::Direct,
-                    work: work.clone(),
-                    authorization: authorization.clone(),
-                },
-                true,
-            )
+            .prepare_terminal_clean_ordered_operation(CleanInvocationReplayRequest::Invoke {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                work: work.clone(),
+                authorization: authorization.clone(),
+            })
             .unwrap();
         assert_eq!(retry.input(), invoke_input);
         let _retained_outcome = retry.retained().unwrap().clone();
@@ -10937,7 +11411,7 @@ mod tests {
             before_divergent
         );
 
-        // A different valid PAP work item is independently rejected without
+        // A different valid public Query work item is independently rejected without
         // mutating the journal while recovery compares exact work and auth.
         let mut divergent_work = work.clone();
         divergent_work.invocation = crate::agent_sdk::InvocationId([0xe1; 32]);
@@ -10958,82 +11432,12 @@ mod tests {
             before_divergent
         );
 
-        if routed {
-            #[cfg(feature = "network")]
-            {
-                assert!(
-                    host.available_ordered_claim(fixture.agent, invoke_input)
-                        .is_err(),
-                    "the compacted slot must not masquerade as a retained exact anchor"
-                );
-                assert!(!host.uses_external_state(fixture.agent).unwrap());
-                let host = Arc::new(Mutex::new(host));
-                let network = live_network(0x31, Vec::new());
-                let signer = SigningMerge(fixture.replica_keys[0].clone());
-                let attachment =
-                    crate::network::SharedAgentNetworkHost::attach_recovering_projection(
-                        Arc::clone(&host),
-                        Arc::clone(&network),
-                        fixture.agent,
-                        &work,
-                        &authorization,
-                        fixture.provision.replicas(),
-                        &signer,
-                    )
-                    .unwrap();
-                let identity = super::super::supervisor::AgentRouteIdentity::new(
-                    super::super::supervisor::AgentRouteKey::new(
-                        work.space, work.agent, work.actor,
-                    )
-                    .unwrap(),
-                    work.incarnation,
-                    work.runtime_deployment,
-                    work.deployment,
-                    work.program,
-                    crate::agent_sdk::AgentProfile::Shared,
-                )
-                .unwrap();
-                let before = host
-                    .lock()
-                    .unwrap()
-                    .journal_position(fixture.agent)
-                    .unwrap();
-                assert_eq!(
-                    attachment
-                        .supervisor_invoke_terminal_reserved(
-                            identity,
-                            work.clone(),
-                            authorization.clone(),
-                        )
-                        .unwrap(),
-                    _retained_outcome
-                );
-                assert_eq!(
-                    host.lock()
-                        .unwrap()
-                        .journal_position(fixture.agent)
-                        .unwrap(),
-                    before,
-                    "serving the snapshot-retained result must not propose another Invoke"
-                );
-                drop(attachment);
-                drop(host);
-                join_live_network(network);
-                return;
-            }
-            #[cfg(not(feature = "network"))]
-            panic!("routed fixture requires network");
-        }
-
         let acknowledgement = host.agents[&fixture.agent]
             .driver
-            .prepare_reserved_projection_operation(
-                CleanInvocationReplayRequest::Acknowledge {
-                    work: work.clone(),
-                    authorization: authorization.clone(),
-                },
-                false,
-            )
+            .prepare_clean_ordered_operation(CleanInvocationReplayRequest::Acknowledge {
+                work: work.clone(),
+                authorization: authorization.clone(),
+            })
             .unwrap();
         let acknowledgement_payload = acknowledgement
             .into_payload()
@@ -11075,11 +11479,8 @@ mod tests {
             host.retained_positive_clean_acknowledgement(fixture.agent, &work, &authorization,)
                 .unwrap()
         );
-        assert_eq!(
-            host.projection_admission_requirement(fixture.agent, &work, &authorization, true,)
-                .unwrap(),
-            Some(0),
-        );
+        // The next owner freshly observes the public Query's positive ACK.
+        check_retained_result(&mut host, 0);
     }
 
     #[cfg(all(feature = "pvm", feature = "network"))]

@@ -21,6 +21,133 @@ pub const LOCAL_LIFECYCLE_QUEUE_CAPACITY: usize = 4;
 mod operation_submission;
 pub use operation_submission::AuthorityOperationSubmission;
 
+mod shared_recovery_retry;
+#[path = "shared_submission.rs"]
+mod shared_submission;
+#[cfg(all(
+    test,
+    target_os = "linux",
+    feature = "storage",
+    feature = "experimental-state-blocks"
+))]
+pub(crate) use shared_submission::shared_submissions_for_test;
+#[cfg(all(
+    target_os = "linux",
+    feature = "storage",
+    feature = "experimental-state-blocks"
+))]
+pub use shared_submission::{
+    SharedCreateApplication, SharedCreateDisposition, SharedCreateResult, SharedCreateSubmission,
+};
+pub use shared_submission::{
+    SharedInstallDisposition, SharedInstallResult, SharedInstallSubmission,
+};
+
+/// Exact public OGAR inputs for warm admission on an existing local voter.
+/// Decoding proves bounded byte identity, never finality or permission to open
+/// a generation; the native owner must obtain fresh installed-System evidence.
+#[cfg(all(
+    target_os = "linux",
+    feature = "storage",
+    feature = "experimental-state-blocks"
+))]
+#[derive(Clone)]
+pub struct SharedMemberAdmissionSubmission {
+    record: super::genesis::AgentGenesisArchiveRecord,
+    expected_node: super::sdk::NodeId,
+}
+
+#[cfg(all(
+    target_os = "linux",
+    feature = "storage",
+    feature = "experimental-state-blocks"
+))]
+impl SharedMemberAdmissionSubmission {
+    pub const MAX_BYTES: usize = super::genesis::MAX_AGENT_GENESIS_ARCHIVE_RECORD_BYTES;
+    /// Required routing scope, not caller authorization or a node credential.
+    pub const TARGET_NODE_HEADER: &'static str = "x-vos-expected-node";
+
+    pub fn decode(
+        bytes: &[u8],
+        expected_node: super::sdk::NodeId,
+    ) -> Result<Self, crate::service::wire::DecodeError> {
+        use crate::service::{ServiceWire as _, wire::DecodeError};
+        if expected_node == super::sdk::NodeId::ZERO {
+            return Err(DecodeError::NonCanonical);
+        }
+        if bytes.len() > Self::MAX_BYTES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let record = super::genesis::AgentGenesisArchiveRecord::decode(bytes)?;
+        if record.encode() != bytes {
+            return Err(DecodeError::NonCanonical);
+        }
+        let descriptor = record
+            .provision()
+            .proposal()
+            .clean_descriptor()
+            .map_err(|_| DecodeError::NonCanonical)?;
+        if !super::replay::external_shared_descriptor_supported(descriptor)
+            || descriptor.runtime_contract.lifecycle_abi
+                != super::sdk::state_execution::STATE_EXECUTION_ABI_ID
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(Self {
+            record,
+            expected_node,
+        })
+    }
+
+    pub fn record(&self) -> &super::genesis::AgentGenesisArchiveRecord {
+        &self.record
+    }
+
+    pub fn locator(&self) -> super::genesis::AgentGenesisLocator {
+        self.record.provision().proposal().locator()
+    }
+
+    pub fn expected_node(&self) -> super::sdk::NodeId {
+        self.expected_node
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    feature = "storage",
+    feature = "experimental-state-blocks"
+))]
+pub type SharedMemberAdmissionResult =
+    Result<super::genesis::AgentGenesisLocator, super::production_owner::AgentProductionOwnerError>;
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    feature = "storage",
+    feature = "experimental-state-blocks"
+))]
+#[test]
+fn shared_member_admission_rejects_invalid_or_retagged_archive_frames() {
+    for bytes in [
+        &b""[..],
+        &b"OGAR"[..],
+        &b"SCQ1"[..],
+        &b"SIQ1"[..],
+        &b"AGNL"[..],
+    ] {
+        assert!(
+            SharedMemberAdmissionSubmission::decode(bytes, super::sdk::NodeId([1; 32])).is_err()
+        );
+    }
+    // These guards confer no owner finality. Genuine signed OGAR, exact queue
+    // delivery and admitted attachment are qualified in the integrated fixture.
+    assert_eq!(LOCAL_LIFECYCLE_QUEUE_CAPACITY, 4);
+    assert!(matches!(
+        SharedMemberAdmissionSubmission::decode(b"OGAR", super::sdk::NodeId::ZERO),
+        Err(crate::service::wire::DecodeError::NonCanonical),
+    ));
+}
+
 pub type AuthorityOperationResult =
     Result<super::clean_bootstrap::NativeAuthorityOperationDecision, SharedAgentHostError>;
 pub type AuthorityOperationPreparationResult =
@@ -179,6 +306,41 @@ impl LocalInstallSubmission {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalCreateDenial {
     bytes: Vec<u8>,
+}
+
+/// Authenticated retirement of one exact refused Shared Create. This is not
+/// an application receipt, genesis approval, or proof of a serving generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedCreateDenial {
+    bytes: Vec<u8>,
+}
+
+impl SharedCreateDenial {
+    pub const MAX_BYTES: usize = super::clean_management_intent::MAX_INTENT_BYTES;
+
+    pub fn verify(
+        descriptor: &AgentDescriptor,
+        call: &AuthorityCredentialCall,
+        bytes: &[u8],
+    ) -> Result<Self, crate::service::wire::DecodeError> {
+        if descriptor.identity.profile != AgentProfile::Shared
+            || call.managed.profile != AgentProfile::Shared
+        {
+            return Err(crate::service::wire::DecodeError::NonCanonical);
+        }
+        super::clean_management_intent::verify_denial_record(
+            bytes,
+            &ManagementRequest::Create(Box::new(descriptor.clone())),
+            call,
+        )?;
+        Ok(Self {
+            bytes: bytes.to_vec(),
+        })
+    }
+
+    pub fn exact_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 /// Authenticated retirement of one exact refused Shared Install. This is not
@@ -511,6 +673,36 @@ pub(crate) enum PendingLocalLifecycle {
         submission: LocalInstallSubmission,
         reply: mpsc::SyncSender<LocalInstallResult>,
     },
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    CreateShared {
+        submission: SharedCreateSubmission,
+        // Internal ingress restriction, never part of the signed submission.
+        // It remains attached if readiness changes before worker dispatch.
+        retained_only: bool,
+        reply: mpsc::SyncSender<SharedCreateResult>,
+    },
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    InstallShared {
+        submission: SharedInstallSubmission,
+        reply: mpsc::SyncSender<SharedInstallResult>,
+    },
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    AdmitSharedMember {
+        submission: SharedMemberAdmissionSubmission,
+        reply: mpsc::SyncSender<SharedMemberAdmissionResult>,
+    },
 }
 
 impl PendingLocalLifecycle {
@@ -543,6 +735,30 @@ impl PendingLocalLifecycle {
             Self::Install { reply, .. } => {
                 let _ = reply.try_send(Err(error));
             }
+            #[cfg(all(
+                target_os = "linux",
+                feature = "storage",
+                feature = "experimental-state-blocks"
+            ))]
+            Self::CreateShared { reply, .. } => {
+                let _ = reply.try_send(Err(error));
+            }
+            #[cfg(all(
+                target_os = "linux",
+                feature = "storage",
+                feature = "experimental-state-blocks"
+            ))]
+            Self::InstallShared { reply, .. } => {
+                let _ = reply.try_send(Err(error));
+            }
+            #[cfg(all(
+                target_os = "linux",
+                feature = "storage",
+                feature = "experimental-state-blocks"
+            ))]
+            Self::AdmitSharedMember { reply, .. } => {
+                let _ = reply.try_send(Err(error));
+            }
         }
     }
 }
@@ -570,7 +786,7 @@ impl LocalLifecycleQueue {
             return Err(LocalLifecycleIngressError::Invalid);
         }
         let (reply, receiver) = mpsc::sync_channel(1);
-        self.enqueue_admin(PendingLocalLifecycle::PrepareAdmin { draft, reply })?;
+        self.enqueue(PendingLocalLifecycle::PrepareAdmin { draft, reply })?;
         Ok(receiver)
     }
 
@@ -583,7 +799,7 @@ impl LocalLifecycleQueue {
             return Err(LocalLifecycleIngressError::Invalid);
         }
         let (reply, receiver) = mpsc::sync_channel(1);
-        self.enqueue_admin(PendingLocalLifecycle::SubmitAdmin {
+        self.enqueue(PendingLocalLifecycle::SubmitAdmin {
             call,
             preparation,
             reply,
@@ -591,10 +807,7 @@ impl LocalLifecycleQueue {
         Ok(receiver)
     }
 
-    fn enqueue_admin(
-        &self,
-        request: PendingLocalLifecycle,
-    ) -> Result<(), LocalLifecycleIngressError> {
+    fn enqueue(&self, request: PendingLocalLifecycle) -> Result<(), LocalLifecycleIngressError> {
         let channel = self
             .channel
             .lock()
@@ -742,6 +955,53 @@ impl LocalLifecycleQueue {
                 mpsc::TrySendError::Full(_) => LocalLifecycleIngressError::Busy,
                 mpsc::TrySendError::Disconnected(_) => LocalLifecycleIngressError::Unavailable,
             })?;
+        Ok(receiver)
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    pub(crate) fn submit_shared_create(
+        &self,
+        submission: SharedCreateSubmission,
+        retained_only: bool,
+    ) -> Result<mpsc::Receiver<SharedCreateResult>, LocalLifecycleIngressError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.enqueue(PendingLocalLifecycle::CreateShared {
+            submission,
+            retained_only,
+            reply,
+        })?;
+        Ok(receiver)
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    pub(crate) fn submit_shared_install(
+        &self,
+        submission: SharedInstallSubmission,
+    ) -> Result<mpsc::Receiver<SharedInstallResult>, LocalLifecycleIngressError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.enqueue(PendingLocalLifecycle::InstallShared { submission, reply })?;
+        Ok(receiver)
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    pub(crate) fn submit_shared_member_admission(
+        &self,
+        submission: SharedMemberAdmissionSubmission,
+    ) -> Result<mpsc::Receiver<SharedMemberAdmissionResult>, LocalLifecycleIngressError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.enqueue(PendingLocalLifecycle::AdmitSharedMember { submission, reply })?;
         Ok(receiver)
     }
 
@@ -2065,6 +2325,110 @@ pub(crate) trait NativeLocalLifecycle: Send {
     > {
         Ok(None)
     }
+    /// Warm member admission obtains fresh installed-System finality and owns
+    /// the independent archive lease. It grants no route or quorum readiness.
+    #[cfg(feature = "experimental-state-blocks")]
+    fn admit_member_archive(
+        &mut self,
+        _record: &super::genesis::AgentGenesisArchiveRecord,
+    ) -> Result<(), SharedAgentHostError> {
+        Err(SharedAgentHostError::Unavailable)
+    }
+    /// Internal Shared lifecycle orchestration. These methods carry admitted
+    /// packages and sealed preparation capabilities, not decoded execution
+    /// authority. Backends without a retained Shared controller fail closed.
+    fn reserve_shared_create(
+        &mut self,
+        _descriptor: &AgentDescriptor,
+        _call: &AuthorityCredentialCall,
+        _runtime: &super::clean_bootstrap::SharedGenesisRuntimePackage,
+        _replicas: &super::genesis::AgentReplicaCommittee,
+    ) -> Result<super::genesis::AgentGenesisLocator, SharedAgentHostError> {
+        Err(SharedAgentHostError::Unavailable)
+    }
+    /// Exact retained continuation only; default backends grant no exception
+    /// to the production owner's fresh-reservation readiness guard.
+    fn retained_shared_create_locator(
+        &mut self,
+        _descriptor: &AgentDescriptor,
+        _call: &AuthorityCredentialCall,
+        _runtime: &super::clean_bootstrap::SharedGenesisRuntimePackage,
+        _replicas: &super::genesis::AgentReplicaCommittee,
+    ) -> Result<Option<super::genesis::AgentGenesisLocator>, SharedAgentHostError> {
+        Ok(None)
+    }
+    fn prepare_shared_create(
+        &mut self,
+        _locator: super::genesis::AgentGenesisLocator,
+    ) -> Result<super::clean_bootstrap::PreparedSharedGenesisEndorsement, SharedAgentHostError>
+    {
+        Err(SharedAgentHostError::Unavailable)
+    }
+    /// Endorse only a natively prepared, retained candidate using an explicitly
+    /// configured production callback. Signatures are not publication or finality.
+    fn endorse_shared_create(
+        &mut self,
+        _locator: super::genesis::AgentGenesisLocator,
+    ) -> Result<Vec<super::committee::AuthoritySignature>, SharedAgentHostError> {
+        Err(SharedAgentHostError::Unavailable)
+    }
+    fn publish_shared_create(
+        &mut self,
+        _locator: super::genesis::AgentGenesisLocator,
+        _signatures: Vec<super::committee::AuthoritySignature>,
+    ) -> Result<super::genesis::AgentGenesisArchiveRecord, SharedAgentHostError> {
+        Err(SharedAgentHostError::Unavailable)
+    }
+    fn shared_create_archive(
+        &mut self,
+        _locator: super::genesis::AgentGenesisLocator,
+    ) -> Result<Option<super::genesis::AgentGenesisArchiveRecord>, SharedAgentHostError> {
+        Err(SharedAgentHostError::Unavailable)
+    }
+    fn shared_create_denial(
+        &mut self,
+        _locator: super::genesis::AgentGenesisLocator,
+        _descriptor: &AgentDescriptor,
+        _call: &AuthorityCredentialCall,
+    ) -> Result<Option<SharedCreateDenial>, SharedAgentHostError> {
+        Err(SharedAgentHostError::Unavailable)
+    }
+    /// Completes the original application and terminal management release.
+    /// Its acknowledgement is not remote member admission or quorum readiness.
+    fn complete_shared_create(
+        &mut self,
+        _locator: super::genesis::AgentGenesisLocator,
+    ) -> Result<ManagementApplicationAck, SharedAgentHostError> {
+        Err(SharedAgentHostError::Unavailable)
+    }
+    fn initialize_shared_management(
+        &mut self,
+        _locator: super::genesis::AgentGenesisLocator,
+    ) -> Result<(), SharedAgentHostError> {
+        Err(SharedAgentHostError::Unavailable)
+    }
+    fn prepare_shared_install(
+        &mut self,
+        _install: super::sdk::InstallActor,
+        _call: AuthorityCredentialCall,
+        _package: &super::package_admission::AdmittedActorPackage,
+    ) -> Result<(), SharedAgentHostError> {
+        Err(SharedAgentHostError::Unavailable)
+    }
+    fn complete_shared_install(
+        &mut self,
+        _locator: super::genesis::AgentGenesisLocator,
+    ) -> Result<SignedManagementTerminal, SharedAgentHostError> {
+        Err(SharedAgentHostError::Unavailable)
+    }
+    fn shared_install_denial(
+        &mut self,
+        _locator: super::genesis::AgentGenesisLocator,
+        _install: &super::sdk::InstallActor,
+        _call: &AuthorityCredentialCall,
+    ) -> Result<Option<SharedInstallDenial>, SharedAgentHostError> {
+        Err(SharedAgentHostError::Unavailable)
+    }
     fn local_attachment_for_agent(
         &self,
         _agent: AgentId,
@@ -2275,6 +2639,103 @@ where
             .map_err(|_| SharedAgentHostError::Unavailable)?
             .ordinary_supervisor_generations()
             .map(Some)
+    }
+    #[cfg(feature = "experimental-state-blocks")]
+    fn admit_member_archive(
+        &mut self,
+        record: &super::genesis::AgentGenesisArchiveRecord,
+    ) -> Result<(), SharedAgentHostError> {
+        LocalLifecycleController::admit_member_archive(self, record)
+    }
+    fn reserve_shared_create(
+        &mut self,
+        descriptor: &AgentDescriptor,
+        call: &AuthorityCredentialCall,
+        runtime: &super::clean_bootstrap::SharedGenesisRuntimePackage,
+        replicas: &super::genesis::AgentReplicaCommittee,
+    ) -> Result<super::genesis::AgentGenesisLocator, SharedAgentHostError> {
+        LocalLifecycleController::reserve_shared_create_with_runtime(
+            self, descriptor, call, runtime, replicas,
+        )
+    }
+    fn prepare_shared_create(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+    ) -> Result<super::clean_bootstrap::PreparedSharedGenesisEndorsement, SharedAgentHostError>
+    {
+        LocalLifecycleController::prepare_shared_create(self, locator)
+    }
+    fn retained_shared_create_locator(
+        &mut self,
+        descriptor: &AgentDescriptor,
+        call: &AuthorityCredentialCall,
+        runtime: &super::clean_bootstrap::SharedGenesisRuntimePackage,
+        replicas: &super::genesis::AgentReplicaCommittee,
+    ) -> Result<Option<super::genesis::AgentGenesisLocator>, SharedAgentHostError> {
+        LocalLifecycleController::retained_shared_create_locator(
+            self, descriptor, call, runtime, replicas,
+        )
+    }
+    fn endorse_shared_create(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+    ) -> Result<Vec<super::committee::AuthoritySignature>, SharedAgentHostError> {
+        LocalLifecycleController::endorse_shared_create(self, locator)
+    }
+    fn publish_shared_create(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+        signatures: Vec<super::committee::AuthoritySignature>,
+    ) -> Result<super::genesis::AgentGenesisArchiveRecord, SharedAgentHostError> {
+        LocalLifecycleController::publish_shared_create(self, locator, signatures)
+    }
+    fn shared_create_archive(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+    ) -> Result<Option<super::genesis::AgentGenesisArchiveRecord>, SharedAgentHostError> {
+        LocalLifecycleController::shared_create_archive(self, locator)
+    }
+    fn shared_create_denial(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+        descriptor: &AgentDescriptor,
+        call: &AuthorityCredentialCall,
+    ) -> Result<Option<SharedCreateDenial>, SharedAgentHostError> {
+        LocalLifecycleController::shared_create_denial(self, locator, descriptor, call)
+    }
+    fn complete_shared_create(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+    ) -> Result<ManagementApplicationAck, SharedAgentHostError> {
+        LocalLifecycleController::complete_shared_create(self, locator)
+    }
+    fn initialize_shared_management(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+    ) -> Result<(), SharedAgentHostError> {
+        LocalLifecycleController::initialize_shared_management(self, locator)
+    }
+    fn prepare_shared_install(
+        &mut self,
+        install: super::sdk::InstallActor,
+        call: AuthorityCredentialCall,
+        package: &super::package_admission::AdmittedActorPackage,
+    ) -> Result<(), SharedAgentHostError> {
+        LocalLifecycleController::prepare_shared_install(self, install, call, package)
+    }
+    fn complete_shared_install(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+    ) -> Result<SignedManagementTerminal, SharedAgentHostError> {
+        LocalLifecycleController::complete_shared_install(self, locator)
+    }
+    fn shared_install_denial(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+        install: &super::sdk::InstallActor,
+        call: &AuthorityCredentialCall,
+    ) -> Result<Option<SharedInstallDenial>, SharedAgentHostError> {
+        LocalLifecycleController::shared_install_denial(self, locator, install, call)
     }
     fn create(
         &mut self,
@@ -2497,6 +2958,14 @@ where
         signer: &mut S,
     ) -> Result<(), SharedAgentHostError>;
 
+    #[cfg(feature = "experimental-state-blocks")]
+    fn admit_member_archive(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        record: &super::genesis::AgentGenesisArchiveRecord,
+        signer: &mut S,
+    ) -> Result<(), SharedAgentHostError>;
+
     fn publish_create(
         &mut self,
         owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
@@ -2504,6 +2973,18 @@ where
         signatures: Vec<super::committee::AuthoritySignature>,
         signer: &mut S,
     ) -> Result<super::genesis::AgentGenesisArchiveRecord, SharedAgentHostError>;
+
+    fn create_archive(
+        &self,
+        locator: super::genesis::AgentGenesisLocator,
+    ) -> Result<Option<super::genesis::AgentGenesisArchiveRecord>, SharedAgentHostError>;
+
+    fn create_denial(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+        descriptor: &AgentDescriptor,
+        call: &AuthorityCredentialCall,
+    ) -> Result<Option<SharedCreateDenial>, SharedAgentHostError>;
 
     fn prepare_create(
         &mut self,
@@ -2553,10 +3034,19 @@ where
         &mut self,
         _: &AgentDescriptor,
         _: &AuthorityCredentialCall,
-        _: &AdmittedRuntimePackage,
+        _: &super::clean_bootstrap::SharedGenesisRuntimePackage,
         _: &super::genesis::AgentReplicaCommittee,
     ) -> Result<super::genesis::AgentGenesisLocator, SharedAgentHostError> {
         Err(SharedAgentHostError::Conflict)
+    }
+    fn retained_create_locator(
+        &mut self,
+        _: &AgentDescriptor,
+        _: &AuthorityCredentialCall,
+        _: &super::clean_bootstrap::SharedGenesisRuntimePackage,
+        _: &super::genesis::AgentReplicaCommittee,
+    ) -> Result<Option<super::genesis::AgentGenesisLocator>, SharedAgentHostError> {
+        Ok(None)
     }
 }
 
@@ -2580,7 +3070,7 @@ where
     F: FnMut(
             &AgentDescriptor,
             &AuthorityCredentialCall,
-            &AdmittedRuntimePackage,
+            &super::clean_bootstrap::SharedGenesisRuntimePackage,
             &super::genesis::AgentReplicaCommittee,
         ) -> Result<
             (
@@ -2598,6 +3088,16 @@ where
         self.0.recover(owner, signer)
     }
 
+    #[cfg(feature = "experimental-state-blocks")]
+    fn admit_member_archive(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        record: &super::genesis::AgentGenesisArchiveRecord,
+        signer: &mut S,
+    ) -> Result<(), SharedAgentHostError> {
+        self.0.admit_member_archive(owner, record, signer)
+    }
+
     fn publish_create(
         &mut self,
         owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
@@ -2607,6 +3107,32 @@ where
     ) -> Result<super::genesis::AgentGenesisArchiveRecord, SharedAgentHostError> {
         self.0
             .publish_pending_create(owner, locator, signatures, signer)
+    }
+
+    fn create_archive(
+        &self,
+        locator: super::genesis::AgentGenesisLocator,
+    ) -> Result<Option<super::genesis::AgentGenesisArchiveRecord>, SharedAgentHostError> {
+        self.0.create_archive(locator)
+    }
+    fn retained_create_locator(
+        &mut self,
+        descriptor: &AgentDescriptor,
+        call: &AuthorityCredentialCall,
+        runtime: &super::clean_bootstrap::SharedGenesisRuntimePackage,
+        replicas: &super::genesis::AgentReplicaCommittee,
+    ) -> Result<Option<super::genesis::AgentGenesisLocator>, SharedAgentHostError> {
+        self.0
+            .retained_create_locator(descriptor, call, runtime, replicas)
+    }
+
+    fn create_denial(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+        descriptor: &AgentDescriptor,
+        call: &AuthorityCredentialCall,
+    ) -> Result<Option<SharedCreateDenial>, SharedAgentHostError> {
+        self.0.create_denial(locator, descriptor, call)
     }
 
     fn prepare_create(
@@ -2671,11 +3197,11 @@ where
         &mut self,
         descriptor: &AgentDescriptor,
         call: &AuthorityCredentialCall,
-        runtime: &AdmittedRuntimePackage,
+        runtime: &super::clean_bootstrap::SharedGenesisRuntimePackage,
         replicas: &super::genesis::AgentReplicaCommittee,
     ) -> Result<super::genesis::AgentGenesisLocator, SharedAgentHostError> {
         let (controller, reserve) = self;
-        controller.reserve_create_with(descriptor, call, runtime, replicas, || {
+        controller.reserve_create_with_runtime(descriptor, call, runtime, replicas, || {
             reserve(descriptor, call, runtime, replicas)
         })
     }
@@ -2704,6 +3230,18 @@ where
         super::clean_bootstrap::NativeSharedGenesisController::recover(self, owner, signer)
     }
 
+    #[cfg(feature = "experimental-state-blocks")]
+    fn admit_member_archive(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        record: &super::genesis::AgentGenesisArchiveRecord,
+        signer: &mut S,
+    ) -> Result<(), SharedAgentHostError> {
+        super::clean_bootstrap::NativeSharedGenesisController::admit_member_archive(
+            self, owner, record, signer,
+        )
+    }
+
     fn publish_create(
         &mut self,
         owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
@@ -2712,6 +3250,35 @@ where
         signer: &mut S,
     ) -> Result<super::genesis::AgentGenesisArchiveRecord, SharedAgentHostError> {
         self.publish_pending_create(owner, locator, signatures, signer)
+    }
+
+    fn create_archive(
+        &self,
+        locator: super::genesis::AgentGenesisLocator,
+    ) -> Result<Option<super::genesis::AgentGenesisArchiveRecord>, SharedAgentHostError> {
+        super::clean_bootstrap::NativeSharedGenesisController::create_archive(self, locator)
+    }
+    fn retained_create_locator(
+        &mut self,
+        descriptor: &AgentDescriptor,
+        call: &AuthorityCredentialCall,
+        runtime: &super::clean_bootstrap::SharedGenesisRuntimePackage,
+        replicas: &super::genesis::AgentReplicaCommittee,
+    ) -> Result<Option<super::genesis::AgentGenesisLocator>, SharedAgentHostError> {
+        super::clean_bootstrap::NativeSharedGenesisController::retained_create_locator(
+            self, descriptor, call, runtime, replicas,
+        )
+    }
+
+    fn create_denial(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+        descriptor: &AgentDescriptor,
+        call: &AuthorityCredentialCall,
+    ) -> Result<Option<SharedCreateDenial>, SharedAgentHostError> {
+        super::clean_bootstrap::NativeSharedGenesisController::create_denial(
+            self, locator, descriptor, call,
+        )
     }
 
     fn prepare_create(
@@ -2804,6 +3371,66 @@ enum LocalBacking {
     },
 }
 
+type SharedGenesisEndorsementCallback = dyn FnMut(
+        &super::clean_bootstrap::PreparedSharedGenesisEndorsement,
+    ) -> Result<Vec<super::committee::AuthoritySignature>, SharedAgentHostError>
+    + Send;
+
+fn install_shared_genesis_endorsement(
+    slot: &mut Option<Box<SharedGenesisEndorsementCallback>>,
+    callback: Box<SharedGenesisEndorsementCallback>,
+) -> Result<(), SharedAgentHostError> {
+    if slot.is_some() {
+        return Err(SharedAgentHostError::Conflict);
+    }
+    *slot = Some(callback);
+    Ok(())
+}
+
+fn configured_shared_genesis_endorsement(
+    slot: &mut Option<Box<SharedGenesisEndorsementCallback>>,
+) -> Result<&mut Box<SharedGenesisEndorsementCallback>, SharedAgentHostError> {
+    slot.as_mut().ok_or(SharedAgentHostError::Unavailable)
+}
+
+#[cfg(test)]
+#[test]
+fn shared_genesis_endorsement_callback_is_opt_in_and_not_replaceable() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let mut slot = None;
+    assert!(matches!(
+        configured_shared_genesis_endorsement(&mut slot),
+        Err(SharedAgentHostError::Unavailable)
+    ));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let first_calls = Arc::clone(&calls);
+    install_shared_genesis_endorsement(
+        &mut slot,
+        Box::new(move |_| {
+            first_calls.fetch_add(1, Ordering::SeqCst);
+            Err(SharedAgentHostError::Unavailable)
+        }),
+    )
+    .unwrap();
+    assert!(configured_shared_genesis_endorsement(&mut slot).is_ok());
+    let replacement_calls = Arc::clone(&calls);
+    assert_eq!(
+        install_shared_genesis_endorsement(
+            &mut slot,
+            Box::new(move |_| {
+                replacement_calls.fetch_add(1, Ordering::SeqCst);
+                Err(SharedAgentHostError::Conflict)
+            }),
+        ),
+        Err(SharedAgentHostError::Conflict)
+    );
+    // Neither configuration nor refusal prepares or signs a candidate. This
+    // unit deliberately does not construct a decoded/fake sealed capability.
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(configured_shared_genesis_endorsement(&mut slot).is_ok());
+}
+
 pub struct LocalLifecycleController<P, R, I, F, S>
 where
     P: CleanSystemAgentBootstrapStore,
@@ -2821,6 +3448,7 @@ where
     operations: Option<Box<dyn NativeAuthorityOperationAccess<P, R, I>>>,
     admins: Option<Box<dyn NativeAuthorityAdminAccess<P, R, I>>>,
     shared_genesis: Option<Box<dyn NativeSharedGenesisAccess<P, R, I, S>>>,
+    shared_genesis_endorsement: Option<Box<SharedGenesisEndorsementCallback>>,
 }
 
 impl<P, R, I, F, S> LocalLifecycleController<P, R, I, F, S>
@@ -2849,6 +3477,7 @@ where
             operations: None,
             admins: None,
             shared_genesis: None,
+            shared_genesis_endorsement: None,
         })
     }
 
@@ -2902,6 +3531,7 @@ where
             operations: None,
             admins: None,
             shared_genesis: None,
+            shared_genesis_endorsement: None,
         };
         for entry in recovery.entries {
             if controller
@@ -3130,7 +3760,7 @@ where
             PubReply,
             A,
         >,
-        reserve: Factory,
+        mut reserve: Factory,
     ) -> Result<Self, SharedAgentHostError>
     where
         B: super::clean_authority_issuer::CleanSharedManagementIntentStore + Send + 'static,
@@ -3144,6 +3774,65 @@ where
                 &AgentDescriptor,
                 &AuthorityCredentialCall,
                 &AdmittedRuntimePackage,
+                &super::genesis::AgentReplicaCommittee,
+            ) -> Result<
+                (
+                    super::clean_bootstrap::NativeSharedGenesisRecovery<
+                        B,
+                        J,
+                        Q,
+                        Reply,
+                        W,
+                        PubReply,
+                    >,
+                    Option<A>,
+                ),
+                SharedAgentHostError,
+            > + Send
+            + 'static,
+    {
+        self.with_shared_genesis_runtime_admission(
+            shared,
+            move |descriptor, call, runtime, replicas| match runtime {
+                super::clean_bootstrap::SharedGenesisRuntimePackage::Image(runtime) => {
+                    reserve(descriptor, call, runtime, replicas)
+                }
+                #[cfg(feature = "experimental-state-blocks")]
+                super::clean_bootstrap::SharedGenesisRuntimePackage::External(_) => {
+                    Err(SharedAgentHostError::ScopeMismatch)
+                }
+            },
+        )
+    }
+
+    /// Carry an independently admitted runtime selection through the existing
+    /// retained Shared factory. This neither changes Local execution nor opens
+    /// public Shared management or production external startup.
+    pub fn with_shared_genesis_runtime_admission<B, J, Q, Reply, W, PubReply, A, Factory>(
+        self,
+        shared: super::clean_bootstrap::NativeSharedGenesisController<
+            B,
+            J,
+            Q,
+            Reply,
+            W,
+            PubReply,
+            A,
+        >,
+        reserve: Factory,
+    ) -> Result<Self, SharedAgentHostError>
+    where
+        B: super::clean_authority_issuer::CleanSharedManagementIntentStore + Send + 'static,
+        J: super::clean_authority_issuer::CleanSharedManagementIssuerStore + Send + 'static,
+        Q: super::clean_authority_issuer::CleanSharedGenesisReplicaStore + Send + 'static,
+        Reply: CleanManagementIssuerStore + Send + 'static,
+        W: CleanManagementIssuerStore + Send + 'static,
+        PubReply: CleanManagementIssuerStore + Send + 'static,
+        A: super::genesis_archive::AgentGenesisArchiveStore + 'static,
+        Factory: FnMut(
+                &AgentDescriptor,
+                &AuthorityCredentialCall,
+                &super::clean_bootstrap::SharedGenesisRuntimePackage,
                 &super::genesis::AgentReplicaCommittee,
             ) -> Result<
                 (
@@ -3176,9 +3865,52 @@ where
                 .system
                 .lock()
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
-            shared.recover(&mut system, &mut self.signer)?;
+            shared_recovery_retry::recover_shared_before_publication(|| {
+                shared.recover(&mut system, &mut self.signer)
+            })?;
         }
         self.shared_genesis = Some(shared);
+        Ok(self)
+    }
+
+/// Admit exact public member inputs through the retained native owner.
+    /// The installed Authority, not the archive or caller, grants finality.
+    /// Existing management/read custody must complete before this warm path.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub fn admit_member_archive(
+        &mut self,
+        record: &super::genesis::AgentGenesisArchiveRecord,
+    ) -> Result<(), SharedAgentHostError> {
+        let mut system = self
+            .system
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        self.shared_genesis
+            .as_mut()
+            .ok_or(SharedAgentHostError::Conflict)?
+            .admit_member_archive(&mut system, record, &mut self.signer)
+    }
+
+    /// Configure endorsement of sealed native candidates, not arbitrary claims
+    /// or caller-selected committees. The callback must use durable signature
+    /// retention; its returned signatures still require normal publication
+    /// validation. Configuration does not prepare, sign or expose a generation.
+    pub fn with_shared_genesis_endorsement<Endorse>(
+        mut self,
+        endorse: Endorse,
+    ) -> Result<Self, SharedAgentHostError>
+    where
+        Endorse: FnMut(
+                &super::clean_bootstrap::PreparedSharedGenesisEndorsement,
+            )
+                -> Result<Vec<super::committee::AuthoritySignature>, SharedAgentHostError>
+            + Send
+            + 'static,
+    {
+        install_shared_genesis_endorsement(
+            &mut self.shared_genesis_endorsement,
+            Box::new(endorse),
+        )?;
         Ok(self)
     }
 
@@ -3192,6 +3924,21 @@ where
         runtime: &AdmittedRuntimePackage,
         replicas: &super::genesis::AgentReplicaCommittee,
     ) -> Result<super::genesis::AgentGenesisLocator, SharedAgentHostError> {
+        self.reserve_shared_create_with_runtime(
+            descriptor,
+            call,
+            &super::clean_bootstrap::SharedGenesisRuntimePackage::Image(runtime.clone()),
+            replicas,
+        )
+    }
+
+    pub fn reserve_shared_create_with_runtime(
+        &mut self,
+        descriptor: &AgentDescriptor,
+        call: &AuthorityCredentialCall,
+        runtime: &super::clean_bootstrap::SharedGenesisRuntimePackage,
+        replicas: &super::genesis::AgentReplicaCommittee,
+    ) -> Result<super::genesis::AgentGenesisLocator, SharedAgentHostError> {
         let _system = self
             .system
             .lock()
@@ -3200,6 +3947,25 @@ where
             .as_mut()
             .ok_or(SharedAgentHostError::Conflict)?
             .reserve_create(descriptor, call, runtime, replicas)
+    }
+
+    /// Inspect the already-owned signed Create and immutable sidecars only.
+    /// No storage factory or native execution is reachable through this lookup.
+    pub(crate) fn retained_shared_create_locator(
+        &mut self,
+        descriptor: &AgentDescriptor,
+        call: &AuthorityCredentialCall,
+        runtime: &super::clean_bootstrap::SharedGenesisRuntimePackage,
+        replicas: &super::genesis::AgentReplicaCommittee,
+    ) -> Result<Option<super::genesis::AgentGenesisLocator>, SharedAgentHostError> {
+        let _system = self
+            .system
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        self.shared_genesis
+            .as_mut()
+            .ok_or(SharedAgentHostError::Conflict)?
+            .retained_create_locator(descriptor, call, runtime, replicas)
     }
 
     /// Reauthenticate retained Create inputs and query their Authority committee.
@@ -3218,6 +3984,44 @@ where
             .as_mut()
             .ok_or(SharedAgentHostError::Conflict)?
             .prepare_create(&mut system, locator, &mut self.signer)
+    }
+
+    /// Reauthenticate the exact retained candidate before invoking the optional
+    /// endorser. Missing configuration fails before native preparation. The
+    /// preparation method releases the System guard before callback file I/O.
+    pub fn endorse_shared_create(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+    ) -> Result<Vec<super::committee::AuthoritySignature>, SharedAgentHostError> {
+        configured_shared_genesis_endorsement(&mut self.shared_genesis_endorsement)?;
+        let prepared = self.prepare_shared_create(locator)?;
+        configured_shared_genesis_endorsement(&mut self.shared_genesis_endorsement)?(&prepared)
+    }
+
+    /// Read publication data only after the exact reservation was authenticated.
+    /// The archive cannot substitute for normal application/finality completion.
+    pub fn shared_create_archive(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+    ) -> Result<Option<super::genesis::AgentGenesisArchiveRecord>, SharedAgentHostError> {
+        self.shared_genesis
+            .as_ref()
+            .ok_or(SharedAgentHostError::Conflict)?
+            .create_archive(locator)
+    }
+
+    /// Read only the exact native denial terminal. This does not execute,
+    /// sign, or release management custody; the normal continuation owns that.
+    pub fn shared_create_denial(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+        descriptor: &AgentDescriptor,
+        call: &AuthorityCredentialCall,
+    ) -> Result<Option<SharedCreateDenial>, SharedAgentHostError> {
+        self.shared_genesis
+            .as_mut()
+            .ok_or(SharedAgentHostError::Conflict)?
+            .create_denial(locator, descriptor, call)
     }
 
     /// Publish collected Shared genesis evidence through the retained owner.
@@ -3640,6 +4444,49 @@ where
                 }
             }
         }
+        for entry in &mut recovery.entries {
+            if !entry
+                .intent
+                .retirement_complete()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            {
+                continue;
+            }
+            let managed = entry
+                .intent
+                .intent()
+                .ok_or(SharedAgentHostError::ScopeMismatch)?
+                .call()
+                .managed;
+            let acknowledgement = entry
+                .finalized
+                .as_ref()
+                .and_then(SignedManagementTerminal::as_applied)
+                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            local
+                .observe_management_application(
+                    entry.agent,
+                    entry
+                        .intent
+                        .intent()
+                        .ok_or(SharedAgentHostError::ScopeMismatch)?
+                        .request(),
+                    entry
+                        .issued
+                        .as_ref()
+                        .ok_or(SharedAgentHostError::ScopeMismatch)?,
+                )
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            // CMR2 preserves both original envelopes across a release timeout.
+            // Complete that exact terminal before any unissued successor can
+            // register another management family; no image is recreated.
+            system.finish_management_intent_retirement(
+                &mut entry.intent,
+                managed,
+                acknowledgement,
+                &entry.issuer,
+            )?;
+        }
         for &index in &admission.order {
             let entry = &mut recovery.entries[index];
             let intent = entry
@@ -3956,6 +4803,7 @@ where
             operations,
             admins,
             shared_genesis,
+            shared_genesis_endorsement,
         } = self;
         assert!(
             shared_genesis.is_none(),
@@ -3969,6 +4817,9 @@ where
             operations.is_none(),
             "test extraction must preserve operation leases"
         );
+        // A configured callback may capture owner handles. Retire it before
+        // requiring exclusive ownership of the extracted physical owners.
+        drop(shared_genesis_endorsement);
         drop(retained_stores);
         let system = Arc::try_unwrap(system)
             .ok()
@@ -4017,8 +4868,10 @@ where
             operations,
             admins,
             shared_genesis,
+            shared_genesis_endorsement,
         } = self;
         assert!(operations.is_none() && admins.is_none() && shared_genesis.is_none());
+        drop(shared_genesis_endorsement);
         drop(retained_stores);
         let LocalBacking::External {
             _directory: directory,

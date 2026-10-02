@@ -239,7 +239,6 @@ where
             || record.call.authority != self.authority_target()
             || record.call.authenticated_node != self.pins.node
             || signer.public_key() != self.authority_target().binding.public_key
-            || self.record.pending_projection.is_some()
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
@@ -260,6 +259,8 @@ where
                 true,
                 || Ok(()),
             )?;
+            self._network_host
+                .release_management_retention(agent, &record.envelope)?;
             return Ok(result);
         }
         self._network_host.ensure_management_pending_member(
@@ -330,6 +331,10 @@ where
                     .map_err(|_| SharedAgentHostError::Unavailable)
             },
         )?;
+        // The retired admin certificate, not just its result or ACK, is
+        // durable before the owner pledges release of the exact root scope.
+        self._network_host
+            .release_management_retention(agent, &record.envelope)?;
         Ok(result)
     }
 }

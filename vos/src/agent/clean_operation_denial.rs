@@ -373,7 +373,14 @@ where
                 Ok(())
             },
         )?;
-        result.ok_or(SharedAgentHostError::Unavailable)
+        let denied = result.ok_or(SharedAgentHostError::Unavailable)?;
+        // The exact denial certificate is durable before quorum release;
+        // its retained bytes survive a retryable release failure.
+        self._network_host.release_management_retention(
+            crate::service::AgentId(self.pins.agent.0),
+            denial.record.envelope(),
+        )?;
+        Ok(denied)
     }
 
     pub(crate) fn restore_native_operation_denial<'a, B: AuthorityOperationIssuerStore>(
@@ -409,6 +416,10 @@ where
             denied.record.envelope(),
             true,
             || Ok(()),
+        )?;
+        self._network_host.release_management_retention(
+            crate::service::AgentId(self.pins.agent.0),
+            denied.record.envelope(),
         )
     }
 }

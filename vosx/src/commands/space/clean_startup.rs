@@ -71,6 +71,7 @@ const OPERATION_IMAGES_DIRECTORY: &str = "authority-operation";
 const OPERATION_JOURNAL_DIRECTORY: &str = "authority-operation-journal";
 const OPERATION_COMPLETIONS_DIRECTORY: &str = "authority-operation-completions";
 const OPERATION_RETIREMENTS_DIRECTORY: &str = "authority-operation-retirements";
+const OPERATION_TERMINALS_DIRECTORY: &str = "authority-operation-terminals";
 const OPERATION_DENIALS_DIRECTORY: &str = "authority-operation-denials";
 const ADMIN_DISPATCH_DIRECTORY: &str = "authority-admin-dispatch";
 const ADMIN_RESULTS_DIRECTORY: &str = "authority-admin-results";
@@ -81,6 +82,14 @@ const PROJECTION_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 // A retry window between bounded bootstrap operations, not a hard execution
 // deadline. Keep the same owner/leases while consensus work becomes available.
 const SYSTEM_BOOTSTRAP_RETRY_WINDOW: Duration = Duration::from_secs(60);
+
+mod bootstrap_prepare;
+#[cfg(feature = "experimental-state-blocks")]
+pub(crate) use bootstrap_prepare::publish_shared_archive;
+pub(crate) use bootstrap_prepare::{
+    ExportBootstrapEnrollmentArgs, PrepareCommonBootstrapArgs, export_bootstrap_enrollment,
+    prepare_common_bootstrap,
+};
 
 /// Verified node-key possession plus the operator-selected fixed roster. This
 /// is preparation input, not live Authority admission or route authority.
@@ -204,6 +213,9 @@ impl SystemBootstrapRoster {
                 hash: descriptor.runtime_package.hash.0,
                 len: descriptor.runtime_package.len,
             },
+            system_runtime_contract: system_authority::RuntimeContractRow::from_sdk(
+                descriptor.runtime_contract,
+            ),
             binding: AuthorityBindingState {
                 policy: authority.policy.0,
                 issuer: AuthorityIssuerState {
@@ -240,7 +252,7 @@ impl SystemBootstrapRoster {
     }
 }
 
-/// One material builder for live singleton startup and offline common-roster
+/// One material builder for System startup and offline common-roster
 /// preparation. Construction validates inputs but does not sign or publish.
 struct SystemBootstrapMaterials {
     descriptor: AgentDescriptor,
@@ -563,6 +575,128 @@ fn open_clean_system_lifecycle(
     )
 }
 
+/// Select the client's expected System target without importing or opening any
+/// owner stores. A configured certificate is mandatory input, never a hint
+/// that may fall back to another runtime after verification fails. This is not
+/// live Authority admission or permission to expose the certified roster.
+pub(crate) fn client_system_authority_target(
+    data_dir: &Path,
+    space: SpaceId,
+    operator: &Keypair,
+    expected_node_public: [u8; 32],
+) -> anyhow::Result<AuthorityActorTarget> {
+    let config = super::local_config::load(data_dir)?;
+    config.local_agent_storage.require_supported()?;
+    let retained = CleanSystemAgentFileStores::read_client_bootstrap(
+        &data_dir.join(SYSTEM_AGENT_CONTROL_DIRECTORY),
+    )?;
+    if retained.is_none() {
+        anyhow::ensure!(
+            matches!(std::fs::symlink_metadata(data_dir.join(SHARED_AGENT_HOST_DIRECTORY)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+            "Shared deployment residue lacks its retained System bootstrap plan"
+        );
+    }
+    if retained.is_some() || config.system_bootstrap_bundle.is_some() {
+        let daemon = bootstrap_prepare::read_node_key(data_dir)?;
+        anyhow::ensure!(
+            raw_public_key(&daemon)? == expected_node_public,
+            "retained node identity differs from the selected daemon"
+        );
+        let configured = config
+            .system_bootstrap_bundle
+            .map(|path| {
+                read_certified_bootstrap_bundle(&data_dir.join(path), space.0, operator, &daemon)
+            })
+            .transpose()?;
+        let deployed = retained
+            .map(|images| {
+                let plan = CleanSystemAgentBootstrapRecord::authorized_plan(&images.bootstrap)
+                    .map_err(|error| {
+                        anyhow::anyhow!("invalid retained bootstrap plan: {error:?}")
+                    })?;
+                anyhow::ensure!(
+                    Hash::digest(b"vos/clean-system-agent-pins/v2", &[&images.pins])
+                        == plan.pins().commitment(),
+                    "retained bootstrap pins differ from its authorized plan"
+                );
+                verify_client_plan_identity(&plan, space.0, operator, &daemon)?;
+                anyhow::ensure!(
+                    plan.pins().node()
+                        == node_id_from_authenticated_peer(&daemon.public().to_peer_id()),
+                    "retained bootstrap plan belongs to another local node"
+                );
+                let (provision, catalog) =
+                    super::clean_genesis_archive::client_archive_parts(&images.genesis)?;
+                let descriptor = plan.pins().descriptor();
+                let trust = Arc::new(SystemAgentTrust::new(
+                    plan.pins().observed_slot(),
+                    HostSpaceId(space.0),
+                    host_authority_binding(descriptor.identity.agent, descriptor.authority),
+                ));
+                let merge =
+                    Arc::new(Ed25519NodeMergeAuthenticator::new(daemon.clone()).map_err(
+                        |error| anyhow::anyhow!("construct bootstrap verifier: {error:?}"),
+                    )?);
+                PreparedCleanSystemAgentBootstrap::from_certified_parts(
+                    plan, provision, catalog, trust, merge,
+                )
+                .map_err(anyhow::Error::from)
+            })
+            .transpose()?;
+        if let (Some(deployed), Some(configured)) = (&deployed, &configured) {
+            anyhow::ensure!(
+                deployed.plan().commitment() == configured.plan().commitment(),
+                "configured certificate differs from the immutable deployed bootstrap plan"
+            );
+        }
+        let certified = deployed
+            .or(configured)
+            .expect("retained or configured input");
+        let descriptor = certified.plan().pins().descriptor();
+        let target = AuthorityActorTarget {
+            space: descriptor.identity.space,
+            system_agent: descriptor.identity.agent,
+            system_runtime_deployment: descriptor.identity.runtime_deployment,
+            binding: descriptor.authority,
+        };
+        anyhow::ensure!(target.is_valid(), "invalid certified System target");
+        return Ok(target);
+    }
+    let runtime = crate::bundled::root_signed_system_agent_runtime_package(operator)?;
+    let authority = crate::bundled::root_signed_actor_package(
+        crate::bundled::system_authority_package_template(),
+        SYSTEM_AUTHORITY_NAME,
+        operator,
+    )?;
+    Ok(derive_system_authority_target(space, raw_public_key(operator)?, &runtime, &authority)?.0)
+}
+
+fn verify_client_plan_identity(
+    plan: &vos::agent::clean_bootstrap::AuthorizedCleanSystemAgentBootstrap,
+    space: [u8; 32],
+    operator: &Keypair,
+    daemon: &Keypair,
+) -> anyhow::Result<()> {
+    let node = node_id_from_authenticated_peer(&daemon.public().to_peer_id());
+    anyhow::ensure!(
+        plan.pins().space() == SpaceId(space)
+            && plan
+                .pins()
+                .replicas()
+                .member_by_node(HostNodeId(node.0))
+                .is_some(),
+        "bootstrap plan belongs to another Space or node"
+    );
+    let root_key = raw_public_key(operator)?;
+    let members = plan.pins().root().record().initial_committee().members();
+    anyhow::ensure!(
+        members.len() == 1 && members[0].public_key() == &root_key,
+        "bootstrap plan was not certified by the configured root operator"
+    );
+    Ok(())
+}
+
 fn read_certified_bootstrap_bundle(
     path: &Path,
     space: [u8; 32],
@@ -586,22 +720,7 @@ fn read_certified_bootstrap_bundle(
         .read_to_end(&mut bytes)?;
     let (plan, provision, catalog) = PreparedCleanSystemAgentBootstrap::decode_import_parts(&bytes)
         .map_err(|error| anyhow::anyhow!("invalid bootstrap bundle encoding: {error:?}"))?;
-    let node = node_id_from_authenticated_peer(&daemon.public().to_peer_id());
-    anyhow::ensure!(
-        plan.pins().space() == SpaceId(space)
-            && plan
-                .pins()
-                .replicas()
-                .member_by_node(HostNodeId(node.0))
-                .is_some(),
-        "bootstrap bundle belongs to another Space or node"
-    );
-    let root_key = raw_public_key(operator)?;
-    let members = plan.pins().root().record().initial_committee().members();
-    anyhow::ensure!(
-        members.len() == 1 && members[0].public_key() == &root_key,
-        "bootstrap bundle was not certified by the configured root operator"
-    );
+    verify_client_plan_identity(&plan, space, operator, daemon)?;
     let descriptor = plan.pins().descriptor();
     let trust = Arc::new(SystemAgentTrust::new(
         plan.pins().observed_slot(),
@@ -630,11 +749,177 @@ fn validate_production_bootstrap_roster(
     plan: &vos::agent::clean_bootstrap::AuthorizedCleanSystemAgentBootstrap,
     allow_candidate_roster: bool,
 ) -> anyhow::Result<()> {
+    if allow_candidate_roster {
+        return Ok(());
+    }
+    validate_system_observation_bootstrap_plan(plan)?;
+    anyhow::bail!(
+        "fixed-three SAC7 System observation startup is pending release qualification; no bootstrap or deployment roots were created"
+    );
+}
+
+/// Exact v1 placement/configuration, not artifact or workflow qualification.
+/// The plan is already root-certified; these checks never repair old inputs.
+fn validate_system_observation_bootstrap_plan(
+    plan: &vos::agent::clean_bootstrap::AuthorizedCleanSystemAgentBootstrap,
+) -> anyhow::Result<()> {
+    let descriptor = plan.pins().descriptor();
     anyhow::ensure!(
-        allow_candidate_roster || plan.pins().replicas().members().len() == 1,
-        "public startup requires singleton bootstrap until signed cluster configuration is integrated"
+        plan.pins().replicas().members().len() == 3,
+        "v1 System startup requires exactly three voters; singleton and unsupported persisted plans must use a fresh deployment, not migration"
+    );
+    let ManagementRequest::Install(install) = plan.authority_request() else {
+        anyhow::bail!("System bootstrap lacks its exact Authority installation");
+    };
+    let data = install.installation_data.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("System Authority installation lacks its SAC7 configuration")
+    })?;
+    validate_system_observation_bootstrap_configuration(descriptor, &data.bytes)
+}
+
+fn validate_system_observation_bootstrap_configuration(
+    descriptor: &AgentDescriptor,
+    configuration_bytes: &[u8],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        descriptor.identity.profile == AgentProfile::Shared
+            && descriptor.replicas.len() == 3
+            && descriptor
+                .replicas
+                .iter()
+                .all(|replica| replica.role == ReplicaRole::Voter),
+        "v1 System startup requires exactly three voters; singleton and unsupported persisted plans must use a fresh deployment, not migration"
+    );
+    #[cfg(feature = "experimental-state-blocks")]
+    let exact_contract = descriptor.runtime_contract
+        == vos::agent::sdk::contract::RuntimePackageContract::system_observation_image();
+    #[cfg(not(feature = "experimental-state-blocks"))]
+    let exact_contract = false;
+    anyhow::ensure!(
+        exact_contract,
+        "v1 System startup requires the exact signed System image observation contract; old contracts cannot be reopened or replaced in place"
+    );
+    let configuration = SystemAuthorityConfiguration::decode(configuration_bytes)
+        .ok_or_else(|| anyhow::anyhow!("System Authority configuration is not canonical SAC7"))?;
+    anyhow::ensure!(
+        configuration_bytes.starts_with(b"SAC7")
+            && configuration.encode() == configuration_bytes
+            && configuration.matches_system_descriptor(descriptor),
+        "System Authority SAC7 configuration differs from its exact root-certified descriptor"
     );
     Ok(())
+}
+
+/// The ABI and SAC7 configuration do not identify a release implementation.
+/// Bind the certified closure to the packaged roles signed by this Space root;
+/// unavailable pins are a refusal, never permission to select embedded guests.
+fn validate_packaged_system_observation_bootstrap_plan(
+    plan: &AuthorizedCleanSystemAgentBootstrap,
+    operator: &Keypair,
+) -> anyhow::Result<()> {
+    validate_system_observation_bootstrap_plan(plan)?;
+    validate_packaged_system_observation_bootstrap_materials(
+        plan.pins().descriptor(),
+        plan.runtime_package_bytes(),
+        plan.authority_package_bytes(),
+        plan.authority_request(),
+        operator,
+    )
+}
+
+fn validate_packaged_system_observation_bootstrap_materials(
+    descriptor: &AgentDescriptor,
+    runtime_package_bytes: &[u8],
+    authority_package_bytes: &[u8],
+    authority_request: &ManagementRequest,
+    operator: &Keypair,
+) -> anyhow::Result<()> {
+    let ManagementRequest::Install(install) = authority_request else {
+        anyhow::bail!("System bootstrap lacks its exact Authority installation");
+    };
+    let data = install.installation_data.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("System Authority installation lacks its SAC7 configuration")
+    })?;
+    validate_system_observation_bootstrap_configuration(descriptor, &data.bytes)?;
+    let runtime = crate::bundled::root_signed_system_agent_runtime_package(operator)?;
+    anyhow::ensure!(
+        runtime_package_bytes == runtime.exact_bytes(),
+        "root-certified System runtime differs from the exact packaged System observation role"
+    );
+    let authority = crate::bundled::root_signed_actor_package(
+        crate::bundled::system_authority_package_template(),
+        SYSTEM_AUTHORITY_NAME,
+        operator,
+    )?;
+    anyhow::ensure!(
+        authority_package_bytes == authority.exact_bytes(),
+        "root-certified Authority differs from the exact packaged Authority template"
+    );
+    let public = raw_public_key(operator)?;
+    let (target, nonce) =
+        derive_system_authority_target(descriptor.identity.space, public, &runtime, &authority)?;
+    anyhow::ensure!(
+        descriptor.identity.agent == target.system_agent
+            && descriptor.identity.owner == PrincipalId::of_public_key(&public)
+            && descriptor.creation_nonce == nonce
+            && descriptor.authority == target.binding
+            && descriptor.private_recovery.is_none()
+            && descriptor.identity.runtime_deployment == runtime.deployment()
+            && descriptor.identity.runtime_program == runtime.program()
+            && descriptor.identity.runtime_producer == runtime.producer()
+            && &descriptor.runtime_package == runtime.package_ref()
+            && descriptor.runtime_contract == runtime.manifest().contract
+            && descriptor.capabilities == runtime.capabilities(),
+        "root-certified System descriptor differs from its exact packaged runtime and Authority closure"
+    );
+    let expected_installation = install_request(
+        target.system_agent,
+        &authority,
+        data.bytes.clone(),
+        b"authority",
+    )?;
+    anyhow::ensure!(
+        authority_request == &expected_installation,
+        "root-certified Authority installation differs from its exact packaged program, package and descriptor closure"
+    );
+    Ok(())
+}
+
+/// Pending release gate runs before taking a writer lease, reconciling stages,
+/// importing a certificate, or creating System/control/Shared/Local roots.
+fn preflight_released_system_startup(
+    data_dir: &Path,
+    local_storage: super::local_config::LocalAgentStorage,
+    certified_inputs: Option<&PreparedCleanSystemAgentBootstrap>,
+    operator: &Keypair,
+) -> anyhow::Result<()> {
+    super::local_config::validate_local_storage_roots(data_dir, local_storage)?;
+    if let Some(inputs) = certified_inputs {
+        validate_packaged_system_observation_bootstrap_plan(inputs.plan(), operator)?;
+    }
+    let retained = CleanSystemAgentFileStores::read_client_bootstrap(
+        &data_dir.join(SYSTEM_AGENT_CONTROL_DIRECTORY),
+    )?;
+    if let Some(images) = &retained {
+        // This decoder accepts only the canonical current CSB2/version-5
+        // record and its fully root-certified plan, before a writer opens.
+        let plan = CleanSystemAgentBootstrapRecord::authorized_plan(&images.bootstrap)
+            .map_err(|error| anyhow::anyhow!("invalid persisted bootstrap plan: {error:?}"))?;
+        validate_packaged_system_observation_bootstrap_plan(&plan, operator)?;
+        if let Some(inputs) = certified_inputs {
+            anyhow::ensure!(
+                plan.commitment() == inputs.plan().commitment(),
+                "certified bootstrap differs from stored plan"
+            );
+        }
+    }
+    anyhow::ensure!(
+        certified_inputs.is_some() || retained.is_some(),
+        "released fixed-three System startup requires a supplied root-certified plan or canonical retained CSB5 plan; no fresh singleton fallback exists"
+    );
+    anyhow::bail!(
+        "fixed-three SAC7 System observation startup is pending release qualification; no bootstrap or deployment roots were created"
+    );
 }
 
 fn open_clean_system_lifecycle_with_inputs(
@@ -675,8 +960,13 @@ fn open_clean_system_lifecycle_with_roster_policy(
     allow_candidate_roster: bool,
     #[cfg(test)] test_inputs: Option<&StartupTestInputs>,
 ) -> anyhow::Result<(vos::agent::sdk::NodeId, CleanProductionLifecycle)> {
-    // Reject unsupported incoming placement before even creating control
-    // stores. Candidate multi-voter fixtures opt into a different test build.
+    // The public v1 role is not promoted yet. Refuse old or unqualified input
+    // before opening writable stores; no canonical singleton fallback exists.
+    if !allow_candidate_roster {
+        preflight_released_system_startup(data_dir, local_storage, certified_inputs, operator)?;
+    }
+    // Candidate fixtures remain explicit preparation/evidence, never a grant
+    // to the public release gate or a selection of production artifacts.
     if let Some(inputs) = certified_inputs {
         validate_production_bootstrap_roster(inputs.plan(), allow_candidate_roster)?;
     }
@@ -720,23 +1010,6 @@ fn open_clean_system_lifecycle_with_roster_policy(
         validate_production_bootstrap_roster(plan, allow_candidate_roster)?;
     }
 
-    let runtime = crate::bundled::root_signed_agent_runtime_package(operator)?;
-    let authority_package = crate::bundled::root_signed_actor_package(
-        crate::bundled::system_authority_package_template_for_storage(local_storage)?,
-        SYSTEM_AUTHORITY_NAME,
-        operator,
-    )?;
-    #[cfg(test)]
-    let (runtime, authority_package) = test_inputs.map_or((runtime, authority_package), |inputs| {
-        (inputs.runtime.clone(), inputs.authority.clone())
-    });
-    let catalog_package = crate::bundled::root_signed_actor_package(
-        crate::bundled::system_catalog_package_template(),
-        SYSTEM_CATALOG_NAME,
-        operator,
-    )?;
-    #[cfg(test)]
-    let catalog_package = test_inputs.map_or(catalog_package, |inputs| inputs.catalog.clone());
     let (runtime, authority_package, catalog_package) = match certified_inputs
         .map(|inputs| inputs.plan())
         .or(stored_plan.as_ref())
@@ -752,7 +1025,28 @@ fn open_clean_system_lifecycle_with_roster_policy(
                 vos::agent::package_admission::admit_actor_package(plan.catalog_package_bytes())?,
             )
         }
-        None => (runtime, authority_package, catalog_package),
+        None => {
+            let runtime = crate::bundled::root_signed_system_agent_runtime_package(operator)?;
+            let authority_package = crate::bundled::root_signed_actor_package(
+                crate::bundled::system_authority_package_template_for_storage(local_storage)?,
+                SYSTEM_AUTHORITY_NAME,
+                operator,
+            )?;
+            #[cfg(test)]
+            let (runtime, authority_package) = test_inputs
+                .map_or((runtime, authority_package), |inputs| {
+                    (inputs.runtime.clone(), inputs.authority.clone())
+                });
+            let catalog_package = crate::bundled::root_signed_actor_package(
+                crate::bundled::system_catalog_package_template(),
+                SYSTEM_CATALOG_NAME,
+                operator,
+            )?;
+            #[cfg(test)]
+            let catalog_package =
+                test_inputs.map_or(catalog_package, |inputs| inputs.catalog.clone());
+            (runtime, authority_package, catalog_package)
+        }
     };
     let node_encryption_public = derive_node_encryption_public(daemon, space)?;
     let enrollment =
@@ -889,6 +1183,43 @@ fn open_clean_system_lifecycle_with_roster_policy(
         )
         .map_err(|error| anyhow::anyhow!("initialize empty Shared owner: {error:?}"))?,
     };
+    #[cfg(feature = "experimental-state-blocks")]
+    {
+        // Member archives are public data under independent leases, never
+        // fabricated issuer records. The existing native controller must
+        // reprove finality and cover every physical generation before serving.
+        let mut members = super::clean_store::CleanSharedMemberGenesisFiles::open(
+            data_dir,
+            HostSpaceId(space.0),
+            HostNodeId(clean_node.0),
+            vos::agent::shared_host::MAX_SHARED_HOST_AGENTS,
+        )?;
+        let archives = members
+            .discover()?
+            .into_iter()
+            // Keep empty leases too: the controller may recover their OGAR
+            // only from an exact existing unexposed host intent. Absence of
+            // both remains preparation, never admission or namespace repair.
+            .map(|entry| (entry.locator, entry.archive))
+            .collect();
+        shared_genesis = shared_genesis
+            .with_member_archives(archives)
+            .map_err(|error| {
+                anyhow::anyhow!("admit retained member archives before startup: {error:?}")
+            })?
+            // Retain the existing noncreating namespace owner. Warm admission
+            // acquires an empty exact lease before host staging; storage alone
+            // grants no finality. The controller obtains the fresh proof and
+            // publishes/reloads OGAR before admitting/attaching the generation.
+            .with_member_archive_factory(move |record| {
+                use vos::service::ServiceWire as _;
+                members
+                    .prepare_insert(&record.encode())
+                    .map(|entry| entry.archive)
+                    .map_err(|_| vos::agent::shared_host::SharedAgentHostError::Unavailable)
+            })
+            .map_err(|error| anyhow::anyhow!("retain Shared member archive factory: {error:?}"))?;
+    }
     report_phase("shared_lifecycle_discovery");
     tracing::debug!(
         existing_roots = existing_shared_roots,
@@ -901,12 +1232,32 @@ fn open_clean_system_lifecycle_with_roster_policy(
     let operation_ids = operation_journal.discover(
         2 * vos::agent::authority_operation_coordinator::MAX_AUTHORITY_OPERATION_COORDINATOR_RECORDS,
     )?;
-    let (operation_coordinator, operation_issuer) =
+    let (mut operation_coordinator, mut operation_issuer) =
         CleanAuthorityOperationFiles::open_or_create(data_dir.join(OPERATION_IMAGES_DIRECTORY))?
             .into_parts();
-    let operation_completions = CleanNativeAuthorityOperationCompletions::open_or_create(
+    // Canonical envelope loading, not decoding runtime-private state. Once
+    // any active image/history exists, never recreate a missing archive root.
+    let coordinator_has_history =
+        vos::agent::authority_operation_coordinator::AuthorityOperationCoordinatorStore::load(
+            &mut operation_coordinator,
+        )?
+        .is_some();
+    let issuer_has_history =
+        vos::agent::authority_operation_issuer::AuthorityOperationIssuerStore::load(
+            &mut operation_issuer,
+        )?
+        .is_some();
+    let operation_journal = operation_journal.with_terminal_archive_mode(
+        &data_dir.join(OPERATION_TERMINALS_DIRECTORY),
+        !coordinator_has_history && !issuer_has_history && operation_ids.is_empty(),
+    )?;
+    let operation_terminal_archive = operation_journal
+        .terminal_archive()
+        .ok_or_else(|| anyhow::anyhow!("missing native operation terminal archive owner"))?;
+    let operation_completions = CleanNativeAuthorityOperationCompletions::open_or_create_archived(
         data_dir.join(OPERATION_COMPLETIONS_DIRECTORY),
         authority_target,
+        operation_terminal_archive.clone(),
     )?;
     let mut operations = vos::agent::clean_bootstrap::NativeAuthorityOperationController::new(
         authority_target,
@@ -915,10 +1266,13 @@ fn open_clean_system_lifecycle_with_roster_policy(
         operation_journal,
     )
     .with_completions(operation_completions)
-    .with_retirements(CleanNativeAuthorityOperationRetirements::open_or_create(
-        data_dir.join(OPERATION_RETIREMENTS_DIRECTORY),
-        authority_target,
-    )?)
+    .with_retirements(
+        CleanNativeAuthorityOperationRetirements::open_or_create_archived(
+            data_dir.join(OPERATION_RETIREMENTS_DIRECTORY),
+            authority_target,
+            operation_terminal_archive,
+        )?,
+    )
     .with_denials(CleanNativeAuthorityOperationDenials::open_or_create(
         data_dir.join(OPERATION_DENIALS_DIRECTORY),
         authority_target,
@@ -952,7 +1306,15 @@ fn open_clean_system_lifecycle_with_roster_policy(
         .map_err(|error| {
             anyhow::anyhow!("admit Shared recovery before startup; preserved stores: {error:?}")
         })?;
-    let mut pending = PendingCleanSystemAgentBootstrap::open_with_operation_admission(
+    // This binary's external Shared support is explicit; System and Local
+    // retain their image ABI. Signed genesis admission selects each ordinary
+    // runtime, never the presence of files in its storage root.
+    #[cfg(feature = "experimental-state-blocks")]
+    let open_pending =
+        PendingCleanSystemAgentBootstrap::open_with_external_shared_operation_admission;
+    #[cfg(not(feature = "experimental-state-blocks"))]
+    let open_pending = PendingCleanSystemAgentBootstrap::open_with_operation_admission;
+    let mut pending = open_pending(
         pins_store,
         record_store,
         issuer_store,
@@ -1032,15 +1394,40 @@ fn open_clean_system_lifecycle_with_roster_policy(
         vos::agent::shared_host::MAX_SHARED_HOST_AGENTS,
     )?;
     let lifecycle = lifecycle
-        .with_shared_genesis_admission(
+        .with_shared_genesis_runtime_admission(
             shared_genesis,
             move |descriptor, call, runtime, replicas| {
-                shared_files.reserve(descriptor, call, runtime, replicas)
+                shared_files.reserve_with_runtime(descriptor, call, runtime, replicas)
             },
         )
         .map_err(|error| {
             anyhow::anyhow!("complete Shared recovery before routes; preserved stores: {error:?}")
         })?;
+    // The initial Authority uses the configured Root signer, independently of
+    // the three transport voters. Reuse the sealed native candidate and its
+    // durable signature pledge; neither request bytes nor the runtime package
+    // can choose a committee or authorize this signature.
+    let signature_parent = data_dir.join("shared-genesis-signatures");
+    let mut genesis_signer = OwnedCleanOperatorIdentitySigner::new(operator.clone())?;
+    let lifecycle = lifecycle.with_shared_genesis_endorsement(move |prepared| {
+        use vos::agent::clean_bootstrap::GenesisClaimSigner as _;
+        use vos::agent::shared_host::SharedAgentHostError;
+        let public_key = genesis_signer.public_key();
+        let signer = production_genesis_signer(prepared.committee(), &public_key)?;
+        // Preserve noncreating startup and refuse an unsupported committee
+        // before any pledge directory is allocated.
+        super::clean_store::ensure_private_directory(&signature_parent)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let mut signature = super::clean_store::CleanAgentGenesisSignatureFile::open_or_create(
+            &signature_parent,
+            prepared.candidate().proposal().locator(),
+            signer,
+        )
+        .map_err(|_| SharedAgentHostError::Unavailable)?;
+        prepared
+            .endorse(&mut signature, &mut genesis_signer)
+            .map(|signature| vec![signature])
+    })?;
     report_phase("shared_lifecycle_recovery");
     let lifecycle = lifecycle
         .with_operations(
@@ -1050,6 +1437,28 @@ fn open_clean_system_lifecycle_with_roster_policy(
         .with_admins(admins, admin_signer)?;
     report_phase("lifecycle_controller");
     Ok((clean_node, lifecycle))
+}
+
+/// The v1 automatic endorser supports only the initial one-voter Root
+/// committee. Transport membership is not an Authority signing grant, and a
+/// single local signature must never stand in for a larger signing quorum.
+fn production_genesis_signer(
+    committee: &vos::agent::committee::AuthorityCommittee,
+    public_key: &[u8; 32],
+) -> Result<vos::agent::committee::AuthoritySignerId, vos::agent::shared_host::SharedAgentHostError>
+{
+    use vos::agent::committee::{AuthorityMemberRole, AuthoritySignerId};
+    use vos::agent::shared_host::SharedAgentHostError;
+    let signer = AuthoritySignerId::of_raw_ed25519(public_key);
+    if committee.members().len() != 1
+        || committee.quorum_threshold() != 1
+        || !committee.member(signer).is_some_and(|member| {
+            member.role() == AuthorityMemberRole::Voter && member.public_key() == public_key
+        })
+    {
+        return Err(SharedAgentHostError::ScopeMismatch);
+    }
+    Ok(signer)
 }
 
 #[cfg(test)]
@@ -1217,11 +1626,11 @@ impl AgentTrustProvider for SystemAgentTrust {
         let observed = system_logical_slot().ok()?;
         #[cfg(test)]
         let observed = self.test_clock.as_ref().map_or(observed, |clock| {
-            // Requests still use wall-clock valid_from slots. Slow guest
-            // execution must not leave the injected clock behind them;
-            // explicit forward jumps for expiry remain authoritative.
+            // Match production wall-clock sampling without advancing on a
+            // read. Explicit forward jumps for expiry remain authoritative;
+            // wall time still catches up a stale injected clock.
             clock.fetch_max(observed, Ordering::AcqRel);
-            clock.fetch_add(1, Ordering::AcqRel)
+            clock.load(Ordering::Acquire)
         });
         Some(
             self.floor

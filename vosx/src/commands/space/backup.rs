@@ -36,6 +36,15 @@ const NODE_KEY_FILE: &str = "node.key";
 const ENDPOINT_FILE: &str = ".endpoint";
 const PENDING_INVITE_FILE: &str = ".pending-invite.token";
 
+#[cfg(target_os = "linux")]
+mod fresh_member;
+#[cfg(target_os = "linux")]
+pub(crate) use fresh_member::{PrepareBootstrapMemberArgs, prepare_bootstrap_member};
+#[cfg(target_os = "linux")]
+mod registry_audit;
+#[cfg(target_os = "linux")]
+pub(crate) use registry_audit::with_registry_audit_copy;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BackupManifest {
@@ -392,6 +401,20 @@ fn classify_data_entry(
         ["agents", name] if metadata.is_file() && is_registry_database(name) => {
             DataEntryDisposition::Copy
         }
+        ["agents", name] if metadata.is_file() && is_registry_consistency_seal(name) => {
+            // The released Registry always reopens as Crdt. Only that exact
+            // reconstructible node-local seal may be omitted: dropping a
+            // narrowed or different tier could widen a restored Registry.
+            let file = open_regular_file_nofollow(physical_path)?;
+            let mut bytes = Vec::new();
+            file.take(2).read_to_end(&mut bytes)?;
+            anyhow::ensure!(
+                metadata.len() == 1 && bytes == [vos::node::Consistency::Crdt as u8],
+                "backup refuses non-Crdt or malformed Registry consistency seal {}",
+                physical_path.display(),
+            );
+            DataEntryDisposition::Skip
+        }
         ["trash", ..] if metadata.is_dir() => DataEntryDisposition::Descend,
         ["trash", ..] if metadata.is_file() => DataEntryDisposition::Skip,
         _ => {
@@ -474,6 +497,10 @@ fn is_node_local_secret_name(name: &str) -> bool {
 
 fn is_registry_database(name: &str) -> bool {
     registry_db_wire().strip_prefix("data/agents/") == Some(name)
+}
+
+fn is_registry_consistency_seal(name: &str) -> bool {
+    name == format!("{:08x}.seal", vos::abi::service::ServiceId::REGISTRY.0)
 }
 
 fn is_lower_hex(value: &str, length: usize) -> bool {
@@ -1487,6 +1514,61 @@ mod tests {
         .unwrap();
         assert_eq!(collect_tree(&destination), first_restore);
         assert_eq!(collect_tree(&replaced), first_restore);
+    }
+
+    #[test]
+    fn registry_crdt_seal_is_reconstructible_and_never_enters_archive() {
+        let temp = TempDir::new("registry-crdt-seal");
+        let (entry, data, cache) = fixture(&temp.0);
+        let seal = data.join("agents").join(format!(
+            "{:08x}.seal",
+            vos::abi::service::ServiceId::REGISTRY.0
+        ));
+        fs::write(&seal, [vos::node::Consistency::Crdt as u8]).unwrap();
+        let source = collect_tree(&data);
+        let archive = temp.0.join("backup");
+        create_archive(&entry, &archive, &cache).unwrap();
+        let manifest = verify_archive(&archive).unwrap();
+        assert_eq!(manifest.files.len(), 2);
+        assert!(
+            manifest
+                .files
+                .iter()
+                .all(|file| !file.path.ends_with(".seal"))
+        );
+        assert_eq!(collect_tree(&data), source);
+    }
+
+    #[test]
+    fn backup_refuses_narrowed_malformed_and_nonregistry_consistency_seals() {
+        for (index, bytes) in [vec![], vec![0], vec![1], vec![3], vec![255], vec![2, 0]]
+            .into_iter()
+            .enumerate()
+        {
+            let temp = TempDir::new(&format!("registry-bad-seal-{index}"));
+            let (entry, data, cache) = fixture(&temp.0);
+            let seal = data.join("agents").join(format!(
+                "{:08x}.seal",
+                vos::abi::service::ServiceId::REGISTRY.0
+            ));
+            fs::write(&seal, &bytes).unwrap();
+            let source = collect_tree(&data);
+            let archive = temp.0.join("backup");
+            let error = create_archive(&entry, &archive, &cache).unwrap_err();
+            assert!(error.to_string().contains("consistency seal"), "{error:#}");
+            assert_eq!(collect_tree(&data), source);
+            assert!(!archive.exists());
+        }
+        let temp = TempDir::new("other-agent-seal");
+        let (entry, data, cache) = fixture(&temp.0);
+        let seal = data.join("agents").join("00000001.seal");
+        fs::write(&seal, [vos::node::Consistency::Crdt as u8]).unwrap();
+        let source = collect_tree(&data);
+        let archive = temp.0.join("backup");
+        let error = create_archive(&entry, &archive, &cache).unwrap_err();
+        assert!(error.to_string().contains("unclassified"), "{error:#}");
+        assert_eq!(collect_tree(&data), source);
+        assert!(!archive.exists());
     }
 
     #[test]

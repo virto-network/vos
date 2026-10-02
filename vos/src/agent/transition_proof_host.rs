@@ -159,7 +159,7 @@ impl AttestedTransitionRoute {
             }
             RuntimeWork::Manage { .. } | RuntimeWork::Acknowledge { .. } => return false,
             #[cfg(feature = "experimental-state-blocks")]
-            RuntimeWork::InspectInvocation { .. } => return false,
+            RuntimeWork::InspectInvocation { .. } | RuntimeWork::Observe { .. } => return false,
         };
         self.is_valid()
             && matches!(context, RuntimeExecutionContext::Attested { proof_system } if *proof_system == self.proof_system)
@@ -338,7 +338,7 @@ impl AuthenticatedAttestedTransition {
             RuntimeWork::Invoke { state, .. } | RuntimeWork::Resume { state, .. } => state,
             RuntimeWork::Manage { .. } | RuntimeWork::Acknowledge { .. } => return None,
             #[cfg(feature = "experimental-state-blocks")]
-            RuntimeWork::InspectInvocation { .. } => return None,
+            RuntimeWork::InspectInvocation { .. } | RuntimeWork::Observe { .. } => return None,
         };
         let root =
             |tag: &[u8], bytes: &[u8]| Hash::digest(b"vos/test/agent-proof-root", &[tag, bytes]);
@@ -2226,7 +2226,7 @@ fn invocation_id(work: &RuntimeWork) -> Option<InvocationId> {
         RuntimeWork::Resume { resume, .. } => Some(resume.invocation),
         RuntimeWork::Manage { .. } | RuntimeWork::Acknowledge { .. } => None,
         #[cfg(feature = "experimental-state-blocks")]
-        RuntimeWork::InspectInvocation { .. } => None,
+        RuntimeWork::InspectInvocation { .. } | RuntimeWork::Observe { .. } => None,
     }
 }
 
@@ -2277,7 +2277,7 @@ fn authenticate_admission(
         }
         RuntimeWork::Manage { .. } | RuntimeWork::Acknowledge { .. } => return None,
         #[cfg(feature = "experimental-state-blocks")]
-        RuntimeWork::InspectInvocation { .. } => return None,
+        RuntimeWork::InspectInvocation { .. } | RuntimeWork::Observe { .. } => return None,
     };
     if admission.space != route.space
         || admission.agent != route.agent
@@ -2358,7 +2358,7 @@ fn subject_for(
         ),
         RuntimeWork::Manage { .. } | RuntimeWork::Acknowledge { .. } => return None,
         #[cfg(feature = "experimental-state-blocks")]
-        RuntimeWork::InspectInvocation { .. } => return None,
+        RuntimeWork::InspectInvocation { .. } | RuntimeWork::Observe { .. } => return None,
     };
     let subject = TransitionProofSubject {
         space: route.space,
@@ -2404,7 +2404,7 @@ fn validate_transition_for_work(
             return Err(TransitionProofHostRejection::InvalidWork);
         }
         #[cfg(feature = "experimental-state-blocks")]
-        RuntimeWork::InspectInvocation { .. } => {
+        RuntimeWork::InspectInvocation { .. } | RuntimeWork::Observe { .. } => {
             return Err(TransitionProofHostRejection::InvalidWork);
         }
     };
@@ -3106,7 +3106,7 @@ mod tests {
                     ));
                 }
                 #[cfg(feature = "experimental-state-blocks")]
-                RuntimeWork::InspectInvocation { .. } => {
+                RuntimeWork::InspectInvocation { .. } | RuntimeWork::Observe { .. } => {
                     return Err(TransitionProofAdapterError::Terminal(
                         AdapterError::Rejected,
                     ));
@@ -3121,7 +3121,9 @@ mod tests {
                 }
                 RuntimeWork::Manage { .. } | RuntimeWork::Acknowledge { .. } => unreachable!(),
                 #[cfg(feature = "experimental-state-blocks")]
-                RuntimeWork::InspectInvocation { .. } => unreachable!(),
+                RuntimeWork::InspectInvocation { .. } | RuntimeWork::Observe { .. } => {
+                    unreachable!()
+                }
             };
             let proof_systems =
                 crate::agent::sdk::ProofSystemSet::from_sorted(&[route.proof_system]).unwrap();
@@ -3199,7 +3201,7 @@ mod tests {
                     ));
                 }
                 #[cfg(feature = "experimental-state-blocks")]
-                RuntimeWork::InspectInvocation { .. } => {
+                RuntimeWork::InspectInvocation { .. } | RuntimeWork::Observe { .. } => {
                     return Err(TransitionProofAdapterError::Terminal(
                         AdapterError::Rejected,
                     ));
@@ -3249,7 +3251,7 @@ mod tests {
                     return Err(TransitionProofAdapterError::Terminal(()));
                 }
                 #[cfg(feature = "experimental-state-blocks")]
-                RuntimeWork::InspectInvocation { .. } => {
+                RuntimeWork::InspectInvocation { .. } | RuntimeWork::Observe { .. } => {
                     return Err(TransitionProofAdapterError::Terminal(()));
                 }
             };
@@ -3369,7 +3371,7 @@ mod tests {
                     ),
                     RuntimeWork::Manage { .. } | RuntimeWork::Acknowledge { .. } => unreachable!(),
                     #[cfg(feature = "experimental-state-blocks")]
-                    RuntimeWork::InspectInvocation { .. } => unreachable!(),
+                    RuntimeWork::InspectInvocation { .. } | RuntimeWork::Observe { .. } => unreachable!(),
                 };
             if self.fail_terminal {
                 return Err(TransitionProofAdapterError::Terminal(
@@ -4353,6 +4355,93 @@ mod tests {
         assert_eq!(producer.prove_calls, proved);
         assert_eq!(producer.sign_calls, signed);
         assert_eq!(publisher.effective_publications(), 1);
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn system_observation_cannot_enter_attested_work_or_durable_proof_retention() {
+        for context in [
+            RuntimeExecutionContext::Direct,
+            RuntimeExecutionContext::Attested {
+                proof_system: route().proof_system,
+            },
+        ] {
+            let RuntimeWork::Invoke {
+                state,
+                mut invocation,
+                observed_slot,
+                ..
+            } = work(15)
+            else {
+                unreachable!()
+            };
+            invocation.mode = MethodMode::Query;
+            let authorization = Box::new(InvocationAuthorization::PublicPreflight(
+                PublicPreflight::for_work(&invocation, observed_slot),
+            ));
+            let observation = RuntimeWork::Observe {
+                context,
+                state: state.clone(),
+                invocation,
+                authorization,
+                observed_slot,
+            };
+            if context.is_direct() {
+                let encoded = observation.encode().unwrap();
+                assert_eq!(RuntimeWork::decode(&encoded), Ok(observation.clone()));
+                assert!(transition_key(&observation, &encoded, state_roots(&state)).is_none());
+            } else {
+                assert!(observation.encode().is_err());
+            }
+            assert!(!route().matches_work(&observation));
+            assert!(super::invocation_id(&observation).is_none());
+            assert!(subject_for(&route(), &observation, "increment".into()).is_none());
+            assert_eq!(
+                validate_transition_for_work(
+                    &observation,
+                    &RuntimeTransition {
+                        state,
+                        outcome: RuntimeOutcome::Completed(Err(
+                            crate::agent_sdk::InvocationError::NotReady,
+                        )),
+                    },
+                ),
+                Err(TransitionProofHostRejection::InvalidWork)
+            );
+
+            let store = MemoryStore::default();
+            let order = Rc::new(RefCell::new(Vec::new()));
+            let (mut validator, mut executor, mut roots, mut producer, mut publisher) =
+                components(order);
+            let mut host =
+                DurableTransitionProofHost::open(store.clone(), route(), &FakeVerifier).unwrap();
+            let image_before = store.image();
+            let commits_before = store.0.borrow().commits;
+            assert!(matches!(
+                host.execute_prove_publish(
+                    observation,
+                    &mut validator,
+                    &mut executor,
+                    &mut roots,
+                    &mut producer,
+                    &FakeVerifier,
+                    &mut publisher,
+                ),
+                Err(TransitionProofHostError::Rejected(
+                    TransitionProofHostRejection::InvalidWork
+                ))
+            ));
+            assert_eq!(validator.auth_calls, 0);
+            assert_eq!(executor.calls, 0);
+            assert_eq!(producer.prove_calls, 0);
+            assert_eq!(producer.sign_calls, 0);
+            assert_eq!(publisher.effective_publications(), 0);
+            assert_eq!(host.retained_transitions(), 0);
+            assert_eq!(store.image(), image_before);
+            assert_eq!(store.0.borrow().commits, commits_before);
+            assert!(store.0.borrow().artifacts.is_empty());
+            assert_eq!(store.witness_count(), 0);
+        }
     }
 
     #[test]

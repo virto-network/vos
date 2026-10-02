@@ -4,6 +4,8 @@
 //! one canonical [`RuntimeWork`](vos::agent_sdk::RuntimeWork) and receives a
 //! canonical [`RuntimeTransition`](vos::agent_sdk::RuntimeTransition). The
 //! host persists the returned lane components without interpreting them.
+//! The scoped `system-observation` image build also accepts explicit Observe
+//! work under its separately signed contract, without publishing any state.
 //!
 //! The opt-in `experimental-state-blocks` build instead accepts XSW2 external
 //! work. Create, Install, ACK, non-yielding Invoke for non-Merge actors, and
@@ -20,6 +22,9 @@ mod guest {
     use vos::agent_sdk::wire::CanonicalWire as _;
 
     const PVM_HALT_ADDR: u64 = 0xffff_0000;
+
+    #[cfg(all(feature = "system-observation", feature = "experimental-state-blocks"))]
+    compile_error!("System image observation and external runtime entries are distinct artifacts");
 
     global_asm!(
         ".global _start",

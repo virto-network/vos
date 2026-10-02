@@ -194,6 +194,33 @@ async fn serve_connection<T>(
     }
 }
 
+fn shared_create_http_phase(
+    path: &str,
+    port: Option<u16>,
+    phase: &'static str,
+    reason: Option<&'static str>,
+    body: Option<&[u8]>,
+) {
+    if path != "/_vos/agents/shared/create"
+        || std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_none()
+    {
+        return;
+    }
+    // A diagnostic byte commitment correlates even pre-decode refusals. It is
+    // not an authenticated call commitment and confers no admission.
+    let request_bytes = body.map(|body| {
+        crate::service::Hash::digest(b"vos/test/shared-create-http-bytes/v1", &[body]).0
+    });
+    tracing::debug!(
+        operation = "shared_create",
+        phase,
+        reason,
+        ?port,
+        ?request_bytes,
+        "Public Shared Create admission diagnostic"
+    );
+}
+
 async fn handle_request(
     request: Request<Incoming>,
     handle: IngressHandle,
@@ -205,6 +232,13 @@ async fn handle_request(
     let upload_permit = match admit_lifecycle_upload(maximum_body, &LIFECYCLE_UPLOADS) {
         Ok(permit) => permit,
         Err(_) => {
+            shared_create_http_phase(
+                &path,
+                Some(inner.bound_port),
+                "pre_handler_refused",
+                Some("upload_capacity"),
+                None,
+            );
             inner.metrics.record_response(503);
             return Ok(simple(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -249,19 +283,34 @@ async fn handle_request(
         }
     };
     let request = http::Request::from_parts(parts, body);
+    shared_create_http_phase(
+        &path,
+        Some(inner.bound_port),
+        "body_collected",
+        None,
+        Some(request.body()),
+    );
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
     if handle.clean_agent_recovering()
-        && !matches!(
+        && !(matches!(
             path.as_str(),
             "/__status"
                 | "/__agents/authorize"
                 | "/__agents/prepare-authorization"
                 | "/__agents/admin"
-        )
+        ) || (cfg!(feature = "experimental-state-blocks")
+            && path == "/_vos/agents/shared/create"))
     {
+        shared_create_http_phase(
+            &path,
+            Some(inner.bound_port),
+            "pre_handler_refused",
+            Some("space_recovering"),
+            Some(request.body()),
+        );
         let response = simple(
             StatusCode::SERVICE_UNAVAILABLE,
-            "Space recovering; only exact retained authorization is available",
+            "Space recovering; only exact retained recovery is available",
         );
         inner.metrics.record_response(503);
         return Ok(response);
@@ -284,6 +333,13 @@ async fn handle_request(
         super::routing::dispatch(&request, &inner, &mut context)
     } else {
         let Ok(permit) = blocking.try_acquire_owned() else {
+            shared_create_http_phase(
+                &path,
+                Some(inner.bound_port),
+                "pre_handler_refused",
+                Some("http_worker_capacity"),
+                Some(request.body()),
+            );
             let response = simple(StatusCode::SERVICE_UNAVAILABLE, "HTTP worker pool is busy");
             inner.metrics.record_response(response.status().as_u16());
             return Ok(response);
@@ -307,6 +363,33 @@ async fn handle_request(
             #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
             if request.uri().path() == "/__agents/local/install" {
                 return handle_local_install(&request, &handle);
+            }
+            #[cfg(all(
+                feature = "network",
+                feature = "storage",
+                feature = "experimental-state-blocks",
+                target_os = "linux"
+            ))]
+            if request.uri().path() == "/_vos/agents/shared/create" {
+                return handle_shared_create(&request, &handle);
+            }
+            #[cfg(all(
+                feature = "network",
+                feature = "storage",
+                feature = "experimental-state-blocks",
+                target_os = "linux"
+            ))]
+            if request.uri().path() == "/_vos/agents/shared/install" {
+                return handle_shared_install(&request, &handle);
+            }
+            #[cfg(all(
+                feature = "network",
+                feature = "storage",
+                feature = "experimental-state-blocks",
+                target_os = "linux"
+            ))]
+            if request.uri().path() == "/_vos/agents/shared/admit" {
+                return handle_shared_member_admission(&request, &handle);
             }
             #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
             if request.uri().path() == "/__agents/authorize" {
@@ -746,6 +829,348 @@ fn local_lifecycle_failure(
     }
 }
 
+#[cfg(all(
+    feature = "network",
+    feature = "storage",
+    feature = "experimental-state-blocks",
+    target_os = "linux"
+))]
+fn handle_shared_create(
+    request: &super::types::Request,
+    handle: &IngressHandle,
+) -> super::types::Response {
+    use super::types::{text, with_content_type};
+    use crate::agent::local_lifecycle::{
+        LocalLifecycleIngressError, SharedCreateDisposition, SharedCreateSubmission,
+    };
+    if request.body().len() > SharedCreateSubmission::MAX_BYTES {
+        return text(413, "request body too large");
+    }
+    if request.method() != http::Method::POST {
+        return text(405, "Shared Create is POST-only");
+    }
+    if request.uri().query().is_some() {
+        return text(400, "Shared Create does not accept query parameters");
+    }
+    if request
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        != Some("application/octet-stream")
+    {
+        return text(415, "Shared Create requires application/octet-stream SCQ1");
+    }
+    let submission = match SharedCreateSubmission::decode(request.body()) {
+        Ok(value) => value,
+        Err(_) => return text(400, "invalid signed Shared Create submission"),
+    };
+    if submission.has_transport_node_claim() {
+        return text(
+            403,
+            "HTTP Shared Create does not accept transport-node claims",
+        );
+    }
+    shared_create_http_phase(
+        request.uri().path(),
+        None,
+        "decoded",
+        None,
+        Some(request.body()),
+    );
+    // This signed ACC3 commitment is identical at enqueue and native dispatch.
+    // Do not encode or log the package, credential material or request body.
+    let signed_call = submission.call().commitment();
+    let agent = submission.call().managed.agent;
+    let started = std::time::Instant::now();
+    tracing::debug!(
+        operation = "shared_create",
+        phase = "enqueue_start",
+        signed_call = ?signed_call.0,
+        ?agent,
+        "Public Shared lifecycle HTTP"
+    );
+    let reply = match handle.create_clean_shared_agent(submission.clone()) {
+        Ok(reply) => reply,
+        Err(LocalLifecycleIngressError::Invalid) => return text(400, "invalid Shared Create"),
+        Err(LocalLifecycleIngressError::Busy) => return text(503, "lifecycle queue is full"),
+        Err(LocalLifecycleIngressError::Unavailable) => {
+            return text(503, "Shared lifecycle unavailable");
+        }
+    };
+    tracing::debug!(
+        operation = "shared_create",
+        phase = "enqueue_accepted",
+        signed_call = ?signed_call.0,
+        ?agent,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "Public Shared lifecycle HTTP"
+    );
+    let result = reply.recv_timeout(Duration::from_secs(120));
+    let outcome = match &result {
+        Ok(Ok(SharedCreateDisposition::Applied(_))) => "applied",
+        Ok(Ok(SharedCreateDisposition::Denied(_))) => "denied",
+        Ok(Err(_)) => "error",
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => "timeout",
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => "disconnected",
+    };
+    tracing::debug!(
+        operation = "shared_create",
+        phase = "reply_wait_complete",
+        signed_call = ?signed_call.0,
+        ?agent,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        outcome,
+        "Public Shared lifecycle HTTP"
+    );
+    match result {
+        Ok(Ok(disposition)) => match submission.encode_response(&disposition) {
+            // Applied is not Ready: member admission and quorum qualification
+            // are separate. Never promote the origin's signed ACK to 201-ready.
+            Ok(bytes) => with_content_type(
+                match disposition {
+                    SharedCreateDisposition::Applied(_) => 202,
+                    SharedCreateDisposition::Denied(_) => 403,
+                },
+                "application/octet-stream",
+                bytes,
+            ),
+            Err(_) => text(500, "invalid Shared Create application evidence"),
+        },
+        Ok(Err(crate::agent::production_owner::AgentProductionOwnerError::Lifecycle(
+            crate::agent::shared_host::SharedAgentHostError::ScopeMismatch,
+        ))) => text(403, "Shared Create scope or authorization rejected"),
+        Ok(Err(error)) => shared_lifecycle_failure(
+            error,
+            "Shared Create incomplete; retry the identical signed submission",
+        ),
+        Err(_) => text(
+            504,
+            "Shared Create outcome unknown; retry the identical signed submission",
+        ),
+    }
+}
+
+#[cfg(all(
+    feature = "network",
+    feature = "storage",
+    feature = "experimental-state-blocks",
+    target_os = "linux"
+))]
+fn handle_shared_install(
+    request: &super::types::Request,
+    handle: &IngressHandle,
+) -> super::types::Response {
+    use super::types::{text, with_content_type};
+    use crate::agent::local_lifecycle::{
+        LocalLifecycleIngressError, SharedInstallDisposition, SharedInstallSubmission,
+    };
+    if request.body().len() > SharedInstallSubmission::MAX_BYTES {
+        return text(413, "request body too large");
+    }
+    if request.method() != http::Method::POST {
+        return text(405, "Shared Install is POST-only");
+    }
+    if request.uri().query().is_some() {
+        return text(400, "Shared Install does not accept query parameters");
+    }
+    if request
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        != Some("application/octet-stream")
+    {
+        return text(415, "Shared Install requires application/octet-stream SIQ1");
+    }
+    let submission = match SharedInstallSubmission::decode(request.body()) {
+        Ok(value) => value,
+        Err(_) => return text(400, "invalid signed Shared Install submission"),
+    };
+    if submission.has_transport_node_claim() {
+        return text(
+            403,
+            "HTTP Shared Install does not accept transport-node claims",
+        );
+    }
+    let reply = match handle.install_clean_shared_actor(submission.clone()) {
+        Ok(reply) => reply,
+        Err(LocalLifecycleIngressError::Invalid) => return text(400, "invalid Shared Install"),
+        Err(LocalLifecycleIngressError::Busy) => return text(503, "lifecycle queue is full"),
+        Err(LocalLifecycleIngressError::Unavailable) => {
+            return text(503, "Shared lifecycle unavailable");
+        }
+    };
+    match reply.recv_timeout(Duration::from_secs(120)) {
+        Ok(Ok(disposition)) => {
+            let status = match &disposition {
+                SharedInstallDisposition::Applied(_) => 201,
+                SharedInstallDisposition::Denied(_) => 403,
+                SharedInstallDisposition::Failed(_) => 422,
+            };
+            match submission.encode_response(&disposition) {
+                Ok(bytes) => with_content_type(status, "application/octet-stream", bytes),
+                Err(_) => text(500, "invalid Shared Install terminal evidence"),
+            }
+        }
+        // Transient owner errors are not signed denials. Only an exact CND1
+        // disposition above can claim terminal refusal.
+        Ok(Err(error)) => shared_lifecycle_failure(
+            error,
+            "Shared Install incomplete; retry the identical signed submission",
+        ),
+        Err(_) => text(
+            504,
+            "Shared Install outcome unknown; retry the identical signed submission",
+        ),
+    }
+}
+
+#[cfg(all(
+    feature = "network",
+    feature = "storage",
+    feature = "experimental-state-blocks",
+    target_os = "linux"
+))]
+fn handle_shared_member_admission(
+    request: &super::types::Request,
+    handle: &IngressHandle,
+) -> super::types::Response {
+    use super::types::{text, with_content_type};
+    use crate::agent::local_lifecycle::{
+        LocalLifecycleIngressError, SharedMemberAdmissionSubmission,
+    };
+    use crate::service::ServiceWire as _;
+    if request.body().len() > SharedMemberAdmissionSubmission::MAX_BYTES {
+        return text(413, "request body too large");
+    }
+    if request.method() != http::Method::POST {
+        return text(405, "Shared member admission is POST-only");
+    }
+    if request.uri().query().is_some() {
+        return text(
+            400,
+            "Shared member admission does not accept query parameters",
+        );
+    }
+    if request
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        != Some("application/octet-stream")
+    {
+        return text(
+            415,
+            "Shared member admission requires application/octet-stream OGAR",
+        );
+    }
+    let Some(expected_node) = shared_member_expected_node(request) else {
+        return text(
+            400,
+            "Shared member admission requires exactly one canonical expected-node header",
+        );
+    };
+    let submission = match SharedMemberAdmissionSubmission::decode(request.body(), expected_node) {
+        Ok(value) => value,
+        Err(_) => return text(400, "invalid Shared member archive"),
+    };
+    let expected = submission.locator();
+    let reply = match handle.admit_clean_shared_member(submission) {
+        Ok(reply) => reply,
+        Err(LocalLifecycleIngressError::Invalid) => {
+            return text(400, "invalid Shared member archive");
+        }
+        Err(LocalLifecycleIngressError::Busy) => return text(503, "lifecycle queue is full"),
+        Err(LocalLifecycleIngressError::Unavailable) => {
+            return text(503, "Shared member admission unavailable");
+        }
+    };
+    match reply.recv_timeout(Duration::from_secs(120)) {
+        // Only the real local attachment can produce this result. AGNL is
+        // byte identity, not a signed management terminal or Ready/quorum proof.
+        Ok(Ok(locator)) if locator == expected => {
+            with_content_type(200, "application/octet-stream", locator.encode())
+        }
+        Ok(Ok(_)) => text(500, "Shared member admission returned a different locator"),
+        Ok(Err(crate::agent::production_owner::AgentProductionOwnerError::Lifecycle(
+            crate::agent::shared_host::SharedAgentHostError::ScopeMismatch,
+        ))) => text(
+            403,
+            "Shared member archive scope or current Authority rejected",
+        ),
+        Ok(Err(error)) => shared_lifecycle_failure(
+            error,
+            "Shared member admission incomplete; retry the identical archive",
+        ),
+        Err(_) => text(
+            504,
+            "Shared member admission outcome unknown; retry the identical archive",
+        ),
+    }
+}
+
+#[cfg(all(
+    feature = "network",
+    feature = "storage",
+    feature = "experimental-state-blocks",
+    target_os = "linux"
+))]
+fn shared_member_expected_node(
+    request: &super::types::Request,
+) -> Option<crate::agent::sdk::NodeId> {
+    use crate::agent::local_lifecycle::SharedMemberAdmissionSubmission;
+    use crate::agent::sdk::NodeId;
+    let mut values = request
+        .headers()
+        .get_all(SharedMemberAdmissionSubmission::TARGET_NODE_HEADER)
+        .iter();
+    let value = values.next()?.to_str().ok()?;
+    if values.next().is_some()
+        || value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
+    let mut bytes = [0; 32];
+    let nibble = |byte: u8| {
+        if byte <= b'9' {
+            byte - b'0'
+        } else {
+            byte - b'a' + 10
+        }
+    };
+    for (output, pair) in bytes.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+        *output = (nibble(pair[0]) << 4) | nibble(pair[1]);
+    }
+    let node = NodeId(bytes);
+    (node != NodeId::ZERO).then_some(node)
+}
+
+#[cfg(all(
+    feature = "network",
+    feature = "storage",
+    feature = "experimental-state-blocks",
+    target_os = "linux"
+))]
+fn shared_lifecycle_failure(
+    error: crate::agent::production_owner::AgentProductionOwnerError,
+    unavailable: &'static str,
+) -> super::types::Response {
+    if matches!(
+        error,
+        crate::agent::production_owner::AgentProductionOwnerError::Lifecycle(
+            crate::agent::shared_host::SharedAgentHostError::Conflict
+        )
+    ) {
+        super::types::text(
+            409,
+            "Shared lifecycle conflicts with retained state; inspect retained operation evidence before retrying",
+        )
+    } else {
+        super::types::text(503, unavailable)
+    }
+}
+
 /// Forward canonical clean lifecycle envelopes around actor messages. Receipt
 /// authorization remains the selected runtime's responsibility. An unsigned
 /// PublicPreflight is not proof of any caller identity, even for Public methods.
@@ -1170,6 +1595,253 @@ mod tests {
         );
     }
 
+    #[cfg(all(
+        feature = "network",
+        feature = "storage",
+        feature = "experimental-state-blocks",
+        target_os = "linux"
+    ))]
+    #[test]
+    fn shared_lifecycle_http_guards_run_before_queue_admission() {
+        use crate::agent::local_lifecycle::shared_submissions_for_test;
+        let node = crate::node::VosNode::new();
+        let handle = node.ingress_handle();
+        for (path, handler, magic) in [
+            (
+                "/_vos/agents/shared/create",
+                handle_shared_create
+                    as fn(
+                        &super::super::types::Request,
+                        &IngressHandle,
+                    ) -> super::super::types::Response,
+                b"SCQ1",
+            ),
+            (
+                "/_vos/agents/shared/install",
+                handle_shared_install
+                    as fn(
+                        &super::super::types::Request,
+                        &IngressHandle,
+                    ) -> super::super::types::Response,
+                b"SIQ1",
+            ),
+            (
+                "/_vos/agents/shared/admit",
+                handle_shared_member_admission
+                    as fn(
+                        &super::super::types::Request,
+                        &IngressHandle,
+                    ) -> super::super::types::Response,
+                b"OGAR",
+            ),
+        ] {
+            for (method, query, content_type, body, expected) in [
+                ("GET", "", "application/octet-stream", Vec::new(), 405),
+                (
+                    "POST",
+                    "?alias=1",
+                    "application/octet-stream",
+                    Vec::new(),
+                    400,
+                ),
+                ("POST", "", "application/json", Vec::new(), 415),
+                ("POST", "", "application/octet-stream", magic.to_vec(), 400),
+                (
+                    "POST",
+                    "",
+                    "application/octet-stream",
+                    b"LCQ1".to_vec(),
+                    400,
+                ),
+                (
+                    "POST",
+                    "",
+                    "application/octet-stream",
+                    vec![0; MAX_BODY_BYTES + 1],
+                    400,
+                ),
+            ] {
+                let request = http::Request::builder()
+                    .method(method)
+                    .uri(format!("{path}{query}"))
+                    .header(http::header::CONTENT_TYPE, content_type)
+                    .body(body)
+                    .unwrap();
+                assert_eq!(handler(&request, &handle).status().as_u16(), expected);
+            }
+        }
+        for claim in [true, false] {
+            let (create, install) = shared_submissions_for_test(claim);
+            for (path, handler, body) in [
+                (
+                    "/_vos/agents/shared/create",
+                    handle_shared_create
+                        as fn(
+                            &super::super::types::Request,
+                            &IngressHandle,
+                        ) -> super::super::types::Response,
+                    create.encode(),
+                ),
+                (
+                    "/_vos/agents/shared/install",
+                    handle_shared_install
+                        as fn(
+                            &super::super::types::Request,
+                            &IngressHandle,
+                        ) -> super::super::types::Response,
+                    install.encode(),
+                ),
+            ] {
+                let request = http::Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(http::header::CONTENT_TYPE, "application/octet-stream")
+                    .body(body)
+                    .unwrap();
+                // A valid transport claim is still forbidden on HTTP. A valid
+                // API request reaches the intentionally unopened queue (503).
+                assert_eq!(
+                    handler(&request, &handle).status().as_u16(),
+                    if claim { 403 } else { 503 }
+                );
+            }
+        }
+    }
+
+    #[cfg(all(
+        feature = "network",
+        feature = "storage",
+        feature = "experimental-state-blocks",
+        target_os = "linux"
+    ))]
+    #[test]
+    fn shared_transient_errors_are_not_terminal_denial_responses() {
+        use crate::agent::production_owner::AgentProductionOwnerError;
+        use crate::agent::shared_host::SharedAgentHostError;
+        for error in [
+            SharedAgentHostError::ScopeMismatch,
+            SharedAgentHostError::Unavailable,
+        ] {
+            assert_eq!(
+                shared_lifecycle_failure(AgentProductionOwnerError::Lifecycle(error), "incomplete")
+                    .status()
+                    .as_u16(),
+                503
+            );
+        }
+        assert_eq!(
+            shared_lifecycle_failure(
+                AgentProductionOwnerError::Lifecycle(SharedAgentHostError::Conflict),
+                "incomplete"
+            )
+            .status()
+            .as_u16(),
+            409
+        );
+    }
+
+    #[cfg(all(
+        feature = "network",
+        feature = "storage",
+        feature = "experimental-state-blocks",
+        target_os = "linux"
+    ))]
+    #[test]
+    fn shared_member_admission_rejects_lifecycle_frames_before_queue_admission() {
+        use crate::agent::local_lifecycle::{
+            SharedMemberAdmissionSubmission, shared_submissions_for_test,
+        };
+        let node = VosNode::new();
+        let handle = node.ingress_handle();
+        for transport_claim in [false, true] {
+            let (create, install) = shared_submissions_for_test(transport_claim);
+            for body in [create.encode(), install.encode()] {
+                let request = http::Request::builder()
+                    .method("POST")
+                    .uri("/_vos/agents/shared/admit")
+                    .header(http::header::CONTENT_TYPE, "application/octet-stream")
+                    .header(
+                        SharedMemberAdmissionSubmission::TARGET_NODE_HEADER,
+                        "01".repeat(32),
+                    )
+                    .body(body)
+                    .unwrap();
+                assert_eq!(
+                    handle_shared_member_admission(&request, &handle)
+                        .status()
+                        .as_u16(),
+                    400,
+                );
+            }
+        }
+    }
+
+    #[cfg(all(
+        feature = "network",
+        feature = "storage",
+        feature = "experimental-state-blocks",
+        target_os = "linux"
+    ))]
+    #[test]
+    fn shared_member_admission_requires_one_canonical_target_node_header() {
+        use crate::agent::local_lifecycle::SharedMemberAdmissionSubmission;
+        let node = VosNode::new();
+        let handle = node.ingress_handle();
+        let canonical = "ab".repeat(32);
+        for values in [
+            Vec::new(),
+            vec![String::new()],
+            vec!["00".repeat(32)],
+            vec![canonical.to_uppercase()],
+            vec![canonical[..62].to_string()],
+            vec!["g".repeat(64)],
+            vec![format!(" {canonical}")],
+            vec![format!("{canonical} ")],
+            vec![format!("{canonical},{canonical}")],
+            vec![canonical.clone(), canonical.clone()],
+            vec![canonical.clone(), "ac".repeat(32)],
+        ] {
+            let mut request = http::Request::builder()
+                .method("POST")
+                .uri("/_vos/agents/shared/admit")
+                .header(http::header::CONTENT_TYPE, "application/octet-stream");
+            for value in values {
+                request =
+                    request.header(SharedMemberAdmissionSubmission::TARGET_NODE_HEADER, value);
+            }
+            let request = request.body(Vec::new()).unwrap();
+            assert_eq!(shared_member_expected_node(&request), None);
+            assert_eq!(
+                handle_shared_member_admission(&request, &handle)
+                    .status()
+                    .as_u16(),
+                400,
+            );
+        }
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/_vos/agents/shared/admit")
+            .header(http::header::CONTENT_TYPE, "application/octet-stream")
+            .header(
+                SharedMemberAdmissionSubmission::TARGET_NODE_HEADER,
+                canonical,
+            )
+            .body(Vec::new())
+            .unwrap();
+        assert_eq!(
+            shared_member_expected_node(&request),
+            Some(crate::agent::sdk::NodeId([0xab; 32])),
+        );
+        // A correct routing header grants nothing: the absent OGAR is still
+        // rejected before the intentionally unopened lifecycle queue.
+        assert_eq!(
+            handle_shared_member_admission(&request, &handle)
+                .status()
+                .as_u16(),
+            400,
+        );
+    }
+
     use super::*;
     use crate::node::VosNode;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -1198,6 +1870,12 @@ mod tests {
         for (path, expected) in [
             ("/__agents/local", "HTTP/1.1 400"),
             ("/__agents/local/install", "HTTP/1.1 400"),
+            #[cfg(feature = "experimental-state-blocks")]
+            ("/_vos/agents/shared/create", "HTTP/1.1 400"),
+            #[cfg(feature = "experimental-state-blocks")]
+            ("/_vos/agents/shared/install", "HTTP/1.1 400"),
+            #[cfg(feature = "experimental-state-blocks")]
+            ("/_vos/agents/shared/create/", "HTTP/1.1 413"),
             ("/__agents/local/", "HTTP/1.1 413"),
             ("/__agents/invoke", "HTTP/1.1 413"),
         ] {
@@ -1223,6 +1901,53 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert!(response.starts_with(expected), "{path}: {response}");
+            serving.await.unwrap();
+        }
+    }
+
+    #[cfg(all(
+        feature = "network",
+        feature = "storage",
+        feature = "experimental-state-blocks",
+        target_os = "linux"
+    ))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_package_length_over_limit_is_rejected_before_body_buffering() {
+        let node = VosNode::new();
+        for (path, maximum) in [
+            (
+                "/_vos/agents/shared/create",
+                crate::agent::local_lifecycle::SharedCreateSubmission::MAX_BYTES,
+            ),
+            (
+                "/_vos/agents/shared/install",
+                crate::agent::local_lifecycle::SharedInstallSubmission::MAX_BYTES,
+            ),
+            (
+                "/_vos/agents/shared/admit",
+                crate::agent::local_lifecycle::SharedMemberAdmissionSubmission::MAX_BYTES,
+            ),
+        ] {
+            let (mut client, server) = tokio::io::duplex(4096);
+            let serving = tokio::spawn(serve_connection(
+                server,
+                node.ingress_handle(),
+                Arc::new(Inner::new(0)),
+                Arc::new(Semaphore::new(2)),
+            ));
+            let headers = format!(
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                maximum + 1
+            );
+            // No body is sent or allocated. The declared length alone must
+            // fail before collection, decoding or queue admission.
+            client.write_all(headers.as_bytes()).await.unwrap();
+            let mut response = String::new();
+            tokio::time::timeout(Duration::from_secs(5), client.read_to_string(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(response.starts_with("HTTP/1.1 413"), "{path}: {response}");
             serving.await.unwrap();
         }
     }
@@ -1512,6 +2237,9 @@ mod tests {
                 "/__agents/authorize/",
                 "/__agents/admin/prepare",
                 "/__agents/admin/",
+                "/_vos/agents/shared/create/",
+                "/_vos/agents/shared/install",
+                "/_vos/agents/shared/admit",
             ] {
                 let response = request(port, path);
                 assert!(response.starts_with("HTTP/1.1 503"), "{path}: {response}");
@@ -1524,6 +2252,16 @@ mod tests {
                 let response = request(port, path);
                 assert!(response.starts_with("HTTP/1.1 405"), "{path}: {response}");
             }
+            // Only the exact supported Create handler may reach its bounded
+            // retained-only queue. Unsupported builds and adjacent routes
+            // remain quarantined; no application fallback is opened.
+            let shared_create = request(port, "/_vos/agents/shared/create");
+            let expected = if cfg!(feature = "experimental-state-blocks") {
+                "HTTP/1.1 405"
+            } else {
+                "HTTP/1.1 503"
+            };
+            assert!(shared_create.starts_with(expected), "{shared_create}");
             ingress.set_clean_agent_recovering_for_test(false);
             assert!(request(port, "/__status").starts_with("HTTP/1.1 200"));
             assert!(query_method.starts_with("HTTP/1.1 405"), "{query_method}");

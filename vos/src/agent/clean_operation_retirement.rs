@@ -10,6 +10,11 @@ pub trait NativeAuthorityOperationRetirementStore {
     type Error;
     fn load(&mut self) -> Result<Vec<Vec<u8>>, Self::Error>;
     fn retain(&mut self, certificate: &[u8]) -> Result<(), Self::Error>;
+    /// Only the controller calls this after synchronizing the complete exact
+    /// terminal archive and pruning both older hot image members.
+    fn remove_retired(&mut self, _certificate: &[u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 impl NativeAuthorityOperationRetirementStore for () {
@@ -51,6 +56,55 @@ pub trait NativeAuthorityOperationRetirementSigner {
 
 pub(crate) struct RetainedNativeOperationRetirement {
     completion: RetainedNativeOperationCompletion,
+}
+
+impl RetainedNativeOperationRetirement {
+    pub(crate) fn dispatches(
+        &self,
+    ) -> (
+        &AuthorityOperationActorDispatch,
+        &AuthorityOperationActorDispatch,
+    ) {
+        (
+            &self.completion.completion.authorization.request,
+            &self.completion.completion.acknowledgement.request,
+        )
+    }
+
+    pub(crate) fn issued(
+        &self,
+    ) -> Result<
+        crate::agent::authority_operation_issuer::IssuedAuthorityOperation,
+        SharedAgentHostError,
+    > {
+        use crate::agent::sdk::authority_operation::AuthorityOperationIntent;
+        let (authorization, acknowledgement) = self.dispatches();
+        let call = AuthorityOperationCall::decode(&authorization.request)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        // Only released v1 actor invocation issuance is eligible. Private
+        // application/retirement records keep their existing independent gates.
+        if !matches!(call.intent, AuthorityOperationIntent::InvokeActor { .. })
+            || call.intent.managed().profile == crate::agent::sdk::AgentProfile::Private
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let ack = AuthorityOperationIssuanceAck::decode(&acknowledgement.request)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let issued = crate::agent::authority_operation_issuer::IssuedAuthorityOperation {
+            receipt: ack.receipt.clone(),
+            issuance_ack: ack,
+        };
+        let submission = crate::agent::local_lifecycle::AuthorityOperationSubmission::new(
+            call,
+            authorization.context.clone(),
+            issued.issuance_ack.issued_at,
+        )
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        submission
+            .encode_response(&NativeAuthorityOperationDecision::Issued(issued.clone()))
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        Ok(issued)
+    }
 }
 
 struct RetirementCertificate {
@@ -177,7 +231,14 @@ where
                 Ok(())
             },
         )?;
-        result.ok_or(SharedAgentHostError::Unavailable)
+        let retired = result.ok_or(SharedAgentHostError::Unavailable)?;
+        // NRT1 is synchronized before releasing its exact root retention.
+        // A quorum timeout leaves the certificate available for exact retry.
+        self._network_host.release_management_retention(
+            crate::service::AgentId(self.pins.agent.0),
+            retained.completion.authorization.envelope(),
+        )?;
+        Ok(retired)
     }
 
     pub(crate) fn restore_native_operation_retirement(
@@ -210,6 +271,10 @@ where
                 completion.authorization.envelope(),
                 completion.acknowledgement.envelope(),
             ],
+        )?;
+        self._network_host.release_management_retention(
+            crate::service::AgentId(self.pins.agent.0),
+            completion.authorization.envelope(),
         )
     }
 }

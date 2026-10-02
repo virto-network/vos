@@ -1,4 +1,4 @@
-//! Credential-reserved Local invocation authorization. Physical application is
+//! Credential-reserved Local/Shared invocation authorization. Physical application is
 //! a separate gate; an issued receipt does not complete this reservation.
 #[cfg(test)]
 #[path = "local_operation_live_tests.rs"]
@@ -17,7 +17,7 @@ use std::{
 use vos::agent::local_lifecycle::AuthorityOperationSubmission;
 use vos::agent::sdk::authority_operation::AuthorityOperationIntent;
 use vos::agent::sdk::wire::CanonicalWire as _;
-use vos::agent::sdk::{AgentProfile, Hash, ProducerId, SpaceId};
+use vos::agent::sdk::{AgentProfile, Hash, PrincipalId, ProducerId, SpaceId};
 use vos::agent::supervisor_adapters::AgentTargetedPreparationRequest;
 
 #[derive(clap::Args, Debug)]
@@ -130,21 +130,11 @@ fn authorize_with_application_validity(
     anyhow::ensure!(validity_secs > 0, "authorization validity must be positive");
     anyhow::ensure!(
         address.ip().is_loopback() && address.port() != 0,
-        "Local authorization requires nonzero loopback HTTP"
+        "Agent authorization requires nonzero loopback HTTP"
     );
     let identity = super::clean_identity::CleanOperatorIdentitySigner::new(operator)?;
-    let runtime = crate::bundled::root_signed_agent_runtime_package(operator)?;
-    let package = crate::bundled::root_signed_actor_package(
-        crate::bundled::system_authority_package_template_for_data_dir(data)?,
-        "system-authority",
-        operator,
-    )?;
-    let (authority, _) = super::clean_startup::derive_system_authority_target(
-        space,
-        identity.raw_public_key(),
-        &runtime,
-        &package,
-    )?;
+    let authority =
+        super::clean_startup::client_system_authority_target(data, space, operator, node_public)?;
     if let Some(request) = initial {
         validate_intent(request, space, &identity)?;
     }
@@ -252,11 +242,15 @@ fn authorize_with_application_validity(
                     intent.target().agent(),
                 )?;
                 anyhow::ensure!(
-                    descriptor.identity.profile == AgentProfile::Local
-                        && descriptor.identity.owner == identity.principal()
-                        && descriptor.identity.transition_producer
-                            == ProducerId::of_public_key(&node_public),
-                    "target is not an operator-owned Local Agent of this node"
+                    descriptor.identity.space == space
+                        && operator_target_supported(
+                            descriptor.identity.profile,
+                            descriptor.identity.owner,
+                            descriptor.identity.transition_producer,
+                            identity.principal(),
+                            ProducerId::of_public_key(&node_public),
+                        ),
+                    "target is not an operator-owned Shared Agent or Local Agent of this node"
                 );
                 let key = operator.clone().try_into_ed25519()?;
                 let secret = key.secret();
@@ -314,14 +308,18 @@ fn authorize_with_application_validity(
                     .ok_or_else(|| anyhow::anyhow!("missing retained AOC5"))?,
             )
             .map_err(|e| anyhow::anyhow!("invalid retained AOC5: {e:?}"))?;
+            verify_retained_operator_call(&call, &identity)?;
             anyhow::ensure!(
                 call.authority == authority
                     && call.principal == identity.principal()
                     && call.credential == identity.credential()
-                    && call.intent.managed().profile == AgentProfile::Local
-                    && call.intent.managed().owner == identity.principal()
-                    && call.intent.managed().transition_producer
-                        == ProducerId::of_public_key(&node_public)
+                    && operator_target_supported(
+                        call.intent.managed().profile,
+                        call.intent.managed().owner,
+                        call.intent.managed().transition_producer,
+                        identity.principal(),
+                        ProducerId::of_public_key(&node_public),
+                    )
                     && call.intent.matches_invocation_work(prepared.work()),
                 "retained call differs from operator, node or actor preparation"
             );
@@ -337,6 +335,7 @@ fn authorize_with_application_validity(
     let submission = AuthorityOperationSubmission::decode(&request)
         .map_err(|e| anyhow::anyhow!("invalid retained AOQ1: {e:?}"))?;
     let call = submission.call();
+    verify_retained_operator_call(call, &identity)?;
     let AuthorityOperationIntent::InvokeActor {
         managed,
         operation_invocation,
@@ -351,9 +350,13 @@ fn authorize_with_application_validity(
             && call.credential == identity.credential()
             && call.authenticated_node().is_none()
             && managed.space == space
-            && managed.profile == AgentProfile::Local
-            && managed.owner == identity.principal()
-            && managed.transition_producer == ProducerId::of_public_key(&node_public)
+            && operator_target_supported(
+                managed.profile,
+                managed.owner,
+                managed.transition_producer,
+                identity.principal(),
+                ProducerId::of_public_key(&node_public),
+            )
             && operation_invocation.0 == nonce.0,
         "retained authorization differs from Space, operator, node or reservation"
     );
@@ -387,6 +390,38 @@ fn authorize_with_application_validity(
     Ok((request_root, response))
 }
 
+// Shared ordering belongs to the admitted Agent, not the daemon delivering a
+// request. Its producer is selected from the verified descriptor when signing
+// AOC5, and is thereafter bound by that exact operator signature. Local retains
+// its node ownership check. Unsupported profiles never enter this CLI workflow.
+fn operator_target_supported(
+    profile: AgentProfile,
+    owner: PrincipalId,
+    producer: ProducerId,
+    operator: PrincipalId,
+    local_producer: ProducerId,
+) -> bool {
+    owner == operator
+        && producer != ProducerId::ZERO
+        && match profile {
+            AgentProfile::Local => producer == local_producer,
+            AgentProfile::Shared => true,
+            AgentProfile::Private => false,
+        }
+}
+
+fn verify_retained_operator_call(
+    call: &vos::agent::sdk::authority_operation::AuthorityOperationCall,
+    identity: &super::clean_identity::CleanOperatorIdentitySigner,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        call.credential_public_key() == identity.raw_public_key(),
+        "retained call was not signed by the selected operator"
+    );
+    call.verify_api_with(&super::local_create::CredentialVerifier)
+        .map_err(|error| anyhow::anyhow!("invalid retained operator signature: {error:?}"))
+}
+
 fn validate_intent(
     request: &AgentTargetedPreparationRequest,
     space: SpaceId,
@@ -413,6 +448,124 @@ mod tests {
         #[command(subcommand)]
         command: super::super::SpaceCommand,
     }
+
+    #[test]
+    fn operator_targets_preserve_local_ownership_and_allow_shared_ordering() {
+        let principal = PrincipalId([0x81; 32]);
+        let local = ProducerId([0x82; 32]);
+        let shared = ProducerId([0x83; 32]);
+        assert!(operator_target_supported(
+            AgentProfile::Local,
+            principal,
+            local,
+            principal,
+            local,
+        ));
+        assert!(!operator_target_supported(
+            AgentProfile::Local,
+            principal,
+            shared,
+            principal,
+            local,
+        ));
+        assert!(operator_target_supported(
+            AgentProfile::Shared,
+            principal,
+            shared,
+            principal,
+            local,
+        ));
+        for profile in [
+            AgentProfile::Local,
+            AgentProfile::Shared,
+            AgentProfile::Private,
+        ] {
+            assert!(!operator_target_supported(
+                profile,
+                PrincipalId([0x84; 32]),
+                local,
+                principal,
+                local,
+            ));
+        }
+        assert!(!operator_target_supported(
+            AgentProfile::Private,
+            principal,
+            local,
+            principal,
+            local,
+        ));
+        assert!(!operator_target_supported(
+            AgentProfile::Shared,
+            principal,
+            ProducerId::ZERO,
+            principal,
+            local,
+        ));
+    }
+
+    #[test]
+    fn retained_shared_producer_is_bound_by_the_original_operator_signature() {
+        use vos::agent::sdk::authority::{AuthorityIngressAuthentication, ManagedAgentTarget};
+        use vos::agent::sdk::authority_operation::AuthorityOperationCall;
+        use vos::agent::sdk::{
+            ActorId, DeploymentId, InvocationId, InvocationOrigin, InvocationRoleClaims,
+        };
+        let (operator, authority, descriptor, _) = super::super::local_create::tests::fixture();
+        let identity =
+            super::super::clean_identity::CleanOperatorIdentitySigner::new(&operator).unwrap();
+        let mut call = AuthorityOperationCall {
+            invocation: InvocationId::ZERO,
+            authority,
+            principal: identity.principal(),
+            credential: identity.credential(),
+            request_sequence: core::num::NonZeroU64::new(1).unwrap(),
+            authentication: AuthorityIngressAuthentication::ApiCredentialSignature {
+                credential_public_key: identity.raw_public_key(),
+                signature: [1; 64],
+            },
+            requested_valid_from: 10,
+            requested_expires_at: 100,
+            intent: AuthorityOperationIntent::InvokeActor {
+                managed: ManagedAgentTarget {
+                    space: descriptor.identity.space,
+                    agent: descriptor.identity.agent,
+                    owner: identity.principal(),
+                    profile: AgentProfile::Shared,
+                    runtime_deployment: descriptor.identity.runtime_deployment,
+                    transition_producer: ProducerId([0x91; 32]),
+                },
+                operation_invocation: InvocationId([0x92; 32]),
+                actor: ActorId([0x93; 32]),
+                actor_deployment: DeploymentId([0x94; 32]),
+                work: Hash([0x95; 32]),
+                origin: InvocationOrigin {
+                    principal: Some(identity.principal()),
+                    credential: Some(identity.credential()),
+                    ..InvocationOrigin::anonymous()
+                },
+                roles: InvocationRoleClaims::none(),
+            },
+        };
+        call.invocation = call.expected_invocation();
+        call.authentication = AuthorityIngressAuthentication::ApiCredentialSignature {
+            credential_public_key: identity.raw_public_key(),
+            signature: operator
+                .sign(&call.signing_bytes())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        };
+        verify_retained_operator_call(&call, &identity).unwrap();
+        let AuthorityOperationIntent::InvokeActor { managed, .. } = &mut call.intent else {
+            unreachable!()
+        };
+        managed.transition_producer = ProducerId([0x96; 32]);
+        call.invocation = call.expected_invocation();
+        assert!(call.validate_shape().is_ok());
+        assert!(verify_retained_operator_call(&call, &identity).is_err());
+    }
+
     #[test]
     fn managed_authorization_requires_exact_intent_or_explicit_resume() {
         for input in [
@@ -425,7 +578,12 @@ mod tests {
             ],
             vec!["vosx", "authorize-local-invocation", "test", "--resume"],
         ] {
-            for command in ["authorize-local-invocation", "invoke-local"] {
+            for command in [
+                "authorize-local-invocation",
+                "invoke-local",
+                "authorize-agent-invocation",
+                "invoke-agent",
+            ] {
                 let mut input = input.clone();
                 input[1] = command;
                 assert!(Args::try_parse_from(input).is_ok());
@@ -442,7 +600,12 @@ mod tests {
                 "other.atq1",
             ],
         ] {
-            for command in ["authorize-local-invocation", "invoke-local"] {
+            for command in [
+                "authorize-local-invocation",
+                "invoke-local",
+                "authorize-agent-invocation",
+                "invoke-agent",
+            ] {
                 let mut input = input.clone();
                 input[1] = command;
                 assert!(Args::try_parse_from(input).is_err());

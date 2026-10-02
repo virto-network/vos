@@ -256,7 +256,9 @@ pub fn admit_actor_package(bytes: &[u8]) -> Result<AdmittedActorPackage, Package
     })
 }
 
-/// Admit exactly one VOS3 AgentRuntime envelope.
+/// Admit exactly one signed VOS3 image AgentRuntime envelope. The scoped
+/// System-observation opt-in still uses the image lifecycle and host allowlist;
+/// it grants no external state or public observation execution authority.
 pub fn admit_runtime_package(
     bytes: &[u8],
 ) -> Result<AdmittedRuntimePackage, PackageAdmissionError> {
@@ -373,7 +375,10 @@ fn admit_runtime_with_contract(
     let PackageManifest::AgentRuntime(manifest) = &envelope.manifest else {
         return Err(PackageAdmissionError::WrongKind);
     };
-    if manifest.contract.lifecycle_abi != expected_abi {
+    if manifest.contract.lifecycle_abi != expected_abi
+        && !(expected_abi == vos_agent_sdk::RUNTIME_ABI_ID
+            && manifest.contract.supports_system_observation())
+    {
         return Err(PackageAdmissionError::UnsupportedRuntimeContract);
     }
     let program_bytes = artifact_bytes(&envelope, &manifest.outer_program)?;
@@ -1089,6 +1094,132 @@ pub(super) mod tests {
     fn admit_runtime(capabilities: RuntimeCapabilities) -> AdmittedRuntimePackage {
         let bytes = runtime_package(capabilities, true).encode().unwrap();
         admit_runtime_package(&bytes).unwrap()
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    fn observation_runtime_envelope(program: Vec<u8>) -> PackageEnvelope {
+        let mut envelope = runtime_package_with_program(RuntimeCapabilities::standard(), program);
+        let PackageManifest::AgentRuntime(manifest) = &mut envelope.manifest else {
+            unreachable!()
+        };
+        manifest.contract = RuntimePackageContract::system_observation_image();
+        sign(envelope)
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn system_observation_admission_requires_explicit_signed_image_contract() {
+        let program = standard_pvm(3);
+        let envelope = observation_runtime_envelope(program.clone());
+        let bytes = envelope.encode().unwrap();
+        let admitted = admit_runtime_package(&bytes).unwrap();
+        assert_eq!(admitted.exact_bytes(), bytes);
+        assert_eq!(admitted.program_bytes(), program);
+        assert_eq!(admitted.program(), ProgramId::of_pvm(&program));
+        assert_eq!(*admitted.package_ref(), BlobRef::of_bytes(&bytes));
+        assert_eq!(admitted.deployment(), envelope.deployment_id().unwrap());
+        assert_eq!(
+            admitted.manifest().contract,
+            RuntimePackageContract::system_observation_image()
+        );
+        assert!(admitted.manifest().contract.supports_system_observation());
+        assert!(admitted.manifest().external_state_limits.is_none());
+        assert_eq!(
+            admitted.manifest().contract.resources,
+            RuntimePackageContract::canonical().resources
+        );
+
+        let canonical = runtime_package(RuntimeCapabilities::standard(), true);
+        let canonical = admit_runtime_package(&canonical.encode().unwrap()).unwrap();
+        assert!(!canonical.manifest().contract.supports_system_observation());
+        assert_eq!(canonical.program(), admitted.program());
+        assert_ne!(canonical.package_ref(), admitted.package_ref());
+        assert_ne!(canonical.deployment(), admitted.deployment());
+
+        // Package admission proves the signed image opt-in, not an execution
+        // permission. External execution still has its exact, disjoint ABI;
+        // System-only observation admission belongs to the executor boundary.
+        assert_eq!(
+            admit_state_runtime_package(&bytes).unwrap_err(),
+            PackageAdmissionError::UnsupportedRuntimeContract
+        );
+        assert_eq!(
+            admit_runtime_with_contract(
+                &bytes,
+                vos_agent_sdk::state_execution::STATE_EXECUTION_ABI_ID,
+                &vos_pvm::spi::REFINE_HOST_CALL_ALLOWLIST,
+            )
+            .unwrap_err(),
+            PackageAdmissionError::UnsupportedRuntimeContract
+        );
+        assert_eq!(
+            admit_runtime_with_contract(
+                &bytes,
+                vos_agent_sdk::Hash([0xfd; 32]),
+                &vos_pvm::spi::REFINE_HOST_CALL_ALLOWLIST,
+            )
+            .unwrap_err(),
+            PackageAdmissionError::UnsupportedRuntimeContract
+        );
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn system_observation_opt_in_cannot_be_substituted_under_another_signature() {
+        let canonical = runtime_package(RuntimeCapabilities::standard(), true);
+        let observation = observation_runtime_envelope(standard_pvm(3));
+        for (mut envelope, replacement) in [
+            (
+                canonical,
+                RuntimePackageContract::system_observation_image(),
+            ),
+            (observation, RuntimePackageContract::canonical()),
+        ] {
+            let original = admit_runtime_package(&envelope.encode().unwrap()).unwrap();
+            let PackageManifest::AgentRuntime(manifest) = &mut envelope.manifest else {
+                unreachable!()
+            };
+            manifest.contract = replacement;
+            assert_eq!(
+                admit_runtime_package(&envelope.encode().unwrap()).unwrap_err(),
+                PackageAdmissionError::Package(PackageError::InvalidSignature)
+            );
+            let resigned = sign(envelope);
+            let changed = admit_runtime_package(&resigned.encode().unwrap()).unwrap();
+            assert_eq!(changed.program(), original.program());
+            assert_eq!(changed.manifest().contract, replacement);
+            assert_ne!(changed.package_ref(), original.package_ref());
+            assert_ne!(changed.deployment(), original.deployment());
+        }
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn system_observation_opt_in_cannot_expand_image_host_calls_or_state_limits() {
+        for program in [
+            b"not a PVM".to_vec(),
+            Assembler::new()
+                .trap()
+                .ecalli(crate::abi::hostcall::DEBUG_WRITE)
+                .build_standard(),
+            Assembler::new()
+                .trap()
+                .ecalli(vos_agent_sdk::state_blocks::STATE_BLOCK_FETCH_CALL)
+                .build_standard(),
+            Assembler::new().trap().ecalli(0x181).build_standard(),
+        ] {
+            let envelope = observation_runtime_envelope(program);
+            assert_eq!(
+                admit_runtime_package(&envelope.encode().unwrap()).unwrap_err(),
+                PackageAdmissionError::InvalidRuntimeProgram
+            );
+        }
+        let mut envelope = observation_runtime_envelope(standard_pvm(3));
+        let PackageManifest::AgentRuntime(manifest) = &mut envelope.manifest else {
+            unreachable!()
+        };
+        manifest.external_state_limits = Some(STATE_FIXTURE_LIMITS);
+        assert_eq!(envelope.encode(), Err(PackageError::InvalidManifest));
     }
 
     #[cfg(feature = "experimental-state-blocks")]

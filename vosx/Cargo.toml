@@ -16,6 +16,8 @@ include = [
     "blobs/space_registry.elf",
     "blobs/space_authority.pvm",
     "blobs/agent_runtime.pvm",
+    "blobs/system_image_runtime.vos",
+    "blobs/shared_external_runtime.vos",
     "blobs/system_authority.vos",
     "blobs/system_catalog.vos",
 ]
@@ -23,7 +25,7 @@ include = [
 [features]
 # Candidate artifact build/probe tools only. Local startup remains image-based;
 # this feature does not expose external Local management or serving routes.
-experimental-state-blocks = ["vos/experimental-state-blocks"]
+experimental-state-blocks = ["vos/experimental-state-blocks", "system-authority/experimental-state-blocks"]
 
 [dependencies]
 ureq = { version = "2", default-features = false, features = ["tls"] }

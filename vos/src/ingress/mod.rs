@@ -85,21 +85,40 @@ impl ApiAccessCredential {
         crate::agent::sdk::authority::AuthorityProjectionQuery,
         crate::agent::sdk::authority::AuthorityActorProtocolError,
     > {
+        self.sign_projection_query_with_recovery(authority, nonce, selector, None)
+    }
+
+    /// Sign the exact recovery scope supplied by the authenticated System
+    /// owner. This validates its shape but does not grant committee membership
+    /// or authorize admission; the receiving owner still checks the live scope.
+    pub fn sign_projection_query_with_recovery(
+        &self,
+        authority: crate::agent::sdk::authority::AuthorityActorTarget,
+        nonce: crate::agent::sdk::Hash,
+        selector: crate::agent::sdk::authority::AuthorityProjectionSelector,
+        recovery: Option<crate::agent::sdk::authority::AuthorityProjectionRecoveryDelegation>,
+    ) -> Result<
+        crate::agent::sdk::authority::AuthorityProjectionQuery,
+        crate::agent::sdk::authority::AuthorityActorProtocolError,
+    > {
         use crate::agent::sdk::authority::{
             AuthorityIngressAuthentication, AuthorityProjectionQuery,
         };
 
         let mut query = AuthorityProjectionQuery {
-            recovery: None,
+            recovery,
             authority,
             credential: self.credential_id(),
             nonce,
             selector,
             authentication: AuthorityIngressAuthentication::ApiCredentialSignature {
                 credential_public_key: self.public_key(),
-                signature: [0; 64],
+                // Nonzero shape placeholder; it is never dispatched or used
+                // as a request identity before the real signature replaces it.
+                signature: [1; 64],
             },
         };
+        query.validate_shape()?;
         let signature = self.sign(&query.signing_bytes());
         query.authentication = AuthorityIngressAuthentication::ApiCredentialSignature {
             credential_public_key: self.public_key(),
@@ -340,6 +359,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn api_projection_signing_binds_exact_recovery_and_preserves_legacy_wire() {
+        use crate::agent::sdk::authority::{
+            AuthorityProjectionRecoveryDelegation, AuthorityProjectionSelector,
+        };
+        use crate::agent::sdk::{AgentId, Hash};
+        let credential = ApiAccessCredential::from_seed([0x5b; 32]).unwrap();
+        let target = authority_target();
+        let nonce = Hash([0x43; 32]);
+        let selector = AuthorityProjectionSelector::GenesisDecision {
+            agent: AgentId([0x44; 32]),
+        };
+        let recovery = AuthorityProjectionRecoveryDelegation {
+            generation: Hash([0x45; 32]),
+            committee: Hash([0x46; 32]),
+            accepted_slot: 10,
+            expires_at: 20,
+        };
+        assert_eq!(
+            credential.sign_projection_query(target, nonce, selector),
+            credential.sign_projection_query_with_recovery(target, nonce, selector, None),
+        );
+        let query = credential
+            .sign_projection_query_with_recovery(target, nonce, selector, Some(recovery))
+            .unwrap();
+        assert_eq!(query.recovery, Some(recovery));
+        let signature = ed25519_dalek::Signature::from_bytes(&query.authentication.signature());
+        credential
+            .0
+            .verifying_key()
+            .verify_strict(&query.signing_bytes(), &signature)
+            .unwrap();
+        for field in 0..4 {
+            let mut altered = query.clone();
+            let scope = altered.recovery.as_mut().unwrap();
+            match field {
+                0 => scope.generation = Hash([0x47; 32]),
+                1 => scope.committee = Hash([0x48; 32]),
+                2 => scope.accepted_slot += 1,
+                3 => scope.expires_at += 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                credential
+                    .0
+                    .verifying_key()
+                    .verify_strict(&altered.signing_bytes(), &signature)
+                    .is_err()
+            );
+        }
+        let mut invalid = recovery;
+        invalid.expires_at = invalid.accepted_slot;
+        assert!(
+            credential
+                .sign_projection_query_with_recovery(target, nonce, selector, Some(invalid))
+                .is_err()
+        );
+    }
+
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
     #[test]
     fn clean_credential_query_rejects_unsigned_or_broader_queries_before_dispatch() {
@@ -385,6 +463,19 @@ mod tests {
             .unwrap();
         assert_eq!(
             handle.query_clean_credential(broader),
+            Err(IngressAuthenticationError::Invalid)
+        );
+        let unsupported = credential
+            .sign_projection_query(
+                authority_target(),
+                Hash([0x43; 32]),
+                AuthorityProjectionSelector::GenesisDecision {
+                    agent: crate::agent::sdk::AgentId([0x44; 32]),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            handle.query_clean_agent_inventory(unsupported),
             Err(IngressAuthenticationError::Invalid)
         );
     }

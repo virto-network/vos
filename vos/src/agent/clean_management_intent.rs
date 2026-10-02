@@ -667,6 +667,14 @@ pub(crate) struct CleanManagementIntentSlot<B> {
     poisoned: bool,
 }
 
+/// Constructor-validated cache only. The original store lease never moves into
+/// this value, and installing it does not establish physical execution.
+pub(crate) struct ReloadedManagementIntent {
+    intent: Option<CleanManagementIntent>,
+    retired: bool,
+    denied: bool,
+}
+
 impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
     /// The native coordinator may call this only for the exact result of the
     /// configured authority actor's authenticated, durably applied invocation.
@@ -749,6 +757,60 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
     /// The next protocol owner must reopen and validate its durable image.
     pub(crate) fn into_store(self) -> B {
         self.store
+    }
+
+    pub(crate) fn leased_store_mut(&mut self) -> &mut B {
+        &mut self.store
+    }
+
+    pub(crate) fn into_reload_cache(
+        self,
+    ) -> Result<ReloadedManagementIntent, IntentSlotError<B::Error>> {
+        if self.poisoned {
+            return Err(IntentSlotError::Poisoned);
+        }
+        Ok(ReloadedManagementIntent {
+            intent: self.intent,
+            retired: self.retired,
+            denied: self.denied,
+        })
+    }
+
+    /// An ambiguous commit may grow the retained phase, but cannot substitute
+    /// the signed Create or any work/anchor already held by this live owner.
+    pub(crate) fn validates_reload_cache(&self, cache: &ReloadedManagementIntent) -> bool {
+        let (Some(before), Some(after)) = (&self.intent, &cache.intent) else {
+            return false;
+        };
+        before.request == after.request
+            && before.call == after.call
+            && before
+                .authorization_work
+                .as_ref()
+                .is_none_or(|work| after.authorization_work.as_ref() == Some(work))
+            && before
+                .authorization_anchor
+                .as_ref()
+                .is_none_or(|anchor| after.authorization_anchor.as_ref() == Some(anchor))
+            && before
+                .finalization_work
+                .as_ref()
+                .is_none_or(|work| after.finalization_work.as_ref() == Some(work))
+            && before
+                .finalization_anchor
+                .as_ref()
+                .is_none_or(|anchor| after.finalization_anchor.as_ref() == Some(anchor))
+            && (!self.retired || cache.retired)
+            && (!self.denied || cache.denied)
+    }
+
+    /// The complete borrowed recovery and both cache guards must pass first.
+    /// This is deliberately infallible so adoption has no half-installed state.
+    pub(crate) fn install_reload_cache(&mut self, cache: ReloadedManagementIntent) {
+        self.intent = cache.intent;
+        self.retired = cache.retired;
+        self.denied = cache.denied;
+        self.poisoned = false;
     }
 
     pub(crate) fn management_continuation_store(&mut self) -> Result<B, IntentSlotError<B::Error>>

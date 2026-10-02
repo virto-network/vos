@@ -749,9 +749,67 @@ pub(crate) fn run_inner_actor_with_storage(
     continuation: Option<ActorMachineContinuation>,
     storage: Option<&dyn super::actor_storage::ActorRowStorage>,
 ) -> Result<ActorRunOutcome, ActorExecutionError> {
+    run_inner_actor_with_storage_policy(
+        invocation,
+        clean_context,
+        actor_pvm,
+        installation_data,
+        actor_state,
+        InnerExecutionPolicy::Invocation(continuation),
+        storage,
+    )
+}
+
+/// Execute one non-retaining Query with the ordinary read/crypto work budgets.
+/// The caller still owns installation, schema, policy and authorization checks,
+/// and must reject any changed output lanes. Effects and suspension are refused
+/// at host dispatch, even if the guest would later hide them in a failed reply.
+#[cfg(feature = "pvm")]
+pub(crate) fn run_inner_actor_observation_with_storage(
+    invocation: &ActorInvocation,
+    clean_context: Option<crate::agent_sdk::InvocationContext>,
+    actor_pvm: &[u8],
+    installation_data: Option<&[u8]>,
+    actor_state: &ActorStateLanes,
+    storage: Option<&dyn super::actor_storage::ActorRowStorage>,
+) -> Result<ActorRunOutcome, ActorExecutionError> {
+    if invocation.mode != MethodMode::Query {
+        return Err(ActorExecutionError::InvalidInput);
+    }
+    run_inner_actor_with_storage_policy(
+        invocation,
+        clean_context,
+        actor_pvm,
+        installation_data,
+        actor_state,
+        InnerExecutionPolicy::Observation,
+        storage,
+    )
+}
+
+#[cfg(feature = "pvm")]
+enum InnerExecutionPolicy {
+    Invocation(Option<ActorMachineContinuation>),
+    Observation,
+}
+
+#[cfg(feature = "pvm")]
+fn run_inner_actor_with_storage_policy(
+    invocation: &ActorInvocation,
+    clean_context: Option<crate::agent_sdk::InvocationContext>,
+    actor_pvm: &[u8],
+    installation_data: Option<&[u8]>,
+    actor_state: &ActorStateLanes,
+    policy: InnerExecutionPolicy,
+    storage: Option<&dyn super::actor_storage::ActorRowStorage>,
+) -> Result<ActorRunOutcome, ActorExecutionError> {
     use super::machine::{ActorMachine, InnerExit};
     use crate::abi::{error, hostcall};
 
+    let (continuation, observation) = match policy {
+        InnerExecutionPolicy::Invocation(continuation) => (continuation, false),
+        InnerExecutionPolicy::Observation => (None, true),
+    };
     if storage.is_some_and(|storage| {
         clean_context
             .as_ref()
@@ -923,6 +981,12 @@ pub(crate) fn run_inner_actor_with_storage(
                         state: actor_state.clone(),
                         rows: Vec::new(),
                     });
+                }
+                if observation
+                    && (id == u64::from(hostcall::ACTOR_EFFECT_EXPORT)
+                        || id == u64::from(hostcall::SUSPEND))
+                {
+                    return Err(ActorExecutionError::UnsupportedHostCall(id));
                 }
                 let registers = *machine.registers();
                 if id == u64::from(hostcall::SUSPEND) {
@@ -1879,6 +1943,250 @@ mod tests {
         output[5..9].copy_from_slice(&(lanes[1] as u32).to_le_bytes());
         output[9..13].copy_from_slice(&(lanes[2] as u32).to_le_bytes());
         output
+    }
+
+    #[cfg(feature = "pvm")]
+    fn observation_call() -> (ActorInvocation, crate::agent_sdk::InvocationContext) {
+        let mut call = invocation();
+        call.mode = MethodMode::Query;
+        call.gas = 100_000;
+        let context = crate::agent_sdk::InvocationContext {
+            invocation: crate::agent_sdk::InvocationId(call.invocation.0),
+            actor: crate::agent_sdk::ActorId(call.actor.0),
+            mode: crate::agent_sdk::MethodMode::Query,
+            origin: crate::agent_sdk::InvocationOrigin::anonymous(),
+            roles: crate::agent_sdk::InvocationRoleClaims::none(),
+            observed_slot: 1,
+        };
+        (call, context)
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn observation_refuses_empty_effect_export_before_done_or_failed_reply() {
+        use super::super::actor_storage::{
+            ActorStorageAccess, ActorStorageReader, encode_row_delta, tests::schema,
+        };
+        use vos_pvm_compiler::assembler::{Assembler, Reg};
+
+        let access =
+            ActorStorageAccess::new(&schema(), "method_0", crate::agent_sdk::MethodMode::Query)
+                .unwrap();
+        let reader = ActorStorageReader::new(&access, None, None, None).unwrap();
+        let (call, context) = observation_call();
+        let before = ActorStateLanes {
+            linear: Some(Vec::new()),
+            merge: Some(Vec::new()),
+            local: Some(Vec::new()),
+        };
+        let base = 2 * vos_pvm::PVM_ZONE_SIZE;
+        let delta = encode_row_delta(&[]).unwrap();
+        for (status, expected) in [
+            (crate::actors::STATUS_DONE, ActorExecutionStatus::Done),
+            (
+                crate::actors::STATUS_FORBIDDEN,
+                ActorExecutionStatus::Forbidden,
+            ),
+            (
+                crate::actors::STATUS_PANICKED,
+                ActorExecutionStatus::Panicked,
+            ),
+            (crate::actors::STATUS_OOG, ActorExecutionStatus::OutOfGas),
+        ] {
+            let mut data = actor_output([0, 0, 0], 0);
+            data[0] = status;
+            data.extend_from_slice(&delta);
+            let mut program = Assembler::new();
+            program
+                .set_rw_data(data)
+                .load_imm_64(Reg::A0, u64::from(base + 13))
+                .load_imm_64(Reg::A1, delta.len() as u64)
+                .ecalli(crate::abi::hostcall::ACTOR_EFFECT_EXPORT)
+                .load_imm_64(Reg::A0, u64::from(base))
+                .load_imm_64(Reg::A1, 13)
+                .jump_ind(Reg::RA, 0);
+            let program = program.build_standard();
+            // Ordinary execution accepts an empty export, and failed replies
+            // do not expose its presence in their returned row vector.
+            let ActorRunOutcome::Completed { reply, state, rows } = run_inner_actor_with_storage(
+                &call,
+                Some(context),
+                &program,
+                None,
+                &before,
+                None,
+                Some(&reader),
+            )
+            .unwrap() else {
+                panic!("empty export yielded");
+            };
+            assert_eq!(reply.status, expected);
+            assert_eq!(state, before);
+            assert!(rows.is_empty());
+            assert_eq!(
+                run_inner_actor_observation_with_storage(
+                    &call,
+                    Some(context),
+                    &program,
+                    None,
+                    &before,
+                    Some(&reader),
+                ),
+                Err(ActorExecutionError::UnsupportedHostCall(u64::from(
+                    crate::abi::hostcall::ACTOR_EFFECT_EXPORT,
+                )))
+            );
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn observation_refuses_suspend_before_creating_a_continuation() {
+        use vos_pvm_compiler::assembler::{Assembler, Reg};
+
+        let (call, context) = observation_call();
+        let before = ActorStateLanes {
+            linear: Some(Vec::new()),
+            merge: Some(Vec::new()),
+            local: Some(Vec::new()),
+        };
+        let base = 2 * vos_pvm::PVM_ZONE_SIZE;
+        let finish = |program: &mut Assembler| {
+            program
+                .load_imm_64(Reg::A0, u64::from(base))
+                .load_imm_64(Reg::A1, 13)
+                .jump_ind(Reg::RA, 0);
+        };
+        let mut prefix = Assembler::new();
+        prefix.jump(0);
+        let finalizer_pc = prefix.current_offset();
+        finish(&mut prefix);
+        let entry_pc = prefix.current_offset();
+        let mut data = actor_output([0, 0, 0], 0);
+        data[0] = crate::actors::STATUS_YIELDED;
+        let mut program = Assembler::new();
+        program.set_rw_data(data).jump(entry_pc);
+        finish(&mut program);
+        assert_eq!(program.current_offset(), entry_pc);
+        program.ecalli(crate::abi::hostcall::SUSPEND);
+        let branch_pc = program.current_offset();
+        program
+            .branch_eq_imm(Reg::A0, 0, finalizer_pc.wrapping_sub(branch_pc))
+            .trap();
+        let program = program.build_standard();
+        assert!(matches!(
+            run_inner_actor_with_storage(
+                &call,
+                Some(context),
+                &program,
+                None,
+                &before,
+                None,
+                None,
+            )
+            .unwrap(),
+            ActorRunOutcome::Yielded { .. }
+        ));
+        assert_eq!(
+            run_inner_actor_observation_with_storage(
+                &call,
+                Some(context),
+                &program,
+                None,
+                &before,
+                None,
+            ),
+            Err(ActorExecutionError::UnsupportedHostCall(u64::from(
+                crate::abi::hostcall::SUSPEND,
+            )))
+        );
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn observation_storage_reads_preserve_regular_reply_state_and_work_budget() {
+        use super::super::actor_storage::{
+            ActorLaneImage, ActorStorageAccess, ActorStorageReader, tests::schema,
+        };
+        use vos_pvm_compiler::assembler::{Assembler, Reg};
+
+        let access =
+            ActorStorageAccess::new(&schema(), "method_0", crate::agent_sdk::MethodMode::Query)
+                .unwrap();
+        let key = b"s/0/value";
+        let image = ActorLaneImage::from_parts(
+            vec![0x62],
+            [(key.to_vec(), vec![0x71; 8])].into_iter().collect(),
+        );
+        let original_image = image.encode().unwrap();
+        let reader = ActorStorageReader::new(&access, Some(&image), None, None).unwrap();
+        let (call, context) = observation_call();
+        let before = ActorStateLanes {
+            linear: Some(vec![0x62]),
+            merge: Some(Vec::new()),
+            local: Some(Vec::new()),
+        };
+        let base = 2 * vos_pvm::PVM_ZONE_SIZE;
+        for repeats in [1, MAX_EXECUTION_FETCH_CALLS + 1] {
+            let mut data = actor_output([1, 0, 0], 16);
+            data[13] = 0x62;
+            let key_address = base + data.len() as u32;
+            data.extend_from_slice(key);
+            let buffer = base + data.len() as u32;
+            data.resize(data.len() + 8, 0);
+            let mut program = Assembler::new();
+            program.set_rw_data(data);
+            for _ in 0..repeats {
+                program
+                    .load_imm_64(Reg::A0, u64::from(key_address))
+                    .load_imm_64(Reg::A1, key.len() as u64)
+                    .load_imm_64(Reg::A2, u64::from(buffer))
+                    .load_imm_64(Reg::A3, 8)
+                    .ecalli(crate::abi::hostcall::STORAGE_R)
+                    .store_u64(Reg::A0, base + 14);
+            }
+            program
+                .load_imm_64(Reg::A0, u64::from(buffer))
+                .load_ind_u64(Reg::A1, Reg::A0, 0)
+                .store_u64(Reg::A1, base + 22)
+                .load_imm_64(Reg::A0, u64::from(base))
+                .load_imm_64(Reg::A1, 30)
+                .jump_ind(Reg::RA, 0);
+            let program = program.build_standard();
+            let regular = run_inner_actor_with_storage(
+                &call,
+                Some(context),
+                &program,
+                None,
+                &before,
+                None,
+                Some(&reader),
+            )
+            .unwrap();
+            let observed = run_inner_actor_observation_with_storage(
+                &call,
+                Some(context),
+                &program,
+                None,
+                &before,
+                Some(&reader),
+            )
+            .unwrap();
+            assert_eq!(observed, regular);
+            let ActorRunOutcome::Completed { reply, state, rows } = observed else {
+                panic!("observation read yielded");
+            };
+            assert_eq!(state, before);
+            assert!(rows.is_empty());
+            if repeats == 1 {
+                assert_eq!(reply.status, ActorExecutionStatus::Done);
+                assert_eq!(u64::from_le_bytes(reply.reply[..8].try_into().unwrap()), 8);
+                assert_eq!(&reply.reply[8..], &[0x71; 8]);
+            } else {
+                assert_eq!(reply.status, ActorExecutionStatus::OutOfGas);
+            }
+            assert_eq!(image.encode().unwrap(), original_image);
+        }
     }
 
     #[cfg(feature = "agent-runtime")]

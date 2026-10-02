@@ -192,7 +192,9 @@ impl PackageManifest {
 }
 
 fn valid_external_state_limits(manifest: &AgentRuntimePackageManifest) -> bool {
-    if manifest.contract.lifecycle_abi == RUNTIME_ABI_ID {
+    if manifest.contract.lifecycle_abi == RUNTIME_ABI_ID
+        || manifest.contract.supports_system_observation()
+    {
         return manifest.external_state_limits.is_none();
     }
     #[cfg(feature = "experimental-state-blocks")]
@@ -1632,6 +1634,61 @@ mod tests {
         });
         assert!(envelope.encode().is_err());
         assert!(PackageEnvelope::decode(&encode_unchecked(&envelope)).is_err());
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn system_observation_manifest_binds_opt_in_without_mutating_image_layout() {
+        let canonical = runtime_package();
+        let canonical_bytes = canonical.encode().unwrap();
+        let mut observation = canonical.clone();
+        let PackageManifest::AgentRuntime(manifest) = &mut observation.manifest else {
+            unreachable!()
+        };
+        manifest.contract = RuntimePackageContract::system_observation_image();
+        let observation = sign(observation);
+        let encoded = observation.encode().unwrap();
+        assert_eq!(
+            encoded[4 + 2 + 32],
+            1,
+            "image manifest keeps its original tag"
+        );
+        assert_eq!(encoded.len(), canonical_bytes.len());
+        assert_ne!(encoded, canonical_bytes);
+        assert_eq!(PackageEnvelope::decode(&encoded).unwrap(), observation);
+        observation.verify(&TestVerifier).unwrap();
+        let mut changed_contract = observation.clone();
+        let PackageManifest::AgentRuntime(manifest) = &mut changed_contract.manifest else {
+            unreachable!()
+        };
+        manifest.contract = RuntimePackageContract::canonical();
+        assert_eq!(
+            changed_contract.verify(&TestVerifier),
+            Err(PackageError::InvalidSignature)
+        );
+        let mut external = observation;
+        let PackageManifest::AgentRuntime(manifest) = &mut external.manifest else {
+            unreachable!()
+        };
+        manifest.external_state_limits = Some(ExternalStateResourceLimits {
+            max_rows_per_lane: 1,
+            max_row_bytes_per_lane: 1,
+        });
+        assert!(external.encode().is_err());
+        assert!(PackageEnvelope::decode(&encode_unchecked(&external)).is_err());
+        assert_eq!(canonical.encode().unwrap(), canonical_bytes);
+    }
+
+    #[cfg(not(feature = "experimental-state-blocks"))]
+    #[test]
+    fn system_observation_manifest_is_refused_without_feature() {
+        let mut observation = runtime_package();
+        let PackageManifest::AgentRuntime(manifest) = &mut observation.manifest else {
+            unreachable!()
+        };
+        manifest.contract.lifecycle_abi = crate::SYSTEM_OBSERVATION_ABI_ID;
+        assert!(observation.encode().is_err());
+        assert!(PackageEnvelope::decode(&encode_unchecked(&observation)).is_err());
     }
 
     #[cfg(not(feature = "experimental-state-blocks"))]

@@ -124,7 +124,9 @@ The authority actor issues signed evidence binding the policy and issuer,
 Space and Agent, operation, runtime and actor deployments, package/proof
 commitment, relevant lane commitments, logical epoch, and exact request hash.
 Every replica verifies that evidence inside the AgentRuntime before applying a
-transition. Denials remain local and never enter replicated state.
+transition. Denial does not authorize or apply the requested application
+mutation; exact System outcome and retirement evidence may be retained and
+replicated.
 
 There is no actor-visible device-signing host interaction. A Local signer is
 an ordinary explicit actor: a workflow first obtains a signature, then submits

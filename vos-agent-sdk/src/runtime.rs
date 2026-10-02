@@ -468,11 +468,12 @@ impl InvocationAuthorization {
         }
         match self {
             Self::AuthorityReceipt(_) => true,
-            // `observed_slot` is the host's current trusted observation. It
-            // equals the immutable preflight slot for unseen work, while an
-            // exact durable retry may occur later. The runtime distinguishes
-            // those cases from its retained result/continuation before it can
-            // execute application code.
+            // `observed_slot` is the host's current trusted observation.
+            // Ordinary unseen work requires the immutable preflight slot;
+            // only an exact signed System Authority projection may use its
+            // bounded first-execution window. An exact durable retry may occur
+            // later. The runtime must distinguish these cases before executing
+            // application code; this structural lower bound grants none of them.
             Self::PublicPreflight(preflight) => {
                 // matches_work above already checked this exact immutable
                 // preflight/work pair, including the work commitment. Only
@@ -798,6 +799,21 @@ pub enum RuntimeWork {
         authorization: Box<InvocationAuthorization>,
         observed_slot: u64,
     },
+    /// Scoped non-retaining System Authority observation. The signed runtime
+    /// package must explicitly opt into `SYSTEM_OBSERVATION_ABI_ID`; compiling
+    /// this variant or decoding its wire grants no execution authority.
+    /// Only Direct Query/PublicPreflight work at one exact observation slot is
+    /// representable. Hosts additionally select authenticated current state and
+    /// the installed Authority target, and require terminal output preserving
+    /// every opaque state byte with no result, continuation or published effect.
+    #[cfg(feature = "experimental-state-blocks")]
+    Observe {
+        context: RuntimeExecutionContext,
+        state: RuntimeState,
+        invocation: Box<InvocationWork>,
+        authorization: Box<InvocationAuthorization>,
+        observed_slot: u64,
+    },
     Resume {
         context: RuntimeExecutionContext,
         state: RuntimeState,
@@ -834,7 +850,7 @@ impl RuntimeWork {
             | Self::Resume { context, .. }
             | Self::Acknowledge { context, .. } => *context,
             #[cfg(feature = "experimental-state-blocks")]
-            Self::InspectInvocation { context, .. } => *context,
+            Self::InspectInvocation { context, .. } | Self::Observe { context, .. } => *context,
         }
     }
 }

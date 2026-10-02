@@ -8,7 +8,7 @@
 //! publication is touched.
 
 use core::fmt;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -36,7 +36,7 @@ use super::supervisor_adapters::{
     AgentRouteHostHandle,
 };
 
-const MAX_INVENTORY_AGENTS: usize = 4096;
+pub(crate) const MAX_INVENTORY_AGENTS: usize = 4096;
 const INITIAL_RECONCILIATION_RETRY: Duration = Duration::from_secs(1);
 
 fn installed_local_route_matches(
@@ -96,6 +96,7 @@ pub enum AgentProductionOwnerError {
     Authentication,
     ProjectionTransport,
     ProjectionNotReady,
+    ProjectionBusy,
     InvalidProjection,
     RevokedCredential,
     WrongCredentialKind,
@@ -147,10 +148,6 @@ pub trait AuthorityProjectionQueryAuthenticator: Send {
 trait AuthorityProjectionTransport: Send {
     fn target(&self) -> AuthorityActorTarget;
 
-    fn recover_pending(&mut self) -> Result<bool, AgentProductionOwnerError> {
-        Ok(false)
-    }
-
     fn dispatch(
         &mut self,
         query: AuthorityProjectionQuery,
@@ -165,10 +162,12 @@ struct SystemAgentProjectionTransport {
 fn projection_transport_error(
     error: super::supervisor::AgentRouteError,
 ) -> AgentProductionOwnerError {
+    tracing::debug!(?error, "Authority inventory transport failed");
     match error {
         super::supervisor::AgentRouteError::NotReady => {
             AgentProductionOwnerError::ProjectionNotReady
         }
+        super::supervisor::AgentRouteError::Busy => AgentProductionOwnerError::ProjectionBusy,
         _ => AgentProductionOwnerError::ProjectionTransport,
     }
 }
@@ -178,21 +177,18 @@ impl AuthorityProjectionTransport for SystemAgentProjectionTransport {
         self.target
     }
 
-    fn recover_pending(&mut self) -> Result<bool, AgentProductionOwnerError> {
-        self.handle
-            .recover_authority_projection()
-            .map_err(projection_transport_error)
-    }
-
     fn dispatch(
         &mut self,
         query: AuthorityProjectionQuery,
     ) -> Result<Vec<u8>, AgentProductionOwnerError> {
-        if query.authority != self.target || query.validate_shape().is_err() {
+        if query.authority != self.target
+            || query.recovery.is_some()
+            || query.validate_shape().is_err()
+        {
             return Err(AgentProductionOwnerError::Authentication);
         }
         self.handle
-            .authority_projection(query)
+            .invoke_authority_observation(query)
             .map_err(projection_transport_error)
     }
 }
@@ -248,29 +244,26 @@ impl CleanAuthorityProjectionClient {
         let started = Instant::now();
         self.check_shutdown()?;
         tracing::debug!(?selector, "Authority inventory query started");
-        self.transport.recover_pending()?;
-        self.check_shutdown()?;
-        tracing::debug!(
-            ?selector,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "Authority inventory pending recovery complete"
-        );
+        // Observations retain no invocation/result custody. Every attempt,
+        // including a retry of the same page, signs a fresh nondelegated query.
         let query = self
             .authenticator
             .authenticate(self.transport.target(), selector)?;
         if query.authority != self.transport.target()
             || query.selector != selector
+            || query.recovery.is_some()
             || query.validate_shape().is_err()
         {
             return Err(AgentProductionOwnerError::Authentication);
         }
         self.check_shutdown()?;
         let bytes = self.transport.dispatch(query.clone())?;
-        // Finish the durable projection call, but never start another page
-        // or publish a partially collected inventory after shutdown.
+        // Never start another page or publish a partially collected inventory
+        // after shutdown, even when the observation itself succeeded.
         self.check_shutdown()?;
         tracing::debug!(
             ?selector,
+            request = ?query.commitment(),
             elapsed_ms = started.elapsed().as_millis() as u64,
             "Authority inventory query dispatch complete"
         );
@@ -309,7 +302,7 @@ impl CleanAuthorityProjectionClient {
 /// Compare complete freshly authenticated claims, not a head or Principal alone.
 /// Nonces, page cursors and signatures vary across calls; their exact query
 /// binding is checked separately before this comparison.
-fn same_inventory_claims(
+pub(crate) fn same_inventory_claims(
     left: &AuthorityCredentialProjection,
     right: &AuthorityCredentialProjection,
 ) -> bool {
@@ -341,13 +334,16 @@ impl PendingInventoryAgent {
 }
 
 #[derive(Default)]
-struct InventoryAssembly {
+pub(crate) struct InventoryAssembly {
     agents: Vec<AgentAuthorityRouteProjection>,
     pending: Option<PendingInventoryAgent>,
 }
 
 impl InventoryAssembly {
-    fn push(&mut self, entry: AuthorityInventoryEntry) -> Result<(), AgentProductionOwnerError> {
+    pub(crate) fn push(
+        &mut self,
+        entry: AuthorityInventoryEntry,
+    ) -> Result<(), AgentProductionOwnerError> {
         match entry {
             AuthorityInventoryEntry::Agent(row) => {
                 if self.agents.len() + usize::from(self.pending.is_some()) >= MAX_INVENTORY_AGENTS {
@@ -403,7 +399,9 @@ impl InventoryAssembly {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<Vec<AgentAuthorityRouteProjection>, AgentProductionOwnerError> {
+    pub(crate) fn finish(
+        mut self,
+    ) -> Result<Vec<AgentAuthorityRouteProjection>, AgentProductionOwnerError> {
         if let Some(pending) = self.pending.take() {
             self.agents.push(pending.finish()?);
         }
@@ -417,8 +415,10 @@ impl AuthorityInventorySource for CleanAuthorityProjectionClient {
     }
 
     fn load_inventory(&mut self) -> Result<AgentAuthorityInventory, AgentProductionOwnerError> {
-        // No failure may leave a usable cache or publish a partially assembled
-        // revision. Durable query recovery/retirement stays in query().
+        // A prior complete revision is only a first-page retry hint until the
+        // exact fresh page authenticates its credential and unchanged head.
+        // Never publish it on failure or retain partially assembled revisions.
+        // Every observation attempt is independently authenticated in query().
         let previous = self.inventory.take();
         let known_head = previous
             .as_ref()
@@ -427,7 +427,19 @@ impl AuthorityInventorySource for CleanAuthorityProjectionClient {
                     && credential.head == inventory.head
             })
             .map(|(_, inventory)| inventory.head);
-        let mut page = self.inventory_page(None, known_head)?;
+        let mut page = match self.inventory_page(None, known_head) {
+            Ok(page) => page,
+            Err(
+                error @ (AgentProductionOwnerError::ProjectionBusy
+                | AgentProductionOwnerError::ProjectionNotReady),
+            ) => {
+                // Keep only a complete private cache hint. A failed fresh read
+                // never succeeds from this cache; retry signs a new query.
+                self.inventory = previous;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         if let Some((credential, inventory)) = &previous {
             let same_binding = credential.query.authority == page.credential.query.authority
                 && credential.query.credential == page.credential.query.credential;
@@ -670,6 +682,10 @@ pub(crate) struct AgentProductionOwner {
     shared_by_agent: Option<BTreeMap<AgentId, OwnedSharedGeneration>>,
     source: Box<dyn AuthorityInventorySource>,
     accepted_head: Option<AuthorityProjectionHead>,
+    // A previously accepted head is an anti-rollback pin, not permission to
+    // serve while a fresh inventory read is contending with retained work.
+    routes_verified: bool,
+    routes_need_quarantine: bool,
     // Bounded, process-local delivery deduplication only. Never used to
     // authorize management, recover an application, or restore publication.
     completed_local_publication: Option<(super::sdk::Hash, AuthorityProjectionHead)>,
@@ -693,11 +709,15 @@ impl fmt::Debug for AgentProductionOwner {
 
 impl AgentProductionOwner {
     pub(crate) fn ingress(&self) -> Result<CleanAgentIngress, AgentProductionOwnerError> {
+        if !self.is_ready() {
+            return Err(AgentProductionOwnerError::ProjectionNotReady);
+        }
         let authority = match &self.system {
             OwnedRouteSlot::Published { handle, .. } => handle.clone(),
             _ => return Err(AgentProductionOwnerError::InvalidConfiguration),
         };
         Ok(CleanAgentIngress {
+            node: self.node,
             supervisor: self.handle(),
             authority,
         })
@@ -790,6 +810,8 @@ impl AgentProductionOwner {
             shared_by_agent: None,
             source: Box::new(source),
             accepted_head: None,
+            routes_verified: false,
+            routes_need_quarantine: false,
             completed_local_publication: None,
             completed_local_install: None,
             reconcile_interval,
@@ -804,11 +826,21 @@ impl AgentProductionOwner {
                 &mut owner.local_by_agent,
             )?;
         }
-        // Only restored native admission may defer first publication. The
-        // caller exposes recovery control, not the unpublished supervisor.
-        if let Err(error) = owner.drive_if_due(Instant::now()) {
-            let _ = owner.shutdown_and_join();
-            return Err(error);
+        // Restored native admission, validated read contention or temporary
+        // leader access may defer first publication. Retain quorum backends;
+        // the caller exposes recovery control only.
+        match owner.drive_if_due(Instant::now()) {
+            Err(
+                AgentProductionOwnerError::ProjectionBusy
+                | AgentProductionOwnerError::ProjectionNotReady,
+            ) => owner.quarantine_routes()?,
+            Err(error) => {
+                let _ = owner.shutdown_and_join();
+                return Err(error);
+            }
+            // Initial NotReady is scheduled as Ok(false), but may still require
+            // revoking a partially published route before the owner is returned.
+            Ok(_) => owner.quarantine_routes()?,
         }
         Ok(owner)
     }
@@ -818,6 +850,342 @@ impl AgentProductionOwner {
             .as_ref()
             .expect("production owner retains supervisor until consumed")
             .handle()
+    }
+
+    /// Continuations use the retained controller even while its native recovery
+    /// obligations defer route publication. The controller authenticates the
+    /// exact retained locator and phase; this grants no public ingress or route.
+    fn retained_shared_lifecycle(
+        &mut self,
+    ) -> Result<&mut dyn super::local_lifecycle::NativeLocalLifecycle, AgentProductionOwnerError>
+    {
+        if !self.is_running() {
+            return Err(AgentProductionOwnerError::ShutdownRequested);
+        }
+        match &mut self.lifecycle {
+            Some((lifecycle, _)) => Ok(lifecycle.as_mut()),
+            None => Err(AgentProductionOwnerError::InvalidConfiguration),
+        }
+    }
+
+    /// Reserve a fresh signed Shared Create without executing or publishing it.
+    /// The runtime selection is admitted and remains immutable across retries.
+    pub(crate) fn reserve_shared_create(
+        &mut self,
+        descriptor: &super::sdk::AgentDescriptor,
+        call: &super::sdk::authority::AuthorityCredentialCall,
+        runtime: &super::clean_bootstrap::SharedGenesisRuntimePackage,
+        replicas: &super::genesis::AgentReplicaCommittee,
+    ) -> Result<super::genesis::AgentGenesisLocator, AgentProductionOwnerError> {
+        if !self.is_ready() {
+            return Err(AgentProductionOwnerError::InvalidConfiguration);
+        }
+        self.retained_shared_lifecycle()?
+            .reserve_shared_create(descriptor, call, runtime, replicas)
+            .map_err(AgentProductionOwnerError::Lifecycle)
+    }
+
+    pub(crate) fn prepare_shared_create(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+    ) -> Result<super::clean_bootstrap::PreparedSharedGenesisEndorsement, AgentProductionOwnerError>
+    {
+        self.retained_shared_lifecycle()?
+            .prepare_shared_create(locator)
+            .map_err(AgentProductionOwnerError::Lifecycle)
+    }
+
+    /// A recovery-only ingress item or a request queued before quarantine can
+    /// finish its exact already-owned management parent. Neither may allocate
+    /// fresh custody while quarantined or restore routes. The ingress restriction
+    /// remains binding even if readiness returns before worker dispatch.
+    fn shared_create_locator(
+        &mut self,
+        descriptor: &super::sdk::AgentDescriptor,
+        call: &super::sdk::authority::AuthorityCredentialCall,
+        runtime: &super::clean_bootstrap::SharedGenesisRuntimePackage,
+        replicas: &super::genesis::AgentReplicaCommittee,
+        retained_only: bool,
+    ) -> Result<super::genesis::AgentGenesisLocator, AgentProductionOwnerError> {
+        if !retained_only && self.is_ready() {
+            return self.reserve_shared_create(descriptor, call, runtime, replicas);
+        }
+        self.retained_shared_lifecycle()?
+            .retained_shared_create_locator(descriptor, call, runtime, replicas)
+            .map_err(AgentProductionOwnerError::Lifecycle)?
+            .ok_or(AgentProductionOwnerError::ProjectionNotReady)
+    }
+
+    /// Endorse a sealed retained candidate; no route or quorum readiness is
+    /// inferred from the configured signer's returned signature bytes.
+    pub(crate) fn endorse_shared_create(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+    ) -> Result<Vec<super::committee::AuthoritySignature>, AgentProductionOwnerError> {
+        self.retained_shared_lifecycle()?
+            .endorse_shared_create(locator)
+            .map_err(AgentProductionOwnerError::Lifecycle)
+    }
+
+    pub(crate) fn publish_shared_create(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+        signatures: Vec<super::committee::AuthoritySignature>,
+    ) -> Result<super::genesis::AgentGenesisArchiveRecord, AgentProductionOwnerError> {
+        self.retained_shared_lifecycle()?
+            .publish_shared_create(locator, signatures)
+            .map_err(AgentProductionOwnerError::Lifecycle)
+    }
+
+    /// Finish application, Authority finalization and terminal retention release
+    /// before remote members obtain fresh admission evidence. The original ACK
+    /// alone is not three-replica readiness: public publication follows elsewhere.
+    pub(crate) fn complete_shared_create(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+    ) -> Result<super::sdk::authority::ManagementApplicationAck, AgentProductionOwnerError> {
+        self.retained_shared_lifecycle()?
+            .complete_shared_create(locator)
+            .map_err(AgentProductionOwnerError::Lifecycle)
+    }
+
+    pub(crate) fn initialize_shared_management(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+    ) -> Result<(), AgentProductionOwnerError> {
+        self.retained_shared_lifecycle()?
+            .initialize_shared_management(locator)
+            .map_err(AgentProductionOwnerError::Lifecycle)
+    }
+
+    pub(crate) fn prepare_shared_install(
+        &mut self,
+        install: super::sdk::InstallActor,
+        call: super::sdk::authority::AuthorityCredentialCall,
+        package: &super::package_admission::AdmittedActorPackage,
+    ) -> Result<(), AgentProductionOwnerError> {
+        if !self.is_ready() {
+            return Err(AgentProductionOwnerError::InvalidConfiguration);
+        }
+        self.retained_shared_lifecycle()?
+            .prepare_shared_install(install, call, package)
+            .map_err(AgentProductionOwnerError::Lifecycle)
+    }
+
+    pub(crate) fn complete_shared_install(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+    ) -> Result<super::clean_authority_issuer::SignedManagementTerminal, AgentProductionOwnerError>
+    {
+        self.retained_shared_lifecycle()?
+            .complete_shared_install(locator)
+            .map_err(AgentProductionOwnerError::Lifecycle)
+    }
+
+    pub(crate) fn shared_install_denial(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+        install: &super::sdk::InstallActor,
+        call: &super::sdk::authority::AuthorityCredentialCall,
+    ) -> Result<Option<super::local_lifecycle::SharedInstallDenial>, AgentProductionOwnerError>
+    {
+        self.retained_shared_lifecycle()?
+            .shared_install_denial(locator, install, call)
+            .map_err(AgentProductionOwnerError::Lifecycle)
+    }
+
+    fn shared_create_denial(
+        &mut self,
+        locator: super::genesis::AgentGenesisLocator,
+        descriptor: &super::sdk::AgentDescriptor,
+        call: &super::sdk::authority::AuthorityCredentialCall,
+    ) -> Result<Option<super::local_lifecycle::SharedCreateDenial>, AgentProductionOwnerError> {
+        self.retained_shared_lifecycle()?
+            .shared_create_denial(locator, descriptor, call)
+            .map_err(AgentProductionOwnerError::Lifecycle)
+    }
+
+    /// Finish the coordinator's durable application before handing public
+    /// archive data to members. This result deliberately makes no quorum or
+    /// public-route readiness claim. Exact retries reuse the retained archive,
+    /// then still perform native completion/fresh finality verification.
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    pub(crate) fn create_shared_disposition(
+        &mut self,
+        submission: super::local_lifecycle::SharedCreateSubmission,
+        retained_only: bool,
+    ) -> super::local_lifecycle::SharedCreateResult {
+        let runtime = super::clean_bootstrap::SharedGenesisRuntimePackage::External(
+            submission.runtime().clone(),
+        );
+        let locator = self.shared_create_locator(
+            submission.descriptor(),
+            submission.call(),
+            &runtime,
+            submission.committee(),
+            retained_only,
+        )?;
+        let archive = match self
+            .retained_shared_lifecycle()?
+            .shared_create_archive(locator)
+            .map_err(AgentProductionOwnerError::Lifecycle)?
+        {
+            Some(record) => {
+                // OGAR is durable before Authority publication: its mere
+                // presence is not proof that Invoke/ACK finished. Replay the
+                // existing publisher with the exact retained QC, never obtain
+                // a replacement endorsement. Retired entries refuse publish;
+                // only normal native completion below may prove that terminal.
+                let signatures = record
+                    .provision()
+                    .evidence()
+                    .certificate()
+                    .signatures()
+                    .to_vec();
+                match self.publish_shared_create(locator, signatures) {
+                    Ok(published) => published,
+                    Err(AgentProductionOwnerError::Lifecycle(
+                        super::shared_host::SharedAgentHostError::Conflict,
+                    )) => record,
+                    Err(error) => return Err(error),
+                }
+            }
+            None => {
+                let signatures = match self.endorse_shared_create(locator) {
+                    Ok(signatures) => signatures,
+                    Err(
+                        error @ AgentProductionOwnerError::Lifecycle(
+                            super::shared_host::SharedAgentHostError::ScopeMismatch,
+                        ),
+                    ) => {
+                        // Only the normal native preparation/denial
+                        // continuation can return this terminal. CND1 may
+                        // precede custody release, so Unavailable/Conflict
+                        // never become a denial merely because it is present.
+                        return match self.shared_create_denial(
+                            locator,
+                            submission.descriptor(),
+                            submission.call(),
+                        )? {
+                            Some(denial) => Ok(
+                                super::local_lifecycle::SharedCreateDisposition::Denied(denial),
+                            ),
+                            None => Err(error),
+                        };
+                    }
+                    Err(error) => return Err(error),
+                };
+                self.publish_shared_create(locator, signatures)?
+            }
+        };
+        let acknowledgement = self.complete_shared_create(locator)?;
+        submission
+            .applied(acknowledgement, archive)
+            .map_err(|_| AgentProductionOwnerError::InvalidProjection)
+    }
+
+    /// Exact signed Install through the same native continuation and route
+    /// reconciliation as recovered work. Only an actual retained certificate
+    /// may turn policy refusal into a terminal denial.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn install_shared_disposition(
+        &mut self,
+        submission: super::local_lifecycle::SharedInstallSubmission,
+    ) -> super::local_lifecycle::SharedInstallResult {
+        use super::local_lifecycle::SharedInstallDisposition;
+        let install = submission.install().clone();
+        let call = submission.call().clone();
+        let locator = super::genesis::AgentGenesisLocator {
+            space: crate::service::SpaceId(call.managed.space.0),
+            agent: crate::service::AgentId(call.managed.agent.0),
+        };
+        let result = (|| {
+            self.initialize_shared_management(locator)?;
+            self.prepare_shared_install(install.clone(), call.clone(), submission.package())?;
+            self.complete_shared_install(locator)
+        })();
+        let disposition = match result {
+            Ok(super::clean_authority_issuer::SignedManagementTerminal::Applied(ack)) => {
+                SharedInstallDisposition::Applied(ack)
+            }
+            Ok(super::clean_authority_issuer::SignedManagementTerminal::Rejected(failure)) => {
+                SharedInstallDisposition::Failed(failure)
+            }
+            Err(
+                error @ AgentProductionOwnerError::Lifecycle(
+                    super::shared_host::SharedAgentHostError::ScopeMismatch,
+                ),
+            ) => match self.shared_install_denial(locator, &install, &call)? {
+                Some(denial) => return Ok(SharedInstallDisposition::Denied(denial)),
+                None => return Err(error),
+            },
+            Err(error) => return Err(error),
+        };
+        submission
+            .encode_response(&disposition)
+            .map_err(|_| AgentProductionOwnerError::InvalidProjection)?;
+        // The native result was finalized and retired. Reconcile actual
+        // installed actor state before replying; do not infer a route from ACK.
+        self.reconcile()?;
+        Ok(disposition)
+    }
+
+    /// Fresh native finality, durable member publication and actual local
+    /// transport attachment. This acknowledges neither a management operation
+    /// nor cluster readiness. A new Agent may have no callable actor routes.
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    pub(crate) fn admit_shared_member(
+        &mut self,
+        submission: super::local_lifecycle::SharedMemberAdmissionSubmission,
+    ) -> super::local_lifecycle::SharedMemberAdmissionResult {
+        // Client routing scope must match this independently admitted owner,
+        // before fresh reads, archive preparation or any native storage work.
+        if submission.expected_node() != self.node {
+            return Err(AgentProductionOwnerError::Lifecycle(
+                super::shared_host::SharedAgentHostError::ScopeMismatch,
+            ));
+        }
+        if !self.is_ready() {
+            return Err(AgentProductionOwnerError::InvalidConfiguration);
+        }
+        let record = submission.record();
+        let locator = submission.locator();
+        let expected = record
+            .provision()
+            .proposal()
+            .clean_descriptor()
+            .map_err(|_| AgentProductionOwnerError::InvalidProjection)?;
+        self.retained_shared_lifecycle()?
+            .admit_member_archive(record)
+            .map_err(AgentProductionOwnerError::Lifecycle)?;
+        self.reconcile()?;
+        let generation = self
+            .shared_by_agent
+            .as_ref()
+            .and_then(|slots| slots.get(&AgentId(locator.agent.0)))
+            .filter(|generation| !generation.slot.is_empty())
+            .ok_or(AgentProductionOwnerError::Lifecycle(
+                super::shared_host::SharedAgentHostError::Unavailable,
+            ))?;
+        // Reconciliation retains a real Pending attachment for a generation
+        // with no actors. Require the live transport/fingerprint and exact
+        // descriptor, not Published actor routes or a quorum claim.
+        let physical = generation
+            .generation
+            .projection()
+            .map_err(AgentProductionOwnerError::Lifecycle)?;
+        if &physical.descriptor != expected {
+            return Err(AgentProductionOwnerError::InvalidProjection);
+        }
+        Ok(locator)
     }
 
     pub(crate) fn create_local_disposition(
@@ -1077,7 +1445,7 @@ impl AgentProductionOwner {
     }
 
     pub(crate) fn is_ready(&self) -> bool {
-        self.is_running() && self.accepted_head.is_some()
+        self.is_running() && self.routes_verified && self.accepted_head.is_some()
     }
 
     pub(crate) fn prepare_admin(
@@ -1235,6 +1603,68 @@ impl AgentProductionOwner {
     }
 
     fn reconcile_at(&mut self, now: Instant) -> Result<(), AgentProductionOwnerError> {
+        if self.routes_need_quarantine {
+            // Ingress must be hidden before any draining route refresh. The
+            // worker completes that boundary before another inventory attempt.
+            return Err(AgentProductionOwnerError::ProjectionBusy);
+        }
+        let result = self.reconcile_inventory_at(now);
+        if matches!(
+            result,
+            Err(AgentProductionOwnerError::ProjectionBusy
+                | AgentProductionOwnerError::ProjectionNotReady)
+        ) {
+            self.routes_verified = false;
+            self.routes_need_quarantine = true;
+            self.reconcile_after = Instant::now()
+                .max(now)
+                .checked_add(INITIAL_RECONCILIATION_RETRY)
+                .ok_or(AgentProductionOwnerError::InvalidConfiguration)?;
+        }
+        result
+    }
+
+    pub(crate) fn needs_route_quarantine(&self) -> bool {
+        self.routes_need_quarantine
+    }
+
+    /// The worker must hide ingress before calling this potentially draining
+    /// operation. Empty identities revoke publication without retiring the
+    /// physical backends or their quorum participants.
+    pub(crate) fn quarantine_routes(&mut self) -> Result<(), AgentProductionOwnerError> {
+        if !self.routes_need_quarantine {
+            return Ok(());
+        }
+        let supervisor = self
+            .supervisor
+            .as_mut()
+            .ok_or(AgentProductionOwnerError::Supervisor(
+                AgentSupervisorError::Closed,
+            ))?;
+        for slot in [&mut self.system, &mut self.local, &mut self.shared]
+            .into_iter()
+            .chain(
+                self.local_by_agent
+                    .iter_mut()
+                    .flat_map(|slots| slots.values_mut()),
+            )
+            .chain(
+                self.shared_by_agent
+                    .iter_mut()
+                    .flat_map(|slots| slots.values_mut().map(|entry| &mut entry.slot)),
+            )
+        {
+            if let OwnedRouteSlot::Published { publication, .. } = slot {
+                if !publication.snapshots().is_empty() {
+                    *publication = supervisor.refresh(publication, Vec::new())?;
+                }
+            }
+        }
+        self.routes_need_quarantine = false;
+        Ok(())
+    }
+
+    fn reconcile_inventory_at(&mut self, now: Instant) -> Result<(), AgentProductionOwnerError> {
         let started = Instant::now();
         tracing::debug!("Authority inventory reconciliation started");
         // A new attempt can change or retire attachments even if it fails.
@@ -1284,30 +1714,6 @@ impl AgentProductionOwner {
             }
         }
         let _authenticated_principal = inventory.principal;
-        if let Some((lifecycle, _)) = &self.lifecycle {
-            match lifecycle
-                .shared_generations()
-                .map_err(AgentProductionOwnerError::Lifecycle)?
-            {
-                Some(generations) if self.shared.is_empty() => {
-                    let supervisor =
-                        self.supervisor
-                            .as_mut()
-                            .ok_or(AgentProductionOwnerError::Supervisor(
-                                AgentSupervisorError::Closed,
-                            ))?;
-                    ensure_shared_generations(
-                        supervisor,
-                        self.system_agent,
-                        &mut self.shared_by_agent,
-                        generations,
-                    )?;
-                }
-                None if self.shared_by_agent.is_none() => {}
-                _ => return Err(AgentProductionOwnerError::InvalidConfiguration),
-            }
-        }
-
         let mut system = Vec::new();
         let mut local = Vec::new();
         let mut shared = Vec::new();
@@ -1339,6 +1745,41 @@ impl AgentProductionOwner {
         if system.len() != 1 {
             self.request_shutdown();
             return Err(AgentProductionOwnerError::MissingSystemAgent);
+        }
+
+        if let Some((lifecycle, _)) = &self.lifecycle {
+            match lifecycle
+                .shared_generations()
+                .map_err(AgentProductionOwnerError::Lifecycle)?
+            {
+                Some(generations) if self.shared.is_empty() => {
+                    // A newly finalized Create can precede this member's
+                    // archive admission and transport attachment. That is not
+                    // permission to forget a generation already owned here:
+                    // check its presence before refresh removes stale slots.
+                    validate_known_shared_presence(
+                        self.shared_by_agent
+                            .iter()
+                            .flat_map(|slots| slots.keys().copied()),
+                        generations.iter().map(|generation| generation.agent()),
+                        &shared,
+                    )?;
+                    let supervisor =
+                        self.supervisor
+                            .as_mut()
+                            .ok_or(AgentProductionOwnerError::Supervisor(
+                                AgentSupervisorError::Closed,
+                            ))?;
+                    ensure_shared_generations(
+                        supervisor,
+                        self.system_agent,
+                        &mut self.shared_by_agent,
+                        generations,
+                    )?;
+                }
+                None if self.shared_by_agent.is_none() => {}
+                _ => return Err(AgentProductionOwnerError::InvalidConfiguration),
+            }
         }
 
         let supervisor = self
@@ -1375,9 +1816,15 @@ impl AgentProductionOwner {
                 .into_iter()
                 .map(|projection| (projection.descriptor().identity.agent, projection))
                 .collect();
-            if projected.keys().any(|agent| !slots.contains_key(agent)) {
+            if projected.iter().any(|(agent, projection)| {
+                !slots.contains_key(agent) && !shared_handoff_projection_can_wait(projection)
+            }) {
                 return Err(AgentProductionOwnerError::InvalidProjection);
             }
+            // Unknown supported members remain completely unexposed. A LIVE
+            // Authority descriptor is not physical readiness: only the native
+            // member admission path can supply a generation handle, which then
+            // goes through the ordinary exact projection authorization below.
             for (agent, generation) in slots {
                 reconcile_slot(
                     supervisor,
@@ -1390,6 +1837,7 @@ impl AgentProductionOwner {
             reconcile_slot(supervisor, &mut self.shared, inventory.head, shared)?;
         }
         self.accepted_head = Some(inventory.head);
+        self.routes_verified = true;
         // Every successful reconciliation, including a lifecycle-triggered
         // publication, starts a full quiet interval after completion. Physical
         // inventory work may itself take longer than the configured interval.
@@ -1463,6 +1911,7 @@ impl AgentProductionOwner {
 /// dispatch handles only, never ownership of the physical system host.
 #[derive(Clone)]
 pub(crate) struct CleanAgentIngress {
+    pub(crate) node: NodeId,
     pub(crate) supervisor: AgentSupervisorHandle,
     pub(crate) authority: AgentRouteHostHandle,
 }
@@ -1570,6 +2019,37 @@ fn retire_owned_slot(
                 Err(error.into())
             }
         },
+    }
+}
+
+fn validate_known_shared_presence(
+    mut known: impl Iterator<Item = AgentId>,
+    current: impl Iterator<Item = AgentId>,
+    projected: &[AgentAuthorityRouteProjection],
+) -> Result<(), AgentProductionOwnerError> {
+    let current: BTreeSet<_> = current.collect();
+    let projected: BTreeSet<_> = projected
+        .iter()
+        .map(|projection| projection.descriptor().identity.agent)
+        .collect();
+    if known.any(|agent| projected.contains(&agent) && !current.contains(&agent)) {
+        return Err(AgentProductionOwnerError::InvalidProjection);
+    }
+    Ok(())
+}
+
+fn shared_handoff_projection_can_wait(projection: &AgentAuthorityRouteProjection) -> bool {
+    #[cfg(feature = "experimental-state-blocks")]
+    {
+        let descriptor = projection.descriptor();
+        super::replay::external_shared_descriptor_supported(descriptor)
+            && descriptor.runtime_contract.lifecycle_abi
+                == super::sdk::state_execution::STATE_EXECUTION_ABI_ID
+    }
+    #[cfg(not(feature = "experimental-state-blocks"))]
+    {
+        let _ = projection;
+        false
     }
 }
 
@@ -1915,6 +2395,8 @@ mod tests {
                 shutdown: None,
             }),
             accepted_head: None,
+            routes_verified: false,
+            routes_need_quarantine: false,
             completed_local_publication: None,
             completed_local_install: None,
             reconcile_interval: Duration::from_secs(60),
@@ -1972,6 +2454,10 @@ mod tests {
             projection_transport_error(AgentRouteError::NotReady),
             AgentProductionOwnerError::ProjectionNotReady
         );
+        assert_eq!(
+            projection_transport_error(AgentRouteError::Busy),
+            AgentProductionOwnerError::ProjectionBusy
+        );
         for error in [AgentRouteError::Unavailable, AgentRouteError::Rejected] {
             assert_eq!(
                 projection_transport_error(error),
@@ -1982,13 +2468,16 @@ mod tests {
         owner.source = Box::new(FailedInventory(
             AgentProductionOwnerError::ProjectionNotReady,
         ));
-        let now = Instant::now();
-        for attempt in 0..3 {
-            let due = now + INITIAL_RECONCILIATION_RETRY * attempt;
+        for _ in 0..3 {
+            let due = owner.reconcile_after;
             assert_eq!(owner.drive_if_due(due), Ok(false));
             assert!(owner.is_running());
             assert!(!owner.is_ready());
             assert!(owner.ingress().is_err());
+            assert_eq!(owner.accepted_head, None);
+            assert!(owner.needs_route_quarantine());
+            owner.quarantine_routes().unwrap();
+            assert!(!owner.needs_route_quarantine());
         }
         let retry = owner.reconcile_after;
         owner.source = Box::new(FailedInventory(
@@ -2018,12 +2507,99 @@ mod tests {
         owner.source = Box::new(FailedInventory(
             AgentProductionOwnerError::ProjectionNotReady,
         ));
-        // Existing routes do not acquire a new stale-serving exemption.
+        // A previously accepted head is retained only as an anti-rollback
+        // anchor, never as permission to keep serving while the source lags.
         assert_eq!(
             owner.drive_if_due(owner.reconcile_after),
             Err(AgentProductionOwnerError::ProjectionNotReady)
         );
+        assert!(owner.is_running());
+        assert!(!owner.is_ready());
+        assert!(owner.ingress().is_err());
+        assert_eq!(owner.accepted_head, Some(head(1)));
+        assert!(owner.needs_route_quarantine());
+        owner.quarantine_routes().unwrap();
         owner.shutdown_and_join().unwrap();
+    }
+
+    #[test]
+    fn temporary_projection_failure_preserves_head_and_requires_quarantine_before_fresh_retry() {
+        for failure in [
+            AgentProductionOwnerError::ProjectionBusy,
+            AgentProductionOwnerError::ProjectionNotReady,
+        ] {
+            let (mut owner, _, _) = held_inventory_owner();
+            let system = descriptor(1, AgentProfile::Shared, owner.node);
+            owner.system_agent = system.identity.agent;
+            let fresh_source = || {
+                Box::new(client(
+                    vec![system.clone()],
+                    vec![actor(&system, true)],
+                    head(1),
+                    Arc::new(Mutex::new(Vec::new())),
+                )) as Box<dyn AuthorityInventorySource>
+            };
+            owner.source = fresh_source();
+            owner.reconcile().unwrap();
+            assert!(owner.is_ready());
+            let accepted = owner.accepted_head;
+            owner.source = Box::new(FailedInventory(failure));
+            assert_eq!(owner.reconcile(), Err(failure));
+            assert!(owner.is_running());
+            assert!(!owner.is_ready());
+            assert!(owner.ingress().is_err());
+            assert_eq!(owner.accepted_head, accepted);
+            assert!(owner.needs_route_quarantine());
+
+            // Even a now-successful source must not bypass the worker's hiding
+            // boundary. The ordinary retry deadline is not reset by early polls.
+            let due = owner.reconcile_after;
+            owner.source = fresh_source();
+            assert_eq!(
+                owner.reconcile(),
+                Err(AgentProductionOwnerError::ProjectionBusy)
+            );
+            assert_eq!(owner.reconcile_after, due);
+            owner.quarantine_routes().unwrap();
+            assert!(!owner.needs_route_quarantine());
+            assert_eq!(
+                owner.drive_if_due(due - Duration::from_millis(1)),
+                Ok(false)
+            );
+            assert!(!owner.is_ready());
+            assert_eq!(owner.drive_if_due(due), Ok(true));
+            assert!(owner.is_ready());
+            assert_eq!(owner.accepted_head, accepted);
+            owner.shutdown_and_join().unwrap();
+        }
+    }
+
+    #[test]
+    fn projection_busy_does_not_exempt_failed_fresh_validation() {
+        for error in [
+            AgentProductionOwnerError::ProjectionTransport,
+            AgentProductionOwnerError::InvalidProjection,
+            AgentProductionOwnerError::Authentication,
+            AgentProductionOwnerError::RevokedCredential,
+            AgentProductionOwnerError::ConflictingHead,
+        ] {
+            let (mut owner, _, _) = held_inventory_owner();
+            owner.accepted_head = Some(head(1));
+            owner.routes_verified = true;
+            owner.source = Box::new(FailedInventory(AgentProductionOwnerError::ProjectionBusy));
+            assert_eq!(
+                owner.reconcile(),
+                Err(AgentProductionOwnerError::ProjectionBusy)
+            );
+            owner.quarantine_routes().unwrap();
+            owner.source = Box::new(FailedInventory(error));
+            let due = owner.reconcile_after;
+            assert_eq!(owner.drive_if_due(due), Err(error));
+            assert!(!owner.is_ready());
+            assert!(owner.ingress().is_err());
+            assert_eq!(owner.accepted_head, Some(head(1)));
+            owner.shutdown_and_join().unwrap();
+        }
     }
 
     #[test]
@@ -2249,6 +2825,114 @@ mod tests {
         }
     }
 
+    #[test]
+    fn shared_handoff_guard_refuses_loss_of_a_known_projected_generation() {
+        let descriptor = descriptor(2, AgentProfile::Shared, NodeId([0x31; 32]));
+        let agent = descriptor.identity.agent;
+        let projection = AgentAuthorityRouteProjection::new(
+            descriptor.replica_generation(),
+            descriptor,
+            Vec::new(),
+        )
+        .unwrap();
+        let projected = [projection];
+        assert_eq!(
+            validate_known_shared_presence([agent].into_iter(), [].into_iter(), &projected),
+            Err(AgentProductionOwnerError::InvalidProjection)
+        );
+        assert_eq!(
+            validate_known_shared_presence([agent].into_iter(), [agent].into_iter(), &projected),
+            Ok(())
+        );
+        // A new desired member has never supplied a physical handle. An
+        // authenticated directory removal may retire an existing member.
+        assert_eq!(
+            validate_known_shared_presence([].into_iter(), [].into_iter(), &projected),
+            Ok(())
+        );
+        assert_eq!(
+            validate_known_shared_presence([agent].into_iter(), [].into_iter(), &[]),
+            Ok(())
+        );
+        // Presence of an unrelated physical member cannot conceal the loss.
+        assert_eq!(
+            validate_known_shared_presence(
+                [agent].into_iter(),
+                [AgentId([0x32; 32])].into_iter(),
+                &projected,
+            ),
+            Err(AgentProductionOwnerError::InvalidProjection)
+        );
+    }
+
+    fn fixed_three_linear_shared_descriptor(node: NodeId) -> AgentDescriptor {
+        let mut descriptor = descriptor(2, AgentProfile::Shared, node);
+        descriptor.capabilities.lanes = LaneSet::of(super::super::sdk::StateLane::Linear);
+        let principal = descriptor.identity.owner;
+        descriptor
+            .replicas
+            .extend([0x32, 0x33].map(|byte| AgentReplica {
+                node: NodeId([byte; 32]),
+                principal,
+                role: ReplicaRole::Voter,
+            }));
+        descriptor.replicas.sort_by_key(|replica| replica.node);
+        descriptor.validate().unwrap();
+        descriptor
+    }
+
+    #[test]
+    fn shared_handoff_never_defers_an_unknown_image_member() {
+        let descriptor = fixed_three_linear_shared_descriptor(NodeId([0x31; 32]));
+        let projection = AgentAuthorityRouteProjection::new(
+            descriptor.replica_generation(),
+            descriptor,
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(!shared_handoff_projection_can_wait(&projection));
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    fn pending_shared_descriptor(node: NodeId) -> AgentDescriptor {
+        let mut descriptor = fixed_three_linear_shared_descriptor(node);
+        descriptor.runtime_contract = RuntimePackageContract::experimental_state_blocks();
+        descriptor.validate().unwrap();
+        descriptor
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn shared_handoff_deferral_is_only_for_supported_external_fixed_three() {
+        fn can_wait(descriptor: AgentDescriptor) -> bool {
+            let projection = AgentAuthorityRouteProjection::new(
+                descriptor.replica_generation(),
+                descriptor,
+                Vec::new(),
+            )
+            .unwrap();
+            shared_handoff_projection_can_wait(&projection)
+        }
+
+        let pending = pending_shared_descriptor(NodeId([0x31; 32]));
+        assert!(can_wait(pending.clone()));
+        let mut image = pending.clone();
+        image.runtime_contract = RuntimePackageContract::canonical();
+        assert!(!can_wait(image));
+        let mut two_voters = pending.clone();
+        two_voters.replicas.pop();
+        assert!(!can_wait(two_voters));
+        let mut observer = pending.clone();
+        observer.replicas[2].role = ReplicaRole::Observer;
+        assert!(!can_wait(observer));
+        let mut extra_lanes = pending.clone();
+        extra_lanes.capabilities.lanes = LaneSet::ALL;
+        assert!(!can_wait(extra_lanes));
+        let mut scheduling = pending;
+        scheduling.capabilities.scheduling = true;
+        assert!(!can_wait(scheduling));
+    }
+
     fn target() -> AuthorityActorTarget {
         AuthorityActorTarget {
             space: SpaceId([0x11; 32]),
@@ -2275,7 +2959,7 @@ mod tests {
             self.ordinal = self.ordinal.wrapping_add(1).max(1);
             let public_key = [0xa1; 32];
             Ok(AuthorityProjectionQuery {
-            recovery: None,
+                recovery: None,
                 authority,
                 credential: super::super::sdk::CredentialId::of_public_key(&public_key),
                 nonce: Hash([self.ordinal; 32]),
@@ -2285,6 +2969,394 @@ mod tests {
                     signature: [0xa2; 64],
                 },
             })
+        }
+    }
+
+    struct FreshProjectionState {
+        target: AuthorityActorTarget,
+        events: Vec<&'static str>,
+        queries: Vec<AuthorityProjectionQuery>,
+        failures: Vec<(usize, AgentProductionOwnerError)>,
+        invalid_reply: u8,
+        invalid_authentication: u8,
+        credential_public_key: Option<[u8; 32]>,
+        page_cap: usize,
+        descriptors: Vec<AgentDescriptor>,
+        actors: Vec<AuthorityActorProjection>,
+    }
+
+    struct FreshProjectionTransport(Arc<Mutex<FreshProjectionState>>);
+
+    impl AuthorityProjectionTransport for FreshProjectionTransport {
+        fn target(&self) -> AuthorityActorTarget {
+            self.0.lock().unwrap().target
+        }
+
+        fn dispatch(
+            &mut self,
+            mut query: AuthorityProjectionQuery,
+        ) -> Result<Vec<u8>, AgentProductionOwnerError> {
+            assert!(query.recovery.is_none());
+            let mut state = self.0.lock().unwrap();
+            state.events.push("dispatch");
+            state.queries.push(query.clone());
+            let ordinal = state.queries.len();
+            if let Some(index) = state.failures.iter().position(|(at, _)| *at == ordinal) {
+                return Err(state.failures.remove(index).1);
+            }
+            if state.invalid_reply == 1 {
+                return Ok(b"not a canonical projection".to_vec());
+            }
+            if state.invalid_reply == 2 {
+                query.nonce = Hash([0xff; 32]);
+            }
+            inventory_page_fixture(
+                query,
+                head(1),
+                if state.invalid_reply == 3 {
+                    PrincipalId([0xb7; 32])
+                } else {
+                    PrincipalId([0xa5; 32])
+                },
+                &state.descriptors,
+                &state.actors,
+                state.page_cap,
+            )
+        }
+    }
+
+    struct FreshProjectionAuthenticator {
+        state: Arc<Mutex<FreshProjectionState>>,
+        inner: TestAuthenticator,
+    }
+
+    impl AuthorityProjectionQueryAuthenticator for FreshProjectionAuthenticator {
+        fn expected_kind(&self) -> AuthorityCredentialKind {
+            AuthorityCredentialKind::Api
+        }
+
+        fn authenticate(
+            &mut self,
+            authority: AuthorityActorTarget,
+            selector: AuthorityProjectionSelector,
+        ) -> Result<AuthorityProjectionQuery, AgentProductionOwnerError> {
+            let (public_key, invalid_authentication) = {
+                let mut state = self.state.lock().unwrap();
+                state.events.push("sign");
+                (state.credential_public_key, state.invalid_authentication)
+            };
+            let mut query = self.inner.authenticate(authority, selector)?;
+            if let Some(public_key) = public_key {
+                query.credential = super::super::sdk::CredentialId::of_public_key(&public_key);
+                query.authentication = AuthorityIngressAuthentication::ApiCredentialSignature {
+                    credential_public_key: public_key,
+                    signature: [0xa2; 64],
+                };
+            }
+            match invalid_authentication {
+                0 => (),
+                1 => {
+                    query.recovery = Some(
+                        super::super::sdk::authority::AuthorityProjectionRecoveryDelegation {
+                            generation: Hash([0xa3; 32]),
+                            committee: Hash([0xa4; 32]),
+                            accepted_slot: 10,
+                            expires_at: 20,
+                        },
+                    );
+                }
+                2 => query.authority.system_runtime_deployment = DeploymentId([0xfc; 32]),
+                3 => query.selector = AuthorityProjectionSelector::Credential,
+                4 => query.nonce = Hash::ZERO,
+                _ => unreachable!(),
+            }
+            Ok(query)
+        }
+    }
+
+    fn fresh_projection_client(
+        failures: Vec<(usize, AgentProductionOwnerError)>,
+    ) -> (
+        CleanAuthorityProjectionClient,
+        Arc<Mutex<FreshProjectionState>>,
+    ) {
+        let state = Arc::new(Mutex::new(FreshProjectionState {
+            target: target(),
+            events: Vec::new(),
+            queries: Vec::new(),
+            failures,
+            invalid_reply: 0,
+            invalid_authentication: 0,
+            credential_public_key: None,
+            page_cap: usize::MAX,
+            descriptors: Vec::new(),
+            actors: Vec::new(),
+        }));
+        let client = CleanAuthorityProjectionClient::new(
+            Box::new(FreshProjectionTransport(state.clone())),
+            Box::new(FreshProjectionAuthenticator {
+                state: state.clone(),
+                inner: TestAuthenticator { ordinal: 0 },
+            }),
+        );
+        (client, state)
+    }
+
+    #[test]
+    fn production_inventory_hinted_transient_retry_requires_a_fresh_observation() {
+        for error in [
+            AgentProductionOwnerError::ProjectionBusy,
+            AgentProductionOwnerError::ProjectionNotReady,
+        ] {
+            let (mut client, state) = fresh_projection_client(vec![(2, error)]);
+            state.lock().unwrap().descriptors.push(descriptor(
+                1,
+                AgentProfile::Shared,
+                NodeId([0x31; 32]),
+            ));
+            let original = client.load_inventory().unwrap();
+            let private_hint = client.inventory.clone().unwrap();
+            state.lock().unwrap().events.clear();
+
+            // Complete cached data is only private retry material, never a
+            // successful refresh or permission to serve a failed observation.
+            assert_eq!(client.load_inventory(), Err(error));
+            assert_eq!(client.inventory, Some(private_hint));
+            assert_eq!(client.load_inventory().unwrap(), original);
+            let state = state.lock().unwrap();
+            assert_eq!(state.queries.len(), 3);
+            assert_eq!(
+                state.queries[1].selector,
+                inventory_selector(Some(original.head))
+            );
+            assert_eq!(state.queries[1].selector, state.queries[2].selector);
+            assert_ne!(state.queries[1].nonce, state.queries[2].nonce);
+            assert!(state.queries.iter().all(|query| query.recovery.is_none()));
+            assert_eq!(state.events, ["sign", "dispatch", "sign", "dispatch"]);
+        }
+    }
+
+    #[test]
+    fn production_inventory_hinted_retry_discards_fatal_invalid_or_changed_claims() {
+        for (failure, invalid_reply, expected) in [
+            (
+                Some(AgentProductionOwnerError::Authentication),
+                0,
+                AgentProductionOwnerError::Authentication,
+            ),
+            (
+                Some(AgentProductionOwnerError::ProjectionTransport),
+                0,
+                AgentProductionOwnerError::ProjectionTransport,
+            ),
+            (None, 1, AgentProductionOwnerError::InvalidProjection),
+            (None, 2, AgentProductionOwnerError::InvalidProjection),
+            (None, 3, AgentProductionOwnerError::InconsistentHead),
+        ] {
+            let (mut client, state) =
+                fresh_projection_client(vec![(2, AgentProductionOwnerError::ProjectionBusy)]);
+            let original = client.load_inventory().unwrap();
+            assert_eq!(
+                client.load_inventory(),
+                Err(AgentProductionOwnerError::ProjectionBusy)
+            );
+            assert!(client.inventory.is_some());
+            {
+                let mut state = state.lock().unwrap();
+                state.invalid_reply = invalid_reply;
+                if let Some(error) = failure {
+                    state.failures.push((3, error));
+                }
+            }
+            assert_eq!(client.load_inventory(), Err(expected));
+            assert!(client.inventory.is_none());
+            state.lock().unwrap().invalid_reply = 0;
+            assert_eq!(client.load_inventory().unwrap(), original);
+            let state = state.lock().unwrap();
+            assert_eq!(state.queries.len(), 4);
+            assert_eq!(state.queries[1].selector, state.queries[2].selector);
+            assert_ne!(state.queries[1].nonce, state.queries[2].nonce);
+            assert_eq!(state.queries[3].selector, inventory_selector(None));
+            assert_eq!(
+                state
+                    .events
+                    .iter()
+                    .filter(|event| **event == "sign")
+                    .count(),
+                4
+            );
+        }
+    }
+
+    #[test]
+    fn production_inventory_hinted_retry_credential_rotation_requires_full_fresh_view() {
+        let (mut client, state) =
+            fresh_projection_client(vec![(2, AgentProductionOwnerError::ProjectionNotReady)]);
+        state.lock().unwrap().descriptors.push(descriptor(
+            1,
+            AgentProfile::Shared,
+            NodeId([0x31; 32]),
+        ));
+        let original = client.load_inventory().unwrap();
+        assert_eq!(original.agents.len(), 1);
+        let original_credential = client.inventory.as_ref().unwrap().0.query.credential;
+        let public_key = [0xb6; 32];
+        let rotated = super::super::sdk::CredentialId::of_public_key(&public_key);
+        {
+            let mut state = state.lock().unwrap();
+            state.credential_public_key = Some(public_key);
+            // Another credential can see different rows at the same head.
+            state.descriptors.clear();
+        }
+        assert_eq!(
+            client.load_inventory(),
+            Err(AgentProductionOwnerError::ProjectionNotReady)
+        );
+        assert_eq!(
+            client.inventory.as_ref().unwrap().0.query.credential,
+            original_credential
+        );
+        let refreshed = client.load_inventory().unwrap();
+        assert_eq!(refreshed.head, original.head);
+        assert!(refreshed.agents.is_empty());
+        assert_ne!(refreshed, original);
+        assert_eq!(
+            client.inventory.as_ref().unwrap().0.query.credential,
+            rotated
+        );
+        let state = state.lock().unwrap();
+        assert_eq!(state.queries.len(), 4);
+        assert_eq!(state.queries[1].credential, rotated);
+        assert_eq!(
+            state.queries[1].selector,
+            inventory_selector(Some(original.head))
+        );
+        assert_eq!(state.queries[1].selector, state.queries[2].selector);
+        assert_ne!(state.queries[1].nonce, state.queries[2].nonce);
+        assert_eq!(state.queries[3].credential, rotated);
+        assert_eq!(state.queries[3].selector, inventory_selector(None));
+        assert_ne!(state.queries[2].nonce, state.queries[3].nonce);
+    }
+
+    #[test]
+    fn production_inventory_each_transient_retry_signs_a_fresh_non_delegated_query() {
+        for error in [
+            AgentProductionOwnerError::ProjectionBusy,
+            AgentProductionOwnerError::ProjectionNotReady,
+        ] {
+            let (mut client, state) = fresh_projection_client(vec![(1, error)]);
+            assert_eq!(client.load_inventory(), Err(error));
+            assert!(client.inventory.is_none());
+            client.load_inventory().unwrap();
+            client.load_inventory().unwrap();
+            let state = state.lock().unwrap();
+            assert_eq!(
+                state.events,
+                ["sign", "dispatch", "sign", "dispatch", "sign", "dispatch"]
+            );
+            assert!(state.queries.iter().all(|query| query.recovery.is_none()));
+            assert_ne!(state.queries[0].nonce, state.queries[1].nonce);
+            assert_ne!(state.queries[1].nonce, state.queries[2].nonce);
+        }
+    }
+
+    #[test]
+    fn production_inventory_target_and_selector_changes_require_fresh_signing() {
+        for change_target in [false, true] {
+            let (mut client, state) =
+                fresh_projection_client(vec![(1, AgentProductionOwnerError::ProjectionBusy)]);
+            assert_eq!(
+                client.query::<AuthorityInventoryProjectionPage>(inventory_selector(None)),
+                Err(AgentProductionOwnerError::ProjectionBusy),
+            );
+            let selector = if change_target {
+                state.lock().unwrap().target.system_runtime_deployment = DeploymentId([0xfc; 32]);
+                inventory_selector(None)
+            } else {
+                inventory_selector(Some(head(1)))
+            };
+            let (query, _) = client
+                .query::<AuthorityInventoryProjectionPage>(selector)
+                .unwrap();
+            let state = state.lock().unwrap();
+            assert_eq!(query.authority, state.target);
+            assert_eq!(query.selector, selector);
+            assert_ne!(state.queries[0].nonce, state.queries[1].nonce);
+            assert_eq!(state.events, ["sign", "dispatch", "sign", "dispatch"]);
+        }
+    }
+
+    #[test]
+    fn production_inventory_failed_later_page_restarts_fresh_without_partial_cache() {
+        let (mut client, state) =
+            fresh_projection_client(vec![(2, AgentProductionOwnerError::ProjectionBusy)]);
+        let descriptor = descriptor(1, AgentProfile::Shared, NodeId([0x31; 32]));
+        {
+            let mut state = state.lock().unwrap();
+            state.page_cap = 1;
+            state.actors.push(actor(&descriptor, true));
+            state.descriptors.push(descriptor);
+        }
+        assert_eq!(
+            client.load_inventory(),
+            Err(AgentProductionOwnerError::ProjectionBusy)
+        );
+        assert!(client.inventory.is_none());
+        assert_eq!(client.load_inventory().unwrap().agents.len(), 1);
+        let state = state.lock().unwrap();
+        assert!(matches!(
+            state.queries[1].selector,
+            AuthorityProjectionSelector::Inventory { after: Some(_), .. },
+        ));
+        assert_eq!(state.queries[2].selector, inventory_selector(None));
+        assert_ne!(state.queries[1].nonce, state.queries[2].nonce);
+    }
+
+    #[test]
+    fn production_inventory_fatal_or_invalid_read_cannot_succeed_from_cache() {
+        for error in [
+            AgentProductionOwnerError::Authentication,
+            AgentProductionOwnerError::ProjectionTransport,
+            AgentProductionOwnerError::InvalidProjection,
+            AgentProductionOwnerError::InconsistentHead,
+            AgentProductionOwnerError::Lifecycle(
+                super::super::shared_host::SharedAgentHostError::ScopeMismatch,
+            ),
+        ] {
+            let (mut client, state) = fresh_projection_client(vec![(1, error)]);
+            assert_eq!(client.load_inventory(), Err(error));
+            assert!(client.inventory.is_none());
+            client.load_inventory().unwrap();
+            let state = state.lock().unwrap();
+            assert_ne!(state.queries[0].nonce, state.queries[1].nonce);
+        }
+        for invalid_reply in [1, 2] {
+            let (mut client, state) = fresh_projection_client(Vec::new());
+            state.lock().unwrap().invalid_reply = invalid_reply;
+            assert_eq!(
+                client.load_inventory(),
+                Err(AgentProductionOwnerError::InvalidProjection)
+            );
+            assert!(client.inventory.is_none());
+            state.lock().unwrap().invalid_reply = 0;
+            client.load_inventory().unwrap();
+            let state = state.lock().unwrap();
+            assert_ne!(state.queries[0].nonce, state.queries[1].nonce);
+        }
+    }
+
+    #[test]
+    fn production_inventory_rejects_delegated_or_substituted_authentication_before_dispatch() {
+        for invalid_authentication in 1..=4 {
+            let (mut client, state) = fresh_projection_client(Vec::new());
+            state.lock().unwrap().invalid_authentication = invalid_authentication;
+            assert_eq!(
+                client.query::<AuthorityInventoryProjectionPage>(inventory_selector(None)),
+                Err(AgentProductionOwnerError::Authentication)
+            );
+            assert_eq!(state.lock().unwrap().events, ["sign"]);
+            assert!(state.lock().unwrap().queries.is_empty());
+            assert!(client.inventory.is_none());
         }
     }
 
@@ -2356,6 +3428,109 @@ mod tests {
             }),
             Box::new(TestAuthenticator { ordinal: 0 }),
         )
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn shared_handoff_keeps_owner_running_without_creating_a_member_route() {
+        use super::super::shared_host::SharedAgentHostError;
+
+        struct UnadmittedShared;
+        impl super::super::local_lifecycle::NativeLocalLifecycle for UnadmittedShared {
+            fn management_admission_held(&self) -> Result<bool, SharedAgentHostError> {
+                Ok(false)
+            }
+            fn shared_generations(
+                &self,
+            ) -> Result<
+                Option<Vec<crate::network::shared_agent::SharedAgentRouteHandle>>,
+                SharedAgentHostError,
+            > {
+                Ok(Some(Vec::new()))
+            }
+            fn node(&self) -> Result<NodeId, SharedAgentHostError> {
+                unreachable!()
+            }
+            fn system_attachment(
+                &self,
+                _: usize,
+            ) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError> {
+                unreachable!()
+            }
+            fn local_attachment(
+                &self,
+                _: usize,
+            ) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError> {
+                unreachable!()
+            }
+            fn create(
+                &mut self,
+                _: AgentDescriptor,
+                _: super::super::sdk::authority::AuthorityCredentialCall,
+                _: super::super::package_admission::AdmittedRuntimePackage,
+            ) -> Result<
+                (
+                    AgentId,
+                    super::super::sdk::authority::ManagementApplicationAck,
+                ),
+                SharedAgentHostError,
+            > {
+                unreachable!()
+            }
+        }
+
+        let node = NodeId([0x31; 32]);
+        let system = descriptor(1, AgentProfile::Shared, node);
+        let pending = pending_shared_descriptor(node);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (mut owner, _, _) = held_inventory_owner();
+        owner.node = node;
+        owner.system_agent = system.identity.agent;
+        owner.lifecycle = Some((Box::new(UnadmittedShared), 1));
+        owner.source = Box::new(client(
+            vec![system.clone()],
+            vec![actor(&system, true)],
+            head(1),
+            calls.clone(),
+        ));
+        assert_eq!(owner.drive_if_due(owner.reconcile_after), Ok(true));
+        assert_eq!(owner.accepted_head, Some(head(1)));
+
+        let new_inventory = |member: AgentDescriptor, revision| {
+            CleanAuthorityProjectionClient::new(
+                Box::new(ProjectionTransport {
+                    page_cap: usize::MAX,
+                    target: target(),
+                    head: head(revision),
+                    actor_head: head(revision),
+                    descriptors: vec![system.clone(), member],
+                    actors: vec![actor(&system, true)],
+                    calls: calls.clone(),
+                }),
+                Box::new(TestAuthenticator { ordinal: 0 }),
+            )
+        };
+        owner.source = Box::new(new_inventory(pending.clone(), 2));
+        for _ in 0..3 {
+            assert_eq!(owner.drive_if_due(owner.reconcile_after), Ok(true));
+            assert!(owner.is_running());
+            assert_eq!(owner.accepted_head, Some(head(2)));
+            assert!(owner.shared_by_agent.as_ref().unwrap().is_empty());
+            assert!(owner.handle().snapshots().unwrap().is_empty());
+        }
+        // This is an owner-control regression, not fabricated physical
+        // readiness. No System attachment or member admission was minted.
+        assert!(owner.ingress().is_err());
+
+        let mut image = pending;
+        image.runtime_contract = RuntimePackageContract::canonical();
+        owner.source = Box::new(new_inventory(image, 3));
+        assert_eq!(
+            owner.drive_if_due(owner.reconcile_after),
+            Err(AgentProductionOwnerError::InvalidProjection)
+        );
+        assert_eq!(owner.accepted_head, Some(head(2)));
+        owner.shutdown_and_join().unwrap();
     }
 
     #[test]
@@ -2953,6 +4128,452 @@ mod tests {
         check_reconciliation_deadline(true);
     }
 
+    #[test]
+    fn shared_lifecycle_continuations_forward_without_publishing_readiness() {
+        use super::super::genesis::AgentGenesisLocator;
+        use super::super::shared_host::SharedAgentHostError;
+
+        struct RetainedShared {
+            locator: AgentGenesisLocator,
+            calls: Arc<Mutex<Vec<&'static str>>>,
+        }
+        impl super::super::local_lifecycle::NativeLocalLifecycle for RetainedShared {
+            fn node(&self) -> Result<NodeId, SharedAgentHostError> {
+                unreachable!()
+            }
+            fn system_attachment(
+                &self,
+                _: usize,
+            ) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError> {
+                unreachable!()
+            }
+            fn local_attachment(
+                &self,
+                _: usize,
+            ) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError> {
+                unreachable!()
+            }
+            fn create(
+                &mut self,
+                _: AgentDescriptor,
+                _: super::super::sdk::authority::AuthorityCredentialCall,
+                _: super::super::package_admission::AdmittedRuntimePackage,
+            ) -> Result<
+                (
+                    AgentId,
+                    super::super::sdk::authority::ManagementApplicationAck,
+                ),
+                SharedAgentHostError,
+            > {
+                unreachable!()
+            }
+            fn prepare_shared_create(
+                &mut self,
+                locator: AgentGenesisLocator,
+            ) -> Result<
+                super::super::clean_bootstrap::PreparedSharedGenesisEndorsement,
+                SharedAgentHostError,
+            > {
+                assert_eq!(locator, self.locator);
+                self.calls.lock().unwrap().push("prepare");
+                Err(SharedAgentHostError::CapacityExhausted)
+            }
+            fn complete_shared_create(
+                &mut self,
+                locator: AgentGenesisLocator,
+            ) -> Result<super::super::sdk::authority::ManagementApplicationAck, SharedAgentHostError>
+            {
+                assert_eq!(locator, self.locator);
+                self.calls.lock().unwrap().push("complete");
+                Err(SharedAgentHostError::Conflict)
+            }
+        }
+
+        let node = NodeId([0x31; 32]);
+        let descriptor = descriptor(1, AgentProfile::Shared, node);
+        let locator = AgentGenesisLocator {
+            space: crate::service::SpaceId(descriptor.identity.space.0),
+            agent: crate::service::AgentId(descriptor.identity.agent.0),
+        };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let inventory_calls = Arc::new(Mutex::new(Vec::new()));
+        let mut owner = AgentProductionOwner {
+            node,
+            system_agent: descriptor.identity.agent,
+            supervisor: Some(
+                AgentSupervisorOwner::start(AgentSupervisorLimits::default()).unwrap(),
+            ),
+            system: OwnedRouteSlot::Empty,
+            local: OwnedRouteSlot::Empty,
+            local_by_agent: None,
+            shared: OwnedRouteSlot::Empty,
+            shared_by_agent: None,
+            source: Box::new(client(
+                vec![descriptor.clone()],
+                vec![actor(&descriptor, true)],
+                head(1),
+                inventory_calls.clone(),
+            )),
+            accepted_head: None,
+            routes_verified: false,
+            routes_need_quarantine: false,
+            completed_local_publication: None,
+            completed_local_install: None,
+            reconcile_interval: Duration::from_secs(60),
+            reconcile_after: Instant::now(),
+            lifecycle: Some((
+                Box::new(RetainedShared {
+                    locator,
+                    calls: calls.clone(),
+                }),
+                1,
+            )),
+        };
+        assert!(!owner.is_ready());
+        assert!(matches!(
+            owner.prepare_shared_create(locator),
+            Err(AgentProductionOwnerError::Lifecycle(
+                SharedAgentHostError::CapacityExhausted
+            ))
+        ));
+        assert!(matches!(
+            owner.endorse_shared_create(locator),
+            Err(AgentProductionOwnerError::Lifecycle(
+                SharedAgentHostError::Unavailable
+            ))
+        ));
+        // A backend without these optional methods cannot grant publication or
+        // initialization merely because the production adapter exposes them.
+        assert!(matches!(
+            owner.publish_shared_create(locator, Vec::new()),
+            Err(AgentProductionOwnerError::Lifecycle(
+                SharedAgentHostError::Unavailable
+            ))
+        ));
+        assert!(matches!(
+            owner.initialize_shared_management(locator),
+            Err(AgentProductionOwnerError::Lifecycle(
+                SharedAgentHostError::Unavailable
+            ))
+        ));
+        assert!(matches!(
+            owner.complete_shared_install(locator),
+            Err(AgentProductionOwnerError::Lifecycle(
+                SharedAgentHostError::Unavailable
+            ))
+        ));
+        assert!(matches!(
+            owner.complete_shared_create(locator),
+            Err(AgentProductionOwnerError::Lifecycle(
+                SharedAgentHostError::Conflict
+            ))
+        ));
+        assert_eq!(*calls.lock().unwrap(), ["prepare", "complete"]);
+        assert!(inventory_calls.lock().unwrap().is_empty());
+        assert!(owner.accepted_head.is_none());
+        assert!(!owner.is_ready());
+        owner.request_shutdown();
+        assert!(matches!(
+            owner.prepare_shared_create(locator),
+            Err(AgentProductionOwnerError::ShutdownRequested)
+        ));
+        assert!(matches!(
+            owner.endorse_shared_create(locator),
+            Err(AgentProductionOwnerError::ShutdownRequested)
+        ));
+        assert_eq!(*calls.lock().unwrap(), ["prepare", "complete"]);
+        owner.shutdown_and_join().unwrap();
+    }
+
+    #[test]
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    fn queued_exact_shared_create_reuses_retained_continuation_after_busy_quarantine() {
+        use super::super::genesis::AgentGenesisLocator;
+        use super::super::local_lifecycle::{
+            LocalLifecycleQueue, NativeLocalLifecycle, PendingLocalLifecycle,
+            SharedCreateSubmission,
+        };
+        use super::super::shared_host::SharedAgentHostError;
+
+        // Owner ordering only: the continuation deliberately stops at prepare,
+        // never fabricating application, quorum, finality or public readiness.
+        struct Retained {
+            submission: SharedCreateSubmission,
+            calls: Arc<Mutex<Vec<&'static str>>>,
+        }
+        impl NativeLocalLifecycle for Retained {
+            fn node(&self) -> Result<NodeId, SharedAgentHostError> {
+                unreachable!()
+            }
+            fn system_attachment(
+                &self,
+                _: usize,
+            ) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError> {
+                unreachable!()
+            }
+            fn local_attachment(
+                &self,
+                _: usize,
+            ) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError> {
+                unreachable!()
+            }
+            fn create(
+                &mut self,
+                _: super::super::sdk::AgentDescriptor,
+                _: super::super::sdk::authority::AuthorityCredentialCall,
+                _: super::super::package_admission::AdmittedRuntimePackage,
+            ) -> Result<
+                (
+                    AgentId,
+                    super::super::sdk::authority::ManagementApplicationAck,
+                ),
+                SharedAgentHostError,
+            > {
+                unreachable!()
+            }
+            fn reserve_shared_create(
+                &mut self,
+                _: &super::super::sdk::AgentDescriptor,
+                _: &super::super::sdk::authority::AuthorityCredentialCall,
+                _: &super::super::clean_bootstrap::SharedGenesisRuntimePackage,
+                _: &super::super::genesis::AgentReplicaCommittee,
+            ) -> Result<AgentGenesisLocator, SharedAgentHostError> {
+                panic!("retained continuation cannot reach fresh reservation");
+            }
+            fn retained_shared_create_locator(
+                &mut self,
+                descriptor: &super::super::sdk::AgentDescriptor,
+                call: &super::super::sdk::authority::AuthorityCredentialCall,
+                runtime: &super::super::clean_bootstrap::SharedGenesisRuntimePackage,
+                replicas: &super::super::genesis::AgentReplicaCommittee,
+            ) -> Result<Option<AgentGenesisLocator>, SharedAgentHostError> {
+                self.calls.lock().unwrap().push("lookup");
+                if descriptor != self.submission.descriptor() {
+                    return Ok(None);
+                }
+                if call != self.submission.call()
+                    || runtime.exact_bytes() != self.submission.runtime().exact_bytes()
+                    || replicas != self.submission.committee()
+                {
+                    return Err(SharedAgentHostError::Conflict);
+                }
+                Ok(Some(AgentGenesisLocator {
+                    space: crate::service::SpaceId(descriptor.identity.space.0),
+                    agent: crate::service::AgentId(descriptor.identity.agent.0),
+                }))
+            }
+            fn shared_create_archive(
+                &mut self,
+                _: AgentGenesisLocator,
+            ) -> Result<
+                Option<super::super::genesis::AgentGenesisArchiveRecord>,
+                SharedAgentHostError,
+            > {
+                Ok(None)
+            }
+            fn endorse_shared_create(
+                &mut self,
+                _: AgentGenesisLocator,
+            ) -> Result<Vec<super::super::committee::AuthoritySignature>, SharedAgentHostError>
+            {
+                self.calls.lock().unwrap().push("prepare");
+                Err(SharedAgentHostError::CapacityExhausted)
+            }
+        }
+        let (submission, _) = super::super::local_lifecycle::shared_submissions_for_test(false);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (mut owner, _, _) = held_inventory_owner();
+        owner.lifecycle = Some((
+            Box::new(Retained {
+                submission: submission.clone(),
+                calls: calls.clone(),
+            }),
+            1,
+        ));
+        owner.accepted_head = Some(head(1));
+        owner.routes_verified = true;
+        assert!(owner.is_ready());
+        let accepted = owner.accepted_head;
+        let queue = LocalLifecycleQueue::default();
+        queue.open().unwrap();
+        let result = queue
+            .submit_shared_create(submission.clone(), false)
+            .unwrap();
+        owner.source = Box::new(FailedInventory(AgentProductionOwnerError::ProjectionBusy));
+        assert_eq!(
+            owner.reconcile(),
+            Err(AgentProductionOwnerError::ProjectionBusy)
+        );
+        owner.quarantine_routes().unwrap();
+        assert!(!owner.is_ready());
+        assert!(owner.ingress().is_err());
+        let PendingLocalLifecycle::CreateShared {
+            submission: queued,
+            retained_only,
+            reply,
+        } = queue.pop().unwrap().unwrap()
+        else {
+            panic!("wrong lifecycle variant");
+        };
+        assert!(!retained_only);
+        reply
+            .try_send(owner.create_shared_disposition(queued, retained_only))
+            .unwrap();
+        assert_eq!(
+            result.recv().unwrap(),
+            Err(AgentProductionOwnerError::Lifecycle(
+                SharedAgentHostError::CapacityExhausted
+            ))
+        );
+        assert_eq!(*calls.lock().unwrap(), ["lookup", "prepare"]);
+        assert_eq!(owner.accepted_head, accepted);
+        assert!(!owner.is_ready());
+        assert!(owner.ingress().is_err());
+        // The generic fresh boundary is unchanged, even for an exact caller.
+        let runtime = super::super::clean_bootstrap::SharedGenesisRuntimePackage::External(
+            submission.runtime().clone(),
+        );
+        assert_eq!(
+            owner.reserve_shared_create(
+                submission.descriptor(),
+                submission.call(),
+                &runtime,
+                submission.committee()
+            ),
+            Err(AgentProductionOwnerError::InvalidConfiguration)
+        );
+
+        // The restriction belongs to the admitted queue item, not the
+        // owner's readiness when it eventually executes. Publication may
+        // recover between enqueue and dispatch without permitting a fresh
+        // reservation through the recovery-only item.
+        let exact_bytes = submission.encode();
+        let result = queue
+            .submit_shared_create(submission.clone(), true)
+            .unwrap();
+        assert!(!owner.is_ready());
+        owner.routes_verified = true;
+        assert!(owner.is_ready());
+        let PendingLocalLifecycle::CreateShared {
+            submission: queued,
+            retained_only,
+            reply,
+        } = queue.pop().unwrap().unwrap()
+        else {
+            panic!("wrong lifecycle variant");
+        };
+        assert!(retained_only);
+        assert_eq!(queued.encode(), exact_bytes);
+        reply
+            .try_send(owner.create_shared_disposition(queued, retained_only))
+            .unwrap();
+        assert_eq!(
+            result.recv().unwrap(),
+            Err(AgentProductionOwnerError::Lifecycle(
+                SharedAgentHostError::CapacityExhausted
+            ))
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["lookup", "prepare", "lookup", "prepare"]
+        );
+        assert_eq!(submission.encode(), exact_bytes);
+        assert_eq!(owner.accepted_head, accepted);
+        assert!(owner.is_ready());
+
+        // Owner ordering only: these deliberately changed inputs exercise
+        // lookup refusal, not raw-signature or native-binding qualification.
+        // Every refusal must stop before preparation and must not fall back
+        // to the fresh factory even though the owner is ready again.
+        let expected_calls = [
+            "lookup", "prepare", "lookup", "prepare", "lookup", "lookup", "lookup", "lookup",
+        ];
+        let mut absent = submission.descriptor().clone();
+        absent.identity.agent = super::super::sdk::AgentId([0xf1; 32]);
+        assert_eq!(
+            owner.shared_create_locator(
+                &absent,
+                submission.call(),
+                &runtime,
+                submission.committee(),
+                true,
+            ),
+            Err(AgentProductionOwnerError::ProjectionNotReady)
+        );
+        let mut altered_call = submission.call().clone();
+        altered_call.requested_expires_at += 1;
+        assert_eq!(
+            owner.shared_create_locator(
+                submission.descriptor(),
+                &altered_call,
+                &runtime,
+                submission.committee(),
+                true,
+            ),
+            Err(AgentProductionOwnerError::Lifecycle(
+                SharedAgentHostError::Conflict
+            ))
+        );
+        let altered_runtime =
+            super::super::package_admission::tests::admitted_state_fixture_max_actors(
+                submission.runtime().program_bytes().to_vec(),
+                submission.runtime().manifest().capabilities.max_actors - 1,
+            );
+        assert_ne!(
+            altered_runtime.exact_bytes(),
+            submission.runtime().exact_bytes()
+        );
+        let altered_runtime =
+            super::super::clean_bootstrap::SharedGenesisRuntimePackage::External(altered_runtime);
+        assert_eq!(
+            owner.shared_create_locator(
+                submission.descriptor(),
+                submission.call(),
+                &altered_runtime,
+                submission.committee(),
+                true,
+            ),
+            Err(AgentProductionOwnerError::Lifecycle(
+                SharedAgentHostError::Conflict
+            ))
+        );
+        let altered_roster = super::super::genesis::AgentReplicaCommittee::new(
+            submission.committee().space(),
+            submission.committee().agent(),
+            submission.committee().profile(),
+            submission.committee().members()[..2].to_vec(),
+        )
+        .unwrap();
+        assert_ne!(&altered_roster, submission.committee());
+        assert_eq!(
+            owner.shared_create_locator(
+                submission.descriptor(),
+                submission.call(),
+                &runtime,
+                &altered_roster,
+                true,
+            ),
+            Err(AgentProductionOwnerError::Lifecycle(
+                SharedAgentHostError::Conflict
+            ))
+        );
+        assert_eq!(*calls.lock().unwrap(), expected_calls);
+        assert_eq!(owner.accepted_head, accepted);
+        assert!(owner.is_ready());
+        owner.request_shutdown();
+        assert_eq!(
+            owner.create_shared_disposition(submission, true),
+            Err(AgentProductionOwnerError::ShutdownRequested)
+        );
+        assert_eq!(*calls.lock().unwrap(), expected_calls);
+        queue.close();
+        owner.shutdown_and_join().unwrap();
+    }
+
     fn check_reconciliation_deadline(lifecycle: bool) {
         use super::super::shared_host::SharedAgentHostError;
         use std::sync::atomic::{AtomicU8, Ordering};
@@ -3021,6 +4642,8 @@ mod tests {
                 calls.clone(),
             )),
             accepted_head: None,
+            routes_verified: false,
+            routes_need_quarantine: false,
             reconcile_interval: interval,
             reconcile_after: admitted,
             lifecycle: None,

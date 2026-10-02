@@ -1,8 +1,9 @@
 //! `vosx space *` — local space lifecycle and daemon control.
 //!
 //! Clean-generation administration includes fresh Local Create and exact
-//! retained-request retries, Local Install, and managed Local invocation.
-//! Ordinary Shared-Agent provisioning remains unwired.
+//! retained-request retries, Local Install, and managed Local/Shared invocation.
+//! Shared Create/Install uses explicit signed runtime/enrollment artifacts;
+//! Create application is distinct from member admission and serving readiness.
 
 use clap::Subcommand;
 use std::path::PathBuf;
@@ -55,12 +56,23 @@ pub mod op_sign;
 #[cfg(target_os = "linux")]
 mod operation_authorization;
 pub mod reconcile;
+#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+mod shared_operation;
 mod space_lock;
 pub mod up;
 pub mod verify;
 
 #[derive(Subcommand, Debug)]
 pub enum SpaceCommand {
+    /// Prepare a fresh node from a verified pre-startup registry seed, not a restore.
+    #[cfg(target_os = "linux")]
+    PrepareBootstrapMember(backup::PrepareBootstrapMemberArgs),
+    /// Export this Space's retained node-key enrollment for a fixed-three bootstrap.
+    #[cfg(target_os = "linux")]
+    ExportBootstrapEnrollment(clean_startup::ExportBootstrapEnrollmentArgs),
+    /// Prepare one root-certified common bootstrap from three signed enrollments.
+    #[cfg(target_os = "linux")]
+    PrepareCommonBootstrap(clean_startup::PrepareCommonBootstrapArgs),
     /// Grant/revoke one deployment-scoped actor role, or resume retained admin work.
     #[cfg(target_os = "linux")]
     SetActorRole(admin_operation::SetActorRoleArgs),
@@ -82,15 +94,21 @@ pub enum SpaceCommand {
         #[arg(long)]
         http: std::net::SocketAddr,
     },
-    /// Authorize, deliver and positively retire exact Local invocation intent.
+    /// Authorize, deliver and positively retire exact Local/Shared invocation intent.
     #[cfg(target_os = "linux")]
+    #[command(name = "invoke-agent", visible_alias = "invoke-local")]
     InvokeLocal(local_operation::AuthorizeLocalArgs),
-    /// Invoke an installed Local actor using a signed package's method schema.
+    /// Invoke an installed Local/Shared actor using its signed package's method schema.
     #[cfg(target_os = "linux")]
+    #[command(name = "call-agent-actor", visible_alias = "call-local-actor")]
     CallLocalActor(local_call::CallLocalArgs),
-    /// Prepare and authorize exact ATQ1 intent on an operator-owned Local Agent.
+    /// Prepare and authorize exact ATQ1 on an operator-owned Local/Shared Agent.
     /// Does not apply the invocation; issuance leaves the credential pending.
     #[cfg(target_os = "linux")]
+    #[command(
+        name = "authorize-agent-invocation",
+        visible_alias = "authorize-local-invocation"
+    )]
     AuthorizeLocalInvocation(local_operation::AuthorizeLocalArgs),
     /// Submit or retry exact AOQ1 authorization; retain the verified decision.
     #[cfg(target_os = "linux")]
@@ -151,6 +169,16 @@ pub enum SpaceCommand {
         #[arg(long)]
         http: std::net::SocketAddr,
     },
+    /// Create an operator-owned fixed-three Shared Agent; exports Applied, not Ready.
+    #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+    CreateSharedAgent(shared_operation::CreateSharedArgs),
+    /// Admit a published Shared archive on this voter; does not claim quorum readiness.
+    #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+    #[command(name = "admit-shared")]
+    AdmitShared(shared_operation::AdmitSharedArgs),
+    /// Install a signed actor on an operator-owned Shared Agent, or resume exact work.
+    #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+    InstallSharedActor(shared_operation::InstallSharedArgs),
     /// Create a local space identity and data directory.
     New {
         name: String,
@@ -224,6 +252,14 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
         #[cfg(target_os = "linux")]
         SpaceCommand::AuthorizeLocalInvocation(args) => local_operation::run(args),
         #[cfg(target_os = "linux")]
+        SpaceCommand::PrepareBootstrapMember(args) => backup::prepare_bootstrap_member(args),
+        #[cfg(target_os = "linux")]
+        SpaceCommand::ExportBootstrapEnrollment(args) => {
+            clean_startup::export_bootstrap_enrollment(args)
+        }
+        #[cfg(target_os = "linux")]
+        SpaceCommand::PrepareCommonBootstrap(args) => clean_startup::prepare_common_bootstrap(args),
+        #[cfg(target_os = "linux")]
         SpaceCommand::SetActorRole(args) => admin_operation::run(args),
         #[cfg(target_os = "linux")]
         SpaceCommand::PrepareAdmin {
@@ -269,6 +305,12 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
         SpaceCommand::SubmitLocalCreate { request_dir, http } => {
             local_create::run_submit(&request_dir, http)
         }
+        #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+        SpaceCommand::CreateSharedAgent(args) => shared_operation::run_create(args),
+        #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+        SpaceCommand::AdmitShared(args) => shared_operation::run_admit(args),
+        #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+        SpaceCommand::InstallSharedActor(args) => shared_operation::run_install(args),
         SpaceCommand::New {
             name,
             registry,

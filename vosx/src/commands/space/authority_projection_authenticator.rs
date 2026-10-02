@@ -168,6 +168,9 @@ mod tests {
                 after: Some(ActorId([0x65; 32])),
                 limit: 5,
             },
+            AuthorityProjectionSelector::GenesisDecision {
+                agent: AgentId([0x66; 32]),
+            },
         ];
         let mut authenticator = OperatorAuthorityProjectionAuthenticator::new(operator()).unwrap();
         assert_eq!(authenticator.expected_kind(), AuthorityCredentialKind::Api);
@@ -229,6 +232,50 @@ mod tests {
                 .unwrap();
             assert_ne!(query.nonce, Hash::ZERO);
             assert!(nonces.insert(query.nonce.0));
+        }
+    }
+
+    #[test]
+    fn observation_authenticator_signs_only_fresh_non_delegated_queries() {
+        use vos::agent::sdk::wire::CanonicalWire as _;
+        let mut authenticator = OperatorAuthorityProjectionAuthenticator::new(operator()).unwrap();
+        let selector = AuthorityProjectionSelector::GenesisDecision {
+            agent: AgentId([0x73; 32]),
+        };
+        let first = authenticator.authenticate(target(), selector).unwrap();
+        let second = authenticator.authenticate(target(), selector).unwrap();
+        assert_eq!(first.recovery, None);
+        assert_eq!(second.recovery, None);
+        assert_ne!(first.nonce, second.nonce);
+        for query in [first, second] {
+            assert_eq!(
+                AuthorityProjectionQuery::decode(&query.encode().unwrap()).unwrap(),
+                query
+            );
+            let AuthorityIngressAuthentication::ApiCredentialSignature {
+                credential_public_key,
+                signature,
+            } = query.authentication
+            else {
+                unreachable!()
+            };
+            let key = VerifyingKey::from_bytes(&credential_public_key).unwrap();
+            let signature = Signature::from_bytes(&signature);
+            key.verify_strict(&query.signing_bytes(), &signature)
+                .unwrap();
+            let mut altered = query.clone();
+            altered.recovery = Some(
+                vos::agent::sdk::authority::AuthorityProjectionRecoveryDelegation {
+                    generation: Hash([0x71; 32]),
+                    committee: Hash([0x72; 32]),
+                    accepted_slot: 100,
+                    expires_at: 120,
+                },
+            );
+            assert!(
+                key.verify_strict(&altered.signing_bytes(), &signature)
+                    .is_err()
+            );
         }
     }
 

@@ -4278,7 +4278,8 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 return Err(AgentDriverError::InvalidRuntime);
             }
             #[cfg(feature = "experimental-state-blocks")]
-            crate::agent_sdk::RuntimeWork::InspectInvocation { .. } => {
+            crate::agent_sdk::RuntimeWork::InspectInvocation { .. }
+            | crate::agent_sdk::RuntimeWork::Observe { .. } => {
                 return Err(AgentDriverError::InvalidRuntime);
             }
         };
@@ -4318,7 +4319,8 @@ impl<S: AgentImageStore> AgentDriver<S> {
                         return Err(AgentDriverError::InvalidRuntime);
                     }
                     #[cfg(feature = "experimental-state-blocks")]
-                    crate::agent_sdk::RuntimeWork::InspectInvocation { .. } => {
+                    crate::agent_sdk::RuntimeWork::InspectInvocation { .. }
+                    | crate::agent_sdk::RuntimeWork::Observe { .. } => {
                         return Err(AgentDriverError::InvalidRuntime);
                     }
                 };
@@ -4358,7 +4360,8 @@ impl<S: AgentImageStore> AgentDriver<S> {
                         crate::agent_sdk::RuntimeWork::Manage { .. }
                         | crate::agent_sdk::RuntimeWork::Acknowledge { .. } => true,
                         #[cfg(feature = "experimental-state-blocks")]
-                        crate::agent_sdk::RuntimeWork::InspectInvocation { .. } => true,
+                        crate::agent_sdk::RuntimeWork::InspectInvocation { .. }
+                        | crate::agent_sdk::RuntimeWork::Observe { .. } => true,
                     }
                 {
                     return Err(AgentDriverError::InvalidRuntime);
@@ -5193,7 +5196,8 @@ fn validate_standard_sdk_yielded_transition(
             return Err(AgentDriverError::InvalidRuntime);
         }
         #[cfg(feature = "experimental-state-blocks")]
-        crate::agent_sdk::RuntimeWork::InspectInvocation { .. } => {
+        crate::agent_sdk::RuntimeWork::InspectInvocation { .. }
+        | crate::agent_sdk::RuntimeWork::Observe { .. } => {
             return Err(AgentDriverError::InvalidRuntime);
         }
     };
@@ -5377,7 +5381,8 @@ fn validate_sdk_exact_execution_transition(
             return Err(AgentDriverError::InvalidRuntime);
         }
         #[cfg(feature = "experimental-state-blocks")]
-        crate::agent_sdk::RuntimeWork::InspectInvocation { .. } => {
+        crate::agent_sdk::RuntimeWork::InspectInvocation { .. }
+        | crate::agent_sdk::RuntimeWork::Observe { .. } => {
             return Err(AgentDriverError::InvalidRuntime);
         }
     };
@@ -5445,7 +5450,8 @@ fn validate_sdk_exact_execution_transition(
             unreachable!("rejected above")
         }
         #[cfg(feature = "experimental-state-blocks")]
-        crate::agent_sdk::RuntimeWork::InspectInvocation { .. } => unreachable!("rejected above"),
+        crate::agent_sdk::RuntimeWork::InspectInvocation { .. }
+        | crate::agent_sdk::RuntimeWork::Observe { .. } => unreachable!("rejected above"),
     }
     let expected = super::wire::encode_standard_runtime_state(&runtime.snapshot());
     if next == &expected {
@@ -5471,7 +5477,8 @@ fn validate_sdk_error_transition(
                 return Err(AgentDriverError::InvalidRuntime);
             }
             #[cfg(feature = "experimental-state-blocks")]
-            crate::agent_sdk::RuntimeWork::InspectInvocation { .. } => {
+            crate::agent_sdk::RuntimeWork::InspectInvocation { .. }
+            | crate::agent_sdk::RuntimeWork::Observe { .. } => {
                 return Err(AgentDriverError::InvalidRuntime);
             }
         };

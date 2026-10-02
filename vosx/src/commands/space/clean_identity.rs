@@ -12,6 +12,7 @@ use core::fmt;
 use libp2p::PeerId;
 use libp2p::identity::{KeyType, Keypair};
 use vos::agent::clean_authority_issuer::CleanManagementReceiptSigner;
+use vos::agent::sdk::authority::{AuthorityIngressAuthentication, AuthorityProjectionQuery};
 use vos::agent::sdk::private::{NodeEncryptionEnrollment, PRIVATE_SIGNATURE_BYTES};
 use vos::agent::sdk::{CredentialId, NodeId, PrincipalId, SpaceId};
 
@@ -119,6 +120,27 @@ impl CleanManagementReceiptSigner for CleanOperatorIdentitySigner<'_> {
             .map_err(|_| CleanIdentitySignerError::InvalidSignatureLength)
     }
 
+    fn sign_authority_projection(&mut self, query: &AuthorityProjectionQuery) -> Option<[u8; 64]> {
+        if query.validate_shape().is_err()
+            || query.authority.binding.public_key != self.public_key
+            || query.credential != self.credential
+            || !matches!(
+                query.authentication,
+                AuthorityIngressAuthentication::ApiCredentialSignature {
+                    credential_public_key,
+                    ..
+                } if credential_public_key == self.public_key
+            )
+        {
+            return None;
+        }
+        self.keypair
+            .sign(&query.signing_bytes())
+            .ok()?
+            .try_into()
+            .ok()
+    }
+
     fn sign_management_application_ack(&mut self, message: &[u8]) -> Result<[u8; 64], Self::Error> {
         self.keypair
             .sign(message)
@@ -163,8 +185,31 @@ impl CleanManagementReceiptSigner for OwnedCleanOperatorIdentitySigner {
         CleanOperatorIdentitySigner::new(&self.keypair)?.sign_authority_receipt(message)
     }
 
+    fn sign_authority_projection(&mut self, query: &AuthorityProjectionQuery) -> Option<[u8; 64]> {
+        CleanOperatorIdentitySigner::new(&self.keypair)
+            .ok()?
+            .sign_authority_projection(query)
+    }
+
     fn sign_management_application_ack(&mut self, message: &[u8]) -> Result<[u8; 64], Self::Error> {
         CleanOperatorIdentitySigner::new(&self.keypair)?.sign_management_application_ack(message)
+    }
+}
+
+/// Sign the existing domain-separated genesis QC message with the retained
+/// operator key. Candidate/committee admission and durable signature pledging
+/// remain owned by `PreparedSharedGenesisEndorsement::endorse`; this adapter
+/// neither selects an authority nor grants finality.
+#[cfg(target_os = "linux")]
+impl vos::agent::clean_bootstrap::GenesisClaimSigner for OwnedCleanOperatorIdentitySigner {
+    type Error = CleanIdentitySignerError;
+
+    fn public_key(&self) -> [u8; 32] {
+        self.public_key
+    }
+
+    fn sign_genesis_claim(&mut self, message: &[u8; 32]) -> Result<[u8; 64], Self::Error> {
+        CleanManagementReceiptSigner::sign_authority_receipt(self, message)
     }
 }
 
@@ -410,6 +455,119 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_genesis_signer_binds_exact_claim_committee_and_operator() {
+        use vos::agent::clean_bootstrap::GenesisClaimSigner;
+        use vos::agent::committee::{
+            AuthorityClaimCommitment, AuthorityClaimDomain, AuthorityCommittee,
+            AuthorityCommitteeMember, AuthorityMemberRole, AuthorityQuorumCertificate,
+            AuthoritySignature, AuthoritySignerId,
+        };
+        use vos::service::{Hash as HostHash, NodeId as HostNodeId, SpaceId as HostSpaceId};
+
+        let keypair = operator_keypair();
+        let expected_public = CleanOperatorIdentitySigner::new(&keypair)
+            .unwrap()
+            .raw_public_key();
+        let mut signer = OwnedCleanOperatorIdentitySigner::new(keypair.clone()).unwrap();
+        assert_eq!(GenesisClaimSigner::public_key(&signer), expected_public);
+        let committee = AuthorityCommittee::new(
+            HostSpaceId([0x71; 32]),
+            HostHash([0x72; 32]),
+            1,
+            None,
+            vec![
+                AuthorityCommitteeMember::new(
+                    HostNodeId([0x73; 32]),
+                    expected_public,
+                    AuthorityMemberRole::Voter,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let claim = AuthorityClaimCommitment::of_bytes(
+            AuthorityClaimDomain::AgentGenesis,
+            1,
+            b"exact genesis claim",
+        );
+        let message = AuthorityQuorumCertificate::signing_message(
+            committee.authority_binding(),
+            committee.epoch(),
+            committee.commitment(),
+            claim,
+        );
+        let signature = signer.sign_genesis_claim(&message.0).unwrap();
+        assert_eq!(signature.as_slice(), keypair.sign(&message.0).unwrap());
+        assert_eq!(signer.sign_genesis_claim(&message.0).unwrap(), signature);
+        let endorsement = AuthoritySignature::new(
+            AuthoritySignerId::of_raw_ed25519(&expected_public),
+            signature,
+        )
+        .unwrap();
+        AuthorityQuorumCertificate::new(&committee, claim, vec![endorsement.clone()])
+            .unwrap()
+            .verify(&committee, claim)
+            .unwrap();
+
+        for substituted in [
+            AuthorityClaimCommitment::of_bytes(
+                AuthorityClaimDomain::AgentGenesis,
+                1,
+                b"different genesis claim",
+            ),
+            AuthorityClaimCommitment::of_bytes(
+                AuthorityClaimDomain::AgentGenesis,
+                2,
+                b"exact genesis claim",
+            ),
+            AuthorityClaimCommitment::of_bytes(
+                AuthorityClaimDomain::SystemAgentGenesis,
+                1,
+                b"exact genesis claim",
+            ),
+        ] {
+            assert!(
+                AuthorityQuorumCertificate::new(&committee, substituted, vec![endorsement.clone()])
+                    .unwrap()
+                    .verify(&committee, substituted)
+                    .is_err()
+            );
+        }
+        for substituted_message in [
+            AuthorityQuorumCertificate::signing_message(
+                HostHash([0x74; 32]),
+                committee.epoch(),
+                committee.commitment(),
+                claim,
+            ),
+            AuthorityQuorumCertificate::signing_message(
+                committee.authority_binding(),
+                2,
+                committee.commitment(),
+                claim,
+            ),
+            AuthorityQuorumCertificate::signing_message(
+                committee.authority_binding(),
+                committee.epoch(),
+                HostHash([0x75; 32]),
+                claim,
+            ),
+        ] {
+            assert!(!StrictRawVerifier.verify(
+                &expected_public,
+                &substituted_message.0,
+                &signature,
+            ));
+        }
+        let other = Keypair::ed25519_from_bytes([0x76; 32]).unwrap();
+        let other_public = CleanOperatorIdentitySigner::new(&other)
+            .unwrap()
+            .raw_public_key();
+        assert!(!StrictRawVerifier.verify(&other_public, &message.0, &signature));
+    }
+
     #[test]
     fn owned_lifecycle_signer_preserves_explicit_operator_identity() {
         let keypair = operator_keypair();
@@ -491,6 +649,116 @@ mod tests {
                 .sign_management_application_ack(b"application")
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn typed_projection_signing_requires_exact_root_api_identity_and_valid_shape() {
+        use vos::agent::sdk::authority::{
+            AgentAuthorityBinding, AuthorityActorTarget, AuthorityProjectionRecoveryDelegation,
+            AuthorityProjectionSelector,
+        };
+        let keypair = operator_keypair();
+        let mut borrowed = CleanOperatorIdentitySigner::new(&keypair).unwrap();
+        let mut owned = OwnedCleanOperatorIdentitySigner::new(keypair.clone()).unwrap();
+        let public = borrowed.raw_public_key();
+        let query = AuthorityProjectionQuery {
+            authority: AuthorityActorTarget {
+                space: SpaceId([0x81; 32]),
+                system_agent: AgentId([0x82; 32]),
+                system_runtime_deployment: DeploymentId([0x83; 32]),
+                binding: AgentAuthorityBinding {
+                    policy: Hash([0x84; 32]),
+                    issuer: AuthorityIssuer {
+                        principal: borrowed.principal(),
+                        actor: ActorId([0x85; 32]),
+                        deployment: DeploymentId([0x86; 32]),
+                        program: ProgramId([0x87; 32]),
+                        producer: ProducerId::of_public_key(&public),
+                    },
+                    public_key: public,
+                    initial_epoch: 1,
+                },
+            },
+            credential: borrowed.credential(),
+            nonce: Hash([0x88; 32]),
+            selector: AuthorityProjectionSelector::GenesisDecision {
+                agent: AgentId([0x89; 32]),
+            },
+            recovery: None,
+            authentication: AuthorityIngressAuthentication::ApiCredentialSignature {
+                credential_public_key: public,
+                signature: [1; 64],
+            },
+        };
+        assert_eq!(query.validate_shape(), Ok(()));
+        let original = query.clone();
+        let signature = borrowed.sign_authority_projection(&query).unwrap();
+        assert_eq!(owned.sign_authority_projection(&query), Some(signature));
+        assert_eq!(
+            signature.as_slice(),
+            keypair.sign(&query.signing_bytes()).unwrap()
+        );
+        assert_eq!(query, original);
+        let mut retired = query.clone();
+        retired.recovery = Some(AuthorityProjectionRecoveryDelegation {
+            generation: Hash([0x8a; 32]),
+            committee: Hash([0x8b; 32]),
+            accepted_slot: 10,
+            expires_at: 20,
+        });
+        assert!(retired.validate_shape().is_err());
+        assert_eq!(borrowed.sign_authority_projection(&retired), None);
+        assert_eq!(owned.sign_authority_projection(&retired), None);
+
+        let foreign = Keypair::ed25519_from_bytes([0x8c; 32]).unwrap();
+        let foreign_public = CleanOperatorIdentitySigner::new(&foreign)
+            .unwrap()
+            .raw_public_key();
+        let mut other_signer = OwnedCleanOperatorIdentitySigner::new(foreign).unwrap();
+        assert_eq!(other_signer.sign_authority_projection(&query), None);
+        for field in 0..6 {
+            let mut invalid = query.clone();
+            match field {
+                0 => {
+                    invalid.authority.binding.public_key = foreign_public;
+                    invalid.authority.binding.issuer.producer =
+                        ProducerId::of_public_key(&foreign_public);
+                    assert_eq!(invalid.validate_shape(), Ok(()));
+                }
+                1 => {
+                    invalid.credential = CredentialId::of_public_key(&foreign_public);
+                    invalid.authentication =
+                        AuthorityIngressAuthentication::ApiCredentialSignature {
+                            credential_public_key: foreign_public,
+                            signature: [1; 64],
+                        };
+                    assert_eq!(invalid.validate_shape(), Ok(()));
+                }
+                2 => invalid.credential = CredentialId::ZERO,
+                3 => invalid.nonce = Hash::ZERO,
+                4 => invalid.recovery = retired.recovery,
+                5 => {
+                    invalid.authentication = AuthorityIngressAuthentication::SshNodeAttestation {
+                        credential_public_key: public,
+                        node: NodeId([0x8d; 32]),
+                        request_binding: Hash([0x8e; 32]),
+                        signature: [1; 64],
+                    };
+                    assert_eq!(invalid.validate_shape(), Ok(()));
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                borrowed.sign_authority_projection(&invalid),
+                None,
+                "field {field}"
+            );
+            assert_eq!(
+                owned.sign_authority_projection(&invalid),
+                None,
+                "field {field}"
+            );
+        }
     }
 
     #[test]

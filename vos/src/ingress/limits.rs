@@ -17,6 +17,18 @@ pub(crate) fn request_body_limit(method: &http::Method, uri: &http::Uri) -> usiz
             "/__agents/local/install" => {
                 return crate::agent::local_lifecycle::LocalInstallSubmission::MAX_BYTES;
             }
+            #[cfg(feature = "experimental-state-blocks")]
+            "/_vos/agents/shared/create" => {
+                return crate::agent::local_lifecycle::SharedCreateSubmission::MAX_BYTES;
+            }
+            #[cfg(feature = "experimental-state-blocks")]
+            "/_vos/agents/shared/install" => {
+                return crate::agent::local_lifecycle::SharedInstallSubmission::MAX_BYTES;
+            }
+            #[cfg(feature = "experimental-state-blocks")]
+            "/_vos/agents/shared/admit" => {
+                return crate::agent::local_lifecycle::SharedMemberAdmissionSubmission::MAX_BYTES;
+            }
             _ => {}
         }
     }
@@ -62,5 +74,42 @@ mod tests {
             request_body_limit(&http::Method::POST, &"/__agents/invoke".parse().unwrap()),
             MAX_BODY_BYTES
         );
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn only_exact_shared_post_routes_receive_package_bounds() {
+        for (path, ceiling) in [
+            (
+                "/_vos/agents/shared/create",
+                crate::agent::local_lifecycle::SharedCreateSubmission::MAX_BYTES,
+            ),
+            (
+                "/_vos/agents/shared/install",
+                crate::agent::local_lifecycle::SharedInstallSubmission::MAX_BYTES,
+            ),
+            (
+                "/_vos/agents/shared/admit",
+                crate::agent::local_lifecycle::SharedMemberAdmissionSubmission::MAX_BYTES,
+            ),
+        ] {
+            assert_eq!(
+                request_body_limit(&http::Method::POST, &path.parse().unwrap()),
+                ceiling
+            );
+            assert_eq!(
+                request_body_limit(&http::Method::GET, &path.parse().unwrap()),
+                MAX_BODY_BYTES
+            );
+            for suffix in ["/", "?alias=1"] {
+                assert_eq!(
+                    request_body_limit(
+                        &http::Method::POST,
+                        &format!("{path}{suffix}").parse().unwrap()
+                    ),
+                    MAX_BODY_BYTES
+                );
+            }
+        }
     }
 }

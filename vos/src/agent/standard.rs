@@ -582,6 +582,31 @@ pub(crate) fn clean_authorization_is_live_at(
     }
 }
 
+/// Structural validation of a retained acceptance before a runtime descriptor
+/// is available. Public preflight retains its exact original observation.
+pub(crate) fn clean_accepted_authorization_is_live_at(
+    _accepted: &crate::agent_sdk::InvocationRetirement,
+    authorization: &crate::agent_sdk::InvocationAuthorization,
+    observed_slot: u64,
+) -> bool {
+    clean_authorization_is_live_at(authorization, observed_slot)
+}
+
+pub(crate) fn clean_accepted_error_authorization_window_is_valid(
+    accepted: &crate::agent_sdk::InvocationRetirement,
+    authorization: &crate::agent_sdk::InvocationAuthorization,
+    error: crate::agent_sdk::InvocationError,
+    observed_slot: u64,
+) -> bool {
+    if error == crate::agent_sdk::InvocationError::ExpiredBeforeExecution {
+        matches!(authorization,
+            crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(receipt)
+                if observed_slot > receipt.selector.expires_at)
+    } else {
+        clean_accepted_authorization_is_live_at(accepted, authorization, observed_slot)
+    }
+}
+
 pub(crate) fn clean_authorization_work(
     authorization: &crate::agent_sdk::InvocationAuthorization,
 ) -> Hash {
@@ -1008,47 +1033,62 @@ fn is_system_authority_projection_query(
     work: &crate::agent_sdk::InvocationRetirement,
     authorization: &crate::agent_sdk::InvocationAuthorization,
 ) -> bool {
+    use crate::agent_sdk::authority::AuthorityActorTarget;
+
+    descriptor.identity.profile == crate::agent_sdk::AgentProfile::Shared
+        && canonical_system_authority_projection_query(work, authorization).is_some_and(|query| {
+            query.authority
+                == (AuthorityActorTarget {
+                    space: descriptor.identity.space,
+                    system_agent: descriptor.identity.agent,
+                    system_runtime_deployment: descriptor.identity.runtime_deployment,
+                    binding: descriptor.authority,
+                })
+        })
+}
+
+/// Structural query binding used by retained acceptance as well as live
+/// descriptor checks. The complete target must match the installed descriptor;
+/// this never changes the original public preflight observation.
+fn canonical_system_authority_projection_query(
+    work: &crate::agent_sdk::InvocationRetirement,
+    authorization: &crate::agent_sdk::InvocationAuthorization,
+) -> Option<crate::agent_sdk::authority::AuthorityProjectionQuery> {
     use crate::actors::codec::{Decode as _, Encode as _};
     use crate::actors::value::{Msg, TAG_DYNAMIC, Value};
-    use crate::agent_sdk::authority::{
-        AuthorityActorTarget, AuthorityProjectionQuery, AuthorityProjectionSelector,
-    };
+    use crate::agent_sdk::authority::{AuthorityProjectionQuery, AuthorityProjectionSelector};
     use crate::agent_sdk::wire::CanonicalWire as _;
 
-    if descriptor.identity.profile != crate::agent_sdk::AgentProfile::Shared
+    if !work.validate_accepted()
         || work.mode != crate::agent_sdk::MethodMode::Query
         || !matches!(
             authorization,
             crate::agent_sdk::InvocationAuthorization::PublicPreflight(_)
         )
-        || work.space != descriptor.identity.space
-        || work.agent != descriptor.identity.agent
-        || work.actor != descriptor.authority.issuer.actor
-        || work.deployment != descriptor.authority.issuer.deployment
-        || work.program != descriptor.authority.issuer.program
+        || !authorization.matches_retirement(work)
         || work.origin.principal.is_some()
         || work.origin.credential.is_some()
         || work.origin.actor.is_some()
         || work.origin.capability.is_some()
         || work.roles != crate::agent_sdk::InvocationRoleClaims::none()
     {
-        return false;
+        return None;
     }
     let Some(message) = work
         .message
         .strip_prefix(&[TAG_DYNAMIC])
         .and_then(Msg::try_decode)
     else {
-        return false;
+        return None;
     };
     if message.args.0.len() != 1 {
-        return false;
+        return None;
     }
     let Some(Value::Bytes(query_bytes)) = message.args.get("query") else {
-        return false;
+        return None;
     };
     let Ok(query) = AuthorityProjectionQuery::decode(query_bytes) else {
-        return false;
+        return None;
     };
     let expected_method = match query.selector {
         AuthorityProjectionSelector::Inventory { .. } => "inventory_projection_page",
@@ -1056,17 +1096,17 @@ fn is_system_authority_projection_query(
         AuthorityProjectionSelector::Agents { .. } => "agent_projection_page",
         AuthorityProjectionSelector::AgentReplicas { .. } => "agent_replica_projection_page",
         AuthorityProjectionSelector::Actors { .. } => "actor_projection_page",
+        AuthorityProjectionSelector::GenesisDecision { .. } => "genesis_decision_projection",
     };
-    query.validate_shape().is_ok()
+    (query.validate_shape().is_ok()
         && query.encode().ok().as_deref() == Some(query_bytes.as_slice())
         && message.name == expected_method
-        && query.authority
-            == (AuthorityActorTarget {
-                space: descriptor.identity.space,
-                system_agent: descriptor.identity.agent,
-                system_runtime_deployment: descriptor.identity.runtime_deployment,
-                binding: descriptor.authority,
-            })
+        && work.space == query.authority.space
+        && work.agent == query.authority.system_agent
+        && work.runtime_deployment == query.authority.system_runtime_deployment
+        && work.actor == query.authority.binding.issuer.actor
+        && work.deployment == query.authority.binding.issuer.deployment
+        && work.program == query.authority.binding.issuer.program
         && query.attesting_node() == work.origin.transport_node
         && work.invocation
             == crate::agent_sdk::InvocationId(
@@ -1076,7 +1116,8 @@ fn is_system_authority_projection_query(
                 )
                 .0,
             )
-        && message.encode() == work.message[1..]
+        && message.encode() == work.message[1..])
+        .then_some(query)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1859,7 +1900,8 @@ impl StandardAgentRuntime {
                                 binding.observed_slot,
                             )
                             .is_ok()
-                        && clean_authorization_is_live_at(
+                        && runtime.accepted_authorization_is_live_at(
+                            &binding.accepted,
                             &binding.authorization,
                             binding.observed_slot,
                         )
@@ -1948,7 +1990,8 @@ impl StandardAgentRuntime {
                         // the signed window once on every hostile-state
                         // restore. Current-time expiry is deliberately not
                         // reapplied when Resume later executes.
-                        && clean_authorization_is_live_at(
+                        && runtime.accepted_authorization_is_live_at(
+                            accepted,
                             authorization,
                             continuation.observed_slot,
                         )
@@ -2550,7 +2593,11 @@ impl StandardAgentRuntime {
             .as_ref()
             .ok_or(InvocationError::DivergentInvocation)?;
         if !binding.matches(work, authorization)
-            || !clean_authorization_is_live_at(&binding.authorization, binding.observed_slot)
+            || !self.accepted_authorization_is_live_at(
+                &binding.accepted,
+                &binding.authorization,
+                binding.observed_slot,
+            )
             || observed_slot < binding.observed_slot
             || self
                 .result_authority_slot(result.storage)
@@ -2624,7 +2671,11 @@ impl StandardAgentRuntime {
             .as_ref()
             .ok_or(InvocationError::DivergentInvocation)?;
         if !binding.matches_retirement(work, authorization)
-            || !clean_authorization_is_live_at(&binding.authorization, binding.observed_slot)
+            || !self.accepted_authorization_is_live_at(
+                &binding.accepted,
+                &binding.authorization,
+                binding.observed_slot,
+            )
             || observed_slot < binding.observed_slot
             || self
                 .result_authority_slot(result.storage)
@@ -2772,6 +2823,44 @@ impl StandardAgentRuntime {
         }
     }
 
+    fn accepted_authorization_is_live_at(
+        &self,
+        _accepted: &crate::agent_sdk::InvocationRetirement,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        observed_slot: u64,
+    ) -> bool {
+        clean_authorization_is_live_at(authorization, observed_slot)
+    }
+
+    /// A public preflight observation is immutable. Exact retries use the
+    /// original acceptance, never a refreshed authorization or clock.
+    pub(crate) fn clean_invocation_authorization_is_live_at(
+        &self,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        observed_slot: u64,
+    ) -> bool {
+        self.accepted_authorization_is_live_at(
+            &crate::agent_sdk::InvocationRetirement::from_work(work),
+            authorization,
+            observed_slot,
+        )
+    }
+
+    pub(crate) fn clean_invocation_error_authorization_window_is_valid(
+        &self,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        error: crate::agent_sdk::InvocationError,
+        observed_slot: u64,
+    ) -> bool {
+        if error == crate::agent_sdk::InvocationError::ExpiredBeforeExecution {
+            Self::clean_error_authorization_window_is_valid(authorization, error, observed_slot)
+        } else {
+            self.clean_invocation_authorization_is_live_at(work, authorization, observed_slot)
+        }
+    }
+
     #[cfg(any(feature = "pvm", feature = "std"))]
     pub(crate) fn validate_clean_unseen_invocation_slot(
         &self,
@@ -2783,6 +2872,30 @@ impl StandardAgentRuntime {
         if !clean_authorization_is_live_at(authorization, observed_slot) {
             return Err(InvocationError::AuthorityExpired);
         }
+        self.validate_clean_unseen_invocation_clock(authorization, observed_slot)
+    }
+
+    #[cfg(any(feature = "pvm", feature = "std"))]
+    pub(crate) fn validate_clean_unseen_invocation_work_slot(
+        &self,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        observed_slot: u64,
+    ) -> Result<(), crate::agent_sdk::InvocationError> {
+        if !self.clean_invocation_authorization_is_live_at(work, authorization, observed_slot) {
+            return Err(crate::agent_sdk::InvocationError::AuthorityExpired);
+        }
+        self.validate_clean_unseen_invocation_clock(authorization, observed_slot)
+    }
+
+    #[cfg(any(feature = "pvm", feature = "std"))]
+    fn validate_clean_unseen_invocation_clock(
+        &self,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        observed_slot: u64,
+    ) -> Result<(), crate::agent_sdk::InvocationError> {
+        use crate::agent_sdk::InvocationError;
+
         if let crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(receipt) = authorization
         {
             if self
@@ -2980,6 +3093,76 @@ impl StandardAgentRuntime {
         Ok(ResolvedCleanInvocation { work, actor, parts })
     }
 
+    /// Admit only installed System Authority observations under the explicitly
+    /// signed image-observation contract. PublicPreflight grants no identity:
+    /// the installed Authority guest verifies the signed query and its current
+    /// credential/revocation facts at this same state revision.
+    #[cfg(all(feature = "pvm", feature = "experimental-state-blocks"))]
+    pub(crate) fn validate_system_authority_observation(
+        &self,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        observed_slot: u64,
+    ) -> Result<(), crate::agent_sdk::InvocationError> {
+        use crate::actors::codec::{Decode as _, Encode as _};
+        use crate::actors::value::{Msg, TAG_DYNAMIC};
+        use crate::agent_sdk::{InvocationAuthorization, InvocationError};
+
+        let descriptor = self.clean_descriptor().ok_or(InvocationError::NotCreated)?;
+        let InvocationAuthorization::PublicPreflight(preflight) = authorization else {
+            return Err(InvocationError::InvalidAuthorization);
+        };
+        if !descriptor.runtime_contract.supports_system_observation()
+            || descriptor.identity.profile != crate::agent_sdk::AgentProfile::Shared
+            || work.space != descriptor.identity.space
+            || work.agent != descriptor.identity.agent
+            || work.runtime_deployment != descriptor.identity.runtime_deployment
+            || work.actor != descriptor.authority.issuer.actor
+            || work.deployment != descriptor.authority.issuer.deployment
+            || work.program != descriptor.authority.issuer.program
+            || work.mode != crate::agent_sdk::MethodMode::Query
+            || work.recovery_only
+            || !work.validate()
+            || !preflight.matches(work, observed_slot)
+            || work.origin.principal.is_some()
+            || work.origin.credential.is_some()
+            || work.origin.actor.is_some()
+            || work.origin.capability.is_some()
+            || work.roles != crate::agent_sdk::InvocationRoleClaims::none()
+        {
+            return Err(InvocationError::InvalidAuthorization);
+        }
+        let signed_query = canonical_system_authority_projection_query(
+            &crate::agent_sdk::InvocationRetirement::from_work(work),
+            authorization,
+        )
+        .is_some_and(|query| {
+            query.recovery.is_none()
+                && query.authority
+                    == (crate::agent_sdk::authority::AuthorityActorTarget {
+                        space: descriptor.identity.space,
+                        system_agent: descriptor.identity.agent,
+                        system_runtime_deployment: descriptor.identity.runtime_deployment,
+                        binding: descriptor.authority,
+                    })
+        });
+        // This existing query reveals the immutable signing committee only.
+        // It has no caller-selected arguments or credential-bearing claims.
+        let committee_query = work
+            .message
+            .strip_prefix(&[TAG_DYNAMIC])
+            .and_then(Msg::try_decode)
+            .is_some_and(|message| {
+                message.name == "genesis_signing_committee"
+                    && message.args.0.is_empty()
+                    && message.encode() == work.message[1..]
+            });
+        if !signed_query && !committee_query {
+            return Err(InvocationError::InvalidAuthorization);
+        }
+        self.validate_clean_unseen_invocation_clock(authorization, observed_slot)
+    }
+
     #[cfg(feature = "pvm")]
     pub(crate) fn validate_unseen_invocation_slot(
         &self,
@@ -3005,6 +3188,29 @@ impl StandardAgentRuntime {
         &self,
         invocation: &super::execution::ActorInvocation,
     ) -> Result<super::execution::ActorStateLanes, super::execution::ActorExecutionError> {
+        self.prepare_execution_state_inner(invocation, true)
+    }
+
+    /// Observation has no result lane or result-capacity dependency. It still
+    /// authenticates the installed target, suspension, lane visibility and
+    /// aggregate input bound using the ordinary execution preparation.
+    #[cfg(all(feature = "pvm", feature = "experimental-state-blocks"))]
+    pub(crate) fn prepare_observation_state(
+        &self,
+        invocation: &super::execution::ActorInvocation,
+    ) -> Result<super::execution::ActorStateLanes, super::execution::ActorExecutionError> {
+        if invocation.mode != super::MethodMode::Query {
+            return Err(super::execution::ActorExecutionError::UnsupportedMethod);
+        }
+        self.prepare_execution_state_inner(invocation, false)
+    }
+
+    #[cfg(feature = "pvm")]
+    fn prepare_execution_state_inner(
+        &self,
+        invocation: &super::execution::ActorInvocation,
+        retain_result: bool,
+    ) -> Result<super::execution::ActorStateLanes, super::execution::ActorExecutionError> {
         use super::execution::{ActorExecutionError, ActorStateLanes};
 
         let config = self
@@ -3020,14 +3226,17 @@ impl StandardAgentRuntime {
                 return Err(ActorExecutionError::UnsupportedMethod);
             }
         }
-        let result_storage = invocation.mode.result_storage();
-        if !self.result_storage_supported(result_storage) {
-            return Err(ActorExecutionError::UnsupportedResultStorage);
-        }
-        if self.invocation_result_count(result_storage) >= MAX_INVOCATION_RESULTS_PER_LANE
-            || self.invocation_result_bytes(result_storage) >= MAX_INVOCATION_RESULT_BYTES_PER_LANE
-        {
-            return Err(ActorExecutionError::ResultCapacity);
+        if retain_result {
+            let result_storage = invocation.mode.result_storage();
+            if !self.result_storage_supported(result_storage) {
+                return Err(ActorExecutionError::UnsupportedResultStorage);
+            }
+            if self.invocation_result_count(result_storage) >= MAX_INVOCATION_RESULTS_PER_LANE
+                || self.invocation_result_bytes(result_storage)
+                    >= MAX_INVOCATION_RESULT_BYTES_PER_LANE
+            {
+                return Err(ActorExecutionError::ResultCapacity);
+            }
         }
         let resolve = |lane| -> Result<Option<Vec<u8>>, ActorExecutionError> {
             if !actor.record.entry.lanes.contains(lane) {
@@ -3196,12 +3405,13 @@ impl StandardAgentRuntime {
         }
         if work.commitment().0 != record.work.0
             || record.authorization.as_ref().is_none_or(|authorization| {
-                !clean_authorization_matches_accepted(
+                self.verify_clean_accepted_authorization(
                     accepted,
                     authorization,
                     record.work,
                     record.observed_slot,
                 )
+                .is_err()
             })
         {
             return Err(InvocationError::StaleContinuation);
@@ -3290,6 +3500,18 @@ impl StandardAgentRuntime {
         use super::execution::{ActorExecutionError, ActorExecutionStatus};
 
         self.validate_invocation_target(invocation)?;
+        if let Some((accepted, authorization)) = accepted.as_ref() {
+            self.verify_clean_accepted_authorization(
+                accepted,
+                authorization,
+                clean_authorization_work(authorization),
+                observed_slot,
+            )
+            .map_err(|_| ActorExecutionError::InvalidAuthorization)?;
+            if !self.accepted_authorization_is_live_at(accepted, authorization, observed_slot) {
+                return Err(ActorExecutionError::AuthorityExpired);
+            }
+        }
         if reply.invocation != invocation.invocation
             || reply.actor != invocation.actor
             || reply.incarnation != invocation.incarnation
@@ -4153,7 +4375,7 @@ impl StandardAgentRuntime {
                 crate::agent_sdk::InvocationError::NotCreated => ActorExecutionError::NotCreated,
                 _ => ActorExecutionError::InvalidAuthorization,
             })?;
-        if !clean_authorization_is_live_at(authorization, observed_slot) {
+        if !self.clean_invocation_authorization_is_live_at(work, authorization, observed_slot) {
             return Err(ActorExecutionError::AuthorityExpired);
         }
         let accepted = StandardAcceptedInvocation::from_work(work);
@@ -4395,7 +4617,7 @@ impl StandardAgentRuntime {
 
         self.verify_clean_invocation_authorization(work, authorization, observed_slot)
             .map_err(|_| ActorExecutionError::InvalidAuthorization)?;
-        if !clean_authorization_is_live_at(authorization, observed_slot) {
+        if !self.clean_invocation_authorization_is_live_at(work, authorization, observed_slot) {
             return Err(ActorExecutionError::AuthorityExpired);
         }
         let (resolved, ..) = self
@@ -4656,7 +4878,11 @@ impl StandardAgentRuntime {
             return Err(InvocationError::InvalidAuthorization);
         }
         if !binding.matches_retirement(work, authorization)
-            || !clean_authorization_is_live_at(&binding.authorization, binding.observed_slot)
+            || !self.accepted_authorization_is_live_at(
+                &binding.accepted,
+                &binding.authorization,
+                binding.observed_slot,
+            )
             || self
                 .result_authority_slot(result.storage)
                 .is_none_or(|slot| slot < binding.observed_slot)
@@ -4740,7 +4966,8 @@ impl StandardAgentRuntime {
             && binding.accepted.validate_accepted()
             && binding.work != crate::agent_sdk::Hash::ZERO
             && self.result_storage_supported(record.storage())
-            && Self::clean_error_authorization_window_is_valid(
+            && self.accepted_error_authorization_window_is_valid(
+                &binding.accepted,
                 &binding.authorization,
                 record.error,
                 binding.observed_slot,
@@ -4829,6 +5056,20 @@ impl StandardAgentRuntime {
         }
     }
 
+    fn accepted_error_authorization_window_is_valid(
+        &self,
+        accepted: &crate::agent_sdk::InvocationRetirement,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        error: crate::agent_sdk::InvocationError,
+        observed_slot: u64,
+    ) -> bool {
+        if error == crate::agent_sdk::InvocationError::ExpiredBeforeExecution {
+            Self::clean_error_authorization_window_is_valid(authorization, error, observed_slot)
+        } else {
+            self.accepted_authorization_is_live_at(accepted, authorization, observed_slot)
+        }
+    }
+
     /// Resolve only an unseen signed invocation whose execution window ended.
     /// Existing results and continuations stay on their exact recovery paths.
     pub(crate) fn retain_clean_unseen_expiry(
@@ -4880,7 +5121,12 @@ impl StandardAgentRuntime {
         if !error.is_durable_exact_outcome() {
             return Err(InvocationError::InvalidInput);
         }
-        if !Self::clean_error_authorization_window_is_valid(authorization, error, observed_slot) {
+        if !self.clean_invocation_error_authorization_window_is_valid(
+            work,
+            authorization,
+            error,
+            observed_slot,
+        ) {
             return Err(InvocationError::AuthorityExpired);
         }
         if error == InvocationError::ExpiredBeforeExecution {
@@ -4992,7 +5238,7 @@ impl StandardAgentRuntime {
     }
 
     #[cfg(feature = "pvm")]
-    fn observation(
+    pub(crate) fn observation(
         &self,
         actor: ActorId,
         mode: super::MethodMode,
@@ -7117,6 +7363,50 @@ mod tests {
 
     fn authority_key() -> SigningKey {
         SigningKey::from_bytes(&[0x42; 32])
+    }
+
+    #[test]
+    fn public_query_preflight_keeps_exact_original_observation() {
+        use crate::agent_sdk as sdk;
+        let work = sdk::InvocationWork {
+            space: sdk::SpaceId([1; 32]),
+            agent: sdk::AgentId([2; 32]),
+            runtime_deployment: sdk::DeploymentId([3; 32]),
+            invocation: sdk::InvocationId([4; 32]),
+            actor: sdk::ActorId([5; 32]),
+            incarnation: sdk::Hash([6; 32]),
+            deployment: sdk::DeploymentId([7; 32]),
+            program: sdk::ProgramId([8; 32]),
+            mode: sdk::MethodMode::Query,
+            origin: sdk::InvocationOrigin::anonymous(),
+            roles: sdk::InvocationRoleClaims::none(),
+            message: vec![1],
+            installation_data: None,
+            availability: vec![],
+            gas: 1,
+            recovery_only: false,
+        };
+        assert!(work.validate());
+        let accepted = sdk::InvocationRetirement::from_work(&work);
+        let authorization = sdk::InvocationAuthorization::PublicPreflight(
+            sdk::PublicPreflight::for_work(&work, 10),
+        );
+        for observed_slot in [9, 10, 11, u64::MAX] {
+            let exact = observed_slot == 10;
+            assert_eq!(
+                clean_authorization_matches_accepted(
+                    &accepted,
+                    &authorization,
+                    Hash(work.commitment().0),
+                    observed_slot,
+                ),
+                exact,
+            );
+            assert_eq!(
+                clean_accepted_authorization_is_live_at(&accepted, &authorization, observed_slot,),
+                exact,
+            );
+        }
     }
 
     #[cfg(feature = "pvm")]

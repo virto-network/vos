@@ -1,431 +1,475 @@
 # Agent saga: v1 release checklist
 
 This is the single live plan. [The review guide](agent-saga-review.md) is the
-sole reviewer entry point. Historical evidence lives in Git, not parallel plans.
-A passing internal checkpoint is not a release; no completion percentage or
-release date is established.
+sole reviewer entry point. Implementation, integration and qualification are
+different milestones. Internal tests or a checkpoint do not constitute release.
 
-## Approved finish line and current position
+## Approved scope and next integrated milestone
 
-A usable **Linux x86-64, fixed authenticated three-node Shared deployment**,
-production **image-based Local Agents**, and one Shared Clerk with **100,000
-retained transfers**. Preserve Clerk's kernel, signatures, committed roots and
-exact retry semantics. A singleton, smaller dataset or experimental-only release
-requires a new user decision.
+Ship Linux x86-64, a fixed authenticated three-node Shared deployment,
+production image-based Local Agents, and one external-state Shared Clerk.
+Fresh external roots are required; no migration or public external-Local cutover.
+The workload, latency, recovery and correctness targets below are unchanged.
 
-The user requested completing this plan before the next whole-branch review.
-This batch follows the qualified archive/preflight checkpoint `49be3bda`; its source
-boundary is that checkpoint plus the implementation in the commit containing
-this document. The active worktree is `.worktrees/ch08-runtime-directory`.
-Verify actual branch heads and cleanliness before using the checkpoint; do not
-infer promotion from these docs. `master` remains `d2378274`; no automatic push,
-mainline change, artifact promotion or deployment is included.
+Approved next priority (2026-10-02): replace internal durable Authority reads
+with scoped observations and remove the obsolete read lifecycle. Fresh v1
+spaces are required, including System/control and Shared roots; existing
+experimental spaces stay untouched and are unsupported by the new binary.
+Local execution/format remains image-based. No migration or legacy-read fallback.
 
-**Implemented** means source and focused tests exist; **integrated** means the
-supported workflow selects it; **qualified** means its specified acceptance test
-passes on the actual release. These are separate milestones.
+The next milestone is the **released three-process Shared Clerk workflow**:
+public Create/Install/Invoke, lost response, restart/catch-up and leader loss,
+recovering the exact result through real filesystem owners and public routing.
+Acceptance uses packaged artifacts and ordinary authenticated identities, not
+test signers, environment-only guests, fake quorum or hand-edited journals.
+A small vertical slice proves integration only, not capacity or service targets.
 
-## This batch: typed destination restore
+Starting checkpoint: `e6f2bb45` on `saga/agents` and
+`wip/ch08-runtime-directory`; active edits are in the latter worktree.
+Verify actual heads/cleanliness before assuming promotion.
+`master` remains `d2378274`. No push, master change, artifact pin promotion or
+deployment is automatic.
 
-`49be3bda` qualifies streaming archive and detached import preflight; use
-`git show 49be3bda:docs/agent-saga-review.md` for its exact evidence.
-The connected candidate implementation adds exact unexposed quarantine resume,
-bounded source-closure promotion under the opaque source-audit/rebind plan, and
-a destination publication capability that audits both actual endpoint trees.
-It preserves source physical identity checks and returns no serving pin.
-Binding-aware ledger preflight permits only the exact installed anchor on retry,
-while refusing later committed **or uncommitted** work before head promotion.
+## Current position
 
-The healthy physical fixture qualifies typed destination CAS, certified ledger
-restore, real file-owner reopen, signed Clerk Invoke/ACK and another reopen on
-the default optimized build. All seven external physical fixtures, four image
-checkpoint/restore cases and 266 distinct core regressions pass. Missing actual
-endpoint blocks refuse without repair; exact staged-head and post-ledger retries
-are tested. This is not automatic host-marker recovery,
-network catch-up, public import, reclamation or a released customer workflow.
-The earlier streaming/preflight boundary is summarized below; do not inherit its
-test counts for these changes; the review guide owns this source's evidence.
+| Mandatory gate | Implementation | Integration / qualification |
+| --- | --- | --- |
+| Internal Authority observations | O1/O2 and O3 removal are implemented: no read custody/transport/apply/expiry lifecycle. Management retention and public Invoke/ACK remain. | Current O3 fixed-three physical observation **passes 86.19s**; management/replay/owner/supervisor/protocol/observation checks **241/241** pass (10 ignored). SDK **259 + 256 passed**, each 1 ignored. New System and external guests build/link; actual paired signed-role/purity probes **pass 4.64s** with explicit, unmeasured limits. Packaging/startup edits still need a coherent frozen build and integrated M1 acceptance. No released workflow or SLA pass. |
+| External storage/restore | Incremental executor, immutable closure, ACX1 publication and exact marker retirement exist. | Historical optimized reopen/crash-cut slices pass; the released workflow must requalify. |
+| System management recovery | Parent retention, immutable MRQ2 first-owner binding, exact mutation evidence, signed terminal release and recovery remain. | Current physical offline-pruning/Install test **fails 156.67s** at authentic checkpoint restore (`SnapshotReplay`); diagnosis is mandatory before M1. Corrected custody/replay unit tests pass, but returning/all-cold Shared pending-Install remain unqualified. Historical passes do not qualify this source. |
+| Member/public management | OGAR handoff, Root/live roster proof, resumable signed CLI, online-owner forwarding and R36x retained-only Create recovery ingress exist. | R36x: 149 focused checks pass in each profile; physical duplicate/reopen passes 35.57s. Public workflow **fails 286.55s** after Create, before member admission. Install/reopen and packaged startup remain open. |
+| Service/operations | Offline signed corpus generator and read-only hardware collector exist. | Public retained loading, backup/restore, overload, soak, artifacts and hardware qualification remain open. |
 
-### Qualified archive/preflight foundation
+R36y is the frozen, superseded legacy-read diagnostic boundary, not qualification
+of this replacement. Its forensic evidence remains in the review guide; there
+is no legacy-read fallback or further expiry/finality extension. Do not add
+management Busy, change signed mutation windows/deadlines, or clear old spaces.
 
-`49be3bda` added this foundation on top of paired external checkpoints and
-current-root retained replies at `b8d3a7e3`. Historical source-specific evidence
-lives in those commits' review guides, not duplicated counts here:
+Bundled role materialization and strict six-file release verification are
+implemented. System callers now select a separate observation runtime; both
+runtime-role pins and ordinary fixed-three startup remain closed pending
+independent immutable-source builds and exact packaged-plan prewrite validation.
+The existing enrollment/common-genesis and Shared Create/admit/Install/call/resume
+CLI are reused; no new CLI/signing framework is needed.
 
-- AXJ1 streams canonical typed objects and scoped blobs with independent
-  object/history/blob/wire limits. It leaves AJB1 and image Local unchanged;
-  AJB1's separate 65,536-object/blob caps cannot represent the approved dataset.
-  Exact source heads are selected before callbacks; foreign predecessor heads
-  remain bounded metadata. Strict ordering, content IDs, counts, membership and
-  archive identity are checked. A report is data, not authority or availability.
-- Export requires a genuinely installed fixed-three common QC/local binding,
-  fresh physical head and detached host. A newer applied suffix or Raft no-op
-  cannot substitute for the certified boundary. Quota refusal does not revoke
-  a healthy pin; physical failures do.
-- Import preflight consumes a fresh, intent-bound descriptor-pinned quarantine
-  slot. One record is staged at a time, followed by the existing external-root
-  audit and exact mark comparison. Invalid prefixes never enter a live permanent
-  history namespace. Source heads are not published, and no exposure, Raft owner
-  or serving pin is created. Failed-stage cleanup remains explicitly scoped.
-- A separate foreign-source audit verifies the admitted roster's genuine QC and
-  original source binding without spoofing scratch identity or weakening local
-  physical-owner checks. Metadata-only rebind preserves Control/Linear/Merge
-  declarations and root-producing contexts; only empty destination Local metadata
-  and publication envelopes change. Its destination claim remains unsigned and
-  cannot activate a head.
+## Next priority: replace durable internal Authority reads
 
-Next: integrate the tested destination binding, endpoint audits and journal-first/
-ledger restore into a thin authenticated durable external restore marker and
-actual host restart/reattachment. Preserve fresh `validate_common_restore`
-admission and `validate_bound_common_restore` retry guards against newer committed
-**and uncommitted** work.
-Do not relax same-boundary ACL1 compaction guards to permit catch-up. Qualify
-marker/journal/ledger interruptions, exact retry, pending scopes and detached
-reclamation before public cutover. Source archive predecessor metadata does not
-promise the obsolete predecessor tree; destination predecessor roots must be
-audited independently before its CAS.
+This is an approved architectural simplification on M1's critical path, not a
+new profile, general query framework or relaxation of release targets.
+Observations return authenticated values at a committed revision. A lost reply
+or restarted observer may obtain a fresh observation; it does not retain an
+obligation to recover the first inventory answer. Public actor Invoke/ACK,
+Create/Install identities, exact mutation results and parent recovery stay
+unchanged.
 
-Public three-node startup/finality, external owner selection, public Shared
-management and pruning remain gated. No current result establishes production
-cutover, customer capacity or the complete customer workflow.
+### Scoped consumers and execution contract
 
-## Recovery requirements
+Replace every internal System Authority read used by credential/inventory
+refresh, Agent/replica/actor projections, genesis signing-committee selection,
+GenesisDecision verification, member admission and returning/all-cold pending
+Install recovery. Cover ordinary and management-anchored read variants together.
+No fallback to a retained read path, implicit special-case actor execution,
+new public observation endpoint or arbitrary actor query redesign.
 
-Custody retains at most one signed slot per physical owner in the fixed-three
-committee. Registration commits the exact request, work and original preflight
-before recoverable admission. PAP2 alone is an intent: origin loss before quorum
-registration can leave a request undiscoverable. Admit one distinct unfinished
-delegated read per system Agent; separate holders of that exact read share its
-result. This adds a registration round for Authority reads, not ordinary calls.
+Reuse the installed Authority guest, existing signed credential/SSH
+authentication, package/schema/policy checks, revision heads, exact System
+route and complete retained-member restriction. The runtime owns its state.
+One explicit scoped non-retaining execution operation must enforce unchanged
+**whole opaque runtime state**, no external StateChange/root advance, no retained
+result, ACK, consumed authorization, continuation, Yield/Await or outbound effect.
+Existing normal Query is not sufficient: it still stores a runtime result.
+Do not simulate purity by dropping a mutating transition or decoding Standard/
+Authority-private layouts. Preserve existing gas/output/read bounds.
 
-Preserve the first physically verified terminal Invoke and first positive ACK.
-Later valid repeated inputs cannot replace their evidence/response; negative
-ACKs do not retire custody. Verify the exact Ordered position rather than the
-latest outcome for an input. Reservation and submission require fresh committed/
-applied barriers. Movement during validation is retryable unavailability; a
-contradictory stable cursor is corruption. Old logs assigning one immutable
-Ordered entry to multiple Raft positions remain invalid.
+### Freshness and receiver-owned verification
 
-New registration requires fresh delegation or exact retained execution evidence.
-An already-applied registration can retry after expiry without authorizing unseen
-execution. Recovery may finish an admitted dependency while retaining a different
-unadmitted local intent unchanged. Owner-only monotonic replacement requires the
-previous PAP2 to be durably clear.
+Baseline is the existing authenticated crash-fault model, not a new Byzantine
+guarantee or a trusted remote page:
 
-The user approved explicit expiry finality on 2026-09-30. A quorum-certified
-terminal proves **no committed Invoke or published effect**, not that a VM preview
-never ran. It retains the exact request/proof and is distinct from Invoke/ACK.
-Signers bind the manifest, committee, trusted time and semantic/physical prefix.
-Existing Invoke evidence and ambiguous suffixes refuse expiry. Clock expiry
-alone never permits execution, evidence deletion or durable cleanup. Historical
-no-expiry bytes remain unchanged; new host recovery envelopes are versioned
-without a guest ABI change.
+1. The System leader calls existing bounded ReadIndex; role/status sampling or
+   commit-equals-tail cannot replace fresh majority contact.
+2. An internal follower obtains a fresh, correlated barrier over existing
+   authenticated transport, bound to exact System route/generation, admitted
+   committee/configuration, leader term and required index R. A small typed
+   barrier request/reply is integration plumbing, not a new quorum protocol.
+3. The consumer independently verifies its own committed System prefix and
+   application frontier A >= R, then captures its admitted runtime/artifacts and
+   actual state under an immutable per-open pin and executes the guest locally.
+   The latest actor-state publication J may be below R after leader no-ops;
+   authenticate that linkage rather than requiring J >= R.
+4. Credentials/visibility and returned facts use the same pinned revision and
+   trusted observation clock. Recheck attachment, configuration, lifecycle and
+   per-open identity after peer I/O; a changed/retired generation refuses.
+5. No host/proposal mutex crosses ReadIndex or network I/O. Reuse bounded
+   cancellation/permits/lifecycle leases. Failed or timed-out observations release
+   volatile resources and leave no read obligation.
 
-The certified floor fences stale admission after holder replacement or clock
-regression. It is not an indefinite archive of the original terminal and cannot
-clear an unadmitted WAL by itself. Candidate `ProjectionExpired` now maps to the
-existing nonretryable route rejection instead of transport unavailability. Its
-focused optimized regression passes; public integration remains unqualified. No
-new public API variant is needed. Production authenticators presently create
-legacy reads without this delegation.
+The barrier is not a transferable certificate. Preserve all actual genesis,
+publication, transfer and checkpoint certificates. Reject the design if a
+mandatory consumer lacks a complete independently authenticated local System
+state; do not silently substitute a leader-supplied answer. All mandatory
+consumer paths must demonstrate this precondition before cutover.
 
-## Batch 1 — Simplify and qualify the recompiler
+Pagination initially reuses exact head/credential-claim consistency:
+discard partial collections and restart with bounded attempts if either changes.
+Do not publish mixed/partial routes or add durable snapshot sessions.
+Continuous Authority mutation may cause repeated restarts; qualify liveness
+under the unchanged release workload early, rather than assume it is harmless.
+A concurrent later revocation can race a completed observation; an old
+observation never authorizes a future mutation.
 
-Linux x86-64 Agents select the recompiler by default with an explicit interpreter
-override. Backend/lifecycle checkpoint evidence is historical; exact-release
-customer-workflow phase measurements remain open.
+### Coherent cutover and removal boundary
 
-- [x] Establish the tested `62ffbc20` review-fix baseline on `saga/agents` before
-  promoting later changes. Retain this commit as the recovery reference for pruning.
-- [x] Consolidate the live plan and reviewer entry; remove redundant navigation
-  documents and historical chronology. Preserve the [recovery contract](agent-recovery-contract.md).
-- [x] Remove saga-added Private host/storage/synchronization implementations and
-  Agent Attested proof-production adapters, including exclusive configuration,
-  routing and tests. Unsupported profiles must fail before durable writes.
-  Preserve canonical wire types/commitments, Shared enrollment cryptography,
-  runtime-independent validation and the existing PVM/prover. Do not remove
-  legacy service paths still used by the registry or extensions.
-- [x] Retain experimental external-Local machinery only where it qualifies
-  storage needed by Shared; remove unsupported user-facing experimental entrypoints.
-  Production Local stays image-based; no mixed-format or in-place migration.
-- [x] Record the removed capabilities and recovery commit, separating production
-  source, tests and documentation reductions. Do not infer complexity reduction
-  from aggregate line counts that include large inline test modules.
-- [ ] Measure optimized cold/warm Authority Query/ACK, actor invocation and Clerk
-  transfer. Separate preparation, outer VM, inner VM, persistence, queue and quorum
-  costs. Synthetic instruction loops and whole-fixture times are not this evidence.
-  Bundled lifecycle and post-cache Authority/Clerk method measurements pass on
-  both backends, including full Clerk recovery. Shared queue/quorum attribution
-  remains open; fixture times are not service qualification.
-- [x] Thread the existing `PvmBackend` through Refine, outer execution first and
-  then inner execution. Reuse the existing recompiler; do not introduce a new VM.
-  Bound immutable compiled preparation; key caches by program and execution
-  semantics; allocate fresh invocation memory.
-- [x] Run focused PVM/SDK and interpreter/native parity checks, image Local
-  lifecycle, opaque custom-runtime recovery, and physical external-state Clerk
-  with rebuilt candidate guests. These qualify the tested slices, not the release.
-- [x] Select the recompiler by default for Linux x86-64 Agent execution,
-  retaining explicit interpreter and tracing/reference execution. Keep gas,
-  authorization, signed artifact identities and persistence semantics unchanged.
-  Compilation failure is explicit; never silently retry an execution fault with
-  another backend.
-  Default/reference host suites and default-selected CLI/daemon checks pass;
-  exact-release resource and service qualification remain mandatory.
-- [x] Differentially compare outputs, gas, PC/registers, exits/faults, memory
-  permissions, host-call suspension/resume and commitments, including standard
-  and genuinely different custom-runtime layouts. Run physical lifecycle/recovery
-  tests and supported feature builds after pruning and backend changes.
-  Standard/custom-runtime checkpoint evidence exists; the final released-artifact
-  matrix remains a batch 3 gate.
+Removal inventory is in the review guide. Delete read-specific producers,
+PAP2/registration/expiry/dependency recovery, Invoke/ACK read dispatch, transport
+and Raft dispositions, custody slots/expiry floor and read-only checkpoint pins
+once all consumers use observation. Remove read-specific scheduling/combined
+replay-budget work only where no management/public use remains. Rename shared
+helpers by their remaining purpose; no runtime flag or catch-error legacy fallback.
 
-Exit: a scoped, tested checkpoint with actual phase timings. Recompiler speedups
-do not by themselves qualify Shared capacity or eliminate whole-runtime work.
+Keep exact signed management intent, first Invoke/positive ACK evidence,
+MRQ2 ownership/families, Register/ReleaseManagementRecovery and authenticated
+checkpoint retention. SharedRecoveryObservation and manifest commitments also
+serve management; they cannot be deleted wholesale. The native 'query' store
+also owns selected replica material: preserve its immutable bytes/lease while
+removing GCW1 and read-reply capsules. Genesis publication must remain a successor
+of the original retained authorization, not lose its predecessor/owner guards
+when the committee-query child is removed.
 
-## Batch 2 — Complete the customer workflow
+**Fresh-space cutover approved:** require fresh System/control as well as Shared
+roots with a coherent new signed artifact set. Earlier approval covered only
+external roots; the user explicitly approved fresh v1 spaces on 2026-10-02.
+Existing experimental System formats must be rejected before durable writes,
+never cleared/reset/
+converted; old spaces remain untouched. Existing image Local execution/format
+stays intact and cannot be silently rebound to a new Authority generation.
+No global ABI bump or old-space reopen promise without evidence. The replacement
+binary does not support existing experimental spaces; do not implement migration.
+No legacy-read decoder/execution fallback is an acceptable shortcut.
 
-- [ ] Complete fixed-roster common authenticated genesis and production Shared
-  finality. Never represent three singleton lineages as one replicated Space.
-  Keep unsupported production paths gated until their admission/recovery is proved.
-- [ ] Qualify leader loss before Invoke commit and the remaining ACK/metadata-clear
-  crash matrix. Preserve exact retry, fresh authorization, reservation ownership
-  and unpublished recovery. Historical custody/checkpoint/delegation fixtures do
-  not qualify all pending scopes, full outer-PVM execution or production startup.
-  Signed delegation is an explicit candidate-only opt-in: legacy authenticators
-  still emit ordinary reads. Delegated SSH attestors must be current voters with
-  authenticated committee keys. Applied custody now retains delegated signed
-  requests for offline-origin discovery. Expired-unseen terminal resolution passes
-  the candidate offline/quorum/import fixture; qualify every pending scope before
-  production. Neither local absence nor a timeout releases PAP2.
-- [ ] Collect quorum-certified snapshots/checkpoints and qualify restart/catch-up
-  before replay capacity is exhausted. Optional checkpoint skipping is temporary;
-  mandatory capacity/certificate guards must continue to fail closed.
-  Use a common-state QC plus a separately signed physical node/store binding;
-  collecting signatures over different local claims is not a quorum certificate.
-  Preserve semantic ancestry independently of physical checkpoint cadence.
-  Image candidate fixtures cover pruned-prefix catch-up, exact boundary retry,
-  reopen, ordering and marker/journal/ledger interruptions. Mutation remains test-only
-  until **all** pending recovery scopes survive retirement, including an offline
-  origin's after-ACK PAP2. Do not replace that gate with a local absence check or
-  weaken exact retry. Ordinary retained replies now have a candidate current-root
-  proof; optimized physical qualification passes, public qualification remains
-  pending. External block-root
-  closure/export remains a separate integration
-  gate; image catch-up does not qualify the 100,000-transfer workload.
-- [ ] Integrate the existing external-state executor and block store into Shared
-  Clerk through a narrow internal executor selection, not a new driver framework.
-  The internal driver now supports signed Linear-only Shared Create/Install,
-  completed Direct Linear/LinearizableQuery and ACK. Public filesystem-owner
-  startup, lifecycle and route selection still use the image path; this is not
-  a CLI-only cutover. Control Query, Resume, yield, timers and Attested execution
-  remain unsupported on this external Shared slice, not on the generic SDK.
-- [ ] Prove durable, available blocks before acknowledging their roots/results
-  under Shared quorum rules, including missing blocks, minority failure and
-  catch-up. Preserve provenance, exact predecessor checks and retry atomicity.
-  Missing data is unavailable state, never an absent row or successful execution.
-  The full-outer signed network and three-file lifecycle slices pass on this
-  batch's optimized source. Integrated external minority behavior and catch-up
-  remain unqualified.
-- [ ] Bound reclamation and root-pinned export. Retain authoritative, pending,
-  checkpoint, retry/recovery and backup roots. Maintenance-window reclamation is
-  acceptable; unbounded historical retention is not. Use public block closure
-  traversal, not host decoding of private runtime/actor state. Full import/recovery
-  audits must not become ordinary-request whole-state scans. The current portable
-  bundle's 65,536-blob ceiling cannot hold approximately 200,000 rows (roughly
-  400,000 Patricia structural blocks before chunks). Cumulative acknowledged
-  invocation history can also exceed its separate 65,536-object ceiling.
-  Stream both kinds with explicit per-record/count/byte limits; qualify archive
-  sizing and peak memory without lowering the approved workload.
-- [ ] Expose public Shared Create/Install/Invoke with resumable, schema-aware CLI
-  commands using existing management/request mechanisms. Preserve signed terminal
-  failure finality and exact request identities; qualify the implemented terminal
-  expiry rejection mapping before promotion.
-- [ ] Verify first-use Space UX: bundled packages prepared automatically,
-  authenticated HTTP/SSH defaults, system actors installed before readiness.
-  User-created arbitrary Agents are not automatically provisioned.
-- [ ] Promote a coherent reproducible artifact set with an explicit signed
-  external-state contract and fresh external roots. Do not reinterpret image
-  Local roots or silently enable an experimental ABI.
-- [ ] Qualify actual three-process released-binary lifecycle and Shared Clerk:
-  create/install/invoke, growing retained data, lost responses, restart and failover.
-  No test signers, hand-edited journals or environment-only candidate artifacts.
+### Acceptance of the replacement
 
-Exit: one integrated customer workflow, not another collection of isolated
-storage tests. The image format's 16,384-row ceiling cannot contain the approved
-dataset: Clerk's retained transfers alone need approximately 200,000 rows.
-Do not hide that requirement by discarding history, raising one codec limit or
-sharding the customer's ledger without approval.
+- [ ] Receiver-owned leader/follower observations verify fresh ReadIndex,
+  authenticated apply-through (including no-ops), exact runtime/artifacts, clock,
+  state pin, signature/revocation, full IDs and route/configuration. Minority,
+  stale reply/leader, incomplete state and lifecycle/reopen races refuse.
+- [ ] Actual image-System PVM observation preserves opaque runtime and actor
+  state; hostile/custom fixtures changing metadata, roots, rows or producing
+  effects/yields/continuations refuse. No native Authority oracle substitutes.
+- [ ] After required catch-up, each selector adds **no request WAL, read custody,
+  retained result, ACK or read-specific log record**. Existing committed writes
+  and election no-ops are not misreported as observation writes.
+- [ ] Lost response, canceled request, expired attempt, restart and distinct
+  concurrent observations require no read settlement and cannot strand routes.
+  Bounded queues/cancellation remain joinable; no deadline/cap inflation.
+- [ ] Revision/claim changes discard partial inventory; concurrent Authority
+  writes still permit bounded progress at the approved workload.
+- [ ] Complete member proofs, wrong roster/runtime/archive/target refusals and
+  cold pending Install use observation without releasing or transferring the
+  parent. Genesis decision alone remains insufficient for application/readiness.
+- [ ] Public Create/admit/Install/Invoke, genuinely lost mutation response,
+  exact retry, locked reopen, returning/all-cold Install, leader loss and
+  checkpoint/pruning pass with management evidence unchanged.
+- [ ] The removal inventory is closed: no live durable internal-read producer,
+  recovery transport/apply branch or fallback survives. Old-format prewrite
+  rejection, coherent artifact reproduction and image Local regressions pass.
+  Relevant old tests are replaced by observation negatives, not blindly deleted.
 
-## Batch 3 — Measure, recover and release
+## Critical path and forecast
 
-User decision (2026-09-29): prepare reproducible deployment/load-test tooling;
-the three external test nodes will be provided later. Continue local three-process
-integration checks meanwhile. Tooling preparation and local results do not close
-the hardware, load or soak gates below; no remote deployment is authorized by
-this choice. Scoped signed-read recovery delegation was approved separately;
-its implementation and qualification remain in batch 2.
+M1 remains the next integrated release milestone; M2 and M3 remain unchanged.
+The approved observation replacement now precedes the rest of M1. It can delay
+M1, but must reduce the final supported design to one internal-read path.
+An internal primitive/checkpoint is not a usable exit or a deployment claim.
 
-- [ ] Prepare inventory/artifact preflight, a signed Clerk corpus/reference
-  generator and a bounded public-API load runner using existing release packaging
-  and lifecycle evidence collection. Do not revive the retired acceptance API.
-  Execution must remain explicitly blocked until public Shared startup/lifecycle,
-  external ownership and retention prerequisites pass. The native 100k-row probe
-  is not a corpus of 100k signed Clerk transfers or a service load result.
-- [ ] Run the exact release under the acceptance envelope below. Permit **at most
-  two measured tuning passes after backend integration**. After two failed passes,
-  stop for an evidence-backed scope/architecture decision; do not silently lower
-  targets or start another workstream. Stop tuning when the agreed gates pass.
-- [ ] Implement maintenance-window Agent backup/restore: drain admissions, capture
-  authenticated Shared state, validated opaque Local exports and lifecycle/retry
-  state. Keep keys separate; restore matching identities and binary/artifact
-  versions; retain replaced destinations. Raw directory copies are not a guarantee.
-- [ ] Qualify overload, partitions/minority refusal, leader loss, catch-up,
-  interrupted lifecycle, full restart and restore with release binaries.
-- [ ] Reproduce final artifacts; run full outer-PVM, supported feature/CLI tests,
-  formatting and targeted lint. Update operator instructions to match supported
-  behavior. Do not mix unrelated repository-wide lint cleanup into this batch.
-- [ ] Review the final checkpoint with no release-blocking correctness findings
-  and recorded evidence for every mandatory gate. Prepare the merge to `master`;
-  production deployment/data cutover still requires operator approval.
+| Milestone | Usable exit and acceptance | Claim / remaining limits |
+| --- | --- | --- |
+| **M1: recoverable packaged test pilot** | Fresh fixed-three startup through ordinary CLI/HTTP, system actors ready, image Local and external Shared Clerk; authenticated Create/Install/Invoke/read/denial; exact lost-result retry, locked reopen, returning/all-cold pending Install and leader-loss recovery; observation freshness/cancellation, mutation-expiry/forwarding negatives and >256 authorization/pruning checks. Reproducible signed role artifacts, setup/acceptance script and recorded tested workload. | A working test-environment release at its demonstrated small workload, not full-capacity or service-qualified v1. Candidate-only tests cannot close this exit. |
+| **M2: full-data operational pilot** | Publicly load and retain 1,000 accounts/100,000 signed transfers and external IDs; independently verify all six maps against accepted execution contexts. Measure signed row/byte/resource bounds, qualify checkpoint/catch-up/reopen and <=30s recovery at that data size, and authenticate Agent backup/restore including image Local state and exact retries. Re-run M1 on the resulting exact artifacts. | Usable with the qualified retained dataset and recovery/backup procedure; the 300-client SLA remains open. |
+| **M3: qualified v1** | Exact release on the three approved hardware nodes; 300 clients, 80/20 mix plus unrelated activity, p95<=1s/p99<=2s, 30-minute load and 24-hour soak; overload/partition/minority/crash/restore checks, <=30s failover, bounded resources, differential/reproducibility and final independent review. | Release/merge candidate only after every mandatory gate passes. Hardware unavailability stays explicit; operator authorizes deployment/cutover. |
+
+
+Implementation is grouped into **three scoped review chunks**, not new release
+milestones or many small checkpoint reviews:
+
+| Chunk | Dependency / deliverable | Acceptance before progressing | Preliminary source effort |
+| --- | --- | --- | --- |
+| O1: pure observation and fresh local state | Fix scoped runtime/transport contract; reuse ReadIndex and authenticated local apply/pin. No host-private Authority decoding or remote page trust. | Physical guest purity, wrong scope/artifact/state refusal; leader/follower freshness including no-op linkage, cancellation and retirement. | **6–12 hours**, medium-low confidence. |
+| O2: complete internal consumer cutover | O1; inventory/credential, committee, ordinary/anchored genesis decision, complete member proofs and native recovery all use observation. | No read-specific durable publication for each selector; lost observation/restart needs no settlement; original management publication chain/roster intact. | **8–16 hours**, low confidence. |
+| O3: delete old read lifecycle and qualify workflow | O2 plus approved fresh-space artifact/format cutover; remove all old live producers/transport/apply/custody/expiry paths and superseded tests. | Public Create/admit/Install/Invoke, lost mutation response/exact retry/reopen, pending-Install/cold/leader loss and pruning; old-format prewrite refusal and Local regressions. | **8–16 hours**, low confidence, plus artifact/physical qualification. |
+
+The preliminary replacement band is **22–44 source hours**, not a calendar ETA
+or M1 completion forecast. Update it after O1's actual physical execution and
+state-evidence boundary. If any chunk exceeds its upper band, explain variance
+and re-scope before expanding it. This replaces continued read-expiry/priority/
+micro-optimization iterations; it is not work added alongside them.
+Use the existing **one focused engineering week go/no-go cap** to assess whether
+the replacement is converging; do not quietly roll the cap forward.
+
+Prerequisites and remaining release work, in dependency order:
+
+1. Close O1's consumer/state ownership inventory, exact ABI/artifact admission
+   and typed freshness contract. Fresh-space direction is now approved. No
+   signed/mutation deadline change, generic observation service, snapshot session
+   framework, remote-result trust or new quorum algorithm.
+2. Complete O1–O3 as one coherent replacement. Freeze producer and artifact
+   changes while qualifying each boundary; do not keep runtime-selectable legacy
+   fallback. Historical legacy-read passes cannot qualify observation.
+3. Requalify original-owner forwarded Install refusals (complete wrong-shadow
+   upload and absent System root), positive completion/exact retry and genuine
+   cumulative >256 public authorizations with unchanged checkpoint/recovery.
+   Preserve signed owner/parent evidence, package limits and whole **<=30s**
+   recovery. Automatic startup must pass; manual recovery loops are not proof.
+4. Materialize coherent independently signed System-image/Shared-external role
+   artifacts, strict release closure and pinned reproduction. Reuse ordinary
+   enrollment/common-genesis CLI, explicit Shared `--runtime`, schema-aware
+   calls and exact resume files. Fresh System template selection only;
+   unsupported/certified old plans reject before writes, never auto-convert.
+   Enable the approved fixed-three roster only after coherent qualification.
+5. Run M1 through ordinary packaged three-process CLI/HTTP: system actors ready,
+   image Local and external Shared Clerk, genuinely lost initial mutation
+   response, exact retry and restart/failover. Record demonstrated small workload
+   and a public steady-state phase/queue/VM/persistence probe. Then progress
+   through unchanged M2 retained-data/backup and M3 load/failure/hardware gates.
+
+Separate forecasts and unknowns:
+
+- **Implementation:** O1/O2 and O3 removal exist; the current physical slice and
+  241 selected regression tests pass. Role materialization, verification and
+  caller selection exist; coherent packaged-plan binding/builds remain open.
+  Exact SAC7 constructor/directory binding was
+  necessary work discovered in O1, not a relaxed runtime matcher. An overbroad
+  O3 network edit was caught and exactly restored from the dirty-source archive
+  before qualification; generic execution was then structurally audited.
+  Six failed regression fixtures were corrected to bind actual first owners,
+  unused request identities and current authenticated anchors; production
+  invariants were unchanged. Packaged startup and the released workflow remain open.
+- **Implementation:** O1–O3 source band above. Main uncertainty is image-runtime
+  observation admission/purity, authenticated Raft-vs-state pin linkage,
+  committee-query store/publication predecessor removal, and coherent durable
+  format/artifact cutover. No net line-count reduction is claimed before deletion.
+- **Integration:** unchanged public phase bounds must survive complete consumer
+  cutover. Cold pending Install, all receiver/local-System ownership, nonleader
+  Create retry, pruning and concurrent Authority pagination may expose more work.
+  If a required consumer lacks verifiable local System state or bounded pagination
+  cannot meet the workload, stop for a focused decision rather than add a framework.
+- **Qualification:** normal optimized rebuilds historically take **14–15 min**.
+  Full physical runs are sequential; new guest/ABI artifacts require reproduction
+  and new evidence. ReadIndex smoke is not System guest or released workflow
+  qualification. No reliable aggregate qualification range exists yet.
+- **Packaging after correctness:** previous **4–8 source-hour** role-tooling band
+  is medium-low confidence and must be revisited for the observation artifact
+  contract; signed resource ceilings and strict coherent closure remain unknown.
+- **M1 overall:** no defensible combined ETA. M2 loading at 1,000 accounts/
+  100,000 retained transfers, measured capacity/recovery, six-map parity and
+  Agent backup/restore remain open. M3 additionally requires external hardware
+  and prescribed 30-minute load/24-hour soak elapsed time.
+
+No completion percentage, deployment date, pin promotion or master change is
+established. At most two measured service-tuning passes remain authorized; none
+has been consumed. Architectural replacement and correctness diagnosis are not
+service-tuning passes. Hardware is unavailable; prepare tooling locally and
+leave hardware/load/soak qualification explicitly open.
+
+## Recovery and authorization invariants
+
+- Internal observations use fresh quorum coordination plus the consumer's own
+  authenticated System state and guest execution. A sampled leader/index,
+  remote page, archive, expired request or incomplete local state is not enough.
+  Authentication and facts share one immutable revision; failed observations
+  cannot leave persistent state, custody or partial routes.
+- Public and management operations preserve the first verified terminal Invoke
+  and first positive ACK. Repeated accepted inputs are ordinary rows, not
+  replacement evidence. Negative ACKs do not retire their custody. Verify exact
+  Ordered evidence rather than a latest cached outcome.
+- Original signed mutation requests/work, nonce, caller, preflight/receipt and
+  clocks remain immutable. Exact retained evidence precedes fresh execution;
+  no re-signing, private-clock clamp, replacement authorization, widened window
+  or non-durable preview refusal becomes terminal.
+- Management families retain bounded exact signed members before dispatch.
+  Native durable terminal and every required positive ACK precede signed release.
+  Observations cannot release/extend parents or grant offline mutation authority.
+  Their no-publication execution no longer spends management replay slots;
+  management capacity/signature/owner checks remain authoritative.
+- Cold member observations remain only the Root-authorized genesis decision
+  and exact fresh complete descriptor/roster for the independently validated
+  required physical set. No remote request expands that set, blanket Root/readiness
+  exception, archive-only member, Local/Create-parent exception or ninth family
+  member. A valid Install parent's caller authorization need not be Root.
+- Forwarded Install remains the original online owner's exact operation.
+  Authenticated sender plus retained registration/member/approval must match the
+  current System. A reply is only a hint: exact replay, ordinary majority
+  availability, issuer terminal/finalization and retention release remain mandatory.
+  Discard-only transfer is not canonical Raft publication. Preserve valid Install
+  packages at the existing 8-MiB reference cap; do not conflate decoder aggregate
+  ceilings with supported package capacity.
+- Fresh decision plus complete live descriptor/roster precedes member publication.
+  Create Applied, durable OGAR or coordinator ACK is not readiness. Missing serving
+  namespaces are never repaired from archives. Reopen uses exact present retained
+  management intent/stage and independent leases.
+- Restore authenticates complete immutable closure/destination before journal-first
+  mutable publication. Exact inode sync and certified reopen precede marker
+  retirement/serving. Scratch paths, process epochs and directory copies are not
+  recovery authority.
+- Fresh v1 System/control and Shared roots are required. Old experimental spaces
+  reject before writes; no reset, legacy fallback, migration or mixed-generation
+  Local rebinding. Image Local execution/format and public exact semantics remain.
+- v1 keeps configured Root operators on participating daemons. No key-copy tool,
+  implicit node API grant or replacement authorization. Enrollment uses existing
+  signed upsert, not a roster-CAS framework.
+- Until replacement cutover, legacy source/evidence remains frozen and is not
+  cleaned by dropping its WAL/expiry/registration data. Reject old generations
+  rather than silently settle them. After complete consumer cutover, remove the
+  read-only machinery and superseded contract, not the management evidence it shares.
+
+## Remaining mandatory release gates
+
+### Integrated workflow and recovery
+
+- [ ] Replace durable internal Authority reads end-to-end and remove the legacy
+  lifecycle; satisfy the named observation acceptance checks above, including
+  supported fresh-space prewrite rejection and coherent System runtime artifacts.
+- [ ] Fixed-roster common authenticated genesis and supported Shared finality.
+- [ ] Public Create/Install/Invoke with schema-aware resumable CLI, signed
+  terminal failure/denial and usable first-use readiness.
+- [ ] Cold/restarting/returning voters, mixed pending generations, fresh
+  observation after observer loss and offline-origin management custody, leader
+  loss before commit, after-ACK/metadata-clear crash cuts, exact retry and
+  automatic bounded recovery.
+- [ ] Common-state certified checkpoint/catch-up before replay exhaustion,
+  separately signed physical store binding, complete pending scopes through pruning.
+- [ ] External Shared block availability before quorum acknowledgment; missing
+  blocks/minority cannot produce success; qualify catch-up and lost responses.
+- [ ] Root-pinned closure/export and bounded detached reclamation. Protect
+  authoritative, pending, checkpoint, retry/recovery and backup roots.
+- [ ] Coherent signed external-state package contract and reproducible artifacts;
+  production Local remains image-based. No default fixed-three prewrite gate or
+  pin opens based on candidate guests/test signers alone.
+- [ ] Bundled packages automatically prepared, authenticated HTTP/SSH defaults,
+  system actors installed before Space readiness. Arbitrary user Agents remain
+  explicit user operations.
+
+### Capacity, service and operations
+
+- [x] Real signed Clerk corpus/reference generator: 1,000 accounts and 100,000
+  retained transfers, not a native tree probe or discarded history.
+  Existing-dependency host example is independently reviewed, passes three debug
+  smoke checks and full optimized generation (32.33s). Counts include 100,000
+  retained external IDs and 101,000 verified signatures; independent file digests
+  match the last-published manifest. Peak memory is unmeasured. Its roots bind
+  explicit offline reference timestamps/order;
+  public validation must replay actual accepted contexts rather than compare those
+  synthetic roots directly. No Root/API/node credentials are generated.
+- [ ] Account signed storage ceilings and streaming archive count/byte limits:
+  >502,000 logical actor rows before other indexes/metadata: committed accounts,
+  transfers and external IDs plus per-transfer root anchors. This implies over
+  one million outer Patricia structural blocks before chunks. This is a structural
+  lower bound, not a measured ceiling. The 65,536-object portable IMAGE/System
+  archive is not the external checkpoint path; do not raise it globally. Existing
+  bounded AXJ1 streaming export/ACX1 restore must be integrated through actual
+  lifecycle ownership and qualified with measured external counts/bytes.
+- [ ] Bounded public-API load tooling using existing ATQ1/AOC5/AOQ1/ASQ1 paths.
+  Execution stays gated on supported startup/lifecycle/retention. Do not multiply
+  Root credentials/queues or revive the retired acceptance API.
+- [ ] Exact-release phase measurements: preparation, outer/inner VM, persistence,
+  queue and quorum. Recompiler selection is implemented, not service qualification.
+  At most two measured tuning passes; stop for direction after two failed passes.
+- [ ] Maintenance-window Agent backup/restore: drain admission; capture authenticated
+  Shared state, opaque validated Local exports and lifecycle/retry state; separate
+  keys, matching identities/artifacts and recoverable replaced destinations.
+  Current public backup is registry-only and rejects live Agent roots; external
+  streaming export is test-only and restore remains internal. Integrate those
+  existing authenticated mechanisms rather than wrapping registry backup or
+  describing it as an Agent backup.
+- [ ] Release-binary overload, partitions/minority refusal, catch-up, full restart,
+  interrupted lifecycle and restore; unchanged load, failover and soak targets.
+  `scripts/collect-agent-release-node.sh` prepares read-only per-node binary-hash,
+  CPU/memory, disk, clock and literal-peer RTT evidence on later hardware. Shell
+  syntax, four output/refusal checks and 13 numeric-address checks pass. Review
+  found/fixed a hostname acceptance bug using standard-library numeric parsing;
+  independent fix review finds no further findings. It never deploys or closes
+  hardware/load qualification.
+- [ ] Final interpreter/recompiler differential, full outer-PVM, supported
+  feature/CLI tests, formatting/targeted lint and artifact reproduction.
+- [ ] Final read-only review without release-blocking correctness findings.
+  Prepare merge to master; production cutover still needs operator approval.
 
 ## Mandatory acceptance envelope
 
 These are approved targets, not measured capacity or an availability promise.
 
-- Three separate Linux x86-64 **8-vCPU / 16-GiB / SSD** nodes; inter-node RTT
-  at most **5 ms**.
-- **300 continuously active clients**, **80% reads / 20% signed mutations**
-  against one Shared Clerk, with unrelated Local/Shared activity. End-to-end
-  **p95 <= 1 s, p99 <= 2 s**, including queues and retries.
-- **1,000 accounts and 100,000 retained transfers**, growing through a
-  **30-minute load run** and **24-hour lower-rate retention soak**. Measure
-  write-only bursts separately.
-- **Failover <= 30 s**; no acknowledged loss, duplicate effects, unauthorized
-  access or false completion. Stable retries across restart/failover; minority
+- Three separate Linux x86-64 **8-vCPU / 16-GiB / SSD** nodes; RTT **<=5 ms**.
+- **300 continuously active clients**, **80% reads / 20% signed mutations** on
+  one Shared Clerk, plus unrelated Local/Shared activity.
+  End-to-end **p95 <=1 s, p99 <=2 s**, including queues and retries.
+- **1,000 accounts / 100,000 retained transfers**, **30-minute load** and
+  **24-hour lower-rate retention soak**; measure write-only bursts separately.
+- **Failover <=30 s**; no acknowledged loss, duplicate effects, unauthorized
+  access or false completion. Exact retry survives restart/failover; minority
   cannot commit.
-- Bounded memory, descriptors, queues, retained results and disk retention under
-  overload. Use realistic backend credentials; multiplying credentials or queues
-  must not manufacture apparent throughput.
-- Backup/restore preserves committed roots, identities, Local state and exact
-  retry behavior. Interpreter/recompiler differential gates from batch 1 remain
-  mandatory through artifact promotion.
+- Bounded memory, descriptors, queues, retained results and disk retention
+  under overload, with realistic backend credentials.
+- Backup/restore preserves roots, identities, Local state and exact retry.
+  Interpreter/recompiler differential gates remain mandatory through promotion.
 
-## Shortcomings to track without expanding scope
+User supplied hardware later; prepare tooling and local three-process evidence.
+Local tests do not close hardware/load/soak gates or authorize remote deployment.
 
-- Exploratory `vos --no-default-features --features 'std storage'` currently
-  fails because Shared-host route-audit methods refer to network-gated adapter
-  types/functions. The affected code is unchanged from `7c850160`; this is a
-  pre-existing embedding-feature defect, not a regression from pending custody.
-  The approved v1 host/CLI includes networking. Keep this extra combination
-  explicitly unqualified and repair its feature boundary separately.
-- Incremental actor rows do not eliminate whole-runtime control-state transport,
-  directory reconstruction/publication or Shared ordering/locking. Measure their
-  actual cost; the release does not promise every operation scales with touched data.
-- External Shared preview uses the same physical response validator and read/reuse
-  budget as application, preventing deterministic invalid-output admission.
-  It currently repeats execution for Install/Invoke/ACK; measure that cost before
-  optimizing. Recovery budgets cover the legal bounded suffix, not a qualified
-  recovery-time target. Historical roots remain pinned until certified snapshot
-  import and reclamation are integrated; this cannot qualify unbounded retention.
-- Qualify sustained minority load: unused requests to a silent voter retain
-  availability permits until transport completion/timeout even after another
-  voter establishes quorum. Idle-loopback progress is not load qualification.
-- Pending-read custody has a fixed three-owner bound, but includes complete
-  signed work/artifacts and public evidence (declared manifest ceiling about
-  14.8 MiB). Canonical decoding, signature checks and evidence validation are
-  still real control-path costs. Candidate debug-test timings are not release
-  latency evidence; measure the exact optimized workflow before claiming capacity.
-  Qualification exposed two concrete costs: manifest preparation holding the
-  database writer needed by Raft heartbeats, and repeated proof construction
-  consuming the availability deadline before peer confirmation. The scoped fixes
-  prepare manifests before the writer with exact atomic predecessor checks,
-  reuse one freshly audited view within each proof call, and skip locking for
-  empty Merge advertisements. Validation after peer I/O stays fresh; nonempty import,
-  durability, authorization and deadline guards remain unchanged.
-  Historical candidate recovery evidence is not service capacity or complete
-  production recovery qualification. Current debug timing and optimized checks
-  are tracked above; retain fresh validation after peer I/O.
-- Certified expiry after custody admission passes the optimized offline-origin,
-  follower-RPC and common-import fixture above; complete public integration and
-  pending-scope qualification remain open. A remote owner's
-  unfinished registration retains the leader's projection reservation until
-  positive ACK or an applied, verified expiry terminal. Clock expiry alone never
-  authorizes execution of unseen work or discarding custody.
-  Legacy/mixed-version stale intents can outlive all owner replacements and
-  pruning; retained-history legacy checks alone cannot prevent such an old read
-  from registering again. Keep this with the legacy pending-scope pruning gate.
-  A registration reply can time out while its append later applies; exact retry
-  reconciles it. Unadmitted WAL cleanup after loss of the retained exact terminal
-  remains gated; the floor alone cannot clear it. None of these limits is closed
-  by refusing expired new admission.
-- Current-root retained inspection is implemented and passes the optimized
-  physical two-checkpoint fixture; public qualification remains pending. It
-  binds exact old work/auth/outcome and fresh majority availability, not merely
-  a newer certificate. Fresh eligible external calls currently perform an extra
-  read-only inspection before preview/execution; measure this integrated cost.
-- A fresh supervisor Invoke currently performs at least four outer runs:
-  directory inspection, retained-result inspection, terminal preview and leader
-  application; followers also apply independently. Both outer and inner machines
-  use the recompiler, but prepared code does not reuse invocation memory. Existing
-  single-call network samples remain around 0.8 s (transfer 854,255 us; post-reopen
-  state-root 812,063 us at `b8d3a7e3`), not a capacity result. The fixture now
-  initializes tracing only with an explicit filter. One debug diagnostic shows
-  six external executions per Invoke: two inspections, preview and three overlapping
-  replica applies. Transfer actor execution is 3–4 ms, versus 139–162 ms in each
-  actor-bearing outer execution; the source cause is not function-attributed yet.
-  Cold outer preparation occurs once per worker, including after reopen, not on
-  every apply. Roughly 0.3 s of call time is still outside measured VM/quorum
-  buckets; queue waits and journal/application persistence remain unattributed.
-  These observations are not optimized load results or a tuning pass.
-- Certified reopen currently repeats complete block-closure/replay audits across
-  the slot opener and driver. Recovery/maintenance time is unmeasured at the
-  approved dataset. Existing GC bounds unlinks, but each pass still audits the
-  reachable tree and scans/stats/sorts the namespace. Keep it detached and measure
-  peak metadata memory and repeated-pass latency; do not put it on request paths.
-- Native full-memory snapshots and cloning still scale with the guest address
-  span, not touched pages, and can materialize a large flat image. Sparse snapshot
-  behavior must not be assumed for the native mapping. Instruction attribution
-  explicitly selects interpreter plus sparse memory; qualify native memory before
-  claiming production concurrency.
-- Inner preparation now retains one immutable exact program per worker, with a
-  2-MiB input-program admission ceiling and explicit backend identity. Larger or
-  unresolved-default programs bypass caching; invocation state is never retained.
-  Native code/tables add memory beyond those input bytes. Post-cache native
-  observations distinguish first/second-query preparation; old overlapped-build
-  totals must not be compared as a controlled cache-effect measurement.
-- Bound guest cumulative allocation as well as live memory: the portable guest's
-  one-shot allocator does not reuse freed arena space. Fixed one-row/100,000-row
-  tree probes do not establish real Clerk multi-row or quorum capacity.
-- External state uses bounded values/blocks and hashed row keys, not ordered
-  prefix scans. Keep collection-owned indexes. Partial chunk reuse, shared-path
-  optimization and actor-removal indexing require measured need or separate scope;
-  never substitute an unbounded Agent scan. Keep initial control/directory caps explicit.
-- Freeze external-fetch gas/resource tariffs with the admitted ABI. The compiler's
-  handling of unrecognized host-ID construction remains a follow-up; the current
-  experimental ABI's explicit immediate host ID is not a general compiler fix.
-- General Private/Attested production, proof production for external reads,
-  bridge/federation/settlement, dynamic-membership orchestration, old-store migration,
-  public external Local, automatic sharding, online GC, broad runtime unification,
-  ARM64 production and thousands-active-client qualification are deferred.
-  Deferred does not mean silently supported, nor permission to remove shared
-  protocol validation or the existing prover.
+## Shortcomings and deferred work
 
-## Evidence and working rules
+Measure these within existing gates, not another redesign:
 
-The [review guide](agent-saga-review.md) records current source-specific evidence,
-candidate fixture limitations and reproducible commands. Reviewed baseline
-evidence is recoverable with `git show 6d3a4926:docs/agent-saga-review.md`.
-Artifact identities
-come from `support/production-artifacts.toml` and `vosx/build.rs`, not this plan.
-Released image ABI remains r19; SAC6 Authority is a candidate, not a repinned release.
+- Whole-runtime/control-directory reconstruction and Shared ordering remain.
+  Incremental actor rows alone do not imply touched-data cost.
+- External preview repeats physical work; fresh invocation has directory/result
+  inspection, preview and application plus follower apply. Outer VM, queue and
+  persistence costs remain important beyond millisecond actor execution.
+- The legacy combined read/management manifest can approach its declared
+  14.8-MiB ceiling. Remeasure the surviving management format after read removal;
+  old ceilings are not new capacity evidence. Fresh predecessor checks and
+  post-I/O validation remain mandatory; no corruption retry or cross-call proof cache.
+- Common reopen repeats full closure/replay audits; detached GC still scans/sorts
+  metadata. Qualify peak memory, recovery time and retained disk at the real corpus.
+- Native snapshots scale with guest address span. Immutable preparation caches
+  do not reuse invocation memory; bound code/table and one-shot guest allocation.
+  Inner cache admits one exact <=2-MiB program per worker; larger/unresolved
+  defaults bypass it, not artifact admission.
+- Silent-voter availability permits can survive successful quorum until timeout;
+  qualify sustained minority load. Management registration can time out then
+  commit: exact mutation retry must reconcile it. Observation timeout instead
+  releases volatile resources; it cannot create a durable read obligation.
+- Old experimental read generations/pending WALs are not migrated or interpreted
+  as settled by absence/expiry. Fresh-space format/admission rejects them before
+  writes. Never-admitted read finality is superseded by replacement, not deferred
+  work to implement alongside it.
+- Experimental external Shared is Direct Linear/LinearizableQuery plus ACK.
+  Control Query, Resume/yield/timers/Attested are not supported on that slice.
+- Frozen ABI fetch tariffs, sparse-memory assumptions, partial chunk/path/index
+  optimizations and unrecognized compiler host-ID handling remain follow-ups,
+  not permission to change admitted semantics.
+- Existing no-network `std storage` embedding combination fails in unchanged
+  Shared adapter references; supported v1 includes networking. Qualify the
+  supported feature matrix, not unrelated feature-boundary cleanup.
+- Defer Private/Attested production, dynamic membership, bridge/settlement,
+  old-store migration, public external Local, sharding, online GC, broad runtime
+  unification, ARM64 and thousands-active-client qualification.
+  The existing prover/protocol validation stays; deferred is not silently supported.
 
-Use offline/locked `cargo +nightly-2025-05-09`. Put builds, test stores and logs in
-the disk-backed `.worktrees/ch08-c2-native/target`, using absolute paths inside
-worktrees and its existing `task-tmp` directory for `TMPDIR`/`JUST_TEMPDIR`.
-Never use RAM-backed `/tmp`. Preserve frozen clients, failure evidence and stores;
-do not mix generations or treat socket-restricted/ignored/zero-selected tests as passes.
+## Working and evidence rules
 
-The full pre-consolidation chronology and removed handoffs are recoverable with
-`git show 62ffbc20:docs/agent-saga-status.md` (or the original document path).
-Historical source-specific timings/test counts are not qualification of today's
-release. Record new checkpoint evidence in the review guide and update this
-checklist; do not grow a second chronological plan.
+Every change closes a named mandatory gate or demonstrated blocking defect.
+Use existing mechanisms; no new profile/framework/migration/broader compatibility.
+Report user-visible behavior, source evidence, integration/qualification, blockers,
+unexpected work and forecast separately. Do not stop at internal tests/commits.
+
+Use offline/locked host nightly `2025-05-09`, guest nightly `2026-03-20`.
+Build/test/log roots are disk-backed `.worktrees/ch08-c2-native/target`; set
+`TMPDIR` and `JUST_TEMPDIR` to its `task-tmp`. Never use RAM-backed `/tmp`.
+Sequence physical tests separately from builds; preserve failure evidence and
+source boundaries. Ignored/socket-denied/zero-selected tests are not passes.
+
+Production identities come from `support/production-artifacts.toml` and
+`vosx/build.rs`; candidate results never promote pins. Baseline evidence is
+recoverable at `e6f2bb45`, `6d3a4926` and `62ffbc20`.
+Superseded uncommitted experiment text is frozen as target evidence
+`release-integration-docs-pre-consolidation-r31.txt`, not a second live plan.

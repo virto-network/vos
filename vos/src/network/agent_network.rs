@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::time::Duration;
 
 use crate::agent::shared_commit::{ReplicaCommitSignature, SharedAgentCommonSnapshotClaim};
-use crate::agent::shared_recovery::{SharedRecoveryExpiryClaim, SharedRecoveryRegistration};
+use crate::agent::shared_raft::AgentRaftCommand;
 use futures_channel::oneshot;
 use libp2p::request_response::{self, Message};
 use libp2p::{PeerId, Swarm};
@@ -21,11 +21,19 @@ use vos_agent_sdk::{Hash, NodeId};
 
 use super::agent_protocol::{
     AgentFrame, AgentGenerationRoute, AgentMessage, AgentProtocolError, AppliedAvailabilityRequest,
-    AuthenticatedAgentFrame, InvocationRedirect, InvocationReply, InvocationRequest,
-    MAX_RAFT_MEMBERS, MergeMessage, RaftMessage, RaftStatus, RaftVotePhase, authenticate_sender,
-    invocation_request_correlation, outcome_matches_work,
+    AuthenticatedAgentFrame, AuthorityReadBarrier, AuthorityReadBarrierRequest,
+    ForwardedSharedInstallRequest, InvocationRedirect, InvocationReply, InvocationRequest,
+    MAX_RAFT_MEMBERS, ManagementRecoveryOperationRequest, MergeMessage, RaftMessage, RaftStatus,
+    RaftVotePhase, authenticate_sender, invocation_request_correlation, outcome_matches_work,
 };
 use super::{Network, NetworkCmd, VosBehaviour};
+
+#[cfg(all(
+    target_os = "linux",
+    feature = "storage",
+    feature = "experimental-state-blocks"
+))]
+mod shared_fixture;
 
 /// Agent consensus traffic has its own bounded timeout.  It must not inherit
 /// the legacy service invocation's five-minute extension budget.
@@ -280,19 +288,25 @@ pub(super) struct PendingMeta {
 }
 
 pub(super) enum PendingAgentReply {
-    RecoveryExpiry {
+    AuthorityReadBarrier {
         meta: PendingMeta,
         request: Hash,
+        reply: std_mpsc::Sender<Result<Option<AuthorityReadBarrier>, AgentNetworkError>>,
+    },
+    ForwardedSharedInstall {
+        meta: PendingMeta,
+        request: Hash,
+        package_len: u64,
+        reply: std_mpsc::Sender<Result<Option<u64>, AgentNetworkError>>,
+    },
+    ManagementRecoveryCommand {
+        meta: PendingMeta,
+        command: Hash,
         reply: std_mpsc::Sender<Result<bool, AgentNetworkError>>,
     },
-    RecoveryExpiryVote {
+    ManagementRecoveryOperation {
         meta: PendingMeta,
-        claim: Hash,
-        reply: std_mpsc::Sender<Result<Option<ReplicaCommitSignature>, AgentNetworkError>>,
-    },
-    RecoveryRegistration {
-        meta: PendingMeta,
-        registration: Hash,
+        request: Hash,
         reply: std_mpsc::Sender<Result<bool, AgentNetworkError>>,
     },
     CommonSnapshotVote {
@@ -308,11 +322,6 @@ pub(super) enum PendingAgentReply {
     CurrentAppliedAvailability {
         meta: PendingMeta,
         request: AppliedAvailabilityRequest,
-        reply: std_mpsc::Sender<Result<bool, AgentNetworkError>>,
-    },
-    Projection {
-        meta: PendingMeta,
-        request: Hash,
         reply: std_mpsc::Sender<Result<bool, AgentNetworkError>>,
     },
     Invocation {
@@ -352,13 +361,13 @@ pub(super) enum PendingAgentReply {
 impl PendingAgentReply {
     fn meta(&self) -> PendingMeta {
         match self {
-            Self::CommonSnapshotVote { meta, .. }
-            | Self::RecoveryExpiryVote { meta, .. }
-            | Self::RecoveryExpiry { meta, .. }
-            | Self::RecoveryRegistration { meta, .. }
+            Self::AuthorityReadBarrier { meta, .. }
+            | Self::CommonSnapshotVote { meta, .. }
+            | Self::ForwardedSharedInstall { meta, .. }
+            | Self::ManagementRecoveryCommand { meta, .. }
+            | Self::ManagementRecoveryOperation { meta, .. }
             | Self::AppliedAvailability { meta, .. }
             | Self::CurrentAppliedAvailability { meta, .. }
-            | Self::Projection { meta, .. }
             | Self::Invocation { meta, .. }
             | Self::RaftAppend { meta, .. }
             | Self::RaftVote { meta, .. }
@@ -371,14 +380,19 @@ impl PendingAgentReply {
 
     pub(super) fn fail(self, error: AgentNetworkError) {
         match self {
-            Self::CommonSnapshotVote { reply, .. } | Self::RecoveryExpiryVote { reply, .. } => {
+            Self::AuthorityReadBarrier { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+            Self::CommonSnapshotVote { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
             Self::AppliedAvailability { reply, .. }
-            | Self::CurrentAppliedAvailability { reply, .. }
-            | Self::RecoveryExpiry { reply, .. }
-            | Self::Projection { reply, .. }
-            | Self::RecoveryRegistration { reply, .. } => {
+            | Self::ManagementRecoveryCommand { reply, .. }
+            | Self::ManagementRecoveryOperation { reply, .. }
+            | Self::CurrentAppliedAvailability { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+            Self::ForwardedSharedInstall { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
             Self::Invocation { reply, .. } => {
@@ -422,8 +436,71 @@ impl PendingAgentReply {
         let message = authenticated.into_frame().message;
         match (self, message) {
             (
-                Self::RecoveryExpiry { request, reply, .. },
-                AgentMessage::RecoveryExpiryReply {
+                Self::AuthorityReadBarrier { request, reply, .. },
+                AgentMessage::AuthorityReadBarrierReply {
+                    request: actual,
+                    barrier,
+                },
+            ) => {
+                let _ = reply.send(
+                    if actual == request
+                        && request != Hash::ZERO
+                        && barrier.is_none_or(|barrier| {
+                            barrier.is_valid()
+                                && barrier.request == request
+                                && barrier.leader == meta.target_node
+                        })
+                    {
+                        Ok(barrier)
+                    } else {
+                        Err(AgentNetworkError::ResponseCorrelationMismatch)
+                    },
+                );
+            }
+            (
+                Self::ForwardedSharedInstall {
+                    request,
+                    package_len,
+                    reply,
+                    ..
+                },
+                AgentMessage::ForwardedSharedInstallReply {
+                    request: actual,
+                    next_offset,
+                },
+            ) => {
+                let _ = reply.send(if actual == request {
+                    if next_offset.is_none_or(|offset| {
+                        offset <= package_len
+                            && (offset == package_len
+                                || offset
+                                    % crate::agent::shared_raft::ARTIFACT_CHUNK_DATA_BYTES as u64
+                                    == 0)
+                    }) {
+                        Ok(next_offset)
+                    } else {
+                        Err(AgentNetworkError::ResponseCorrelationMismatch)
+                    }
+                } else {
+                    Err(AgentNetworkError::ResponseCorrelationMismatch)
+                });
+            }
+            (
+                Self::ManagementRecoveryCommand { command, reply, .. },
+                AgentMessage::ManagementRecoveryCommandReply {
+                    command: actual,
+                    applied,
+                },
+            ) => {
+                let _ = reply.send(if actual == command {
+                    Ok(applied)
+                } else {
+                    Err(AgentNetworkError::ResponseCorrelationMismatch)
+                });
+            }
+            (
+                Self::ManagementRecoveryOperation { request, reply, .. },
+                AgentMessage::ManagementRecoveryOperationReply {
                     request: actual,
                     applied,
                 },
@@ -435,38 +512,23 @@ impl PendingAgentReply {
                 });
             }
             (
-                Self::RecoveryRegistration { registration, reply, .. },
-                AgentMessage::RecoveryRegistrationReply { registration: actual, applied },
-            ) => {
-                let _ = reply.send(if actual == registration {
-                    Ok(applied)
-                } else {
-                    Err(AgentNetworkError::ResponseCorrelationMismatch)
-                });
-            }
-            (
                 Self::CommonSnapshotVote { claim, reply, .. },
                 AgentMessage::CommonSnapshotVoteReply {
                     claim: response,
                     signature,
                 },
-            )
-            | (
-                Self::RecoveryExpiryVote { claim, reply, .. },
-                AgentMessage::RecoveryExpiryVoteReply {
-                    claim: response,
-                    signature,
-                },
             ) => {
-                let _ = reply.send(if response == claim
-                    && signature
-                        .as_ref()
-                        .is_none_or(|signature| signature.signer().0 == meta.target_node.0)
-                {
-                    Ok(signature)
-                } else {
-                    Err(AgentNetworkError::ResponseCorrelationMismatch)
-                });
+                let _ = reply.send(
+                    if response == claim
+                        && signature
+                            .as_ref()
+                            .is_none_or(|signature| signature.signer().0 == meta.target_node.0)
+                    {
+                        Ok(signature)
+                    } else {
+                        Err(AgentNetworkError::ResponseCorrelationMismatch)
+                    },
+                );
             }
             (
                 Self::AppliedAvailability { request, reply, .. },
@@ -484,19 +546,6 @@ impl PendingAgentReply {
             ) => {
                 let _ = reply.send(if response == request {
                     Ok(available)
-                } else {
-                    Err(AgentNetworkError::ResponseCorrelationMismatch)
-                });
-            }
-            (
-                Self::Projection { request, reply, .. },
-                AgentMessage::ProjectionAccepted {
-                    request: response,
-                    accepted,
-                },
-            ) => {
-                let _ = reply.send(if response == request {
-                    Ok(accepted)
                 } else {
                     Err(AgentNetworkError::ResponseCorrelationMismatch)
                 });
@@ -633,12 +682,12 @@ impl AgentTrafficClass {
             AgentMessage::Raft(_) => Self::Raft,
             AgentMessage::AppliedAvailabilityRequest(_)
             | AgentMessage::AppliedAvailabilityReply { .. }
+            | AgentMessage::AuthorityReadBarrierRequest(_)
+            | AgentMessage::AuthorityReadBarrierReply { .. }
             | AgentMessage::CurrentAppliedAvailabilityRequest(_)
             | AgentMessage::CurrentAppliedAvailabilityReply { .. }
             | AgentMessage::CommonSnapshotVoteRequest(_)
-            | AgentMessage::CommonSnapshotVoteReply { .. }
-            | AgentMessage::RecoveryExpiryVoteRequest(_)
-            | AgentMessage::RecoveryExpiryVoteReply { .. } => Self::Availability,
+            | AgentMessage::CommonSnapshotVoteReply { .. } => Self::Availability,
             _ => Self::Application,
         }
     }
@@ -937,6 +986,55 @@ impl Network {
         reserve_agent_outbound_permit(&self.agent_outbound_permits, class)
     }
 
+    #[cfg(test)]
+    pub(crate) fn authority_observation_available_permits_for_test(&self) -> usize {
+        self.agent_outbound_permits
+            .available(AgentTrafficClass::Availability)
+    }
+
+    /// Obtain bounded current-term freshness coordination from one exact
+    /// admitted leader. The result is not a guest answer or transferable proof.
+    /// The caller must apply and authenticate its own System state through R.
+    pub(crate) fn send_agent_authority_read_barrier(
+        &self,
+        target: NodeId,
+        route: AgentGenerationRoute,
+        request: AuthorityReadBarrierRequest,
+    ) -> std_mpsc::Receiver<Result<Option<AuthorityReadBarrier>, AgentNetworkError>> {
+        let (reply, receiver) = std_mpsc::channel();
+        let permit = match self.reserve_agent_outbound(AgentTrafficClass::Availability) {
+            Ok(permit) => permit,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return receiver;
+            }
+        };
+        match self.prepare_agent_request(
+            target,
+            route,
+            AgentMessage::AuthorityReadBarrierRequest(request),
+        ) {
+            Ok((peer, frame)) => self.queue_agent_request(AgentOutboundRequest {
+                peer,
+                frame,
+                permit,
+                pending: PendingAgentReply::AuthorityReadBarrier {
+                    meta: PendingMeta {
+                        route,
+                        target_node: target,
+                        target_peer: peer,
+                    },
+                    request: request.request,
+                    reply,
+                },
+            }),
+            Err(error) => {
+                let _ = reply.send(Err(error));
+            }
+        }
+        receiver
+    }
+
     /// Ask an exact authenticated replica about durable applied state. A
     /// positive reply is only one voter's evidence; callers own quorum policy.
     pub(crate) fn send_agent_applied_availability(
@@ -1066,13 +1164,23 @@ impl Network {
         receiver
     }
 
-    pub(crate) fn send_agent_recovery_registration(
+    /// Forward only the original owner's signed retention metadata. A true
+    /// reply is not proof for cleanup: the owner must observe its local apply.
+    pub(crate) fn send_agent_management_recovery_command(
         &self,
         target: NodeId,
         route: AgentGenerationRoute,
-        registration: SharedRecoveryRegistration,
+        command: AgentRaftCommand,
     ) -> std_mpsc::Receiver<Result<bool, AgentNetworkError>> {
         let (reply, receiver) = std_mpsc::channel();
+        if !matches!(
+            &command,
+            AgentRaftCommand::RegisterManagementRecovery { .. }
+                | AgentRaftCommand::ReleaseManagementRecovery { .. }
+        ) {
+            let _ = reply.send(Err(AgentNetworkError::InvalidRequestKind));
+            return receiver;
+        }
         let permit = match self.reserve_agent_outbound(AgentTrafficClass::Application) {
             Ok(permit) => permit,
             Err(error) => {
@@ -1080,23 +1188,23 @@ impl Network {
                 return receiver;
             }
         };
-        let commitment = Hash(registration.commitment().0);
+        let commitment = Hash(command.commitment().0);
         match self.prepare_agent_request(
             target,
             route,
-            AgentMessage::RecoveryRegistrationRequest(registration),
+            AgentMessage::ManagementRecoveryCommandRequest(command),
         ) {
             Ok((peer, frame)) => self.queue_agent_request(AgentOutboundRequest {
                 peer,
                 frame,
                 permit,
-                pending: PendingAgentReply::RecoveryRegistration {
+                pending: PendingAgentReply::ManagementRecoveryCommand {
                     meta: PendingMeta {
                         route,
                         target_node: target,
                         target_peer: peer,
                     },
-                    registration: commitment,
+                    command: commitment,
                     reply,
                 },
             }),
@@ -1107,37 +1215,39 @@ impl Network {
         receiver
     }
 
-    pub(crate) fn send_agent_recovery_expiry_vote(
+    /// Request one exact retained member operation, without carrying work,
+    /// replay results, or permission for another owner to dispatch it offline.
+    pub(crate) fn send_agent_management_recovery_operation(
         &self,
         target: NodeId,
         route: AgentGenerationRoute,
-        claim: SharedRecoveryExpiryClaim,
-    ) -> std_mpsc::Receiver<Result<Option<ReplicaCommitSignature>, AgentNetworkError>> {
+        request: ManagementRecoveryOperationRequest,
+    ) -> std_mpsc::Receiver<Result<bool, AgentNetworkError>> {
         let (reply, receiver) = std_mpsc::channel();
-        let permit = match self.reserve_agent_outbound(AgentTrafficClass::Availability) {
+        let permit = match self.reserve_agent_outbound(AgentTrafficClass::Application) {
             Ok(permit) => permit,
             Err(error) => {
                 let _ = reply.send(Err(error));
                 return receiver;
             }
         };
-        let commitment = Hash(claim.commitment().0);
+        let correlation = request.correlation();
         match self.prepare_agent_request(
             target,
             route,
-            AgentMessage::RecoveryExpiryVoteRequest(claim),
+            AgentMessage::ManagementRecoveryOperationRequest(request),
         ) {
             Ok((peer, frame)) => self.queue_agent_request(AgentOutboundRequest {
                 peer,
                 frame,
                 permit,
-                pending: PendingAgentReply::RecoveryExpiryVote {
+                pending: PendingAgentReply::ManagementRecoveryOperation {
                     meta: PendingMeta {
                         route,
                         target_node: target,
                         target_peer: peer,
                     },
-                    claim: commitment,
+                    request: correlation,
                     reply,
                 },
             }),
@@ -1148,12 +1258,15 @@ impl Network {
         receiver
     }
 
-    pub(crate) fn send_agent_recovery_expiry(
+    /// Transfer one bounded package chunk, or request its exact online-owner
+    /// Install. The reply is only a scheduling/staging hint; the owner obtains
+    /// management evidence from its own replayed journal before finalization.
+    pub(crate) fn send_agent_forwarded_shared_install(
         &self,
         target: NodeId,
         route: AgentGenerationRoute,
-        request: Hash,
-    ) -> std_mpsc::Receiver<Result<bool, AgentNetworkError>> {
+        request: ForwardedSharedInstallRequest,
+    ) -> std_mpsc::Receiver<Result<Option<u64>, AgentNetworkError>> {
         let (reply, receiver) = std_mpsc::channel();
         let permit = match self.reserve_agent_outbound(AgentTrafficClass::Application) {
             Ok(permit) => permit,
@@ -1162,22 +1275,28 @@ impl Network {
                 return receiver;
             }
         };
+        let correlation = request.correlation();
+        let package_len = match &request.request {
+            crate::agent_sdk::ManagementRequest::Install(install) => install.package.len,
+            _ => 0,
+        };
         match self.prepare_agent_request(
             target,
             route,
-            AgentMessage::RecoveryExpiryRequest { request },
+            AgentMessage::ForwardedSharedInstallRequest(request),
         ) {
             Ok((peer, frame)) => self.queue_agent_request(AgentOutboundRequest {
                 peer,
                 frame,
                 permit,
-                pending: PendingAgentReply::RecoveryExpiry {
+                pending: PendingAgentReply::ForwardedSharedInstall {
                     meta: PendingMeta {
                         route,
                         target_node: target,
                         target_peer: peer,
                     },
-                    request,
+                    request: correlation,
+                    package_len,
                     reply,
                 },
             }),
@@ -1212,49 +1331,6 @@ impl Network {
                 frame,
                 permit,
                 pending: PendingAgentReply::Invocation {
-                    meta: PendingMeta {
-                        route,
-                        target_node: target,
-                        target_peer: peer,
-                    },
-                    request,
-                    reply,
-                },
-            }),
-            Err(error) => {
-                let _ = reply.send(Err(error));
-            }
-        }
-        receiver
-    }
-
-    pub(crate) fn send_agent_projection(
-        &self,
-        target: NodeId,
-        route: AgentGenerationRoute,
-        query: vos_agent_sdk::authority::AuthorityProjectionQuery,
-        recovering: bool,
-    ) -> std_mpsc::Receiver<Result<bool, AgentNetworkError>> {
-        let (reply, receiver) = std_mpsc::channel();
-        let request = query.commitment();
-        let permit = match self.reserve_agent_outbound(AgentTrafficClass::Application) {
-            Ok(permit) => permit,
-            Err(error) => {
-                let _ = reply.send(Err(error));
-                return receiver;
-            }
-        };
-        let message = if recovering {
-            AgentMessage::ProjectionRecoveryRequest(query)
-        } else {
-            AgentMessage::ProjectionRequest(query)
-        };
-        match self.prepare_agent_request(target, route, message) {
-            Ok((peer, frame)) => self.queue_agent_request(AgentOutboundRequest {
-                peer,
-                frame,
-                permit,
-                pending: PendingAgentReply::Projection {
                     meta: PendingMeta {
                         route,
                         target_node: target,
@@ -1559,15 +1635,14 @@ fn authorize_inbound(
 fn is_request(message: &AgentMessage) -> bool {
     matches!(
         message,
-        AgentMessage::InvokeRequest(_)
+        AgentMessage::AuthorityReadBarrierRequest(_)
+            | AgentMessage::InvokeRequest(_)
+            | AgentMessage::ForwardedSharedInstallRequest(_)
+            | AgentMessage::ManagementRecoveryCommandRequest(_)
+            | AgentMessage::ManagementRecoveryOperationRequest(_)
             | AgentMessage::AppliedAvailabilityRequest(_)
             | AgentMessage::CurrentAppliedAvailabilityRequest(_)
             | AgentMessage::CommonSnapshotVoteRequest(_)
-            | AgentMessage::RecoveryRegistrationRequest(_)
-            | AgentMessage::RecoveryExpiryRequest { .. }
-            | AgentMessage::RecoveryExpiryVoteRequest(_)
-            | AgentMessage::ProjectionRequest(_)
-            | AgentMessage::ProjectionRecoveryRequest(_)
             | AgentMessage::Raft(RaftMessage::AppendRequest { .. })
             | AgentMessage::Raft(RaftMessage::VoteRequest { .. })
             | AgentMessage::Raft(RaftMessage::InstallSnapshotRequest { .. })
@@ -1581,19 +1656,39 @@ fn is_request(message: &AgentMessage) -> bool {
 fn response_matches_request(request: &AgentMessage, response: &AgentMessage) -> bool {
     match (request, response) {
         (
-            AgentMessage::RecoveryExpiryRequest { request },
-            AgentMessage::RecoveryExpiryReply {
+            AgentMessage::AuthorityReadBarrierRequest(request),
+            AgentMessage::AuthorityReadBarrierReply {
+                request: actual,
+                barrier,
+            },
+        ) => {
+            request.request == *actual
+                && request.request != Hash::ZERO
+                && barrier
+                    .is_none_or(|barrier| barrier.request == request.request && barrier.is_valid())
+        }
+        (
+            AgentMessage::ForwardedSharedInstallRequest(request),
+            AgentMessage::ForwardedSharedInstallReply {
+                request: actual,
+                next_offset,
+            },
+        ) => {
+            request.correlation() == *actual
+                && next_offset.is_none_or(|offset| request.admits_progress(offset))
+        }
+        (
+            AgentMessage::ManagementRecoveryCommandRequest(command),
+            AgentMessage::ManagementRecoveryCommandReply {
+                command: actual, ..
+            },
+        ) => command.commitment().0 == actual.0,
+        (
+            AgentMessage::ManagementRecoveryOperationRequest(request),
+            AgentMessage::ManagementRecoveryOperationReply {
                 request: actual, ..
             },
-        ) => request == actual,
-        (
-            AgentMessage::RecoveryExpiryVoteRequest(request),
-            AgentMessage::RecoveryExpiryVoteReply { claim, .. },
-        ) => request.commitment().0 == claim.0,
-        (
-            AgentMessage::RecoveryRegistrationRequest(request),
-            AgentMessage::RecoveryRegistrationReply { registration, .. },
-        ) => request.commitment().0 == registration.0,
+        ) => request.correlation() == *actual,
         (
             AgentMessage::CommonSnapshotVoteRequest(request),
             AgentMessage::CommonSnapshotVoteReply { claim, .. },
@@ -1610,10 +1705,6 @@ fn response_matches_request(request: &AgentMessage, response: &AgentMessage) -> 
                 request: response, ..
             },
         ) => request == response,
-        (
-            AgentMessage::ProjectionRequest(query) | AgentMessage::ProjectionRecoveryRequest(query),
-            AgentMessage::ProjectionAccepted { request, .. },
-        ) => query.commitment() == *request,
         (AgentMessage::InvokeRequest(request), AgentMessage::InvokeReply(response)) => {
             response.request == invocation_request_correlation(request)
                 && outcome_matches_work(&response.outcome, &request.work)
@@ -1734,7 +1825,19 @@ pub(super) fn handle_agent_event(
                 let request_message = authenticated.frame().message.clone();
                 let route = authenticated.frame().route;
                 let response_tx = response_tx.clone();
+                let common_vote_admitted =
+                    matches!(&request_message, AgentMessage::CommonSnapshotVoteRequest(_))
+                        .then(std::time::Instant::now);
                 tokio::task::spawn_blocking(move || {
+                    if let Some(admitted) = common_vote_admitted {
+                        debug!(
+                            node = ?local_node,
+                            ?route,
+                            phase = "handler_started",
+                            elapsed_us = admitted.elapsed().as_micros(),
+                            "Common checkpoint vote dispatch phase"
+                        );
+                    }
                     let Ok(response_message) = registration.handler.handle(authenticated) else {
                         return;
                     };
@@ -1754,6 +1857,15 @@ pub(super) fn handle_agent_event(
                     // Move the permit with the response so both handler jobs
                     // and not-yet-drained response channels share one cap.
                     let _ = response_tx.send((channel, response, permit));
+                    if let Some(admitted) = common_vote_admitted {
+                        debug!(
+                            node = ?local_node,
+                            ?route,
+                            phase = "handler_completed",
+                            elapsed_us = admitted.elapsed().as_micros(),
+                            "Common checkpoint vote dispatch phase"
+                        );
+                    }
                 });
             }
             Message::Response {
@@ -1994,12 +2106,119 @@ mod tests {
     }
 
     #[test]
-    fn recovery_registration_and_expiry_replies_require_exact_peer_sender_route_and_commitment() {
+    fn forwarded_shared_install_replies_require_exact_peer_sender_route_kind_and_commitment() {
+        let peer = key(91).public().to_peer_id();
+        let other = key(92).public().to_peer_id();
+        let route = test_route(91);
+        let correlation = Hash(id(93));
+        for fault in 0..9 {
+            let (reply, result) = std_mpsc::channel();
+            let pending = PendingAgentReply::ForwardedSharedInstall {
+                meta: PendingMeta {
+                    route,
+                    target_node: node(peer),
+                    target_peer: peer,
+                },
+                request: correlation,
+                package_len: 100,
+                reply,
+            };
+            let mut response = frame(
+                peer,
+                route,
+                AgentMessage::ForwardedSharedInstallReply {
+                    request: if fault == 2 {
+                        Hash(id(94))
+                    } else {
+                        correlation
+                    },
+                    next_offset: match fault {
+                        1 => None,
+                        7 => Some(101),
+                        8 => Some(1),
+                        _ => Some(100),
+                    },
+                },
+            );
+            if fault == 3 {
+                response.route.generation = Hash(id(95));
+            }
+            if fault == 5 {
+                response.sender = node(other);
+            }
+            if fault == 6 {
+                response.message = AgentMessage::ManagementRecoveryOperationReply {
+                    request: correlation,
+                    applied: true,
+                };
+            }
+            let authenticated =
+                authenticate_sender(if fault == 5 { &other } else { &peer }, response).unwrap();
+            pending.complete(if fault == 4 { other } else { peer }, authenticated);
+            let expected = match fault {
+                0 => Ok(Some(100)),
+                1 => Ok(None),
+                2 => Err(AgentNetworkError::ResponseCorrelationMismatch),
+                3 => Err(AgentNetworkError::ResponseRouteMismatch),
+                4 => Err(AgentNetworkError::ResponsePeerMismatch),
+                5 => Err(AgentNetworkError::ResponseSenderMismatch),
+                6 => Err(AgentNetworkError::ResponseTypeMismatch),
+                _ => Err(AgentNetworkError::ResponseCorrelationMismatch),
+            };
+            assert_eq!(result.recv().unwrap(), expected);
+        }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    #[test]
+    fn forwarded_shared_install_uses_existing_application_pool_and_exact_chunk_correlations() {
+        let (route, request) =
+            super::super::agent_protocol::forwarded_shared_install_for_test(true);
+        let chunk = AgentMessage::ForwardedSharedInstallRequest(request.clone());
+        assert!(is_request(&chunk));
+        assert!(matches!(
+            AgentTrafficClass::for_message(&chunk),
+            AgentTrafficClass::Application
+        ));
+        let reply = AgentMessage::ForwardedSharedInstallReply {
+            request: request.correlation(),
+            next_offset: Some(0),
+        };
+        assert!(response_matches_request(&chunk, &reply));
+        let finish = AgentMessage::ForwardedSharedInstallRequest(ForwardedSharedInstallRequest {
+            operation: super::super::agent_protocol::ForwardedSharedInstallOperation::Finish,
+            ..request
+        });
+        assert!(!response_matches_request(&finish, &reply));
+        assert!(!response_matches_request(
+            &chunk,
+            &AgentMessage::ManagementRecoveryOperationReply {
+                request: Hash(id(93)),
+                applied: true,
+            }
+        ));
+        let pools = new_agent_outbound_permits();
+        let permits = (0..MAX_AGENT_OUTBOUND_APPLICATION_REQUESTS)
+            .map(|_| pools.try_acquire(AgentTrafficClass::Application).unwrap())
+            .collect::<Vec<_>>();
+        assert!(pools.try_acquire(AgentTrafficClass::Application).is_err());
+        assert!(pools.try_acquire(AgentTrafficClass::Raft).is_ok());
+        assert!(pools.try_acquire(AgentTrafficClass::Availability).is_ok());
+        drop(permits);
+        assert!(route.is_valid());
+    }
+
+    #[test]
+    fn management_recovery_replies_require_exact_peer_sender_route_kind_and_commitment() {
         let peer = key(84).public().to_peer_id();
         let other = key(85).public().to_peer_id();
         let route = test_route(84);
-        let registration = Hash(id(86));
-        for expiry in [false, true] {
+        let correlation = Hash(id(86));
+        for operation in [false, true] {
             for fault in 0..7 {
                 let (reply, result) = std_mpsc::channel();
                 let meta = PendingMeta {
@@ -2007,35 +2226,35 @@ mod tests {
                     target_node: node(peer),
                     target_peer: peer,
                 };
-                let pending = if expiry {
-                    PendingAgentReply::RecoveryExpiry {
+                let pending = if operation {
+                    PendingAgentReply::ManagementRecoveryOperation {
                         meta,
-                        request: registration,
+                        request: correlation,
                         reply,
                     }
                 } else {
-                    PendingAgentReply::RecoveryRegistration {
+                    PendingAgentReply::ManagementRecoveryCommand {
                         meta,
-                        registration,
+                        command: correlation,
                         reply,
                     }
                 };
-                let response_hash = if fault == 2 {
+                let actual = if fault == 2 {
                     Hash(id(87))
                 } else {
-                    registration
+                    correlation
                 };
                 let mut response = frame(
                     peer,
                     route,
-                    if expiry {
-                        AgentMessage::RecoveryExpiryReply {
-                            request: response_hash,
+                    if operation {
+                        AgentMessage::ManagementRecoveryOperationReply {
+                            request: actual,
                             applied: fault != 1,
                         }
                     } else {
-                        AgentMessage::RecoveryRegistrationReply {
-                            registration: response_hash,
+                        AgentMessage::ManagementRecoveryCommandReply {
+                            command: actual,
                             applied: fault != 1,
                         }
                     },
@@ -2047,9 +2266,16 @@ mod tests {
                     response.sender = node(other);
                 }
                 if fault == 6 {
-                    response.message = AgentMessage::ProjectionAccepted {
-                        request: registration,
-                        accepted: true,
+                    response.message = if operation {
+                        AgentMessage::ManagementRecoveryCommandReply {
+                            command: actual,
+                            applied: true,
+                        }
+                    } else {
+                        AgentMessage::ManagementRecoveryOperationReply {
+                            request: actual,
+                            applied: true,
+                        }
                     };
                 }
                 let authenticated =
@@ -2065,30 +2291,71 @@ mod tests {
                     6 => Err(AgentNetworkError::ResponseTypeMismatch),
                     _ => unreachable!(),
                 };
-                assert_eq!(result.recv().unwrap(), expected, "fault {fault}");
+                assert_eq!(
+                    result.recv().unwrap(),
+                    expected,
+                    "operation={operation} fault={fault}"
+                );
             }
         }
     }
 
     #[test]
-    fn recovery_registration_uses_bounded_application_pool_and_exact_reply() {
-        let registration = crate::agent::shared_recovery::recovery_registration_for_test(1, 7);
-        let request = AgentMessage::RecoveryRegistrationRequest(registration.clone());
-        let reply = AgentMessage::RecoveryRegistrationReply {
-            registration: Hash(registration.commitment().0),
-            applied: true,
-        };
-        assert!(is_request(&request));
-        assert!(!is_request(&reply));
-        assert!(response_matches_request(&request, &reply));
-        assert!(!response_matches_request(
-            &request,
-            &AgentMessage::RecoveryRegistrationReply {
-                registration: Hash(id(99)),
+    fn management_recovery_uses_bounded_application_pool_and_distinct_exact_replies() {
+        let mut messages = Vec::new();
+        for command in super::super::agent_protocol::management_recovery_commands_for_test() {
+            let request = AgentMessage::ManagementRecoveryCommandRequest(command.clone());
+            let reply = AgentMessage::ManagementRecoveryCommandReply {
+                command: Hash(command.commitment().0),
                 applied: true,
-            }
+            };
+            assert!(is_request(&request));
+            assert!(!is_request(&reply));
+            assert!(response_matches_request(&request, &reply));
+            assert!(!response_matches_request(
+                &request,
+                &AgentMessage::ManagementRecoveryCommandReply {
+                    command: Hash(id(99)),
+                    applied: true
+                }
+            ));
+            messages.extend([request, reply]);
+        }
+        let invoke = ManagementRecoveryOperationRequest {
+            registration: Hash(id(90)),
+            member: Hash(id(91)),
+            operation: super::super::agent_protocol::ManagementRecoveryOperation::Invoke,
+        };
+        let acknowledge = ManagementRecoveryOperationRequest {
+            operation: super::super::agent_protocol::ManagementRecoveryOperation::Acknowledge,
+            ..invoke
+        };
+        for request in [invoke, acknowledge] {
+            let message = AgentMessage::ManagementRecoveryOperationRequest(request);
+            let reply = AgentMessage::ManagementRecoveryOperationReply {
+                request: request.correlation(),
+                applied: true,
+            };
+            assert!(is_request(&message));
+            assert!(!is_request(&reply));
+            assert!(response_matches_request(&message, &reply));
+            assert!(!response_matches_request(
+                &message,
+                &AgentMessage::ManagementRecoveryOperationReply {
+                    request: Hash(id(99)),
+                    applied: true
+                }
+            ));
+            messages.extend([message, reply]);
+        }
+        assert!(!response_matches_request(
+            &AgentMessage::ManagementRecoveryOperationRequest(invoke),
+            &AgentMessage::ManagementRecoveryOperationReply {
+                request: acknowledge.correlation(),
+                applied: true
+            },
         ));
-        for message in [&request, &reply] {
+        for message in &messages {
             assert_eq!(
                 AgentTrafficClass::for_message(message),
                 AgentTrafficClass::Application
@@ -2102,171 +2369,77 @@ mod tests {
             .unwrap();
         assert!(reserve_agent_outbound_permit(&pools, AgentTrafficClass::Application).is_err());
         assert_eq!(
-            pools.available(AgentTrafficClass::Availability),
-            MAX_AGENT_OUTBOUND_AVAILABILITY_REQUESTS
-        );
-        assert_eq!(
             pools.available(AgentTrafficClass::Raft),
             MAX_AGENT_OUTBOUND_RAFT_REQUESTS
+        );
+        assert_eq!(
+            pools.available(AgentTrafficClass::Availability),
+            MAX_AGENT_OUTBOUND_AVAILABILITY_REQUESTS
         );
     }
 
     #[test]
-    fn snapshot_and_expiry_votes_require_exact_peer_sender_route_claim_and_signer() {
+    fn snapshot_votes_require_exact_peer_sender_route_claim_and_signer() {
         let peer = key(84).public().to_peer_id();
         let other = key(85).public().to_peer_id();
         let route = test_route(84);
         let claim = Hash(id(86));
         let signature =
             ReplicaCommitSignature::new(crate::service::NodeId(node(peer).0), [7; 64]).unwrap();
-        for expiry in [false, true] {
-            for fault in 0..8 {
-                let (reply, result) = std_mpsc::channel();
-                let meta = PendingMeta {
-                    route,
-                    target_node: node(peer),
-                    target_peer: peer,
-                };
-                let pending = if expiry {
-                    PendingAgentReply::RecoveryExpiryVote { meta, claim, reply }
-                } else {
-                    PendingAgentReply::CommonSnapshotVote { meta, claim, reply }
-                };
-                let response_hash = if fault == 2 { Hash(id(87)) } else { claim };
-                let response_signature = if fault == 1 {
-                    None
-                } else if fault == 3 {
-                    Some(
-                        ReplicaCommitSignature::new(crate::service::NodeId(node(other).0), [7; 64])
-                            .unwrap(),
-                    )
-                } else {
-                    Some(signature.clone())
-                };
-                let mut response = frame(
-                    peer,
-                    route,
-                    if expiry {
-                        AgentMessage::RecoveryExpiryVoteReply {
-                            claim: response_hash,
-                            signature: response_signature,
-                        }
-                    } else {
-                        AgentMessage::CommonSnapshotVoteReply {
-                            claim: response_hash,
-                            signature: response_signature,
-                        }
-                    },
-                );
-                if fault == 4 {
-                    response.route.generation = Hash(id(88));
-                }
-                if fault == 6 {
-                    response.sender = node(other);
-                }
-                if fault == 7 {
-                    response.message = AgentMessage::ProjectionAccepted {
-                        request: claim,
-                        accepted: true,
-                    };
-                }
-                let authenticated =
-                    authenticate_sender(if fault == 6 { &other } else { &peer }, response).unwrap();
-                pending.complete(if fault == 5 { other } else { peer }, authenticated);
-                let expected = match fault {
-                    0 => Ok(Some(signature.clone())),
-                    1 => Ok(None),
-                    2 | 3 => Err(AgentNetworkError::ResponseCorrelationMismatch),
-                    4 => Err(AgentNetworkError::ResponseRouteMismatch),
-                    5 => Err(AgentNetworkError::ResponsePeerMismatch),
-                    6 => Err(AgentNetworkError::ResponseSenderMismatch),
-                    7 => Err(AgentNetworkError::ResponseTypeMismatch),
-                    _ => unreachable!(),
-                };
-                assert_eq!(result.recv().unwrap(), expected, "fault {fault}");
-            }
-        }
-    }
-
-    #[test]
-    fn recovery_expiry_uses_separate_bounded_pools_and_authenticated_route_membership() {
-        let claim = super::super::agent_protocol::recovery_expiry_claim_for_test();
-        let vote = AgentMessage::RecoveryExpiryVoteRequest(claim.clone());
-        let vote_reply = AgentMessage::RecoveryExpiryVoteReply {
-            claim: Hash(claim.commitment().0),
-            signature: None,
-        };
-        let expire = AgentMessage::RecoveryExpiryRequest {
-            request: Hash(claim.request().0),
-        };
-        let expire_reply = AgentMessage::RecoveryExpiryReply {
-            request: Hash(claim.request().0),
-            applied: true,
-        };
-        for (request, reply, class) in [
-            (&vote, &vote_reply, AgentTrafficClass::Availability),
-            (&expire, &expire_reply, AgentTrafficClass::Application),
-        ] {
-            assert!(is_request(request));
-            assert!(!is_request(reply));
-            assert!(response_matches_request(request, reply));
-            assert_eq!(AgentTrafficClass::for_message(request), class);
-            assert_eq!(AgentTrafficClass::for_message(reply), class);
-        }
-        assert!(!response_matches_request(&vote, &expire_reply));
-        assert!(!response_matches_request(&expire, &vote_reply));
-        assert!(!response_matches_request(
-            &expire,
-            &AgentMessage::RecoveryExpiryReply {
-                request: Hash(id(99)),
-                applied: true
-            }
-        ));
-        assert!(!response_matches_request(
-            &vote,
-            &AgentMessage::RecoveryExpiryVoteReply {
-                claim: Hash(id(99)),
-                signature: None
-            }
-        ));
-        let pools = new_agent_outbound_permits();
-        let _application = pools
-            .application
-            .clone()
-            .try_acquire_many_owned(MAX_AGENT_OUTBOUND_APPLICATION_REQUESTS as u32)
-            .unwrap();
-        assert!(reserve_agent_outbound_permit(&pools, AgentTrafficClass::Application).is_err());
-        let _vote = reserve_agent_outbound_permit(&pools, AgentTrafficClass::Availability).unwrap();
-        assert_eq!(
-            pools.available(AgentTrafficClass::Raft),
-            MAX_AGENT_OUTBOUND_RAFT_REQUESTS
-        );
-
-        let peer = key(84).public().to_peer_id();
-        let outsider = key(85).public().to_peer_id();
-        let generation = claim.generation();
-        let route = AgentGenerationRoute {
-            space: SpaceId(generation.space().0),
-            agent: AgentId(generation.agent().0),
-            generation: Hash(generation.replication_id()),
-        };
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let routes = Arc::new(Mutex::new(BTreeMap::from([(
-            route,
-            registration(vec![node(peer)], calls.clone()),
-        )])));
-        for message in [vote, expire] {
-            let request = frame(peer, route, message.clone());
-            let decoded = AgentFrame::decode(&request.encode().unwrap()).unwrap();
-            assert!(authorize_inbound(peer, decoded, &routes).is_ok());
-            assert_eq!(
-                authorize_inbound(outsider, frame(outsider, route, message), &routes)
-                    .err()
-                    .unwrap(),
-                AgentNetworkError::UnknownMember(node(outsider))
+        for fault in 0..8 {
+            let (reply, result) = std_mpsc::channel();
+            let meta = PendingMeta {
+                route,
+                target_node: node(peer),
+                target_peer: peer,
+            };
+            let pending = PendingAgentReply::CommonSnapshotVote { meta, claim, reply };
+            let response_hash = if fault == 2 { Hash(id(87)) } else { claim };
+            let response_signature = if fault == 1 {
+                None
+            } else if fault == 3 {
+                Some(
+                    ReplicaCommitSignature::new(crate::service::NodeId(node(other).0), [7; 64])
+                        .unwrap(),
+                )
+            } else {
+                Some(signature.clone())
+            };
+            let mut response = frame(
+                peer,
+                route,
+                AgentMessage::CommonSnapshotVoteReply {
+                    claim: response_hash,
+                    signature: response_signature,
+                },
             );
+            if fault == 4 {
+                response.route.generation = Hash(id(88));
+            }
+            if fault == 6 {
+                response.sender = node(other);
+            }
+            if fault == 7 {
+                response.message = AgentMessage::ManagementRecoveryCommandReply {
+                    command: claim,
+                    applied: true,
+                };
+            }
+            let authenticated =
+                authenticate_sender(if fault == 6 { &other } else { &peer }, response).unwrap();
+            pending.complete(if fault == 5 { other } else { peer }, authenticated);
+            let expected = match fault {
+                0 => Ok(Some(signature.clone())),
+                1 => Ok(None),
+                2 | 3 => Err(AgentNetworkError::ResponseCorrelationMismatch),
+                4 => Err(AgentNetworkError::ResponseRouteMismatch),
+                5 => Err(AgentNetworkError::ResponsePeerMismatch),
+                6 => Err(AgentNetworkError::ResponseSenderMismatch),
+                7 => Err(AgentNetworkError::ResponseTypeMismatch),
+                _ => unreachable!(),
+            };
+            assert_eq!(result.recv().unwrap(), expected, "fault {fault}");
         }
-        assert!(calls.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2453,6 +2626,149 @@ mod tests {
     }
 
     #[test]
+    fn authority_read_barrier_requires_exact_request_peer_route_and_kind() {
+        let peer = key(86).public().to_peer_id();
+        let other_peer = key(87).public().to_peer_id();
+        let route = test_route(86);
+        let request = Hash(id(88));
+        let barrier = AuthorityReadBarrier {
+            request,
+            leader: node(peer),
+            raft_term: 3,
+            read_index: 7,
+            configuration_index: 0,
+        };
+        for fault in 0..15 {
+            let (reply, result) = std_mpsc::channel();
+            let pending = PendingAgentReply::AuthorityReadBarrier {
+                meta: PendingMeta {
+                    route,
+                    target_node: node(peer),
+                    target_peer: peer,
+                },
+                request,
+                reply,
+            };
+            let mut altered = barrier;
+            match fault {
+                3 => altered.request = Hash(id(89)),
+                4 => altered.leader = node(other_peer),
+                5 => altered.raft_term = 0,
+                6 => altered.read_index = 0,
+                7 => altered.configuration_index = 8,
+                _ => {}
+            }
+            let mut response = frame(
+                peer,
+                route,
+                AgentMessage::AuthorityReadBarrierReply {
+                    request: if fault == 2 { Hash(id(89)) } else { request },
+                    barrier: (fault != 1).then_some(altered),
+                },
+            );
+            match fault {
+                8 => response.route.space = SpaceId(id(90)),
+                9 => response.route.agent = AgentId(id(90)),
+                10 => response.route.generation = Hash(id(90)),
+                12 => response.sender = node(other_peer),
+                13 => response.message = AgentMessage::Raft(RaftMessage::StatusReply(None)),
+                14 => {
+                    response.message = AgentMessage::ManagementRecoveryCommandReply {
+                        command: request,
+                        applied: true,
+                    }
+                }
+                _ => {}
+            }
+            let authenticated =
+                authenticate_sender(if fault == 12 { &other_peer } else { &peer }, response)
+                    .unwrap();
+            pending.complete(if fault == 11 { other_peer } else { peer }, authenticated);
+            let expected = match fault {
+                0 => Ok(Some(barrier)),
+                1 => Ok(None),
+                2..=7 => Err(AgentNetworkError::ResponseCorrelationMismatch),
+                8..=10 => Err(AgentNetworkError::ResponseRouteMismatch),
+                11 => Err(AgentNetworkError::ResponsePeerMismatch),
+                12 => Err(AgentNetworkError::ResponseSenderMismatch),
+                13..=14 => Err(AgentNetworkError::ResponseTypeMismatch),
+                _ => unreachable!(),
+            };
+            assert_eq!(result.recv().unwrap(), expected, "fault {fault}");
+        }
+        let input =
+            AgentMessage::AuthorityReadBarrierRequest(AuthorityReadBarrierRequest { request });
+        let output = AgentMessage::AuthorityReadBarrierReply {
+            request,
+            barrier: Some(barrier),
+        };
+        assert!(response_matches_request(&input, &output));
+        for message in [&input, &output] {
+            assert_eq!(
+                AgentTrafficClass::for_message(message),
+                AgentTrafficClass::Availability
+            );
+        }
+        assert!(is_request(&input));
+        assert!(!is_request(&output));
+        assert!(!response_matches_request(
+            &input,
+            &AgentMessage::Raft(RaftMessage::StatusReply(None))
+        ));
+    }
+
+    #[test]
+    fn cancelled_authority_barrier_receiver_releases_capacity_on_late_reply_or_failure() {
+        let pools = new_agent_outbound_permits();
+        let peer = key(86).public().to_peer_id();
+        let route = test_route(86);
+        let request = Hash(id(88));
+        let barrier = AuthorityReadBarrier {
+            request,
+            leader: node(peer),
+            raft_term: 3,
+            read_index: 7,
+            configuration_index: 0,
+        };
+        let capacity = pools.available(AgentTrafficClass::Availability);
+        for late_response in [false, true] {
+            let (reply, receiver) = std_mpsc::channel();
+            let tracked = TrackedAgentReply {
+                pending: PendingAgentReply::AuthorityReadBarrier {
+                    meta: PendingMeta {
+                        route,
+                        target_node: node(peer),
+                        target_peer: peer,
+                    },
+                    request,
+                    reply,
+                },
+                _permit: reserve_agent_outbound_permit(&pools, AgentTrafficClass::Availability)
+                    .unwrap(),
+            };
+            assert_eq!(
+                pools.available(AgentTrafficClass::Availability),
+                capacity - 1
+            );
+            drop(receiver);
+            if late_response {
+                let response = frame(
+                    peer,
+                    route,
+                    AgentMessage::AuthorityReadBarrierReply {
+                        request,
+                        barrier: Some(barrier),
+                    },
+                );
+                tracked.complete(peer, authenticate_sender(&peer, response).unwrap());
+            } else {
+                tracked.fail(AgentNetworkError::Timeout);
+            }
+            assert_eq!(pools.available(AgentTrafficClass::Availability), capacity);
+        }
+    }
+
+    #[test]
     fn current_applied_availability_requires_exact_identity_claim_and_mode() {
         let peer = key(86).public().to_peer_id();
         let other_peer = key(87).public().to_peer_id();
@@ -2612,60 +2928,6 @@ mod tests {
             ));
         }
         assert!(!response_matches_request(&request, &request));
-    }
-
-    #[test]
-    fn projection_acceptance_requires_exact_peer_route_and_query_correlation() {
-        let peer = key(80).public().to_peer_id();
-        let route = test_route(81);
-        let request = Hash(id(82));
-        for fault in 0..5 {
-            let (reply, result) = std_mpsc::channel();
-            let pending = PendingAgentReply::Projection {
-                meta: PendingMeta {
-                    route,
-                    target_node: node(peer),
-                    target_peer: peer,
-                },
-                request,
-                reply,
-            };
-            let mut frame = frame(
-                peer,
-                route,
-                AgentMessage::ProjectionAccepted {
-                    request,
-                    accepted: true,
-                },
-            );
-            if fault == 1 {
-                frame.route = test_route(83);
-            }
-            if fault == 2 {
-                frame.message = AgentMessage::ProjectionAccepted {
-                    request: Hash(id(84)),
-                    accepted: true,
-                };
-            }
-            if fault == 3 {
-                frame.message = AgentMessage::Merge(MergeMessage::Heads(vec![]));
-            }
-            let authenticated = authenticate_sender(&peer, frame).unwrap();
-            pending.complete(
-                if fault == 4 {
-                    key(85).public().to_peer_id()
-                } else {
-                    peer
-                },
-                authenticated,
-            );
-            let actual = result.recv().unwrap();
-            if fault == 0 {
-                assert_eq!(actual, Ok(true));
-            } else {
-                assert!(actual.is_err(), "fault {fault}");
-            }
-        }
     }
 
     fn invocation_request(

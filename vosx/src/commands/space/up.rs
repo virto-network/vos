@@ -17,6 +17,9 @@ use crate::commands::space::common::{derive_hyperspace_id, registry_replication_
 use crate::commands::space::{local_config, reconcile};
 use crate::spaces_index;
 
+#[cfg(target_os = "linux")]
+mod registry_enrollment;
+
 pub struct Args {
     pub query: String,
     pub once: bool,
@@ -118,6 +121,18 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         local.local_agent_storage,
         local.system_bootstrap_bundle.as_deref(),
     )?;
+    // Enrollment is a genuine root-signed registry mutation, not a benefit of
+    // possessing a preparation seed. Keep it strictly after successful System
+    // startup: the unsupported fixed-three prewrite gate must refuse first.
+    #[cfg(target_os = "linux")]
+    vos::block_on(registry_enrollment::ensure_local_registry_node(
+        &registry,
+        &mut &node,
+        &space_id,
+        &operator_keypair,
+        &daemon_keypair,
+        local_prefix,
+    ))?;
     let extension_caps = register_extensions_from_local(
         &mut node,
         &local,

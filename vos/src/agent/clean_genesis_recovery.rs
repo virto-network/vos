@@ -1,11 +1,119 @@
 //! Retained Shared Create recovery and continuing management ownership.
 
-use super::genesis_issuance::RetainedCommitteeQuery;
 use super::*;
 use crate::agent::clean_authority_issuer::SignedManagementTerminal;
 use crate::agent::clean_management_intent::{
     CleanManagementIntent, CleanManagementIntentSlot, ManagementJournalAnchor, SharedInstallHandoff,
 };
+#[cfg(feature = "experimental-state-blocks")]
+use alloc::boxed::Box;
+
+/// The only pre-archive retained phase is the original Create authorization.
+/// Publication (and its optional finalization successor) requires the selected
+/// archive even when no ordinary generation has yet been physically opened.
+fn shared_creation_requires_archive(retired: bool, retained_phases: usize) -> bool {
+    retired || retained_phases > 1
+}
+
+#[cfg(test)]
+mod archive_phase_tests {
+    use super::shared_creation_requires_archive;
+
+    #[test]
+    fn missing_archive_accepts_only_prepublication_create_phases() {
+        // No authorization yet, then the original authorization alone. The
+        // caller still requires retained runtime and selected replica inputs.
+        assert!(!shared_creation_requires_archive(false, 0));
+        assert!(!shared_creation_requires_archive(false, 1));
+        // Original authorization + publication is no longer an unarchived
+        // preparation; adding finalization does not change that requirement.
+        assert!(shared_creation_requires_archive(false, 2));
+        assert!(shared_creation_requires_archive(false, 3));
+        // Retirement clears reservations, not the archive's retention duty.
+        assert!(shared_creation_requires_archive(true, 0));
+    }
+}
+
+/// The exact admitted runtime selected by a signed ordinary Shared Create.
+/// This is not an executor or finality capability. Retained VOS3 bytes are
+/// re-admitted against the signed descriptor before this selection is restored.
+#[derive(Clone, Debug)]
+pub enum SharedGenesisRuntimePackage {
+    Image(AdmittedRuntimePackage),
+    #[cfg(feature = "experimental-state-blocks")]
+    External(super::super::package_admission::AdmittedStateRuntimePackage),
+}
+
+impl SharedGenesisRuntimePackage {
+    pub fn exact_bytes(&self) -> &[u8] {
+        match self {
+            Self::Image(runtime) => runtime.exact_bytes(),
+            #[cfg(feature = "experimental-state-blocks")]
+            Self::External(runtime) => runtime.exact_bytes(),
+        }
+    }
+
+    fn validate_descriptor(
+        &self,
+        descriptor: &AgentDescriptor,
+    ) -> Result<(), SharedAgentHostError> {
+        if descriptor.identity.profile != AgentProfile::Shared {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        match self {
+            Self::Image(runtime) => {
+                super::super::driver::verify_clean_runtime_package_binding(descriptor, runtime)
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)
+            }
+            #[cfg(feature = "experimental-state-blocks")]
+            Self::External(runtime) => {
+                if descriptor.runtime_package != *runtime.package_ref()
+                    || descriptor.identity.runtime_deployment != runtime.deployment()
+                    || descriptor.identity.runtime_program != runtime.program()
+                    || descriptor.identity.runtime_producer != runtime.manifest().signing.producer
+                    || descriptor.runtime_contract != runtime.manifest().contract
+                    || descriptor.capabilities != runtime.manifest().capabilities
+                    || !super::super::replay::external_shared_descriptor_supported(descriptor)
+                {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn from_retained(
+        descriptor: &AgentDescriptor,
+        bytes: &[u8],
+    ) -> Result<Self, SharedAgentHostError> {
+        // Select by the signed lifecycle ABI, never by a failed image decode
+        // or by the presence of external storage files.
+        let package =
+            if descriptor.runtime_contract.lifecycle_abi == super::super::sdk::RUNTIME_ABI_ID {
+                Self::Image(
+                    super::super::package_admission::admit_runtime_package(bytes)
+                        .map_err(|_| SharedAgentHostError::ScopeMismatch)?,
+                )
+            } else {
+                #[cfg(feature = "experimental-state-blocks")]
+                {
+                    if descriptor.runtime_contract.lifecycle_abi
+                        != super::super::sdk::state_execution::STATE_EXECUTION_ABI_ID
+                    {
+                        return Err(SharedAgentHostError::ScopeMismatch);
+                    }
+                    Self::External(
+                        super::super::package_admission::admit_state_runtime_package(bytes)
+                            .map_err(|_| SharedAgentHostError::ScopeMismatch)?,
+                    )
+                }
+                #[cfg(not(feature = "experimental-state-blocks"))]
+                return Err(SharedAgentHostError::ScopeMismatch);
+            };
+        package.validate_descriptor(descriptor)?;
+        Ok(package)
+    }
+}
 
 fn recover_shared_install_handoff<I, J>(
     slot: &mut CleanManagementIntentSlot<I>,
@@ -202,6 +310,18 @@ where
 pub struct NativeSharedGenesisController<I, J: CleanManagementIssuerStore, Q, R, W, P, A> {
     authority: AuthorityActorTarget,
     entries: Vec<(NativeSharedGenesisRecovery<I, J, Q, R, W, P>, Option<A>)>,
+    // Members retain public archives, not another node's issuer or Create WAL.
+    // The existing archive lease stays owned through recovery and serving.
+    member_archives: Vec<(super::super::genesis::AgentGenesisLocator, A)>,
+    #[cfg(feature = "experimental-state-blocks")]
+    member_archive_factory: Option<
+        Box<
+            dyn FnMut(
+                    &super::super::genesis::AgentGenesisArchiveRecord,
+                ) -> Result<A, SharedAgentHostError>
+                + Send,
+        >,
+    >,
     recovered: bool,
     generations_recovered: bool,
 }
@@ -242,6 +362,9 @@ where
         Ok(Self {
             authority,
             entries,
+            member_archives: Vec::new(),
+            #[cfg(feature = "experimental-state-blocks")]
+            member_archive_factory: None,
             recovered: false,
             generations_recovered: false,
         })
@@ -255,6 +378,140 @@ where
         self.recovered
     }
 
+    /// Retain issuer-independent member archives before startup admission.
+    /// Locators only select leased public data; decoding an archive cannot
+    /// grant finality, provision a generation, or impersonate its coordinator.
+    /// Cold recovery requires the member's physical namespace to exist;
+    /// archive-only preparation cannot create or repair a missing generation.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub fn with_member_archives(
+        mut self,
+        mut members: Vec<(super::super::genesis::AgentGenesisLocator, A)>,
+    ) -> Result<Self, SharedAgentHostError> {
+        if self.recovered || self.generations_recovered || !self.member_archives.is_empty() {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        validate_member_archive_locators(
+            self.authority,
+            &self
+                .entries
+                .iter()
+                .map(|(entry, _)| entry.locator)
+                .collect::<Vec<_>>(),
+            &members
+                .iter()
+                .map(|(locator, _)| *locator)
+                .collect::<Vec<_>>(),
+        )?;
+        members.sort_unstable_by_key(|(locator, _)| locator.agent);
+        self.member_archives = members;
+        Ok(self)
+    }
+
+    /// Retain the existing per-member archive owner for live admission. The
+    /// factory acquires an empty or byte-identical lease only; it must not
+    /// publish inputs, execute Authority, or create a physical generation.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub fn with_member_archive_factory<F>(
+        mut self,
+        factory: F,
+    ) -> Result<Self, SharedAgentHostError>
+    where
+        F: FnMut(
+                &super::super::genesis::AgentGenesisArchiveRecord,
+            ) -> Result<A, SharedAgentHostError>
+            + Send
+            + 'static,
+    {
+        if self.recovered || self.generations_recovered || self.member_archive_factory.is_some() {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        self.member_archive_factory = Some(Box::new(factory));
+        Ok(self)
+    }
+
+    /// Admit this node's member of a finalized ordinary Shared Create. Public
+    /// archive bytes never confer admission: the installed System must freshly
+    /// confirm both the permanent decision and the complete live descriptor.
+    /// This retains storage and physical ownership, not transport or readiness.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub fn admit_member_archive<B, C, D, S>(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<B, C, D>,
+        record: &super::super::genesis::AgentGenesisArchiveRecord,
+        signer: &mut S,
+    ) -> Result<(), SharedAgentHostError>
+    where
+        B: CleanSystemAgentBootstrapStore + Send + 'static,
+        C: CleanSystemAgentBootstrapStore + Send + 'static,
+        D: CleanManagementIssuerStore + Send + 'static,
+        S: CleanManagementReceiptSigner,
+    {
+        let locator = record.provision().proposal().locator();
+        let existing = validate_live_member_archive_selection(
+            self.authority,
+            self.recovered,
+            &self
+                .entries
+                .iter()
+                .map(|(entry, _)| entry.locator)
+                .collect::<Vec<_>>(),
+            &self
+                .member_archives
+                .iter()
+                .map(|(locator, _)| *locator)
+                .collect::<Vec<_>>(),
+            locator,
+        )?;
+        if owner.authority_target() != self.authority {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        // Static certified material, actual Root and exclusion checks precede
+        // even the empty lease. No signing or projection WAL occurs here.
+        owner.preflight_live_member_shared_genesis(record, signer.public_key())?;
+        let index = match existing {
+            Some(index) => index,
+            None => {
+                let archive =
+                    self.member_archive_factory
+                        .as_mut()
+                        .ok_or(SharedAgentHostError::Unavailable)?(record)?;
+                let index = self
+                    .member_archives
+                    .partition_point(|(member, _)| member.agent < locator.agent);
+                // Retain the lease before fresh reads or host staging. Any
+                // later ambiguous write is retried through this exact owner.
+                self.member_archives.insert(index, (locator, archive));
+                index
+            }
+        };
+        let (_, archive) = &self.member_archives[index];
+        let stored = archive
+            .load(locator)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if stored.as_deref().is_some_and(|bytes| {
+            bytes.len() > super::super::genesis::MAX_AGENT_GENESIS_ARCHIVE_RECORD_BYTES
+                || bytes != record.encode().as_slice()
+        }) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        // Published inputs cannot repair an absent serving namespace. Empty
+        // preparation permits only a genuine first admission or exact stage.
+        owner.preflight_live_member_namespace(record, stored.is_some())?;
+        let proof = owner.stage_live_member_shared_genesis(record, stored.is_some(), signer)?;
+        super::super::genesis_archive::ArchivedAgentGenesisProvider::new(locator.space, archive)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+            .publish(record)
+            .map_err(|error| match error {
+                super::super::genesis::AgentGenesisProviderError::Unavailable => {
+                    SharedAgentHostError::Unavailable
+                }
+                _ => SharedAgentHostError::ScopeMismatch,
+            })?;
+        owner.finish_live_member_shared_genesis(record, &proof, archive)?;
+        self.refresh_member_projection_scope(owner)
+    }
+
     /// Retain a new signed, unissued Create after startup recovery. The factory
     /// may only reserve inputs and acquire leases: it must not execute Authority
     /// or provision a generation. Exact retries use the already-owned entry and
@@ -264,6 +521,31 @@ where
         descriptor: &AgentDescriptor,
         call: &super::super::sdk::authority::AuthorityCredentialCall,
         runtime: &AdmittedRuntimePackage,
+        replicas: &AgentReplicaCommittee,
+        reserve: F,
+    ) -> Result<super::super::genesis::AgentGenesisLocator, SharedAgentHostError>
+    where
+        F: FnOnce() -> Result<
+            (NativeSharedGenesisRecovery<I, J, Q, R, W, P>, Option<A>),
+            SharedAgentHostError,
+        >,
+    {
+        self.reserve_create_with_runtime(
+            descriptor,
+            call,
+            &SharedGenesisRuntimePackage::Image(runtime.clone()),
+            replicas,
+            reserve,
+        )
+    }
+
+    /// The signed runtime contract is retained together with the original
+    /// reservation; exact retries cannot replace its executor selection.
+    pub fn reserve_create_with_runtime<F>(
+        &mut self,
+        descriptor: &AgentDescriptor,
+        call: &super::super::sdk::authority::AuthorityCredentialCall,
+        runtime: &SharedGenesisRuntimePackage,
         replicas: &AgentReplicaCommittee,
         reserve: F,
     ) -> Result<super::super::genesis::AgentGenesisLocator, SharedAgentHostError>
@@ -288,21 +570,23 @@ where
             runtime,
             replicas,
         )?;
+        if self
+            .member_archives
+            .iter()
+            .any(|(member, _)| member.agent == locator.agent)
+        {
+            // A member lease is not an issuer reservation or authority to
+            // consume the coordinator's management sequence on this node.
+            return Err(SharedAgentHostError::Conflict);
+        }
         let matches = |recovery: &mut NativeSharedGenesisRecovery<I, J, Q, R, W, P>| {
-            Ok::<_, SharedAgentHostError>(
-                recovery.authority == self.authority
-                    && recovery.locator == locator
-                    // Execution anchors/work grow after reservation. They are
-                    // not caller inputs and cannot make an exact retry differ.
-                    && recovery.intent.intent().is_some_and(|retained| {
-                        retained.request() == signed.request() && retained.call() == signed.call()
-                    })
-                    && recovery
-                        .runtime
-                        .as_ref()
-                        .map(AdmittedRuntimePackage::exact_bytes)
-                        == Some(runtime.exact_bytes())
-                    && recovery.retained_replicas()?.as_ref() == Some(replicas),
+            Self::create_reservation_matches(
+                self.authority,
+                locator,
+                &signed,
+                runtime,
+                replicas,
+                recovery,
             )
         };
         let position = match self
@@ -318,7 +602,12 @@ where
             }
             Err(index) => index,
         };
-        if self.entries.len() >= super::super::shared_host::MAX_SHARED_HOST_AGENTS {
+        if self
+            .entries
+            .len()
+            .saturating_add(self.member_archives.len())
+            >= super::super::shared_host::MAX_SHARED_HOST_AGENTS
+        {
             return Err(SharedAgentHostError::CapacityExhausted);
         }
         let (mut recovery, archive) = reserve()?;
@@ -357,11 +646,166 @@ where
         Ok(locator)
     }
 
+    fn create_reservation_matches(
+        authority: AuthorityActorTarget,
+        locator: super::super::genesis::AgentGenesisLocator,
+        signed: &CleanManagementIntent,
+        runtime: &SharedGenesisRuntimePackage,
+        replicas: &AgentReplicaCommittee,
+        recovery: &mut NativeSharedGenesisRecovery<I, J, Q, R, W, P>,
+    ) -> Result<bool, SharedAgentHostError> {
+        Ok(recovery.authority == authority
+            && recovery.locator == locator
+            // Work grows after reservation. It is not caller input, and an
+            // invalid admission cache must still permit exact native reload.
+            && recovery.intent.intent().is_some_and(|retained| {
+                retained.request() == signed.request() && retained.call() == signed.call()
+            })
+            && recovery.runtime.as_ref().map(SharedGenesisRuntimePackage::exact_bytes)
+                == Some(runtime.exact_bytes())
+            && recovery.retained_replicas()?.as_ref() == Some(replicas))
+    }
+
+    /// Lookup only: validate the complete signed caller material against an
+    /// already-owned issuer reservation, without opening a lease, signing,
+    /// persisting, or admitting a new Create while route publication is hidden.
+    pub(crate) fn retained_create_locator(
+        &mut self,
+        descriptor: &AgentDescriptor,
+        call: &AuthorityCredentialCall,
+        runtime: &SharedGenesisRuntimePackage,
+        replicas: &AgentReplicaCommittee,
+    ) -> Result<Option<super::super::genesis::AgentGenesisLocator>, SharedAgentHostError> {
+        if !self.recovered {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let locator = super::super::genesis::AgentGenesisLocator {
+            space: crate::service::SpaceId(self.authority.space.0),
+            agent: crate::service::AgentId(descriptor.identity.agent.0),
+        };
+        let signed = NativeSharedGenesisRecovery::<I, J, Q, R, W, P>::validated_create_intent(
+            self.authority,
+            locator,
+            descriptor,
+            call,
+            runtime,
+            replicas,
+        )?;
+        if self
+            .member_archives
+            .iter()
+            .any(|(member, _)| member.agent == locator.agent)
+        {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let Ok(index) = self
+            .entries
+            .binary_search_by_key(&locator.agent, |(entry, _)| entry.locator.agent)
+        else {
+            return Ok(None);
+        };
+        if Self::create_reservation_matches(
+            self.authority,
+            locator,
+            &signed,
+            runtime,
+            replicas,
+            &mut self.entries[index].0,
+        )? {
+            Ok(Some(locator))
+        } else {
+            Err(SharedAgentHostError::Conflict)
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn into_entries_for_test(
         self,
     ) -> Vec<(NativeSharedGenesisRecovery<I, J, Q, R, W, P>, Option<A>)> {
         self.entries
+    }
+
+    /// Read the exact leased coordinator archive for a recovered reservation.
+    /// This is untrusted publication data, not finality or route permission.
+    /// A public exact retry may skip new endorsement when it already exists;
+    /// completion must still perform the owner's normal live verification.
+    pub(crate) fn create_archive(
+        &self,
+        locator: super::super::genesis::AgentGenesisLocator,
+    ) -> Result<Option<super::super::genesis::AgentGenesisArchiveRecord>, SharedAgentHostError>
+    {
+        if !self.recovered {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let (_, archive) = self
+            .entries
+            .iter()
+            .find(|(entry, _)| entry.locator == locator)
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let archive = archive.as_ref().ok_or(SharedAgentHostError::Unavailable)?;
+        let provider = super::super::genesis_archive::ArchivedAgentGenesisProvider::new(
+            locator.space,
+            archive,
+        )
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        provider.load_record(locator).map_err(|error| match error {
+            super::super::genesis::AgentGenesisProviderError::Unavailable => {
+                SharedAgentHostError::Unavailable
+            }
+            _ => SharedAgentHostError::ScopeMismatch,
+        })
+    }
+
+    /// Inspect the exact retained Create denial without executing or signing.
+    /// A durable certificate alone does not prove retention release: callers
+    /// must first finish the normal native denial continuation successfully.
+    pub(crate) fn create_denial(
+        &mut self,
+        locator: super::super::genesis::AgentGenesisLocator,
+        descriptor: &AgentDescriptor,
+        call: &AuthorityCredentialCall,
+    ) -> Result<Option<super::super::local_lifecycle::SharedCreateDenial>, SharedAgentHostError>
+    {
+        if !self.recovered || call.authority != self.authority {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        if locator.space.0 != self.authority.space.0
+            || locator.space.0 != descriptor.identity.space.0
+            || locator.agent.0 != descriptor.identity.agent.0
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let Some((recovery, _)) = self
+            .entries
+            .iter_mut()
+            .find(|(entry, _)| entry.locator == locator)
+        else {
+            return Ok(None);
+        };
+        let request = ManagementRequest::Create(Box::new(descriptor.clone()));
+        if !recovery.intent.intent().is_some_and(|intent| {
+            recovery.authority == self.authority
+                && intent.request() == &request
+                && intent.call() == call
+        }) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if !recovery
+            .intent
+            .denial_complete()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        {
+            return Ok(None);
+        }
+        recovery
+            .intent
+            .load_denial_certificate()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .map(|bytes| {
+                super::super::local_lifecycle::SharedCreateDenial::verify(descriptor, call, &bytes)
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)
+            })
+            .transpose()
     }
 
     /// Resume one signed, pre-archive Create through the retained lifecycle
@@ -384,11 +828,22 @@ where
         if !self.recovered || owner.authority_target() != self.authority {
             return Err(SharedAgentHostError::Conflict);
         }
-        let (recovery, archive) = self
+        let index = self
             .entries
-            .iter_mut()
-            .find(|(recovery, _)| recovery.locator == locator)
+            .iter()
+            .position(|(recovery, _)| recovery.locator == locator)
             .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let (recovery, archive) = &mut self.entries[index];
+        if !recovery.admission_valid {
+            recovery
+                .readmit_creation_from_leased_stores()
+                .map_err(|error| {
+                    if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                        tracing::debug!(?error, "shared_create_prepare_phase_error: reload");
+                    }
+                    error
+                })?;
+        }
         if recovery.retired {
             return Err(SharedAgentHostError::Conflict);
         }
@@ -405,7 +860,22 @@ where
         {
             return Err(SharedAgentHostError::Conflict);
         }
-        if owner.finish_denied_shared_genesis(recovery, receipt_signer)? {
+        if owner
+            .finish_denied_shared_genesis(recovery, receipt_signer)
+            .map_err(|error| {
+                if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                    tracing::debug!(
+                        node = ?owner.pins().node,
+                        locator = ?locator,
+                        phase = "create_denial_evidence",
+                        admission_valid = recovery.admission_valid,
+                        ?error,
+                        "Retained Shared Create preparation refused"
+                    );
+                }
+                error
+            })?
+        {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         let replicas = recovery
@@ -415,12 +885,50 @@ where
             .host
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?
-            .preflight_live_genesis_capacity(locator)?;
+            .preflight_live_genesis_capacity(locator)
+            .map_err(|error| {
+                if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                    tracing::debug!(
+                        node = ?owner.pins().node,
+                        locator = ?locator,
+                        phase = "create_physical_preflight",
+                        admission_valid = recovery.admission_valid,
+                        ?error,
+                        "Retained Shared Create preparation refused"
+                    );
+                }
+                error
+            })?;
         let (candidate, committee) =
             match owner.resume_shared_genesis_preparation(recovery, &replicas, receipt_signer) {
                 Ok(prepared) => prepared,
                 Err(error) => {
-                    owner.finish_denied_shared_genesis(recovery, receipt_signer)?;
+                    if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                        tracing::debug!(
+                            node = ?owner.pins().node,
+                            locator = ?locator,
+                            phase = "create_resume",
+                            admission_valid = recovery.admission_valid,
+                            ?error,
+                            "Retained Shared Create preparation refused"
+                        );
+                    }
+                    owner
+                        .finish_denied_shared_genesis(recovery, receipt_signer)
+                        .map_err(|denial_error| {
+                            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                                tracing::debug!(
+                                    node = ?owner.pins().node,
+                                    locator = ?locator,
+                                    phase = "create_denial_after_resume_error",
+                                    admission_valid = recovery.admission_valid,
+                                    resume_error = ?error,
+                                    ?denial_error,
+                                    "Retained Shared Create preparation refused"
+                                );
+                            }
+                            denial_error
+                        })?;
                     return Err(error);
                 }
             };
@@ -563,7 +1071,11 @@ where
             .load_record(locator)
             .map_err(|_| SharedAgentHostError::Unavailable)?
             .ok_or(SharedAgentHostError::Unavailable)?;
-        owner.complete_live_shared_genesis(recovery, &record, signer, predecessor.as_ref())
+        let acknowledgement =
+            owner.complete_live_shared_genesis(recovery, &record, signer, predecessor.as_ref())?;
+        #[cfg(feature = "experimental-state-blocks")]
+        self.refresh_member_projection_scope(owner)?;
+        Ok(acknowledgement)
     }
 
     /// Retain one continuing issuer only after authenticating the completed
@@ -833,7 +1345,7 @@ where
         if admission.authority != self.authority {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        let empty = self.entries.is_empty();
+        let empty = self.entries.is_empty() && self.member_archives.is_empty();
         for (recovery, _) in &mut self.entries {
             admission = admission.include_shared_genesis(recovery)?;
         }
@@ -871,12 +1383,65 @@ where
         if owner.authority_target() != self.authority {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        if self.entries.is_empty() {
+        if !self.member_archives.is_empty()
+            && signer.public_key() != self.authority.binding.public_key
+        {
+            // Refuse before recovering any read WAL or issuing retained work.
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if self.entries.is_empty() && self.member_archives.is_empty() {
             owner.verify_empty_shared_genesis_startup()?;
             self.recovered = true;
             return Ok(());
         }
         owner.shared_lifecycle_recovery_pending = true;
+        // Re-read every leased member archive before any replay or physical
+        // staging. A previous in-memory record is not current storage evidence.
+        #[cfg(feature = "experimental-state-blocks")]
+        let mut staged_member_archives = Vec::new();
+        let member_records = self.member_archives.iter().enumerate().filter_map(|(index, (locator, archive))| {
+            let bytes = match archive.load(*locator) {
+                Ok(Some(bytes)) => bytes,
+                Err(_) => return Some(Err(SharedAgentHostError::Unavailable)),
+                Ok(None) => {
+                    // Empty preparation alone grants nothing. Only a present,
+                    // never-opened exact host intent supplies missing inputs;
+                    // publication still waits for fresh proof after issuer
+                    // recovery has discharged its own dependencies below.
+                    #[cfg(feature = "experimental-state-blocks")]
+                    {
+                        let staged = owner.host.lock()
+                            .map_err(|_| SharedAgentHostError::Unavailable)
+                            .and_then(|mut host| host.staged_member_genesis_archive(*locator));
+                        match staged {
+                            Ok(Some(record)) => {
+                                staged_member_archives.push((index, record.clone()));
+                                crate::service::ServiceWire::encode(&record)
+                            }
+                            Ok(None) => return None,
+                            Err(error) => return Some(Err(error)),
+                        }
+                    }
+                    #[cfg(not(feature = "experimental-state-blocks"))]
+                    { return None; }
+                }
+            };
+            if bytes.len() > super::super::genesis::MAX_AGENT_GENESIS_ARCHIVE_RECORD_BYTES {
+                return Some(Err(SharedAgentHostError::ScopeMismatch));
+            }
+            let record = <super::super::genesis::AgentGenesisArchiveRecord as crate::service::ServiceWire>::decode(&bytes)
+                .map_err(|_| SharedAgentHostError::ScopeMismatch);
+            let record = match record {
+                Ok(record) => record,
+                Err(error) => return Some(Err(error)),
+            };
+            if record.provision().proposal().locator() != *locator
+                || crate::service::ServiceWire::encode(&record) != bytes
+            {
+                return Some(Err(SharedAgentHostError::ScopeMismatch));
+            }
+            Some(Ok(record))
+        }).collect::<Result<Vec<_>, _>>()?;
         let records = self
             .entries
             .iter_mut()
@@ -894,8 +1459,7 @@ where
                     // Authorization and committee selection precede archive
                     // publication. Their presence is not evidence of a lost
                     // archive. Publication/finalization, however, require it.
-                    if recovery.retired
-                        || recovery.pending.len() > 2
+                    if shared_creation_requires_archive(recovery.retired, recovery.pending.len())
                         || recovery.runtime.is_none()
                         || recovery.retained_replicas()?.is_none()
                     {
@@ -917,16 +1481,39 @@ where
                 Ok(Some(record))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        // A crash may have retained the narrowly admitted verification read
-        // beside its original Create. Drain only that child before replaying
-        // lifecycle preparation, which continues to exclude ordinary reads.
-        owner.recover_pending_authority_projection()?;
-        // Replay retained system work before fresh reads can advance the clock
-        // beyond its immutable preflight. Authorization only yields a receipt;
+        #[cfg(feature = "experimental-state-blocks")]
+        {
+            let mut cold_records = records.iter().flatten().collect::<Vec<_>>();
+            cold_records.extend(member_records.iter());
+            owner.validate_recovery_member_set(&cold_records)?;
+        }
+        // Replay retained mutation work using its immutable preflight.
+        // Non-retaining observations do not advance the guest's logical clock.
+        // Authorization only yields a receipt;
         // finalization only resumes an already signed application outcome.
         // Physical execution/evidence and fresh genesis authority remain gated
         // below, with route export closed throughout recovery.
         for (recovery, _) in &mut self.entries {
+            if let Some(slot) = recovery.management_intent.as_mut() {
+                if slot
+                    .denial_complete()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?
+                {
+                    let issuer = recovery
+                        .management_issuer
+                        .as_ref()
+                        .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                    // A durable CND1 omits runtime admission, not the exact
+                    // owner's quorum-release obligation. Retry its verified
+                    // terminal before fresh genesis reads or the later skip.
+                    if !owner.finish_denied_shared_install(slot, issuer, signer)? {
+                        return Err(SharedAgentHostError::ScopeMismatch);
+                    }
+                    recovery.management_pending.clear();
+                    recovery.management_retirements.clear();
+                    continue;
+                }
+            }
             if recovery.management_retirements.is_empty() && recovery.management_pending.is_empty()
             {
                 continue;
@@ -1029,10 +1616,28 @@ where
             .filter_map(|((recovery, _), record)| record.as_ref().map(|record| (recovery, record)))
             .collect();
         if !self.generations_recovered {
-            owner.recover_deferred_shared_generations_with_pending(
+            owner.recover_deferred_shared_generations_with_members(
                 &mut entries,
+                &member_records,
                 signer,
                 predecessor.as_ref(),
+                |_member_owner, _member_signer| {
+                    #[cfg(feature = "experimental-state-blocks")]
+                    for (index, expected) in staged_member_archives {
+                        let (locator, archive) = &self.member_archives[index];
+                        let recovered = _member_owner
+                            .recover_staged_member_shared_genesis_archive(
+                                *locator,
+                                archive,
+                                _member_signer,
+                            )?
+                            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                        if recovered != expected {
+                            return Err(SharedAgentHostError::ScopeMismatch);
+                        }
+                    }
+                    Ok(())
+                },
             )?;
             self.generations_recovered = true;
         }
@@ -1084,9 +1689,59 @@ where
         for (_, _, _, index) in installs {
             Self::complete_retained_install(owner, &mut self.entries[index].0, signer)?;
         }
+        #[cfg(feature = "experimental-state-blocks")]
+        self.refresh_member_projection_scope(owner)?;
         owner.shared_lifecycle_recovery_pending = false;
         self.recovered = true;
         Ok(())
+    }
+
+    /// Lifecycle-boundary material restriction for both warm and cold voters.
+    /// Read every existing lease again; an unserved archive alone is excluded
+    /// by the actual host namespace set. This does not sign or dispatch reads.
+    #[cfg(feature = "experimental-state-blocks")]
+    fn refresh_member_projection_scope<B, C, D>(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<B, C, D>,
+    ) -> Result<(), SharedAgentHostError>
+    where
+        B: CleanSystemAgentBootstrapStore,
+        C: CleanSystemAgentBootstrapStore,
+        D: CleanManagementIssuerStore,
+    {
+        if owner.authority_target() != self.authority {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let leases = self
+            .entries
+            .iter()
+            .filter_map(|(entry, archive)| archive.as_ref().map(|archive| (entry.locator, archive)))
+            .chain(
+                self.member_archives
+                    .iter()
+                    .map(|(locator, archive)| (*locator, archive)),
+            );
+        let mut records = Vec::new();
+        for (locator, archive) in leases {
+            let Some(bytes) = archive
+                .load(locator)
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            else {
+                continue;
+            };
+            if bytes.len() > super::super::genesis::MAX_AGENT_GENESIS_ARCHIVE_RECORD_BYTES {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            let record = <super::super::genesis::AgentGenesisArchiveRecord as crate::service::ServiceWire>::decode(&bytes)
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            if record.provision().proposal().locator() != locator
+                || crate::service::ServiceWire::encode(&record) != bytes
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            records.push(record);
+        }
+        owner.validate_recovery_member_set(&records.iter().collect::<Vec<_>>())
     }
 
     fn complete_retained_install<B, C, D, S>(
@@ -1141,6 +1796,296 @@ where
     }
 }
 
+#[cfg(feature = "experimental-state-blocks")]
+fn validate_live_member_archive_selection(
+    authority: AuthorityActorTarget,
+    recovered: bool,
+    issuer: &[super::super::genesis::AgentGenesisLocator],
+    members: &[super::super::genesis::AgentGenesisLocator],
+    requested: super::super::genesis::AgentGenesisLocator,
+) -> Result<Option<usize>, SharedAgentHostError> {
+    if !recovered {
+        return Err(SharedAgentHostError::Conflict);
+    }
+    validate_member_archive_locators(authority, issuer, members)?;
+    if let Some(index) = members.iter().position(|member| *member == requested) {
+        return Ok(Some(index));
+    }
+    let mut proposed = members.to_vec();
+    proposed.push(requested);
+    validate_member_archive_locators(authority, issuer, &proposed)?;
+    Ok(None)
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+fn validate_member_archive_locators(
+    authority: AuthorityActorTarget,
+    issuer: &[super::super::genesis::AgentGenesisLocator],
+    members: &[super::super::genesis::AgentGenesisLocator],
+) -> Result<(), SharedAgentHostError> {
+    if issuer.len().saturating_add(members.len())
+        > super::super::shared_host::MAX_SHARED_HOST_AGENTS
+    {
+        return Err(SharedAgentHostError::CapacityExhausted);
+    }
+    let mut all: Vec<_> = issuer.iter().chain(members).copied().collect();
+    if !authority.is_valid()
+        || all.iter().any(|locator| {
+            locator.validate().is_err()
+                || locator.space.0 != authority.space.0
+                || locator.agent.0 == authority.system_agent.0
+        })
+    {
+        return Err(SharedAgentHostError::ScopeMismatch);
+    }
+    all.sort_unstable_by_key(|locator| locator.agent);
+    if all.windows(2).any(|pair| pair[0].agent == pair[1].agent) {
+        return Err(SharedAgentHostError::Conflict);
+    }
+    Ok(())
+}
+
+#[cfg(all(test, feature = "experimental-state-blocks"))]
+mod member_archive_tests {
+    use super::*;
+    use crate::agent::sdk::{DeploymentId, PrincipalId, ProducerId, ProgramId};
+
+    // Construction-only stores: no execution or finality fixture is supplied.
+    struct NoStore;
+    impl CleanManagementIssuerStore for NoStore {
+        type Error = ();
+        fn load(&mut self) -> Result<Option<Vec<u8>>, ()> {
+            Ok(None)
+        }
+        fn commit(&mut self, _: &[u8]) -> Result<(), ()> {
+            Err(())
+        }
+    }
+    impl super::super::super::clean_authority_issuer::CleanManagementRuntimeStore for NoStore {
+        fn load_runtime(&mut self) -> Result<Option<Vec<u8>>, ()> {
+            Ok(None)
+        }
+        fn commit_runtime(&mut self, _: &[u8]) -> Result<(), ()> {
+            Err(())
+        }
+    }
+    impl super::super::super::clean_authority_issuer::CleanSharedGenesisReplicaStore for NoStore {
+        fn load_replicas(&mut self) -> Result<Option<Vec<u8>>, ()> {
+            Ok(None)
+        }
+        fn commit_replicas(&mut self, _: &[u8]) -> Result<(), ()> {
+            Err(())
+        }
+    }
+    impl super::super::super::genesis_archive::AgentGenesisArchiveStore for NoStore {
+        type Error = ();
+        fn load(
+            &self,
+            _: super::super::super::genesis::AgentGenesisLocator,
+        ) -> Result<Option<Vec<u8>>, ()> {
+            Ok(None)
+        }
+        fn insert_if_absent(
+            &self,
+            _: super::super::super::genesis::AgentGenesisLocator,
+            _: &[u8],
+        ) -> Result<(), ()> {
+            Err(())
+        }
+    }
+    type EmptyController = NativeSharedGenesisController<
+        NoStore,
+        NoStore,
+        NoStore,
+        NoStore,
+        NoStore,
+        NoStore,
+        NoStore,
+    >;
+
+    #[test]
+    fn live_member_archive_factory_retains_its_owner_without_running_it() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Owner(Arc<AtomicUsize>);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let owner = Owner(drops.clone());
+        let factory_calls = calls.clone();
+        let controller = EmptyController::new(authority(), Vec::new())
+            .unwrap()
+            .with_member_archive_factory(move |_| {
+                let _retained = &owner;
+                factory_calls.fetch_add(1, Ordering::SeqCst);
+                Err(SharedAgentHostError::Unavailable)
+            })
+            .unwrap();
+        assert!(controller.member_archives.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(controller);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        let controller = EmptyController::new(authority(), Vec::new())
+            .unwrap()
+            .with_member_archive_factory(|_| Err(SharedAgentHostError::Unavailable))
+            .unwrap();
+        assert!(matches!(
+            controller.with_member_archive_factory(|_| Err(SharedAgentHostError::Unavailable)),
+            Err(SharedAgentHostError::Conflict)
+        ));
+        let mut controller = EmptyController::new(authority(), Vec::new()).unwrap();
+        controller.recovered = true; // Tests only builder ownership, not recovery.
+        assert!(matches!(
+            controller.with_member_archive_factory(|_| Err(SharedAgentHostError::Unavailable)),
+            Err(SharedAgentHostError::Conflict)
+        ));
+    }
+
+    fn authority() -> AuthorityActorTarget {
+        let public_key = [9; 32];
+        AuthorityActorTarget {
+            space: SpaceId([1; 32]),
+            system_agent: AgentId([2; 32]),
+            system_runtime_deployment: DeploymentId([3; 32]),
+            binding: AgentAuthorityBinding {
+                policy: Hash([4; 32]),
+                issuer: AuthorityIssuer {
+                    principal: PrincipalId([5; 32]),
+                    actor: ActorId([6; 32]),
+                    deployment: DeploymentId([7; 32]),
+                    program: ProgramId([8; 32]),
+                    producer: ProducerId::of_public_key(&public_key),
+                },
+                public_key,
+                initial_epoch: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn member_archive_union_rejects_duplicate_and_wrong_scope_locators() {
+        let authority = authority();
+        let locator = super::super::super::genesis::AgentGenesisLocator {
+            space: crate::service::SpaceId(authority.space.0),
+            agent: crate::service::AgentId([14; 32]),
+        };
+        // This guard validates selections only; it mints no finality proof.
+        assert_eq!(
+            validate_member_archive_locators(authority, &[], &[]),
+            Ok(())
+        );
+        for (issuer, members) in [
+            (vec![locator], vec![locator]),
+            (Vec::new(), vec![locator, locator]),
+        ] {
+            assert_eq!(
+                validate_member_archive_locators(authority, &issuer, &members),
+                Err(SharedAgentHostError::Conflict),
+            );
+        }
+        for changed in [
+            super::super::super::genesis::AgentGenesisLocator {
+                space: crate::service::SpaceId([15; 32]),
+                ..locator
+            },
+            super::super::super::genesis::AgentGenesisLocator {
+                agent: crate::service::AgentId::ZERO,
+                ..locator
+            },
+            super::super::super::genesis::AgentGenesisLocator {
+                agent: crate::service::AgentId(authority.system_agent.0),
+                ..locator
+            },
+        ] {
+            assert_eq!(
+                validate_member_archive_locators(authority, &[], &[changed]),
+                Err(SharedAgentHostError::ScopeMismatch),
+            );
+        }
+        assert_eq!(
+            validate_member_archive_locators(
+                authority,
+                &[locator],
+                &vec![locator; super::super::super::shared_host::MAX_SHARED_HOST_AGENTS]
+            ),
+            Err(SharedAgentHostError::CapacityExhausted),
+        );
+    }
+
+    #[test]
+    fn live_member_archive_selection_reuses_only_exact_member_ownership() {
+        let authority = authority();
+        let locator = super::super::super::genesis::AgentGenesisLocator {
+            space: crate::service::SpaceId(authority.space.0),
+            agent: crate::service::AgentId([14; 32]),
+        };
+        assert_eq!(
+            validate_live_member_archive_selection(authority, false, &[], &[], locator),
+            Err(SharedAgentHostError::Conflict)
+        );
+        assert_eq!(
+            validate_live_member_archive_selection(authority, true, &[], &[], locator),
+            Ok(None)
+        );
+        assert_eq!(
+            validate_live_member_archive_selection(authority, true, &[], &[locator], locator),
+            Ok(Some(0))
+        );
+        assert_eq!(
+            validate_live_member_archive_selection(authority, true, &[locator], &[], locator),
+            Err(SharedAgentHostError::Conflict)
+        );
+        for changed in [
+            super::super::super::genesis::AgentGenesisLocator {
+                space: crate::service::SpaceId([15; 32]),
+                ..locator
+            },
+            super::super::super::genesis::AgentGenesisLocator {
+                agent: crate::service::AgentId(authority.system_agent.0),
+                ..locator
+            },
+        ] {
+            assert_eq!(
+                validate_live_member_archive_selection(authority, true, &[], &[locator], changed),
+                Err(SharedAgentHostError::ScopeMismatch)
+            );
+        }
+        let maximum = super::super::super::shared_host::MAX_SHARED_HOST_AGENTS;
+        let mut members = Vec::new();
+        for index in 0..maximum {
+            let mut id = [16; 32];
+            id[..8].copy_from_slice(&(index as u64 + 1).to_le_bytes());
+            members.push(super::super::super::genesis::AgentGenesisLocator {
+                agent: crate::service::AgentId(id),
+                ..locator
+            });
+        }
+        assert_eq!(
+            validate_live_member_archive_selection(
+                authority,
+                true,
+                &[],
+                &members,
+                members[maximum - 1]
+            ),
+            Ok(Some(maximum - 1))
+        );
+        assert_eq!(
+            validate_live_member_archive_selection(authority, true, &[], &members, locator),
+            Err(SharedAgentHostError::CapacityExhausted)
+        );
+    }
+}
+
 /// Owns the stores while bootstrap borrows their validated reservation data.
 /// This authenticates the signed request, not execution, issuance or finality.
 /// The owner must replay the authorization and reproduce its candidate before
@@ -1156,7 +2101,7 @@ pub struct NativeSharedGenesisRecovery<I, J: CleanManagementIssuerStore, Q, R, W
     pub(super) reply: R,
     pub(super) publication: W,
     pub(super) publication_reply: P,
-    pub(super) runtime: Option<AdmittedRuntimePackage>,
+    pub(super) runtime: Option<SharedGenesisRuntimePackage>,
     pub(super) issuer: DurableCleanManagementIssuer<J>,
     management_issuer: Option<DurableCleanManagementIssuer<J>>,
     management_intent: Option<CleanManagementIntentSlot<I>>,
@@ -1433,6 +2378,24 @@ impl<
         runtime: &AdmittedRuntimePackage,
         replicas: &AgentReplicaCommittee,
     ) -> Result<(), SharedAgentHostError> {
+        Self::validate_create_reservation_with_runtime(
+            authority,
+            locator,
+            descriptor,
+            call,
+            &SharedGenesisRuntimePackage::Image(runtime.clone()),
+            replicas,
+        )
+    }
+
+    pub fn validate_create_reservation_with_runtime(
+        authority: AuthorityActorTarget,
+        locator: super::super::genesis::AgentGenesisLocator,
+        descriptor: &AgentDescriptor,
+        call: &super::super::sdk::authority::AuthorityCredentialCall,
+        runtime: &SharedGenesisRuntimePackage,
+        replicas: &AgentReplicaCommittee,
+    ) -> Result<(), SharedAgentHostError> {
         Self::validated_create_intent(authority, locator, descriptor, call, runtime, replicas)
             .map(|_| ())
     }
@@ -1442,7 +2405,7 @@ impl<
         locator: super::super::genesis::AgentGenesisLocator,
         descriptor: &AgentDescriptor,
         call: &super::super::sdk::authority::AuthorityCredentialCall,
-        runtime: &AdmittedRuntimePackage,
+        runtime: &SharedGenesisRuntimePackage,
         replicas: &AgentReplicaCommittee,
     ) -> Result<CleanManagementIntent, SharedAgentHostError> {
         locator
@@ -1455,8 +2418,7 @@ impl<
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        super::super::driver::verify_clean_runtime_package_binding(descriptor, runtime)
-            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        runtime.validate_descriptor(descriptor)?;
         CleanManagementIntent::new(
             authority,
             call.managed,
@@ -1478,6 +2440,31 @@ impl<
         descriptor: AgentDescriptor,
         call: super::super::sdk::authority::AuthorityCredentialCall,
         runtime: AdmittedRuntimePackage,
+        replicas: AgentReplicaCommittee,
+        stores: (I, J, Q, R, W, P),
+    ) -> Result<Self, SharedAgentHostError>
+    where
+        I: super::super::clean_authority_issuer::CleanManagementActorStore
+            + super::super::clean_authority_issuer::CleanExternalLocalCreateArchiveStore,
+        Q: super::super::clean_authority_issuer::CleanSharedGenesisReplicaStore,
+    {
+        Self::reserve_create_with_replicas_runtime(
+            authority,
+            locator,
+            descriptor,
+            call,
+            SharedGenesisRuntimePackage::Image(runtime),
+            replicas,
+            stores,
+        )
+    }
+
+    pub fn reserve_create_with_replicas_runtime(
+        authority: AuthorityActorTarget,
+        locator: super::super::genesis::AgentGenesisLocator,
+        descriptor: AgentDescriptor,
+        call: super::super::sdk::authority::AuthorityCredentialCall,
+        runtime: SharedGenesisRuntimePackage,
         replicas: AgentReplicaCommittee,
         stores: (I, J, Q, R, W, P),
     ) -> Result<Self, SharedAgentHostError>
@@ -1523,7 +2510,7 @@ impl<
             if recovered
                 .runtime
                 .as_ref()
-                .map(AdmittedRuntimePackage::exact_bytes)
+                .map(SharedGenesisRuntimePackage::exact_bytes)
                 != Some(runtime.exact_bytes())
                 || recovered.retained_replicas()? != Some(replicas)
             {
@@ -1809,6 +2796,20 @@ impl<
         locator
             .validate()
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        // Fresh fixed-three startup has no durable committee read. Do not
+        // reinterpret an older query/reply capsule as the selected-roster
+        // sidecar: that separate Q-store object and its lease remain intact.
+        if query
+            .load()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .is_some()
+            || reply
+                .load()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .is_some()
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
         let mut intent = CleanManagementIntentSlot::open(intent_store)
             .map_err(|_| SharedAgentHostError::Unavailable)?;
         let request = intent.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
@@ -1915,13 +2916,7 @@ impl<
         let runtime = intent
             .load_runtime()
             .map_err(|_| SharedAgentHostError::Unavailable)?
-            .map(|bytes| {
-                let package = super::super::package_admission::admit_runtime_package(&bytes)
-                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-                super::super::driver::verify_clean_runtime_package_binding(&descriptor, &package)
-                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-                Ok(package)
-            })
+            .map(|bytes| SharedGenesisRuntimePackage::from_retained(&descriptor, &bytes))
             .transpose()?;
         let anchor = intent
             .authorization_anchor()
@@ -1936,61 +2931,53 @@ impl<
                     return Err(SharedAgentHostError::ScopeMismatch);
                 }
                 pending.push((anchor.clone(), work.clone()));
-                if let Some(saved) =
-                    RetainedCommitteeQuery::load_for_recovery(&mut query, &authority, anchor, work)
-                        .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+                if let Some(provision) =
+                    genesis_issuance::RetainedGenesisPublication::load_candidate_for_recovery(
+                        &mut publication,
+                    )
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?
                 {
-                    if issued.is_none() {
-                        return Err(SharedAgentHostError::ScopeMismatch);
-                    }
-                    let RuntimeWork::Invoke {
-                        invocation,
-                        authorization,
+                    let super::super::journal::ReplayOperation::CleanManage {
+                        request: ManagementRequest::Create(saved_descriptor),
+                        authority: receipt,
                         ..
-                    } = &saved.work
+                    } = &provision.proposal().create().operation
                     else {
                         return Err(SharedAgentHostError::ScopeMismatch);
                     };
-                    // Existing reply bytes must be canonical and belong to this
-                    // exact query, but are never used as execution authority.
-                    genesis_issuance::load_committee_reply(
-                        &mut reply,
-                        invocation,
-                        authorization,
-                        &authority,
-                    )
-                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-                    let published =
-                        genesis_issuance::RetainedGenesisPublication::load_for_recovery(
-                            &mut publication,
-                            &authority,
-                            &saved,
-                        )
-                        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-                    pending.push((saved.anchor, saved.work));
-                    if let Some(saved) = published {
-                        genesis_issuance::load_publication_reply(&mut publication_reply, &saved)
-                            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-                        pending.push((saved.anchor, saved.work));
-                    } else if publication_reply
-                        .load()
+                    let selected = query
+                        .load_replicas()
                         .map_err(|_| SharedAgentHostError::Unavailable)?
-                        .is_some()
+                        .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                    if selected.len() > MAX_AGENT_REPLICA_COMMITTEE_BYTES {
+                        return Err(SharedAgentHostError::ScopeMismatch);
+                    }
+                    let replicas = AgentReplicaCommittee::decode(&selected)
+                        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                    if issued.as_ref() != Some(receipt)
+                        || saved_descriptor.as_ref() != &descriptor
+                        || replicas.encode() != selected
+                        || replicas.validate_for_clean_descriptor(&descriptor).is_err()
+                        || provision.replicas() != &replicas
                     {
                         return Err(SharedAgentHostError::ScopeMismatch);
                     }
-                } else if reply
+                    let saved = genesis_issuance::RetainedGenesisPublication::load_for_recovery(
+                        &mut publication,
+                        &authority,
+                        provision.evidence().claim().authority_claim().claim_hash(),
+                        anchor,
+                        work,
+                    )
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                    genesis_issuance::load_publication_reply(&mut publication_reply, &saved)
+                        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                    pending.push((saved.anchor, saved.work));
+                } else if publication_reply
                     .load()
                     .map_err(|_| SharedAgentHostError::Unavailable)?
                     .is_some()
-                    || publication
-                        .load()
-                        .map_err(|_| SharedAgentHostError::Unavailable)?
-                        .is_some()
-                    || publication_reply
-                        .load()
-                        .map_err(|_| SharedAgentHostError::Unavailable)?
-                        .is_some()
                 {
                     return Err(SharedAgentHostError::ScopeMismatch);
                 }
@@ -2027,7 +3014,7 @@ impl<
         if let Some(work) = finalization {
             // Publication must precede application finalization. An incomplete
             // earlier phase cannot be hidden by a signed application ACK.
-            if pending.len() != 3 {
+            if pending.len() != 2 {
                 return Err(SharedAgentHostError::ScopeMismatch);
             }
             let anchor = intent
@@ -2080,6 +3067,102 @@ impl<
         Ok(recovered)
     }
 
+    /// Reconstruct a failed pre-archive preparation through the existing
+    /// canonical open path, borrowing rather than moving the original leases.
+    /// Reload grants no execution/finality: the owner still replays every phase.
+    fn readmit_creation_from_leased_stores(&mut self) -> Result<(), SharedAgentHostError>
+    where
+        Q: super::super::clean_authority_issuer::CleanSharedGenesisReplicaStore,
+    {
+        self.admission_valid = false;
+        if self.management_issuer.is_some()
+            || self.management_intent.is_some()
+            || !self.management_pending.is_empty()
+            || !self.management_retirements.is_empty()
+        {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let original = self
+            .intent
+            .intent()
+            .cloned()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let original_runtime = self
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.exact_bytes().to_vec());
+        let original_pending = self.pending.clone();
+        let original_issued = self.issued.clone();
+        let original_retired = self.retired;
+        let (intent_cache, issuer_cache, runtime, pending, issued, retired) = {
+            let recovered = NativeSharedGenesisRecovery::open(
+                self.authority,
+                self.locator,
+                self.intent.leased_store_mut(),
+                self.issuer.leased_store_mut(),
+                &mut self.query,
+                &mut self.reply,
+                &mut self.publication,
+                &mut self.publication_reply,
+            )?;
+            let request = recovered
+                .intent
+                .intent()
+                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            if request.request() != original.request()
+                || request.call() != original.call()
+                || original_runtime.as_ref().is_some_and(|bytes| {
+                    recovered
+                        .runtime
+                        .as_ref()
+                        .map(|runtime| runtime.exact_bytes())
+                        != Some(bytes.as_slice())
+                })
+                || original_issued
+                    .as_ref()
+                    .is_some_and(|receipt| recovered.issued.as_ref() != Some(receipt))
+                || (original_retired && !recovered.retired)
+                || (!recovered.retired
+                    && !recovered
+                        .intent
+                        .denial_complete()
+                        .map_err(|_| SharedAgentHostError::Unavailable)?
+                    && !recovered.pending.starts_with(&original_pending))
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            (
+                recovered
+                    .intent
+                    .into_reload_cache()
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?,
+                recovered
+                    .issuer
+                    .into_creation_reload_cache()
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?,
+                recovered.runtime,
+                recovered.pending,
+                recovered.issued,
+                recovered.retired,
+            )
+        };
+        // No cache or admission field changes until the entire canonical set
+        // and both monotonic, exact-original ownership guards have succeeded.
+        if !self.intent.validates_reload_cache(&intent_cache)
+            || !self.issuer.validates_creation_reload_cache(&issuer_cache)
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self.intent.install_reload_cache(intent_cache);
+        self.issuer.install_creation_reload_cache(issuer_cache);
+        self.runtime = runtime;
+        self.pending = pending;
+        self.issued = issued;
+        self.retired = retired;
+        self.admission_valid = true;
+        Ok(())
+    }
+
     /// The exact locator checked against the signed Create during opening.
     /// This identifies the reservation; it is not proof of publication/finality.
     pub fn locator(&self) -> super::super::genesis::AgentGenesisLocator {
@@ -2087,7 +3170,7 @@ impl<
     }
 
     /// Admitted, descriptor-bound package retained before authorization.
-    pub fn runtime(&self) -> Option<&AdmittedRuntimePackage> {
+    pub fn runtime(&self) -> Option<&SharedGenesisRuntimePackage> {
         self.runtime.as_ref()
     }
 
@@ -2095,8 +3178,8 @@ impl<
         self.issued.as_ref()
     }
 
-    /// Re-admit a retained replica roster under the same committee lease as
-    /// the query. The file envelope is not authority: peer identities must be
+    /// Re-admit the independently retained replica selection under its original
+    /// store lease. The file envelope is not authority: peer identities must be
     /// canonical and the roster must match the already verified signed Create.
     pub fn retained_replicas(
         &mut self,

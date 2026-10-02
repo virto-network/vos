@@ -1,5 +1,5 @@
-//! Human-readable Local calls use the same retained ATQ1 authorization and
-//! delivery path as `invoke-local`. The package is an argument-encoding aid;
+//! Human-readable Local/Shared calls use the same retained ATQ1 authorization and
+//! delivery path as `invoke-agent`. The package is an argument-encoding aid;
 //! the live Agent still selects and validates its installed actor and policy.
 
 use super::clean_identity::CleanOperatorIdentitySigner;
@@ -7,9 +7,13 @@ use serde_json::Value as Json;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use vos::agent::sdk::RuntimeOutcome;
-use vos::agent::sdk::method_policy::{ActorMethodPolicy, ActorMethodPolicyArtifact};
+use vos::agent::sdk::method_policy::{
+    ActorMethodPolicy, ActorMethodPolicyArtifact, AuthorizationPolicySelector,
+};
 use vos::agent::sdk::wire::CanonicalWire as _;
-use vos::agent::sdk::{ActorId, AgentId, InvocationId, InvocationOrigin, InvocationRoleClaims};
+use vos::agent::sdk::{
+    ActorId, AgentId, CapabilityId, InvocationId, InvocationOrigin, InvocationRoleClaims,
+};
 use vos::agent::supervisor::AgentRouteKey;
 use vos::agent::supervisor_adapters::{
     AgentInvocationIntent, AgentInvocationResponse, AgentTargetedPreparationRequest,
@@ -20,7 +24,7 @@ use vos::{Decode as _, Encode as _};
 #[derive(clap::Args, Debug)]
 pub struct CallLocalArgs {
     pub space: String,
-    /// Full Agent ID, as printed by create-local-agent.
+    /// Full operator-owned Local or Shared Agent ID.
     pub agent: String,
     /// Installed top-level actor name.
     pub actor: String,
@@ -59,6 +63,7 @@ pub(crate) fn run(args: CallLocalArgs) -> anyhow::Result<()> {
         anyhow::anyhow!("method '{}' is not declared by the package", args.method)
     })?;
     let message = encode_message(method, &args.args)?;
+    let (roles, capability) = policy_claims(method.authorization_policy);
     let mut nonce = [0u8; 32];
     getrandom::getrandom(&mut nonce)
         .map_err(|error| anyhow::anyhow!("invocation nonce entropy: {error}"))?;
@@ -71,9 +76,10 @@ pub(crate) fn run(args: CallLocalArgs) -> anyhow::Result<()> {
             InvocationOrigin {
                 principal: Some(identity.principal()),
                 credential: Some(identity.credential()),
+                capability,
                 ..InvocationOrigin::anonymous()
             },
-            InvocationRoleClaims::none(),
+            roles,
             message,
             vos::agent::execution::MAX_EXECUTION_GAS,
             false,
@@ -100,9 +106,38 @@ pub(crate) fn run(args: CallLocalArgs) -> anyhow::Result<()> {
         "decision_retained": true,
         "delivery_retired": !denied,
         "result": result,
-        "retry": format!("vosx space invoke-local {} --resume --http {}", args.space, address),
+        "retry": format!("vosx space invoke-agent {} --resume --http {}", args.space, address),
     }));
     Ok(())
+}
+
+/// Request exactly the predicate declared by the signed package. These are
+/// claims, not grants: the installed policy, live Authority and actor still
+/// verify the caller's authorization. Root/admin status is never substituted
+/// for an actor-role grant (including Clerk's role).
+fn policy_claims(
+    selector: AuthorizationPolicySelector,
+) -> (InvocationRoleClaims, Option<CapabilityId>) {
+    match selector {
+        AuthorizationPolicySelector::Public => (InvocationRoleClaims::none(), None),
+        AuthorizationPolicySelector::ActorRole(role) => (
+            InvocationRoleClaims {
+                space: None,
+                actor: Some(role),
+            },
+            None,
+        ),
+        AuthorizationPolicySelector::SpaceRole(role) => (
+            InvocationRoleClaims {
+                space: Some(role),
+                actor: None,
+            },
+            None,
+        ),
+        AuthorizationPolicySelector::Capability(capability) => {
+            (InvocationRoleClaims::none(), Some(capability))
+        }
+    }
 }
 
 fn retained_result(request_dir: &std::path::Path) -> anyhow::Result<Json> {
@@ -276,6 +311,41 @@ mod tests {
             idempotency: IdempotencyRequirement::Required,
             attestation: AttestationRequirement::None,
         }
+    }
+
+    #[test]
+    fn schema_policy_requests_exact_claims_without_granting_them() {
+        use vos::agent::sdk::RoleId;
+        let role = RoleId([0x61; 32]);
+        let capability = CapabilityId([0x62; 32]);
+        assert_eq!(
+            policy_claims(AuthorizationPolicySelector::Public),
+            (InvocationRoleClaims::none(), None),
+        );
+        assert_eq!(
+            policy_claims(AuthorizationPolicySelector::ActorRole(role)),
+            (
+                InvocationRoleClaims {
+                    space: None,
+                    actor: Some(role)
+                },
+                None
+            ),
+        );
+        assert_eq!(
+            policy_claims(AuthorizationPolicySelector::SpaceRole(role)),
+            (
+                InvocationRoleClaims {
+                    space: Some(role),
+                    actor: None
+                },
+                None
+            ),
+        );
+        assert_eq!(
+            policy_claims(AuthorizationPolicySelector::Capability(capability)),
+            (InvocationRoleClaims::none(), Some(capability)),
+        );
     }
 
     #[test]

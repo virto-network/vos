@@ -185,7 +185,6 @@ where
             || draft.authenticated_node != self.pins.node
             || draft.verify_with(&RawCredentialVerifier).is_err()
             || signer.public_key() != self.authority_target().binding.public_key
-            || self.record.pending_projection.is_some()
             || self.management_admission_held()?
         {
             return Err(SharedAgentHostError::ScopeMismatch);

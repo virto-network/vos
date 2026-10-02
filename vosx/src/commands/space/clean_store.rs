@@ -288,6 +288,10 @@ enum StoreRole {
     SharedManagementIntent = 50,
     SharedManagementActor = 51,
     SharedInstallHandoff = 52,
+    SharedCreateRequest = 53,
+    SharedCreateResponse = 54,
+    SharedInstallRequest = 55,
+    SharedInstallResponse = 56,
 }
 
 impl StoreRole {
@@ -304,6 +308,10 @@ impl StoreRole {
             Self::SharedManagementIntent => "shared-management.intent",
             Self::SharedManagementActor => "shared-management.actor",
             Self::SharedInstallHandoff => "shared-management.install-handoff",
+            Self::SharedCreateRequest => "shared-create.request",
+            Self::SharedCreateResponse => "shared-create.response",
+            Self::SharedInstallRequest => "shared-install.request",
+            Self::SharedInstallResponse => "shared-install.response",
             Self::LocalCreateRequest => LOCAL_REQUEST_FILE,
             Self::CredentialQuery => CREDENTIAL_QUERY_FILE,
             Self::CredentialReservation => RESERVATION_FILE,
@@ -361,6 +369,10 @@ impl StoreRole {
             Self::SharedManagementIntent => "shared-management.intent.next",
             Self::SharedManagementActor => "shared-management.actor.next",
             Self::SharedInstallHandoff => "shared-management.install-handoff.next",
+            Self::SharedCreateRequest => "shared-create.request.next",
+            Self::SharedCreateResponse => "shared-create.response.next",
+            Self::SharedInstallRequest => "shared-install.request.next",
+            Self::SharedInstallResponse => "shared-install.response.next",
             Self::LocalCreateRequest => LOCAL_REQUEST_STAGE_FILE,
             Self::CredentialQuery => CREDENTIAL_QUERY_STAGE_FILE,
             Self::CredentialReservation => RESERVATION_STAGE_FILE,
@@ -409,6 +421,27 @@ impl StoreRole {
 
     const fn maximum_bytes(self) -> usize {
         match self {
+            Self::SharedCreateRequest
+            | Self::SharedCreateResponse
+            | Self::SharedInstallRequest
+            | Self::SharedInstallResponse => {
+                #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+                {
+                    use vos::agent::local_lifecycle::{
+                        SharedCreateSubmission, SharedInstallSubmission,
+                    };
+                    match self {
+                        Self::SharedCreateRequest => SharedCreateSubmission::MAX_BYTES,
+                        Self::SharedCreateResponse => SharedCreateSubmission::MAX_RESPONSE_BYTES,
+                        Self::SharedInstallRequest => SharedInstallSubmission::MAX_BYTES,
+                        _ => SharedInstallSubmission::MAX_RESPONSE_BYTES,
+                    }
+                }
+                #[cfg(not(all(target_os = "linux", feature = "experimental-state-blocks")))]
+                {
+                    0
+                }
+            }
             Self::AdminPreparationRequest
             | Self::AdminPreparationResponse
             | Self::AdminClientRequest
@@ -587,6 +620,10 @@ impl StoreRole {
             50 => Some(Self::SharedManagementIntent),
             51 => Some(Self::SharedManagementActor),
             52 => Some(Self::SharedInstallHandoff),
+            53 => Some(Self::SharedCreateRequest),
+            54 => Some(Self::SharedCreateResponse),
+            55 => Some(Self::SharedInstallRequest),
+            56 => Some(Self::SharedInstallResponse),
             1 => Some(Self::Pins),
             2 => Some(Self::Bootstrap),
             3 => Some(Self::ManagementIssuer),
@@ -615,7 +652,65 @@ pub(crate) struct CleanSystemAgentFileStores {
     genesis: CleanSystemAgentGenesisFile,
 }
 
+/// Read-only selection material, not an owner lease or startup admission.
+pub(crate) struct RetainedClientBootstrap {
+    pub pins: Vec<u8>,
+    pub bootstrap: Vec<u8>,
+    pub genesis: Vec<u8>,
+}
+
 impl CleanSystemAgentFileStores {
+    /// Inspect only a completely published deployment. The live owner alone
+    /// may reconcile a stage; clients never repair, create, sync or take its
+    /// writer lock while selecting their expected System target.
+    pub(crate) fn read_client_bootstrap(
+        path: &Path,
+    ) -> Result<Option<RetainedClientBootstrap>, CleanFileStoreError> {
+        validate_new_path(path)?;
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+            Ok(_) => (),
+        }
+        let parent_path = path.parent().ok_or(CleanFileStoreError::InvalidPath)?;
+        let parent = open_private_directory(parent_path, true)?;
+        let directory = open_child_directory(&parent, path)?;
+        let inspect = || -> Result<(), CleanFileStoreError> {
+            validate_opened_directory(&parent, parent_path, true)?;
+            validate_opened_directory(&directory, path, false)?;
+            audit_named_entries(path, &ALLOWED_ENTRIES, false)?;
+            for name in ALLOWED_ENTRIES
+                .iter()
+                .filter(|name| name.ends_with(".next"))
+            {
+                match named_metadata(path, name) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+                    Err(error) => return Err(error.into()),
+                    Ok(_) => return Err(CleanFileStoreError::AmbiguousPublication),
+                }
+            }
+            let lock = named_metadata(path, LOCK_FILE)?;
+            validate_private_regular_metadata(&lock)?;
+            if lock.len() != 0 {
+                return Err(CleanFileStoreError::Corrupt);
+            }
+            Ok(())
+        };
+        inspect()?;
+        let read = |role: StoreRole| {
+            read_store_image(&directory, path, role.file(), role, role.maximum_bytes())?
+                .map(|stored| stored.payload)
+                .ok_or(CleanFileStoreError::Corrupt)
+        };
+        let images = RetainedClientBootstrap {
+            pins: read(StoreRole::Pins)?,
+            bootstrap: read(StoreRole::Bootstrap)?,
+            genesis: read(StoreRole::GenesisArchive)?,
+        };
+        inspect()?;
+        Ok(Some(images))
+    }
+
     /// Open or create one dedicated clean store directory.
     ///
     /// The immediate parent must already be an absolute, canonical, private
@@ -973,9 +1068,44 @@ impl CleanSharedGenesisAdmissionFiles {
         ),
         vos::agent::shared_host::SharedAgentHostError,
     > {
+        self.reserve_with_runtime(
+            descriptor,
+            call,
+            &vos::agent::clean_bootstrap::SharedGenesisRuntimePackage::Image(runtime.clone()),
+            replicas,
+        )
+    }
+
+    pub(crate) fn reserve_with_runtime(
+        &mut self,
+        descriptor: &vos::agent::sdk::AgentDescriptor,
+        call: &vos::agent::sdk::authority::AuthorityCredentialCall,
+        runtime: &vos::agent::clean_bootstrap::SharedGenesisRuntimePackage,
+        replicas: &vos::agent::genesis::AgentReplicaCommittee,
+    ) -> Result<
+        (
+            CleanSharedGenesisRecovery,
+            Option<CleanAgentGenesisArchiveFile>,
+        ),
+        vos::agent::shared_host::SharedAgentHostError,
+    > {
         use vos::agent::shared_host::SharedAgentHostError as Error;
         validate_opened_directory(&self.directory, &self.data_dir, true)
             .map_err(|_| Error::Unavailable)?;
+        // Refuse a substituted package/contract before even creating empty
+        // Shared namespaces. The factory repeats this check before per-Agent
+        // files are opened under its pinned parent identities.
+        CleanSharedGenesisRecovery::validate_create_reservation_with_runtime(
+            self.authority,
+            vos::agent::genesis::AgentGenesisLocator {
+                space: vos::service::SpaceId(self.authority.space.0),
+                agent: vos::service::AgentId(descriptor.identity.agent.0),
+            },
+            descriptor,
+            call,
+            runtime,
+            replicas,
+        )?;
         if self.files.is_none() {
             self.files = Some(
                 CleanSharedGenesisStoreFactory::open_or_create(
@@ -992,7 +1122,7 @@ impl CleanSharedGenesisAdmissionFiles {
             .files
             .as_mut()
             .ok_or(Error::Unavailable)?
-            .reserve_create(
+            .reserve_create_with_runtime(
                 descriptor.clone(),
                 call.clone(),
                 runtime.clone(),
@@ -1054,6 +1184,21 @@ impl CleanSharedGenesisStoreFactory {
         runtime: vos::agent::package_admission::AdmittedRuntimePackage,
         replicas: vos::agent::genesis::AgentReplicaCommittee,
     ) -> Result<CleanSharedGenesisStartupEntry, vos::agent::shared_host::SharedAgentHostError> {
+        self.reserve_create_with_runtime(
+            descriptor,
+            call,
+            vos::agent::clean_bootstrap::SharedGenesisRuntimePackage::Image(runtime),
+            replicas,
+        )
+    }
+
+    pub(crate) fn reserve_create_with_runtime(
+        &mut self,
+        descriptor: vos::agent::sdk::AgentDescriptor,
+        call: vos::agent::sdk::authority::AuthorityCredentialCall,
+        runtime: vos::agent::clean_bootstrap::SharedGenesisRuntimePackage,
+        replicas: vos::agent::genesis::AgentReplicaCommittee,
+    ) -> Result<CleanSharedGenesisStartupEntry, vos::agent::shared_host::SharedAgentHostError> {
         use vos::agent::local_lifecycle::LocalLifecycleStoreFactory as _;
         use vos::agent::shared_host::SharedAgentHostError as Error;
         let locator = vos::agent::genesis::AgentGenesisLocator {
@@ -1062,7 +1207,7 @@ impl CleanSharedGenesisStoreFactory {
         };
         // Use the core's exact validation, without exposing private lifecycle
         // representations or allocating stores for malformed inputs.
-        CleanSharedGenesisRecovery::validate_create_reservation(
+        CleanSharedGenesisRecovery::validate_create_reservation_with_runtime(
             self.authority,
             locator,
             &descriptor,
@@ -1107,7 +1252,7 @@ impl CleanSharedGenesisStoreFactory {
             .map_err(|_| Error::Unavailable)?;
         let publication = query.publication();
         let publication_reply = query.publication_reply();
-        let recovery = CleanSharedGenesisRecovery::reserve_create_with_replicas(
+        let recovery = CleanSharedGenesisRecovery::reserve_create_with_replicas_runtime(
             self.authority,
             locator,
             descriptor,
@@ -1403,8 +1548,33 @@ impl CleanAgentGenesisCommitteeStoreFactory {
                     return Err(CleanFileStoreError::UnexpectedResidue);
                 }
                 if let Some(bytes) = intent.load_runtime()? {
-                    vos::agent::package_admission::admit_runtime_package(&bytes)
+                    // Staging has no signed Create yet and grants no Agent
+                    // admission. Validate only its explicit VOS3 runtime ABI;
+                    // never select external storage after failed IMAGE admission.
+                    let envelope = vos::agent::sdk::package::PackageEnvelope::decode(&bytes)
                         .map_err(|_| CleanFileStoreError::Corrupt)?;
+                    let vos::agent::sdk::package::PackageManifest::AgentRuntime(manifest) =
+                        envelope.manifest
+                    else {
+                        return Err(CleanFileStoreError::Corrupt);
+                    };
+                    if manifest.contract.lifecycle_abi == vos::agent::sdk::RUNTIME_ABI_ID {
+                        vos::agent::package_admission::admit_runtime_package(&bytes)
+                            .map_err(|_| CleanFileStoreError::Corrupt)?;
+                    } else {
+                        #[cfg(feature = "experimental-state-blocks")]
+                        {
+                            if manifest.contract.lifecycle_abi
+                                != vos::agent::sdk::state_execution::STATE_EXECUTION_ABI_ID
+                            {
+                                return Err(CleanFileStoreError::Corrupt);
+                            }
+                            vos::agent::package_admission::admit_state_runtime_package(&bytes)
+                                .map_err(|_| CleanFileStoreError::Corrupt)?;
+                        }
+                        #[cfg(not(feature = "experimental-state-blocks"))]
+                        return Err(CleanFileStoreError::Corrupt);
+                    }
                 }
                 if committees
                     .binary_search_by_key(&locator.agent, |found| found.agent)
@@ -1760,6 +1930,7 @@ impl CleanAuthorityOperationFiles {
 pub(crate) struct CleanNativeAuthorityOperationJournal {
     root: Arc<StoreRoot>,
     authority: vos::agent::sdk::authority::AuthorityActorTarget,
+    terminal_archive: Option<Arc<operation_terminal_archive::NativeOperationTerminalArchive>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1806,6 +1977,7 @@ impl CleanNativeAuthorityOperationJournal {
         let mut journal = Self {
             root: Arc::new(StoreRoot::open_namespace(path, &[LOCK_FILE], create, true)?),
             authority,
+            terminal_archive: None,
         };
         for invocation in journal.discover(MAX_OPERATION_JOURNAL_RECORDS)? {
             journal
@@ -1866,24 +2038,26 @@ impl NativeAuthorityOperationJournalStore for CleanNativeAuthorityOperationJourn
         &mut self,
         invocation: vos::agent::sdk::InvocationId,
     ) -> Result<Option<Vec<u8>>, Self::Error> {
-        let file = ExactFileStore::operation_record(Arc::clone(&self.root), invocation)?;
-        let _guard = self.root.guard()?;
-        self.root.audit_entries()?;
-        // Validate both names before reconciliation may publish a stage.
-        for name in [file.file(), file.stage_file()] {
-            if let Some(image) =
-                file.read_optional(name, MAX_NATIVE_AUTHORITY_OPERATION_DISPATCH_BYTES)?
-            {
-                self.validate(invocation, &image.payload)?;
-            }
+        if let Some(bytes) = self.load_hot(invocation)? {
+            return Ok(Some(bytes));
         }
-        let image = file.reconcile(MAX_NATIVE_AUTHORITY_OPERATION_DISPATCH_BYTES)?;
-        if let Some(image) = &image {
-            self.validate(invocation, &image.payload)?;
-            file.sync_named(file.file())?;
-            self.root.sync()?;
-        }
-        Ok(image.map(|image| image.payload))
+        let Some(archive) = &self.terminal_archive else {
+            return Ok(None);
+        };
+        let Some(record) = archive.load(invocation)? else {
+            return Ok(None);
+        };
+        let completion = vos::agent::clean_bootstrap::native_operation_retirement_completion(
+            &self.authority.binding.public_key,
+            &record[2],
+        )
+        .ok_or(CleanFileStoreError::Corrupt)?;
+        let ids = vos::agent::clean_bootstrap::native_operation_completion_invocations(
+            &self.authority.binding.public_key,
+            &completion,
+        )
+        .ok_or(CleanFileStoreError::Corrupt)?;
+        Ok(Some(record[usize::from(invocation == ids[1])].clone()))
     }
 
     fn retain(
@@ -1892,7 +2066,16 @@ impl NativeAuthorityOperationJournalStore for CleanNativeAuthorityOperationJourn
         record: &[u8],
     ) -> Result<(), Self::Error> {
         self.validate(invocation, record)?;
-        let existing = self.load(invocation)?;
+        let existing = self.load_hot(invocation)?;
+        if existing.is_none()
+            && let Some(archive) = &self.terminal_archive
+            && let Some(saved) = archive.load(invocation)?
+        {
+            if saved[0] != record && saved[1] != record {
+                return Err(CleanFileStoreError::RequestConflict);
+            }
+            return archive.retain([&saved[0], &saved[1]], &saved[2]);
+        }
         if existing.as_deref().is_some_and(|bytes| bytes != record) {
             return Err(CleanFileStoreError::RequestConflict);
         }
@@ -1904,7 +2087,44 @@ impl NativeAuthorityOperationJournalStore for CleanNativeAuthorityOperationJourn
         ExactFileStore::operation_record(Arc::clone(&self.root), invocation)?
             .commit_with_replacement(record, false)
     }
+
+    fn supports_retired_archive(&self) -> bool {
+        self.terminal_archive.is_some()
+    }
+    fn load_retired(
+        &mut self,
+        invocation: vos::agent::sdk::InvocationId,
+    ) -> Result<Option<[Vec<u8>; 3]>, Self::Error> {
+        self.terminal_archive
+            .as_ref()
+            .map(|archive| archive.load(invocation))
+            .transpose()
+            .map(Option::flatten)
+    }
+    fn retain_retired(
+        &mut self,
+        records: [&[u8]; 2],
+        terminal: &[u8],
+    ) -> Result<bool, Self::Error> {
+        let Some(archive) = &self.terminal_archive else {
+            return Ok(false);
+        };
+        archive.retain(records, terminal)?;
+        Ok(true)
+    }
+    fn remove_retired(&mut self, records: [&[u8]; 2], terminal: &[u8]) -> Result<(), Self::Error> {
+        self.remove_hot_retired(records, terminal)
+    }
+    fn active_invocations(
+        &mut self,
+    ) -> Result<Option<Vec<vos::agent::sdk::InvocationId>>, Self::Error> {
+        self.discover(MAX_OPERATION_JOURNAL_RECORDS).map(Some)
+    }
 }
+
+#[cfg(target_os = "linux")]
+#[path = "clean_store/operation_terminal_archive.rs"]
+mod operation_terminal_archive;
 
 pub(crate) struct CleanAuthorityOperationCoordinatorFile(ExactFileStore);
 pub(crate) struct CleanAuthorityOperationIssuerFile(ExactFileStore);
@@ -3333,6 +3553,10 @@ impl ExactFileStore {
                 | StoreRole::PreparationResponse
                 | StoreRole::AuthorizationPreparationRequest
                 | StoreRole::AuthorizationPreparationResponse
+                | StoreRole::SharedCreateRequest
+                | StoreRole::SharedCreateResponse
+                | StoreRole::SharedInstallRequest
+                | StoreRole::SharedInstallResponse
         ) && canonical
             .iter()
             .chain(staged.iter())
@@ -3370,50 +3594,13 @@ impl ExactFileStore {
         name: &str,
         maximum_bytes: usize,
     ) -> Result<Option<StoredImage>, CleanFileStoreError> {
-        let named = match named_metadata(&self.root.path, name) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        validate_private_regular_metadata(&named)?;
-        let mut file = open_read_at(&self.root.directory, &self.root.path, name)?;
-        validate_opened_file(&file, &named)?;
-        let physical_maximum = STORE_HEADER_BYTES
-            .checked_add(maximum_bytes)
-            .ok_or(CleanFileStoreError::Oversized)?;
-        let length = usize::try_from(named.len()).map_err(|_| CleanFileStoreError::Oversized)?;
-        if length > physical_maximum {
-            return Err(CleanFileStoreError::Oversized);
-        }
-        if length < STORE_HEADER_BYTES {
-            return Err(CleanFileStoreError::Corrupt);
-        }
-        let mut header = [0_u8; STORE_HEADER_BYTES];
-        read_exact_or_corrupt(&mut file, &mut header)?;
-        let payload_length = decode_payload_length(self.role, &header, maximum_bytes)?;
-        if STORE_HEADER_BYTES
-            .checked_add(payload_length)
-            .ok_or(CleanFileStoreError::Oversized)?
-            != length
-        {
-            return Err(CleanFileStoreError::Corrupt);
-        }
-        let mut payload = Vec::new();
-        payload
-            .try_reserve_exact(payload_length)
-            .map_err(|_| CleanFileStoreError::Oversized)?;
-        payload.resize(payload_length, 0);
-        read_exact_or_corrupt(&mut file, &mut payload)?;
-        let mut trailing = [0_u8; 1];
-        if file.read(&mut trailing).map_err(CleanFileStoreError::Io)? != 0 {
-            return Err(CleanFileStoreError::Corrupt);
-        }
-        let after = file.metadata()?;
-        validate_opened_file(&file, &named)?;
-        if after.len() != named.len() {
-            return Err(CleanFileStoreError::Corrupt);
-        }
-        decode_envelope_parts(self.role, &header, payload).map(Some)
+        read_store_image(
+            &self.root.directory,
+            &self.root.path,
+            name,
+            self.role,
+            maximum_bytes,
+        )
     }
 
     fn write_stage(&self, encoded: &[u8]) -> Result<(), CleanFileStoreError> {
@@ -3509,6 +3696,61 @@ impl ExactFileStore {
         file.sync_all()?;
         Ok(())
     }
+}
+
+// Shared physical reader: no lease acquisition or staged publication occurs.
+fn read_store_image(
+    directory: &File,
+    path: &Path,
+    name: &str,
+    role: StoreRole,
+    maximum_bytes: usize,
+) -> Result<Option<StoredImage>, CleanFileStoreError> {
+    let named = match named_metadata(path, name) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    validate_private_regular_metadata(&named)?;
+    let mut file = open_read_at(directory, path, name)?;
+    validate_opened_file(&file, &named)?;
+    let physical_maximum = STORE_HEADER_BYTES
+        .checked_add(maximum_bytes)
+        .ok_or(CleanFileStoreError::Oversized)?;
+    let length = usize::try_from(named.len()).map_err(|_| CleanFileStoreError::Oversized)?;
+    if length > physical_maximum {
+        return Err(CleanFileStoreError::Oversized);
+    }
+    if length < STORE_HEADER_BYTES {
+        return Err(CleanFileStoreError::Corrupt);
+    }
+    let mut header = [0_u8; STORE_HEADER_BYTES];
+    read_exact_or_corrupt(&mut file, &mut header)?;
+    let payload_length = decode_payload_length(role, &header, maximum_bytes)?;
+    if STORE_HEADER_BYTES
+        .checked_add(payload_length)
+        .ok_or(CleanFileStoreError::Oversized)?
+        != length
+    {
+        return Err(CleanFileStoreError::Corrupt);
+    }
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(payload_length)
+        .map_err(|_| CleanFileStoreError::Oversized)?;
+    payload.resize(payload_length, 0);
+    read_exact_or_corrupt(&mut file, &mut payload)?;
+    let mut trailing = [0_u8; 1];
+    if file.read(&mut trailing).map_err(CleanFileStoreError::Io)? != 0 {
+        return Err(CleanFileStoreError::Corrupt);
+    }
+    let after = file.metadata()?;
+    validate_opened_file(&file, &named)?;
+    validate_opened_file(&file, &named_metadata(path, name)?)?;
+    if after.len() != named.len() {
+        return Err(CleanFileStoreError::Corrupt);
+    }
+    decode_envelope_parts(role, &header, payload).map(Some)
 }
 
 fn read_exact_or_corrupt(
@@ -4010,6 +4252,22 @@ mod operation_journal_tests;
 #[path = "clean_admin_store.rs"]
 pub(crate) mod admin_store;
 
+#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+#[path = "clean_store/member_genesis.rs"]
+mod member_genesis;
+#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+pub(crate) use member_genesis::{CleanSharedMemberGenesisEntry, CleanSharedMemberGenesisFiles};
+
+#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+#[path = "clean_store/shared_client.rs"]
+mod shared_client;
+#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+pub(crate) use shared_client::{CleanSharedCreateFile, CleanSharedInstallFile};
+#[cfg(all(test, target_os = "linux", feature = "experimental-state-blocks"))]
+pub(super) use shared_client::tests::submissions as shared_client_submissions_for_test;
+#[cfg(all(test, target_os = "linux", feature = "experimental-state-blocks"))]
+pub(super) use shared_client::tests::acknowledgement as shared_client_acknowledgement_for_test;
+
 #[cfg(target_os = "linux")]
 #[path = "clean_operation_completions.rs"]
 mod operation_completions;
@@ -4086,13 +4344,13 @@ pub(crate) mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 
-    pub(super) struct Fixture {
-        pub(super) parent: PathBuf,
-        pub(super) root: PathBuf,
+    pub(in crate::commands::space) struct Fixture {
+        pub(in crate::commands::space) parent: PathBuf,
+        pub(in crate::commands::space) root: PathBuf,
     }
 
     impl Fixture {
-        pub(super) fn new(label: &str) -> Self {
+        pub(in crate::commands::space) fn new(label: &str) -> Self {
             let mut nonce = [0_u8; 8];
             getrandom::getrandom(&mut nonce).expect("test entropy");
             let parent = std::env::temp_dir().join(format!(
@@ -4160,6 +4418,84 @@ pub(crate) mod tests {
         let staged = decode_envelope(store.role, &encoded, payload.len()).expect("decode stage");
         store.write_stage(&encoded).expect("write stage");
         staged
+    }
+
+    #[test]
+    fn client_bootstrap_reader_is_noncreating_and_works_beside_the_live_writer() {
+        let fixture = Fixture::new("client-bootstrap-read");
+        assert!(
+            CleanSystemAgentFileStores::read_client_bootstrap(&fixture.root)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!fixture.root.exists());
+        let (mut pins, mut bootstrap, _issuer, mut genesis) =
+            fixture.stores().into_production_parts();
+        pins.commit(b"pins").unwrap();
+        bootstrap.commit(b"bootstrap").unwrap();
+        genesis.commit(b"genesis").unwrap();
+        let before: Vec<_> = ALLOWED_ENTRIES
+            .iter()
+            .map(|name| (*name, fs::read(fixture.root.join(name)).ok()))
+            .collect();
+        let images = CleanSystemAgentFileStores::read_client_bootstrap(&fixture.root)
+            .unwrap()
+            .unwrap();
+        assert_eq!(images.pins, b"pins");
+        assert_eq!(images.bootstrap, b"bootstrap");
+        assert_eq!(images.genesis, b"genesis");
+        assert_eq!(
+            before,
+            ALLOWED_ENTRIES
+                .iter()
+                .map(|name| { (*name, fs::read(fixture.root.join(name)).ok()) })
+                .collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            CleanSystemAgentFileStores::open_or_create(&fixture.root),
+            Err(CleanFileStoreError::Busy)
+        ));
+        // A client must leave even an exact-retry stage to its actual owner.
+        stage(&bootstrap.0, None, b"bootstrap");
+        let staged = fs::read(fixture.root.join(BOOTSTRAP_STAGE_FILE)).unwrap();
+        assert!(matches!(
+            CleanSystemAgentFileStores::read_client_bootstrap(&fixture.root),
+            Err(CleanFileStoreError::AmbiguousPublication)
+        ));
+        assert_eq!(
+            fs::read(fixture.root.join(BOOTSTRAP_STAGE_FILE)).unwrap(),
+            staged
+        );
+    }
+
+    #[test]
+    fn client_bootstrap_reader_refuses_partial_and_role_confused_publication() {
+        let fixture = Fixture::new("client-bootstrap-partial");
+        let (mut pins, mut bootstrap, _issuer, mut genesis) =
+            fixture.stores().into_production_parts();
+        assert!(CleanSystemAgentFileStores::read_client_bootstrap(&fixture.root).is_err());
+        pins.commit(b"pins").unwrap();
+        bootstrap.commit(b"bootstrap").unwrap();
+        assert!(CleanSystemAgentFileStores::read_client_bootstrap(&fixture.root).is_err());
+        genesis.commit(b"genesis").unwrap();
+        let original = fs::read(fixture.root.join(PINS_FILE)).unwrap();
+        fs::write(
+            fixture.root.join(PINS_FILE),
+            fs::read(fixture.root.join(BOOTSTRAP_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            CleanSystemAgentFileStores::read_client_bootstrap(&fixture.root),
+            Err(CleanFileStoreError::WrongStoreRole)
+        ));
+        let mut corrupt = original;
+        *corrupt.last_mut().unwrap() ^= 1;
+        fs::write(fixture.root.join(PINS_FILE), &corrupt).unwrap();
+        assert!(matches!(
+            CleanSystemAgentFileStores::read_client_bootstrap(&fixture.root),
+            Err(CleanFileStoreError::Corrupt)
+        ));
+        assert_eq!(fs::read(fixture.root.join(PINS_FILE)).unwrap(), corrupt);
     }
 
     #[cfg(target_os = "linux")]
@@ -6342,6 +6678,358 @@ pub(crate) mod tests {
             reopened.load_replicas(),
             Err(CleanFileStoreError::RequestConflict)
         ));
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn ordinary_external_genesis_selection_is_bound_before_files_and_reopens_exactly() {
+        use vos::agent::clean_bootstrap::SharedGenesisRuntimePackage;
+        use vos::agent::sdk::package::{PackageEnvelope, PackageManifest};
+        use vos::agent::sdk::{
+            AgentProfile, LaneSet, ManagementRequest, ProofSystemSet, StateLane,
+        };
+
+        // This is admission/recovery evidence, not execution of the fixture
+        // program through the external ABI or proof of genesis finality.
+        let fixture = Fixture::new("ordinary-external-genesis-runtime-selection");
+        let (operator, authority, mut descriptor, image) =
+            super::super::local_create::tests::fixture();
+        let (_, original_call, _) = super::super::local_create::prepare(
+            &operator,
+            authority,
+            descriptor.clone(),
+            image.clone(),
+            core::num::NonZeroU64::new(1).unwrap(),
+            10,
+            30,
+        )
+        .unwrap()
+        .into_parts();
+        let mut envelope = PackageEnvelope::decode(image.exact_bytes()).unwrap();
+        let PackageManifest::AgentRuntime(manifest) = &mut envelope.manifest else {
+            unreachable!()
+        };
+        manifest.contract =
+            vos::agent::sdk::contract::RuntimePackageContract::experimental_state_blocks();
+        manifest.external_state_limits =
+            Some(vos::agent::sdk::contract::ExternalStateResourceLimits {
+                max_rows_per_lane: 1_000_000,
+                max_row_bytes_per_lane: 1 << 30,
+            });
+        manifest.capabilities.lanes = LaneSet::of(StateLane::Linear);
+        manifest.capabilities.scheduling = false;
+        manifest.capabilities.proof_systems = ProofSystemSet::EMPTY;
+        envelope.manifest.signing_mut().signature = operator
+            .sign(&envelope.signing_bytes().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let runtime =
+            vos::agent::package_admission::admit_state_runtime_package(&envelope.encode().unwrap())
+                .unwrap();
+        descriptor.identity.profile = AgentProfile::Shared;
+        descriptor.identity.runtime_deployment = runtime.deployment();
+        descriptor.identity.runtime_program = runtime.program();
+        descriptor.identity.runtime_producer = runtime.manifest().signing.producer;
+        descriptor.runtime_package = runtime.package_ref().clone();
+        descriptor.runtime_contract = runtime.manifest().contract;
+        descriptor.capabilities = runtime.manifest().capabilities;
+        let mut members = Vec::new();
+        for seed in [0x46, 0x47, 0x48] {
+            let node = libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap();
+            let peer = node.public().to_peer_id().to_bytes();
+            let replica = vos::agent::AgentReplica {
+                node: vos::service::NodeId::of_authenticated_peer(&peer),
+                principal: vos::service::PrincipalId(descriptor.identity.owner.0),
+                role: vos::agent::ReplicaRole::Voter,
+            };
+            members.push(
+                vos::agent::genesis::AgentReplicaMember::new(
+                    replica,
+                    peer.clone(),
+                    node.public().try_into_ed25519().unwrap().to_bytes(),
+                    Some(vos::agent::genesis::derive_replica_raft_slot(&peer)),
+                )
+                .unwrap(),
+            );
+        }
+        members.sort_by_key(|member| member.replica().node);
+        descriptor.replicas = members
+            .iter()
+            .map(|member| vos::agent::sdk::AgentReplica {
+                node: vos::agent::sdk::NodeId(member.replica().node.0),
+                principal: vos::agent::sdk::PrincipalId(member.replica().principal.0),
+                role: vos::agent::sdk::ReplicaRole::Voter,
+            })
+            .collect();
+        let replicas = vos::agent::genesis::AgentReplicaCommittee::new(
+            vos::service::SpaceId(authority.space.0),
+            vos::service::AgentId(descriptor.identity.agent.0),
+            vos::agent::AgentProfile::Shared,
+            members,
+        )
+        .unwrap();
+        descriptor.validate().unwrap();
+        replicas.validate_for_clean_descriptor(&descriptor).unwrap();
+        let sign_create = |descriptor: &vos::agent::sdk::AgentDescriptor| {
+            descriptor.validate().unwrap();
+            let mut call = original_call.clone();
+            call.managed.profile = AgentProfile::Shared;
+            call.managed.runtime_deployment = descriptor.identity.runtime_deployment;
+            call.plan = ManagementRequest::Create(Box::new(descriptor.clone()))
+                .authorization_plan()
+                .unwrap();
+            call.invocation = call.expected_invocation();
+            call.signature = operator
+                .sign(&call.signing_bytes())
+                .unwrap()
+                .try_into()
+                .unwrap();
+            call
+        };
+        let selected = SharedGenesisRuntimePackage::External(runtime.clone());
+        let mut lazy =
+            CleanSharedGenesisAdmissionFiles::open(&fixture.parent, authority, 1).unwrap();
+        let mut wrong_producer = descriptor.clone();
+        wrong_producer.identity.runtime_producer.0[0] ^= 1;
+        let mut wrong_capabilities = descriptor.clone();
+        // Keep the substituted descriptor independently authorizable: raising
+        // the standard ceiling would test malformed input, not package binding.
+        wrong_capabilities.capabilities.max_actors -= 1;
+        for (invalid, package) in [
+            (&descriptor, SharedGenesisRuntimePackage::Image(image)),
+            (&wrong_producer, selected.clone()),
+            (&wrong_capabilities, selected.clone()),
+        ] {
+            assert!(matches!(
+                lazy.reserve_with_runtime(invalid, &sign_create(invalid), &package, &replicas),
+                Err(vos::agent::shared_host::SharedAgentHostError::ScopeMismatch)
+            ));
+            assert_eq!(fs::read_dir(&fixture.parent).unwrap().count(), 0);
+        }
+        let call = sign_create(&descriptor);
+        let (recovery, archive) = lazy
+            .reserve_with_runtime(&descriptor, &call, &selected, &replicas)
+            .unwrap();
+        assert!(matches!(
+            recovery.runtime(),
+            Some(SharedGenesisRuntimePackage::External(_))
+        ));
+        assert_eq!(
+            recovery.runtime().unwrap().exact_bytes(),
+            runtime.exact_bytes()
+        );
+        assert!(recovery.issued_receipt().is_none());
+        assert!(matches!(
+            discover_shared_genesis_startup(&fixture.parent, authority, 1),
+            Err(CleanFileStoreError::Busy)
+        ));
+        drop((recovery, archive, lazy));
+        let mut files =
+            CleanSharedGenesisStoreFactory::open_or_create(&fixture.parent, authority, 1).unwrap();
+        let mut entries = files
+            .archives
+            .discover_recovery(&mut files.lifecycle, &files.committee, authority, 1)
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        let recovered = &mut entries[0].recovery;
+        assert!(matches!(
+            recovered.runtime(),
+            Some(SharedGenesisRuntimePackage::External(_))
+        ));
+        assert_eq!(
+            recovered.runtime().unwrap().exact_bytes(),
+            runtime.exact_bytes()
+        );
+        assert_eq!(
+            recovered.retained_replicas().unwrap(),
+            Some(replicas.clone())
+        );
+        assert!(recovered.issued_receipt().is_none());
+        drop((entries, files));
+        let mut lazy =
+            CleanSharedGenesisAdmissionFiles::open(&fixture.parent, authority, 1).unwrap();
+        let (recovery, archive) = lazy
+            .reserve_with_runtime(&descriptor, &call, &selected, &replicas)
+            .unwrap();
+        assert!(matches!(
+            recovery.runtime(),
+            Some(SharedGenesisRuntimePackage::External(_))
+        ));
+        assert!(recovery.issued_receipt().is_none());
+        drop((recovery, archive, lazy));
+        let controller = discover_shared_genesis_startup(&fixture.parent, authority, 1)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !controller.is_recovered(),
+            "file admission never grants finality or a serving route"
+        );
+
+        // Reproduce the real pre-pledge cut: the reservation persists the
+        // committee and runtime before it pledges the signed intent. Use the
+        // production file owners, then drop every lease before cold discovery.
+        use vos::agent::local_lifecycle::LocalLifecycleStoreFactory as _;
+        use vos::service::ServiceWire as _;
+        let locator = vos::agent::genesis::AgentGenesisLocator {
+            space: vos::service::SpaceId(authority.space.0),
+            agent: vos::service::AgentId(descriptor.identity.agent.0),
+        };
+        let stage_unpledged = |label, bytes: &[u8]| {
+            let staged = Fixture::new(label);
+            let mut files =
+                CleanSharedGenesisStoreFactory::open_or_create(&staged.parent, authority, 1)
+                    .unwrap();
+            let (mut intent, mut issuer) = files
+                .lifecycle
+                .open(authority.space, descriptor.identity.agent)
+                .unwrap();
+            let (mut query, mut reply) =
+                CleanAgentGenesisCommitteeFile::open_pair(&files.committee.parent, locator)
+                    .unwrap();
+            query.commit_replicas(&replicas.encode()).unwrap();
+            intent.commit_runtime(bytes).unwrap();
+            assert!(intent.load().unwrap().is_none());
+            assert!(issuer.load().unwrap().is_none());
+            assert!(query.load().unwrap().is_none());
+            assert!(reply.load().unwrap().is_none());
+            assert!(query.publication().load().unwrap().is_none());
+            assert!(query.publication_reply().load().unwrap().is_none());
+            assert!(files.archives.discover(1).unwrap().is_empty());
+            drop((intent, issuer, query, reply, files));
+            staged
+        };
+        let staged = stage_unpledged(
+            "ordinary-external-genesis-unpledged-runtime",
+            runtime.exact_bytes(),
+        );
+        let mut files =
+            CleanSharedGenesisStoreFactory::open_or_create(&staged.parent, authority, 1).unwrap();
+        assert!(
+            files
+                .archives
+                .discover_recovery(&mut files.lifecycle, &files.committee, authority, 1)
+                .unwrap()
+                .is_empty(),
+            "unpledged runtime staging must not become a recovery reservation"
+        );
+        drop(files);
+        let cold = discover_shared_genesis_startup(&staged.parent, authority, 1)
+            .unwrap()
+            .unwrap();
+        assert!(!cold.is_recovered());
+        drop(cold);
+        let mut files =
+            CleanSharedGenesisStoreFactory::open_or_create(&staged.parent, authority, 1).unwrap();
+        let entry = files
+            .reserve_create_with_runtime(
+                descriptor.clone(),
+                call.clone(),
+                selected.clone(),
+                replicas.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            entry.recovery.runtime().unwrap().exact_bytes(),
+            runtime.exact_bytes()
+        );
+        assert!(entry.recovery.issued_receipt().is_none());
+        assert!(entry.archive.as_ref().unwrap().1.is_none());
+        drop((entry, files));
+
+        // A different but independently valid signed package is inert too;
+        // exact retry may not replace it or pledge the original Create over it.
+        let mut different = PackageEnvelope::decode(runtime.exact_bytes()).unwrap();
+        let PackageManifest::AgentRuntime(manifest) = &mut different.manifest else {
+            unreachable!()
+        };
+        manifest.name.push_str("-different");
+        different.manifest.signing_mut().signature = operator
+            .sign(&different.signing_bytes().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let different = different.encode().unwrap();
+        vos::agent::package_admission::admit_state_runtime_package(&different).unwrap();
+        let mismatch = stage_unpledged("ordinary-external-genesis-unpledged-mismatch", &different);
+        let cold = discover_shared_genesis_startup(&mismatch.parent, authority, 1)
+            .unwrap()
+            .unwrap();
+        assert!(!cold.is_recovered());
+        drop(cold);
+        let mut files =
+            CleanSharedGenesisStoreFactory::open_or_create(&mismatch.parent, authority, 1).unwrap();
+        assert!(matches!(
+            files.reserve_create_with_runtime(
+                descriptor.clone(),
+                call.clone(),
+                selected.clone(),
+                replicas.clone(),
+            ),
+            Err(vos::agent::shared_host::SharedAgentHostError::Conflict)
+        ));
+        let (mut intent, mut issuer) = files
+            .lifecycle
+            .open_existing(authority.space, descriptor.identity.agent)
+            .unwrap();
+        assert!(intent.load().unwrap().is_none());
+        assert!(issuer.load().unwrap().is_none());
+        assert_eq!(
+            intent.load_runtime().unwrap().as_deref(),
+            Some(different.as_slice())
+        );
+        assert!(files.archives.discover(1).unwrap().is_empty());
+        drop((intent, issuer, files));
+
+        // Signature corruption, wrong package kind, and unknown ABI remain
+        // fatal on the same cold path; no decode-failure fallback or repair.
+        let mut forged = PackageEnvelope::decode(runtime.exact_bytes()).unwrap();
+        forged.manifest.signing_mut().signature[0] ^= 1;
+        let forged = forged.encode().unwrap();
+        let actor = crate::bundled::root_signed_actor_package(
+            crate::bundled::system_catalog_package_template(),
+            "system-catalog",
+            &operator,
+        )
+        .unwrap();
+        let mut unknown = runtime.exact_bytes().to_vec();
+        let abi = vos::agent::sdk::state_execution::STATE_EXECUTION_ABI_ID.0;
+        let offset = unknown
+            .windows(abi.len())
+            .position(|bytes| bytes == abi)
+            .unwrap();
+        unknown[offset..offset + abi.len()].fill(0x77);
+        for (label, bytes) in [
+            (
+                "ordinary-external-genesis-unpledged-signature",
+                forged.as_slice(),
+            ),
+            (
+                "ordinary-external-genesis-unpledged-actor",
+                actor.exact_bytes(),
+            ),
+            (
+                "ordinary-external-genesis-unpledged-unknown-abi",
+                unknown.as_slice(),
+            ),
+        ] {
+            let corrupt = stage_unpledged(label, bytes);
+            assert!(matches!(
+                discover_shared_genesis_startup(&corrupt.parent, authority, 1),
+                Err(CleanFileStoreError::Corrupt)
+            ));
+            let mut files =
+                CleanSharedGenesisStoreFactory::open_or_create(&corrupt.parent, authority, 1)
+                    .unwrap();
+            let (mut intent, mut issuer) = files
+                .lifecycle
+                .open_existing(authority.space, descriptor.identity.agent)
+                .unwrap();
+            assert!(intent.load().unwrap().is_none());
+            assert!(issuer.load().unwrap().is_none());
+            assert_eq!(intent.load_runtime().unwrap().as_deref(), Some(bytes));
+            assert!(files.archives.discover(1).unwrap().is_empty());
+        }
     }
 
     #[test]

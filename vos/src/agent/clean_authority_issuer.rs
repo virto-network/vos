@@ -596,6 +596,18 @@ pub trait CleanManagementReceiptSigner {
 
     fn public_key(&self) -> [u8; 32];
 
+    /// Explicit opt-in for a signed, read-only Authority projection. This is
+    /// separate from receipt signing: a query has no durable selector pledge
+    /// and grants no management authority. Implementations must validate the
+    /// exact typed query and configured credential before signing its preimage.
+    /// Unsupported signers fail closed without becoming a generic oracle.
+    fn sign_authority_projection(
+        &mut self,
+        _query: &super::sdk::authority::AuthorityProjectionQuery,
+    ) -> Option<[u8; 64]> {
+        None
+    }
+
     fn sign_authority_receipt(&mut self, message: &[u8]) -> Result<[u8; 64], Self::Error>;
 
     fn sign_management_application_ack(&mut self, message: &[u8]) -> Result<[u8; 64], Self::Error>;
@@ -1242,6 +1254,9 @@ pub struct DurableCleanManagementIssuer<B: CleanManagementIssuerStore> {
     continuation_open: bool,
 }
 
+/// Canonical issuer-open result without ownership of its still-borrowed store.
+pub(crate) struct ReloadedCreationIssuer(CleanManagementIssuerImage);
+
 impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
     pub fn open(
         mut store: B,
@@ -1306,6 +1321,55 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
 
     pub fn into_store(self) -> B {
         self.store
+    }
+
+    pub(crate) fn leased_store_mut(&mut self) -> &mut B {
+        &mut self.store
+    }
+
+    pub(crate) fn into_creation_reload_cache(
+        self,
+    ) -> Result<ReloadedCreationIssuer, CleanManagementIssuerError<B::Error>> {
+        if self.poisoned || self.continuation_open {
+            return Err(CleanManagementIssuerError::InvalidState);
+        }
+        Ok(ReloadedCreationIssuer(self.image))
+    }
+
+    /// Preparation can durably finish an already pending issuance, including a
+    /// write that returned an error. It cannot retire applications or roll back
+    /// a signed decision, floor, or continuation held by this live owner.
+    pub(crate) fn validates_creation_reload_cache(&self, cache: &ReloadedCreationIssuer) -> bool {
+        let before = &self.image;
+        let after = &cache.0;
+        !self.continuation_open
+            && before.binding == after.binding
+            && before.space == after.space
+            && before.agent == after.agent
+            && after.authorization_high_water >= before.authorization_high_water
+            && after.decision_sequence_high_water >= before.decision_sequence_high_water
+            && before.acknowledged_through == after.acknowledged_through
+            && before.acknowledged == after.acknowledged
+            && before.pending_application_ack == after.pending_application_ack
+            && before
+                .epoch_high_water
+                .is_none_or(|floor| after.epoch_high_water.is_some_and(|slot| slot >= floor))
+            && before
+                .retained
+                .iter()
+                .all(|row| after.retained.iter().any(|candidate| candidate == row))
+            && before.pending.as_ref().is_none_or(|pending| {
+                after.pending.as_ref() == Some(pending)
+                    || after.retained.iter().any(|row| {
+                        row.sequence == pending.sequence && row.decision == pending.decision
+                    })
+            })
+    }
+
+    pub(crate) fn install_creation_reload_cache(&mut self, cache: ReloadedCreationIssuer) {
+        self.image = cache.0;
+        self.poisoned = false;
+        self.continuation_open = false;
     }
 
     pub(crate) fn creation_continuation_retained(

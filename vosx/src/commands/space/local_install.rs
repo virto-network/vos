@@ -72,18 +72,8 @@ fn install_local(
         "invalid Local Install target/endpoint"
     );
     let identity = super::clean_identity::CleanOperatorIdentitySigner::new(operator)?;
-    let runtime = crate::bundled::root_signed_agent_runtime_package(operator)?;
-    let authority_package = crate::bundled::root_signed_actor_package(
-        crate::bundled::system_authority_package_template(),
-        "system-authority",
-        operator,
-    )?;
-    let (authority, _) = super::clean_startup::derive_system_authority_target(
-        space,
-        identity.raw_public_key(),
-        &runtime,
-        &authority_package,
-    )?;
+    let authority =
+        super::clean_startup::client_system_authority_target(data, space, operator, node_public)?;
     let root = data.join("agent-client");
     let _root = ensure_private_directory(&root)?;
     let claims = root.join("credentials");

@@ -33,6 +33,10 @@ const BUNDLED_SYSTEM_AUTHORITY_PACKAGE: &[u8] =
     include_bytes!(env!("VOSX_BUNDLED_SYSTEM_AUTHORITY_PACKAGE"));
 const BUNDLED_SYSTEM_CATALOG_PACKAGE: &[u8] =
     include_bytes!(env!("VOSX_BUNDLED_SYSTEM_CATALOG_PACKAGE"));
+const BUNDLED_SYSTEM_IMAGE_RUNTIME_PACKAGE: &[u8] =
+    include_bytes!(env!("VOSX_BUNDLED_SYSTEM_IMAGE_RUNTIME_PACKAGE"));
+const BUNDLED_SHARED_EXTERNAL_RUNTIME_PACKAGE: &[u8] =
+    include_bytes!(env!("VOSX_BUNDLED_SHARED_EXTERNAL_RUNTIME_PACKAGE"));
 const BUNDLED_AGENT_RUNTIME_PACKAGE_NAME: &str = "standard-agent-runtime";
 
 /// Prepare the complete, root-signed package closure used by native bootstrap.
@@ -48,7 +52,7 @@ pub(crate) fn prepare_system_packages_for_storage(
     root: &Keypair,
     storage: crate::commands::space::local_config::LocalAgentStorage,
 ) -> anyhow::Result<()> {
-    let runtime = root_signed_agent_runtime_package(root)?;
+    let runtime = root_signed_system_agent_runtime_package(root)?;
     let authority = root_signed_actor_package(
         system_authority_package_template_for_storage(storage)?,
         "system-authority",
@@ -128,6 +132,54 @@ pub(crate) fn system_catalog_package_template() -> &'static [u8] {
     BUNDLED_SYSTEM_CATALOG_PACKAGE
 }
 
+pub(crate) fn system_image_runtime_package_template() -> anyhow::Result<&'static [u8]> {
+    if BUNDLED_SYSTEM_IMAGE_RUNTIME_PACKAGE.is_empty() {
+        bail!("System observation runtime release artifact is not yet qualified and pinned");
+    }
+    Ok(BUNDLED_SYSTEM_IMAGE_RUNTIME_PACKAGE)
+}
+
+pub(crate) fn shared_external_runtime_package_template() -> anyhow::Result<&'static [u8]> {
+    if BUNDLED_SHARED_EXTERNAL_RUNTIME_PACKAGE.is_empty() {
+        bail!("Shared external runtime release artifact is not yet qualified and pinned");
+    }
+    Ok(BUNDLED_SHARED_EXTERNAL_RUNTIME_PACKAGE)
+}
+
+/// Re-sign the independently checked System role with this space's actual
+/// root. Local's canonical image package is never relabeled as observation
+/// capable, and a missing release pin never selects a target-directory guest.
+pub(crate) fn root_signed_system_agent_runtime_package(
+    root: &Keypair,
+) -> anyhow::Result<AdmittedRuntimePackage> {
+    require_ed25519_space_root(root.key_type())?;
+    #[cfg(not(feature = "experimental-state-blocks"))]
+    {
+        bail!("System observation startup requires the released state-block build profile");
+    }
+    #[cfg(feature = "experimental-state-blocks")]
+    {
+        let template = admit_runtime_package(system_image_runtime_package_template()?)?;
+        if template.manifest().name != "system-image-runtime"
+            || template.manifest().contract != RuntimePackageContract::system_observation_image()
+            || template.capabilities() != RuntimeCapabilities::standard()
+            || template.manifest().external_state_limits.is_some()
+            || template.program_bytes() == agent_runtime_pvm()
+        {
+            bail!("bundled System runtime template has the wrong signed role");
+        }
+        let bytes = root_signed_runtime_package_bytes(
+            root,
+            template.program_bytes(),
+            "system-image-runtime",
+            template.manifest().contract,
+            template.capabilities(),
+            None,
+        )?;
+        admit_runtime_package(&bytes).map_err(Into::into)
+    }
+}
+
 /// Construct and admit the bundled standard AgentRuntime package signed by an
 /// explicit per-space operator root.
 ///
@@ -144,6 +196,7 @@ pub(crate) fn root_signed_agent_runtime_package(
         agent_runtime_pvm(),
         BUNDLED_AGENT_RUNTIME_PACKAGE_NAME,
         RuntimePackageContract::canonical(),
+        RuntimeCapabilities::standard(),
         None,
     )?;
     // Return only the host-admitted value. This proves canonical encoding,
@@ -152,11 +205,12 @@ pub(crate) fn root_signed_agent_runtime_package(
     admit_runtime_package(&bytes).map_err(Into::into)
 }
 
-fn root_signed_runtime_package_bytes(
+pub(crate) fn root_signed_runtime_package_bytes(
     root: &Keypair,
     runtime_pvm: &[u8],
     name: &str,
     contract: RuntimePackageContract,
+    capabilities: RuntimeCapabilities,
     external_state_limits: Option<vos::agent::sdk::contract::ExternalStateResourceLimits>,
 ) -> anyhow::Result<Vec<u8>> {
     require_ed25519_space_root(root.key_type())?;
@@ -172,7 +226,7 @@ fn root_signed_runtime_package_bytes(
             external_state_limits,
             outer_program: outer_program.clone(),
             contract,
-            capabilities: RuntimeCapabilities::standard(),
+            capabilities,
             signing: PackageSigning {
                 producer: ProducerId::of_public_key(&public_key),
                 public_key,

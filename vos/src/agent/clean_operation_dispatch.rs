@@ -28,6 +28,7 @@ pub use completion::{
     MAX_NATIVE_OPERATION_COMPLETION_BYTES, NativeAuthorityOperationCompletionSigner,
     native_operation_completion_invocations,
 };
+pub(crate) use retirement::RetainedNativeOperationRetirement;
 pub use retirement::{
     MAX_NATIVE_OPERATION_RETIREMENT_BYTES, NativeAuthorityOperationRetirementSigner,
     NativeAuthorityOperationRetirementStore, native_operation_retirement_completion,
@@ -51,6 +52,48 @@ pub fn native_operation_record_matches(
     bytes: &[u8],
 ) -> bool {
     decode_bound_operation_record(authority, invocation, bytes).is_ok()
+}
+
+/// Verify an immutable terminal archive against both complete original NOD1
+/// preimages. This proves retirement of policy work, never actor application.
+pub fn native_operation_retired_pair_matches(
+    authority: AuthorityActorTarget,
+    invocation: InvocationId,
+    authorization: &[u8],
+    acknowledgement: &[u8],
+    terminal: &[u8],
+) -> bool {
+    let Some(completion) =
+        native_operation_retirement_completion(&authority.binding.public_key, terminal)
+    else {
+        return false;
+    };
+    let Some(ids) =
+        native_operation_completion_invocations(&authority.binding.public_key, &completion)
+    else {
+        return false;
+    };
+    if !ids.contains(&invocation) {
+        return false;
+    }
+    let Ok(authorization) = decode_bound_operation_record(authority, ids[0], authorization) else {
+        return false;
+    };
+    let Ok(acknowledgement) = decode_bound_operation_record(authority, ids[1], acknowledgement)
+    else {
+        return false;
+    };
+    retirement::restore_retirement(authority, &authorization, &acknowledgement, terminal)
+        .is_ok_and(|retired| retired.issued().is_ok())
+}
+
+pub(super) fn restore_retired_operation_pair(
+    authority: AuthorityActorTarget,
+    authorization: &RetainedAuthorityOperationDispatch,
+    acknowledgement: &RetainedAuthorityOperationDispatch,
+    terminal: &[u8],
+) -> Result<RetainedNativeOperationRetirement, SharedAgentHostError> {
+    retirement::restore_retirement(authority, authorization, acknowledgement, terminal)
 }
 
 /// Return the same fully decoded record whose canonical bytes and file scope
@@ -80,6 +123,41 @@ pub trait NativeAuthorityOperationJournalStore {
 
     fn load(&mut self, invocation: InvocationId) -> Result<Option<Vec<u8>>, Self::Error>;
     fn retain(&mut self, invocation: InvocationId, record: &[u8]) -> Result<(), Self::Error>;
+
+    /// Optional production terminal archive; old implementations retain their
+    /// fail-closed cumulative ceiling. The three entries are original authorize
+    /// NOD1, original AOI NOD1 and exact NRT1. Lookup is keyed by either ID.
+    fn load_retired(
+        &mut self,
+        _invocation: InvocationId,
+    ) -> Result<Option<[Vec<u8>; 3]>, Self::Error> {
+        Ok(None)
+    }
+    fn supports_retired_archive(&self) -> bool {
+        false
+    }
+    /// Synchronize both keyed identities before returning true. No hot record
+    /// may be pruned when a store declines this optional capability.
+    fn retain_retired(
+        &mut self,
+        _records: [&[u8]; 2],
+        _terminal: &[u8],
+    ) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+    /// Remove only hot NODs whose unchanged bytes are independently present in
+    /// the exact verified terminal archive. Never delete terminal history.
+    fn remove_retired(
+        &mut self,
+        _records: [&[u8]; 2],
+        _terminal: &[u8],
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    /// Complete bounded active discovery, excluding the terminal archive.
+    fn active_invocations(&mut self) -> Result<Option<Vec<InvocationId>>, Self::Error> {
+        Ok(None)
+    }
 }
 
 /// Exact admission loaded while the journal and certificate leases are held.
@@ -1124,7 +1202,7 @@ where
     where
         F: FnOnce(&RetainedAuthorityOperationDispatch) -> Result<(), SharedAgentHostError>,
     {
-        if call.authority != self.authority_target() || self.record.pending_projection.is_some() {
+        if call.authority != self.authority_target() {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         let material = self
@@ -1211,10 +1289,7 @@ where
         &self,
         request: &AuthorityOperationActorDispatch,
     ) -> Result<RuntimeWork, SharedAgentHostError> {
-        if self.record.pending_projection.is_some()
-            || request.target != self.authority_target()
-            || !request.has_valid_request()
-        {
+        if request.target != self.authority_target() || !request.has_valid_request() {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         let material = self
@@ -1227,10 +1302,7 @@ where
         request: &AuthorityOperationActorDispatch,
         mut material: super::super::invocation_preparation::PhysicalInvocationMaterial,
     ) -> Result<RuntimeWork, SharedAgentHostError> {
-        if self.record.pending_projection.is_some()
-            || request.target != self.authority_target()
-            || !request.has_valid_request()
-        {
+        if request.target != self.authority_target() || !request.has_valid_request() {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         material.root_provenance = false;
@@ -1312,8 +1384,7 @@ where
         envelope: &RuntimeWork,
         anchor: &super::super::clean_management_intent::ManagementJournalAnchor,
     ) -> Result<AuthorityOperationActorResult, SharedAgentHostError> {
-        if self.record.pending_projection.is_some()
-            || request.target != self.authority_target()
+        if request.target != self.authority_target()
             || !matches_operation_envelope(request, envelope)
         {
             return Err(SharedAgentHostError::ScopeMismatch);

@@ -220,6 +220,9 @@ pub struct SystemAuthorityConfiguration {
     pub system_transition_producer: [u8; 32],
     /// Exact bundled standard-runtime package admitted for the system Agent.
     pub system_runtime_package: AuthorityBlobRow,
+    /// Complete contract selected by the signed System image package. SAC7
+    /// declares the exact observation opt-in; a fixed roster alone does not.
+    pub system_runtime_contract: RuntimeContractRow,
     pub binding: AuthorityBindingState,
     /// Exact durable issuer sequence already consumed by root admission.
     pub bootstrap_authorization_high_water: u64,
@@ -237,7 +240,8 @@ pub struct SystemAuthorityConfiguration {
     pub bootstrap_node_encryption_public_key: [u8; 32],
     pub bootstrap_node_transport_signature: [u8; PRIVATE_SIGNATURE_BYTES],
     /// Two additional founding-owner nodes for the fixed three-voter profile.
-    /// Absent preserves the exact SAC5 singleton constructor representation.
+    /// Absent preserves the exact SAC5 canonical constructor representation;
+    /// the explicitly declared observation contract requires all three nodes.
     pub bootstrap_additional_nodes: Option<[AuthorityBootstrapNode; 2]>,
 }
 
@@ -272,6 +276,9 @@ impl AuthorityBootstrapNode {
 
 const FIXED_ROSTER_CONFIGURATION_MAGIC: [u8; 4] = *b"SAC6";
 const FIXED_ROSTER_CONFIG_BYTES: usize = CONFIG_ENCODED_BYTES + 2 * (64 + PRIVATE_SIGNATURE_BYTES);
+const OBSERVATION_CONFIGURATION_MAGIC: [u8; 4] = *b"SAC7";
+const RUNTIME_CONTRACT_ENCODED_BYTES: usize = 2 * 32 + 4 * 4 + 2 * 8 + 1;
+const OBSERVATION_CONFIG_BYTES: usize = FIXED_ROSTER_CONFIG_BYTES + RUNTIME_CONTRACT_ENCODED_BYTES;
 
 impl Default for SystemAuthorityConfiguration {
     fn default() -> Self {
@@ -286,6 +293,9 @@ impl Default for SystemAuthorityConfiguration {
                 hash: [0; 32],
                 len: 0,
             },
+            system_runtime_contract: RuntimeContractRow::from_sdk(
+                RuntimePackageContract::canonical(),
+            ),
             binding: AuthorityBindingState::default(),
             bootstrap_authorization_high_water: 0,
             bootstrap_system_agent_creation_nonce: [0; 32],
@@ -321,7 +331,8 @@ impl SystemAuthorityConfiguration {
             && descriptor.creation_nonce.0 == self.bootstrap_system_agent_creation_nonce
             && descriptor.runtime_package.hash.0 == self.system_runtime_package.hash
             && descriptor.runtime_package.len == self.system_runtime_package.len
-            && descriptor.runtime_contract == RuntimePackageContract::canonical()
+            && RuntimeContractRow::from_sdk(descriptor.runtime_contract)
+                == self.system_runtime_contract
             && descriptor.capabilities == RuntimeCapabilities::standard()
             && descriptor.private_recovery.is_none()
             && descriptor.replicas
@@ -377,6 +388,9 @@ impl SystemAuthorityConfiguration {
 
     pub fn is_valid(self) -> bool {
         self.space != [0; 32]
+            && (self.system_runtime_contract
+                == RuntimeContractRow::from_sdk(RuntimePackageContract::canonical())
+                || self.has_observation_contract() && self.bootstrap_additional_nodes.is_some())
             && self.bootstrap_additional_nodes.is_none_or(|additional| {
                 let nodes = additional.map(|node| {
                     node.enrollment(SpaceId(self.space), PrincipalId(self.bootstrap_principal))
@@ -416,10 +430,34 @@ impl SystemAuthorityConfiguration {
             && self.binding.sdk().is_valid()
     }
 
+    fn has_observation_contract(self) -> bool {
+        #[cfg(feature = "experimental-state-blocks")]
+        {
+            self.system_runtime_contract
+                == RuntimeContractRow::from_sdk(RuntimePackageContract::system_observation_image())
+        }
+        #[cfg(not(feature = "experimental-state-blocks"))]
+        {
+            false
+        }
+    }
+
     /// One exact clean-generation installation-data representation.
     pub fn encode(self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(CONFIG_ENCODED_BYTES);
-        bytes.extend_from_slice(&if self.bootstrap_additional_nodes.is_some() {
+        // Invalid noncanonical contracts still get an explicit SAC7 body,
+        // which decode refuses. Never drop a declaration into a legacy tag.
+        let explicit_contract = self.system_runtime_contract
+            != RuntimeContractRow::from_sdk(RuntimePackageContract::canonical());
+        let mut bytes = Vec::with_capacity(if explicit_contract {
+            OBSERVATION_CONFIG_BYTES
+        } else if self.bootstrap_additional_nodes.is_some() {
+            FIXED_ROSTER_CONFIG_BYTES
+        } else {
+            CONFIG_ENCODED_BYTES
+        });
+        bytes.extend_from_slice(&if explicit_contract {
+            OBSERVATION_CONFIGURATION_MAGIC
+        } else if self.bootstrap_additional_nodes.is_some() {
             FIXED_ROSTER_CONFIGURATION_MAGIC
         } else {
             SYSTEM_AUTHORITY_CONFIGURATION_MAGIC
@@ -459,14 +497,21 @@ impl SystemAuthorityConfiguration {
                 bytes.extend_from_slice(&node.transport_signature);
             }
         }
+        if explicit_contract {
+            self.system_runtime_contract.encode_into(&mut bytes);
+        }
         bytes
     }
 
-    /// Decode exact SAC5 singleton or SAC6 fixed-three-node constructors.
+    /// Decode exact legacy SAC5/SAC6 canonical constructors or the explicitly
+    /// declared SAC7 fixed-three System observation constructor.
     /// Prior generations, truncation, and trailing data are rejected.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let fixed_roster = bytes.get(..4) == Some(FIXED_ROSTER_CONFIGURATION_MAGIC.as_slice());
-        if !(fixed_roster && bytes.len() == FIXED_ROSTER_CONFIG_BYTES
+        let observation = bytes.get(..4) == Some(OBSERVATION_CONFIGURATION_MAGIC.as_slice());
+        let fixed_roster =
+            observation || bytes.get(..4) == Some(FIXED_ROSTER_CONFIGURATION_MAGIC.as_slice());
+        if !(observation && bytes.len() == OBSERVATION_CONFIG_BYTES
+            || !observation && fixed_roster && bytes.len() == FIXED_ROSTER_CONFIG_BYTES
             || bytes.get(..4) == Some(SYSTEM_AUTHORITY_CONFIGURATION_MAGIC.as_slice())
                 && bytes.len() == CONFIG_ENCODED_BYTES)
             || bytes.get(4..36) != Some(RUNTIME_ABI_ID.as_bytes().as_slice())
@@ -522,6 +567,11 @@ impl SystemAuthorityConfiguration {
         } else {
             None
         };
+        let system_runtime_contract = if observation {
+            RuntimeContractRow::decode_from(bytes, &mut cursor)?
+        } else {
+            RuntimeContractRow::from_sdk(RuntimePackageContract::canonical())
+        };
         if cursor != bytes.len() {
             return None;
         }
@@ -533,6 +583,7 @@ impl SystemAuthorityConfiguration {
             system_runtime_producer,
             system_transition_producer,
             system_runtime_package,
+            system_runtime_contract,
             binding: AuthorityBindingState {
                 policy,
                 issuer,
@@ -552,7 +603,7 @@ impl SystemAuthorityConfiguration {
             bootstrap_node_transport_signature,
             bootstrap_additional_nodes,
         };
-        value.is_valid().then_some(value)
+        (value.is_valid() && (!observation || value.has_observation_contract())).then_some(value)
     }
 }
 
@@ -776,7 +827,9 @@ pub struct RuntimeContractRow {
 }
 
 impl RuntimeContractRow {
-    fn from_sdk(contract: RuntimePackageContract) -> Self {
+    /// Copy the complete declaration; package/configuration admission remains
+    /// responsible for authenticating and accepting its exact contract.
+    pub fn from_sdk(contract: RuntimePackageContract) -> Self {
         Self {
             lifecycle_abi: contract.lifecycle_abi.0,
             actor_abi_minimum: contract.actor_abis.minimum,
@@ -788,6 +841,34 @@ impl RuntimeContractRow {
             max_proof_material_bytes: contract.resources.max_proof_material_bytes,
             migration: contract.migration as u8,
         }
+    }
+
+    fn encode_into(self, bytes: &mut Vec<u8>) {
+        bytes.extend_from_slice(&self.lifecycle_abi);
+        bytes.extend_from_slice(&self.actor_abi_minimum.to_le_bytes());
+        bytes.extend_from_slice(&self.actor_abi_maximum.to_le_bytes());
+        bytes.extend_from_slice(&self.control_schema);
+        bytes.extend_from_slice(&self.max_runtime_state_bytes.to_le_bytes());
+        bytes.extend_from_slice(&self.max_artifact_references.to_le_bytes());
+        bytes.extend_from_slice(&self.max_artifact_referenced_bytes.to_le_bytes());
+        bytes.extend_from_slice(&self.max_proof_material_bytes.to_le_bytes());
+        bytes.push(self.migration);
+    }
+
+    fn decode_from(bytes: &[u8], cursor: &mut usize) -> Option<Self> {
+        let row = Self {
+            lifecycle_abi: take_fixed(bytes, cursor)?,
+            actor_abi_minimum: u32::from_le_bytes(take_array(bytes, cursor)?),
+            actor_abi_maximum: u32::from_le_bytes(take_array(bytes, cursor)?),
+            control_schema: take_fixed(bytes, cursor)?,
+            max_runtime_state_bytes: u32::from_le_bytes(take_array(bytes, cursor)?),
+            max_artifact_references: u32::from_le_bytes(take_array(bytes, cursor)?),
+            max_artifact_referenced_bytes: u64::from_le_bytes(take_array(bytes, cursor)?),
+            max_proof_material_bytes: u64::from_le_bytes(take_array(bytes, cursor)?),
+            migration: *bytes.get(*cursor)?,
+        };
+        *cursor += 1;
+        Some(row)
     }
 
     fn sdk(self) -> Option<RuntimePackageContract> {
@@ -986,7 +1067,7 @@ fn root_managed_agent(config: SystemAuthorityConfiguration) -> ManagedAgentRow {
         creation_nonce: config.bootstrap_system_agent_creation_nonce,
         private_recovery: None,
         runtime_package: config.system_runtime_package,
-        runtime_contract: RuntimeContractRow::from_sdk(RuntimePackageContract::canonical()),
+        runtime_contract: config.system_runtime_contract,
         capabilities: RuntimeCapabilitiesRow::from_sdk(RuntimeCapabilities::standard()),
         replicas: config
             .bootstrap_enrollments()
@@ -1642,30 +1723,21 @@ impl SystemAuthority {
     /// credential may still prove possession and receive its revoked status;
     /// unknown, substituted, or corrupt state fails closed.
     #[msg(query)]
-    fn credential_projection(&self, query: Vec<u8>, ctx: &mut Context<Self>) -> Vec<u8> {
-        if !projection_context_matches(&query, ctx.agent_invocation_context()) {
-            return Vec::new();
-        }
+    fn credential_projection(&self, query: Vec<u8>, _ctx: &mut Context<Self>) -> Vec<u8> {
         credential_projection(&self.configuration, &self.state, &query)
     }
 
     /// Bounded, revision-consistent credential and directory stream. One
     /// query authenticates the complete page; no per-row invocation is needed.
     #[msg(query)]
-    fn inventory_projection_page(&self, query: Vec<u8>, ctx: &mut Context<Self>) -> Vec<u8> {
-        if !projection_context_matches(&query, ctx.agent_invocation_context()) {
-            return Vec::new();
-        }
+    fn inventory_projection_page(&self, query: Vec<u8>, _ctx: &mut Context<Self>) -> Vec<u8> {
         inventory_projection_page(&self.configuration, &self.state, &query)
     }
 
     /// Return one bounded, full-ID ordered Agent policy page. Private entries
     /// are visible only to their owner or an Admin and never carry aliases.
     #[msg(query)]
-    fn agent_projection_page(&self, query: Vec<u8>, ctx: &mut Context<Self>) -> Vec<u8> {
-        if !projection_context_matches(&query, ctx.agent_invocation_context()) {
-            return Vec::new();
-        }
+    fn agent_projection_page(&self, query: Vec<u8>, _ctx: &mut Context<Self>) -> Vec<u8> {
         agent_projection_page(&self.configuration, &self.state, &query)
     }
 
@@ -1673,20 +1745,14 @@ impl SystemAuthority {
     /// reconstruct the descriptor only from pages sharing the Agent row's
     /// state head, replica count, and replica generation.
     #[msg(query)]
-    fn agent_replica_projection_page(&self, query: Vec<u8>, ctx: &mut Context<Self>) -> Vec<u8> {
-        if !projection_context_matches(&query, ctx.agent_invocation_context()) {
-            return Vec::new();
-        }
+    fn agent_replica_projection_page(&self, query: Vec<u8>, _ctx: &mut Context<Self>) -> Vec<u8> {
         agent_replica_projection_page(&self.configuration, &self.state, &query)
     }
 
     /// Return one bounded Actor policy/status/artifact page for an exact
     /// Agent. Private inventories are owner/Admin-only.
     #[msg(query)]
-    fn actor_projection_page(&self, query: Vec<u8>, ctx: &mut Context<Self>) -> Vec<u8> {
-        if !projection_context_matches(&query, ctx.agent_invocation_context()) {
-            return Vec::new();
-        }
+    fn actor_projection_page(&self, query: Vec<u8>, _ctx: &mut Context<Self>) -> Vec<u8> {
         actor_projection_page(&self.configuration, &self.state, &query)
     }
 
@@ -1696,6 +1762,16 @@ impl SystemAuthority {
     #[msg(query)]
     fn genesis_signing_committee(&self) -> Vec<u8> {
         genesis_publication::signing_committee(&self.configuration)
+    }
+
+    /// Read one permanent ordinary Shared genesis decision through the exact
+    /// signed projection query. This does not assert Create application finality.
+    #[msg(query)]
+    fn genesis_decision_projection(&self, query: Vec<u8>, ctx: &mut Context<Self>) -> Vec<u8> {
+        let Some(context) = ctx.agent_invocation_context() else {
+            return Vec::new();
+        };
+        genesis_decision_projection(&self.configuration, &self.state, &query, context)
     }
 }
 
@@ -1886,17 +1962,6 @@ fn projection_head(state: &AuthorityLinearState) -> Option<AuthorityProjectionHe
     })
 }
 
-// Live committee/expiry authorization is enforced by the host before proposing
-// unseen work. The guest checks the signed immutable execution identity; using
-// replay's accepted slot as a new admission clock would defeat expiration.
-fn projection_context_matches(encoded: &[u8], context: Option<&InvocationContext>) -> bool {
-    let Ok(query) = AuthorityProjectionQuery::decode(encoded) else {
-        return false;
-    };
-    query.recovery.is_none()
-        || context.is_some_and(|context| query.matches_recovery_context(context))
-}
-
 fn authenticated_projection_query(
     configuration: &SystemAuthorityConfiguration,
     state: &AuthorityLinearState,
@@ -1964,6 +2029,33 @@ fn authenticated_projection_query(
         principal,
         state.roles[role_index].role,
     ))
+}
+
+fn genesis_decision_projection(
+    configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
+    encoded_query: &[u8],
+    context: &InvocationContext,
+) -> Vec<u8> {
+    let Some((query, _, _, _)) =
+        authenticated_projection_query(configuration, state, encoded_query, false)
+    else {
+        return Vec::new();
+    };
+    let AuthorityProjectionSelector::GenesisDecision { agent } = query.selector else {
+        return Vec::new();
+    };
+    if !context.validate()
+        || context.invocation != query.expected_invocation()
+        || context.actor != query.authority.binding.issuer.actor
+        || context.mode != vos::agent_sdk::MethodMode::Query
+    {
+        return Vec::new();
+    }
+    // The signed selector, target and invocation are checked above. Keep the
+    // permanent decision's existing canonical format and publication checks;
+    // authenticated local execution binds it to this exact query.
+    genesis_publication::read(configuration, state, agent.as_bytes(), context)
 }
 
 fn credential_projection(
@@ -9103,6 +9195,9 @@ mod tests {
                 hash: [0x1b; 32],
                 len: 1_024,
             },
+            system_runtime_contract: RuntimeContractRow::from_sdk(
+                RuntimePackageContract::canonical(),
+            ),
             binding: AuthorityBindingState {
                 policy: [0x14; 32],
                 issuer: AuthorityIssuerState {
@@ -10829,6 +10924,186 @@ mod tests {
         vos::storage::mock::reset();
     }
 
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn sac7_observation_contract_binds_initial_system_projection_and_restore() {
+        use vos::Actor;
+        vos::storage::mock::reset();
+        let mut config = fixed_roster_configuration();
+        let contract = RuntimePackageContract::system_observation_image();
+        config.system_runtime_contract = RuntimeContractRow::from_sdk(contract);
+        assert!(config.is_valid());
+        let encoded = config.encode();
+        assert_eq!(&encoded[..4], b"SAC7");
+        assert_eq!(encoded.len(), OBSERVATION_CONFIG_BYTES);
+        assert_eq!(encoded.len() - FIXED_ROSTER_CONFIG_BYTES, 97);
+        assert_eq!(SystemAuthorityConfiguration::decode(&encoded), Some(config));
+        let actor =
+            <SystemAuthority as Actor>::__load_agent_state(Some(&encoded), None, None, None)
+                .unwrap();
+        assert!(authority_state_is_valid(&config, &actor.state));
+        assert_eq!(
+            actor.state.managed_agents[0].runtime_contract,
+            config.system_runtime_contract
+        );
+        assert_eq!(
+            actor.state.managed_agents[0].runtime_contract.sdk(),
+            Some(contract)
+        );
+        let query = ssh_projection_query(
+            config,
+            &signing(0x21),
+            ADMIN_NODE,
+            &signing(0x31),
+            0xf0,
+            AuthorityProjectionSelector::Agents {
+                after: None,
+                limit: 1,
+            },
+        );
+        let linear = actor.__save_agent_lane(vos::agent::StateLane::Linear);
+        let page = AuthorityAgentProjectionPage::decode(&agent_projection_page(
+            &config,
+            &actor.state,
+            &query.encode().unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(page.query, query);
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].identity.agent, AgentId(config.system_agent));
+        assert_eq!(page.entries[0].runtime_contract, contract);
+        assert_eq!(
+            actor.__save_agent_lane(vos::agent::StateLane::Linear),
+            linear
+        );
+
+        let mut certified = descriptor(config, ADMIN_PRINCIPAL, AgentProfile::Shared, 0x12);
+        certified.identity.runtime_deployment = DeploymentId(config.system_runtime_deployment);
+        certified.identity.runtime_program = ProgramId(config.system_runtime_program);
+        certified.identity.runtime_producer = ProducerId(config.system_runtime_producer);
+        certified.identity.transition_producer = ProducerId(config.system_transition_producer);
+        certified.runtime_package = authority_blob_sdk(config.system_runtime_package);
+        certified.runtime_contract = contract;
+        certified.replicas = actor.state.managed_agents[0]
+            .replicas
+            .iter()
+            .map(|row| row.sdk().unwrap())
+            .collect();
+        assert!(config.matches_system_descriptor(&certified));
+        let mut other = certified.clone();
+        other.runtime_contract = RuntimePackageContract::canonical();
+        assert!(other.validate().is_ok());
+        assert!(!config.matches_system_descriptor(&other));
+        other = certified.clone();
+        other.runtime_contract.resources.max_runtime_state_bytes -= 1;
+        assert!(other.validate().is_ok());
+        assert!(!config.matches_system_descriptor(&other));
+        let mut canonical = config;
+        canonical.system_runtime_contract =
+            RuntimeContractRow::from_sdk(RuntimePackageContract::canonical());
+        assert!(canonical.is_valid());
+        assert_eq!(&canonical.encode()[..4], b"SAC6");
+        assert!(!canonical.matches_system_descriptor(&certified));
+
+        let reopened = <SystemAuthority as Actor>::__load_agent_state(
+            Some(&encoded),
+            Some(&linear),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(reopened.state, actor.state);
+        assert!(authority_state_is_valid(&config, &reopened.state));
+        assert_eq!(
+            agent_projection_page(&config, &reopened.state, &query.encode().unwrap()),
+            page.encode().unwrap(),
+        );
+        assert!(
+            agent_projection_page(&canonical, &reopened.state, &query.encode().unwrap()).is_empty(),
+            "a different constructor contract cannot authenticate the retained state"
+        );
+        vos::storage::mock::reset();
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn sac7_refuses_other_contracts_mismatched_headers_and_nonfixed_rosters() {
+        let mut config = fixed_roster_configuration();
+        config.system_runtime_contract =
+            RuntimeContractRow::from_sdk(RuntimePackageContract::system_observation_image());
+        let encoded = config.encode();
+        for field in 0..9 {
+            let mut wrong = config;
+            let contract = &mut wrong.system_runtime_contract;
+            match field {
+                0 => contract.lifecycle_abi[0] ^= 1,
+                1 => contract.actor_abi_minimum += 1,
+                2 => contract.actor_abi_maximum += 1,
+                3 => contract.control_schema[0] ^= 1,
+                4 => contract.max_runtime_state_bytes -= 1,
+                5 => contract.max_artifact_references -= 1,
+                6 => contract.max_artifact_referenced_bytes -= 1,
+                7 => contract.max_proof_material_bytes -= 1,
+                8 => contract.migration = 1,
+                _ => unreachable!(),
+            }
+            assert!(!wrong.is_valid());
+            assert!(SystemAuthorityConfiguration::decode(&wrong.encode()).is_none());
+        }
+        let mut external = config;
+        external.system_runtime_contract =
+            RuntimeContractRow::from_sdk(RuntimePackageContract::experimental_state_blocks());
+        assert!(!external.is_valid());
+        assert!(SystemAuthorityConfiguration::decode(&external.encode()).is_none());
+
+        // SAC7 must carry the exact observation row. Neither a supported
+        // canonical payload nor a legacy tag can substitute for that binding.
+        let mut canonical_payload = encoded[..FIXED_ROSTER_CONFIG_BYTES].to_vec();
+        RuntimeContractRow::from_sdk(RuntimePackageContract::canonical())
+            .encode_into(&mut canonical_payload);
+        assert_eq!(canonical_payload.len(), OBSERVATION_CONFIG_BYTES);
+        assert!(SystemAuthorityConfiguration::decode(&canonical_payload).is_none());
+        for tag in [*b"SAC5", *b"SAC6"] {
+            let mut wrong = encoded.clone();
+            wrong[..4].copy_from_slice(&tag);
+            assert!(SystemAuthorityConfiguration::decode(&wrong).is_none());
+        }
+        let mut declared_without_body = fixed_roster_configuration().encode();
+        declared_without_body[..4].copy_from_slice(b"SAC7");
+        assert!(SystemAuthorityConfiguration::decode(&declared_without_body).is_none());
+        for len in 0..encoded.len() {
+            assert!(SystemAuthorityConfiguration::decode(&encoded[..len]).is_none());
+        }
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(SystemAuthorityConfiguration::decode(&trailing).is_none());
+
+        let mut singleton = config;
+        singleton.bootstrap_additional_nodes = None;
+        assert!(!singleton.is_valid());
+        assert!(SystemAuthorityConfiguration::decode(&singleton.encode()).is_none());
+        let mut reordered = config;
+        reordered
+            .bootstrap_additional_nodes
+            .as_mut()
+            .unwrap()
+            .swap(0, 1);
+        assert!(!reordered.is_valid());
+        assert!(SystemAuthorityConfiguration::decode(&reordered.encode()).is_none());
+    }
+
+    #[cfg(not(feature = "experimental-state-blocks"))]
+    #[test]
+    fn sac7_observation_constructor_is_refused_without_explicit_feature() {
+        let mut config = fixed_roster_configuration();
+        config.system_runtime_contract.lifecycle_abi = vos::agent_sdk::SYSTEM_OBSERVATION_ABI_ID.0;
+        assert!(!config.is_valid());
+        let encoded = config.encode();
+        assert_eq!(&encoded[..4], b"SAC7");
+        assert_eq!(encoded.len(), OBSERVATION_CONFIG_BYTES);
+        assert!(SystemAuthorityConfiguration::decode(&encoded).is_none());
+    }
+
     #[test]
     fn sac5_configuration_is_exact_and_clean_generation_bound() {
         let config = configuration();
@@ -10956,9 +11231,8 @@ mod tests {
     }
 
     #[test]
-    fn delegated_projection_dispatch_requires_exact_context_and_original_signature() {
+    fn retired_delegated_query_is_refused_without_mutating_authority() {
         use vos::agent_sdk::authority::AuthorityProjectionRecoveryDelegation;
-
         let mut actor = actor();
         let before = actor.state.clone();
         let node_key = signing(0x31);
@@ -10970,7 +11244,18 @@ mod tests {
             0xd1,
             AuthorityProjectionSelector::Credential,
         );
-        let legacy = query.encode().unwrap();
+        let dispatch = |actor: &mut SystemAuthority, bytes, context| {
+            let mut ctx = Context::new(ServiceId(0));
+            if let Some(context) = context {
+                ctx.__set_agent_invocation_context(context);
+            }
+            block_on(<SystemAuthority as Message<CredentialProjection>>::handle(
+                actor,
+                CredentialProjection { query: bytes },
+                &mut ctx,
+            ))
+        };
+        assert!(!dispatch(&mut actor, query.encode().unwrap(), None).is_empty());
         query.recovery = Some(AuthorityProjectionRecoveryDelegation {
             generation: Hash([0xd2; 32]),
             committee: Hash([0xd3; 32]),
@@ -10985,7 +11270,22 @@ mod tests {
             unreachable!()
         };
         *field = signature;
-        let invocation_context = InvocationContext {
+        assert!(
+            <Ed25519CredentialVerifier as AuthorityCredentialVerifier>::verify(
+                &Ed25519CredentialVerifier,
+                &node_key.verifying_key().to_bytes(),
+                &query.signing_bytes(),
+                &signature,
+            )
+        );
+        assert!(query.encode().is_err());
+        // Construct the exact historical APQ1 body: delegated authentication
+        // tags 2/3, complete signed payload and original valid signature.
+        let mut historical = query.signing_bytes();
+        historical[..4].copy_from_slice(b"APQ1");
+        historical.extend_from_slice(&signature);
+        assert!(AuthorityProjectionQuery::decode(&historical).is_err());
+        let context = InvocationContext {
             invocation: query.expected_invocation(),
             actor: query.authority.binding.issuer.actor,
             mode: MethodMode::Query,
@@ -10999,49 +11299,8 @@ mod tests {
             roles: InvocationRoleClaims::none(),
             observed_slot: OBSERVED_SLOT,
         };
-        let dispatch =
-            |actor: &mut SystemAuthority, bytes: Vec<u8>, context: Option<InvocationContext>| {
-                let mut ctx = Context::new(ServiceId(0));
-                if let Some(context) = context {
-                    ctx.__set_agent_invocation_context(context);
-                }
-                block_on(<SystemAuthority as Message<CredentialProjection>>::handle(
-                    actor,
-                    CredentialProjection { query: bytes },
-                    &mut ctx,
-                ))
-            };
-        // An unchanged legacy read still works against the same method without
-        // the new context requirement; no implicit recovery permission is added.
-        assert!(!dispatch(&mut actor, legacy, None).is_empty());
-        let bytes = query.encode().unwrap();
-        let result = dispatch(&mut actor, bytes.clone(), Some(invocation_context));
-        assert_eq!(
-            AuthorityCredentialProjection::decode(&result)
-                .unwrap()
-                .query,
-            query
-        );
-        assert!(dispatch(&mut actor, bytes.clone(), None).is_empty());
-        for change in 0..4 {
-            let mut context = invocation_context;
-            match change {
-                0 => context.observed_slot += 1,
-                1 => context.origin.transport_node = Some(NodeId([0xd4; 32])),
-                2 => context.invocation = InvocationId([0xd5; 32]),
-                _ => context.mode = MethodMode::Linear,
-            }
-            assert!(dispatch(&mut actor, bytes.clone(), Some(context)).is_empty());
-        }
-        let mut altered = query.clone();
-        altered.recovery.as_mut().unwrap().committee.0[0] ^= 1;
-        // Even a matching altered invocation cannot make the old signature
-        // authorize a different recovery scope.
-        let mut altered_context = invocation_context;
-        altered_context.invocation = altered.expected_invocation();
-        assert!(dispatch(&mut actor, altered.encode().unwrap(), Some(altered_context)).is_empty());
-        altered.recovery = None;
-        assert!(dispatch(&mut actor, altered.encode().unwrap(), None).is_empty());
+        assert!(dispatch(&mut actor, historical.clone(), None).is_empty());
+        assert!(dispatch(&mut actor, historical, Some(context)).is_empty());
         assert_eq!(actor.state, before);
     }
 
@@ -16857,6 +17116,269 @@ mod tests {
     }
 
     #[test]
+    fn signed_genesis_decision_projection_requires_live_exact_query() {
+        let (mut actor, agent, expected) = exercise_signed_genesis_publication(None);
+        let config = actor.configuration;
+        let api_key = signing(0xc2);
+        let api_principal = PrincipalId([0xc3; 32]);
+        assert!(
+            authority_state_is_valid(&config, &actor.state),
+            "post-ACK publication fixture must restore a canonical live state",
+        );
+        let admin_key = signing(0x21);
+        let mut enroll_call = admin_call(
+            config,
+            &admin_key,
+            ADMIN_PRINCIPAL,
+            ADMIN_NODE,
+            0xc4,
+            actor.state.administration_generation,
+            AuthorityAdminOperation::EnrollPrincipal {
+                principal: api_principal,
+                credential: enrollment(&api_key, AuthorityCredentialKind::Api),
+            },
+        );
+        prepare_admin_call(&actor, &mut enroll_call, &admin_key);
+        assert!(authenticated_admin(&actor.state, &enroll_call));
+        assert!(!credential_has_pending_application(
+            &actor.state,
+            enroll_call.credential,
+        ));
+        assert!(admin_invocation_is_available(
+            &actor.state,
+            enroll_call.invocation
+        ));
+        assert!(
+            !dispatch_admin(&mut actor, &enroll_call).is_empty(),
+            "canonical exact API enrollment must succeed after finalized Create",
+        );
+        // Revocation cannot remove a Principal's last active credential. Keep
+        // one independently enrolled replacement so the later negative read
+        // exercises revocation rather than the lockout guard.
+        dispatch_fixture_admin(
+            &mut actor,
+            InvocationId([0xd3; 32]),
+            AuthorityAdminOperation::AddCredential {
+                principal: api_principal,
+                credential: enrollment(&signing(0xd4), AuthorityCredentialKind::Api),
+            },
+        );
+        assert_eq!(active_credential_count(&actor.state, api_principal), 2);
+        let before = actor.state.clone();
+        let dispatch =
+            |actor: &mut SystemAuthority, query: Vec<u8>, context: Option<InvocationContext>| {
+                let mut ctx = Context::new(ServiceId(0));
+                if let Some(context) = context {
+                    ctx.__set_agent_invocation_context(context);
+                }
+                block_on(
+                    <SystemAuthority as Message<GenesisDecisionProjection>>::handle(
+                        actor,
+                        GenesisDecisionProjection { query },
+                        &mut ctx,
+                    ),
+                )
+            };
+        let context_for = |query: &AuthorityProjectionQuery| InvocationContext {
+            invocation: query.expected_invocation(),
+            actor: query.authority.binding.issuer.actor,
+            mode: MethodMode::Query,
+            origin: InvocationOrigin {
+                principal: None,
+                credential: None,
+                transport_node: query.attesting_node(),
+                actor: None,
+                capability: None,
+            },
+            roles: InvocationRoleClaims::none(),
+            observed_slot: OBSERVED_SLOT,
+        };
+        let resign = |query: &mut AuthorityProjectionQuery, key: &SigningKey| {
+            let signature = key.sign(&query.signing_bytes()).to_bytes();
+            match &mut query.authentication {
+                AuthorityIngressAuthentication::ApiCredentialSignature {
+                    signature: field, ..
+                }
+                | AuthorityIngressAuthentication::SshNodeAttestation {
+                    signature: field, ..
+                } => *field = signature,
+            }
+        };
+        for ssh in [false, true] {
+            let signing_key = if ssh { signing(0x31) } else { api_key.clone() };
+            let mut query = if ssh {
+                ssh_projection_query(
+                    config,
+                    &signing(0x21),
+                    ADMIN_NODE,
+                    &signing_key,
+                    0xc5,
+                    AuthorityProjectionSelector::GenesisDecision { agent },
+                )
+            } else {
+                api_projection_query(
+                    config,
+                    &api_key,
+                    0xc5,
+                    AuthorityProjectionSelector::GenesisDecision { agent },
+                )
+            };
+            resign(&mut query, &signing_key);
+            let context = context_for(&query);
+            let encoded = query.encode().unwrap();
+            assert_eq!(
+                dispatch(&mut actor, encoded.clone(), Some(context)),
+                expected
+            );
+            assert_eq!(
+                dispatch(&mut actor, encoded.clone(), Some(context)),
+                expected
+            );
+            assert!(dispatch(&mut actor, encoded.clone(), None).is_empty());
+            for change in 0..3 {
+                let mut changed = context;
+                match change {
+                    0 => changed.invocation = InvocationId([0xc8; 32]),
+                    1 => changed.actor = ActorId([0xc9; 32]),
+                    2 => changed.mode = MethodMode::Linear,
+                    3 => changed.observed_slot = OBSERVED_SLOT - 1,
+                    4 => changed.origin.transport_node = Some(NodeId([0xca; 32])),
+                    _ => changed.origin.principal = Some(api_principal),
+                }
+                assert!(dispatch(&mut actor, encoded.clone(), Some(changed)).is_empty());
+            }
+            for change in 0..4 {
+                let mut altered = query.clone();
+                match change {
+                    0 => {
+                        altered.selector = AuthorityProjectionSelector::GenesisDecision {
+                            agent: AgentId([0xcb; 32]),
+                        };
+                    }
+                    1 => altered.nonce.0[0] ^= 1,
+                    2 => altered.authority.system_agent.0[0] ^= 1,
+                    3 => match &mut altered.authentication {
+                        AuthorityIngressAuthentication::ApiCredentialSignature {
+                            signature,
+                            ..
+                        }
+                        | AuthorityIngressAuthentication::SshNodeAttestation {
+                            signature, ..
+                        } => signature[0] ^= 1,
+                    },
+                    _ => unreachable!(),
+                }
+                // Matching a substituted invocation is not enough: the
+                // original signer authorized the original complete query.
+                assert!(
+                    dispatch(
+                        &mut actor,
+                        altered.encode().unwrap(),
+                        Some(context_for(&altered)),
+                    )
+                    .is_empty()
+                );
+            }
+            query.selector = AuthorityProjectionSelector::Credential;
+            resign(&mut query, &signing_key);
+            assert!(
+                dispatch(
+                    &mut actor,
+                    query.encode().unwrap(),
+                    Some(context_for(&query))
+                )
+                .is_empty()
+            );
+            assert_eq!(actor.state, before);
+        }
+        let unknown_credential = api_projection_query(
+            config,
+            &signing(0xcc),
+            0xcd,
+            AuthorityProjectionSelector::GenesisDecision { agent },
+        );
+        assert!(
+            dispatch(
+                &mut actor,
+                unknown_credential.encode().unwrap(),
+                Some(context_for(&unknown_credential)),
+            )
+            .is_empty()
+        );
+        let mut wrong_target = api_projection_query(
+            config,
+            &api_key,
+            0xd0,
+            AuthorityProjectionSelector::GenesisDecision { agent },
+        );
+        wrong_target.authority.system_agent.0[0] ^= 1;
+        resign(&mut wrong_target, &api_key);
+        assert!(
+            dispatch(
+                &mut actor,
+                wrong_target.encode().unwrap(),
+                Some(context_for(&wrong_target)),
+            )
+            .is_empty()
+        );
+        let unknown_agent = api_projection_query(
+            config,
+            &api_key,
+            0xd1,
+            AuthorityProjectionSelector::GenesisDecision {
+                agent: AgentId([0xd2; 32]),
+            },
+        );
+        assert!(
+            dispatch(
+                &mut actor,
+                unknown_agent.encode().unwrap(),
+                Some(context_for(&unknown_agent)),
+            )
+            .is_empty()
+        );
+        assert_eq!(actor.state, before);
+        let query = api_projection_query(
+            config,
+            &api_key,
+            0xce,
+            AuthorityProjectionSelector::GenesisDecision { agent },
+        );
+        dispatch_fixture_admin(
+            &mut actor,
+            InvocationId([0xcf; 32]),
+            AuthorityAdminOperation::RevokeCredential {
+                principal: api_principal,
+                credential: query.credential,
+            },
+        );
+        let revoked = actor.state.clone();
+        assert!(
+            dispatch(
+                &mut actor,
+                query.encode().unwrap(),
+                Some(context_for(&query))
+            )
+            .is_empty()
+        );
+        assert_eq!(actor.state, revoked);
+        // The old anonymous method and its existing response remain compatible.
+        let mut ctx = Context::new(ServiceId(0));
+        ctx.__set_agent_invocation_context(context_for(&query));
+        assert_eq!(
+            block_on(<SystemAuthority as Message<GenesisDecision>>::handle(
+                &mut actor,
+                GenesisDecision {
+                    agent: agent.0.to_vec()
+                },
+                &mut ctx,
+            )),
+            expected
+        );
+        assert_eq!(actor.state, revoked);
+    }
+
+    #[test]
     fn node_mutation_rows_and_header_survive_restart_and_exact_retry() {
         exercise_node_mutations(None, 1);
     }
@@ -17053,7 +17575,9 @@ mod tests {
         exercise_signed_genesis_publication(Some(std::path::Path::new(&directory)));
     }
 
-    fn exercise_signed_genesis_publication(export: Option<&std::path::Path>) {
+    fn exercise_signed_genesis_publication(
+        export: Option<&std::path::Path>,
+    ) -> (SystemAuthority, AgentId, Vec<u8>) {
         vos::storage::mock::reset();
         use vos::agent::committee::{
             AuthorityCommittee, AuthorityCommitteeMember, AuthorityMemberRole,
@@ -17481,6 +18005,7 @@ mod tests {
             &restarted.state,
             context.invocation,
         ));
+        (after_ack_restart, AgentId(agent.0), expected)
     }
 
     #[test]
@@ -19173,7 +19698,7 @@ mod tests {
     #[test]
     fn generated_agent_schema_marks_authority_methods_as_explicit_linear_public_preflight() {
         let method = SystemAuthorityMsg::AGENT_METHODS;
-        assert_eq!(method.len(), 14);
+        assert_eq!(method.len(), 15);
         assert_eq!(method[0].name, "authorize");
         assert_eq!(method[0].mode, vos::agent_sdk::schema::MethodMode::Linear);
         assert!(method[0].explicit);
@@ -19205,6 +19730,7 @@ mod tests {
             "agent_replica_projection_page",
             "actor_projection_page",
             "genesis_signing_committee",
+            "genesis_decision_projection",
         ]
         .iter()
         .enumerate()
@@ -19216,7 +19742,7 @@ mod tests {
             );
             assert!(method[index + 8].explicit);
         }
-        assert_eq!(SystemAuthorityMsg::AGENT_AUTHORIZATIONS.len(), 14);
+        assert_eq!(SystemAuthorityMsg::AGENT_AUTHORIZATIONS.len(), 15);
         assert!(
             SystemAuthorityMsg::AGENT_AUTHORIZATIONS
                 .iter()

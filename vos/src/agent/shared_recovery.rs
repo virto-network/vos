@@ -1,12 +1,10 @@
-//! Bounded, public recovery custody for a fixed three-voter Shared generation.
+//! Bounded authenticated retention for unfinished System management.
 //!
-//! Registration is not invocation authorization. It records which physical
-//! owner must retain an exact read, including its original clock and artifacts.
-//! Only validated physical replay may attach a result or positive ACK. Quorum
-//! expiry is a distinct committed terminal, never a clock-only release. A slot
-//! survives either terminal until its owner signs the next exact sequence after
-//! durably clearing its local pending record.
-//! Decoding a manifest establishes shape, not checkpoint or execution authority.
+//! Only the exact owner-signed management scope and its physical Invoke/ACK
+//! evidence are retained. Registration grants no execution authorization;
+//! release still requires the original owner's durable terminal and exact
+//! positive evidence. Internal observations never enter this manifest.
+//! Decoding establishes shape, not checkpoint or execution authority.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -16,8 +14,7 @@ use super::genesis::{
     AgentReplicaCommittee, AgentReplicaCommitteeId, MAX_AGENT_REPLICA_COMMITTEE_BYTES,
 };
 use super::journal::{
-    CanonicalJournalRecord, OrderedBase, OrderedEntry, OrderedEntryId, ReplayInput, ReplayInputId,
-    ReplayOperation,
+    CanonicalJournalRecord, OrderedBase, OrderedEntry, ReplayInput, ReplayInputId, ReplayOperation,
 };
 use super::shared_commit::{OrderedCommitClaim, ReplicaCommitSignature};
 use super::shared_raft::AgentGenerationRouteKey;
@@ -25,38 +22,37 @@ use super::{AgentProfile, ReplicaRole};
 use crate::agent_sdk as sdk;
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 use crate::service::{Hash, NodeId};
-use sdk::authority::{AuthorityProjectionQuery, AuthorityProjectionSelector};
 use sdk::wire::CanonicalWire;
 use sdk::{
     InvocationAuthorization, InvocationWork, RuntimeExecutionContext, RuntimeOutcome, RuntimeState,
     RuntimeTransition, RuntimeWork,
 };
 
+#[cfg(feature = "std")]
+pub(crate) mod management;
+#[cfg(feature = "std")]
+pub(crate) use management::{
+    MAX_SHARED_MANAGEMENT_RECOVERY_REGISTRATION_BYTES,
+    MAX_SHARED_MANAGEMENT_RECOVERY_RELEASE_BYTES, SharedManagementRecoveryRegistration,
+    SharedManagementRecoveryRelease, SharedManagementRecoverySlot,
+};
+
+/// Fixed founding-voter and independent management-holder bound.
 pub const MAX_SHARED_RECOVERY_SLOTS: usize = 3;
 pub const MAX_SHARED_RECOVERY_REQUEST_BYTES: usize =
     sdk::MAX_RUNTIME_AVAILABILITY_BYTES + 2 * sdk::MAX_INVOCATION_MESSAGE_BYTES + 16 * 1024;
-pub const MAX_SHARED_RECOVERY_REGISTRATION_BYTES: usize = MAX_SHARED_RECOVERY_REQUEST_BYTES + 256;
 pub const MAX_SHARED_RECOVERY_OUTCOME_BYTES: usize = sdk::MAX_INVOCATION_REPLY_BYTES + 2048;
-pub const MAX_SHARED_RECOVERY_EXPIRY_CLAIM_BYTES: usize = MAX_AGENT_REPLICA_COMMITTEE_BYTES + 1024;
-pub const MAX_SHARED_RECOVERY_EXPIRY_CERTIFICATE_BYTES: usize =
-    MAX_SHARED_RECOVERY_EXPIRY_CLAIM_BYTES
-        + 3 * super::shared_commit::MAX_REPLICA_COMMIT_SIGNATURE_BYTES
-        + 128;
-pub const MAX_SHARED_RECOVERY_EXPIRY_TERMINAL_BYTES: usize =
-    MAX_SHARED_RECOVERY_EXPIRY_CERTIFICATE_BYTES + 128;
 pub const MAX_SHARED_RECOVERY_OBSERVATION_BYTES: usize = sdk::MAX_RUNTIME_AVAILABILITY_BYTES
     + sdk::MAX_INVOCATION_MESSAGE_BYTES
     + MAX_SHARED_RECOVERY_OUTCOME_BYTES
     + super::shared_commit::MAX_ORDERED_COMMIT_CLAIM_BYTES
     + 32 * 1024;
-pub const MAX_SHARED_RECOVERY_SLOT_BYTES: usize = MAX_SHARED_RECOVERY_REGISTRATION_BYTES
-    + 2 * MAX_SHARED_RECOVERY_OBSERVATION_BYTES
-    + MAX_SHARED_RECOVERY_EXPIRY_TERMINAL_BYTES
-    + 256;
-pub const MAX_SHARED_RECOVERY_MANIFEST_BYTES: usize = MAX_SHARED_RECOVERY_SLOTS
-    * MAX_SHARED_RECOVERY_SLOT_BYTES
-    + MAX_AGENT_REPLICA_COMMITTEE_BYTES
-    + 1024;
+#[cfg(not(feature = "std"))]
+pub const MAX_SHARED_RECOVERY_MANIFEST_BYTES: usize = MAX_AGENT_REPLICA_COMMITTEE_BYTES + 1024;
+#[cfg(feature = "std")]
+pub const MAX_SHARED_RECOVERY_MANIFEST_BYTES: usize = MAX_AGENT_REPLICA_COMMITTEE_BYTES
+    + 1024
+    + MAX_SHARED_RECOVERY_SLOTS * management::MAX_SHARED_MANAGEMENT_RECOVERY_SLOT_BYTES;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SharedRecoveryError {
@@ -76,542 +72,6 @@ impl fmt::Display for SharedRecoveryError {
     }
 }
 impl core::error::Error for SharedRecoveryError {}
-
-/// Unsigned custody message. A signer must additionally prove its own durable
-/// pending-record clear before signing a replacement; this type cannot do so.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SharedRecoveryRegistrationRequest {
-    generation: AgentGenerationRouteKey,
-    committee: AgentReplicaCommitteeId,
-    owner: NodeId,
-    sequence: u64,
-    previous: Option<Hash>,
-    query: AuthorityProjectionQuery,
-    envelope: RuntimeWork,
-}
-
-impl SharedRecoveryRegistrationRequest {
-    pub fn new(
-        generation: AgentGenerationRouteKey,
-        committee: AgentReplicaCommitteeId,
-        owner: NodeId,
-        sequence: u64,
-        previous: Option<Hash>,
-        query: AuthorityProjectionQuery,
-        work: InvocationWork,
-        authorization: InvocationAuthorization,
-    ) -> Result<Self, SharedRecoveryError> {
-        let InvocationAuthorization::PublicPreflight(preflight) = &authorization else {
-            return Err(SharedRecoveryError::InvalidEnvelope);
-        };
-        let envelope = RuntimeWork::Invoke {
-            context: RuntimeExecutionContext::Direct,
-            state: RuntimeState::default(),
-            observed_slot: preflight.observed_slot,
-            invocation: Box::new(work),
-            authorization: Box::new(authorization),
-        };
-        let value = Self {
-            generation,
-            committee,
-            owner,
-            sequence,
-            previous,
-            query,
-            envelope,
-        };
-        value.validate()?;
-        Ok(value)
-    }
-
-    pub const fn generation(&self) -> AgentGenerationRouteKey {
-        self.generation
-    }
-    pub const fn committee(&self) -> AgentReplicaCommitteeId {
-        self.committee
-    }
-    pub const fn owner(&self) -> NodeId {
-        self.owner
-    }
-    pub const fn sequence(&self) -> u64 {
-        self.sequence
-    }
-    pub const fn previous(&self) -> Option<Hash> {
-        self.previous
-    }
-    pub const fn query(&self) -> &AuthorityProjectionQuery {
-        &self.query
-    }
-    pub const fn envelope(&self) -> &RuntimeWork {
-        &self.envelope
-    }
-    /// Exact read identity independent of the physical holder and its sequence.
-    pub fn request_commitment(&self) -> Hash {
-        Hash::digest(
-            b"vos/agent/shared/recovery-request/v1",
-            &[
-                &self.query.encode().expect("private canonical query"),
-                &self.envelope.encode().expect("private canonical envelope"),
-            ],
-        )
-    }
-    pub fn work(&self) -> &InvocationWork {
-        match &self.envelope {
-            RuntimeWork::Invoke { invocation, .. } => invocation,
-            _ => unreachable!("private validated envelope"),
-        }
-    }
-    pub fn authorization(&self) -> &InvocationAuthorization {
-        match &self.envelope {
-            RuntimeWork::Invoke { authorization, .. } => authorization,
-            _ => unreachable!("private validated envelope"),
-        }
-    }
-    pub fn signing_message(&self) -> Hash {
-        Hash::digest(
-            b"vos/agent/shared/recovery-registration-signature/v1",
-            &[&self.encode()],
-        )
-    }
-    pub fn validate(&self) -> Result<(), SharedRecoveryError> {
-        let RuntimeWork::Invoke {
-            context,
-            state,
-            invocation,
-            authorization,
-            observed_slot,
-        } = &self.envelope
-        else {
-            return Err(SharedRecoveryError::InvalidEnvelope);
-        };
-        let InvocationAuthorization::PublicPreflight(preflight) = authorization.as_ref() else {
-            return Err(SharedRecoveryError::InvalidEnvelope);
-        };
-        if self.generation.validate().is_err()
-            || self.committee.as_bytes() == &[0; 32]
-            || self.owner == NodeId::ZERO
-            || self.sequence == 0
-            || (self.sequence == 1) != self.previous.is_none()
-            || self.previous == Some(Hash::ZERO)
-            || *context != RuntimeExecutionContext::Direct
-            || !state.is_empty()
-            || *observed_slot != preflight.observed_slot
-            || invocation.space.0 != self.generation.space().0
-            || invocation.agent.0 != self.generation.agent().0
-            || self.query.recovery.is_none()
-            || !projection_query_matches_work(&self.query, invocation, authorization)
-            || self.query.recovery.is_some_and(|scope| {
-                scope.generation.0 != self.generation.replication_id()
-                    || scope.committee.0 != *self.committee.as_bytes()
-            })
-        {
-            return Err(SharedRecoveryError::InvalidEnvelope);
-        }
-        self.envelope
-            .encode()
-            .map_err(|_| SharedRecoveryError::InvalidEnvelope)?;
-        bound(self, MAX_SHARED_RECOVERY_REQUEST_BYTES)
-    }
-}
-
-impl ServiceWire for SharedRecoveryRegistrationRequest {
-    const MAGIC: [u8; 4] = *b"RRG1";
-    fn encode_body(&self, output: &mut Vec<u8>) {
-        let mut e = Encoder(output);
-        e.bytes(&self.generation.encode());
-        e.fixed(self.committee.as_bytes());
-        e.fixed(&self.owner.0);
-        e.u64(self.sequence);
-        e.option(&self.previous, |e, value| e.fixed(&value.0));
-        e.bytes(&self.query.encode().expect("private canonical query"));
-        e.bytes(&self.envelope.encode().expect("private canonical envelope"));
-    }
-    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        decode_bound(d, MAX_SHARED_RECOVERY_REQUEST_BYTES)?;
-        let value = Self {
-            generation: nested(d, super::shared_raft::MAX_AGENT_GENERATION_ROUTE_KEY_BYTES)?,
-            committee: AgentReplicaCommitteeId::from_bytes(d.fixed()?),
-            owner: NodeId(d.fixed()?),
-            sequence: d.u64()?,
-            previous: d.option(|d| d.fixed().map(Hash))?,
-            query: sdk_nested(d, sdk::wire::MAX_AUTHORITY_PROJECTION_QUERY_WIRE_BYTES)?,
-            envelope: sdk_nested(d, MAX_SHARED_RECOVERY_REQUEST_BYTES)?,
-        };
-        value.validate().map_err(decode_error)?;
-        Ok(value)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SharedRecoveryRegistration {
-    request: SharedRecoveryRegistrationRequest,
-    signature: ReplicaCommitSignature,
-}
-
-impl SharedRecoveryRegistration {
-    pub fn new(
-        request: SharedRecoveryRegistrationRequest,
-        signature: ReplicaCommitSignature,
-    ) -> Result<Self, SharedRecoveryError> {
-        let value = Self { request, signature };
-        value.validate()?;
-        Ok(value)
-    }
-    pub const fn request(&self) -> &SharedRecoveryRegistrationRequest {
-        &self.request
-    }
-    pub const fn generation(&self) -> AgentGenerationRouteKey {
-        self.request.generation()
-    }
-    pub const fn committee(&self) -> AgentReplicaCommitteeId {
-        self.request.committee()
-    }
-    pub const fn owner(&self) -> NodeId {
-        self.request.owner()
-    }
-    pub const fn sequence(&self) -> u64 {
-        self.request.sequence()
-    }
-    pub const fn previous(&self) -> Option<Hash> {
-        self.request.previous()
-    }
-    pub const fn query(&self) -> &AuthorityProjectionQuery {
-        self.request.query()
-    }
-    pub fn work(&self) -> &InvocationWork {
-        self.request.work()
-    }
-    pub fn authorization(&self) -> &InvocationAuthorization {
-        self.request.authorization()
-    }
-    pub const fn signature(&self) -> &ReplicaCommitSignature {
-        &self.signature
-    }
-    pub fn signing_message(&self) -> Hash {
-        self.request.signing_message()
-    }
-    pub fn commitment(&self) -> Hash {
-        Hash::digest(
-            b"vos/agent/shared/recovery-registration/v1",
-            &[&self.encode()],
-        )
-    }
-    pub fn validate(&self) -> Result<(), SharedRecoveryError> {
-        self.request.validate()?;
-        if self.signature.validate().is_err() || self.signature.signer() != self.owner() {
-            return Err(SharedRecoveryError::InvalidSignature);
-        }
-        bound(self, MAX_SHARED_RECOVERY_REGISTRATION_BYTES)
-    }
-    /// Verify custody only. The existing signed-query admission path still
-    /// owns credential/enrollment, fresh time, and invocation authorization.
-    pub fn verify(
-        &self,
-        generation: AgentGenerationRouteKey,
-        committee: &AgentReplicaCommittee,
-    ) -> Result<(), SharedRecoveryError> {
-        self.validate()?;
-        validate_scope(generation, committee)?;
-        if self.generation() != generation || self.committee() != committee.id() {
-            return Err(SharedRecoveryError::ScopeMismatch);
-        }
-        let member = committee
-            .member_by_node(self.owner())
-            .ok_or(SharedRecoveryError::ScopeMismatch)?;
-        if member.replica().role != ReplicaRole::Voter
-            || !verify_signature(
-                member.ed25519_public_key(),
-                &self.signing_message().0,
-                self.signature.signature(),
-            )
-        {
-            return Err(SharedRecoveryError::InvalidSignature);
-        }
-        Ok(())
-    }
-}
-
-impl ServiceWire for SharedRecoveryRegistration {
-    const MAGIC: [u8; 4] = *b"RRS1";
-    fn encode_body(&self, output: &mut Vec<u8>) {
-        let mut e = Encoder(output);
-        e.bytes(&self.request.encode());
-        e.bytes(&self.signature.encode());
-    }
-    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        decode_bound(d, MAX_SHARED_RECOVERY_REGISTRATION_BYTES)?;
-        Self::new(
-            nested(d, MAX_SHARED_RECOVERY_REQUEST_BYTES)?,
-            nested(d, super::shared_commit::MAX_REPLICA_COMMIT_SIGNATURE_BYTES)?,
-        )
-        .map_err(decode_error)
-    }
-}
-
-/// A vote that an exact registered read expired before any committed Invoke.
-///
-/// Shape is not authority: each signer must freshly authenticate this complete
-/// applied prefix, current manifest, absence of an Invoke, and its trusted clock.
-/// Replay checks these recorded facts and signatures, never reopening time.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SharedRecoveryExpiryClaim {
-    generation: AgentGenerationRouteKey,
-    committee: AgentReplicaCommittee,
-    request: Hash,
-    manifest: Hash,
-    prefix_index: u64,
-    prefix_term: u64,
-    ordered: OrderedBase,
-    expires_at: u64,
-    observed_slot: u64,
-}
-
-impl SharedRecoveryExpiryClaim {
-    pub const fn generation(&self) -> AgentGenerationRouteKey {
-        self.generation
-    }
-    pub const fn committee(&self) -> &AgentReplicaCommittee {
-        &self.committee
-    }
-    pub const fn request(&self) -> Hash {
-        self.request
-    }
-    pub const fn manifest(&self) -> Hash {
-        self.manifest
-    }
-    pub const fn prefix_index(&self) -> u64 {
-        self.prefix_index
-    }
-    pub const fn prefix_term(&self) -> u64 {
-        self.prefix_term
-    }
-    pub const fn ordered(&self) -> OrderedBase {
-        self.ordered
-    }
-    pub const fn expires_at(&self) -> u64 {
-        self.expires_at
-    }
-    pub const fn observed_slot(&self) -> u64 {
-        self.observed_slot
-    }
-    pub fn commitment(&self) -> Hash {
-        Hash::digest(
-            b"vos/agent/shared/recovery-expiry-claim/v1",
-            &[&self.encode()],
-        )
-    }
-    pub fn signing_message(&self) -> Hash {
-        Hash::digest(
-            b"vos/agent/shared/recovery-expiry-signature/v1",
-            &[self.committee.id().as_bytes(), &self.commitment().0],
-        )
-    }
-    pub fn validate(&self) -> Result<(), SharedRecoveryError> {
-        validate_scope(self.generation, &self.committee)?;
-        if self.request == Hash::ZERO
-            || self.manifest == Hash::ZERO
-            || self.prefix_index == 0
-            || self.prefix_index == u64::MAX
-            || self.prefix_term == 0
-            || self.ordered.validate().is_err()
-            || self.ordered.index > self.prefix_index
-            || self.expires_at == 0
-            || self.observed_slot < self.expires_at
-        {
-            return Err(SharedRecoveryError::InvalidEnvelope);
-        }
-        bound(self, MAX_SHARED_RECOVERY_EXPIRY_CLAIM_BYTES)
-    }
-}
-
-impl ServiceWire for SharedRecoveryExpiryClaim {
-    const MAGIC: [u8; 4] = *b"REX1";
-    fn encode_body(&self, output: &mut Vec<u8>) {
-        let mut e = Encoder(output);
-        e.bytes(&self.generation.encode());
-        e.bytes(&self.committee.encode());
-        e.fixed(&self.request.0);
-        e.fixed(&self.manifest.0);
-        e.u64(self.prefix_index);
-        e.u64(self.prefix_term);
-        e.u64(self.ordered.index);
-        e.option(&self.ordered.head, |e, head| e.fixed(head.as_bytes()));
-        e.u64(self.expires_at);
-        e.u64(self.observed_slot);
-    }
-    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        decode_bound(d, MAX_SHARED_RECOVERY_EXPIRY_CLAIM_BYTES)?;
-        let value = Self {
-            generation: nested(d, super::shared_raft::MAX_AGENT_GENERATION_ROUTE_KEY_BYTES)?,
-            committee: nested(d, MAX_AGENT_REPLICA_COMMITTEE_BYTES)?,
-            request: Hash(d.fixed()?),
-            manifest: Hash(d.fixed()?),
-            prefix_index: d.u64()?,
-            prefix_term: d.u64()?,
-            ordered: OrderedBase {
-                index: d.u64()?,
-                head: d.option(|d| Ok(OrderedEntryId::new(d.fixed()?)))?,
-            },
-            expires_at: d.u64()?,
-            observed_slot: d.u64()?,
-        };
-        value.validate().map_err(decode_error)?;
-        Ok(value)
-    }
-}
-
-/// Fixed-three authenticated-CFT majority evidence, not an execution/ACK result.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SharedRecoveryExpiryCertificate {
-    claim: SharedRecoveryExpiryClaim,
-    signatures: Vec<ReplicaCommitSignature>,
-}
-
-impl SharedRecoveryExpiryCertificate {
-    pub fn new(
-        claim: SharedRecoveryExpiryClaim,
-        signatures: Vec<ReplicaCommitSignature>,
-    ) -> Result<Self, SharedRecoveryError> {
-        let value = Self { claim, signatures };
-        value.validate()?;
-        Ok(value)
-    }
-    pub const fn claim(&self) -> &SharedRecoveryExpiryClaim {
-        &self.claim
-    }
-    pub fn signatures(&self) -> &[ReplicaCommitSignature] {
-        &self.signatures
-    }
-    pub fn commitment(&self) -> Hash {
-        Hash::digest(
-            b"vos/agent/shared/recovery-expiry-certificate/v1",
-            &[&self.encode()],
-        )
-    }
-    pub fn validate(&self) -> Result<(), SharedRecoveryError> {
-        self.claim.validate()?;
-        if !(2..=3).contains(&self.signatures.len())
-            || self
-                .signatures
-                .windows(2)
-                .any(|pair| pair[0].signer() >= pair[1].signer())
-            || self
-                .signatures
-                .iter()
-                .any(|signature| signature.validate().is_err())
-        {
-            return Err(SharedRecoveryError::InvalidSignature);
-        }
-        bound(self, MAX_SHARED_RECOVERY_EXPIRY_CERTIFICATE_BYTES)
-    }
-    pub fn verify(
-        &self,
-        generation: AgentGenerationRouteKey,
-        committee: &AgentReplicaCommittee,
-        expected: &SharedRecoveryExpiryClaim,
-    ) -> Result<(), SharedRecoveryError> {
-        self.validate()?;
-        if self.claim.generation != generation
-            || &self.claim.committee != committee
-            || &self.claim != expected
-        {
-            return Err(SharedRecoveryError::ScopeMismatch);
-        }
-        let message = self.claim.signing_message();
-        for signature in &self.signatures {
-            let member = committee
-                .member_by_node(signature.signer())
-                .ok_or(SharedRecoveryError::InvalidSignature)?;
-            if member.replica().role != ReplicaRole::Voter
-                || !verify_signature(
-                    member.ed25519_public_key(),
-                    &message.0,
-                    signature.signature(),
-                )
-            {
-                return Err(SharedRecoveryError::InvalidSignature);
-            }
-        }
-        Ok(())
-    }
-}
-
-impl ServiceWire for SharedRecoveryExpiryCertificate {
-    const MAGIC: [u8; 4] = *b"REQ1";
-    fn encode_body(&self, output: &mut Vec<u8>) {
-        let mut e = Encoder(output);
-        e.bytes(&self.claim.encode());
-        e.u8(self.signatures.len() as u8);
-        for signature in &self.signatures {
-            e.bytes(&signature.encode());
-        }
-    }
-    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        decode_bound(d, MAX_SHARED_RECOVERY_EXPIRY_CERTIFICATE_BYTES)?;
-        let claim = nested(d, MAX_SHARED_RECOVERY_EXPIRY_CLAIM_BYTES)?;
-        let count = d.u8()? as usize;
-        if !(2..=3).contains(&count) {
-            return Err(DecodeError::LimitExceeded);
-        }
-        let mut signatures = Vec::with_capacity(count);
-        for _ in 0..count {
-            signatures.push(nested(
-                d,
-                super::shared_commit::MAX_REPLICA_COMMIT_SIGNATURE_BYTES,
-            )?);
-        }
-        Self::new(claim, signatures).map_err(decode_error)
-    }
-}
-
-/// Applied expiry fence. It says no committed Invoke/published effect, not
-/// that read-only preflight never executed. No guest outcome is synthesized.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SharedRecoveryExpiryTerminal {
-    certificate: SharedRecoveryExpiryCertificate,
-    raft_index: u64,
-    raft_term: u64,
-}
-impl SharedRecoveryExpiryTerminal {
-    pub const fn certificate(&self) -> &SharedRecoveryExpiryCertificate {
-        &self.certificate
-    }
-    pub const fn raft_index(&self) -> u64 {
-        self.raft_index
-    }
-    pub const fn raft_term(&self) -> u64 {
-        self.raft_term
-    }
-    fn validate(&self) -> Result<(), SharedRecoveryError> {
-        self.certificate.validate()?;
-        let claim = self.certificate.claim();
-        if claim.prefix_index.checked_add(1) != Some(self.raft_index)
-            || self.raft_term < claim.prefix_term
-        {
-            return Err(SharedRecoveryError::InvalidObservation);
-        }
-        bound(self, MAX_SHARED_RECOVERY_EXPIRY_TERMINAL_BYTES)
-    }
-}
-impl ServiceWire for SharedRecoveryExpiryTerminal {
-    const MAGIC: [u8; 4] = *b"RET1";
-    fn encode_body(&self, output: &mut Vec<u8>) {
-        let mut e = Encoder(output);
-        e.bytes(&self.certificate.encode());
-        e.u64(self.raft_index);
-        e.u64(self.raft_term);
-    }
-    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        decode_bound(d, MAX_SHARED_RECOVERY_EXPIRY_TERMINAL_BYTES)?;
-        let value = Self {
-            certificate: nested(d, MAX_SHARED_RECOVERY_EXPIRY_CERTIFICATE_BYTES)?,
-            raft_index: d.u64()?,
-            raft_term: d.u64()?,
-        };
-        value.validate().map_err(decode_error)?;
-        Ok(value)
-    }
-}
 
 /// Canonical public evidence, never by itself permission to update a manifest.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -644,7 +104,7 @@ impl SharedRecoveryObservation {
         &self.input
     }
     pub fn input_id(&self) -> ReplayInputId {
-        self.input.id()
+        self.input.retained_recovery_id()
     }
     pub const fn outcome(&self) -> &RuntimeOutcome {
         &self.outcome
@@ -702,7 +162,10 @@ impl SharedRecoveryObservation {
                 let InvocationAuthorization::PublicPreflight(preflight) = authorization else {
                     return Err(SharedRecoveryError::InvalidObservation);
                 };
-                if work.mode != sdk::MethodMode::Query
+                // Public Query and retained management Linear evidence use the
+                // same exact signed preflight binding. Recording evidence
+                // grants no authorization to execute or recover a mutation.
+                if !matches!(work.mode, sdk::MethodMode::Query | sdk::MethodMode::Linear)
                     || !authorization.matches_work(work)
                     || *observed_slot != preflight.observed_slot
                     || result.as_ref().is_ok_and(|reply| {
@@ -726,7 +189,7 @@ impl SharedRecoveryObservation {
                 },
                 RuntimeOutcome::Acknowledged(Ok(ack)),
             ) => {
-                if work.mode != sdk::MethodMode::Query
+                if !matches!(work.mode, sdk::MethodMode::Query | sdk::MethodMode::Linear)
                     || !matches!(authorization, InvocationAuthorization::PublicPreflight(_))
                     || ack.invocation != work.invocation
                     || ack.actor != work.actor
@@ -750,27 +213,6 @@ impl SharedRecoveryObservation {
         }
         bound(self, MAX_SHARED_RECOVERY_OBSERVATION_BYTES)
     }
-    fn matches(&self, request: &SharedRecoveryRegistrationRequest) -> bool {
-        if self.generation != request.generation() {
-            return false;
-        }
-        match &self.input.operation {
-            ReplayOperation::CleanInvoke {
-                work,
-                authorization,
-                ..
-            } => work == request.work() && authorization == request.authorization(),
-            ReplayOperation::CleanAcknowledge {
-                work,
-                authorization,
-                ..
-            } => {
-                work == &sdk::InvocationRetirement::from_work(request.work())
-                    && authorization == request.authorization()
-            }
-            _ => false,
-        }
-    }
 }
 
 impl ServiceWire for SharedRecoveryObservation {
@@ -781,7 +223,7 @@ impl ServiceWire for SharedRecoveryObservation {
         e.u64(self.raft_index);
         e.u64(self.raft_term);
         e.bytes(&self.claim.encode());
-        e.bytes(&self.input.encode());
+        e.bytes(&self.input.encode_retained_recovery());
         e.bytes(&outcome_bytes(&self.outcome).expect("private bounded outcome"));
     }
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -823,10 +265,25 @@ impl VerifiedSharedRecoveryObservation {
     /// replay before serving or certifying that manifest. Certified baseline
     /// records instead require their exact common-QC manifest commitment.
     /// Merely decoding a record is never sufficient to call this constructor.
+    #[cfg(test)]
     pub(crate) fn from_audited_record(
         observation: SharedRecoveryObservation,
     ) -> Result<Self, SharedRecoveryError> {
         observation.validate()?;
+        Ok(Self(observation))
+    }
+    /// Same provisional physical-audit capability, with the exact slot/input
+    /// binding checked in this constructor. No validation survives mutation
+    /// or a later storage observation; the driver replay requirement above
+    /// remains unchanged.
+    pub(super) fn from_bound_audited_record(
+        observation: SharedRecoveryObservation,
+        index: u64,
+        term: u64,
+        claim: Hash,
+        input: &ReplayInput,
+    ) -> Result<Self, SharedRecoveryError> {
+        observation.validate_binding(index, term, claim, input)?;
         Ok(Self(observation))
     }
     pub(crate) fn from_published(
@@ -885,164 +342,15 @@ impl VerifiedSharedRecoveryObservation {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SharedRecoverySlot {
-    registration: SharedRecoveryRegistration,
-    raft_index: u64,
-    raft_term: u64,
-    invoke: Option<SharedRecoveryObservation>,
-    acknowledgement: Option<SharedRecoveryObservation>,
-    expiry: Option<SharedRecoveryExpiryTerminal>,
-}
-
-impl SharedRecoverySlot {
-    pub const fn registration(&self) -> &SharedRecoveryRegistration {
-        &self.registration
-    }
-    pub const fn owner(&self) -> NodeId {
-        self.registration.owner()
-    }
-    pub const fn sequence(&self) -> u64 {
-        self.registration.sequence()
-    }
-    pub const fn raft_index(&self) -> u64 {
-        self.raft_index
-    }
-    pub const fn raft_term(&self) -> u64 {
-        self.raft_term
-    }
-    pub const fn invoke(&self) -> Option<&SharedRecoveryObservation> {
-        self.invoke.as_ref()
-    }
-    pub const fn acknowledgement(&self) -> Option<&SharedRecoveryObservation> {
-        self.acknowledgement.as_ref()
-    }
-    pub fn is_acknowledged(&self) -> bool {
-        self.acknowledgement.is_some()
-    }
-    pub const fn expiry(&self) -> Option<&SharedRecoveryExpiryTerminal> {
-        self.expiry.as_ref()
-    }
-    pub fn is_terminal(&self) -> bool {
-        self.is_acknowledged() || self.expiry.is_some()
-    }
-    pub fn completed(&self) -> bool {
-        self.is_acknowledged()
-    }
-    pub fn commitment(&self) -> Hash {
-        Hash::digest(
-            if self.expiry.is_some() {
-                b"vos/agent/shared/recovery-slot/v2"
-            } else {
-                b"vos/agent/shared/recovery-slot/v1"
-            },
-            &[&self.encode()],
-        )
-    }
-    fn validate(&self) -> Result<(), SharedRecoveryError> {
-        self.registration.validate()?;
-        if self.raft_index == 0 || self.raft_term == 0 {
-            return Err(SharedRecoveryError::InvalidEnvelope);
-        }
-        if let Some(terminal) = &self.expiry {
-            terminal.validate()?;
-            let claim = terminal.certificate.claim();
-            if self.invoke.is_some()
-                || self.acknowledgement.is_some()
-                || claim.generation() != self.registration.generation()
-                || claim.committee().id() != self.registration.committee()
-                || claim.request() != self.registration.request().request_commitment()
-                || self
-                    .registration
-                    .query()
-                    .recovery
-                    .is_none_or(|scope| scope.expires_at != claim.expires_at())
-            {
-                return Err(SharedRecoveryError::InvalidObservation);
-            }
-        }
-        for evidence in [&self.invoke, &self.acknowledgement].into_iter().flatten() {
-            evidence.validate()?;
-            if !evidence.matches(self.registration.request())
-                || evidence.claim.committee() != self.registration.committee()
-            {
-                return Err(SharedRecoveryError::InvalidObservation);
-            }
-        }
-        if self
-            .invoke
-            .as_ref()
-            .is_some_and(SharedRecoveryObservation::is_acknowledgement)
-            || self.acknowledgement.as_ref().is_some_and(|ack| {
-                !ack.is_acknowledgement()
-                    || self.invoke.as_ref().is_none_or(|invoke| {
-                        invoke.raft_index >= ack.raft_index || invoke.raft_term > ack.raft_term
-                    })
-            })
-        {
-            return Err(SharedRecoveryError::InvalidObservation);
-        }
-        bound(self, MAX_SHARED_RECOVERY_SLOT_BYTES)
-    }
-}
-
-impl ServiceWire for SharedRecoverySlot {
-    const MAGIC: [u8; 4] = *b"RSL1";
-    fn encode(&self) -> Vec<u8> {
-        encode_expiry_version(self, self.expiry.is_some(), *b"RSL2")
-    }
-    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        let (mut d, expiry) =
-            decode_expiry_version(bytes, Self::MAGIC, *b"RSL2", MAX_SHARED_RECOVERY_SLOT_BYTES)?;
-        let value = Self::decode_body(&mut d)?;
-        if !d.exhausted() || value.expiry.is_some() != expiry {
-            return Err(DecodeError::NonCanonical);
-        }
-        Ok(value)
-    }
-    fn encode_body(&self, output: &mut Vec<u8>) {
-        let mut e = Encoder(output);
-        e.bytes(&self.registration.encode());
-        e.u64(self.raft_index);
-        e.u64(self.raft_term);
-        e.option(&self.invoke, |e, value| e.bytes(&value.encode()));
-        e.option(&self.acknowledgement, |e, value| e.bytes(&value.encode()));
-        if let Some(expiry) = &self.expiry {
-            e.bytes(&expiry.encode());
-        }
-    }
-    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        decode_bound(d, MAX_SHARED_RECOVERY_SLOT_BYTES)?;
-        let value = Self {
-            registration: nested(d, MAX_SHARED_RECOVERY_REGISTRATION_BYTES)?,
-            raft_index: d.u64()?,
-            raft_term: d.u64()?,
-            invoke: d.option(|d| nested(d, MAX_SHARED_RECOVERY_OBSERVATION_BYTES))?,
-            acknowledgement: d.option(|d| nested(d, MAX_SHARED_RECOVERY_OBSERVATION_BYTES))?,
-            expiry: if d.exhausted() {
-                None
-            } else {
-                Some(nested(d, MAX_SHARED_RECOVERY_EXPIRY_TERMINAL_BYTES)?)
-            },
-        };
-        value.validate().map_err(decode_error)?;
-        Ok(value)
-    }
-}
-
-/// At most one monotonically numbered slot for each independently admitted
-/// voter. Completed slots are retained watermarks, never silently discarded.
+/// At most one monotonically numbered management scope per admitted voter.
+/// Released scopes retain their signed watermarks; observations have no slots.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SharedRecoveryManifest {
     generation: AgentGenerationRouteKey,
     committee: AgentReplicaCommittee,
-    slots: Vec<SharedRecoverySlot>,
-    // Quorum-certified time lower bound, never discarded by owner replacement.
-    // It prevents a backwards local clock from resurrecting an old signed read
-    // after the last exact terminal capsule has been retired.
-    expiry_floor: u64,
+    #[cfg(feature = "std")]
+    management: Vec<SharedManagementRecoverySlot>,
 }
-
 impl SharedRecoveryManifest {
     pub fn new(
         generation: AgentGenerationRouteKey,
@@ -1052,8 +360,8 @@ impl SharedRecoveryManifest {
         Ok(Self {
             generation,
             committee,
-            slots: Vec::new(),
-            expiry_floor: 0,
+            #[cfg(feature = "std")]
+            management: Vec::new(),
         })
     }
     pub const fn generation(&self) -> AgentGenerationRouteKey {
@@ -1062,321 +370,174 @@ impl SharedRecoveryManifest {
     pub const fn committee(&self) -> &AgentReplicaCommittee {
         &self.committee
     }
-    pub fn slots(&self) -> &[SharedRecoverySlot] {
-        &self.slots
-    }
     pub fn is_empty(&self) -> bool {
-        self.slots.is_empty()
+        #[cfg(feature = "std")]
+        {
+            self.management.is_empty()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            true
+        }
     }
-    pub const fn expiry_floor(&self) -> u64 {
-        self.expiry_floor
+    #[cfg(feature = "std")]
+    pub(crate) fn management_slots(&self) -> &[SharedManagementRecoverySlot] {
+        &self.management
     }
-    pub fn slot(&self, owner: NodeId) -> Option<&SharedRecoverySlot> {
-        self.slots
-            .binary_search_by_key(&owner, SharedRecoverySlot::owner)
+    #[cfg(feature = "std")]
+    pub(crate) fn management_slot(&self, owner: NodeId) -> Option<&SharedManagementRecoverySlot> {
+        self.management
+            .binary_search_by_key(&owner, SharedManagementRecoverySlot::owner)
             .ok()
-            .map(|index| &self.slots[index])
+            .map(|index| &self.management[index])
+    }
+    #[cfg(feature = "std")]
+    pub(crate) fn management_origin_for_root(
+        &self,
+        owner: NodeId,
+        root: &management::SharedManagementRecoveryMember,
+    ) -> Result<NodeId, SharedRecoveryError> {
+        self.validate()?;
+        root.validate_scope(self.generation)?;
+        management::management_origin_for_root(&self.management, owner, root)
+    }
+    #[cfg(feature = "std")]
+    pub(crate) fn has_pending_management(&self) -> bool {
+        self.management.iter().any(|slot| !slot.is_released())
+    }
+    #[cfg(feature = "std")]
+    pub(crate) fn apply_management_registration(
+        &mut self,
+        registration: &SharedManagementRecoveryRegistration,
+        index: u64,
+        term: u64,
+    ) -> Result<bool, SharedRecoveryError> {
+        self.validate_management_registration_request(registration.request())?;
+        let mut candidate = self.clone();
+        let changed = management::apply_management_registration(
+            &mut candidate.management,
+            self.generation,
+            &self.committee,
+            registration,
+            index,
+            term,
+        )?;
+        if changed {
+            let previous = self.last_position();
+            if index <= previous.0 || term < previous.1 {
+                return Err(SharedRecoveryError::InvalidObservation);
+            }
+            candidate.validate_at(index)?;
+            *self = candidate;
+        }
+        Ok(changed)
+    }
+    #[cfg(feature = "std")]
+    pub(crate) fn apply_management_release(
+        &mut self,
+        release: &SharedManagementRecoveryRelease,
+        index: u64,
+        term: u64,
+    ) -> Result<bool, SharedRecoveryError> {
+        let mut candidate = self.clone();
+        let changed = management::apply_management_release(
+            &mut candidate.management,
+            self.generation,
+            &self.committee,
+            release,
+            index,
+            term,
+        )?;
+        if changed {
+            let previous = self.last_position();
+            if index <= previous.0 || term < previous.1 {
+                return Err(SharedRecoveryError::InvalidObservation);
+            }
+            candidate.validate_at(index)?;
+            *self = candidate;
+        }
+        Ok(changed)
+    }
+
+    pub(crate) fn observations(&self) -> Vec<&SharedRecoveryObservation> {
+        #[cfg(feature = "std")]
+        {
+            self.management
+                .iter()
+                .flat_map(SharedManagementRecoverySlot::observations)
+                .collect()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            Vec::new()
+        }
+    }
+    pub(crate) fn retains_input(&self, input: &ReplayInput) -> bool {
+        #[cfg(feature = "std")]
+        {
+            self.management.iter().any(|slot| slot.matches_input(input))
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = input;
+            false
+        }
     }
     pub fn commitment(&self) -> Hash {
         Hash::digest(
-            if self.expiry_floor != 0 {
-                b"vos/agent/shared/recovery-manifest/v2"
-            } else {
-                b"vos/agent/shared/recovery-manifest/v1"
-            },
+            b"vos/agent/shared/management-recovery-manifest/v4",
             &[&self.encode()],
         )
     }
     pub fn validate(&self) -> Result<(), SharedRecoveryError> {
         validate_scope(self.generation, &self.committee)?;
-        if (self.slots.is_empty() && self.expiry_floor != 0)
-            || self.slots.len() > MAX_SHARED_RECOVERY_SLOTS
-            || self
-                .slots
-                .windows(2)
-                .any(|pair| pair[0].owner() >= pair[1].owner())
-        {
-            return Err(SharedRecoveryError::InvalidEnvelope);
-        }
-        for (index, slot) in self.slots.iter().enumerate() {
-            slot.validate()?;
-            slot.registration.verify(self.generation, &self.committee)?;
-            if let Some(expiry) = &slot.expiry {
-                expiry.certificate.verify(
-                    self.generation,
-                    &self.committee,
-                    expiry.certificate.claim(),
-                )?;
-                if self.expiry_floor < expiry.certificate.claim().observed_slot() {
-                    return Err(SharedRecoveryError::InvalidObservation);
-                }
-            }
-            for other in &self.slots[..index] {
-                if !slot.is_terminal()
-                    && !other.is_terminal()
-                    && !same_request(slot.registration.request(), other.registration.request())
-                {
-                    return Err(SharedRecoveryError::Conflict);
-                }
-                if same_invocation(slot.registration.request(), other.registration.request()) {
-                    if !same_request(slot.registration.request(), other.registration.request())
-                        || slot.invoke != other.invoke
-                        || slot.acknowledgement != other.acknowledgement
-                        || slot.expiry != other.expiry
-                    {
-                        return Err(SharedRecoveryError::Conflict);
-                    }
-                }
-            }
-        }
+        #[cfg(feature = "std")]
+        management::validate_management_slots(&self.management, self.generation, &self.committee)?;
         bound(self, MAX_SHARED_RECOVERY_MANIFEST_BYTES)
     }
     pub fn validate_at(&self, raft_index: u64) -> Result<(), SharedRecoveryError> {
         self.validate()?;
-        if self.slots.iter().any(|slot| {
-            slot.raft_index > raft_index
-                || slot
-                    .expiry
-                    .as_ref()
-                    .is_some_and(|value| value.raft_index > raft_index)
-                || [&slot.invoke, &slot.acknowledgement]
-                    .into_iter()
-                    .flatten()
-                    .any(|evidence| evidence.raft_index > raft_index)
-        }) {
-            return Err(SharedRecoveryError::InvalidObservation);
+        self.validate_positions_after_validation(raft_index)
+    }
+    /// Only the position check after complete immutable manifest validation.
+    pub(super) fn validate_positions_after_validation(
+        &self,
+        raft_index: u64,
+    ) -> Result<(), SharedRecoveryError> {
+        #[cfg(feature = "std")]
+        for slot in &self.management {
+            if slot.last_position().0 > raft_index {
+                return Err(SharedRecoveryError::InvalidObservation);
+            }
         }
+        #[cfg(not(feature = "std"))]
+        let _ = raft_index;
         Ok(())
     }
     pub fn validate_at_raft_index(&self, raft_index: u64) -> Result<(), SharedRecoveryError> {
         self.validate_at(raft_index)
     }
     fn last_position(&self) -> (u64, u64) {
-        self.slots
-            .iter()
-            .flat_map(|slot| {
-                core::iter::once((slot.raft_index, slot.raft_term))
-                    .chain(
-                        [&slot.invoke, &slot.acknowledgement]
-                            .into_iter()
-                            .flatten()
-                            .map(|evidence| (evidence.raft_index, evidence.raft_term)),
-                    )
-                    .chain(
-                        slot.expiry
-                            .iter()
-                            .map(|value| (value.raft_index, value.raft_term)),
-                    )
-            })
-            .max()
-            .unwrap_or((0, 0))
+        #[cfg(feature = "std")]
+        {
+            management::management_last_position(&self.management)
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            (0, 0)
+        }
     }
-    /// Pure succession check, not evidence that the owner cleared its PAP2.
-    pub fn validate_registration(
+    #[cfg(feature = "std")]
+    pub(crate) fn validate_management_registration_request(
         &self,
-        request: &SharedRecoveryRegistrationRequest,
+        request: &management::SharedManagementRecoveryRegistrationRequest,
     ) -> Result<(), SharedRecoveryError> {
-        request.validate()?;
-        if request.generation() != self.generation
-            || request.committee() != self.committee.id()
-            || self.committee.member_by_node(request.owner()).is_none()
-        {
-            return Err(SharedRecoveryError::ScopeMismatch);
-        }
-        for slot in &self.slots {
-            if same_invocation(slot.registration.request(), request)
-                && !same_request(slot.registration.request(), request)
-            {
-                return Err(SharedRecoveryError::Conflict);
-            }
-        }
-        let retained = self.slots.iter().any(|slot| {
-            (slot.registration.request() == request || slot.invoke.is_some() || slot.is_terminal())
-                && same_request(slot.registration.request(), request)
-        });
-        if !retained
-            && request
-                .query()
-                .recovery
-                .is_none_or(|scope| scope.expires_at <= self.expiry_floor)
-        {
-            return Err(SharedRecoveryError::Conflict);
-        }
-        match self.slot(request.owner()) {
-            None if request.sequence() == 1 && request.previous().is_none() => Ok(()),
-            Some(slot) if slot.registration.request() == request => Ok(()),
-            Some(slot) => {
-                if !slot.is_terminal() {
-                    return Err(SharedRecoveryError::NotAcknowledged);
-                }
-                if slot.sequence().checked_add(1) != Some(request.sequence())
-                    || request.previous() != Some(slot.commitment())
-                {
-                    return Err(SharedRecoveryError::Sequence);
-                }
-                Ok(())
-            }
-            None => Err(SharedRecoveryError::Sequence),
-        }?;
-        // One exact unfinished projection shares one Invoke/ACK capacity
-        // reservation across its physical owners. A second distinct pending
-        // request must not consume that headroom. A late holder of an already
-        // completed request inherits terminal evidence and needs no pair.
-        let inherits_terminal = self
-            .slots
-            .iter()
-            .any(|slot| slot.is_terminal() && same_request(slot.registration.request(), request));
-        if !inherits_terminal
-            && self.slots.iter().any(|slot| {
-                !slot.is_terminal() && !same_request(slot.registration.request(), request)
-            })
-        {
-            return Err(SharedRecoveryError::Conflict);
-        }
-        Ok(())
-    }
-    pub fn apply_registration(
-        &mut self,
-        registration: &SharedRecoveryRegistration,
-        raft_index: u64,
-        raft_term: u64,
-    ) -> Result<bool, SharedRecoveryError> {
-        registration.verify(self.generation, &self.committee)?;
-        self.validate_registration(registration.request())?;
-        if raft_index == 0 || raft_term == 0 {
-            return Err(SharedRecoveryError::InvalidEnvelope);
-        }
-        if let Some(existing) = self.slot(registration.owner())
-            && existing.registration == *registration
-        {
-            return Ok(false);
-        }
-        let previous = self.last_position();
-        if raft_index <= previous.0 || raft_term < previous.1 {
-            return Err(SharedRecoveryError::InvalidObservation);
-        }
-        let retained = self
-            .slots
-            .iter()
-            .find(|slot| same_request(slot.registration.request(), registration.request()));
-        let slot = SharedRecoverySlot {
-            registration: registration.clone(),
-            raft_index,
-            raft_term,
-            invoke: retained.and_then(|slot| slot.invoke.clone()),
-            acknowledgement: retained.and_then(|slot| slot.acknowledgement.clone()),
-            expiry: retained.and_then(|slot| slot.expiry.clone()),
-        };
-        let mut candidate = self.clone();
-        match candidate
-            .slots
-            .binary_search_by_key(&registration.owner(), SharedRecoverySlot::owner)
-        {
-            Ok(index) => candidate.slots[index] = slot,
-            Err(index) => candidate.slots.insert(index, slot),
-        }
-        candidate.validate_at(raft_index)?;
-        *self = candidate;
-        Ok(true)
-    }
-    /// Structural candidate construction only. The caller must establish the
-    /// exact physical prefix/Ordered predecessor and check its current clock.
-    pub fn expiry_claim(
-        &self,
-        request: &SharedRecoveryRegistrationRequest,
-        prefix_index: u64,
-        prefix_term: u64,
-        ordered: OrderedBase,
-        observed_slot: u64,
-    ) -> Result<SharedRecoveryExpiryClaim, SharedRecoveryError> {
-        let scope = request
-            .query()
-            .recovery
-            .ok_or(SharedRecoveryError::InvalidEnvelope)?;
-        let claim = SharedRecoveryExpiryClaim {
-            generation: self.generation,
-            committee: self.committee.clone(),
-            request: request.request_commitment(),
-            manifest: self.commitment(),
-            prefix_index,
-            prefix_term,
-            ordered,
-            expires_at: scope.expires_at,
-            observed_slot,
-        };
-        self.validate_expiry_claim(&claim)?;
-        Ok(claim)
-    }
-    pub fn validate_expiry_claim(
-        &self,
-        claim: &SharedRecoveryExpiryClaim,
-    ) -> Result<(), SharedRecoveryError> {
-        self.validate_at(claim.prefix_index)?;
-        claim.validate()?;
-        if claim.generation != self.generation
-            || claim.committee != self.committee
-            || claim.manifest != self.commitment()
-            || self.last_position().1 > claim.prefix_term
-            || claim.observed_slot < self.expiry_floor
-        {
-            return Err(SharedRecoveryError::ScopeMismatch);
-        }
-        let mut found = false;
-        for slot in &self.slots {
-            if slot.registration.request().request_commitment() != claim.request {
-                continue;
-            }
-            found = true;
-            if slot.invoke.is_some()
-                || slot.is_terminal()
-                || slot
-                    .registration
-                    .query()
-                    .recovery
-                    .is_none_or(|scope| scope.expires_at != claim.expires_at)
-            {
-                return Err(SharedRecoveryError::Conflict);
-            }
-        }
-        if !found {
-            return Err(SharedRecoveryError::Conflict);
-        }
-        Ok(())
-    }
-    pub fn apply_expiry(
-        &mut self,
-        certificate: &SharedRecoveryExpiryCertificate,
-        raft_index: u64,
-        raft_term: u64,
-    ) -> Result<bool, SharedRecoveryError> {
-        certificate.verify(self.generation, &self.committee, certificate.claim())?;
-        let terminal = SharedRecoveryExpiryTerminal {
-            certificate: certificate.clone(),
-            raft_index,
-            raft_term,
-        };
-        terminal.validate()?;
-        if self
-            .slots
-            .iter()
-            .any(|slot| slot.expiry.as_ref() == Some(&terminal))
-        {
-            self.validate()?;
-            return Ok(false);
-        }
-        self.validate_expiry_claim(certificate.claim())?;
-        let mut candidate = self.clone();
-        candidate.expiry_floor = candidate
-            .expiry_floor
-            .max(certificate.claim().observed_slot());
-        for slot in &mut candidate.slots {
-            if slot.registration.request().request_commitment() == certificate.claim().request {
-                slot.expiry = Some(terminal.clone());
-            }
-        }
-        candidate.validate_at(raft_index)?;
-        *self = candidate;
-        Ok(true)
+        management::validate_management_registration_request(
+            &self.management,
+            self.generation,
+            &self.committee,
+            request,
+        )
     }
     pub(crate) fn observe(
         &mut self,
@@ -1388,41 +549,11 @@ impl SharedRecoveryManifest {
             return Err(SharedRecoveryError::ScopeMismatch);
         }
         let mut candidate = self.clone();
-        let mut changed = false;
-        for slot in &mut candidate.slots {
-            if !observation.matches(slot.registration.request()) {
-                continue;
-            }
-            if observation.claim().committee() != slot.registration.committee() {
-                return Err(SharedRecoveryError::ScopeMismatch);
-            }
-            if slot.expiry.is_some() {
-                return Err(SharedRecoveryError::Conflict);
-            }
-            let target = if observation.is_acknowledgement() {
-                &mut slot.acknowledgement
-            } else {
-                &mut slot.invoke
-            };
-            match target {
-                Some(previous)
-                    if previous != observation
-                        && (observation.raft_index <= previous.raft_index
-                            || observation.raft_term < previous.raft_term) =>
-                {
-                    return Err(SharedRecoveryError::Conflict);
-                }
-                // Custody retains the first terminal Invoke and first
-                // positive ACK. Later committed retries have their own
-                // physical evidence, but cannot replace this capsule even
-                // when execution legitimately returns a different outcome.
-                Some(_) => {}
-                None => {
-                    *target = Some(observation.clone());
-                    changed = true;
-                }
-            }
-        }
+        #[cfg(feature = "std")]
+        let changed =
+            management::observe_management_candidate(&mut candidate.management, verified)?;
+        #[cfg(not(feature = "std"))]
+        let changed = false;
         candidate.validate()?;
         if changed {
             let previous = self.last_position();
@@ -1434,36 +565,21 @@ impl SharedRecoveryManifest {
         Ok(changed)
     }
 }
-
 impl ServiceWire for SharedRecoveryManifest {
-    const MAGIC: [u8; 4] = *b"RMF1";
-    fn encode(&self) -> Vec<u8> {
-        encode_expiry_version(self, self.expiry_floor != 0, *b"RMF2")
-    }
-    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        let (mut d, expiry) = decode_expiry_version(
-            bytes,
-            Self::MAGIC,
-            *b"RMF2",
-            MAX_SHARED_RECOVERY_MANIFEST_BYTES,
-        )?;
-        let value = Self::decode_body(&mut d)?;
-        if !d.exhausted() || (value.expiry_floor != 0) != expiry {
-            return Err(DecodeError::NonCanonical);
-        }
-        Ok(value)
-    }
+    const MAGIC: [u8; 4] = *b"RMF4";
     fn encode_body(&self, output: &mut Vec<u8>) {
         let mut e = Encoder(output);
         e.bytes(&self.generation.encode());
         e.bytes(&self.committee.encode());
-        e.u8(self.slots.len() as u8);
-        for slot in &self.slots {
-            e.bytes(&slot.encode());
+        #[cfg(feature = "std")]
+        {
+            e.u8(self.management.len() as u8);
+            for slot in &self.management {
+                e.bytes(&slot.encode());
+            }
         }
-        if self.expiry_floor != 0 {
-            e.u64(self.expiry_floor);
-        }
+        #[cfg(not(feature = "std"))]
+        e.u8(0);
     }
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         decode_bound(d, MAX_SHARED_RECOVERY_MANIFEST_BYTES)?;
@@ -1473,65 +589,30 @@ impl ServiceWire for SharedRecoveryManifest {
         if count > MAX_SHARED_RECOVERY_SLOTS {
             return Err(DecodeError::LimitExceeded);
         }
-        let mut slots = Vec::with_capacity(count);
-        for _ in 0..count {
-            slots.push(nested(d, MAX_SHARED_RECOVERY_SLOT_BYTES)?);
+        #[cfg(feature = "std")]
+        let management = {
+            let mut slots = Vec::with_capacity(count);
+            for _ in 0..count {
+                slots.push(nested(
+                    d,
+                    management::MAX_SHARED_MANAGEMENT_RECOVERY_SLOT_BYTES,
+                )?);
+            }
+            slots
+        };
+        #[cfg(not(feature = "std"))]
+        if count != 0 {
+            return Err(DecodeError::InvalidTag);
         }
         let value = Self {
             generation,
             committee,
-            slots,
-            expiry_floor: if d.exhausted() { 0 } else { d.u64()? },
+            #[cfg(feature = "std")]
+            management,
         };
         value.validate().map_err(decode_error)?;
         Ok(value)
     }
-}
-
-fn encode_expiry_version<T: ServiceWire>(value: &T, expiry: bool, magic: [u8; 4]) -> Vec<u8> {
-    let mut output = Vec::new();
-    output.extend_from_slice(if expiry { &magic } else { &T::MAGIC });
-    output.extend_from_slice(&crate::service::PLATFORM_ID.0);
-    value.encode_body(&mut output);
-    output
-}
-fn decode_expiry_version<'a>(
-    bytes: &'a [u8],
-    legacy: [u8; 4],
-    expiry: [u8; 4],
-    maximum: usize,
-) -> Result<(Decoder<'a>, bool), DecodeError> {
-    if bytes.len() > maximum {
-        return Err(DecodeError::LimitExceeded);
-    }
-    let mut d = Decoder::new(bytes);
-    let magic = d.take(4)?;
-    let extended = if magic == legacy {
-        false
-    } else if magic == expiry {
-        true
-    } else {
-        return Err(DecodeError::InvalidTag);
-    };
-    if Hash(d.fixed()?) != crate::service::PLATFORM_ID {
-        return Err(DecodeError::InvalidPlatform);
-    }
-    Ok((d, extended))
-}
-
-fn same_invocation(
-    left: &SharedRecoveryRegistrationRequest,
-    right: &SharedRecoveryRegistrationRequest,
-) -> bool {
-    left.work().invocation == right.work().invocation
-}
-fn same_request(
-    left: &SharedRecoveryRegistrationRequest,
-    right: &SharedRecoveryRegistrationRequest,
-) -> bool {
-    left.query == right.query
-        && left.work() == right.work()
-        && left.authorization() == right.authorization()
 }
 fn validate_scope(
     generation: AgentGenerationRouteKey,
@@ -1549,59 +630,6 @@ fn validate_scope(
     }
     Ok(())
 }
-pub(crate) fn projection_query_matches_work(
-    query: &AuthorityProjectionQuery,
-    work: &InvocationWork,
-    authorization: &InvocationAuthorization,
-) -> bool {
-    let InvocationAuthorization::PublicPreflight(preflight) = authorization else {
-        return false;
-    };
-    let target = query.authority;
-    let Ok(bytes) = query.encode() else {
-        return false;
-    };
-    let method = match query.selector {
-        AuthorityProjectionSelector::Inventory { .. } => "inventory_projection_page",
-        AuthorityProjectionSelector::Credential => "credential_projection",
-        AuthorityProjectionSelector::Agents { .. } => "agent_projection_page",
-        AuthorityProjectionSelector::AgentReplicas { .. } => "agent_replica_projection_page",
-        AuthorityProjectionSelector::Actors { .. } => "actor_projection_page",
-    };
-    use crate::actors::codec::Encode as _;
-    let mut message = alloc::vec![crate::actors::value::TAG_DYNAMIC];
-    message.extend(
-        crate::actors::value::Msg::new(method)
-            .with("query", crate::actors::value::Value::Bytes(bytes))
-            .encode(),
-    );
-    let invocation = sdk::Hash::digest(
-        b"vos/system-authority/projection-invocation/v2",
-        &[query.commitment().as_bytes()],
-    );
-    query.validate_shape().is_ok()
-        && work.validate()
-        && authorization.matches_work(work)
-        && query
-            .recovery
-            .is_none_or(|scope| scope.accepted_slot == preflight.observed_slot)
-        && work.space == target.space
-        && work.agent == target.system_agent
-        && work.runtime_deployment == target.system_runtime_deployment
-        && work.actor == target.binding.issuer.actor
-        && work.deployment == target.binding.issuer.deployment
-        && work.program == target.binding.issuer.program
-        && work.mode == sdk::MethodMode::Query
-        && work.invocation.0 == invocation.0
-        && work.origin.principal.is_none()
-        && work.origin.transport_node == query.attesting_node()
-        && work.origin.credential.is_none()
-        && work.origin.actor.is_none()
-        && work.origin.capability.is_none()
-        && work.roles == sdk::InvocationRoleClaims::none()
-        && work.message == message
-        && !work.recovery_only
-}
 fn outcome_bytes(outcome: &RuntimeOutcome) -> Result<Vec<u8>, SharedRecoveryError> {
     let bytes = RuntimeTransition {
         state: RuntimeState::default(),
@@ -1611,6 +639,24 @@ fn outcome_bytes(outcome: &RuntimeOutcome) -> Result<Vec<u8>, SharedRecoveryErro
     .map_err(|_| SharedRecoveryError::InvalidObservation)?;
     if bytes.len() > MAX_SHARED_RECOVERY_OUTCOME_BYTES {
         return Err(SharedRecoveryError::LimitExceeded);
+    }
+    Ok(bytes)
+}
+
+/// Canonical serialization, never validation or execution authority. These
+/// ServiceWire encoders already serialize without admission checks; their
+/// private retained envelopes still undergo the complete checked SDK encode
+/// in every constructor/validation path and strict SDK decode on input.
+/// Avoid hiding another caller-sized preimage validation inside each enclosing
+/// bound, commitment, signature message, and canonical re-encoding. This uses
+/// the existing journal encoder's exact frame/body mechanism, not cached bytes.
+fn encode_retained_envelope(work: &RuntimeWork) -> Result<Vec<u8>, sdk::wire::WireError> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&RuntimeWork::MAGIC);
+    bytes.extend_from_slice(sdk::RUNTIME_ABI_ID.as_bytes());
+    work.encode_body(&mut vos_protocol::wire::Encoder(&mut bytes));
+    if bytes.len() > RuntimeWork::MAX_ENCODED_BYTES {
+        return Err(sdk::wire::WireError::LimitExceeded);
     }
     Ok(bytes)
 }
@@ -1670,955 +716,319 @@ fn verify_signature(_: &[u8; 32], _: &[u8], _: &[u8; 64]) -> bool {
     false
 }
 
-#[cfg(test)]
-pub(crate) fn recovery_registration_for_test(
-    owner_key: u8,
-    nonce: u8,
-) -> SharedRecoveryRegistration {
-    tests::registration(owner_key, nonce)
-}
-
-#[cfg(test)]
-pub(crate) fn completed_recovery_manifest_for_test() -> SharedRecoveryManifest {
-    tests::completed_manifest()
-}
-
-#[cfg(test)]
-pub(crate) fn recovery_observation_for_test(
-    registration: &SharedRecoveryRegistration,
-    index: u64,
-    acknowledgement: bool,
-) -> VerifiedSharedRecoveryObservation {
-    tests::observation(registration, index, acknowledgement)
-}
-
-#[cfg(test)]
-pub(crate) fn recovery_expiry_certificate_for_test(
-    manifest: &SharedRecoveryManifest,
-    request: &SharedRecoveryRegistrationRequest,
-    index: u64,
-    term: u64,
-    ordered: OrderedBase,
-    observed_slot: u64,
-) -> SharedRecoveryExpiryCertificate {
-    tests::expiry_certificate(
-        manifest
-            .expiry_claim(request, index, term, ordered, observed_slot)
-            .unwrap(),
-    )
-}
-#[cfg(test)]
-pub(crate) fn recovery_replacement_expiring_for_test(
-    manifest: &SharedRecoveryManifest,
-    owner: u8,
-    nonce: u8,
-    expires_at: u64,
-) -> SharedRecoveryRegistration {
-    tests::replacement_expiring(manifest, owner, nonce, expires_at)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ed25519_dalek::{Signer as _, SigningKey};
-    use sdk::authority::{
-        AgentAuthorityBinding, AuthorityActorTarget, AuthorityIngressAuthentication,
-        AuthorityIssuer, AuthorityProjectionRecoveryDelegation,
-    };
-
-    fn key(byte: u8) -> SigningKey {
-        SigningKey::from_bytes(&[byte; 32])
-    }
-    fn node(byte: u8) -> NodeId {
-        let mut peer = alloc::vec![0, 0x24, 8, 1, 0x12, 0x20];
-        peer.extend_from_slice(&key(byte).verifying_key().to_bytes());
-        NodeId::of_authenticated_peer(&peer)
-    }
-    fn manifest() -> SharedRecoveryManifest {
-        let common = super::super::shared_commit::common_snapshot_claim_for_test();
-        let claim = common.ordered();
-        SharedRecoveryManifest::new(
-            AgentGenerationRouteKey::new(
-                claim.space(),
-                claim.agent(),
-                claim.genesis(),
-                claim.admission(),
-            )
-            .unwrap(),
-            common.active_committee().clone(),
+#[cfg(all(test, feature = "std"))]
+pub(crate) fn management_manifest_for_test() -> SharedRecoveryManifest {
+    let common = super::shared_commit::common_snapshot_claim_for_test();
+    let claim = common.ordered();
+    SharedRecoveryManifest::new(
+        AgentGenerationRouteKey::new(
+            claim.space(),
+            claim.agent(),
+            claim.genesis(),
+            claim.admission(),
         )
-        .unwrap()
+        .unwrap(),
+        common.active_committee().clone(),
+    )
+    .unwrap()
+}
+#[cfg(all(test, feature = "std"))]
+pub(crate) fn management_node_for_test(owner: u8) -> NodeId {
+    let key = ed25519_dalek::SigningKey::from_bytes(&[owner; 32]);
+    let mut peer = alloc::vec![0, 0x24, 8, 1, 0x12, 0x20];
+    peer.extend_from_slice(&key.verifying_key().to_bytes());
+    NodeId::of_authenticated_peer(&peer)
+}
+/// Structural physical-evidence fixture, not custody or execution authority.
+/// Its work carries a real signed Linear administration call. Multiple test
+/// holders of the same nonce share the original node's exact immutable work.
+#[cfg(all(test, feature = "std"))]
+#[derive(Clone, Debug)]
+pub(crate) struct ManagementRecoveryFixture {
+    generation: AgentGenerationRouteKey,
+    committee: AgentReplicaCommitteeId,
+    owner: NodeId,
+    envelope: RuntimeWork,
+}
+#[cfg(all(test, feature = "std"))]
+impl ManagementRecoveryFixture {
+    pub(crate) const fn generation(&self) -> AgentGenerationRouteKey {
+        self.generation
     }
-    fn query_work(
-        nonce: u8,
-    ) -> (
-        AuthorityProjectionQuery,
-        InvocationWork,
-        InvocationAuthorization,
-    ) {
-        query_work_expiring(nonce, 20)
+    pub(crate) const fn committee(&self) -> AgentReplicaCommitteeId {
+        self.committee
     }
-    fn query_work_expiring(
-        nonce: u8,
-        expires_at: u64,
-    ) -> (
-        AuthorityProjectionQuery,
-        InvocationWork,
-        InvocationAuthorization,
-    ) {
-        let manifest = manifest();
-        let runtime = super::super::shared_commit::common_snapshot_claim_for_test()
-            .ordered()
-            .runtime()
-            .clone();
-        let public_key = key(7).verifying_key().to_bytes();
-        let mut query = AuthorityProjectionQuery {
-            authority: AuthorityActorTarget {
-                space: sdk::SpaceId(runtime.space.0),
-                system_agent: sdk::AgentId(runtime.agent.0),
-                system_runtime_deployment: sdk::DeploymentId(runtime.deployment.0),
-                binding: AgentAuthorityBinding {
-                    policy: sdk::Hash([0x51; 32]),
-                    issuer: AuthorityIssuer {
-                        principal: sdk::PrincipalId([0x52; 32]),
-                        actor: sdk::ActorId([0x53; 32]),
-                        deployment: sdk::DeploymentId([0x54; 32]),
-                        program: sdk::ProgramId([0x55; 32]),
-                        producer: sdk::ProducerId::of_public_key(&public_key),
-                    },
-                    public_key,
-                    initial_epoch: 1,
-                },
-            },
-            credential: sdk::CredentialId::of_public_key(&public_key),
-            nonce: sdk::Hash([nonce; 32]),
-            selector: AuthorityProjectionSelector::Credential,
-            authentication: AuthorityIngressAuthentication::ApiCredentialSignature {
-                credential_public_key: public_key,
-                signature: [1; 64],
-            },
-            recovery: Some(AuthorityProjectionRecoveryDelegation {
-                generation: sdk::Hash(manifest.generation().replication_id()),
-                committee: sdk::Hash(*manifest.committee().id().as_bytes()),
-                accepted_slot: 10,
-                expires_at,
-            }),
-        };
-        let signature = key(7).sign(&query.signing_bytes()).to_bytes();
-        let AuthorityIngressAuthentication::ApiCredentialSignature {
-            signature: stored, ..
-        } = &mut query.authentication
-        else {
+    pub(crate) const fn owner(&self) -> NodeId {
+        self.owner
+    }
+    pub(crate) const fn envelope(&self) -> &RuntimeWork {
+        &self.envelope
+    }
+    pub(crate) fn work(&self) -> &InvocationWork {
+        let RuntimeWork::Invoke { invocation, .. } = &self.envelope else {
             unreachable!()
         };
-        *stored = signature;
-        use crate::actors::codec::Encode as _;
-        let mut message = alloc::vec![crate::actors::value::TAG_DYNAMIC];
-        message.extend(
-            crate::actors::value::Msg::new("credential_projection")
-                .with(
-                    "query",
-                    crate::actors::value::Value::Bytes(query.encode().unwrap()),
-                )
-                .encode(),
-        );
-        let invocation = sdk::Hash::digest(
-            b"vos/system-authority/projection-invocation/v2",
-            &[query.commitment().as_bytes()],
-        );
-        let work = InvocationWork {
-            space: query.authority.space,
-            agent: query.authority.system_agent,
-            runtime_deployment: query.authority.system_runtime_deployment,
-            invocation: sdk::InvocationId(invocation.0),
-            actor: query.authority.binding.issuer.actor,
-            incarnation: sdk::Hash([0x56; 32]),
-            deployment: query.authority.binding.issuer.deployment,
-            program: query.authority.binding.issuer.program,
-            mode: sdk::MethodMode::Query,
-            origin: sdk::InvocationOrigin {
-                principal: None,
-                transport_node: None,
-                credential: None,
-                actor: None,
-                capability: None,
+        invocation
+    }
+    pub(crate) fn authorization(&self) -> &InvocationAuthorization {
+        let RuntimeWork::Invoke { authorization, .. } = &self.envelope else {
+            unreachable!()
+        };
+        authorization
+    }
+}
+#[cfg(all(test, feature = "std"))]
+pub(crate) fn management_recovery_fixture_for_test(
+    owner: u8,
+    nonce: u8,
+) -> ManagementRecoveryFixture {
+    management_recovery_fixture_at_slot_for_test(owner, nonce, 10)
+}
+#[cfg(all(test, feature = "std"))]
+pub(crate) fn management_recovery_fixture_at_slot_for_test(
+    owner: u8,
+    nonce: u8,
+    observed_slot: u64,
+) -> ManagementRecoveryFixture {
+    use crate::actors::codec::Encode as _;
+    use ed25519_dalek::{Signer as _, SigningKey};
+    use sdk::authority::{
+        AgentAuthorityBinding, AuthorityActorTarget, AuthorityAdminCall, AuthorityAdminOperation,
+        AuthorityIssuer,
+    };
+    let manifest = management_manifest_for_test();
+    let runtime = super::shared_commit::common_snapshot_claim_for_test()
+        .ordered()
+        .runtime()
+        .clone();
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let public_key = key.verifying_key().to_bytes();
+    let authority = AuthorityActorTarget {
+        space: sdk::SpaceId(runtime.space.0),
+        system_agent: sdk::AgentId(runtime.agent.0),
+        system_runtime_deployment: sdk::DeploymentId(runtime.deployment.0),
+        binding: AgentAuthorityBinding {
+            policy: sdk::Hash([0x51; 32]),
+            issuer: AuthorityIssuer {
+                principal: sdk::PrincipalId([0x52; 32]),
+                actor: sdk::ActorId([0x53; 32]),
+                deployment: sdk::DeploymentId([0x54; 32]),
+                program: sdk::ProgramId([0x55; 32]),
+                producer: sdk::ProducerId::of_public_key(&public_key),
             },
-            roles: sdk::InvocationRoleClaims::none(),
-            message,
-            installation_data: None,
-            availability: Vec::new(),
-            gas: 100,
-            recovery_only: false,
-        };
-        let auth =
-            InvocationAuthorization::PublicPreflight(sdk::PublicPreflight::for_work(&work, 10));
-        (query, work, auth)
+            public_key,
+            initial_epoch: 1,
+        },
+    };
+    let mut call = AuthorityAdminCall {
+        invocation: sdk::InvocationId::ZERO,
+        authority,
+        administrator: sdk::PrincipalId([0x52; 32]),
+        credential: sdk::CredentialId::of_public_key(&public_key),
+        request_sequence: core::num::NonZeroU64::new(u64::from(nonce) + 1).unwrap(),
+        credential_public_key: public_key,
+        authenticated_node: sdk::NodeId(management_node_for_test(1).0),
+        observed_slot,
+        expected_generation: core::num::NonZeroU64::new(1).unwrap(),
+        operation: AuthorityAdminOperation::SetSpaceRole {
+            principal: sdk::PrincipalId([0x52; 32]),
+            role: sdk::RoleId([nonce.wrapping_add(1).max(1); 32]),
+            granted: true,
+        },
+        signature: [1; 64],
+    };
+    call.invocation = call.expected_invocation();
+    call.signature = key.sign(&call.signing_bytes()).to_bytes();
+    call.validate_shape().unwrap();
+    let mut message = alloc::vec![crate::actors::value::TAG_DYNAMIC];
+    message.extend(
+        crate::actors::value::Msg::new("administer")
+            .with(
+                "call",
+                crate::actors::value::Value::Bytes(call.encode().unwrap()),
+            )
+            .encode(),
+    );
+    let work = InvocationWork {
+        space: authority.space,
+        agent: authority.system_agent,
+        runtime_deployment: authority.system_runtime_deployment,
+        invocation: call.invocation,
+        actor: authority.binding.issuer.actor,
+        incarnation: sdk::Hash([0x56; 32]),
+        deployment: authority.binding.issuer.deployment,
+        program: authority.binding.issuer.program,
+        mode: sdk::MethodMode::Linear,
+        origin: sdk::InvocationOrigin {
+            principal: Some(call.administrator),
+            transport_node: Some(call.authenticated_node),
+            credential: Some(call.credential),
+            actor: None,
+            capability: None,
+        },
+        roles: sdk::InvocationRoleClaims::none(),
+        message,
+        installation_data: None,
+        availability: Vec::new(),
+        gas: 100,
+        recovery_only: false,
+    };
+    work.validate().then_some(()).unwrap();
+    let authorization = InvocationAuthorization::PublicPreflight(sdk::PublicPreflight::for_work(
+        &work,
+        observed_slot,
+    ));
+    let envelope = RuntimeWork::Invoke {
+        context: RuntimeExecutionContext::Direct,
+        state: RuntimeState::default(),
+        invocation: Box::new(work),
+        authorization: Box::new(authorization),
+        observed_slot,
+    };
+    envelope.encode().unwrap();
+    ManagementRecoveryFixture {
+        generation: manifest.generation(),
+        committee: manifest.committee().id(),
+        owner: management_node_for_test(owner),
+        envelope,
     }
-    fn sign(
-        request: SharedRecoveryRegistrationRequest,
-        owner_key: u8,
-    ) -> SharedRecoveryRegistration {
-        let signature = key(owner_key).sign(&request.signing_message().0).to_bytes();
-        SharedRecoveryRegistration::new(
-            request,
-            ReplicaCommitSignature::new(node(owner_key), signature).unwrap(),
+}
+#[cfg(all(test, feature = "std"))]
+pub(crate) fn management_observation_for_test(
+    fixture: &ManagementRecoveryFixture,
+    index: u64,
+    acknowledge: bool,
+) -> VerifiedSharedRecoveryObservation {
+    let common = super::shared_commit::common_snapshot_claim_for_test();
+    let claim = common.ordered().with_raft_foundation(index, 3).unwrap();
+    let work = fixture.work();
+    let authorization = fixture.authorization();
+    let InvocationAuthorization::PublicPreflight(preflight) = authorization else {
+        unreachable!()
+    };
+    let (operation, outcome) = if acknowledge {
+        (
+            ReplayOperation::CleanAcknowledge {
+                context: RuntimeExecutionContext::Direct,
+                expected_live: None,
+                work: sdk::InvocationRetirement::from_work(work),
+                authorization: authorization.clone(),
+            },
+            RuntimeOutcome::Acknowledged(Ok(sdk::InvocationAcknowledgement {
+                invocation: work.invocation,
+                actor: work.actor,
+                incarnation: work.incarnation,
+                deployment: work.deployment,
+                mode: work.mode,
+                work: work.commitment(),
+                authorization: authorization.commitment(),
+            })),
         )
+    } else {
+        (
+            ReplayOperation::CleanInvoke {
+                context: RuntimeExecutionContext::Direct,
+                work: work.clone(),
+                authorization: authorization.clone(),
+                observed_slot: preflight.observed_slot,
+            },
+            RuntimeOutcome::Completed(Ok(sdk::InvocationReply {
+                invocation: work.invocation,
+                actor: work.actor,
+                incarnation: work.incarnation,
+                deployment: work.deployment,
+                mode: work.mode,
+                lane: work.mode.write_lane(),
+                status: sdk::InvocationStatus::Done,
+                reply: b"management terminal".to_vec(),
+                gas_remaining: 99,
+                observation: sdk::InvocationObservation::default(),
+            })),
+        )
+    };
+    let input = ReplayInput {
+        runtime: claim.runtime().clone(),
+        operation,
+    };
+    VerifiedSharedRecoveryObservation::from_validated_replay(index, 3, &claim, &input, &outcome)
         .unwrap()
-    }
-    pub(super) fn registration(owner_key: u8, nonce: u8) -> SharedRecoveryRegistration {
-        let scope = manifest();
-        let (query, work, auth) = query_work(nonce);
-        sign(
-            SharedRecoveryRegistrationRequest::new(
-                scope.generation(),
-                scope.committee().id(),
-                node(owner_key),
-                1,
-                None,
-                query,
-                work,
-                auth,
-            )
-            .unwrap(),
-            owner_key,
-        )
-    }
-    fn replacement(
-        manifest: &SharedRecoveryManifest,
-        owner_key: u8,
-        nonce: u8,
-    ) -> SharedRecoveryRegistration {
-        replacement_expiring(manifest, owner_key, nonce, 20)
-    }
-    pub(super) fn replacement_expiring(
-        manifest: &SharedRecoveryManifest,
-        owner_key: u8,
-        nonce: u8,
-        expires_at: u64,
-    ) -> SharedRecoveryRegistration {
-        let previous = manifest.slot(node(owner_key)).unwrap();
-        let (query, work, auth) = query_work_expiring(nonce, expires_at);
-        sign(
-            SharedRecoveryRegistrationRequest::new(
-                manifest.generation(),
-                manifest.committee().id(),
-                node(owner_key),
-                previous.sequence() + 1,
-                Some(previous.commitment()),
-                query,
-                work,
-                auth,
-            )
-            .unwrap(),
-            owner_key,
-        )
-    }
-    pub(super) fn observation(
-        registration: &SharedRecoveryRegistration,
-        index: u64,
-        ack: bool,
-    ) -> VerifiedSharedRecoveryObservation {
-        let common = super::super::shared_commit::common_snapshot_claim_for_test();
-        let claim = common.ordered().with_raft_foundation(index, 3).unwrap();
-        let work = registration.work();
-        let auth = registration.authorization();
-        let (operation, outcome) = if ack {
-            (
-                ReplayOperation::CleanAcknowledge {
-                    context: RuntimeExecutionContext::Direct,
-                    expected_live: None,
-                    work: sdk::InvocationRetirement::from_work(work),
-                    authorization: auth.clone(),
-                },
-                RuntimeOutcome::Acknowledged(Ok(sdk::InvocationAcknowledgement {
-                    invocation: work.invocation,
-                    actor: work.actor,
-                    incarnation: work.incarnation,
-                    deployment: work.deployment,
-                    mode: work.mode,
-                    work: work.commitment(),
-                    authorization: auth.commitment(),
-                })),
-            )
-        } else {
-            (
-                ReplayOperation::CleanInvoke {
-                    context: RuntimeExecutionContext::Direct,
-                    work: work.clone(),
-                    authorization: auth.clone(),
-                    observed_slot: 10,
-                },
-                RuntimeOutcome::Completed(Ok(sdk::InvocationReply {
-                    invocation: work.invocation,
-                    actor: work.actor,
-                    incarnation: work.incarnation,
-                    deployment: work.deployment,
-                    mode: work.mode,
-                    lane: None,
-                    status: sdk::InvocationStatus::Done,
-                    reply: b"exact public response".to_vec(),
-                    gas_remaining: 99,
-                    observation: sdk::InvocationObservation::default(),
-                })),
-            )
-        };
-        let input = ReplayInput {
-            runtime: claim.runtime().clone(),
-            operation,
-        };
-        VerifiedSharedRecoveryObservation::from_validated_replay(index, 3, &claim, &input, &outcome)
-            .unwrap()
-    }
-
-    pub(super) fn completed_manifest() -> SharedRecoveryManifest {
-        let registration = registration(1, 9);
-        let mut state = manifest();
-        state.apply_registration(&registration, 1, 3).unwrap();
-        state
-            .observe(&observation(&registration, 2, false))
-            .unwrap();
-        state.observe(&observation(&registration, 3, true)).unwrap();
-        state
-    }
-
-    pub(super) fn expiry_certificate(
-        claim: SharedRecoveryExpiryClaim,
-    ) -> SharedRecoveryExpiryCertificate {
-        let message = claim.signing_message();
-        let mut signatures: Vec<_> = [1, 2]
-            .into_iter()
-            .map(|owner| {
-                ReplicaCommitSignature::new(node(owner), key(owner).sign(&message.0).to_bytes())
-                    .unwrap()
-            })
-            .collect();
-        signatures.sort_by_key(ReplicaCommitSignature::signer);
-        SharedRecoveryExpiryCertificate::new(claim, signatures).unwrap()
-    }
-
+}
+#[cfg(all(test, feature = "std"))]
+pub(crate) fn completed_management_manifest_for_test() -> SharedRecoveryManifest {
+    let mut manifest = management_manifest_for_test();
+    manifest
+        .management
+        .push(management::completed_management_slot_for_test());
+    manifest.validate().unwrap();
+    manifest
+}
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use super::*;
     #[test]
-    fn expiry_quorum_is_distinct_terminal_consistent_across_holders() {
-        let first = registration(1, 9);
-        let mut state = manifest();
-        state.apply_registration(&first, 1, 3).unwrap();
-        state.apply_registration(&registration(2, 9), 2, 3).unwrap();
-        assert!(
-            state
-                .expiry_claim(first.request(), 2, 3, OrderedBase::post_genesis(), 19)
-                .is_err()
-        );
-        let certificate = expiry_certificate(
-            state
-                .expiry_claim(first.request(), 2, 3, OrderedBase::post_genesis(), 20)
-                .unwrap(),
-        );
-        assert!(state.apply_expiry(&certificate, 3, 3).unwrap());
-        assert!(!state.apply_expiry(&certificate, 3, 3).unwrap());
-        assert_eq!(state.expiry_floor(), 20);
-        assert!(
-            state.slots().iter().all(|slot| slot.is_terminal()
-                && !slot.is_acknowledged()
-                && slot.invoke().is_none())
-        );
-        assert_eq!(state.slots()[0].expiry(), state.slots()[1].expiry());
-        let expired = state.clone();
-        assert!(state.observe(&observation(&first, 4, false)).is_err());
-        assert!(state.observe(&observation(&first, 4, true)).is_err());
-        assert!(state.apply_expiry(&certificate, 4, 3).is_err());
-        assert_eq!(state, expired);
-        state.apply_registration(&registration(3, 9), 4, 3).unwrap();
-        assert!(state.slots().iter().all(SharedRecoverySlot::is_terminal));
-        assert_eq!(&state.encode()[..4], b"RMF2");
-        assert_eq!(
-            SharedRecoveryManifest::decode(&state.encode()).unwrap(),
-            state
-        );
-        assert!(state.validate_at(3).is_err());
-    }
-
-    #[test]
-    fn expiry_certificate_binds_scope_prefix_manifest_request_and_time() {
-        let first = registration(1, 9);
-        let mut state = manifest();
-        state.apply_registration(&first, 1, 3).unwrap();
-        let claim = state
-            .expiry_claim(first.request(), 1, 3, OrderedBase::post_genesis(), 20)
-            .unwrap();
-        let certificate = expiry_certificate(claim.clone());
-        certificate
-            .verify(state.generation(), state.committee(), &claim)
-            .unwrap();
-        assert!(
-            SharedRecoveryExpiryCertificate::new(
-                claim.clone(),
-                certificate.signatures[..1].to_vec()
-            )
-            .is_err()
-        );
-        assert!(
-            SharedRecoveryExpiryCertificate::new(
-                claim.clone(),
-                alloc::vec![certificate.signatures[0].clone(); 2]
-            )
-            .is_err()
-        );
-        for field in 0..8 {
-            let mut changed = claim.clone();
-            match field {
-                0 => changed.request = Hash([71; 32]),
-                1 => changed.manifest = Hash([72; 32]),
-                2 => changed.prefix_index += 1,
-                3 => changed.prefix_term += 1,
-                4 => {
-                    changed.ordered = OrderedBase {
-                        index: 1,
-                        head: Some(OrderedEntryId::new([73; 32])),
-                    }
-                }
-                5 => changed.observed_slot += 1,
-                6 => changed.expires_at -= 1,
-                _ => {
-                    changed.generation = AgentGenerationRouteKey::new(
-                        changed.generation.space(),
-                        changed.generation.agent(),
-                        changed.generation.genesis(),
-                        super::super::genesis::AgentGenesisAdmissionId::from_bytes([74; 32]),
-                    )
-                    .unwrap()
-                }
-            }
-            let mut forged = certificate.clone();
-            forged.claim = changed.clone();
-            assert!(
-                forged
-                    .verify(changed.generation, &changed.committee, &changed)
-                    .is_err()
-            );
-            assert!(
-                certificate
-                    .verify(state.generation(), state.committee(), &changed)
-                    .is_err()
-            );
+    fn management_only_manifest_is_strict_rmf4_without_read_slots_or_expiry() {
+        let manifest = management_manifest_for_test();
+        assert!(manifest.is_empty());
+        let encoded = manifest.encode();
+        assert_eq!(&encoded[..4], b"RMF4");
+        assert_eq!(SharedRecoveryManifest::decode(&encoded).unwrap(), manifest);
+        for tag in [*b"RMF1", *b"RMF2", *b"RMF3"] {
+            let mut old = encoded.clone();
+            old[..4].copy_from_slice(&tag);
+            assert!(SharedRecoveryManifest::decode(&old).is_err());
         }
-        let mut wrong_signer = certificate.clone();
-        wrong_signer.signatures[0] = ReplicaCommitSignature::new(
-            node(4),
-            key(4).sign(&claim.signing_message().0).to_bytes(),
-        )
-        .unwrap();
-        wrong_signer
-            .signatures
-            .sort_by_key(ReplicaCommitSignature::signer);
-        assert!(
-            wrong_signer
-                .verify(state.generation(), state.committee(), &claim)
-                .is_err()
-        );
-        let before = state.clone();
-        assert!(state.apply_expiry(&certificate, 3, 3).is_err());
-        assert!(state.apply_expiry(&certificate, 2, 2).is_err());
-        assert_eq!(state, before);
-        state.observe(&observation(&first, 2, false)).unwrap();
-        let observed = state.clone();
-        assert!(state.apply_expiry(&certificate, 2, 3).is_err());
-        assert!(
-            state
-                .expiry_claim(first.request(), 2, 3, OrderedBase::post_genesis(), 20)
-                .is_err()
-        );
-        assert_eq!(state, observed);
+        for end in 0..encoded.len() {
+            assert!(SharedRecoveryManifest::decode(&encoded[..end]).is_err());
+        }
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(SharedRecoveryManifest::decode(&trailing).is_err());
     }
-
     #[test]
-    fn expiry_floor_survives_last_capsule_replacement_and_codec_reopen() {
-        let first = registration(1, 9);
-        let mut state = manifest();
-        state.apply_registration(&first, 1, 3).unwrap();
-        let proof = expiry_certificate(
-            state
-                .expiry_claim(first.request(), 1, 3, OrderedBase::post_genesis(), 22)
-                .unwrap(),
-        );
-        state.apply_expiry(&proof, 2, 3).unwrap();
-        let expired = state.clone();
-        assert!(
-            state
-                .apply_registration(&replacement(&state, 1, 10), 3, 3)
-                .is_err()
-        );
-        assert_eq!(state, expired);
-        let next = replacement_expiring(&state, 1, 10, 30);
-        state.apply_registration(&next, 3, 3).unwrap();
-        assert!(state.slots().iter().all(|slot| slot.expiry().is_none()));
-        assert_eq!(state.expiry_floor(), 22);
-        assert_eq!(&state.encode()[..4], b"RMF2");
-        let reopened = SharedRecoveryManifest::decode(&state.encode()).unwrap();
-        assert_eq!(reopened, state);
-        assert!(
-            reopened
-                .validate_registration(registration(2, 9).request())
-                .is_err()
-        );
-        assert!(reopened.validate_registration(first.request()).is_err());
-    }
-
-    #[test]
-    fn expiry_codec_preserves_legacy_bytes_and_rejects_version_reinterpretation() {
-        let first = registration(1, 9);
-        let mut state = manifest();
-        state.apply_registration(&first, 1, 3).unwrap();
-        let mut old = Vec::new();
-        old.extend_from_slice(b"RMF1");
-        old.extend_from_slice(&crate::service::PLATFORM_ID.0);
-        let mut e = Encoder(&mut old);
-        e.bytes(&state.generation.encode());
-        e.bytes(&state.committee.encode());
-        e.u8(1);
-        let slot = &state.slots[0];
-        let mut old_slot = Vec::new();
-        old_slot.extend_from_slice(b"RSL1");
-        old_slot.extend_from_slice(&crate::service::PLATFORM_ID.0);
-        let mut s = Encoder(&mut old_slot);
-        s.bytes(&first.encode());
-        s.u64(1);
-        s.u64(3);
-        s.u8(0);
-        s.u8(0);
-        assert_eq!(slot.encode(), old_slot);
-        e.bytes(&old_slot);
-        assert_eq!(state.encode(), old);
-        let mut changed = old.clone();
-        changed[..4].copy_from_slice(b"RMF2");
-        assert!(SharedRecoveryManifest::decode(&changed).is_err());
-        let proof = expiry_certificate(
-            state
-                .expiry_claim(first.request(), 1, 3, OrderedBase::post_genesis(), 20)
-                .unwrap(),
-        );
-        assert_eq!(
-            SharedRecoveryExpiryCertificate::decode(&proof.encode()).unwrap(),
-            proof
-        );
-        state.apply_expiry(&proof, 2, 3).unwrap();
-        let mut bytes = state.encode();
-        bytes[..4].copy_from_slice(b"RMF1");
-        assert!(SharedRecoveryManifest::decode(&bytes).is_err());
-        let mut bytes = state.slots[0].encode();
-        bytes[..4].copy_from_slice(b"RSL1");
-        assert!(SharedRecoverySlot::decode(&bytes).is_err());
-        let mut bytes = proof.encode();
-        bytes.push(0);
-        assert!(SharedRecoveryExpiryCertificate::decode(&bytes).is_err());
-        assert!(
-            SharedRecoveryManifest::decode(&alloc::vec![0; MAX_SHARED_RECOVERY_MANIFEST_BYTES + 1])
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn custody_roundtrip_signature_and_exact_idempotence() {
-        let registration = registration(1, 9);
-        let mut manifest = manifest();
-        registration
-            .verify(manifest.generation(), manifest.committee())
-            .unwrap();
-        assert_eq!(
-            SharedRecoveryRegistration::decode(&registration.encode()).unwrap(),
-            registration
-        );
-        assert!(manifest.apply_registration(&registration, 1, 3).unwrap());
-        let original = manifest.clone();
-        assert!(!manifest.apply_registration(&registration, 2, 3).unwrap());
-        assert_eq!(manifest, original);
+    fn complete_management_evidence_round_trips_without_internal_read_records() {
+        let manifest = completed_management_manifest_for_test();
+        assert!(!manifest.is_empty());
+        assert_eq!(manifest.management_slots().len(), 1);
+        assert_eq!(manifest.observations().len(), 2);
         assert_eq!(
             SharedRecoveryManifest::decode(&manifest.encode()).unwrap(),
             manifest
         );
-        assert!(manifest.validate_at_raft_index(0).is_err());
-        manifest.validate_at_raft_index(1).unwrap();
+        manifest.validate_at(3).unwrap();
+        assert!(manifest.validate_at(2).is_err());
     }
-
     #[test]
-    fn exact_owner_sequence_replacement_requires_ack_and_previous_commitment() {
-        let first = registration(1, 9);
-        let mut state = manifest();
-        state.apply_registration(&first, 1, 3).unwrap();
-        let denied = replacement(&state, 1, 10);
-        let before = state.clone();
-        assert_eq!(
-            state.apply_registration(&denied, 2, 3),
-            Err(SharedRecoveryError::NotAcknowledged)
-        );
-        assert_eq!(state, before);
-        state.observe(&observation(&first, 10, false)).unwrap();
-        let before_ack = state.slot(node(1)).unwrap().commitment();
-        state.observe(&observation(&first, 11, true)).unwrap();
-        assert_ne!(before_ack, state.slot(node(1)).unwrap().commitment());
-        let next = replacement(&state, 1, 10);
-        let mut stale = next.request().clone();
-        stale.previous = Some(before_ack);
-        assert_eq!(
-            state.apply_registration(&sign(stale, 1), 12, 3),
-            Err(SharedRecoveryError::Sequence)
-        );
-        assert!(state.apply_registration(&next, 12, 3).unwrap());
-        assert_eq!(state.slot(node(1)).unwrap().sequence(), 2);
-        assert!(!state.slot(node(1)).unwrap().completed());
-        assert!(state.apply_registration(&first, 13, 3).is_err());
-    }
-
-    #[test]
-    fn every_owner_gets_same_exact_evidence_and_late_holder_inherits_it() {
-        let mut state = manifest();
-        let first = registration(1, 9);
-        let second = registration(2, 9);
-        state.apply_registration(&first, 1, 3).unwrap();
-        state.apply_registration(&second, 2, 3).unwrap();
-        let invoke = observation(&first, 10, false);
-        assert!(state.observe(&invoke).unwrap());
-        assert!(!state.observe(&invoke).unwrap());
-        let ack = observation(&first, 11, true);
-        state.observe(&ack).unwrap();
-        assert!(state.slots().iter().all(SharedRecoverySlot::completed));
-        state
-            .apply_registration(&registration(3, 9), 12, 3)
-            .unwrap();
-        assert_eq!(state.slots().len(), 3);
-        assert!(
-            state
-                .slots()
-                .iter()
-                .all(|slot| slot.invoke() == Some(invoke.observation())
-                    && slot.acknowledgement() == Some(ack.observation()))
-        );
-        assert_eq!(
-            SharedRecoveryManifest::decode(&state.encode()).unwrap(),
-            state
-        );
-        assert!(state.validate_at(11).is_err());
-        state.validate_at(12).unwrap();
-    }
-
-    #[test]
-    fn only_one_distinct_unfinished_projection_consumes_lifecycle_headroom() {
-        let first = registration(1, 9);
-        let different = registration(2, 10);
-        let mut state = manifest();
-        state.apply_registration(&first, 1, 3).unwrap();
-        for index in [2, 1023] {
-            let before = state.clone();
-            assert_eq!(
-                state.validate_registration(different.request()),
-                Err(SharedRecoveryError::Conflict)
-            );
-            assert_eq!(
-                state.apply_registration(&different, index, 3),
-                Err(SharedRecoveryError::Conflict)
-            );
-            assert_eq!(state, before);
-        }
-        state.apply_registration(&registration(2, 9), 2, 3).unwrap();
-        state.observe(&observation(&first, 3, false)).unwrap();
-        assert!(
-            state
-                .apply_registration(&registration(3, 10), 4, 3)
-                .is_err()
-        );
-        state.observe(&observation(&first, 4, true)).unwrap();
-        let next = replacement(&state, 2, 10);
-        state.apply_registration(&next, 5, 3).unwrap();
-        // The archived result is still recoverable and can gain another
-        // physical owner while a different unfinished projection is active.
-        state.apply_registration(&registration(3, 9), 6, 3).unwrap();
-        assert!(state.slot(node(3)).unwrap().completed());
-        assert!(!state.slot(node(2)).unwrap().completed());
-        let unchanged = state.clone();
-        assert!(!state.apply_registration(&first, 7, 3).unwrap());
-        assert_eq!(state, unchanged);
-
-        let mut malformed = state;
-        let slot = malformed
-            .slots
-            .iter_mut()
-            .find(|slot| slot.owner() == node(3))
-            .unwrap();
-        slot.invoke = None;
-        slot.acknowledgement = None;
-        assert_eq!(malformed.validate(), Err(SharedRecoveryError::Conflict));
-        assert!(SharedRecoveryManifest::decode(&malformed.encode()).is_err());
-    }
-
-    #[test]
-    fn same_invocation_changed_gas_authorization_or_foreign_owner_cannot_register() {
-        let first = registration(1, 9);
-        let mut state = manifest();
-        state.apply_registration(&first, 1, 3).unwrap();
-        let (query, mut work, _) = query_work(9);
-        work.gas += 1;
-        let authorization =
-            InvocationAuthorization::PublicPreflight(sdk::PublicPreflight::for_work(&work, 10));
-        let conflict = sign(
-            SharedRecoveryRegistrationRequest::new(
-                state.generation(),
-                state.committee().id(),
-                node(2),
-                1,
-                None,
-                query,
-                work,
+    fn replay_observations_bind_exact_preflight_for_public_query_and_management() {
+        for mode in [sdk::MethodMode::Query, sdk::MethodMode::Linear] {
+            let mut fixture = management_recovery_fixture_for_test(1, 7);
+            let RuntimeWork::Invoke {
+                invocation,
                 authorization,
-            )
-            .unwrap(),
-            2,
-        );
-        let before = state.clone();
-        assert_eq!(
-            state.apply_registration(&conflict, 2, 3),
-            Err(SharedRecoveryError::Conflict)
-        );
-        assert_eq!(state, before);
-        assert!(
-            state
-                .apply_registration(&registration(4, 10), 2, 3)
-                .is_err()
-        );
-        assert_eq!(state, before);
-    }
-
-    #[test]
-    fn changed_signed_fields_and_scope_are_not_accepted() {
-        let state = manifest();
-        let first = registration(1, 9);
-        let mut tampered = first.clone();
-        tampered.request.sequence = 2;
-        tampered.request.previous = Some(Hash([7; 32]));
-        assert_eq!(
-            tampered.verify(state.generation(), state.committee()),
-            Err(SharedRecoveryError::InvalidSignature)
-        );
-        let other_generation = AgentGenerationRouteKey::new(
-            state.generation().space(),
-            state.generation().agent(),
-            super::super::journal::AgentJournalGenesisId([8; 32]),
-            state.generation().admission(),
-        )
-        .unwrap();
-        assert_eq!(
-            first.verify(other_generation, state.committee()),
-            Err(SharedRecoveryError::ScopeMismatch)
-        );
-        let mut bytes = first.encode();
-        bytes.push(0);
-        assert!(SharedRecoveryRegistration::decode(&bytes).is_err());
-    }
-
-    #[test]
-    fn legacy_query_without_delegation_cannot_become_recovery_custody() {
-        let mut request = registration(1, 9).request().clone();
-        request.query.recovery = None;
-        // Preserve a canonically shaped, correctly signed legacy read and
-        // rebuild its exact work identity: rejection must be the missing
-        // delegation, not an incidental stale signature or message mismatch.
-        let signature = key(7).sign(&request.query.signing_bytes()).to_bytes();
-        let AuthorityIngressAuthentication::ApiCredentialSignature {
-            signature: stored, ..
-        } = &mut request.query.authentication
-        else {
-            unreachable!()
-        };
-        *stored = signature;
-        use crate::actors::codec::Encode as _;
-        let mut message = alloc::vec![crate::actors::value::TAG_DYNAMIC];
-        message.extend(
-            crate::actors::value::Msg::new("credential_projection")
-                .with(
-                    "query",
-                    crate::actors::value::Value::Bytes(request.query.encode().unwrap()),
-                )
-                .encode(),
-        );
-        let RuntimeWork::Invoke {
-            invocation,
-            authorization,
-            ..
-        } = &mut request.envelope
-        else {
-            unreachable!()
-        };
-        invocation.message = message;
-        invocation.invocation = sdk::InvocationId(
-            sdk::Hash::digest(
-                b"vos/system-authority/projection-invocation/v2",
-                &[request.query.commitment().as_bytes()],
-            )
-            .0,
-        );
-        **authorization = InvocationAuthorization::PublicPreflight(sdk::PublicPreflight::for_work(
-            invocation, 10,
-        ));
-        assert!(projection_query_matches_work(
-            &request.query,
-            request.work(),
-            request.authorization()
-        ));
-        assert_eq!(
-            request.validate(),
-            Err(SharedRecoveryError::InvalidEnvelope)
-        );
-        assert!(SharedRecoveryRegistrationRequest::decode(&request.encode()).is_err());
-    }
-
-    #[test]
-    fn clock_expiry_alone_never_releases_unseen_or_committed_slot() {
-        let first = registration(1, 9);
-        let mut state = manifest();
-        state.apply_registration(&first, 1, 3).unwrap();
-        assert!(!first.query().recovery.unwrap().admits_at(u64::MAX));
-        assert_eq!(
-            state.apply_registration(&replacement(&state, 1, 10), 2, 3),
-            Err(SharedRecoveryError::NotAcknowledged)
-        );
-        state.observe(&observation(&first, 10, false)).unwrap();
-        state.observe(&observation(&first, 11, true)).unwrap();
-        assert!(state.slot(node(1)).unwrap().completed());
-    }
-
-    #[test]
-    fn ack_without_invoke_and_conflicting_outcome_leave_manifest_unchanged() {
-        let first = registration(1, 9);
-        let mut state = manifest();
-        state.apply_registration(&first, 1, 3).unwrap();
-        let before = state.clone();
-        assert!(state.observe(&observation(&first, 11, true)).is_err());
-        assert_eq!(state, before);
-        state.observe(&observation(&first, 10, false)).unwrap();
-        let before = state.clone();
-        let mut changed = observation(&first, 10, false);
-        let RuntimeOutcome::Completed(Ok(reply)) = &mut changed.0.outcome else {
-            unreachable!()
-        };
-        reply.reply.push(1);
-        assert_eq!(state.observe(&changed), Err(SharedRecoveryError::Conflict));
-        assert_eq!(state, before);
-    }
-
-    #[test]
-    fn repeated_positions_keep_first_invoke_and_positive_ack_capsule() {
-        let first = registration(1, 9);
-        let mut state = manifest();
-        state.apply_registration(&first, 1, 3).unwrap();
-        state.observe(&observation(&first, 2, false)).unwrap();
-        state.observe(&observation(&first, 3, true)).unwrap();
-        state.apply_registration(&registration(2, 9), 4, 3).unwrap();
-        let canonical = state.clone();
-        for (index, ack) in [(5, false), (6, true), (7, false), (8, true)] {
-            let mut repeated = observation(&first, index, ack);
-            if index == 7 {
-                repeated.0.outcome = RuntimeOutcome::Completed(Err(sdk::InvocationError::NotFound));
+                ..
+            } = &mut fixture.envelope
+            else {
+                unreachable!()
+            };
+            invocation.mode = mode;
+            **authorization = InvocationAuthorization::PublicPreflight(
+                sdk::PublicPreflight::for_work(invocation, 10),
+            );
+            fixture.envelope.encode().unwrap();
+            for acknowledge in [false, true] {
+                let verified = management_observation_for_test(&fixture, 2, acknowledge);
+                let observation = verified.observation();
+                assert_eq!(
+                    SharedRecoveryObservation::decode(&observation.encode()).unwrap(),
+                    *observation
+                );
+                let mut wrong = observation.clone();
+                if let ReplayOperation::CleanInvoke { observed_slot, .. } =
+                    &mut wrong.input.operation
+                {
+                    *observed_slot += 1;
+                    assert!(wrong.validate().is_err());
+                }
             }
-            assert!(!state.observe(&repeated).unwrap());
-            assert_eq!(state, canonical);
         }
-        assert_eq!(
-            SharedRecoveryManifest::decode(&state.encode()).unwrap(),
-            canonical
-        );
-        let mut foreign = observation(&first, 9, false);
-        let old = foreign.0.claim();
-        foreign.0.claim = OrderedCommitClaim::new(
-            old.genesis(),
-            old.admission(),
-            AgentReplicaCommitteeId::from_bytes([0xff; 32]),
-            old.raft_index(),
-            old.raft_term(),
-            old.ordered(),
-            old.merge_frontier(),
-            old.merge().clone(),
-            old.merge_invocations(),
-            old.runtime().clone(),
-            old.control().clone(),
-            old.linear().clone(),
-            old.ordered_invocations(),
-            old.artifacts(),
-            old.merge_fence(),
-            old.sealed_merge().cloned(),
-            old.fence_ancestry(),
-        )
-        .unwrap();
-        assert_eq!(
-            state.observe(&foreign),
-            Err(SharedRecoveryError::ScopeMismatch)
-        );
-        assert_eq!(state, canonical);
-    }
-
-    #[test]
-    fn observation_binding_and_public_outcome_validation_fail_closed() {
-        let first = registration(1, 9);
-        let observation = observation(&first, 10, false);
-        let value = observation.observation();
-        assert_eq!(
-            SharedRecoveryObservation::decode(&value.encode()).unwrap(),
-            *value
-        );
-        value
-            .validate_binding(10, 3, value.claim_commitment(), value.input())
-            .unwrap();
-        assert!(
-            value
-                .validate_binding(11, 3, value.claim_commitment(), value.input())
-                .is_err()
-        );
-        assert!(
-            value
-                .validate_binding(10, 4, value.claim_commitment(), value.input())
-                .is_err()
-        );
-        assert!(
-            value
-                .validate_binding(10, 3, Hash([0xff; 32]), value.input())
-                .is_err()
-        );
-        let mut invalid = value.clone();
-        let RuntimeOutcome::Completed(Ok(reply)) = &mut invalid.outcome else {
-            unreachable!()
-        };
-        reply.gas_remaining = first.work().gas + 1;
-        assert_eq!(
-            invalid.validate(),
-            Err(SharedRecoveryError::InvalidObservation)
-        );
-        let mut invalid = value.clone();
-        let RuntimeOutcome::Completed(Ok(reply)) = &mut invalid.outcome else {
-            unreachable!()
-        };
-        reply.lane = Some(sdk::StateLane::Linear);
-        assert!(invalid.validate().is_err());
-        let mut invalid = value.clone();
-        invalid.outcome = RuntimeOutcome::Acknowledged(Err(sdk::InvocationError::NotFound));
-        assert!(invalid.validate().is_err());
-    }
-
-    #[test]
-    fn canonical_slot_count_order_and_complete_byte_limits_are_enforced() {
-        let mut state = manifest();
-        state.apply_registration(&registration(1, 9), 1, 3).unwrap();
-        state.apply_registration(&registration(2, 9), 2, 3).unwrap();
-        let mut reversed = state.clone();
-        reversed.slots.reverse();
-        assert!(SharedRecoveryManifest::decode(&reversed.encode()).is_err());
-        let mut excessive = state.clone();
-        excessive.slots.extend(state.slots.clone());
-        assert_eq!(
-            SharedRecoveryManifest::decode(&excessive.encode()),
-            Err(DecodeError::LimitExceeded)
-        );
-        let mut bytes = state.encode();
-        bytes.resize(MAX_SHARED_RECOVERY_MANIFEST_BYTES + 1, 0);
-        assert_eq!(
-            SharedRecoveryManifest::decode(&bytes),
-            Err(DecodeError::LimitExceeded)
-        );
-        assert!(state.encode().len() <= MAX_SHARED_RECOVERY_MANIFEST_BYTES);
     }
 }

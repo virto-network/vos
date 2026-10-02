@@ -212,7 +212,7 @@ fn enroll_replica(owner: &mut MemoryBootstrapOwner, node_key: &SigningKey, nonce
         signature,
     };
     let current =
-        AuthorityCredentialProjection::decode(&owner.invoke_authority_projection(query).unwrap())
+        AuthorityCredentialProjection::decode(&invoke_public_authority_query_for_test(owner, query))
             .unwrap();
     let target = owner.authority_target();
     let mut material = owner
@@ -310,6 +310,46 @@ enum ExternalNetworkExercise {
     LostResponse,
     Checkpoint(Option<crate::agent::shared_host::CommonCheckpointCrashStage>),
     RetainedCheckpoint,
+    HostRestore(Option<crate::agent::shared_host::CommonCheckpointCrashStage>),
+}
+
+#[test]
+#[ignore = "requires compiled external runtime/Authority, CLERK_AGENT_PACKAGE and authenticated loopback"]
+fn three_network_replicas_external_clerk_host_restore_reopen_and_continue() {
+    external_clerk_lifecycle(true, ExternalNetworkExercise::HostRestore(None));
+}
+
+#[test]
+#[ignore = "requires compiled external runtime/Authority, CLERK_AGENT_PACKAGE and authenticated loopback"]
+fn three_network_replicas_external_clerk_host_restore_recovers_marker_crash() {
+    external_clerk_lifecycle(
+        true,
+        ExternalNetworkExercise::HostRestore(Some(
+            crate::agent::shared_host::CommonCheckpointCrashStage::Marker,
+        )),
+    );
+}
+
+#[test]
+#[ignore = "requires compiled external runtime/Authority, CLERK_AGENT_PACKAGE and authenticated loopback"]
+fn three_network_replicas_external_clerk_host_restore_recovers_journal_crash() {
+    external_clerk_lifecycle(
+        true,
+        ExternalNetworkExercise::HostRestore(Some(
+            crate::agent::shared_host::CommonCheckpointCrashStage::Journal,
+        )),
+    );
+}
+
+#[test]
+#[ignore = "requires compiled external runtime/Authority, CLERK_AGENT_PACKAGE and authenticated loopback"]
+fn three_network_replicas_external_clerk_host_restore_recovers_ledger_crash() {
+    external_clerk_lifecycle(
+        true,
+        ExternalNetworkExercise::HostRestore(Some(
+            crate::agent::shared_host::CommonCheckpointCrashStage::Ledger,
+        )),
+    );
 }
 
 #[test]
@@ -549,14 +589,7 @@ fn external_clerk_lifecycle(with_network: bool, exercise: ExternalNetworkExercis
     assert_eq!(receipt_signer.calls, 1);
     assert_eq!(owner.ordered_index_for_test().unwrap(), applied);
     let mut query = IssuerMemoryStore::default();
-    let authority_committee = owner
-        .query_genesis_committee(
-            &prepared,
-            &slot,
-            &mut query,
-            &mut IssuerMemoryStore::default(),
-        )
-        .unwrap();
+    let authority_committee = owner.query_genesis_committee(&prepared, &slot).unwrap();
     let signature = super::super::super::genesis_issuance::issue(
         &prepared,
         &authority_committee,
@@ -578,7 +611,7 @@ fn external_clerk_lifecycle(with_network: bool, exercise: ExternalNetworkExercis
                 &prepared,
                 &authority_committee,
                 &record,
-                &mut query,
+                &slot,
                 &mut publication,
                 &mut publication_reply,
             )
@@ -590,7 +623,7 @@ fn external_clerk_lifecycle(with_network: bool, exercise: ExternalNetworkExercis
             &prepared,
             &authority_committee,
             &record,
-            &mut query,
+            &slot,
             &mut publication,
             &mut publication_reply,
         )
@@ -600,7 +633,7 @@ fn external_clerk_lifecycle(with_network: bool, exercise: ExternalNetworkExercis
             &prepared,
             &authority_committee,
             &record,
-            &mut query,
+            &slot,
             &mut publication,
             &mut publication_reply,
         )
@@ -1020,10 +1053,15 @@ fn external_network_lifecycle(
         descriptor.authority.initial_epoch,
     )
     .unwrap();
+    let provision_authority = authority;
     let directories: Vec<_> = keys
         .iter()
         .map(|_| TestDirectory::new("external-shared-network-owner"))
         .collect();
+    let restore_directory = matches!(exercise, ExternalNetworkExercise::HostRestore(_))
+        .then(|| TestDirectory::new("external-shared-host-restore"));
+    let restore_destination = std::cell::Cell::new(None);
+    let mut restored_host = None;
     let merges: Vec<Arc<dyn LocalMergeAuthenticator>> = keys
         .iter()
         .map(|key| {
@@ -1036,6 +1074,11 @@ fn external_network_lifecycle(
         })
         .collect();
     let open = |index: usize, candidate: bool| {
+        let directory = if restore_destination.get() == Some(index) {
+            restore_directory.as_ref().unwrap()
+        } else {
+            &directories[index]
+        };
         let scope = crate::agent::host::AgentHostScope {
             space: HostSpaceId(descriptor.identity.space.0),
             node: merges[index].node(),
@@ -1043,8 +1086,8 @@ fn external_network_lifecycle(
         let proof: Arc<dyn AgentGenesisFinalityVerifier> = Arc::new(finality.clone());
         if candidate {
             SharedAgentHost::open_external_candidates(
-                directories[index].host(),
-                directories[index].lock(),
+                directory.host(),
+                directory.lock(),
                 scope,
                 fixture.trust.clone(),
                 merges[index].clone(),
@@ -1053,8 +1096,8 @@ fn external_network_lifecycle(
             )
         } else {
             SharedAgentHost::open(
-                directories[index].host(),
-                directories[index].lock(),
+                directory.host(),
+                directory.lock(),
                 scope,
                 fixture.trust.clone(),
                 merges[index].clone(),
@@ -1565,10 +1608,11 @@ fn external_network_lifecycle(
         },
     }
     .id();
+    let root_acknowledgement = external_network_on_leader(&attached, agent, |owner| {
+        owner.supervisor_acknowledge(identity, root_work.clone(), root_authorization.clone())
+    });
     assert!(matches!(
-        external_network_on_leader(&attached, agent, |owner| {
-            owner.supervisor_acknowledge(identity, root_work.clone(), root_authorization.clone())
-        }),
+        &root_acknowledgement,
         RuntimeOutcome::Acknowledged(Ok(_))
     ));
     let mut completed = None;
@@ -1690,6 +1734,7 @@ fn external_network_lifecycle(
     let checkpoint_crash = match exercise {
         ExternalNetworkExercise::Checkpoint(crash) => Some(crash),
         ExternalNetworkExercise::RetainedCheckpoint => Some(None),
+        ExternalNetworkExercise::HostRestore(_) => Some(None),
         ExternalNetworkExercise::LostResponse => None,
     };
     if let Some(crash) = checkpoint_crash {
@@ -1699,7 +1744,14 @@ fn external_network_lifecycle(
         // replies retain availability after physical compaction.
         drop(attached);
         let leaf: String = agent.0.iter().map(|byte| format!("{byte:02x}")).collect();
-        let journal_root = |index: usize| directories[index].host().join(format!("{leaf}.agent"));
+        let journal_root = |index: usize| {
+            if restore_destination.get() == Some(index) {
+                restore_directory.as_ref().unwrap().host()
+            } else {
+                directories[index].host()
+            }
+            .join(format!("{leaf}.agent"))
+        };
         if crash.is_none() && !retained_mode {
             let mut host = hosts[0].lock().unwrap();
             let position = host.journal_position(agent).unwrap();
@@ -2344,9 +2396,251 @@ fn external_network_lifecycle(
                     Ok(audited)
                 })
                 .unwrap();
-            let destination_index = (checkpoint_owner + 1) % merges.len();
-            let destination_node = merges[destination_index].node();
-            let destination_seal =
+            if let ExternalNetworkExercise::HostRestore(cut) = exercise {
+                // The destination is an independently admitted actual host,
+                // still at Create, not a hand-assembled file/ledger driver.
+                let destination_index = (checkpoint_owner + 1) % merges.len();
+                restore_destination.set(Some(destination_index));
+                let mut lagging = open(destination_index, true).unwrap();
+                lagging
+                    .provision_replay_verified(
+                        provision.clone(),
+                        catalog.to_vec(),
+                        provision_authority,
+                        finality,
+                    )
+                    .unwrap();
+                assert!(lagging.uses_external_state(agent).unwrap());
+                assert_eq!(lagging.journal_position(agent).unwrap().ordered_index, 0);
+                let physical = lagging.physical_route(agent).unwrap();
+                let before_heads =
+                    std::fs::read(journal_root(destination_index).join("heads")).unwrap();
+                let baseline = if authority.0.claim().recovery_manifest().is_some() {
+                    host.common_snapshot_recovery_manifest_for_test(agent)
+                        .unwrap()
+                } else {
+                    None
+                };
+                if let Some(cut) = cut {
+                    lagging.set_common_checkpoint_crash_for_test(cut);
+                }
+                let result = lagging.restore_external_common_checkpoint(
+                    agent,
+                    &mut staged,
+                    &source_seal,
+                    &authority.0,
+                    &authority.1,
+                    baseline.as_ref(),
+                    limits,
+                );
+                let marker = restore_directory
+                    .as_ref()
+                    .unwrap()
+                    .host()
+                    .join(format!("{leaf}.shared-portable-restore"));
+                if let Some(cut) = cut {
+                    assert!(
+                        matches!(&result, Err(SharedAgentHostError::Unavailable)),
+                        "external host restore must reach the requested {cut:?} cut: {result:?}"
+                    );
+                    assert!(!lagging.common_checkpoint_crash_pending_for_test());
+                    assert!(lagging.show(agent).unwrap().is_none());
+                    assert!(lagging.physical_route(agent).is_err());
+                    assert!(
+                        lagging
+                            .supervisor_attachment_status(agent)
+                            .unwrap()
+                            .is_none()
+                    );
+                    let (predecessor, target) = lagging
+                        .common_checkpoint_install_endpoints_for_test(agent)
+                        .unwrap()
+                        .expect("external restore cut must retain its exact marker");
+                    assert_eq!(predecessor.encode(), before_heads);
+                    let durable =
+                        std::fs::read(journal_root(destination_index).join("heads")).unwrap();
+                    assert_eq!(
+                        durable,
+                        match cut {
+                            crate::agent::shared_host::CommonCheckpointCrashStage::Marker =>
+                                predecessor.encode(),
+                            crate::agent::shared_host::CommonCheckpointCrashStage::Journal
+                            | crate::agent::shared_host::CommonCheckpointCrashStage::Ledger =>
+                                target.encode(),
+                        }
+                    );
+                    let marker_bytes = std::fs::read(&marker).unwrap();
+                    let marker_record = if matches!(
+                        cut,
+                        crate::agent::shared_host::CommonCheckpointCrashStage::Marker
+                    ) {
+                        // Model recovery of the exact admitted ACX1 through
+                        // its stage-only name, without changing signed bytes
+                        // or claiming a publisher/power-loss fault injection.
+                        let staged = marker.with_extension("shared-portable-restore.next");
+                        assert!(!staged.exists());
+                        std::fs::rename(&marker, &staged).unwrap();
+                        std::fs::File::open(staged.parent().unwrap())
+                            .unwrap()
+                            .sync_all()
+                            .unwrap();
+                        staged
+                    } else {
+                        marker.clone()
+                    };
+                    let heads_stage = journal_root(destination_index).join("heads.next");
+                    let heads_stage_bytes = matches!(
+                        cut,
+                        crate::agent::shared_host::CommonCheckpointCrashStage::Marker
+                    )
+                    .then(|| target.encode());
+                    if let Some(bytes) = &heads_stage_bytes {
+                        // Model host recovery at the existing synced-head
+                        // stage using the exact already-audited signed target.
+                        // This does not claim a new injected publisher crash.
+                        let mut stage = std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&heads_stage)
+                            .unwrap();
+                        std::io::Write::write_all(&mut stage, bytes).unwrap();
+                        stage.sync_all().unwrap();
+                        drop(stage);
+                        std::fs::File::open(journal_root(destination_index))
+                            .unwrap()
+                            .sync_all()
+                            .unwrap();
+                    }
+                    let retained_files =
+                        external_gc_storage_fingerprint(&journal_root(destination_index));
+                    assert!(
+                        lagging
+                            .compact_external_common_checkpoint(agent, external_gc_limits(1))
+                            .is_err(),
+                        "an ACX1 endpoint marker must not authorize reclamation"
+                    );
+                    assert_eq!(
+                        external_gc_storage_fingerprint(&journal_root(destination_index)),
+                        retained_files
+                    );
+                    assert_eq!(std::fs::read(&marker_record).unwrap(), marker_bytes);
+                    assert_eq!(marker.exists(), marker_record == marker);
+                    drop(lagging);
+                    // Startup must audit both actual endpoint trees before
+                    // promotion/cleanup, even when the ledger is installed.
+                    for (name, endpoint) in [("predecessor", &predecessor), ("target", &target)] {
+                        let path = external_checkpoint_root_block_path(
+                            &journal_root(destination_index),
+                            endpoint,
+                        );
+                        let parked = restore_directory
+                            .as_ref()
+                            .unwrap()
+                            .0
+                            .join(format!("parked-host-restore-{name}"));
+                        std::fs::rename(&path, &parked).unwrap();
+                        assert!(
+                            open(destination_index, true).is_err(),
+                            "missing {name} tree must refuse host restart"
+                        );
+                        assert!(
+                            !path.exists(),
+                            "restart must not recopy a committed missing block from quarantine"
+                        );
+                        assert_eq!(
+                            std::fs::read(journal_root(destination_index).join("heads")).unwrap(),
+                            durable
+                        );
+                        assert_eq!(std::fs::read(&marker_record).unwrap(), marker_bytes);
+                        assert_eq!(marker.exists(), marker_record == marker);
+                        assert_eq!(std::fs::read(&heads_stage).ok(), heads_stage_bytes);
+                        std::fs::rename(&parked, &path).unwrap();
+                    }
+                    // A marker is not authority to truncate a later physical
+                    // suffix. This negative test uses the normal log writer;
+                    // it does not pretend the uncommitted entries were applied.
+                    {
+                        let database =
+                            Arc::new(redb::Database::create(&physical.raft_database).unwrap());
+                        let meta = crate::raft::RaftMeta::load(&database).unwrap();
+                        let mut log = crate::raft::RaftLog::open(database.clone()).unwrap();
+                        let transaction = database.begin_write().unwrap();
+                        let payload = crate::agent::shared_raft::encode_agent_raft_entry_kind(
+                            &vos_raft::EntryKind::Data {
+                                payload: Vec::new(),
+                            },
+                        )
+                        .unwrap();
+                        while log.last_index() <= authority.0.claim().ordered().raft_index() {
+                            log.append_in_txn(
+                                &transaction,
+                                authority.0.claim().ordered().raft_term(),
+                                &payload,
+                            )
+                            .unwrap();
+                        }
+                        transaction.commit().unwrap();
+                        drop(log);
+                        drop(database);
+                        assert!(
+                            open(destination_index, true).is_err(),
+                            "even exact installed marker retry must refuse a later uncommitted suffix"
+                        );
+                        assert_eq!(
+                            std::fs::read(journal_root(destination_index).join("heads")).unwrap(),
+                            durable
+                        );
+                        assert_eq!(std::fs::read(&marker_record).unwrap(), marker_bytes);
+                        assert_eq!(marker.exists(), marker_record == marker);
+                        assert_eq!(std::fs::read(&heads_stage).ok(), heads_stage_bytes);
+                        let database =
+                            Arc::new(redb::Database::create(&physical.raft_database).unwrap());
+                        assert_eq!(crate::raft::RaftMeta::load(&database).unwrap(), meta);
+                        let mut log = crate::raft::RaftLog::open(database.clone()).unwrap();
+                        let transaction = database.begin_write().unwrap();
+                        log.truncate_after_in_txn(
+                            &transaction,
+                            meta.snap_last_index.max(meta.last_applied),
+                        )
+                        .unwrap();
+                        transaction.commit().unwrap();
+                    }
+                } else {
+                    result.unwrap();
+                    assert!(!marker.exists());
+                    drop(lagging);
+                }
+                let mut reopened = open(destination_index, true).unwrap();
+                assert!(reopened.uses_external_state(agent).unwrap());
+                let installed = reopened
+                    .common_snapshot_authority_for_test(agent)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(installed.0, authority.0);
+                installed
+                    .1
+                    .verify(&installed.0, installed.1.claim())
+                    .unwrap();
+                assert_ne!(installed.1, authority.1);
+                assert_eq!(reopened.journal_position(agent).unwrap(), position);
+                assert!(reopened.physical_route(agent).is_ok());
+                assert!(!marker.exists());
+                assert!(
+                    !marker
+                        .with_extension("shared-portable-restore.next")
+                        .exists()
+                );
+                assert!(!journal_root(destination_index).join("heads.next").exists());
+                restored_host = Some((destination_index, reopened));
+                assert_eq!(
+                    std::fs::read(scratch_root.join("heads")).unwrap(),
+                    scratch_heads
+                );
+                assert!(!scratch_root.join("heads.next").exists());
+            } else {
+                let destination_index = (checkpoint_owner + 1) % merges.len();
+                let destination_node = merges[destination_index].node();
+                let destination_seal =
                 LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_external_shared_genesis(
                     &verified,
                     committee
@@ -2358,256 +2652,296 @@ fn external_network_lifecycle(
                     destination_node,
                 )
                 .unwrap();
-            let destination_directory =
-                TestDirectory::new("external-checkpoint-rebind-destination");
-            let destination_parent = std::fs::File::open(&destination_directory.0).unwrap();
-            let destination_root = destination_directory.0.join(format!("{leaf}.agent"));
-            let destination_intent = HostHash::digest(
-                b"vos/test/external-checkpoint-rebind-destination/v1",
-                &[
-                    destination_seal.genesis().id().as_bytes(),
-                    destination_node.as_bytes(),
-                ],
-            );
-            let destination_slot = FileLocalAgentJournalSlot::acquire_with_pinned_parents(
-                &destination_root,
-                destination_root.with_extension("agent-lock"),
-                destination_node,
-                destination_intent,
-                &destination_parent,
-                &destination_parent,
-            )
-            .unwrap();
-            let mut destination_store = destination_slot
-                .open_external_genesis(
-                    &destination_seal,
-                    false,
-                    &mut Driver::external_recovery_budget(),
+                let destination_directory =
+                    TestDirectory::new("external-checkpoint-rebind-destination");
+                let destination_parent = std::fs::File::open(&destination_directory.0).unwrap();
+                let destination_root = destination_directory.0.join(format!("{leaf}.agent"));
+                let destination_intent = HostHash::digest(
+                    b"vos/test/external-checkpoint-rebind-destination/v1",
+                    &[
+                        destination_seal.genesis().id().as_bytes(),
+                        destination_node.as_bytes(),
+                    ],
+                );
+                let destination_slot = FileLocalAgentJournalSlot::acquire_with_pinned_parents(
+                    &destination_root,
+                    destination_root.with_extension("agent-lock"),
+                    destination_node,
+                    destination_intent,
+                    &destination_parent,
+                    &destination_parent,
                 )
                 .unwrap();
-            for blob in catalog {
-                destination_store
-                    .put_blob(
-                        JournalBlobClass::CatalogArtifact,
-                        &blob.reference,
-                        &blob.bytes,
+                let mut destination_store = destination_slot
+                    .open_external_genesis(
+                        &destination_seal,
+                        false,
+                        &mut Driver::external_recovery_budget(),
                     )
                     .unwrap();
-            }
-            destination_store
-                .initialize_external_local(
-                    &destination_seal,
-                    &mut Driver::external_recovery_budget(),
+                for blob in catalog {
+                    destination_store
+                        .put_blob(
+                            JournalBlobClass::CatalogArtifact,
+                            &blob.reference,
+                            &blob.bytes,
+                        )
+                        .unwrap();
+                }
+                destination_store
+                    .initialize_external_local(
+                        &destination_seal,
+                        &mut Driver::external_recovery_budget(),
+                    )
+                    .unwrap();
+                let destination_predecessor = destination_store.heads().unwrap().unwrap();
+                let rebound =
+                    crate::agent::shared_journal_driver::preflight_external_common_rebind(
+                        audited,
+                        &mut staged,
+                        &destination_seal,
+                        &destination_store,
+                        &destination_predecessor,
+                    )
+                    .unwrap();
+                assert_eq!(rebound.predecessor(), &destination_predecessor);
+                assert_eq!(rebound.heads().node, destination_node);
+                assert_eq!(rebound.heads().previous, Some(destination_predecessor.id()));
+                assert_eq!(rebound.heads().ordered_head, source_heads.ordered_head);
+                assert_eq!(rebound.heads().ordered_index, source_heads.ordered_index);
+                assert_eq!(rebound.certificate(), &authority.0);
+                assert_eq!(rebound.source_binding(), &authority.1);
+                assert_ne!(rebound.heads().id(), source_heads.id());
+                let source_checkpoint = staged
+                    .with_source_view(|view| {
+                        view.get::<crate::agent::journal::CheckpointManifest>(
+                            source_heads.checkpoint.unwrap(),
+                        )?
+                        .ok_or(crate::agent::journal_store::JournalStoreError::MissingObject)
+                    })
+                    .unwrap();
+                for lane in [
+                    crate::agent::journal::PersistedLane::Control,
+                    crate::agent::journal::PersistedLane::Linear,
+                    crate::agent::journal::PersistedLane::Merge,
+                ] {
+                    assert_eq!(
+                        rebound
+                            .checkpoint()
+                            .lanes
+                            .iter()
+                            .find(|entry| entry.lane == lane),
+                        source_checkpoint
+                            .lanes
+                            .iter()
+                            .find(|entry| entry.lane == lane),
+                        "common lane declarations must not be localized or reconstructed",
+                    );
+                }
+                let destination_generation = AgentGenerationRouteKey::new(
+                    committee.space(),
+                    committee.agent(),
+                    destination_seal.genesis().id(),
+                    destination_seal.admission_record().unwrap().id(),
                 )
                 .unwrap();
-            let destination_predecessor = destination_store.heads().unwrap().unwrap();
-            let rebound = crate::agent::shared_journal_driver::preflight_external_common_rebind(
-                audited,
-                &mut staged,
-                &destination_seal,
-                &destination_store,
-                &destination_predecessor,
-            )
-            .unwrap();
-            assert_eq!(rebound.predecessor(), &destination_predecessor);
-            assert_eq!(rebound.heads().node, destination_node);
-            assert_eq!(rebound.heads().previous, Some(destination_predecessor.id()));
-            assert_eq!(rebound.heads().ordered_head, source_heads.ordered_head);
-            assert_eq!(rebound.heads().ordered_index, source_heads.ordered_index);
-            assert_eq!(rebound.certificate(), &authority.0);
-            assert_eq!(rebound.source_binding(), &authority.1);
-            assert_ne!(rebound.heads().id(), source_heads.id());
-            let source_checkpoint = staged
-                .with_source_view(|view| {
-                    view.get::<crate::agent::journal::CheckpointManifest>(
-                        source_heads.checkpoint.unwrap(),
-                    )?
-                    .ok_or(crate::agent::journal_store::JournalStoreError::MissingObject)
-                })
+                let destination_authority = CommitteeChangeAuthorityBinding::new(
+                    descriptor.authority.policy,
+                    descriptor.authority.issuer,
+                    descriptor.identity.runtime_deployment,
+                    descriptor.authority.public_key,
+                    descriptor.authority.initial_epoch,
+                )
                 .unwrap();
-            for lane in [
-                crate::agent::journal::PersistedLane::Control,
-                crate::agent::journal::PersistedLane::Linear,
-                crate::agent::journal::PersistedLane::Merge,
-            ] {
+                let destination_ledger = AgentRaftApplicationLedgerV2::open(
+                    Arc::new(
+                        redb::Database::create(destination_directory.0.join("raft.redb")).unwrap(),
+                    ),
+                    destination_generation,
+                    destination_store.instance_id(),
+                    destination_node,
+                    committee.clone(),
+                    destination_authority,
+                )
+                .unwrap();
+                let foundation = destination_ledger
+                    .common_restore_foundation(rebound.certificate())
+                    .unwrap();
+                let unsigned = rebound.physical_claim(&foundation).unwrap();
+                assert_eq!(unsigned.local_node(), destination_node);
                 assert_eq!(
-                    rebound
-                        .checkpoint()
-                        .lanes
-                        .iter()
-                        .find(|entry| entry.lane == lane),
-                    source_checkpoint
-                        .lanes
-                        .iter()
-                        .find(|entry| entry.lane == lane),
-                    "common lane declarations must not be localized or reconstructed",
+                    &unsigned.journal_store().0,
+                    destination_store.instance_id().as_bytes()
                 );
-            }
-            let destination_generation = AgentGenerationRouteKey::new(
-                committee.space(),
-                committee.agent(),
-                destination_seal.genesis().id(),
-                destination_seal.admission_record().unwrap().id(),
-            )
-            .unwrap();
-            let destination_authority = CommitteeChangeAuthorityBinding::new(
-                descriptor.authority.policy,
-                descriptor.authority.issuer,
-                descriptor.identity.runtime_deployment,
-                descriptor.authority.public_key,
-                descriptor.authority.initial_epoch,
-            )
-            .unwrap();
-            let destination_ledger = AgentRaftApplicationLedgerV2::open(
-                Arc::new(
-                    redb::Database::create(destination_directory.0.join("raft.redb")).unwrap(),
-                ),
-                destination_generation,
-                destination_store.instance_id(),
-                destination_node,
-                committee.clone(),
-                destination_authority,
-            )
-            .unwrap();
-            let foundation = destination_ledger
-                .common_restore_foundation(rebound.certificate())
-                .unwrap();
-            let unsigned = rebound.physical_claim(&foundation).unwrap();
-            assert_eq!(unsigned.local_node(), destination_node);
-            assert_eq!(
-                &unsigned.journal_store().0,
-                destination_store.instance_id().as_bytes()
-            );
-            assert_eq!(unsigned.journal_heads(), rebound.heads().id());
-            assert_eq!(unsigned.ordered(), authority.0.claim().ordered());
-            rebound
-                .require_current(&mut staged, &destination_store, &destination_seal)
-                .unwrap();
-            assert_eq!(
-                destination_store.heads().unwrap().as_ref(),
-                Some(&destination_predecessor)
-            );
-            assert!(
-                destination_ledger
-                    .common_snapshot_authority()
-                    .unwrap()
-                    .is_none()
-            );
-            assert!(!destination_root.join("heads.next").exists());
-            // All preceding assertions are read-only preflight evidence. The
-            // independently admitted destination now commits its own initial
-            // exposure before typed catch-up changes any mutable head.
-            destination_store
-                .commit_external_genesis_exposure(
-                    &destination_seal,
-                    destination_intent,
-                    &mut Driver::external_recovery_budget(),
-                )
-                .unwrap();
-            staged
-                .promote_authenticated_source(
-                    &source_seal,
-                    &destination_seal,
-                    &rebound,
+                assert_eq!(unsigned.journal_heads(), rebound.heads().id());
+                assert_eq!(unsigned.ordered(), authority.0.claim().ordered());
+                rebound
+                    .require_current(&mut staged, &destination_store, &destination_seal)
+                    .unwrap();
+                assert_eq!(
+                    destination_store.heads().unwrap().as_ref(),
+                    Some(&destination_predecessor)
+                );
+                assert!(
+                    destination_ledger
+                        .common_snapshot_authority()
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(!destination_root.join("heads.next").exists());
+                // All preceding assertions are read-only preflight evidence. The
+                // independently admitted destination now commits its own initial
+                // exposure before typed catch-up changes any mutable head.
+                destination_store
+                    .commit_external_genesis_exposure(
+                        &destination_seal,
+                        destination_intent,
+                        &mut Driver::external_recovery_budget(),
+                    )
+                    .unwrap();
+                staged
+                    .promote_authenticated_source(
+                        &source_seal,
+                        &destination_seal,
+                        &rebound,
+                        &mut destination_store,
+                        limits,
+                        &mut Driver::external_recovery_budget(),
+                    )
+                    .unwrap();
+                rebound
+                    .stage_metadata(&mut staged, &mut destination_store, &destination_seal)
+                    .unwrap();
+                crate::agent::replay::validate_external_checkpoint_heads(
                     &mut destination_store,
-                    limits,
+                    rebound.heads(),
                     &mut Driver::external_recovery_budget(),
                 )
                 .unwrap();
-            rebound
-                .stage_metadata(&mut staged, &mut destination_store, &destination_seal)
-                .unwrap();
-            crate::agent::replay::validate_external_checkpoint_heads(
-                &mut destination_store,
-                rebound.heads(),
-                &mut Driver::external_recovery_budget(),
-            )
-            .unwrap();
-            let candidate = crate::agent::shared_host::VerifiedSharedAgentLocalSnapshotCandidate::from_reconstructed_for_test(
+                let candidate = crate::agent::shared_host::VerifiedSharedAgentLocalSnapshotCandidate::from_reconstructed_for_test(
                 authority.0.commitment(),
                 unsigned,
             );
-            let destination_binding =
-                crate::agent::shared_commit::SharedAgentLocalSnapshotBinding::new(
-                    authority.0.commitment(),
-                    candidate.claim().clone(),
-                    merges[destination_index]
-                        .sign_local_snapshot_candidate(&candidate)
-                        .unwrap(),
-                )
-                .unwrap();
-            destination_binding
-                .verify(&authority.0, candidate.claim())
-                .unwrap();
-            assert_ne!(destination_binding, authority.1);
-            destination_ledger
-                .validate_bound_common_restore(&authority.0, &destination_binding)
-                .unwrap();
-            let certified_recovery = host
-                .common_snapshot_recovery_manifest_for_test(agent)
-                .unwrap();
-            let recovery = certified_recovery.clone().unwrap_or_else(|| {
-                crate::agent::shared_recovery::SharedRecoveryManifest::new(
-                    destination_generation,
-                    committee.clone(),
-                )
-                .unwrap()
-            });
-            recovery
-                .validate_at_raft_index(authority.0.claim().ordered().raft_index())
-                .unwrap();
-            assert_eq!(recovery.generation(), destination_generation);
-            assert_eq!(recovery.committee(), &committee);
-            match authority.0.claim().recovery_manifest() {
-                Some(commitment) => {
-                    assert_eq!(certified_recovery.unwrap().commitment(), commitment);
+                let destination_binding =
+                    crate::agent::shared_commit::SharedAgentLocalSnapshotBinding::new(
+                        authority.0.commitment(),
+                        candidate.claim().clone(),
+                        merges[destination_index]
+                            .sign_local_snapshot_candidate(&candidate)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                destination_binding
+                    .verify(&authority.0, candidate.claim())
+                    .unwrap();
+                assert_ne!(destination_binding, authority.1);
+                destination_ledger
+                    .validate_bound_common_restore(&authority.0, &destination_binding)
+                    .unwrap();
+                let certified_recovery = host
+                    .common_snapshot_recovery_manifest_for_test(agent)
+                    .unwrap();
+                let recovery = certified_recovery.clone().unwrap_or_else(|| {
+                    crate::agent::shared_recovery::SharedRecoveryManifest::new(
+                        destination_generation,
+                        committee.clone(),
+                    )
+                    .unwrap()
+                });
+                recovery
+                    .validate_at_raft_index(authority.0.claim().ordered().raft_index())
+                    .unwrap();
+                assert_eq!(recovery.generation(), destination_generation);
+                assert_eq!(recovery.committee(), &committee);
+                match authority.0.claim().recovery_manifest() {
+                    Some(commitment) => {
+                        assert_eq!(certified_recovery.unwrap().commitment(), commitment);
+                    }
+                    None => assert!(recovery.is_empty()),
                 }
-                None => assert!(recovery.is_empty()),
-            }
-            let mut destination_executor = StandardLocalReplayExecutor::new_shared(
-                destination_store.catalog_blob_resolver().unwrap(),
-                fixture.trust.clone(),
-                merges[destination_index].clone(),
-                destination_ledger.committee_history().unwrap(),
-            );
-            let unpublished_ledger = destination_ledger.journal_audit().unwrap();
-            let unpublished_recovery = destination_ledger.recovery_manifest_if_present().unwrap();
-            for (endpoint, heads) in [
-                ("predecessor", &destination_predecessor),
-                ("target", rebound.heads()),
-            ] {
-                let checkpoint = destination_store
-                    .get::<crate::agent::journal::CheckpointManifest>(heads.checkpoint.unwrap())
-                    .unwrap()
-                    .unwrap();
-                let linear = checkpoint
-                    .lanes
-                    .iter()
-                    .find(|lane| lane.lane == crate::agent::journal::PersistedLane::Linear)
-                    .unwrap();
-                let manifest = destination_store
-                    .get::<crate::agent::journal::LaneStateManifest>(linear.state)
-                    .unwrap()
-                    .unwrap();
-                let descriptor = manifest.external_root.unwrap().descriptor;
-                let block = descriptor
-                    .bind(descriptor.context(), descriptor.commitment())
-                    .unwrap()
-                    .root()
-                    .unwrap();
-                let block_name: String = block
-                    .hash()
-                    .0
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect();
-                let path = destination_root.join("lane-state/blocks").join(block_name);
-                let parked = destination_directory
-                    .0
-                    .join(format!("parked-restore-{endpoint}-block"));
-                let original = std::fs::read(&path).unwrap();
-                std::fs::rename(&path, &parked).unwrap();
-                assert!(
+                let mut destination_executor = StandardLocalReplayExecutor::new_shared(
+                    destination_store.catalog_blob_resolver().unwrap(),
+                    fixture.trust.clone(),
+                    merges[destination_index].clone(),
+                    destination_ledger.committee_history().unwrap(),
+                );
+                let unpublished_ledger = destination_ledger.journal_audit().unwrap();
+                let unpublished_recovery =
+                    destination_ledger.recovery_manifest_if_present().unwrap();
+                for (endpoint, heads) in [
+                    ("predecessor", &destination_predecessor),
+                    ("target", rebound.heads()),
+                ] {
+                    let checkpoint = destination_store
+                        .get::<crate::agent::journal::CheckpointManifest>(heads.checkpoint.unwrap())
+                        .unwrap()
+                        .unwrap();
+                    let linear = checkpoint
+                        .lanes
+                        .iter()
+                        .find(|lane| lane.lane == crate::agent::journal::PersistedLane::Linear)
+                        .unwrap();
+                    let manifest = destination_store
+                        .get::<crate::agent::journal::LaneStateManifest>(linear.state)
+                        .unwrap()
+                        .unwrap();
+                    let descriptor = manifest.external_root.unwrap().descriptor;
+                    let block = descriptor
+                        .bind(descriptor.context(), descriptor.commitment())
+                        .unwrap()
+                        .root()
+                        .unwrap();
+                    let block_name: String = block
+                        .hash()
+                        .0
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect();
+                    let path = destination_root.join("lane-state/blocks").join(block_name);
+                    let parked = destination_directory
+                        .0
+                        .join(format!("parked-restore-{endpoint}-block"));
+                    let original = std::fs::read(&path).unwrap();
+                    std::fs::rename(&path, &parked).unwrap();
+                    assert!(
+                        crate::agent::replay::audit_external_common_restore(
+                            &mut destination_store,
+                            &destination_seal,
+                            &destination_predecessor,
+                            rebound.heads(),
+                            &mut destination_executor,
+                            &NoPrunedOrderedBases,
+                            &authority.0,
+                            &destination_binding,
+                            &mut Driver::external_recovery_budget(),
+                        )
+                        .is_err(),
+                        "missing {endpoint} closure must refuse catch-up before publication"
+                    );
+                    assert!(!path.exists(), "a refused audit must not repair state");
+                    assert_eq!(
+                        std::fs::read(destination_root.join("heads")).unwrap(),
+                        destination_predecessor.encode()
+                    );
+                    assert!(!destination_root.join("heads.next").exists());
+                    assert_eq!(
+                        destination_ledger.journal_audit().unwrap(),
+                        unpublished_ledger
+                    );
+                    assert_eq!(
+                        destination_ledger.recovery_manifest_if_present().unwrap(),
+                        unpublished_recovery
+                    );
+                    assert!(
+                        destination_ledger
+                            .common_snapshot_authority()
+                            .unwrap()
+                            .is_none()
+                    );
+                    std::fs::rename(&parked, &path).unwrap();
+                    assert_eq!(std::fs::read(&path).unwrap(), original);
+                }
+                assert!(matches!(
                     crate::agent::replay::audit_external_common_restore(
                         &mut destination_store,
                         &destination_seal,
@@ -2619,15 +2953,18 @@ fn external_network_lifecycle(
                         &destination_binding,
                         &mut Driver::external_recovery_budget(),
                     )
-                    .is_err(),
-                    "missing {endpoint} closure must refuse catch-up before publication"
-                );
-                assert!(!path.exists(), "a refused audit must not repair state");
+                    .unwrap()
+                    .publish_through_heads_stage_for_test(),
+                    Err(crate::agent::journal_store::JournalStoreError::Unavailable),
+                ));
                 assert_eq!(
                     std::fs::read(destination_root.join("heads")).unwrap(),
                     destination_predecessor.encode()
                 );
-                assert!(!destination_root.join("heads.next").exists());
+                assert_eq!(
+                    std::fs::read(destination_root.join("heads.next")).unwrap(),
+                    rebound.heads().encode()
+                );
                 assert_eq!(
                     destination_ledger.journal_audit().unwrap(),
                     unpublished_ledger
@@ -2642,11 +2979,12 @@ fn external_network_lifecycle(
                         .unwrap()
                         .is_none()
                 );
-                std::fs::rename(&parked, &path).unwrap();
-                assert_eq!(std::fs::read(&path).unwrap(), original);
-            }
-            assert!(matches!(
-                crate::agent::replay::audit_external_common_restore(
+                // This is a retry through the real typed heads.next primitive,
+                // not restart through an authenticated automatic host marker.
+                destination_ledger
+                    .validate_bound_common_restore(&authority.0, &destination_binding)
+                    .unwrap();
+                let publication = crate::agent::replay::audit_external_common_restore(
                     &mut destination_store,
                     &destination_seal,
                     &destination_predecessor,
@@ -2658,278 +2996,238 @@ fn external_network_lifecycle(
                     &mut Driver::external_recovery_budget(),
                 )
                 .unwrap()
-                .publish_through_heads_stage_for_test(),
-                Err(crate::agent::journal_store::JournalStoreError::Unavailable),
-            ));
-            assert_eq!(
-                std::fs::read(destination_root.join("heads")).unwrap(),
-                destination_predecessor.encode()
-            );
-            assert_eq!(
-                std::fs::read(destination_root.join("heads.next")).unwrap(),
-                rebound.heads().encode()
-            );
-            assert_eq!(
-                destination_ledger.journal_audit().unwrap(),
-                unpublished_ledger
-            );
-            assert_eq!(
-                destination_ledger.recovery_manifest_if_present().unwrap(),
-                unpublished_recovery
-            );
-            assert!(
+                .publish()
+                .unwrap();
+                assert!(publication.heads_advanced);
+                assert_eq!(
+                    destination_store.heads().unwrap().as_ref(),
+                    Some(rebound.heads())
+                );
+                assert!(!destination_root.join("heads.next").exists());
                 destination_ledger
-                    .common_snapshot_authority()
-                    .unwrap()
-                    .is_none()
-            );
-            // This is a retry through the real typed heads.next primitive,
-            // not restart through an authenticated automatic host marker.
-            destination_ledger
-                .validate_bound_common_restore(&authority.0, &destination_binding)
-                .unwrap();
-            let publication = crate::agent::replay::audit_external_common_restore(
-                &mut destination_store,
-                &destination_seal,
-                &destination_predecessor,
-                rebound.heads(),
-                &mut destination_executor,
-                &NoPrunedOrderedBases,
-                &authority.0,
-                &destination_binding,
-                &mut Driver::external_recovery_budget(),
-            )
-            .unwrap()
-            .publish()
-            .unwrap();
-            assert!(publication.heads_advanced);
-            assert_eq!(
-                destination_store.heads().unwrap().as_ref(),
-                Some(rebound.heads())
-            );
-            assert!(!destination_root.join("heads.next").exists());
-            destination_ledger
-                .restore_common_snapshot(&authority.0, &destination_binding, &recovery)
-                .unwrap();
-            assert_eq!(
-                destination_ledger.common_snapshot_authority().unwrap(),
-                Some((authority.0.clone(), destination_binding.clone()))
-            );
-            let installed_ledger = destination_ledger.journal_audit().unwrap();
-            destination_ledger
-                .validate_bound_common_restore(&authority.0, &destination_binding)
-                .unwrap();
-            let repeated_publication = crate::agent::replay::audit_external_common_restore(
-                &mut destination_store,
-                &destination_seal,
-                &destination_predecessor,
-                rebound.heads(),
-                &mut destination_executor,
-                &NoPrunedOrderedBases,
-                &authority.0,
-                &destination_binding,
-                &mut Driver::external_recovery_budget(),
-            )
-            .unwrap()
-            .publish()
-            .unwrap();
-            assert!(!repeated_publication.heads_advanced);
-            assert!(!repeated_publication.object_created);
-            assert_eq!(
-                destination_store.heads().unwrap().as_ref(),
-                Some(rebound.heads())
-            );
-            assert!(!destination_root.join("heads.next").exists());
-            assert_eq!(
-                destination_ledger.journal_audit().unwrap(),
-                installed_ledger
-            );
-            let restored_heads = rebound.heads().clone();
-            drop(destination_executor);
-            drop(destination_ledger);
-            drop(destination_store);
-            let destination_seal = Arc::new(destination_seal);
-            let destination_artifacts = destination_directory.0.join("artifacts");
-            std::fs::create_dir(&destination_artifacts).unwrap();
-            let open_destination = || {
-                let slot = FileLocalAgentJournalSlot::acquire_with_pinned_parents(
-                    &destination_root,
-                    destination_root.with_extension("agent-lock"),
-                    destination_node,
-                    destination_intent,
-                    &destination_parent,
-                    &destination_parent,
-                )
-                .unwrap();
-                let ledger = AgentRaftApplicationLedgerV2::open(
-                    Arc::new(
-                        redb::Database::create(destination_directory.0.join("raft.redb")).unwrap(),
-                    ),
-                    destination_generation,
-                    slot.instance_id(),
-                    destination_node,
-                    committee.clone(),
-                    destination_authority,
-                )
-                .unwrap();
-                let (store, executor, validated) = slot
-                    .open_external_shared_checkpoint_with_executor(
-                        &destination_seal,
-                        |store| {
-                            Ok((
-                                StandardLocalReplayExecutor::new_shared(
-                                    store.catalog_blob_resolver()?,
-                                    fixture.trust.clone(),
-                                    merges[destination_index].clone(),
-                                    ledger.committee_history().map_err(|_| {
-                                        crate::agent::journal_store::JournalStoreError::Corrupt
-                                    })?,
-                                ),
-                                ledger.common_snapshot_authority().map_err(|_| {
-                                    crate::agent::journal_store::JournalStoreError::Corrupt
-                                })?,
-                            ))
-                        },
-                        &NoPrunedOrderedBases,
-                        &mut Driver::external_recovery_budget(),
-                        None,
-                    )
+                    .restore_common_snapshot(&authority.0, &destination_binding, &recovery)
                     .unwrap();
-                let (materialization, availability) = validated
-                    .into_external_common_shared_availability(
-                        &store,
-                        &destination_seal,
-                        &authority.0,
-                        &destination_binding,
-                    )
+                assert_eq!(
+                    destination_ledger.common_snapshot_authority().unwrap(),
+                    Some((authority.0.clone(), destination_binding.clone()))
+                );
+                let installed_ledger = destination_ledger.journal_audit().unwrap();
+                destination_ledger
+                    .validate_bound_common_restore(&authority.0, &destination_binding)
                     .unwrap();
-                availability
-                    .require_current(&store, &materialization)
-                    .unwrap();
-                drop(executor);
-                Driver::open_external(
-                    store,
-                    FileSharedArtifactStager::open(
-                        destination_artifacts.clone(),
-                        destination_generation,
-                    )
-                    .unwrap(),
-                    ledger,
-                    fixture.trust.clone(),
-                    merges[destination_index].clone(),
-                    destination_seal.clone(),
+                let repeated_publication = crate::agent::replay::audit_external_common_restore(
+                    &mut destination_store,
+                    &destination_seal,
+                    &destination_predecessor,
+                    rebound.heads(),
+                    &mut destination_executor,
+                    &NoPrunedOrderedBases,
+                    &authority.0,
+                    &destination_binding,
+                    &mut Driver::external_recovery_budget(),
                 )
                 .unwrap()
-            };
-            let mut restored = open_destination();
-            assert_eq!(restored.materialization().heads(), &restored_heads);
-            assert_eq!(
-                restored.common_snapshot_authority().unwrap(),
-                Some((authority.0.clone(), destination_binding.clone()))
-            );
-            // This isolates real destination execution/application, not public
-            // host-marker restart or a new network-quorum serving workflow.
-            let (restored_work, restored_authorization) = clerk_call(
-                "state_root",
-                Vec::new(),
-                MethodMode::LinearizableQuery,
-                member,
-                0xf4,
-            );
-            let mut acknowledgement = None;
-            for (operation, request) in [
-                CleanInvocationReplayRequest::Invoke {
-                    context: crate::agent_sdk::RuntimeExecutionContext::Direct,
-                    work: restored_work.clone(),
-                    authorization: restored_authorization.clone(),
-                },
-                CleanInvocationReplayRequest::Acknowledge {
-                    work: restored_work.clone(),
-                    authorization: restored_authorization.clone(),
-                },
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let PreparedCleanOrdered::Proposal { input, payload } =
-                    restored.prepare_clean_ordered_operation(request).unwrap()
-                else {
-                    panic!("restored Clerk operation unexpectedly retained");
-                };
-                let index = restored
-                    .append_command_for_test(authority.0.claim().ordered().raft_term(), payload)
+                .publish()
+                .unwrap();
+                assert!(!repeated_publication.heads_advanced);
+                assert!(!repeated_publication.object_created);
+                assert_eq!(
+                    destination_store.heads().unwrap().as_ref(),
+                    Some(rebound.heads())
+                );
+                assert!(!destination_root.join("heads.next").exists());
+                assert_eq!(
+                    destination_ledger.journal_audit().unwrap(),
+                    installed_ledger
+                );
+                let restored_heads = rebound.heads().clone();
+                drop(destination_executor);
+                drop(destination_ledger);
+                drop(destination_store);
+                let destination_seal = Arc::new(destination_seal);
+                let destination_artifacts = destination_directory.0.join("artifacts");
+                std::fs::create_dir(&destination_artifacts).unwrap();
+                let open_destination = || {
+                    let slot = FileLocalAgentJournalSlot::acquire_with_pinned_parents(
+                        &destination_root,
+                        destination_root.with_extension("agent-lock"),
+                        destination_node,
+                        destination_intent,
+                        &destination_parent,
+                        &destination_parent,
+                    )
                     .unwrap();
+                    let ledger = AgentRaftApplicationLedgerV2::open(
+                        Arc::new(
+                            redb::Database::create(destination_directory.0.join("raft.redb"))
+                                .unwrap(),
+                        ),
+                        destination_generation,
+                        slot.instance_id(),
+                        destination_node,
+                        committee.clone(),
+                        destination_authority,
+                    )
+                    .unwrap();
+                    let (store, executor, validated) = slot
+                        .open_external_shared_checkpoint_with_executor(
+                            &destination_seal,
+                            |store| {
+                                Ok((
+                                    StandardLocalReplayExecutor::new_shared(
+                                        store.catalog_blob_resolver()?,
+                                        fixture.trust.clone(),
+                                        merges[destination_index].clone(),
+                                        ledger.committee_history().map_err(|_| {
+                                            crate::agent::journal_store::JournalStoreError::Corrupt
+                                        })?,
+                                    ),
+                                    ledger.common_snapshot_authority().map_err(|_| {
+                                        crate::agent::journal_store::JournalStoreError::Corrupt
+                                    })?,
+                                ))
+                            },
+                            &NoPrunedOrderedBases,
+                            &mut Driver::external_recovery_budget(),
+                            None,
+                        )
+                        .unwrap();
+                    let (materialization, availability) = validated
+                        .into_external_common_shared_availability(
+                            &store,
+                            &destination_seal,
+                            &authority.0,
+                            &destination_binding,
+                        )
+                        .unwrap();
+                    availability
+                        .require_current(&store, &materialization)
+                        .unwrap();
+                    drop(executor);
+                    Driver::open_external(
+                        store,
+                        FileSharedArtifactStager::open(
+                            destination_artifacts.clone(),
+                            destination_generation,
+                        )
+                        .unwrap(),
+                        ledger,
+                        fixture.trust.clone(),
+                        merges[destination_index].clone(),
+                        destination_seal.clone(),
+                    )
+                    .unwrap()
+                };
+                let mut restored = open_destination();
+                assert_eq!(restored.materialization().heads(), &restored_heads);
                 assert_eq!(
-                    index,
-                    authority.0.claim().ordered().raft_index() + operation as u64 + 1
+                    restored.common_snapshot_authority().unwrap(),
+                    Some((authority.0.clone(), destination_binding.clone()))
                 );
-                assert_eq!(
-                    restored.apply_next().unwrap(),
-                    SharedPhysicalApplyOutcome::Applied { index }
+                // This isolates real destination execution/application, not public
+                // host-marker restart or a new network-quorum serving workflow.
+                let (restored_work, restored_authorization) = clerk_call(
+                    "state_root",
+                    Vec::new(),
+                    MethodMode::LinearizableQuery,
+                    member,
+                    0xf4,
                 );
-                let outcome = restored.take_clean_ordered_result(input).unwrap();
-                if operation == 0 {
-                    let RuntimeOutcome::Completed(Ok(reply)) = outcome else {
-                        panic!("restored Clerk state_root failed: {outcome:?}");
+                let mut acknowledgement = None;
+                for (operation, request) in [
+                    CleanInvocationReplayRequest::Invoke {
+                        context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                        work: restored_work.clone(),
+                        authorization: restored_authorization.clone(),
+                    },
+                    CleanInvocationReplayRequest::Acknowledge {
+                        work: restored_work.clone(),
+                        authorization: restored_authorization.clone(),
+                    },
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let PreparedCleanOrdered::Proposal { input, payload } =
+                        restored.prepare_clean_ordered_operation(request).unwrap()
+                    else {
+                        panic!("restored Clerk operation unexpectedly retained");
                     };
+                    let index = restored
+                        .append_command_for_test(authority.0.claim().ordered().raft_term(), payload)
+                        .unwrap();
                     assert_eq!(
-                        Value::decode(&reply.reply),
-                        Value::Bytes(reference.root().to_vec()),
-                        "typed catch-up must preserve the signed transfer's kernel root"
+                        index,
+                        authority.0.claim().ordered().raft_index() + operation as u64 + 1
                     );
-                } else {
-                    assert!(matches!(outcome, RuntimeOutcome::Acknowledged(Ok(_))));
-                    acknowledgement =
-                        Some((input, restored.available_ordered_claim(input).unwrap()));
+                    assert_eq!(
+                        restored.apply_next().unwrap(),
+                        SharedPhysicalApplyOutcome::Applied { index }
+                    );
+                    let outcome = restored.take_clean_ordered_result(input).unwrap();
+                    if operation == 0 {
+                        let RuntimeOutcome::Completed(Ok(reply)) = outcome else {
+                            panic!("restored Clerk state_root failed: {outcome:?}");
+                        };
+                        assert_eq!(
+                            Value::decode(&reply.reply),
+                            Value::Bytes(reference.root().to_vec()),
+                            "typed catch-up must preserve the signed transfer's kernel root"
+                        );
+                    } else {
+                        assert!(matches!(outcome, RuntimeOutcome::Acknowledged(Ok(_))));
+                        acknowledgement =
+                            Some((input, restored.available_ordered_claim(input).unwrap()));
+                    }
                 }
-            }
-            let evolved_heads = restored.materialization().heads().clone();
-            assert_eq!(
-                evolved_heads.ordered_index,
-                restored_heads.ordered_index + 2
-            );
-            let (acknowledgement_input, acknowledgement_claim) = acknowledgement.unwrap();
-            drop(restored);
-            let mut reopened = open_destination();
-            assert_eq!(reopened.materialization().heads(), &evolved_heads);
-            assert_eq!(
-                reopened
-                    .available_ordered_claim(acknowledgement_input)
-                    .unwrap(),
-                acknowledgement_claim
-            );
-            assert_eq!(
-                reopened.common_snapshot_authority().unwrap(),
-                Some((authority.0.clone(), destination_binding))
-            );
-            drop(reopened);
-            assert_eq!(
-                std::fs::read(scratch_root.join("heads")).unwrap(),
-                scratch_heads
-            );
-            assert!(!scratch_root.join("heads.next").exists());
-            drop(source_executor);
-            drop(staged);
-            let scratch_slot = FileLocalAgentJournalSlot::acquire_with_pinned_parents(
-                &scratch_root,
-                scratch_root.with_extension("agent-lock"),
-                source_node,
-                scratch_intent,
-                &parent,
-                &parent,
-            )
-            .unwrap();
-            assert!(
-                matches!(
-                    scratch_slot.open_external_genesis(
-                        &source_seal,
-                        true,
-                        &mut Driver::external_recovery_budget(),
+                let evolved_heads = restored.materialization().heads().clone();
+                assert_eq!(
+                    evolved_heads.ordered_index,
+                    restored_heads.ordered_index + 2
+                );
+                let (acknowledgement_input, acknowledgement_claim) = acknowledgement.unwrap();
+                drop(restored);
+                let mut reopened = open_destination();
+                assert_eq!(reopened.materialization().heads(), &evolved_heads);
+                assert_eq!(
+                    reopened
+                        .available_ordered_claim(acknowledgement_input)
+                        .unwrap(),
+                    acknowledgement_claim
+                );
+                assert_eq!(
+                    reopened.common_snapshot_authority().unwrap(),
+                    Some((authority.0.clone(), destination_binding))
+                );
+                drop(reopened);
+                assert_eq!(
+                    std::fs::read(scratch_root.join("heads")).unwrap(),
+                    scratch_heads
+                );
+                assert!(!scratch_root.join("heads.next").exists());
+                drop(source_executor);
+                drop(staged);
+                let scratch_slot = FileLocalAgentJournalSlot::acquire_with_pinned_parents(
+                    &scratch_root,
+                    scratch_root.with_extension("agent-lock"),
+                    source_node,
+                    scratch_intent,
+                    &parent,
+                    &parent,
+                )
+                .unwrap();
+                assert!(
+                    matches!(
+                        scratch_slot.open_external_genesis(
+                            &source_seal,
+                            true,
+                            &mut Driver::external_recovery_budget(),
+                        ),
+                        Err(crate::agent::journal_store::JournalStoreError::Corrupt),
                     ),
-                    Err(crate::agent::journal_store::JournalStoreError::Corrupt),
-                ),
-                "quarantine must never acquire an exposed-generation lock bit"
-            );
+                    "quarantine must never acquire an exposed-generation lock bit"
+                );
+            }
             assert_eq!(
                 std::fs::read(journal_root(checkpoint_owner).join("heads")).unwrap(),
                 heads_bytes
@@ -2945,6 +3243,244 @@ fn external_network_lifecycle(
                 host.supervisor_attachment_status(agent).unwrap().unwrap(),
                 attachment
             );
+        }
+        if let Some((index, host)) = restored_host.take() {
+            // Replace the detached original voter, never attach a second
+            // simultaneous transport with that authenticated PeerId. The
+            // existing continuation below now includes the restored real host.
+            hosts[index] = Arc::new(std::sync::Mutex::new(host));
+        }
+        if matches!(exercise, ExternalNetworkExercise::HostRestore(None)) {
+            let source = checkpoint_owner;
+            let root = journal_root(source);
+            let heads = std::fs::read(root.join("heads")).unwrap();
+            let authority = hosts[source]
+                .lock()
+                .unwrap()
+                .common_snapshot_authority_for_test(agent)
+                .unwrap()
+                .unwrap();
+            let live =
+                external_checkpoint_root_block_path(&root, &JournalHeads::decode(&heads).unwrap());
+            let live_bytes = std::fs::read(&live).unwrap();
+            let archive = directories[source].0.join("external-common-checkpoint.axj");
+            let archive_before = BlobRef::of_bytes(&std::fs::read(&archive).unwrap());
+            // A quota refused late in the namespace scan must not first
+            // retire even one authenticated Shared commit binding.
+            let files = external_gc_storage_fingerprint(&root);
+            let mut refused = external_gc_limits(1);
+            refused.max_scanned_files = 1;
+            assert!(matches!(
+                hosts[source]
+                    .lock()
+                    .unwrap()
+                    .compact_external_common_checkpoint(agent, refused),
+                Err(SharedAgentHostError::CapacityExhausted)
+            ));
+            assert_eq!(external_gc_storage_fingerprint(&root), files);
+            // Missing committed data is not garbage or an empty tree. Even
+            // restoring its bytes cannot revive the cached availability pin.
+            let parked = directories[source].0.join("parked-reclamation-live-block");
+            std::fs::rename(&live, &parked).unwrap();
+            let damaged = external_gc_storage_fingerprint(&root);
+            assert!(
+                hosts[source]
+                    .lock()
+                    .unwrap()
+                    .compact_external_common_checkpoint(agent, external_gc_limits(1))
+                    .is_err()
+            );
+            assert_eq!(external_gc_storage_fingerprint(&root), damaged);
+            assert!(!live.exists());
+            std::fs::rename(&parked, &live).unwrap();
+            assert!(
+                hosts[source]
+                    .lock()
+                    .unwrap()
+                    .compact_external_common_checkpoint(agent, external_gc_limits(1))
+                    .is_err()
+            );
+            assert_eq!(external_gc_storage_fingerprint(&root), files);
+            let physical = hosts[source].lock().unwrap().physical_route(agent).unwrap();
+            drop(hosts);
+            // A real uncommitted physical suffix is not covered by the
+            // installed QC and must survive a refused maintenance pass.
+            {
+                let database = Arc::new(redb::Database::create(&physical.raft_database).unwrap());
+                let mut log = crate::raft::RaftLog::open(database.clone()).unwrap();
+                let transaction = database.begin_write().unwrap();
+                assert_eq!(log.last_index(), authority.0.claim().ordered().raft_index());
+                log.append_in_txn(
+                    &transaction,
+                    authority.0.claim().ordered().raft_term(),
+                    &crate::agent::shared_raft::encode_agent_raft_entry_kind(
+                        &vos_raft::EntryKind::Data {
+                            payload: Vec::new(),
+                        },
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                transaction.commit().unwrap();
+            }
+            hosts = (0..keys.len())
+                .map(|index| Arc::new(std::sync::Mutex::new(open(index, true).unwrap())))
+                .collect();
+            assert!(
+                hosts[source]
+                    .lock()
+                    .unwrap()
+                    .compact_external_common_checkpoint(agent, external_gc_limits(1))
+                    .is_err(),
+                "a later uncommitted Raft row must refuse detached reclamation"
+            );
+            assert_eq!(external_gc_storage_fingerprint(&root), files);
+            drop(hosts);
+            {
+                let database = Arc::new(redb::Database::create(&physical.raft_database).unwrap());
+                let mut log = crate::raft::RaftLog::open(database.clone()).unwrap();
+                assert_eq!(
+                    log.last_index(),
+                    authority.0.claim().ordered().raft_index() + 1
+                );
+                let transaction = database.begin_write().unwrap();
+                // Remove only the test-created, never-committed suffix.
+                log.truncate_after_in_txn(&transaction, authority.0.claim().ordered().raft_index())
+                    .unwrap();
+                transaction.commit().unwrap();
+            }
+            hosts = (0..keys.len())
+                .map(|index| Arc::new(std::sync::Mutex::new(open(index, true).unwrap())))
+                .collect();
+            let descriptor = hosts[source]
+                .lock()
+                .unwrap()
+                .external_inspection_lanes_for_test(agent)
+                .unwrap()[0]
+                .base;
+            let (orphan, orphan_bytes) = descriptor
+                .context()
+                .scope()
+                .encode_block(b"canonical unreachable external maintenance fixture")
+                .unwrap();
+            let orphan_path = root.join("lane-state/blocks").join(
+                orphan
+                    .hash()
+                    .0
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>(),
+            );
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&orphan_path)
+                .unwrap();
+            std::io::Write::write_all(&mut output, &orphan_bytes).unwrap();
+            output.sync_all().unwrap();
+            drop(output);
+            std::fs::File::open(root.join("lane-state/blocks"))
+                .unwrap()
+                .sync_all()
+                .unwrap();
+            let first = hosts[source]
+                .lock()
+                .unwrap()
+                .compact_external_common_checkpoint(agent, external_gc_limits(1))
+                .unwrap();
+            assert_eq!(first.bindings_removed, 1);
+            assert!(first.bindings_remaining > 0);
+            assert_eq!(
+                (
+                    first.objects_removed,
+                    first.blobs_removed,
+                    first.aliases_removed
+                ),
+                (0, 0, 0)
+            );
+            assert!(!first.complete);
+            assert!(orphan_path.exists());
+            assert_eq!(std::fs::read(&live).unwrap(), live_bytes);
+            assert_eq!(std::fs::read(root.join("heads")).unwrap(), heads);
+            drop(hosts);
+            hosts = (0..keys.len())
+                .map(|index| Arc::new(std::sync::Mutex::new(open(index, true).unwrap())))
+                .collect();
+            // Reach a genuinely incomplete journal sweep, then lose the
+            // entire filesystem owner with its durable GC intent retained.
+            let mut interrupted = false;
+            for _ in 0..128 {
+                let pass = hosts[source]
+                    .lock()
+                    .unwrap()
+                    .compact_external_common_checkpoint(agent, external_gc_limits(1))
+                    .unwrap();
+                if pass.objects_removed + pass.blobs_removed + pass.aliases_removed != 0 {
+                    assert_eq!(pass.bindings_remaining, 0);
+                    assert!(!pass.complete);
+                    interrupted = true;
+                    break;
+                }
+            }
+            assert!(
+                interrupted,
+                "must exercise a real incomplete root-pinned GC pass"
+            );
+            assert!(root.join("gc-intent").exists());
+            drop(hosts);
+            hosts = (0..keys.len())
+                .map(|index| Arc::new(std::sync::Mutex::new(open(index, true).unwrap())))
+                .collect();
+            let mut finished = false;
+            let mut resumed = false;
+            for _ in 0..128 {
+                let mut host = hosts[source].lock().unwrap();
+                let pass = host
+                    .compact_external_common_checkpoint(agent, external_gc_limits(32))
+                    .unwrap();
+                resumed |= pass.resumed;
+                assert_eq!(
+                    host.common_snapshot_authority_for_test(agent)
+                        .unwrap()
+                        .unwrap(),
+                    authority
+                );
+                assert_eq!(host.journal_position(agent).unwrap(), completed.0);
+                assert_eq!(std::fs::read(root.join("heads")).unwrap(), heads);
+                assert_eq!(std::fs::read(&live).unwrap(), live_bytes);
+                if pass.complete {
+                    finished = true;
+                    break;
+                }
+            }
+            assert!(finished && resumed);
+            assert!(!root.join("gc-intent").exists());
+            assert!(
+                !orphan_path.exists(),
+                "unreachable canonical block must be reclaimed"
+            );
+            assert_eq!(
+                BlobRef::of_bytes(&std::fs::read(&archive).unwrap()),
+                archive_before
+            );
+            let destination = restore_destination.get().unwrap();
+            let mut finished = false;
+            for _ in 0..128 {
+                let pass = hosts[destination]
+                    .lock()
+                    .unwrap()
+                    .compact_external_common_checkpoint(agent, external_gc_limits(32))
+                    .unwrap();
+                assert_eq!(
+                    pass.bindings_removed, 0,
+                    "archive restore must not fabricate old bindings"
+                );
+                if pass.complete {
+                    finished = true;
+                    break;
+                }
+            }
+            assert!(finished);
         }
         if let Some((retained_work, retained_authorization, retained_outcome)) = retained_reply {
             let InvocationAuthorization::AuthorityReceipt(receipt) = &retained_authorization else {
@@ -3322,6 +3858,37 @@ fn external_network_lifecycle(
             return;
         }
         attached = attach(&hosts);
+        if matches!(exercise, ExternalNetworkExercise::HostRestore(None)) {
+            let mut host = hosts[checkpoint_owner].lock().unwrap();
+            let heads = std::fs::read(journal_root(checkpoint_owner).join("heads")).unwrap();
+            assert!(matches!(
+                host.compact_external_common_checkpoint(agent, external_gc_limits(1)),
+                Err(SharedAgentHostError::Conflict)
+            ));
+            assert_eq!(
+                std::fs::read(journal_root(checkpoint_owner).join("heads")).unwrap(),
+                heads
+            );
+        }
+        if matches!(exercise, ExternalNetworkExercise::HostRestore(_)) {
+            assert_eq!(
+                external_network_on_leader(&attached, agent, |owner| {
+                    owner.supervisor_acknowledge(
+                        identity,
+                        root_work.clone(),
+                        root_authorization.clone(),
+                    )
+                }),
+                root_acknowledgement,
+                "restored actual voter must preserve the exact retired ACK through current-root quorum",
+            );
+            for host in &hosts {
+                assert_eq!(
+                    host.lock().unwrap().journal_position(agent).unwrap(),
+                    completed.0
+                );
+            }
+        }
         let (continued_work, continued_authorization) = clerk_call(
             "state_root",
             Vec::new(),
@@ -3471,6 +4038,86 @@ fn external_network_lifecycle(
     for network in networks.into_iter().skip(1) {
         stop_network(network);
     }
+}
+
+fn external_gc_limits(batch: usize) -> crate::agent::shared_host::SharedAgentCompactionLimits {
+    crate::agent::shared_host::SharedAgentCompactionLimits {
+        max_binding_unlinks: batch,
+        max_index_nodes: 1_000_000,
+        max_marked_objects: 1_000_000,
+        max_marked_blobs: 1_000_000,
+        max_scanned_files: 2_000_000,
+        max_scanned_bytes: 64 * 1024 * 1024 * 1024,
+        max_unlinks: batch,
+    }
+}
+
+/// Small-fixture mutation witness: hashes one file payload at a time, not a
+/// runtime-state image. These bounds are not large-workload qualification.
+fn external_gc_storage_fingerprint(
+    root: &std::path::Path,
+) -> Vec<(PathBuf, crate::service::BlobRef)> {
+    fn visit(
+        root: &std::path::Path,
+        directory: &std::path::Path,
+        files: &mut Vec<(PathBuf, crate::service::BlobRef)>,
+    ) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                visit(root, &entry.path(), files);
+            } else {
+                assert!(kind.is_file());
+                files.push((
+                    entry.path().strip_prefix(root).unwrap().to_owned(),
+                    crate::service::BlobRef::of_bytes(&std::fs::read(entry.path()).unwrap()),
+                ));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    visit(root, root, &mut files);
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
+}
+
+fn external_checkpoint_root_block_path(root: &std::path::Path, heads: &JournalHeads) -> PathBuf {
+    let hex = |id: &[u8]| {
+        id.iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let checkpoint = crate::agent::journal::CheckpointManifest::decode(
+        &std::fs::read(
+            root.join("checkpoints")
+                .join(hex(heads.checkpoint.unwrap().as_bytes())),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(Some(checkpoint.id()), heads.checkpoint);
+    let lane = checkpoint
+        .lanes
+        .iter()
+        .find(|lane| lane.lane == crate::agent::journal::PersistedLane::Linear)
+        .unwrap();
+    let manifest = crate::agent::journal::LaneStateManifest::decode(
+        &std::fs::read(
+            root.join("lane-state/manifests")
+                .join(hex(lane.state.as_bytes())),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest.id(), lane.state);
+    let descriptor = manifest.external_root.unwrap().descriptor;
+    let block = descriptor
+        .bind(descriptor.context(), descriptor.commitment())
+        .unwrap()
+        .root()
+        .unwrap();
+    root.join("lane-state/blocks").join(hex(&block.hash().0))
 }
 
 fn external_current_root_block(host: &mut SharedAgentHost, agent: HostAgentId) -> String {

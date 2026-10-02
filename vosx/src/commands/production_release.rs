@@ -1,8 +1,9 @@
 //! Build and verify one self-describing Agent-generation release directory.
 //!
 //! The released `vosx` binary already embeds every program needed to create a
-//! fresh space: the standard AgentRuntime and the authority and catalog system
-//! actors. `release bundle` materializes those exact checked pins without any
+//! fresh space: the unchanged Local AgentRuntime, separate System observation
+//! and external Shared runtime templates, and authority/catalog system actors.
+//! `release bundle` materializes those exact checked pins without any
 //! caller-supplied program path. That keeps the release identity reproducible
 //! and prevents a retired root-service program from being smuggled back into
 //! an otherwise current bundle.
@@ -23,6 +24,10 @@ const MANIFEST_FILE: &str = "manifest.json";
 const STANDARD_RUNTIME_FILE: &str = "standard-runtime.pvm";
 const AUTHORITY_FILE: &str = "system-authority.vos";
 const CATALOG_FILE: &str = "system-catalog.vos";
+const SYSTEM_IMAGE_RUNTIME_FILE: &str = "system-image-runtime.vos";
+const SHARED_EXTERNAL_RUNTIME_FILE: &str = "shared-external-runtime.vos";
+#[cfg(any(feature = "experimental-state-blocks", test))]
+const MAX_EXTERNAL_LIMITS_BYTES: u64 = 8 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -39,6 +44,17 @@ pub enum ReleaseCommand {
         /// Build an experimental Authority candidate; never replaces release pins.
         #[arg(long)]
         experimental_state_blocks: bool,
+        /// Source-coherent System IMAGE PVM; supply all three runtime-role inputs.
+        /// This never replaces the existing Local standard-runtime pin.
+        #[arg(long, requires_all = ["shared_runtime_pvm", "external_state_limits", "experimental_state_blocks"])]
+        system_runtime_pvm: Option<PathBuf>,
+        /// Source-coherent Shared EXTERNAL PVM, explicitly selected with --runtime.
+        #[arg(long, requires_all = ["system_runtime_pvm", "external_state_limits", "experimental_state_blocks"])]
+        shared_runtime_pvm: Option<PathBuf>,
+        /// Explicit JSON object with max_rows_per_lane and max_row_bytes_per_lane.
+        /// No default or qualification claim is inferred from ABI-probe limits.
+        #[arg(long, requires_all = ["system_runtime_pvm", "shared_runtime_pvm", "experimental_state_blocks"])]
+        external_state_limits: Option<PathBuf>,
     },
     /// Materialize the programs pinned inside this binary and their manifest.
     Bundle {
@@ -59,6 +75,8 @@ struct ReleaseManifest {
     format: String,
     agent_execution_semantics: String,
     standard_runtime: ReleaseArtifact,
+    system_image_runtime: ReleaseArtifact,
+    shared_external_runtime: ReleaseArtifact,
     authority_actor: ReleaseArtifact,
     catalog_actor: ReleaseArtifact,
 }
@@ -77,6 +95,7 @@ struct ReleaseArtifact {
 #[serde(rename_all = "snake_case")]
 enum ReleaseArtifactKind {
     AgentRuntime,
+    AgentRuntimePackageTemplate,
     ActorPackageTemplate,
 }
 
@@ -86,7 +105,17 @@ pub fn run(command: ReleaseCommand) -> anyhow::Result<()> {
             source,
             out,
             experimental_state_blocks,
-        } => build_system_templates(&source, &out, experimental_state_blocks),
+            system_runtime_pvm,
+            shared_runtime_pvm,
+            external_state_limits,
+        } => {
+            let roles = runtime_role_inputs(
+                system_runtime_pvm.as_deref(),
+                shared_runtime_pvm.as_deref(),
+                external_state_limits.as_deref(),
+            )?;
+            build_system_templates(&source, &out, experimental_state_blocks, roles)
+        }
         ReleaseCommand::Bundle { out } => bundle(&out),
         ReleaseCommand::Verify { directory } => verify(&directory).map(|manifest| {
             println!(
@@ -111,6 +140,7 @@ fn build_system_templates(
     source: &Path,
     out: &Path,
     experimental_state_blocks: bool,
+    runtime_roles: Option<RuntimeRoleTemplateInputs<'_>>,
 ) -> anyhow::Result<()> {
     #[cfg(not(feature = "experimental-state-blocks"))]
     if experimental_state_blocks {
@@ -133,6 +163,12 @@ fn build_system_templates(
             out.display()
         );
     }
+    // Validate every role input before creating output or launching guest
+    // compilation. These signed templates feed the one coherent repin and
+    // released-role selection; materialization alone is not a release gate.
+    let roles = runtime_roles
+        .map(|inputs| prepare_runtime_role_templates(inputs, experimental_state_blocks))
+        .transpose()?;
     fs::create_dir_all(nonempty_parent(out))?;
     fs::create_dir(out).context("create fresh system-template output")?;
     let signer = system_template_signer()?;
@@ -159,7 +195,153 @@ fn build_system_templates(
             &signer,
         )?;
     }
+    if let Some(roles) = roles {
+        fs::write(out.join(SYSTEM_IMAGE_RUNTIME_FILE), &roles.system_image)
+            .context("write System IMAGE runtime template")?;
+        fs::write(
+            out.join(SHARED_EXTERNAL_RUNTIME_FILE),
+            &roles.shared_external,
+        )
+        .context("write Shared EXTERNAL runtime template")?;
+        println!("prepared separately signed System IMAGE and Shared EXTERNAL runtime templates");
+        println!("OPEN: exact role repin, released selection and workload/recovery qualification");
+    }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeRoleTemplateInputs<'a> {
+    system_image: &'a Path,
+    shared_external: &'a Path,
+    external_limits: &'a Path,
+}
+
+fn runtime_role_inputs<'a>(
+    system_image: Option<&'a Path>,
+    shared_external: Option<&'a Path>,
+    external_limits: Option<&'a Path>,
+) -> anyhow::Result<Option<RuntimeRoleTemplateInputs<'a>>> {
+    match (system_image, shared_external, external_limits) {
+        (None, None, None) => Ok(None),
+        (Some(system_image), Some(shared_external), Some(external_limits)) => {
+            Ok(Some(RuntimeRoleTemplateInputs {
+                system_image,
+                shared_external,
+                external_limits,
+            }))
+        }
+        _ => bail!(
+            "System IMAGE, Shared EXTERNAL and explicit external limits must be supplied together"
+        ),
+    }
+}
+
+#[cfg(any(feature = "experimental-state-blocks", test))]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeRoleExternalLimits {
+    max_rows_per_lane: u64,
+    max_row_bytes_per_lane: u64,
+}
+
+#[cfg(any(feature = "experimental-state-blocks", test))]
+impl RuntimeRoleExternalLimits {
+    fn signed_limits(
+        self,
+    ) -> anyhow::Result<vos::agent::sdk::contract::ExternalStateResourceLimits> {
+        let limits = vos::agent::sdk::contract::ExternalStateResourceLimits {
+            max_rows_per_lane: self.max_rows_per_lane,
+            max_row_bytes_per_lane: self.max_row_bytes_per_lane,
+        };
+        if !limits.is_valid() {
+            bail!("external runtime limits must both be positive");
+        }
+        Ok(limits)
+    }
+}
+
+#[derive(Debug)]
+struct RuntimeRoleTemplates {
+    system_image: Vec<u8>,
+    shared_external: Vec<u8>,
+}
+
+fn prepare_runtime_role_templates(
+    inputs: RuntimeRoleTemplateInputs<'_>,
+    experimental_state_blocks: bool,
+) -> anyhow::Result<RuntimeRoleTemplates> {
+    if !experimental_state_blocks {
+        bail!("paired runtime roles require experimental-state-blocks artifact tooling");
+    }
+    #[cfg(not(feature = "experimental-state-blocks"))]
+    {
+        let _ = inputs;
+        bail!("paired runtime roles require an experimental-state-blocks vosx build");
+    }
+    #[cfg(feature = "experimental-state-blocks")]
+    {
+        use vos::agent::package_admission::{admit_runtime_package, admit_state_runtime_package};
+        use vos::agent::sdk::contract::RuntimePackageContract;
+        use vos::agent::sdk::{LaneSet, ProofSystemSet, RuntimeCapabilities, StateLane};
+
+        let limits_bytes = read_regular_bounded(inputs.external_limits, MAX_EXTERNAL_LIMITS_BYTES)?;
+        let limits = serde_json::from_slice::<RuntimeRoleExternalLimits>(&limits_bytes)
+            // serde errors may echo unknown key names. Invalid input can be
+            // a mistakenly supplied credential file; do not disclose it.
+            .map_err(|_| {
+                anyhow::anyhow!("external runtime limits must be a strict two-field JSON object")
+            })?
+            .signed_limits()?;
+        let system_pvm = read_regular_bounded(inputs.system_image, MAX_ARTIFACT_BYTES)?;
+        let external_pvm = read_regular_bounded(inputs.shared_external, MAX_ARTIFACT_BYTES)?;
+        anyhow::ensure!(
+            system_pvm != external_pvm,
+            "System and Shared runtime inputs must not alias"
+        );
+        // Reuse the actual guest probes, not merely a syntactically signed
+        // contract which could mislabel an IMAGE guest as EXTERNAL or vice versa.
+        super::agent_runtime_pvm::validate_system_observation_runtime_pvm(&system_pvm)
+            .context("qualify System IMAGE guest ABI")?;
+        super::agent_runtime_pvm::validate_state_runtime_pvm(&external_pvm)
+            .context("qualify Shared EXTERNAL guest ABI")?;
+        let signer = system_template_signer()?;
+        let system_image = bundled::root_signed_runtime_package_bytes(
+            &signer,
+            &system_pvm,
+            "system-image-runtime",
+            RuntimePackageContract::system_observation_image(),
+            RuntimeCapabilities::standard(),
+            None,
+        )?;
+        let shared_external = bundled::root_signed_runtime_package_bytes(
+            &signer,
+            &external_pvm,
+            "shared-external-runtime",
+            RuntimePackageContract::experimental_state_blocks(),
+            RuntimeCapabilities {
+                lanes: LaneSet::of(StateLane::Linear),
+                scheduling: false,
+                proof_systems: ProofSystemSet::EMPTY,
+                ..RuntimeCapabilities::standard()
+            },
+            Some(limits),
+        )?;
+        validate_runtime_role_templates(&system_image, &shared_external)?;
+        let image =
+            admit_runtime_package(&system_image).context("admit signed System IMAGE template")?;
+        let external = admit_state_runtime_package(&shared_external)
+            .context("admit signed Shared EXTERNAL template")?;
+        anyhow::ensure!(
+            image.program_bytes() == system_pvm
+                && external.program_bytes() == external_pvm
+                && external.external_state_limits() == limits,
+            "runtime role signing changed its admitted closure or limits",
+        );
+        Ok(RuntimeRoleTemplates {
+            system_image,
+            shared_external,
+        })
+    }
 }
 
 fn bundle(output: &Path) -> anyhow::Result<()> {
@@ -175,7 +357,18 @@ fn bundle(output: &Path) -> anyhow::Result<()> {
     validate_authority(authority)?;
     let catalog = bundled::system_catalog_package_template();
     validate_catalog(&catalog)?;
-    let manifest = manifest_for(standard_runtime, authority, catalog)?;
+    // Both exact role pins are mandatory. The checked getters refuse while
+    // qualification/repin is incomplete, before any output is created.
+    let system_image = bundled::system_image_runtime_package_template()?;
+    let shared_external = bundled::shared_external_runtime_package_template()?;
+    validate_runtime_role_templates(system_image, shared_external)?;
+    let manifest = manifest_for(
+        standard_runtime,
+        system_image,
+        shared_external,
+        authority,
+        catalog,
+    )?;
 
     let parent = nonempty_parent(output);
     fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -186,6 +379,10 @@ fn bundle(output: &Path) -> anyhow::Result<()> {
     let mut guard = PartialDirectory(Some(output.to_path_buf()));
     fs::write(output.join(STANDARD_RUNTIME_FILE), standard_runtime)
         .context("write canonical standard runtime")?;
+    fs::write(output.join(SYSTEM_IMAGE_RUNTIME_FILE), system_image)
+        .context("write canonical System observation runtime template")?;
+    fs::write(output.join(SHARED_EXTERNAL_RUNTIME_FILE), shared_external)
+        .context("write canonical Shared external runtime template")?;
     fs::write(output.join(AUTHORITY_FILE), authority)
         .context("write canonical system-authority actor")?;
     fs::write(output.join(CATALOG_FILE), &catalog)
@@ -198,6 +395,14 @@ fn bundle(output: &Path) -> anyhow::Result<()> {
     println!(
         "  standard_runtime_program_id = {}",
         manifest.standard_runtime.program_id
+    );
+    println!(
+        "  system_image_runtime_program_id = {}",
+        manifest.system_image_runtime.program_id
+    );
+    println!(
+        "  shared_external_runtime_program_id = {}",
+        manifest.shared_external_runtime.program_id
     );
     println!(
         "  authority_actor_program_id = {}",
@@ -228,22 +433,51 @@ fn verify(directory: &Path) -> anyhow::Result<ReleaseManifest> {
         serde_json::from_slice(&manifest_bytes).context("decode production release manifest")?;
     let standard_runtime =
         read_regular_bounded(&directory.join(STANDARD_RUNTIME_FILE), MAX_ARTIFACT_BYTES)?;
+    let system_image = read_regular_bounded(
+        &directory.join(SYSTEM_IMAGE_RUNTIME_FILE),
+        MAX_ARTIFACT_BYTES,
+    )?;
+    let shared_external = read_regular_bounded(
+        &directory.join(SHARED_EXTERNAL_RUNTIME_FILE),
+        MAX_ARTIFACT_BYTES,
+    )?;
     let authority = read_regular_bounded(&directory.join(AUTHORITY_FILE), MAX_ARTIFACT_BYTES)?;
     let catalog = read_regular_bounded(&directory.join(CATALOG_FILE), MAX_ARTIFACT_BYTES)?;
     validate_standard_runtime(&standard_runtime)?;
+    anyhow::ensure!(
+        system_image == bundled::system_image_runtime_package_template()?
+            && shared_external == bundled::shared_external_runtime_package_template()?,
+        "runtime role templates do not match the exact canonical release bytes"
+    );
+    validate_runtime_role_templates(&system_image, &shared_external)?;
     validate_authority(&authority)?;
     validate_catalog(&catalog)?;
-    validate_manifest(&manifest, &standard_runtime, &authority, &catalog)?;
+    validate_manifest(
+        &manifest,
+        &standard_runtime,
+        &system_image,
+        &shared_external,
+        &authority,
+        &catalog,
+    )?;
     Ok(manifest)
 }
 
 fn validate_manifest(
     manifest: &ReleaseManifest,
     standard_runtime: &[u8],
+    system_image: &[u8],
+    shared_external: &[u8],
     authority: &[u8],
     catalog: &[u8],
 ) -> anyhow::Result<()> {
-    let expected = manifest_for(standard_runtime, authority, catalog)?;
+    let expected = manifest_for(
+        standard_runtime,
+        system_image,
+        shared_external,
+        authority,
+        catalog,
+    )?;
     if manifest != &expected {
         bail!("release manifest does not describe the exact pinned artifacts");
     }
@@ -291,6 +525,58 @@ fn validate_standard_runtime_program(bytes: &[u8]) -> anyhow::Result<()> {
     })
 }
 
+/// Exact typed role admission, reused by source materialization and pinned
+/// release verification. Signature/closure admission is not a guest probe;
+/// actual ABI qualification remains mandatory before these pins are assigned.
+fn validate_runtime_role_templates(
+    system_image: &[u8],
+    shared_external: &[u8],
+) -> anyhow::Result<()> {
+    #[cfg(not(feature = "experimental-state-blocks"))]
+    {
+        let _ = (system_image, shared_external);
+        bail!(
+            "System observation and Shared external release roles require experimental-state-blocks support"
+        );
+    }
+    #[cfg(feature = "experimental-state-blocks")]
+    {
+        use vos::agent::package_admission::{admit_runtime_package, admit_state_runtime_package};
+        use vos::agent::sdk::contract::RuntimePackageContract;
+        use vos::agent::sdk::{LaneSet, RuntimeCapabilities, StateLane};
+
+        let image = admit_runtime_package(system_image)
+            .context("admit signed System observation runtime template")?;
+        let external = admit_state_runtime_package(shared_external)
+            .context("admit signed Shared external runtime template")?;
+        let expected_external = RuntimeCapabilities {
+            lanes: LaneSet::of(StateLane::Linear),
+            ..RuntimeCapabilities::standard()
+        };
+        let public = system_template_signer()?
+            .public()
+            .try_into_ed25519()
+            .map_err(|_| anyhow::anyhow!("template signer is not Ed25519"))?
+            .to_bytes();
+        anyhow::ensure!(
+            image.manifest().name == "system-image-runtime"
+                && image.manifest().contract == RuntimePackageContract::system_observation_image()
+                && image.manifest().capabilities == RuntimeCapabilities::standard()
+                && image.manifest().external_state_limits.is_none()
+                && image.manifest().signing.public_key == public
+                && external.manifest().name == "shared-external-runtime"
+                && external.manifest().contract
+                    == RuntimePackageContract::experimental_state_blocks()
+                && external.manifest().capabilities == expected_external
+                && external.external_state_limits().is_valid()
+                && external.manifest().signing.public_key == public
+                && image.program() != external.program(),
+            "signed runtime templates do not implement the exact System/Shared release roles"
+        );
+        Ok(())
+    }
+}
+
 fn validate_actor_package(bytes: &[u8], label: &str) -> anyhow::Result<()> {
     let actor = vos::agent::package_admission::admit_actor_package(bytes)
         .with_context(|| format!("admit {label} package template"))?;
@@ -317,6 +603,8 @@ fn validate_actor_package(bytes: &[u8], label: &str) -> anyhow::Result<()> {
 
 fn manifest_for(
     standard_runtime: &[u8],
+    system_image: &[u8],
+    shared_external: &[u8],
     authority: &[u8],
     catalog: &[u8],
 ) -> anyhow::Result<ReleaseManifest> {
@@ -328,9 +616,36 @@ fn manifest_for(
             STANDARD_RUNTIME_FILE,
             standard_runtime,
         ),
+        system_image_runtime: runtime_package_artifact(SYSTEM_IMAGE_RUNTIME_FILE, system_image)?,
+        shared_external_runtime: runtime_package_artifact(
+            SHARED_EXTERNAL_RUNTIME_FILE,
+            shared_external,
+        )?,
         authority_actor: package_artifact(AUTHORITY_FILE, authority)?,
         catalog_actor: package_artifact(CATALOG_FILE, catalog)?,
     })
+}
+
+fn runtime_package_artifact(file: &str, bytes: &[u8]) -> anyhow::Result<ReleaseArtifact> {
+    use vos::agent::sdk::package::{PackageEnvelope, PackageManifest};
+    let envelope = PackageEnvelope::decode(bytes).context("decode release runtime template")?;
+    let PackageManifest::AgentRuntime(manifest) = &envelope.manifest else {
+        bail!("release runtime template has the wrong package kind");
+    };
+    let program = envelope
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.identity == manifest.outer_program)
+        .ok_or_else(|| anyhow::anyhow!("release runtime template lacks its exact outer program"))?;
+    let mut result = artifact(
+        ReleaseArtifactKind::AgentRuntimePackageTemplate,
+        file,
+        bytes,
+    );
+    // The complete signed envelope digest binds the role contract/capabilities
+    // and external limits. Program identity remains the enclosed PVM identity.
+    result.program_id = hex::encode(AgentProgramId::of_pvm(&program.bytes).0);
+    Ok(result)
 }
 
 fn package_artifact(file: &str, bytes: &[u8]) -> anyhow::Result<ReleaseArtifact> {
@@ -418,7 +733,7 @@ fn normalize_release_directory(path: &Path) -> anyhow::Result<PathBuf> {
 }
 
 fn verify_directory_shape(directory: &Path) -> anyhow::Result<()> {
-    let mut seen = [false; 4];
+    let mut seen = [false; 6];
     let mut count = 0usize;
     for entry in fs::read_dir(directory)
         .with_context(|| format!("read release directory {}", directory.display()))?
@@ -427,7 +742,7 @@ fn verify_directory_shape(directory: &Path) -> anyhow::Result<()> {
         count += 1;
         if count > seen.len() {
             bail!(
-                "release directory must contain exactly {MANIFEST_FILE}, {STANDARD_RUNTIME_FILE}, {AUTHORITY_FILE}, and {CATALOG_FILE}",
+                "release directory must contain exactly {MANIFEST_FILE}, {STANDARD_RUNTIME_FILE}, {SYSTEM_IMAGE_RUNTIME_FILE}, {SHARED_EXTERNAL_RUNTIME_FILE}, {AUTHORITY_FILE}, and {CATALOG_FILE}",
             );
         }
         let name = entry.file_name();
@@ -436,6 +751,8 @@ fn verify_directory_shape(directory: &Path) -> anyhow::Result<()> {
             Some(STANDARD_RUNTIME_FILE) => 1,
             Some(AUTHORITY_FILE) => 2,
             Some(CATALOG_FILE) => 3,
+            Some(SYSTEM_IMAGE_RUNTIME_FILE) => 4,
+            Some(SHARED_EXTERNAL_RUNTIME_FILE) => 5,
             Some(_) => bail!("release directory contains an unexpected entry"),
             None => bail!("release contains a non-UTF-8 file name"),
         };
@@ -445,7 +762,7 @@ fn verify_directory_shape(directory: &Path) -> anyhow::Result<()> {
     }
     if count != seen.len() || !seen.into_iter().all(|present| present) {
         bail!(
-            "release directory must contain exactly {MANIFEST_FILE}, {STANDARD_RUNTIME_FILE}, {AUTHORITY_FILE}, and {CATALOG_FILE}",
+            "release directory must contain exactly {MANIFEST_FILE}, {STANDARD_RUNTIME_FILE}, {SYSTEM_IMAGE_RUNTIME_FILE}, {SHARED_EXTERNAL_RUNTIME_FILE}, {AUTHORITY_FILE}, and {CATALOG_FILE}",
         );
     }
     Ok(())
@@ -556,12 +873,223 @@ mod tests {
     }
 
     #[test]
+    fn runtime_role_inputs_are_all_or_none() {
+        let image = Path::new("system-image.pvm");
+        let external = Path::new("shared-external.pvm");
+        let limits = Path::new("limits.json");
+        assert!(runtime_role_inputs(None, None, None).unwrap().is_none());
+        let complete = runtime_role_inputs(Some(image), Some(external), Some(limits))
+            .unwrap()
+            .unwrap();
+        assert_eq!(complete.system_image, image);
+        assert_eq!(complete.shared_external, external);
+        assert_eq!(complete.external_limits, limits);
+        for mask in 1..7 {
+            assert!(
+                runtime_role_inputs(
+                    (mask & 1 != 0).then_some(image),
+                    (mask & 2 != 0).then_some(external),
+                    (mask & 4 != 0).then_some(limits),
+                )
+                .is_err(),
+                "partial role input mask {mask} must fail",
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_role_external_limits_are_explicit_and_strict() {
+        let valid = serde_json::from_str::<RuntimeRoleExternalLimits>(
+            r#"{"max_rows_per_lane":23,"max_row_bytes_per_lane":4096}"#,
+        )
+        .unwrap()
+        .signed_limits()
+        .unwrap();
+        assert_eq!(valid.max_rows_per_lane, 23);
+        assert_eq!(valid.max_row_bytes_per_lane, 4096);
+        for json in [
+            "{}",
+            r#"{"max_rows_per_lane":23}"#,
+            r#"{"max_rows_per_lane":23,"max_row_bytes_per_lane":4096,"extra":1}"#,
+            r#"{"max_rows_per_lane":0,"max_row_bytes_per_lane":4096}"#,
+            r#"{"max_rows_per_lane":23,"max_row_bytes_per_lane":0}"#,
+            r#"{"max_rows_per_lane":-1,"max_row_bytes_per_lane":4096}"#,
+            r#"{"max_rows_per_lane":23,"max_rows_per_lane":24,"max_row_bytes_per_lane":4096}"#,
+            r#"{"max_rows_per_lane":18446744073709551616,"max_row_bytes_per_lane":4096}"#,
+        ] {
+            let decoded = serde_json::from_str::<RuntimeRoleExternalLimits>(json);
+            assert!(
+                decoded
+                    .and_then(|limits| { limits.signed_limits().map_err(serde::de::Error::custom) })
+                    .is_err(),
+                "invalid or implicit limits must fail: {json}",
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_role_limits_are_bounded_without_disclosing_invalid_input() {
+        let directory = TestDir::new("role-limits-bound");
+        let limits = directory.0.join("limits.json");
+        let sensitive = vec![b'x'; MAX_EXTERNAL_LIMITS_BYTES as usize + 1];
+        fs::write(&limits, &sensitive).unwrap();
+        let error = read_regular_bounded(&limits, MAX_EXTERNAL_LIMITS_BYTES).unwrap_err();
+        assert!(error.to_string().contains("invalid size"));
+        assert!(!error.to_string().contains("xxxxx"));
+        assert_eq!(fs::read(limits).unwrap(), sensitive);
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn invalid_runtime_role_inputs_never_create_template_output() {
+        let source = TestDir::new("invalid-role-source");
+        for actor in ["system-authority", "system-catalog"] {
+            let path = source.0.join("actors").join(actor);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("Cargo.toml"), b"unused invalid-input fixture").unwrap();
+        }
+        let image = source.0.join("image.pvm");
+        let external = source.0.join("external.pvm");
+        let limits = source.0.join("limits.json");
+        fs::write(&image, b"not a PVM").unwrap();
+        fs::write(&external, b"not an external PVM").unwrap();
+        let sensitive = b"not JSON: signer material must not be copied to output";
+        fs::write(&limits, sensitive).unwrap();
+        let inputs = RuntimeRoleTemplateInputs {
+            system_image: &image,
+            shared_external: &external,
+            external_limits: &limits,
+        };
+        let out = source.0.join("new-output");
+        let error = build_system_templates(&source.0, &out, true, Some(inputs)).unwrap_err();
+        assert!(!error.to_string().contains("signer material"));
+        assert!(!out.exists());
+        assert_eq!(fs::read(&limits).unwrap(), sensitive);
+        fs::write(
+            &limits,
+            br#"{"SECRET_MUST_NOT_APPEAR_IN_ERRORS":1,"max_rows_per_lane":23,"max_row_bytes_per_lane":4096}"#,
+        ).unwrap();
+        let error = build_system_templates(&source.0, &out, true, Some(inputs)).unwrap_err();
+        assert!(!format!("{error:#}").contains("SECRET_MUST_NOT_APPEAR_IN_ERRORS"));
+        assert!(!out.exists());
+        fs::write(
+            &limits,
+            br#"{"max_rows_per_lane":23,"max_row_bytes_per_lane":4096}"#,
+        )
+        .unwrap();
+        assert!(build_system_templates(&source.0, &out, true, Some(inputs)).is_err());
+        assert!(!out.exists());
+        // A reused image, including a hard-link alias, is not two role inputs.
+        let aliases = RuntimeRoleTemplateInputs {
+            shared_external: &image,
+            ..inputs
+        };
+        assert!(
+            prepare_runtime_role_templates(aliases, true)
+                .unwrap_err()
+                .to_string()
+                .contains("alias")
+        );
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    #[ignore = "requires independently reproduced coherent IMAGE/EXTERNAL runtime role inputs"]
+    fn candidate_runtime_role_templates_bind_abi_capabilities_limits_and_signer() {
+        use vos::agent::package_admission::{admit_runtime_package, admit_state_runtime_package};
+        use vos::agent::sdk::contract::RuntimePackageContract;
+        use vos::agent::sdk::package::{PackageEnvelope, PackageManifest};
+        use vos::agent::sdk::{LaneSet, ProofSystemSet, StateLane};
+
+        let image_path = PathBuf::from(
+            std::env::var_os("VOS_AGENT_SYSTEM_IMAGE_RUNTIME_PVM")
+                .expect("set coherent System IMAGE PVM"),
+        );
+        let external_path = PathBuf::from(
+            std::env::var_os("VOS_AGENT_SHARED_EXTERNAL_RUNTIME_PVM")
+                .expect("set coherent Shared EXTERNAL PVM"),
+        );
+        let limits_path = PathBuf::from(
+            std::env::var_os("VOS_AGENT_RUNTIME_ROLE_LIMITS").expect("set explicit role limits"),
+        );
+        let inputs = RuntimeRoleTemplateInputs {
+            system_image: &image_path,
+            shared_external: &external_path,
+            external_limits: &limits_path,
+        };
+        let first = prepare_runtime_role_templates(inputs, true).unwrap();
+        let second = prepare_runtime_role_templates(inputs, true).unwrap();
+        assert_eq!(first.system_image, second.system_image);
+        assert_eq!(first.shared_external, second.shared_external);
+        let image = admit_runtime_package(&first.system_image).unwrap();
+        let external = admit_state_runtime_package(&first.shared_external).unwrap();
+        assert_eq!(image.manifest().name, "system-image-runtime");
+        assert_eq!(external.manifest().name, "shared-external-runtime");
+        assert_eq!(
+            image.manifest().contract,
+            RuntimePackageContract::system_observation_image()
+        );
+        assert!(image.manifest().external_state_limits.is_none());
+        assert_eq!(
+            external.manifest().contract,
+            RuntimePackageContract::experimental_state_blocks(),
+        );
+        assert_eq!(
+            external.manifest().capabilities.lanes,
+            LaneSet::of(StateLane::Linear)
+        );
+        assert!(!external.manifest().capabilities.scheduling);
+        assert_eq!(
+            external.manifest().capabilities.proof_systems,
+            ProofSystemSet::EMPTY
+        );
+        assert!(admit_runtime_package(&first.shared_external).is_err());
+        assert!(admit_state_runtime_package(&first.system_image).is_err());
+        let public = system_template_signer()
+            .unwrap()
+            .public()
+            .try_into_ed25519()
+            .unwrap()
+            .to_bytes();
+        assert_eq!(image.manifest().signing.public_key, public);
+        assert_eq!(external.manifest().signing.public_key, public);
+        let mut forged = PackageEnvelope::decode(&first.shared_external).unwrap();
+        let PackageManifest::AgentRuntime(manifest) = &mut forged.manifest else {
+            unreachable!()
+        };
+        let rows = &mut manifest
+            .external_state_limits
+            .as_mut()
+            .unwrap()
+            .max_rows_per_lane;
+        *rows = if *rows == u64::MAX {
+            *rows - 1
+        } else {
+            *rows + 1
+        };
+        assert!(admit_state_runtime_package(&forged.encode().unwrap()).is_err());
+        // A typed contract label alone cannot make the other physical guest
+        // implement that ABI. The same existing probes must reject swapped roles.
+        assert!(
+            super::super::agent_runtime_pvm::validate_state_runtime_pvm(image.program_bytes(),)
+                .is_err()
+        );
+        assert!(
+            super::super::agent_runtime_pvm::validate_system_observation_runtime_pvm(
+                external.program_bytes(),
+            )
+            .is_err()
+        );
+        validate_standard_runtime(bundled::agent_runtime_pvm()).unwrap();
+    }
+
+    #[test]
     fn system_templates_reject_existing_output_without_modifying_it() {
         let out = TestDir::new("templates-existing");
         let sentinel = out.0.join("keep");
         fs::write(&sentinel, b"unchanged").unwrap();
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        assert!(build_system_templates(source, &out.0, false).is_err());
+        assert!(build_system_templates(source, &out.0, false, None).is_err());
         assert_eq!(fs::read(sentinel).unwrap(), b"unchanged");
     }
 
@@ -569,7 +1097,7 @@ mod tests {
     fn system_templates_validate_source_before_creating_output() {
         let source = TestDir::new("templates-missing-source");
         let out = source.0.join("output");
-        assert!(build_system_templates(&source.0, &out, false).is_err());
+        assert!(build_system_templates(&source.0, &out, false, None).is_err());
         assert!(!out.exists());
     }
 
@@ -579,7 +1107,7 @@ mod tests {
         let source = TestDir::new("templates-experimental-disabled");
         let out = source.0.join("output");
         assert!(
-            build_system_templates(&source.0, &out, true)
+            build_system_templates(&source.0, &out, true, None)
                 .unwrap_err()
                 .to_string()
                 .contains("experimental-state-blocks vosx build")
@@ -599,6 +1127,22 @@ mod tests {
         assert_eq!(
             manifest.standard_runtime.kind,
             ReleaseArtifactKind::AgentRuntime
+        );
+        assert_eq!(
+            manifest.system_image_runtime.file,
+            SYSTEM_IMAGE_RUNTIME_FILE
+        );
+        assert_eq!(
+            manifest.shared_external_runtime.file,
+            SHARED_EXTERNAL_RUNTIME_FILE
+        );
+        assert_eq!(
+            manifest.system_image_runtime.kind,
+            ReleaseArtifactKind::AgentRuntimePackageTemplate
+        );
+        assert_eq!(
+            manifest.shared_external_runtime.kind,
+            ReleaseArtifactKind::AgentRuntimePackageTemplate
         );
         assert_eq!(manifest.authority_actor.file, AUTHORITY_FILE);
         assert_eq!(
@@ -644,13 +1188,64 @@ mod tests {
     }
 
     #[test]
+    fn release_manifest_requires_both_signed_runtime_roles() {
+        let value = serde_json::to_value(fixture_manifest()).unwrap();
+        for missing in ["system_image_runtime", "shared_external_runtime"] {
+            let mut incomplete = value.clone();
+            incomplete.as_object_mut().unwrap().remove(missing);
+            assert!(serde_json::from_value::<ReleaseManifest>(incomplete).is_err());
+        }
+        let (image, external) = fixture_runtime_templates();
+        assert!(
+            validate_runtime_role_templates(&image, &external).is_err(),
+            "ordinary Local images cannot be relabeled as released System/Shared roles"
+        );
+    }
+
+    #[test]
+    fn runtime_manifest_binds_signed_envelope_not_only_enclosed_program() {
+        let (image, external) = fixture_runtime_templates();
+        let manifest = fixture_manifest();
+        let mut changed = vos::agent::sdk::package::PackageEnvelope::decode(&external).unwrap();
+        let vos::agent::sdk::package::PackageManifest::AgentRuntime(runtime) =
+            &mut changed.manifest
+        else {
+            unreachable!()
+        };
+        runtime.signing.signature[0] ^= 1;
+        let changed = changed.encode().unwrap();
+        assert_eq!(
+            runtime_package_artifact(SHARED_EXTERNAL_RUNTIME_FILE, &external)
+                .unwrap()
+                .program_id,
+            runtime_package_artifact(SHARED_EXTERNAL_RUNTIME_FILE, &changed)
+                .unwrap()
+                .program_id,
+        );
+        assert!(
+            validate_manifest(
+                &manifest,
+                bundled::agent_runtime_pvm(),
+                &image,
+                &changed,
+                bundled::system_authority_package_template(),
+                bundled::system_catalog_package_template(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn release_manifest_rejects_the_previous_agent_semantics() {
         let mut manifest = fixture_manifest();
+        let (image, external) = fixture_runtime_templates();
         manifest.agent_execution_semantics = hex::encode(*b"vos-pvm-41d31e6-standard-gas-r02");
         assert!(
             validate_manifest(
                 &manifest,
                 bundled::agent_runtime_pvm(),
+                &image,
+                &external,
                 bundled::system_authority_package_template(),
                 bundled::system_catalog_package_template()
             )
@@ -674,6 +1269,14 @@ mod tests {
         assert_eq!(
             manifest.standard_runtime.program_id,
             hex::encode(AgentProgramId::of_pvm(runtime).0),
+        );
+        assert_eq!(
+            manifest.system_image_runtime.program_id,
+            manifest.standard_runtime.program_id
+        );
+        assert_eq!(
+            manifest.shared_external_runtime.program_id,
+            manifest.standard_runtime.program_id
         );
         assert_eq!(
             manifest.authority_actor.program_id,
@@ -735,9 +1338,36 @@ mod tests {
         validate_catalog(catalog).expect("bundled and release catalog pins must agree");
     }
 
+    // Structural manifest tests must not invent qualified System/Shared pins.
+    // Ordinary canonical signed images only exercise envelope/program digest
+    // binding here; typed role admission rejects these fixtures explicitly.
+    fn fixture_runtime_templates() -> (Vec<u8>, Vec<u8>) {
+        use vos::agent::sdk::RuntimeCapabilities;
+        use vos::agent::sdk::contract::RuntimePackageContract;
+        let signer = system_template_signer().unwrap();
+        let package = |name| {
+            bundled::root_signed_runtime_package_bytes(
+                &signer,
+                bundled::agent_runtime_pvm(),
+                name,
+                RuntimePackageContract::canonical(),
+                RuntimeCapabilities::standard(),
+                None,
+            )
+            .unwrap()
+        };
+        (
+            package("system-image-runtime"),
+            package("shared-external-runtime"),
+        )
+    }
+
     fn fixture_manifest() -> ReleaseManifest {
+        let (image, external) = fixture_runtime_templates();
         manifest_for(
             bundled::agent_runtime_pvm(),
+            &image,
+            &external,
             bundled::system_authority_package_template(),
             bundled::system_catalog_package_template(),
         )
@@ -749,11 +1379,14 @@ mod tests {
         assert!(validate_authority(bundled::space_authority_pvm().unwrap()).is_err());
         assert!(validate_catalog(bundled::registry_elf().unwrap()).is_err());
         let mut manifest = fixture_manifest();
+        let (image, external) = fixture_runtime_templates();
         manifest.format = "VOS-AGENT-RELEASE-1".into();
         assert!(
             validate_manifest(
                 &manifest,
                 bundled::agent_runtime_pvm(),
+                &image,
+                &external,
                 bundled::system_authority_package_template(),
                 bundled::system_catalog_package_template()
             )
@@ -762,10 +1395,20 @@ mod tests {
     }
 
     #[test]
-    fn bundle_is_self_contained_and_byte_reproducible() {
+    fn bundle_requires_exact_roles_and_is_reproducible_when_pinned() {
         let temp = TestDir::new("reproducible");
         let first = temp.0.join("first");
         let second = temp.0.join("second");
+        if bundled::system_image_runtime_package_template().is_err()
+            || bundled::shared_external_runtime_package_template().is_err()
+        {
+            assert!(bundle(&first).is_err());
+            assert!(
+                !first.exists(),
+                "unqualified role pins must refuse before output writes"
+            );
+            return;
+        }
         bundle(&first).expect("first bundle");
         bundle(&second).expect("second bundle");
         let first_manifest = verify(&first).expect("verify first bundle");
@@ -774,6 +1417,8 @@ mod tests {
         for file in [
             MANIFEST_FILE,
             STANDARD_RUNTIME_FILE,
+            SYSTEM_IMAGE_RUNTIME_FILE,
+            SHARED_EXTERNAL_RUNTIME_FILE,
             AUTHORITY_FILE,
             CATALOG_FILE,
         ] {
@@ -783,6 +1428,20 @@ mod tests {
                 "artifact={file}",
             );
         }
+    }
+
+    #[test]
+    fn release_bundle_refuses_existing_output_without_modifying_it() {
+        let directory = TestDir::new("bundle-no-clobber");
+        let sentinel = directory.0.join("keep");
+        fs::write(&sentinel, b"unchanged").unwrap();
+        assert!(
+            bundle(&directory.0)
+                .unwrap_err()
+                .to_string()
+                .contains("already exists")
+        );
+        assert_eq!(fs::read(sentinel).unwrap(), b"unchanged");
     }
 
     #[cfg(unix)]
@@ -812,6 +1471,8 @@ mod tests {
         for name in [
             MANIFEST_FILE,
             STANDARD_RUNTIME_FILE,
+            SYSTEM_IMAGE_RUNTIME_FILE,
+            SHARED_EXTERNAL_RUNTIME_FILE,
             AUTHORITY_FILE,
             CATALOG_FILE,
             "surplus",
@@ -819,6 +1480,24 @@ mod tests {
             fs::write(temp.0.join(name), b"x").expect("write test entry");
         }
         assert!(verify_directory_shape(&temp.0).is_err());
+    }
+
+    #[test]
+    fn release_directory_requires_both_role_packages() {
+        let directory = TestDir::new("role-directory-shape");
+        for name in [
+            MANIFEST_FILE,
+            STANDARD_RUNTIME_FILE,
+            AUTHORITY_FILE,
+            CATALOG_FILE,
+        ] {
+            fs::write(directory.0.join(name), b"x").unwrap();
+        }
+        assert!(verify_directory_shape(&directory.0).is_err());
+        fs::write(directory.0.join(SYSTEM_IMAGE_RUNTIME_FILE), b"x").unwrap();
+        assert!(verify_directory_shape(&directory.0).is_err());
+        fs::write(directory.0.join(SHARED_EXTERNAL_RUNTIME_FILE), b"x").unwrap();
+        verify_directory_shape(&directory.0).unwrap();
     }
 
     #[cfg(unix)]

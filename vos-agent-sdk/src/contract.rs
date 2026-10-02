@@ -217,8 +217,9 @@ impl RuntimePackageContract {
     pub fn is_valid(self) -> bool {
         let supported_abi = self.lifecycle_abi == RUNTIME_ABI_ID;
         #[cfg(feature = "experimental-state-blocks")]
-        let supported_abi =
-            supported_abi || self.lifecycle_abi == crate::state_execution::STATE_EXECUTION_ABI_ID;
+        let supported_abi = supported_abi
+            || self.lifecycle_abi == crate::state_execution::STATE_EXECUTION_ABI_ID
+            || self.lifecycle_abi == crate::SYSTEM_OBSERVATION_ABI_ID;
         supported_abi
             && self.actor_abis.is_valid()
             && self.control_schema.0 == CONTROL_SCHEMA_ID.0
@@ -242,6 +243,31 @@ impl RuntimePackageContract {
         }
     }
 
+    /// Explicit signed image-runtime opt-in for scoped System observations.
+    /// Existing mutation/state encodings and resource ceilings are unchanged.
+    /// Host admission must still select the System Authority observation path;
+    /// this does not authorize observation through ordinary invocation ingress.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub const fn system_observation_image() -> Self {
+        Self {
+            lifecycle_abi: crate::SYSTEM_OBSERVATION_ABI_ID,
+            ..Self::canonical()
+        }
+    }
+
+    /// Whether this build understands the exact signed observation opt-in.
+    /// Shape/package authentication and scoped host admission remain required.
+    pub fn supports_system_observation(self) -> bool {
+        #[cfg(feature = "experimental-state-blocks")]
+        {
+            self.lifecycle_abi == crate::SYSTEM_OBSERVATION_ABI_ID && self.is_valid()
+        }
+        #[cfg(not(feature = "experimental-state-blocks"))]
+        {
+            false
+        }
+    }
+
     pub fn supports(self, actor: ActorPackageContract) -> bool {
         self.is_valid() && actor.is_valid() && self.actor_abis.supports(actor.actor_abi)
     }
@@ -250,6 +276,40 @@ impl RuntimePackageContract {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_observation_contract_is_explicit_image_only_and_feature_gated() {
+        let canonical = RuntimePackageContract::canonical();
+        let mut observation = canonical;
+        observation.lifecycle_abi = crate::SYSTEM_OBSERVATION_ABI_ID;
+        assert_ne!(observation.lifecycle_abi, RUNTIME_ABI_ID);
+        assert_eq!(
+            observation.is_valid(),
+            cfg!(feature = "experimental-state-blocks")
+        );
+        assert_eq!(
+            observation.supports_system_observation(),
+            cfg!(feature = "experimental-state-blocks")
+        );
+        assert!(!canonical.supports_system_observation());
+        #[cfg(feature = "experimental-state-blocks")]
+        {
+            assert_eq!(
+                observation,
+                RuntimePackageContract::system_observation_image()
+            );
+            assert_eq!(observation.resources, canonical.resources);
+            assert_eq!(observation.control_schema, canonical.control_schema);
+            assert_eq!(observation.actor_abis, canonical.actor_abis);
+            assert_eq!(observation.migration, canonical.migration);
+            assert!(
+                !RuntimePackageContract::experimental_state_blocks().supports_system_observation()
+            );
+        }
+        observation.resources.max_runtime_state_bytes = 0;
+        assert!(!observation.supports_system_observation());
+        assert!(!observation.is_valid());
+    }
 
     #[test]
     fn external_state_contract_requires_explicit_feature_and_identity() {

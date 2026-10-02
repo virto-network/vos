@@ -342,6 +342,7 @@ impl StagedExternalArchive {
     /// Copy only the authenticated source closure admitted by an opaque rebind
     /// plan. Destination-private empty metadata is independently derived and
     /// staged by that plan, never replaced with foreign Local identifiers.
+    #[cfg(feature = "storage")]
     pub(crate) fn promote_authenticated_source(
         &mut self,
         source_genesis: &super::super::replay::ReplaySealedExternalGenesis,

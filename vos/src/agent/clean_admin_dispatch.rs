@@ -179,7 +179,6 @@ where
         if !preparation.matches_call(call)
             || call.authority != self.authority_target()
             || call.authenticated_node != self.pins.node
-            || self.record.pending_projection.is_some()
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
@@ -319,7 +318,6 @@ where
         if !retained.validate_wire()
             || retained.call.authority != self.authority_target()
             || retained.call.authenticated_node != self.pins.node
-            || self.record.pending_projection.is_some()
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }

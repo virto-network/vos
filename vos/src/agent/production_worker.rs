@@ -101,10 +101,67 @@ impl Control {
             }
             *exposed = Some(handle);
             self.recovering.store(false, Ordering::Release);
+            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                tracing::debug!(
+                    operation = "shared_create_readiness",
+                    phase = "fresh_routes_published",
+                    owner = ?owner,
+                    "Public Shared Create readiness diagnostic"
+                );
+            }
             tracing::info!("Clean Agent recovery complete; verified routes ready");
         }
         Ok(())
     }
+
+    fn quarantine_pending(&self, owner: &mut AgentProductionOwner) -> Result<(), Error> {
+        if !owner.needs_route_quarantine() {
+            return Ok(());
+        }
+        // Close public admission before refresh waits for already admitted
+        // operations. Keep the lifecycle queue and quorum participant alive.
+        self.recovering.store(true, Ordering::Release);
+        if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+            tracing::debug!(
+                operation = "shared_create_readiness",
+                phase = "temporary_projection_quarantine",
+                owner = ?owner,
+                "Public Shared Create readiness diagnostic"
+            );
+        }
+        *self
+            .exposed
+            .write()
+            .map_err(|_| Error::InvalidConfiguration)? = None;
+        let result = owner.quarantine_routes();
+        if self.shutdown.load(Ordering::Acquire) {
+            // Explicit cancellation also shuts down the supervisor, which can
+            // interrupt a draining refresh. The ordinary exit guard owns the
+            // remaining retirement and queued-command rejection.
+            Ok(())
+        } else {
+            result
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn quarantine_routes_for_test(
+    owner: &mut AgentProductionOwner,
+    exposed: Arc<RwLock<Option<CleanAgentIngress>>>,
+    recovering: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
+    lifecycle: Arc<LocalLifecycleQueue>,
+) -> Result<(), Error> {
+    Control {
+        supervisor: owner.handle(),
+        exposed,
+        recovering,
+        shutdown,
+        lifecycle,
+        activity: Mutex::new((false, Instant::now())),
+    }
+    .quarantine_pending(owner)
 }
 
 // Close admission/publication even on panic, then reject queued direct calls.
@@ -156,6 +213,12 @@ impl AgentProductionWorker {
                     commands: receiver,
                 };
                 let result = drive(&mut owner, &guard);
+                if let Err(error) = &result {
+                    // A fatal control-path failure closes public ingress.
+                    // Preserve its cause before Drop joins the worker and
+                    // callers can observe only a disappeared listener.
+                    tracing::error!(?error, "Clean Agent control worker stopped");
+                }
                 guard.control.stop();
                 let shutdown = owner.shutdown_and_join();
                 result.and(shutdown)
@@ -251,6 +314,7 @@ fn drive(owner: &mut AgentProductionOwner, guard: &ExitGuard) -> Result<(), Erro
         if control.shutdown.load(Ordering::Acquire) {
             break;
         }
+        control.quarantine_pending(owner)?;
         if let Some(request) = control
             .lifecycle
             .pop()
@@ -262,6 +326,7 @@ fn drive(owner: &mut AgentProductionOwner, guard: &ExitGuard) -> Result<(), Erro
             }
             let _active = ActiveWork::enter(&control.activity);
             dispatch(owner, request);
+            control.quarantine_pending(owner)?;
         }
         if control.shutdown.load(Ordering::Acquire) {
             break;
@@ -274,10 +339,15 @@ fn drive(owner: &mut AgentProductionOwner, guard: &ExitGuard) -> Result<(), Erro
         };
         match reconciliation {
             Err(Error::ShutdownRequested) if control.shutdown.load(Ordering::Acquire) => break,
+            Err(Error::ProjectionBusy | Error::ProjectionNotReady) => {}
             result => {
                 result?;
             }
         }
+        // Also covers initial NotReady, which drive_if_due schedules as
+        // Ok(false). Hide before draining, without stopping the lifecycle queue
+        // or the physical quorum participants.
+        control.quarantine_pending(owner)?;
         match control.publish_recovered(owner) {
             Err(Error::ShutdownRequested) if control.shutdown.load(Ordering::Acquire) => break,
             result => result?,
@@ -326,6 +396,60 @@ fn dispatch(owner: &mut AgentProductionOwner, request: PendingLocalLifecycle) {
         PendingLocalLifecycle::Install { submission, reply } => {
             let (install, call, package) = submission.into_parts();
             let _ = reply.try_send(owner.install_local_actor(install, call, package));
+        }
+        #[cfg(all(
+            target_os = "linux",
+            feature = "storage",
+            feature = "experimental-state-blocks"
+        ))]
+        PendingLocalLifecycle::CreateShared {
+            submission,
+            retained_only,
+            reply,
+        } => {
+            // Correlate the complete signed caller intent, not its body or keys.
+            // Existing owner Debug exposes bounded physical node/System IDs.
+            let signed_call = submission.call().commitment();
+            let agent = submission.call().managed.agent;
+            let started = Instant::now();
+            tracing::debug!(
+                operation = "shared_create",
+                phase = "dispatch_start",
+                retained_only,
+                signed_call = ?signed_call.0,
+                ?agent,
+                owner = ?owner,
+                "Public Shared lifecycle dispatch"
+            );
+            let result = owner.create_shared_disposition(submission, retained_only);
+            tracing::debug!(
+                operation = "shared_create",
+                phase = "dispatch_complete",
+                signed_call = ?signed_call.0,
+                ?agent,
+                owner = ?owner,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                succeeded = result.is_ok(),
+                error = ?result.as_ref().err(),
+                "Public Shared lifecycle dispatch"
+            );
+            let _ = reply.try_send(result);
+        }
+        #[cfg(all(
+            target_os = "linux",
+            feature = "storage",
+            feature = "experimental-state-blocks"
+        ))]
+        PendingLocalLifecycle::InstallShared { submission, reply } => {
+            let _ = reply.try_send(owner.install_shared_disposition(submission));
+        }
+        #[cfg(all(
+            target_os = "linux",
+            feature = "storage",
+            feature = "experimental-state-blocks"
+        ))]
+        PendingLocalLifecycle::AdmitSharedMember { submission, reply } => {
+            let _ = reply.try_send(owner.admit_shared_member(submission));
         }
     }
 }

@@ -52,9 +52,11 @@ use super::shared_raft::{
     AgentRaftPendingOrderedV2, ArtifactBatchId, ArtifactBatchManifest, ArtifactChunk,
     CommittedSharedRaftSlot, InstalledAgentRaftSnapshotV2,
 };
+
+#[cfg(all(feature = "network", target_os = "linux"))]
+mod forwarded_management;
 use super::shared_recovery::{
-    SharedRecoveryExpiryTerminal, SharedRecoveryManifest, SharedRecoveryObservation,
-    SharedRecoveryRegistration, VerifiedSharedRecoveryObservation,
+    SharedRecoveryManifest, SharedRecoveryObservation, VerifiedSharedRecoveryObservation,
 };
 use super::wire::RuntimeState;
 use super::{AgentProfile, ReplicaRole};
@@ -62,6 +64,20 @@ use crate::service::wire::ServiceWire;
 use crate::service::{BlobRef, Hash, NodeId};
 
 type SharedReplayError = MaterializeError<core::convert::Infallible, LocalReplayExecutorError>;
+
+fn clean_outcome_kind(outcome: Option<&crate::agent_sdk::RuntimeOutcome>) -> &'static str {
+    use crate::agent_sdk::RuntimeOutcome;
+    match outcome {
+        None => "missing",
+        Some(RuntimeOutcome::Acknowledged(Ok(_))) => "ack_ok",
+        Some(RuntimeOutcome::Acknowledged(Err(_))) => "ack_err",
+        Some(RuntimeOutcome::Completed(Ok(_))) => "completed_ok",
+        Some(RuntimeOutcome::Completed(Err(_))) => "completed_err",
+        Some(RuntimeOutcome::Yielded(_)) => "yielded",
+        Some(RuntimeOutcome::Management(Ok(_))) => "management_ok",
+        Some(RuntimeOutcome::Management(Err(_))) => "management_err",
+    }
+}
 
 // Every unpruned recovery observation is checked against a freshly replayed
 // result. Physical metadata slots do not consume this Ordered-result cache.
@@ -111,12 +127,7 @@ fn unique_recovery_observations(
     manifest: &SharedRecoveryManifest,
 ) -> Vec<&SharedRecoveryObservation> {
     let mut unique = Vec::with_capacity(super::shared_recovery::MAX_SHARED_RECOVERY_SLOTS * 2);
-    for observation in manifest
-        .slots()
-        .iter()
-        .flat_map(|slot| [slot.invoke(), slot.acknowledgement()])
-        .flatten()
-    {
+    for observation in manifest.observations() {
         // Equality includes the complete input, claim and outcome. Index or
         // invocation identity alone cannot authorize skipping another proof.
         if !unique.contains(&observation) {
@@ -124,6 +135,136 @@ fn unique_recovery_observations(
         }
     }
     unique
+}
+
+/// Capacity selection only. The caller has verified the live manifest and any
+/// proposed registration; replacement never manufactures evidence for its new
+/// member. A positive ACK is not a denial and must not enter denial recovery.
+fn management_retention_headroom<'a>(
+    heads: &super::journal::JournalHeads,
+    manifest: &'a SharedRecoveryManifest,
+    incoming: Option<
+        &'a super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest,
+    >,
+) -> Result<
+    (
+        Vec<(
+            &'a super::clean_management_intent::ManagementJournalAnchor,
+            &'a crate::agent_sdk::RuntimeWork,
+        )>,
+        usize,
+        usize,
+    ),
+    SharedJournalDriverError,
+> {
+    let scopes = manifest
+        .management_slots()
+        .iter()
+        .filter(|slot| {
+            !slot.is_released() && incoming.is_none_or(|request| request.owner() != slot.owner())
+        })
+        .map(|slot| (slot.owner(), slot.members()))
+        .chain(incoming.map(|request| (request.owner(), request.members())));
+    let mut pending = Vec::new();
+    let mut future_entries = 0usize;
+    let mut future_bytes = 0usize;
+    for (owner, members) in scopes {
+        let root = members
+            .first()
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        // Preserve the initial finalization reserve for every unreleased
+        // family, even when its root approval was already acknowledged.
+        let (entries, bytes) = management_finalization_headroom(heads, root.envelope())?;
+        future_entries = future_entries
+            .checked_add(entries)
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        future_bytes = future_bytes
+            .checked_add(bytes)
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        let retained = manifest
+            .management_slot(owner)
+            .filter(|slot| !slot.is_released());
+        for member in members {
+            let acknowledged = retained.is_some_and(|slot| {
+                slot.members()
+                    .iter()
+                    .zip(slot.members_evidence())
+                    .any(|(saved, evidence)| {
+                        saved == member && evidence.acknowledgement().is_some()
+                    })
+            });
+            if !acknowledged {
+                pending.push((member.anchor(), member.envelope()));
+            }
+        }
+    }
+    Ok((pending, future_entries, future_bytes))
+}
+
+/// The same conservative future Invoke/ACK framing used by fresh management
+/// admission. No placeholder result or runtime effect is created or admitted.
+fn management_finalization_headroom(
+    heads: &super::journal::JournalHeads,
+    envelope: &crate::agent_sdk::RuntimeWork,
+) -> Result<(usize, usize), SharedJournalDriverError> {
+    let crate::agent_sdk::RuntimeWork::Invoke {
+        context,
+        invocation,
+        authorization,
+        observed_slot,
+        ..
+    } = envelope
+    else {
+        return Err(SharedJournalDriverError::CrossStoreMismatch);
+    };
+    let mut future_bytes = 0usize;
+    for operation in [
+        ReplayOperation::CleanInvoke {
+            context: *context,
+            work: (**invocation).clone(),
+            authorization: (**authorization).clone(),
+            observed_slot: *observed_slot,
+        },
+        ReplayOperation::CleanAcknowledge {
+            context: *context,
+            expected_live: None,
+            work: crate::agent_sdk::InvocationRetirement::from_work(invocation),
+            authorization: (**authorization).clone(),
+        },
+    ] {
+        let entry = OrderedEntry {
+            genesis: heads.genesis,
+            index: heads
+                .ordered_index
+                .checked_add(1)
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?,
+            parent: heads.ordered_head,
+            merge_frontier: heads.merge_frontier,
+            merge_seal: None,
+            input: ReplayInput {
+                runtime: heads.runtime.clone(),
+                operation,
+            },
+        };
+        // A currently absent parent may become a 32-byte hash. Finalization
+        // replaces fixed-size identities and may use the full message limit.
+        future_bytes = future_bytes
+            .checked_add(entry.encode().len())
+            .and_then(|bytes| bytes.checked_add(crate::agent_sdk::MAX_INVOCATION_MESSAGE_BYTES))
+            .and_then(|bytes| bytes.checked_add(32))
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+    }
+    Ok((2, future_bytes))
+}
+
+// A verified first capsule may outlive recent suffix evidence. Two absences
+// cannot substitute for that capsule or excuse a late/substituted anchor.
+fn management_pending_input_matches_anchor(
+    recent: Option<ReplayInputId>,
+    anchored: Option<ReplayInputId>,
+    capsule: Option<ReplayInputId>,
+) -> bool {
+    recent == anchored || capsule.is_some_and(|input| anchored == Some(input))
 }
 
 /// Selection only, after the caller verifies live provenance and the certified
@@ -136,18 +277,154 @@ fn certified_live_recovery_observation<'a>(
 ) -> Option<&'a SharedRecoveryObservation> {
     let baseline = baseline?;
     let observation = live
-        .slots()
-        .iter()
-        .flat_map(|slot| [slot.invoke(), slot.acknowledgement()])
-        .flatten()
+        .observations()
+        .into_iter()
         .find(|observation| *observation == requested)?;
     baseline
-        .slots()
-        .iter()
-        .flat_map(|slot| [slot.invoke(), slot.acknowledgement()])
-        .flatten()
+        .observations()
+        .into_iter()
         .any(|certified| certified == observation)
         .then_some(observation)
+}
+
+// This is selection, not authentication. The budget's verified live view and
+// the freshly audited common-authority view must agree in their entirety:
+// matching one requested capsule alone cannot authorize call-local reuse.
+fn certified_budget_recovery_observation<'a>(
+    budget: &SharedRecoveryManifest,
+    live: &'a SharedRecoveryManifest,
+    baseline: Option<&SharedRecoveryManifest>,
+    requested: &SharedRecoveryObservation,
+) -> Option<&'a SharedRecoveryObservation> {
+    (budget == live)
+        .then(|| certified_live_recovery_observation(live, baseline, requested))
+        .flatten()
+}
+
+/// Selection only after provenance verification. An invocation collision is
+/// never evidence of absence, and a different captured anchor cannot recover
+/// this member even when its work bytes happen to match.
+fn exact_retained_management_member<'a>(
+    manifest: &'a SharedRecoveryManifest,
+    anchor: Option<OrderedBase>,
+    envelope: &crate::agent_sdk::RuntimeWork,
+) -> Result<
+    Option<&'a super::shared_recovery::management::SharedManagementRecoveryMemberEvidence>,
+    SharedJournalDriverError,
+> {
+    let crate::agent_sdk::RuntimeWork::Invoke { invocation, .. } = envelope else {
+        return Err(SharedJournalDriverError::CrossStoreMismatch);
+    };
+    let mut retained = None;
+    for slot in manifest.management_slots() {
+        for (member, evidence) in slot.members().iter().zip(slot.members_evidence()) {
+            if member.work().invocation != invocation.invocation {
+                continue;
+            }
+            if member.envelope() != envelope
+                || anchor.is_some_and(|anchor| member.anchor().ordered != anchor)
+            {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+            if retained.is_some_and(|prior| prior != evidence) {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+            retained = Some(evidence);
+        }
+    }
+    Ok(retained)
+}
+
+/// A fresh management Invoke cannot pass an earlier admitted immutable clock.
+/// Selection is over already authenticated custody, not Standard private state.
+/// Exact outcomes are selected before this guard; committed replay is unchanged.
+fn management_first_invoke_clock_ready(
+    manifest: &SharedRecoveryManifest,
+    observed_slot: u64,
+) -> Result<bool, SharedJournalDriverError> {
+    for slot in manifest
+        .management_slots()
+        .iter()
+        .filter(|slot| !slot.is_released())
+    {
+        for (member, evidence) in slot.members().iter().zip(slot.members_evidence()) {
+            if evidence.invoke().is_some() {
+                continue;
+            }
+            let crate::agent_sdk::RuntimeWork::Invoke {
+                observed_slot: accepted_slot,
+                ..
+            } = member.envelope()
+            else {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            };
+            if *accepted_slot < observed_slot {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// A caller may recover retained outcomes, not execution permission. Match the
+/// complete public preflight work before choosing the original physical input.
+fn retained_management_operation<'a>(
+    manifest: &'a SharedRecoveryManifest,
+    operation: &ReplayOperation,
+) -> Result<Option<&'a SharedRecoveryObservation>, SharedJournalDriverError> {
+    let requested = match operation {
+        ReplayOperation::CleanInvoke { work, .. } | ReplayOperation::CleanResume { work, .. } => {
+            work.invocation
+        }
+        ReplayOperation::CleanAcknowledge { work, .. } => work.invocation,
+        _ => return Ok(None),
+    };
+    let mut retained = None;
+    for slot in manifest.management_slots() {
+        for (member, evidence) in slot.members().iter().zip(slot.members_evidence()) {
+            if member.work().invocation != requested {
+                continue;
+            }
+            let matches = match operation {
+                ReplayOperation::CleanInvoke {
+                    context,
+                    work,
+                    authorization,
+                    ..
+                } => {
+                    *context == crate::agent_sdk::RuntimeExecutionContext::Direct
+                        && member.work() == work
+                        && member.authorization() == authorization
+                }
+                ReplayOperation::CleanAcknowledge {
+                    context,
+                    expected_live: None,
+                    work,
+                    authorization,
+                } => {
+                    *context == crate::agent_sdk::RuntimeExecutionContext::Direct
+                        && crate::agent_sdk::InvocationRetirement::from_work(member.work()) == *work
+                        && member.authorization() == authorization
+                }
+                _ => false,
+            };
+            if !matches {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+            let observation = if matches!(operation, ReplayOperation::CleanAcknowledge { .. }) {
+                evidence.acknowledgement()
+            } else {
+                evidence.invoke()
+            };
+            if let Some(observation) = observation {
+                if retained.is_some_and(|prior| prior != observation) {
+                    return Err(SharedJournalDriverError::CrossStoreMismatch);
+                }
+                retained = Some(observation);
+            }
+        }
+    }
+    Ok(retained)
 }
 
 /// The manifest has already passed this owner's exact provenance checks.
@@ -162,13 +439,18 @@ fn retained_acknowledged_projection_outcome(
 ) -> Option<crate::agent_sdk::RuntimeOutcome> {
     manifest
         .and_then(|manifest| {
-            manifest.slots().iter().find_map(|slot| {
-                (slot.registration().work() == work
-                    && slot.registration().authorization() == authorization
-                    && slot.is_acknowledged())
-                .then(|| slot.invoke())
-                .flatten()
-                .filter(|observation| observation.input_id() == input)
+            manifest.management_slots().iter().find_map(|slot| {
+                slot.members()
+                    .iter()
+                    .zip(slot.members_evidence())
+                    .find_map(|(member, evidence)| {
+                        (member.work() == work
+                            && member.authorization() == authorization
+                            && evidence.acknowledgement().is_some())
+                        .then(|| evidence.invoke())
+                        .flatten()
+                        .filter(|observation| observation.input_id() == input)
+                    })
             })
         })
         .map(|observation| observation.outcome().clone())
@@ -493,6 +775,8 @@ impl FileSharedArtifactStager {
         let route_path = root.join(STAGING_ROUTE_FILE);
         install_immutable_file(&route_path, &generation.encode())?;
         let stager = Self { root, generation };
+        #[cfg(feature = "network")]
+        forwarded_management::discard_forwarded_install_uploads(&stager)?;
         stager.audit_namespace()?;
         Ok(stager)
     }
@@ -519,6 +803,11 @@ impl FileSharedArtifactStager {
                 .map_err(|_| SharedArtifactStagerError::Corrupt)?;
             if name == STAGING_ROUTE_FILE {
                 require_regular(&entry.path())?;
+                continue;
+            }
+            #[cfg(feature = "network")]
+            if name == forwarded_management::FORWARDED_INSTALL_DIRECTORY {
+                forwarded_management::audit_forwarded_install_uploads(self)?;
                 continue;
             }
             let batch = decode_batch_directory_name(&name)?;
@@ -791,11 +1080,15 @@ pub(super) fn install_immutable_file(
                     {
                         return Err(SharedArtifactStagerError::Conflict);
                     }
+                    sync_exact_immutable_file(path, bytes)?;
                     fs::remove_file(&staged).map_err(|_| SharedArtifactStagerError::Unavailable)?;
                     let parent = path.parent().ok_or(SharedArtifactStagerError::Corrupt)?;
                     sync_directory(parent)?;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    sync_exact_immutable_file(path, bytes)?;
+                    sync_directory(path.parent().ok_or(SharedArtifactStagerError::Corrupt)?)?;
+                }
                 Err(_) => return Err(SharedArtifactStagerError::Unavailable),
             }
             return Ok(());
@@ -822,6 +1115,9 @@ pub(super) fn install_immutable_file(
             if existing != bytes {
                 return Err(SharedArtifactStagerError::Conflict);
             }
+            // Readable bytes can remain after an interrupted/failed sync.
+            // A retry must establish durability before publishing their name.
+            sync_exact_immutable_file(&staged, bytes)?;
         }
         Err(_) => return Err(SharedArtifactStagerError::Unavailable),
     }
@@ -836,12 +1132,54 @@ pub(super) fn install_immutable_file(
             if existing != bytes {
                 return Err(SharedArtifactStagerError::Conflict);
             }
+            sync_exact_immutable_file(path, bytes)?;
         }
         Err(_) => return Err(SharedArtifactStagerError::Unavailable),
     }
     fs::remove_file(&staged).map_err(|_| SharedArtifactStagerError::Unavailable)?;
     let parent = path.parent().ok_or(SharedArtifactStagerError::Corrupt)?;
     sync_directory(parent)
+}
+
+/// Reestablish durability of the exact already retained inode without changing
+/// names. In particular, a complete staged recovery record is not automatically
+/// durable merely because it can be read after a process interruption.
+#[cfg(target_os = "linux")]
+pub(super) fn sync_exact_immutable_file(
+    path: &Path,
+    expected: &[u8],
+) -> Result<(), SharedArtifactStagerError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    require_regular(path)?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| SharedArtifactStagerError::Unavailable)?;
+    let opened = file
+        .metadata()
+        .map_err(|_| SharedArtifactStagerError::Unavailable)?;
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(expected.len().saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| SharedArtifactStagerError::Unavailable)?;
+    if bytes != expected {
+        return Err(SharedArtifactStagerError::Conflict);
+    }
+    file.sync_all()
+        .map_err(|_| SharedArtifactStagerError::Unavailable)?;
+    let named = fs::symlink_metadata(path).map_err(|_| SharedArtifactStagerError::Unavailable)?;
+    if !named.file_type().is_file()
+        || named.file_type().is_symlink()
+        || named.dev() != opened.dev()
+        || named.ino() != opened.ino()
+        || named.len() != expected.len() as u64
+    {
+        return Err(SharedArtifactStagerError::Conflict);
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1283,7 +1621,6 @@ where
     /// Reconstructed from the certified baseline and exact applied suffix on
     /// open; advanced only by successful expiry application. Mutable manifest
     /// bytes cannot lower or invent this trusted admission floor on hot reads.
-    recovery_expiry_floor: u64,
     #[cfg(feature = "experimental-state-blocks")]
     external: Option<SharedExternalOwner>,
 }
@@ -1513,7 +1850,6 @@ where
         report_phase("reconcile_journal_ledger");
         store.finish_reverified_open()?;
         report_phase("finish_reverified_open");
-        let recovery_expiry_floor = ledger.authenticated_recovery_expiry_floor()?;
         Ok(Self {
             store,
             artifacts,
@@ -1523,7 +1859,6 @@ where
             local_node,
             replay_trust: trust,
             replay_merge: merge,
-            recovery_expiry_floor,
             #[cfg(feature = "experimental-state-blocks")]
             external,
         })
@@ -1595,6 +1930,29 @@ where
         let _entered = span.enter();
         let started = std::time::Instant::now();
         let operation = request.into_operation(0);
+        if let Some(manifest) = self.verified_recovery_manifest()?
+            && let Some(observation) = retained_management_operation(&manifest, &operation)?
+        {
+            if anchored_input.is_some_and(|input| input != observation.input_id()) {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+            // This exact selector and its availability check share the one
+            // freshly verified immutable live view. The existing availability
+            // helper still checks the physical anchor or complete certified
+            // archived closure; no proof survives this borrowed call.
+            self.available_ordered_claim_in_management_budget(
+                observation.input_id(),
+                Some(&manifest),
+                &mut None,
+            )?;
+            if !matches!(
+                observation.outcome(),
+                crate::agent_sdk::RuntimeOutcome::Completed(_)
+            ) {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+            return Ok(observation.outcome().clone());
+        }
         let (recovered, executor) = self.replay_verified_current()?;
         let input = if let Some(input) = anchored_input {
             input
@@ -2134,19 +2492,6 @@ where
     /// composite replay budgets. Recovery first proves a retained positive
     /// Ack, then an exact terminal Invoke, so it reserves zero, one, or two
     /// records rather than pessimistically requiring a fresh pair.
-    pub(crate) fn projection_admission_requirement(
-        &self,
-        work: &crate::agent_sdk::InvocationWork,
-        authorization: &crate::agent_sdk::InvocationAuthorization,
-        recovering: bool,
-    ) -> Result<Option<usize>, SharedJournalDriverError> {
-        let (required_entries, required_bytes) =
-            self.projection_admission_delta(work, authorization, recovering)?;
-        Ok(self
-            .materialization
-            .has_suffix_headroom(required_entries, required_bytes)
-            .then_some(required_entries))
-    }
 
     /// Exact remaining suffix cost of retiring two completed Linear management
     /// invocations. This is a capacity check, not a proposal/GC reservation.
@@ -2175,6 +2520,10 @@ where
         envelopes: &[&crate::agent_sdk::RuntimeWork],
         mut index: u64,
         mut parent: Option<super::journal::OrderedEntryId>,
+        manifest: Option<&SharedRecoveryManifest>,
+        available: &mut impl FnMut(
+            ReplayInputId,
+        ) -> Result<OrderedCommitClaim, SharedJournalDriverError>,
     ) -> Result<(usize, usize), SharedJournalDriverError> {
         use crate::agent_sdk::{
             InvocationAuthorization, MethodMode, RuntimeExecutionContext, RuntimeOutcome,
@@ -2212,7 +2561,12 @@ where
             {
                 return Err(SharedJournalDriverError::CrossStoreMismatch);
             }
-            if self.retained_positive_clean_acknowledgement(work, authorization)? {
+            if self.retained_positive_clean_acknowledgement_with_availability(
+                work,
+                authorization,
+                manifest,
+                available,
+            )? {
                 continue;
             }
             let invoke = ReplayOperation::CleanInvoke {
@@ -2221,11 +2575,20 @@ where
                 authorization: (**authorization).clone(),
                 observed_slot: *observed_slot,
             };
-            let input =
-                recent_clean_ordered_operation(&self.store, &self.materialization, &invoke)?
-                    .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+            let retained = self
+                .retained_management_invocation_with_availability(envelope, manifest, available)?;
+            let input = match retained.as_ref() {
+                Some(observation) => observation.input_id(),
+                None => {
+                    recent_clean_ordered_operation(&self.store, &self.materialization, &invoke)?
+                        .ok_or(SharedJournalDriverError::CrossStoreMismatch)?
+                }
+            };
             if !matches!(
-                self.executor.clean_ordered_result(input),
+                retained
+                    .as_ref()
+                    .map(|observation| observation.outcome().clone())
+                    .or_else(|| self.executor.clean_ordered_result(input)),
                 Some(RuntimeOutcome::Completed(Ok(_)))
             ) {
                 return Err(SharedJournalDriverError::CrossStoreMismatch);
@@ -2275,6 +2638,23 @@ where
         self.management_recovery_admission_requirement(pending, &[])
     }
 
+    /// Calculate the singleton submission budget and its exact anchored input
+    /// in one borrowed read. The caller must consume both under the same
+    /// drained admission exclusion, before preparation or publication.
+    pub(crate) fn management_pending_admission_with_input(
+        &self,
+        anchor: &super::clean_management_intent::ManagementJournalAnchor,
+        envelope: &crate::agent_sdk::RuntimeWork,
+    ) -> Result<(Option<usize>, Option<ReplayInputId>), SharedJournalDriverError> {
+        self.management_recovery_admission_with_headroom_and_input(
+            &[(anchor, envelope)],
+            &[],
+            0,
+            0,
+            true,
+        )
+    }
+
     /// One prospective Ordered chain for incomplete invocations and completed
     /// results awaiting retirement. Independent per-set checks are insufficient
     /// because both consume the same suffix entry and byte budgets.
@@ -2299,61 +2679,42 @@ where
         anchor: &super::clean_management_intent::ManagementJournalAnchor,
         envelope: &crate::agent_sdk::RuntimeWork,
     ) -> Result<Option<usize>, SharedJournalDriverError> {
-        let crate::agent_sdk::RuntimeWork::Invoke {
-            context,
-            invocation,
-            authorization,
-            observed_slot,
-            ..
-        } = envelope
-        else {
-            return Err(SharedJournalDriverError::CrossStoreMismatch);
-        };
-        let heads = self.materialization.heads();
-        let mut future_bytes = 0usize;
-        for operation in [
-            ReplayOperation::CleanInvoke {
-                context: *context,
-                work: (**invocation).clone(),
-                authorization: (**authorization).clone(),
-                observed_slot: *observed_slot,
-            },
-            ReplayOperation::CleanAcknowledge {
-                context: *context,
-                expected_live: None,
-                work: crate::agent_sdk::InvocationRetirement::from_work(invocation),
-                authorization: (**authorization).clone(),
-            },
-        ] {
-            let entry = OrderedEntry {
-                genesis: heads.genesis,
-                index: heads
-                    .ordered_index
-                    .checked_add(1)
-                    .ok_or(SharedJournalDriverError::CrossStoreMismatch)?,
-                parent: heads.ordered_head,
-                merge_frontier: heads.merge_frontier,
-                merge_seal: None,
-                input: ReplayInput {
-                    runtime: heads.runtime.clone(),
-                    operation,
-                },
-            };
-            // A currently absent parent may become a 32-byte hash. All other
-            // framing uses the same fixed-width encoding as actual admission.
-            future_bytes = future_bytes
-                .checked_add(entry.encode().len())
-                .and_then(|bytes| bytes.checked_add(crate::agent_sdk::MAX_INVOCATION_MESSAGE_BYTES))
-                .and_then(|bytes| bytes.checked_add(32))
-                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
-        }
+        let (future_entries, future_bytes) =
+            management_finalization_headroom(self.materialization.heads(), envelope)?;
         self.management_recovery_admission_with_headroom(
             &[(anchor, envelope)],
             &[],
-            2,
+            future_entries,
             future_bytes,
         )
     }
+
+    /// A leader may have no origin-side volatile intent map. Budget all live
+    /// owners from authenticated retained custody, replacing only the incoming
+    /// owner's validated scope. This neither signs nor reserves admission.
+    pub(crate) fn management_retention_admission_requirement(
+        &self,
+        incoming: Option<
+            &super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest,
+        >,
+    ) -> Result<Option<usize>, SharedJournalDriverError> {
+        let manifest = self.recovery_manifest()?;
+        if let Some(request) = incoming {
+            self.validate_management_recovery_registration_request(request)?;
+        }
+        let (pending, future_entries, future_bytes) =
+            management_retention_headroom(self.materialization.heads(), &manifest, incoming)?;
+        self.management_recovery_admission_with_headroom(
+            &pending,
+            &[],
+            future_entries,
+            future_bytes,
+        )
+    }
+
+    /// One budget for the exact read and every retained management owner's
+    /// unfinished lifecycle. Separate successful checks would double-spend the
+    /// same bounded suffix; read custody grants no parent release or extension.
 
     fn management_recovery_admission_with_headroom(
         &self,
@@ -2365,7 +2726,36 @@ where
         future_entries: usize,
         future_bytes: usize,
     ) -> Result<Option<usize>, SharedJournalDriverError> {
+        self.management_recovery_admission_with_headroom_and_input(
+            pending,
+            retiring,
+            future_entries,
+            future_bytes,
+            false,
+        )
+        .map(|(requirement, _)| requirement)
+    }
+
+    fn management_recovery_admission_with_headroom_and_input(
+        &self,
+        pending: &[(
+            &super::clean_management_intent::ManagementJournalAnchor,
+            &crate::agent_sdk::RuntimeWork,
+        )],
+        retiring: &[&crate::agent_sdk::RuntimeWork],
+        future_entries: usize,
+        future_bytes: usize,
+        select_input: bool,
+    ) -> Result<(Option<usize>, Option<ReplayInputId>), SharedJournalDriverError> {
         use crate::agent_sdk::{RuntimeOutcome, RuntimeWork};
+        if select_input
+            && (pending.len() != 1
+                || !retiring.is_empty()
+                || future_entries != 0
+                || future_bytes != 0)
+        {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
         if pending
             .len()
             .checked_add(retiring.len())
@@ -2379,6 +2769,29 @@ where
         let mut bytes = 0usize;
         let mut entries = 0usize;
         let mut seen = BTreeSet::new();
+        let mut selected_input = None;
+        // The borrowed driver cannot publish or drain during this calculation.
+        // Reuse only this call's freshly verified view for retained selectors;
+        // each unseen registered member still proves absence against its own
+        // fresh settled physical prefix below. Never retain the view for
+        // another budget, preparation, peer operation or publication.
+        let manifest = if pending.is_empty() && retiring.is_empty() {
+            None
+        } else {
+            self.verified_recovery_manifest()?
+        };
+        // This proof never escapes this immutable budget calculation. The
+        // first archived lookup authenticates its entire live/baseline view
+        // and physical checkpoint closure; every later capsule must match
+        // both that baseline and the same complete budget manifest.
+        let mut archived = None;
+        let mut available = |input| {
+            self.available_ordered_claim_in_management_budget(
+                input,
+                manifest.as_ref(),
+                &mut archived,
+            )
+        };
         for &(anchor, envelope) in pending {
             if anchor.genesis != heads.genesis
                 || anchor.admission != heads.admission
@@ -2399,15 +2812,49 @@ where
             if !seen.insert(work.invocation) {
                 return Err(SharedJournalDriverError::CrossStoreMismatch);
             }
-            if self.retained_positive_clean_acknowledgement(work, authorization)? {
+            if self.retained_positive_clean_acknowledgement_with_availability(
+                work,
+                authorization,
+                manifest.as_ref(),
+                &mut available,
+            )? {
                 let input = self
-                    .management_denial_invocation_after(anchor.ordered, envelope)?
+                    .management_invocation_after_with_availability(
+                        anchor.ordered,
+                        envelope,
+                        true,
+                        manifest.as_ref(),
+                        &mut available,
+                    )?
                     .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
-                let Some(RuntimeOutcome::Completed(Ok(reply))) =
-                    self.executor.clean_ordered_result(input)
+                let Some(RuntimeOutcome::Completed(Ok(reply))) = self
+                    .retained_management_completed_outcome_with_availability(
+                        input,
+                        manifest.as_ref(),
+                        &mut available,
+                    )?
+                    .or_else(|| self.executor.clean_ordered_result(input))
                 else {
                     return Err(SharedJournalDriverError::CrossStoreMismatch);
                 };
+                // Registered custody retains the exact first Invoke and its
+                // positive ACK even after the guest result has been retired.
+                // Its successful reply need not be one of the legacy terminal
+                // classes below: no new Ordered row or lifecycle release is
+                // authorized by this budget calculation.
+                let retained_terminal = manifest
+                    .as_ref()
+                    .map(|manifest| {
+                        exact_retained_management_member(manifest, Some(anchor.ordered), envelope)
+                    })
+                    .transpose()?
+                    .flatten()
+                    .is_some_and(|evidence| {
+                        evidence
+                            .invoke()
+                            .is_some_and(|invoke| invoke.input_id() == input)
+                            && evidence.acknowledgement().is_some()
+                    });
                 #[cfg(all(feature = "network", target_os = "linux"))]
                 let admin_success =
                     super::clean_bootstrap::admin_dispatch::matches_successful_admin_reply(
@@ -2417,14 +2864,6 @@ where
                     );
                 #[cfg(not(all(feature = "network", target_os = "linux")))]
                 let admin_success = false;
-                #[cfg(all(feature = "network", target_os = "linux"))]
-                let committee_query =
-                    super::clean_bootstrap::genesis_issuance::is_committee_query_reply(
-                        work,
-                        &reply.reply,
-                    );
-                #[cfg(not(all(feature = "network", target_os = "linux")))]
-                let committee_query = false;
                 #[cfg(all(feature = "network", target_os = "linux"))]
                 let publication = super::clean_bootstrap::genesis_issuance::is_publication_reply(
                     work,
@@ -2438,8 +2877,8 @@ where
                     || reply.deployment != work.deployment
                     || reply.mode != work.mode
                     || reply.status != crate::agent_sdk::InvocationStatus::Done
-                    || (!admin_success
-                        && !committee_query
+                    || (!retained_terminal
+                        && !admin_success
                         && !publication
                         && reply.reply
                             != crate::actors::codec::Encode::encode(
@@ -2448,12 +2887,39 @@ where
                 {
                     return Err(SharedJournalDriverError::CrossStoreMismatch);
                 }
-                // A proven denial, admin success, query or publication may remain
-                // pending after ACK while terminal evidence is persisted.
-                // Other successes still require their separate lifecycle.
+                if select_input {
+                    // The ordinary post-budget anchor lookup did not permit
+                    // a legacy ACK to substitute for a live Invoke. Keep that
+                    // stricter lookup even though the budget's terminal branch
+                    // also validates the exact denial/admin/publication reply.
+                    selected_input = self.management_invocation_after_with_availability(
+                        anchor.ordered,
+                        envelope,
+                        false,
+                        manifest.as_ref(),
+                        &mut available,
+                    )?;
+                    if selected_input != Some(input) {
+                        return Err(SharedJournalDriverError::CrossStoreMismatch);
+                    }
+                }
+                // Retained Invoke/ACK pairs and the legacy terminal classes
+                // need no further rows. Parent finalization/release retains
+                // its separate capacity and durable lifecycle requirements.
                 continue;
             }
-            let retained = self.management_invocation_after(anchor.ordered, envelope)?;
+            let retained = self.management_invocation_after_with_availability(
+                anchor.ordered,
+                envelope,
+                false,
+                manifest.as_ref(),
+                &mut available,
+            )?;
+            let capsule = self.retained_management_invocation_with_availability(
+                envelope,
+                manifest.as_ref(),
+                &mut available,
+            )?;
             let invoke = ReplayOperation::CleanInvoke {
                 context: *context,
                 work: (**work).clone(),
@@ -2463,23 +2929,39 @@ where
             // An anchor newer than a retained invocation cannot be used to
             // budget it as unseen. Later lifecycle steps already fail the
             // anchored walk; completed retirement uses its separate protocol.
-            if recent_clean_ordered_operation(&self.store, &self.materialization, &invoke)?
-                != retained
-            {
+            if !management_pending_input_matches_anchor(
+                recent_clean_ordered_operation(&self.store, &self.materialization, &invoke)?,
+                retained,
+                capsule.as_ref().map(SharedRecoveryObservation::input_id),
+            ) {
                 return Err(SharedJournalDriverError::CrossStoreMismatch);
             }
             if retained.is_none()
-                && self.retained_positive_clean_acknowledgement(work, authorization)?
+                && self.retained_positive_clean_acknowledgement_with_availability(
+                    work,
+                    authorization,
+                    manifest.as_ref(),
+                    &mut available,
+                )?
             {
                 return Err(SharedJournalDriverError::CrossStoreMismatch);
             }
             if let Some(input) = retained {
                 if !matches!(
-                    self.executor.clean_ordered_result(input),
+                    capsule
+                        .as_ref()
+                        .filter(|observation| observation.input_id() == input)
+                        .map(|observation| observation.outcome().clone())
+                        .or_else(|| self.executor.clean_ordered_result(input)),
                     Some(RuntimeOutcome::Completed(Ok(_)))
                 ) {
                     return Err(SharedJournalDriverError::CrossStoreMismatch);
                 }
+            }
+            if select_input {
+                // Preserve the budget's fresh per-member absence proof rather
+                // than repeating it before preparation under the same locks.
+                selected_input = retained;
             }
             let acknowledgement = ReplayOperation::CleanAcknowledge {
                 context: *context,
@@ -2525,8 +3007,13 @@ where
                 return Err(SharedJournalDriverError::CrossStoreMismatch);
             }
         }
-        let (retirement_entries, retirement_bytes) =
-            self.management_retirement_delta(retiring, index, parent)?;
+        let (retirement_entries, retirement_bytes) = self.management_retirement_delta(
+            retiring,
+            index,
+            parent,
+            manifest.as_ref(),
+            &mut available,
+        )?;
         let entries = entries
             .checked_add(retirement_entries)
             .and_then(|entries| entries.checked_add(future_entries))
@@ -2535,10 +3022,12 @@ where
             .checked_add(retirement_bytes)
             .and_then(|bytes| bytes.checked_add(future_bytes))
             .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
-        Ok(self
-            .materialization
-            .has_suffix_headroom(entries, bytes)
-            .then_some(entries))
+        Ok((
+            self.materialization
+                .has_suffix_headroom(entries, bytes)
+                .then_some(entries),
+            selected_input,
+        ))
     }
 
     /// Validate and encode the exact projection lifecycle delta independently
@@ -2546,143 +3035,28 @@ where
     /// the old authenticated suffix is deliberately full; ordinary admission
     /// still calls [`Self::projection_admission_requirement`] and therefore
     /// cannot bypass either replay budget.
-    pub(crate) fn projection_admission_records(
-        &self,
-        work: &crate::agent_sdk::InvocationWork,
-        authorization: &crate::agent_sdk::InvocationAuthorization,
-        recovering: bool,
-    ) -> Result<usize, SharedJournalDriverError> {
-        self.projection_admission_delta(work, authorization, recovering)
-            .map(|(entries, _)| entries)
-    }
-
-    fn projection_admission_delta(
-        &self,
-        work: &crate::agent_sdk::InvocationWork,
-        authorization: &crate::agent_sdk::InvocationAuthorization,
-        recovering: bool,
-    ) -> Result<(usize, usize), SharedJournalDriverError> {
-        if work.mode != crate::agent_sdk::MethodMode::Query || !authorization.matches_work(work) {
-            return Err(SharedJournalDriverError::CrossStoreMismatch);
-        }
-        let crate::agent_sdk::InvocationAuthorization::PublicPreflight(preflight) = authorization
-        else {
-            return Err(SharedJournalDriverError::CrossStoreMismatch);
-        };
-        if recovering && self.retained_positive_clean_acknowledgement(work, authorization)? {
-            return Ok((0, 0));
-        }
-        if recovering
-            && self.verified_recovery_manifest()?.is_some_and(|manifest| {
-                manifest.slots().iter().any(|slot| {
-                    slot.expiry().is_some()
-                        && slot.registration().work() == work
-                        && slot.registration().authorization() == authorization
-                })
-            })
-        {
-            // Certified expiry needs only durable host cleanup, not VM rows.
-            // An expired clock without this exact applied proof saves nothing.
-            return Ok((0, 0));
-        }
-
-        let invoke_operation = ReplayOperation::CleanInvoke {
-            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
-            work: work.clone(),
-            authorization: authorization.clone(),
-            observed_slot: preflight.observed_slot,
-        };
-        let retained_invoke = if recovering {
-            self.retained_terminal_projection_input(&invoke_operation)?
-        } else {
-            None
-        };
-
-        let heads = self.materialization.heads();
-        let mut entries = Vec::with_capacity(if retained_invoke.is_some() { 1 } else { 2 });
-        if retained_invoke.is_none() {
-            let invoke = OrderedEntry {
-                genesis: heads.genesis,
-                index: heads
-                    .ordered_index
-                    .checked_add(1)
-                    .ok_or(SharedJournalDriverError::CrossStoreMismatch)?,
-                parent: heads.ordered_head,
-                merge_frontier: heads.merge_frontier,
-                merge_seal: None,
-                input: ReplayInput {
-                    runtime: heads.runtime.clone(),
-                    operation: invoke_operation,
-                },
-            };
-            invoke
-                .validate()
-                .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
-            entries.push(invoke);
-        }
-        let (ack_index, ack_parent) = match entries.last() {
-            Some(invoke) => (
-                invoke
-                    .index
-                    .checked_add(1)
-                    .ok_or(SharedJournalDriverError::CrossStoreMismatch)?,
-                Some(invoke.id()),
-            ),
-            None => (
-                heads
-                    .ordered_index
-                    .checked_add(1)
-                    .ok_or(SharedJournalDriverError::CrossStoreMismatch)?,
-                heads.ordered_head,
-            ),
-        };
-        let acknowledgement = OrderedEntry {
-            genesis: heads.genesis,
-            index: ack_index,
-            parent: ack_parent,
-            merge_frontier: heads.merge_frontier,
-            merge_seal: None,
-            input: ReplayInput {
-                runtime: heads.runtime.clone(),
-                operation: ReplayOperation::CleanAcknowledge {
-                    context: crate::agent_sdk::RuntimeExecutionContext::Direct,
-                    expected_live: None,
-                    work: crate::agent_sdk::InvocationRetirement::from_work(work),
-                    authorization: authorization.clone(),
-                },
-            },
-        };
-        acknowledgement
-            .validate()
-            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
-        entries.push(acknowledgement);
-        let required_bytes = entries.iter().try_fold(0usize, |total, entry| {
-            total
-                .checked_add(entry.encode().len())
-                .ok_or(SharedJournalDriverError::CrossStoreMismatch)
-        })?;
-        let required_entries = entries.len();
-        Ok((required_entries, required_bytes))
-    }
 
     fn retained_terminal_projection_input(
         &self,
         operation: &ReplayOperation,
     ) -> Result<Option<(ReplayInputId, crate::agent_sdk::RuntimeOutcome)>, SharedJournalDriverError>
     {
-        if let ReplayOperation::CleanInvoke {
-            work,
-            authorization,
-            ..
-        } = operation
-            && let Some(manifest) = self.verified_recovery_manifest()?
-            && let Some(observation) = manifest.slots().iter().find_map(|slot| {
-                (slot.registration().work() == work
-                    && slot.registration().authorization() == authorization)
-                    .then(|| slot.invoke())
-                    .flatten()
-            })
+        let manifest = self.verified_recovery_manifest()?;
+        self.retained_terminal_projection_input_with_manifest(operation, manifest.as_ref())
+    }
+
+    fn retained_terminal_projection_input_with_manifest(
+        &self,
+        operation: &ReplayOperation,
+        manifest: Option<&SharedRecoveryManifest>,
+    ) -> Result<Option<(ReplayInputId, crate::agent_sdk::RuntimeOutcome)>, SharedJournalDriverError>
+    {
+        // The caller freshly verified this view for this immutable lookup.
+        // Every legacy, availability and certified-boundary check stays below.
+        if let Some(manifest) = manifest
+            && let Some(observation) = retained_management_operation(manifest, operation)?
         {
+            self.available_ordered_claim(observation.input_id())?;
             return Ok(Some((
                 observation.input_id(),
                 observation.outcome().clone(),
@@ -2772,6 +3146,32 @@ where
         Ok(Some((entry.input.id(), outcome)))
     }
 
+    /// One guard's retained ACK/Invoke decision, freshly verified per call.
+    /// Standalone selectors remain fresh; no view survives a guest preview.
+    pub(crate) fn retained_positive_or_terminal_projection(
+        &self,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+    ) -> Result<bool, SharedJournalDriverError> {
+        let manifest = self.verified_recovery_manifest()?;
+        if self.retained_positive_clean_acknowledgement_with_manifest(
+            work,
+            authorization,
+            manifest.as_ref(),
+        )? {
+            return Ok(true);
+        }
+        let operation = ReplayOperation::CleanInvoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+            work: work.clone(),
+            authorization: authorization.clone(),
+            observed_slot: 0,
+        };
+        Ok(self
+            .retained_terminal_projection_input_with_manifest(&operation, manifest.as_ref())?
+            .is_some())
+    }
+
     pub(crate) fn retained_terminal_projection_invoke(
         &self,
         work: &crate::agent_sdk::InvocationWork,
@@ -2790,15 +3190,6 @@ where
 
     /// Prove that a fresh exact projection Invoke/Ack pair fits both
     /// authenticated composite replay budgets.
-    pub(crate) fn projection_pair_fits(
-        &self,
-        work: &crate::agent_sdk::InvocationWork,
-        authorization: &crate::agent_sdk::InvocationAuthorization,
-    ) -> Result<bool, SharedJournalDriverError> {
-        Ok(self
-            .projection_admission_requirement(work, authorization, false)?
-            .is_some())
-    }
 
     /// Read-only proof that the exact pending projection lifecycle already
     /// reached a positive durable acknowledgement. This is used after a
@@ -2823,13 +3214,36 @@ where
         authorization: &crate::agent_sdk::InvocationAuthorization,
         manifest: Option<&SharedRecoveryManifest>,
     ) -> Result<bool, SharedJournalDriverError> {
-        if manifest.is_some_and(|manifest| {
-            manifest.slots().iter().any(|slot| {
-                slot.registration().work() == work
-                    && slot.registration().authorization() == authorization
-                    && slot.is_acknowledged()
+        self.retained_positive_clean_acknowledgement_with_availability(
+            work,
+            authorization,
+            manifest,
+            &mut |input| self.available_ordered_claim(input),
+        )
+    }
+
+    fn retained_positive_clean_acknowledgement_with_availability(
+        &self,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        manifest: Option<&SharedRecoveryManifest>,
+        available: &mut impl FnMut(
+            ReplayInputId,
+        ) -> Result<OrderedCommitClaim, SharedJournalDriverError>,
+    ) -> Result<bool, SharedJournalDriverError> {
+        if let Some(observation) = manifest.and_then(|manifest| {
+            manifest.management_slots().iter().find_map(|slot| {
+                slot.members()
+                    .iter()
+                    .zip(slot.members_evidence())
+                    .find_map(|(member, evidence)| {
+                        (member.work() == work && member.authorization() == authorization)
+                            .then(|| evidence.acknowledgement())
+                            .flatten()
+                    })
             })
         }) {
+            available(observation.input_id())?;
             return Ok(true);
         }
         let operation = ReplayOperation::CleanAcknowledge {
@@ -2843,7 +3257,8 @@ where
         else {
             return Ok(false);
         };
-        match self.executor.clean_ordered_result(input) {
+        let outcome = self.executor.clean_ordered_result(input);
+        match &outcome {
             Some(crate::agent_sdk::RuntimeOutcome::Acknowledged(Ok(acknowledged)))
                 if acknowledged.invocation == work.invocation
                     && acknowledged.actor == work.actor
@@ -2855,7 +3270,37 @@ where
             {
                 Ok(true)
             }
-            _ => Err(SharedJournalDriverError::CrossStoreMismatch),
+            _ => {
+                let acknowledged = match &outcome {
+                    Some(crate::agent_sdk::RuntimeOutcome::Acknowledged(Ok(value))) => Some(value),
+                    _ => None,
+                };
+                tracing::warn!(
+                    phase = "ack_fallback",
+                    ordered_index = self.materialization.heads().ordered_index,
+                    outcome_kind = clean_outcome_kind(outcome.as_ref()),
+                    acknowledgement_error = ?match &outcome {
+                        Some(crate::agent_sdk::RuntimeOutcome::Acknowledged(Err(error))) => {
+                            Some(*error)
+                        }
+                        _ => None,
+                    },
+                    invocation_matches =
+                        acknowledged.is_some_and(|value| value.invocation == work.invocation),
+                    actor_matches = acknowledged.is_some_and(|value| value.actor == work.actor),
+                    incarnation_matches =
+                        acknowledged.is_some_and(|value| value.incarnation == work.incarnation),
+                    deployment_matches =
+                        acknowledged.is_some_and(|value| value.deployment == work.deployment),
+                    mode_matches = acknowledged.is_some_and(|value| value.mode == work.mode),
+                    work_matches =
+                        acknowledged.is_some_and(|value| value.work == work.commitment()),
+                    authorization_matches = acknowledged
+                        .is_some_and(|value| value.authorization == authorization.commitment()),
+                    "Shared recovery exact ACK outcome mismatch"
+                );
+                Err(SharedJournalDriverError::CrossStoreMismatch)
+            }
         }
     }
 
@@ -2908,6 +3353,36 @@ where
         envelope: &crate::agent_sdk::RuntimeWork,
         denial: bool,
     ) -> Result<Option<ReplayInputId>, SharedJournalDriverError> {
+        let manifest = self.verified_recovery_manifest()?;
+        self.management_invocation_after_with_manifest(anchor, envelope, denial, manifest.as_ref())
+    }
+
+    fn management_invocation_after_with_manifest(
+        &self,
+        anchor: OrderedBase,
+        envelope: &crate::agent_sdk::RuntimeWork,
+        denial: bool,
+        manifest: Option<&SharedRecoveryManifest>,
+    ) -> Result<Option<ReplayInputId>, SharedJournalDriverError> {
+        self.management_invocation_after_with_availability(
+            anchor,
+            envelope,
+            denial,
+            manifest,
+            &mut |input| self.available_ordered_claim(input),
+        )
+    }
+
+    fn management_invocation_after_with_availability(
+        &self,
+        anchor: OrderedBase,
+        envelope: &crate::agent_sdk::RuntimeWork,
+        denial: bool,
+        manifest: Option<&SharedRecoveryManifest>,
+        available: &mut impl FnMut(
+            ReplayInputId,
+        ) -> Result<OrderedCommitClaim, SharedJournalDriverError>,
+    ) -> Result<Option<ReplayInputId>, SharedJournalDriverError> {
         use crate::agent_sdk::{
             InvocationAuthorization, MethodMode, RuntimeExecutionContext, RuntimeState, RuntimeWork,
         };
@@ -2936,6 +3411,50 @@ where
         {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
+        if let Some(manifest) = manifest
+            && let Some(evidence) =
+                exact_retained_management_member(manifest, Some(anchor), envelope)?
+        {
+            if let Some(observation) = evidence.invoke() {
+                // An exact registered capsule retains the first Invoke even
+                // through its ACK. This is evidence for the existing lifecycle,
+                // not permission to dispatch the original mutation again.
+                available(observation.input_id())?;
+                return Ok(Some(observation.input_id()));
+            }
+            // A mutable hot row cannot prove a mutation never ran. Authenticate
+            // the complete stable applied/committed prefix under the existing
+            // management barrier and compare it with this materialization.
+            // An unsettled tail refuses absence without calling it corruption.
+            let (ordered, fresh) = self.ledger.management_absence_context().map_err(|error| {
+                if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                    tracing::debug!(
+                        node = ?self.materialization.heads().node,
+                        agent = ?invocation.agent,
+                        invocation = ?invocation.invocation,
+                        phase = "management_absence_context",
+                        ?error,
+                        "Retained management absence proof refused"
+                    );
+                }
+                error
+            })?;
+            if ordered != self.materialization.ordered_base() {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+            let fresh = self
+                .verified_recovery_manifest_from_read(fresh)?
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+            let evidence = exact_retained_management_member(&fresh, Some(anchor), envelope)?
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+            if let Some(observation) = evidence.invoke() {
+                // A separate absence proof may have observed newer custody.
+                // It deliberately does not borrow the budget's older view.
+                self.available_ordered_claim(observation.input_id())?;
+                return Ok(Some(observation.input_id()));
+            }
+            return Ok(None);
+        }
         let operation = ReplayOperation::CleanInvoke {
             context: *context,
             work: (**invocation).clone(),
@@ -2963,6 +3482,51 @@ where
             },
         )
         .map_err(Into::into)
+    }
+
+    fn retained_management_invocation_with_availability(
+        &self,
+        envelope: &crate::agent_sdk::RuntimeWork,
+        manifest: Option<&SharedRecoveryManifest>,
+        available: &mut impl FnMut(
+            ReplayInputId,
+        ) -> Result<OrderedCommitClaim, SharedJournalDriverError>,
+    ) -> Result<Option<SharedRecoveryObservation>, SharedJournalDriverError> {
+        let Some(manifest) = manifest else {
+            return Ok(None);
+        };
+        let observation = exact_retained_management_member(manifest, None, envelope)?
+            .and_then(|evidence| evidence.invoke())
+            .cloned();
+        if let Some(observation) = &observation {
+            available(observation.input_id())?;
+        }
+        Ok(observation)
+    }
+
+    fn retained_management_completed_outcome_with_availability(
+        &self,
+        input: ReplayInputId,
+        manifest: Option<&SharedRecoveryManifest>,
+        available: &mut impl FnMut(
+            ReplayInputId,
+        ) -> Result<OrderedCommitClaim, SharedJournalDriverError>,
+    ) -> Result<Option<crate::agent_sdk::RuntimeOutcome>, SharedJournalDriverError> {
+        let Some(manifest) = manifest else {
+            return Ok(None);
+        };
+        let observation = manifest
+            .management_slots()
+            .iter()
+            .flat_map(|slot| slot.observations())
+            .find(|observation| {
+                observation.input_id() == input && !observation.is_acknowledgement()
+            });
+        if let Some(observation) = observation {
+            available(input)?;
+            return Ok(Some(observation.outcome().clone()));
+        }
+        Ok(None)
     }
 
     pub(crate) fn ledger(&self) -> &AgentRaftApplicationLedgerV2 {
@@ -3325,6 +3889,26 @@ where
             .map_err(Into::into)
     }
 
+    /// A fresh observation uses this independently authenticated image, not a
+    /// peer-provided Authority page. No candidate, custody or publication is
+    /// created. The network lifecycle owner establishes ReadIndex/apply first.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn observe_system_authority(
+        &self,
+        work: &crate::agent_sdk::InvocationWork,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedJournalDriverError> {
+        if self.external.is_some() {
+            return Err(SharedJournalDriverError::InvalidProfile);
+        }
+        self.executor
+            .observe_system_authority(
+                self.materialization.runtime(),
+                self.materialization.state(),
+                work,
+            )
+            .map_err(Into::into)
+    }
+
     /// Inspect only retained acceptance at this current head. The guest owns
     /// the original authorization/time checks; the host supplies its trusted
     /// inspection clock, never a caller-selected acceptance slot. No Invoke,
@@ -3635,7 +4219,7 @@ where
         &self,
         request: CleanInvocationReplayRequest,
     ) -> Result<PreparedCleanOrdered, SharedJournalDriverError> {
-        self.prepare_clean_ordered_operation_with_policy(request, false, None)
+        self.prepare_clean_ordered_operation_with_policy(request, false, None, false)
     }
 
     /// Locally generated bootstrap work receives its unsigned preflight at
@@ -3652,7 +4236,7 @@ where
             unreachable!()
         };
         let observed_slot = preflight.observed_slot;
-        self.prepare_clean_ordered_operation_with_policy(request, false, Some(observed_slot))
+        self.prepare_clean_ordered_operation_with_policy(request, false, Some(observed_slot), false)
     }
 
     /// Recover an already committed bootstrap result through fresh physical
@@ -3847,19 +4431,25 @@ where
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
         if let Some(manifest) = manifest
-            && let Some(slot) = manifest.slots().iter().find(|slot| {
-                slot.registration().work().invocation == invocation
-                    && slot.registration().work().mode == mode
-                    && slot.invoke().is_some()
-            })
+            && let Some((member, observation)) =
+                manifest.management_slots().iter().find_map(|slot| {
+                    slot.members().iter().zip(slot.members_evidence()).find_map(
+                        |(member, evidence)| {
+                            (member.work().invocation == invocation && member.work().mode == mode)
+                                .then(|| evidence.invoke().map(|observation| (member, observation)))
+                                .flatten()
+                        },
+                    )
+                })
         {
+            self.available_ordered_claim(observation.input_id())?;
             return Ok(Some((
                 CleanInvocationReplayRequest::Invoke {
                     context: RuntimeExecutionContext::Direct,
-                    work: slot.registration().work().clone(),
-                    authorization: slot.registration().authorization().clone(),
+                    work: member.work().clone(),
+                    authorization: member.authorization().clone(),
                 },
-                slot.invoke().expect("matched invoke").input_id(),
+                observation.input_id(),
             )));
         }
         let mut cursor = self.materialization.heads().ordered_head;
@@ -3948,7 +4538,7 @@ where
         &self,
         request: CleanInvocationReplayRequest,
     ) -> Result<PreparedCleanOrdered, SharedJournalDriverError> {
-        self.prepare_clean_ordered_operation_with_policy(request, true, None)
+        self.prepare_clean_ordered_operation_with_policy(request, true, None, false)
     }
 
     /// Internal management work whose complete preflight envelope is already
@@ -3967,46 +4557,14 @@ where
         else {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         };
-        if !matches!(
-            work.mode,
-            crate::agent_sdk::MethodMode::Linear | crate::agent_sdk::MethodMode::Query
-        ) || !preflight.matches_work(work)
+        if work.mode != crate::agent_sdk::MethodMode::Linear
+            || !preflight.matches_work(work)
             || preflight.observed_slot > self.executor.current_logical_slot()?
         {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
         let observed_slot = preflight.observed_slot;
-        self.prepare_clean_ordered_operation_with_policy(request, true, Some(observed_slot))
-    }
-
-    /// Prepare only the exact persisted system-authority projection work
-    /// protected by a projection-pair admission. Its PublicPreflight slot was
-    /// sampled before the pending bootstrap record became durable, so recovery
-    /// must reuse that accepted slot rather than resampling the trust clock.
-    pub(crate) fn prepare_reserved_projection_operation(
-        &self,
-        request: CleanInvocationReplayRequest,
-        terminal_only: bool,
-    ) -> Result<PreparedCleanOrdered, SharedJournalDriverError> {
-        let work = request.work();
-        let crate::agent_sdk::InvocationAuthorization::PublicPreflight(preflight) =
-            request.authorization()
-        else {
-            return Err(SharedJournalDriverError::CrossStoreMismatch);
-        };
-        let accepted_observed_slot = preflight.observed_slot;
-        if work.mode != crate::agent_sdk::MethodMode::Query
-            || !request
-                .authorization()
-                .matches_invoke(work, accepted_observed_slot)
-        {
-            return Err(SharedJournalDriverError::CrossStoreMismatch);
-        }
-        self.prepare_clean_ordered_operation_with_policy(
-            request,
-            terminal_only,
-            Some(accepted_observed_slot),
-        )
+        self.prepare_clean_ordered_operation_with_policy(request, true, Some(observed_slot), true)
     }
 
     fn prepare_clean_ordered_operation_with_policy(
@@ -4014,43 +4572,27 @@ where
         request: CleanInvocationReplayRequest,
         terminal_only: bool,
         accepted_observed_slot: Option<u64>,
+        persisted_management: bool,
     ) -> Result<PreparedCleanOrdered, SharedJournalDriverError> {
         // Retry identity excludes the trusted observation slot. The real slot
         // is sampled exactly once below only when a new operation is built.
         let operation = request.clone().into_operation(0);
-        if let Some(manifest) = self.verified_recovery_manifest()? {
-            for slot in manifest.slots() {
-                if slot.registration().work() != request.work()
-                    || slot.registration().authorization() != request.authorization()
+        let manifest = self.verified_recovery_manifest()?;
+        if let Some(manifest) = manifest.as_ref() {
+            if let Some(observation) = retained_management_operation(manifest, &operation)? {
+                if terminal_only
+                    && !matches!(
+                        observation.outcome(),
+                        crate::agent_sdk::RuntimeOutcome::Completed(_)
+                    )
                 {
-                    continue;
+                    return Err(SharedJournalDriverError::CrossStoreMismatch);
                 }
-                let retained = match &operation {
-                    ReplayOperation::CleanInvoke {
-                        context: crate::agent_sdk::RuntimeExecutionContext::Direct,
-                        ..
-                    } => slot.invoke(),
-                    ReplayOperation::CleanAcknowledge {
-                        context: crate::agent_sdk::RuntimeExecutionContext::Direct,
-                        expected_live: None,
-                        ..
-                    } => slot.acknowledgement(),
-                    _ => None,
-                };
-                if let Some(observation) = retained {
-                    if terminal_only
-                        && !matches!(
-                            observation.outcome(),
-                            crate::agent_sdk::RuntimeOutcome::Completed(_)
-                        )
-                    {
-                        return Err(SharedJournalDriverError::CrossStoreMismatch);
-                    }
-                    return Ok(PreparedCleanOrdered::Retained {
-                        input: observation.input_id(),
-                        outcome: observation.outcome().clone(),
-                    });
-                }
+                self.available_ordered_claim(observation.input_id())?;
+                return Ok(PreparedCleanOrdered::Retained {
+                    input: observation.input_id(),
+                    outcome: observation.outcome().clone(),
+                });
             }
         }
         if let Some(input) =
@@ -4075,6 +4617,32 @@ where
         {
             return Ok(PreparedCleanOrdered::Retained { input, outcome });
         }
+        // Preserve all exact first selectors above. Only a genuinely unseen
+        // fixed-three retained management member needs ordering and a successful
+        // preview; singleton/ordinary/bootstrap execution remains unchanged.
+        let successful_management = if persisted_management {
+            let observed_slot =
+                accepted_observed_slot.ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+            let envelope = crate::agent_sdk::RuntimeWork::Invoke {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                state: crate::agent_sdk::RuntimeState::default(),
+                invocation: Box::new(request.work().clone()),
+                authorization: Box::new(request.authorization().clone()),
+                observed_slot,
+            };
+            if let Some(manifest) = manifest.as_ref()
+                && exact_retained_management_member(manifest, None, &envelope)?.is_some()
+            {
+                if !management_first_invoke_clock_ready(manifest, observed_slot)? {
+                    return Err(JournalStoreError::Unavailable.into());
+                }
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         let input = match accepted_observed_slot {
             Some(observed_slot) => self.clean_operation_input_at(request, observed_slot)?,
             None => self.clean_operation_input(request)?,
@@ -4102,9 +4670,9 @@ where
             .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
         let input = &entry.input;
         #[cfg(feature = "experimental-state-blocks")]
-        let require_terminal = terminal_only || self.external.is_some();
+        let require_terminal = terminal_only || successful_management || self.external.is_some();
         #[cfg(not(feature = "experimental-state-blocks"))]
-        let require_terminal = terminal_only;
+        let require_terminal = terminal_only || successful_management;
         if require_terminal {
             #[cfg(feature = "experimental-state-blocks")]
             let terminal = if self.external.is_some() {
@@ -4114,8 +4682,8 @@ where
                 )
                 .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
                 let outcome = self.execute_external_work_at(work, Some(&entry))?.outcome;
-                matches!(
-                    (&input.operation, outcome),
+                let terminal = matches!(
+                    (&input.operation, &outcome),
                     (
                         ReplayOperation::CleanInvoke { .. },
                         crate::agent_sdk::RuntimeOutcome::Completed(_)
@@ -4123,7 +4691,52 @@ where
                         ReplayOperation::CleanAcknowledge { .. },
                         crate::agent_sdk::RuntimeOutcome::Acknowledged(_)
                     )
-                )
+                ) && (!successful_management
+                    || matches!(outcome, crate::agent_sdk::RuntimeOutcome::Completed(Ok(_))));
+                if successful_management && !terminal {
+                    let (outcome_kind, invocation_error) = match &outcome {
+                        crate::agent_sdk::RuntimeOutcome::Completed(Ok(_)) => {
+                            ("completed_ok", None)
+                        }
+                        crate::agent_sdk::RuntimeOutcome::Completed(Err(error)) => {
+                            ("completed_error", Some(*error))
+                        }
+                        crate::agent_sdk::RuntimeOutcome::Yielded(_) => ("yielded", None),
+                        crate::agent_sdk::RuntimeOutcome::Acknowledged(_) => ("acknowledged", None),
+                        crate::agent_sdk::RuntimeOutcome::Management(_) => ("management", None),
+                    };
+                    tracing::debug!(
+                        phase = "external_durable_preview_refused",
+                        outcome_kind,
+                        ?invocation_error,
+                        "Retained management preparation refused"
+                    );
+                }
+                terminal
+            } else {
+                if successful_management {
+                    self.executor
+                        .clean_management_invocation_is_successful_terminal(
+                            &input.operation,
+                            self.materialization.state(),
+                            &input.runtime,
+                        )?
+                } else {
+                    self.executor.clean_invocation_is_terminal(
+                        &input.operation,
+                        self.materialization.state(),
+                        &input.runtime,
+                    )?
+                }
+            };
+            #[cfg(not(feature = "experimental-state-blocks"))]
+            let terminal = if successful_management {
+                self.executor
+                    .clean_management_invocation_is_successful_terminal(
+                        &input.operation,
+                        self.materialization.state(),
+                        &input.runtime,
+                    )?
             } else {
                 self.executor.clean_invocation_is_terminal(
                     &input.operation,
@@ -4131,13 +4744,10 @@ where
                     &input.runtime,
                 )?
             };
-            #[cfg(not(feature = "experimental-state-blocks"))]
-            let terminal = self.executor.clean_invocation_is_terminal(
-                &input.operation,
-                self.materialization.state(),
-                &input.runtime,
-            )?;
             if !terminal {
+                if successful_management {
+                    return Err(JournalStoreError::Unavailable.into());
+                }
                 return Err(SharedJournalDriverError::CrossStoreMismatch);
             }
         }
@@ -4498,51 +5108,8 @@ where
         }
     }
 
-    pub(crate) fn recovery_expiry_context(
-        &mut self,
-    ) -> Result<
-        (
-            u64,
-            u64,
-            super::journal::OrderedBase,
-            SharedRecoveryManifest,
-        ),
-        SharedJournalDriverError,
-    > {
-        let (index, term, ordered, manifest) = self.ledger.recovery_expiry_context()?;
-        // The ledger has already authenticated this manifest and its complete
-        // physical prefix in one read snapshot. Check its driver provenance
-        // directly instead of mixing that prefix with a second manifest read.
-        // The caller retains the host lock and brackets signing with its Raft
-        // barrier; publication also freshly revalidates the certified prefix.
-        let manifest = self
-            .verified_recovery_manifest_from_read(Some(manifest))?
-            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
-        if ordered != self.materialization.ordered_base() {
-            return Err(SharedJournalDriverError::CrossStoreMismatch);
-        }
-        Ok((index, term, ordered, manifest))
-    }
-
-    pub(crate) const fn recovery_expiry_floor(&self) -> u64 {
-        self.recovery_expiry_floor
-    }
-
-    pub(crate) fn recovery_expiry_terminal(
-        &mut self,
-        request: Hash,
-    ) -> Result<Option<SharedRecoveryExpiryTerminal>, SharedJournalDriverError> {
-        Ok(self.verified_recovery_manifest()?.and_then(|manifest| {
-            manifest.slots().iter().find_map(|slot| {
-                (slot.registration().request().request_commitment() == request)
-                    .then(|| slot.expiry().cloned())
-                    .flatten()
-            })
-        }))
-    }
-
     /// Mutable capsule bytes are not authenticated by their registration
-    /// signature. Recheck at most six observations against either the exact
+    /// signature. Recheck the bounded read/management observations against either the exact
     /// certified baseline or this open owner's independently replayed result
     /// and the corresponding physical Ordered anchor. No suffix scan or VM
     /// execution is needed on a normal lookup.
@@ -4556,16 +5123,12 @@ where
         &self,
         manifest: Option<SharedRecoveryManifest>,
     ) -> Result<Option<SharedRecoveryManifest>, SharedJournalDriverError> {
-        if manifest
-            .as_ref()
-            .map_or(0, SharedRecoveryManifest::expiry_floor)
-            != self.recovery_expiry_floor
-        {
-            return Err(SharedJournalDriverError::CrossStoreMismatch);
-        }
         let Some(manifest) = manifest else {
             return Ok(None);
         };
+        for slot in manifest.management_slots() {
+            self.validate_management_registration_runtime(slot.registration().request())?;
+        }
         let baseline = if self.materialization.common_checkpoint().is_some() {
             self.ledger
                 .common_snapshot_recovery_manifest_at(self.materialization.common_checkpoint())?
@@ -4581,63 +5144,68 @@ where
         manifest: &SharedRecoveryManifest,
         baseline: Option<&SharedRecoveryManifest>,
     ) -> Result<(), SharedJournalDriverError> {
-        if manifest.expiry_floor() != self.recovery_expiry_floor {
-            return Err(SharedJournalDriverError::CrossStoreMismatch);
-        }
-        for slot in manifest.slots() {
-            if baseline.is_some_and(|baseline| {
-                baseline.slots().iter().any(|certified| {
+        for slot in manifest.management_slots() {
+            let heads = self.materialization.heads();
+            if slot.members().iter().any(|member| {
+                member.anchor().genesis != heads.genesis
+                    || member.anchor().admission != heads.admission
+                    || member.anchor().runtime != heads.runtime.commitment()
+                    || member.work().runtime_deployment.0 != heads.runtime.deployment.0
+                    || member.anchor().ordered.index > heads.ordered_index
+            }) {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+            if !baseline.is_some_and(|baseline| {
+                baseline.management_slots().iter().any(|certified| {
                     certified.registration() == slot.registration()
                         && certified.raft_index() == slot.raft_index()
                         && certified.raft_term() == slot.raft_term()
                 })
             }) {
-                continue;
+                self.ledger
+                    .validate_management_recovery_slot_registration(slot)?;
             }
-            self.ledger.validate_recovery_slot_registration(slot)?;
+            if slot.release().is_some()
+                && !baseline.is_some_and(|baseline| {
+                    baseline.management_slots().iter().any(|certified| {
+                        certified.release() == slot.release()
+                            && certified.release_raft_index() == slot.release_raft_index()
+                            && certified.release_raft_term() == slot.release_raft_term()
+                    })
+                })
+            {
+                self.ledger
+                    .validate_management_recovery_slot_release(slot)?;
+            }
         }
         for observation in unique_recovery_observations(manifest) {
             if baseline.is_some_and(|baseline| {
                 baseline
-                    .slots()
-                    .iter()
-                    .flat_map(|slot| [slot.invoke(), slot.acknowledgement()])
-                    .flatten()
+                    .observations()
+                    .into_iter()
                     .any(|certified| certified == observation)
             }) {
                 continue;
             }
-            if self
-                .executor
-                .clean_ordered_result_at(
-                    observation.claim().ordered().head
-                        .ok_or(SharedJournalDriverError::CrossStoreMismatch)?,
-                    observation.input_id(),
-                )
-                .as_ref()
-                != Some(observation.outcome())
-            {
+            let outcome = self.executor.clean_ordered_result_at(
+                observation
+                    .claim()
+                    .ordered()
+                    .head
+                    .ok_or(SharedJournalDriverError::CrossStoreMismatch)?,
+                observation.input_id(),
+            );
+            if outcome.as_ref() != Some(observation.outcome()) {
+                tracing::warn!(
+                    phase = "positioned_recovery_observation",
+                    ordered_index = self.materialization.heads().ordered_index,
+                    outcome_kind = clean_outcome_kind(outcome.as_ref()),
+                    expected_outcome_kind = clean_outcome_kind(Some(observation.outcome())),
+                    "Shared recovery positioned outcome mismatch"
+                );
                 return Err(SharedJournalDriverError::CrossStoreMismatch);
             }
             self.ledger.validate_recovery_observation(observation)?;
-        }
-        let mut verified_expiry = Vec::new();
-        for terminal in manifest.slots().iter().filter_map(|slot| slot.expiry()) {
-            if verified_expiry.contains(&terminal) {
-                continue;
-            }
-            // A pruned terminal must be retained byte-for-byte in the certified
-            // baseline. A matching request alone cannot authenticate its proof.
-            if !baseline.is_some_and(|baseline| {
-                baseline
-                    .slots()
-                    .iter()
-                    .filter_map(|slot| slot.expiry())
-                    .any(|certified| certified == terminal)
-            }) {
-                self.ledger.validate_recovery_expiry(terminal)?;
-            }
-            verified_expiry.push(terminal);
         }
         Ok(())
     }
@@ -4650,13 +5218,122 @@ where
             .map_err(Into::into)
     }
 
-    pub(crate) fn validate_recovery_registration(
+    pub(crate) fn validate_management_recovery_registration_request(
         &self,
-        registration: &SharedRecoveryRegistration,
+        request: &super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest,
+    ) -> Result<(), SharedJournalDriverError> {
+        self.verified_recovery_manifest()?;
+        self.validate_management_registration_runtime(request)?;
+        self.ledger
+            .validate_management_recovery_registration_request(request)
+            .map_err(Into::into)
+    }
+
+    /// Admission only, before custody or an independent intent write. A late
+    /// unadmitted clock must not become an unfinishable durable obligation.
+    /// Exact admitted envelopes (including ambiguous commits/shadow holders)
+    /// keep their original clock; their existing evidence is never replaced.
+    pub(crate) fn validate_new_management_invocation_clock(
+        &self,
+        request: &super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest,
+    ) -> Result<(), SharedJournalDriverError> {
+        self.validate_management_registration_runtime(request)?;
+        let member = request
+            .members()
+            .last()
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        let manifest = self.verified_recovery_manifest()?;
+        if let Some(manifest) = manifest.as_ref()
+            && exact_retained_management_member(manifest, None, member.envelope())?.is_some()
+        {
+            return Ok(());
+        }
+        let crate::agent_sdk::RuntimeWork::Invoke {
+            context,
+            invocation,
+            authorization,
+            observed_slot,
+            ..
+        } = member.envelope()
+        else {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        };
+        if *observed_slot > self.executor.current_logical_slot()? {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        let operation = ReplayOperation::CleanInvoke {
+            context: *context,
+            work: (**invocation).clone(),
+            authorization: (**authorization).clone(),
+            observed_slot: *observed_slot,
+        };
+        if !self
+            .executor
+            .new_management_invocation_is_successful_terminal(
+                &operation,
+                self.materialization.state(),
+                self.materialization.runtime(),
+            )?
+        {
+            return Err(JournalStoreError::Unavailable.into());
+        }
+        Ok(())
+    }
+
+    /// The ledger's post-genesis prefix can be empty. Its metadata fold cannot
+    /// invent the runtime identity from absent Ordered rows: seal it against
+    /// this actual admitted materialization before minting or applying a row.
+    fn validate_management_registration_runtime(
+        &self,
+        request: &super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest,
+    ) -> Result<(), SharedJournalDriverError> {
+        let heads = self.materialization.heads();
+        if request.generation() != self.ledger.generation()
+            || request.members().iter().any(|member| {
+                member.anchor().genesis != heads.genesis
+                    || member.anchor().admission != heads.admission
+                    || member.anchor().runtime != heads.runtime.commitment()
+                    || member.work().runtime_deployment.0 != heads.runtime.deployment.0
+            })
+        {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_management_recovery_registration(
+        &self,
+        registration: &super::shared_recovery::SharedManagementRecoveryRegistration,
+    ) -> Result<(), SharedJournalDriverError> {
+        self.verified_recovery_manifest()?;
+        self.validate_management_registration_runtime(registration.request())?;
+        // The signature-verifying ledger entry point also performs the fresh,
+        // complete request preflight. Do not audit that same request twice.
+        self.ledger
+            .validate_management_recovery_registration(registration)
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn validate_management_recovery_release_request(
+        &self,
+        request: &super::shared_recovery::management::SharedManagementRecoveryReleaseRequest,
     ) -> Result<(), SharedJournalDriverError> {
         self.verified_recovery_manifest()?;
         self.ledger
-            .validate_recovery_registration(registration)
+            .validate_management_recovery_release_request(request)
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn validate_management_recovery_release(
+        &self,
+        release: &super::shared_recovery::SharedManagementRecoveryRelease,
+    ) -> Result<(), SharedJournalDriverError> {
+        self.verified_recovery_manifest()?;
+        // The signed ledger entry point performs its own exact request
+        // preflight. Keep driver provenance and that signature-first boundary
+        // without repeating the same settled physical-prefix audit here.
+        self.ledger
+            .validate_management_recovery_release(release)
             .map_err(Into::into)
     }
 
@@ -4687,10 +5364,8 @@ where
             && self.materialization.common_checkpoint().is_some()
             && let Some(observation) = recovery.as_ref().and_then(|manifest| {
                 manifest
-                    .slots()
-                    .iter()
-                    .flat_map(|slot| [slot.invoke(), slot.acknowledgement()])
-                    .flatten()
+                    .observations()
+                    .into_iter()
                     .find(|observation| observation.input_id() == input)
             })
             && observation.claim().ordered().index <= self.materialization.replay_boundary().index
@@ -4700,12 +5375,21 @@ where
         // Noncertified suffix observations retain the existing bounded cache
         // and physical-row checks, not a new full suffix audit on every reply.
         let recovery = self.verified_recovery_manifest_from_read(recovery)?;
-        if let Some(observation) = recovery.as_ref().and_then(|manifest| {
+        self.available_nonarchived_ordered_claim(input, recovery.as_ref())
+    }
+
+    // The raw wrapper above verifies its own fresh live view. The budget
+    // caller has already verified its immutable call-local live view; neither
+    // caller may skip the exact physical availability checks below.
+    fn available_nonarchived_ordered_claim(
+        &self,
+        input: ReplayInputId,
+        recovery: Option<&SharedRecoveryManifest>,
+    ) -> Result<OrderedCommitClaim, SharedJournalDriverError> {
+        if let Some(observation) = recovery.and_then(|manifest| {
             manifest
-                .slots()
-                .iter()
-                .flat_map(|slot| [slot.invoke(), slot.acknowledgement()])
-                .flatten()
+                .observations()
+                .into_iter()
                 .find(|observation| observation.input_id() == input)
         }) {
             let claim = observation.claim();
@@ -4767,6 +5451,68 @@ where
         Err(JournalStoreError::Unavailable.into())
     }
 
+    fn available_ordered_claim_in_management_budget(
+        &self,
+        input: ReplayInputId,
+        budget: Option<&SharedRecoveryManifest>,
+        archived: &mut Option<(
+            SharedAgentCommonSnapshotCertificate,
+            SharedAgentLocalSnapshotBinding,
+            Option<SharedRecoveryManifest>,
+            Option<SharedRecoveryManifest>,
+        )>,
+    ) -> Result<OrderedCommitClaim, SharedJournalDriverError> {
+        if !self.uses_external_state()
+            && self.materialization.common_checkpoint().is_some()
+            && let Some(budget) = budget
+            && let Some(requested) = budget
+                .observations()
+                .into_iter()
+                .find(|observation| observation.input_id() == input)
+            && requested.claim().ordered().index <= self.materialization.replay_boundary().index
+        {
+            if archived.is_none() {
+                let view = self
+                    .ledger
+                    .common_snapshot_authority_with_recovery()?
+                    .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+                let (certificate, binding, baseline, live) = &view;
+                let live = live
+                    .as_ref()
+                    .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+                if Some(binding.claim().checkpoint()) != self.materialization.common_checkpoint()
+                    || live != budget
+                {
+                    return Err(SharedJournalDriverError::CrossStoreMismatch);
+                }
+                // The physical fold alone is not execution-result authority.
+                // Preserve all live/nonbaseline evidence and physical closure
+                // checks before the tuple can be reused.
+                self.verify_recovery_manifest_evidence(live, baseline.as_ref())?;
+                certified_budget_recovery_observation(budget, live, baseline.as_ref(), requested)
+                    .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+                self.validate_common_checkpoint_boundary(certificate, binding)?;
+                *archived = Some(view);
+            }
+            let (_, binding, baseline, live) = archived
+                .as_ref()
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+            if Some(binding.claim().checkpoint()) != self.materialization.common_checkpoint() {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+            let observation = certified_budget_recovery_observation(
+                budget,
+                live.as_ref()
+                    .ok_or(SharedJournalDriverError::CrossStoreMismatch)?,
+                baseline.as_ref(),
+                requested,
+            )
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+            return Ok(observation.claim().clone());
+        }
+        self.available_nonarchived_ordered_claim(input, budget)
+    }
+
     fn available_archived_recovery_observation(
         &self,
         requested: &SharedRecoveryObservation,
@@ -4798,17 +5544,15 @@ where
         if self.uses_external_state() || self.materialization.common_checkpoint().is_none() {
             return Ok(None);
         }
-        let Some((certificate, binding, recovery, _live)) =
+        let Some((certificate, binding, recovery, live)) =
             self.ledger.common_snapshot_authority_with_recovery()?
         else {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         };
-        let observation = recovery
+        let observation = live
             .as_ref()
             .into_iter()
-            .flat_map(|manifest| manifest.slots())
-            .flat_map(|slot| [slot.invoke(), slot.acknowledgement()])
-            .flatten()
+            .flat_map(SharedRecoveryManifest::observations)
             .find(|observation| {
                 observation.raft_index() == index
                     && observation.raft_term() == term
@@ -4819,6 +5563,13 @@ where
         // the newer checkpoint boundary never stands in for old evidence.
         let (boundary, _) = self.validate_common_checkpoint_boundary(&certificate, &binding)?;
         if let Some(observation) = observation {
+            let live = live
+                .as_ref()
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+            self.verify_recovery_manifest_evidence(live, recovery.as_ref())?;
+            let observation =
+                certified_live_recovery_observation(live, recovery.as_ref(), observation)
+                    .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
             return Ok(Some(observation.claim().clone()));
         }
         Ok((boundary.raft_index() == index
@@ -5235,8 +5986,23 @@ where
         ),
         SharedJournalDriverError,
     > {
+        let (plan, claim, _) = self.prepare_common_snapshot_candidate_with_recovery(initial)?;
+        Ok((plan, claim))
+    }
+
+    fn prepare_common_snapshot_candidate_with_recovery(
+        &mut self,
+        initial: &RuntimeState,
+    ) -> Result<
+        (
+            super::replay::PreparedSharedCheckpoint,
+            SharedAgentSnapshotClaim,
+            Option<SharedRecoveryManifest>,
+        ),
+        SharedJournalDriverError,
+    > {
         self.require_common_snapshot_profile(initial)?;
-        self.prepare_snapshot_candidate_inner()
+        self.prepare_snapshot_candidate_inner_with_recovery()
     }
 
     fn prepare_snapshot_candidate_inner(
@@ -5245,6 +6011,20 @@ where
         (
             super::replay::PreparedSharedCheckpoint,
             SharedAgentSnapshotClaim,
+        ),
+        SharedJournalDriverError,
+    > {
+        let (plan, claim, _) = self.prepare_snapshot_candidate_inner_with_recovery()?;
+        Ok((plan, claim))
+    }
+
+    fn prepare_snapshot_candidate_inner_with_recovery(
+        &mut self,
+    ) -> Result<
+        (
+            super::replay::PreparedSharedCheckpoint,
+            SharedAgentSnapshotClaim,
+            Option<SharedRecoveryManifest>,
         ),
         SharedJournalDriverError,
     > {
@@ -5300,7 +6080,10 @@ where
             context.previous_snapshot,
         )?;
         plan.validate_claim(&claim)?;
-        Ok((plan, claim))
+        // Carry the owned manifest from this exact audited physical prefix.
+        // Preparation stages only immutable checkpoint/proof objects; it does
+        // not change materialization, live custody, or any ledger cursor.
+        Ok((plan, claim, context.recovery_manifest))
     }
 
     /// Return the exact unsigned checkpoint claim. This may stage immutable
@@ -5326,7 +6109,8 @@ where
         ),
         SharedJournalDriverError,
     > {
-        let (plan, physical) = self.prepare_common_snapshot_candidate(initial)?;
+        let (plan, physical, recovery) =
+            self.prepare_common_snapshot_candidate_with_recovery(initial)?;
         plan.validate_common_claim(&physical)?;
         let mut common = SharedAgentCommonSnapshotClaim::new(
             physical.ordered().clone(),
@@ -5334,7 +6118,11 @@ where
             physical.authority_epoch(),
             self.materialization.common_snapshot_ancestry()?,
         )?;
-        if let Some(manifest) = self.verified_recovery_manifest()? {
+        // Keep every driver provenance check, but do not decode the same live
+        // manifest again after the audited candidate context supplied it. The
+        // mutable driver remains borrowed throughout; no peer I/O or durable
+        // publication occurs between these checks.
+        if let Some(manifest) = self.verified_recovery_manifest_from_read(recovery)? {
             common = common.with_recovery_manifest(manifest.commitment())?;
         }
         Ok((common, physical, plan.next_heads().clone()))
@@ -5692,6 +6480,87 @@ where
         self.ledger.current_snapshot().map_err(Into::into)
     }
 
+    /// Candidate-only ordinary external maintenance. Transport and pending
+    /// host markers must be excluded by the detached lifecycle owner.
+    #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+    pub(crate) fn compact_external_common_checkpoint(
+        &mut self,
+        maximum_binding_unlinks: usize,
+        gc_limits: GcLimits,
+    ) -> Result<SharedSnapshotCompactionOutcome, SharedJournalDriverError> {
+        if maximum_binding_unlinks == 0 {
+            return Err(JournalStoreError::LimitExceeded.into());
+        }
+        validate_gc_limits(gc_limits)?;
+        let result = (|| {
+            let authority = self.require_external_archive_checkpoint()?;
+            let snapshot = self
+                .ledger
+                .validate_common_reclamation(&authority.0, &authority.1)?;
+            let expected = self.materialization.heads_id();
+            let genesis = Arc::clone(
+                &self
+                    .external
+                    .as_ref()
+                    .ok_or(SharedJournalDriverError::InvalidProfile)?
+                    .genesis,
+            );
+            // Authenticate the complete mark, named retirements and bounded
+            // filesystem scan before the first authority binding unlink.
+            self.store.preflight_external_genesis_checkpoint_garbage(
+                &genesis,
+                expected,
+                gc_limits,
+                &mut Self::external_recovery_budget(),
+            )?;
+            let bindings = self
+                .store
+                .retire_shared_ordered_commits(&snapshot, maximum_binding_unlinks)?;
+            let journal = if bindings.remaining == 0 {
+                Some(self.store.collect_external_genesis_checkpoint_garbage(
+                    &genesis,
+                    expected,
+                    gc_limits,
+                    &mut Self::external_recovery_budget(),
+                )?)
+            } else {
+                None
+            };
+            if self.materialization.heads_id() != expected
+                || self.require_external_archive_checkpoint()? != authority
+                || self
+                    .ledger
+                    .validate_common_reclamation(&authority.0, &authority.1)?
+                    != snapshot
+            {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+            Ok(SharedSnapshotCompactionOutcome {
+                bindings_removed: bindings.removed,
+                bindings_remaining: bindings.remaining,
+                journal,
+            })
+        })();
+        // A physical failure or ambiguous unlink revokes cached availability.
+        // Quota/profile/stale-boundary refusal does not damage healthy roots.
+        if let Err(error) = &result
+            && !matches!(
+                error,
+                SharedJournalDriverError::InvalidProfile
+                    | SharedJournalDriverError::Store(
+                        JournalStoreError::LimitExceeded | JournalStoreError::Backpressure
+                    )
+                    | SharedJournalDriverError::Ledger(
+                        AgentRaftApplicationErrorV2::SnapshotBoundaryRequired
+                    )
+            )
+            && let Some(external) = &self.external
+        {
+            external.availability.invalidate();
+        }
+        result
+    }
+
     pub(crate) fn compact_snapshot(
         &mut self,
         maximum_binding_unlinks: usize,
@@ -5874,10 +6743,15 @@ where
                 if matches!(
                     command.entry().command(),
                     AgentRaftCommand::PrepareCommitteeChange(_)
-                        | AgentRaftCommand::RegisterRecovery { .. }
-                        | AgentRaftCommand::ExpireRecovery { .. }
+                        | AgentRaftCommand::RegisterManagementRecovery { .. }
+                        | AgentRaftCommand::ReleaseManagementRecovery { .. }
                 ) =>
             {
+                if let AgentRaftCommand::RegisterManagementRecovery { registration, .. } =
+                    command.entry().command()
+                {
+                    self.validate_management_registration_runtime(registration.request())?;
+                }
                 let outcome = match self.ledger.apply_foundation_slot(&slot)? {
                     AgentRaftFoundationApplyOutcomeV2::Applied(_) => {
                         SharedPhysicalApplyOutcome::Applied { index }
@@ -5888,20 +6762,13 @@ where
                 };
                 if matches!(
                     command.entry().command(),
-                    AgentRaftCommand::RegisterRecovery { .. }
-                        | AgentRaftCommand::ExpireRecovery { .. }
+                    AgentRaftCommand::RegisterManagementRecovery { .. }
+                        | AgentRaftCommand::ReleaseManagementRecovery { .. }
                 ) {
                     // Registration is fixed-roster metadata: application
                     // requires no pending transition and the initial active
                     // committee, then retains that exact committee state.
                     self.ledger.audit_recovery()?;
-                    if let AgentRaftCommand::ExpireRecovery { certificate, .. } =
-                        command.entry().command()
-                    {
-                        self.recovery_expiry_floor = self
-                            .recovery_expiry_floor
-                            .max(certificate.claim().observed_slot());
-                    }
                 } else {
                     self.executor
                         .replace_shared_committees(self.ledger.committee_history()?);
@@ -6057,17 +6924,22 @@ where
                                 .executor
                                 .clean_ordered_result_at(entry.id(), entry.input.id())
                                 .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
-                            if matches!(outcome, crate::agent_sdk::RuntimeOutcome::Acknowledged(Err(_))) {
+                            if matches!(
+                                outcome,
+                                crate::agent_sdk::RuntimeOutcome::Acknowledged(Err(_))
+                            ) {
                                 // Negative ACKs do not retire custody. Their
                                 // exact absence is rechecked against physical
                                 // replay on reopen; they are ordinary applies.
                                 None
-                            } else { Some(
-                                VerifiedSharedRecoveryObservation::from_published(
-                                    &published, entry, outcome,
+                            } else {
+                                Some(
+                                    VerifiedSharedRecoveryObservation::from_published(
+                                        &published, entry, outcome,
+                                    )
+                                    .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?,
                                 )
-                                .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?,
-                            ) }
+                            }
                         } else {
                             None
                         };
@@ -6081,8 +6953,8 @@ where
                         command_outcome(completion, index)
                     }
                     AgentRaftCommand::PrepareCommitteeChange(_)
-                    | AgentRaftCommand::RegisterRecovery { .. }
-                    | AgentRaftCommand::ExpireRecovery { .. } => unreachable!(),
+                    | AgentRaftCommand::RegisterManagementRecovery { .. }
+                    | AgentRaftCommand::ReleaseManagementRecovery { .. } => unreachable!(),
                 }
             }
         };
@@ -6094,6 +6966,212 @@ where
 impl
     SharedJournalAgentDriver<super::journal_store::FileAgentJournalStore, FileSharedArtifactStager>
 {
+    #[cfg(test)]
+    pub(crate) fn assert_terminal_retirement_reuses_manifest_for_test(
+        &mut self,
+        envelopes: [&crate::agent_sdk::RuntimeWork; 2],
+        expected_entries: usize,
+        check_corruption: bool,
+    ) {
+        use redb::ReadableTable as _;
+
+        let heads = self.store.heads().unwrap();
+        let manifest = self.verified_recovery_manifest().unwrap().unwrap();
+        for envelope in envelopes {
+            let crate::agent_sdk::RuntimeWork::Invoke {
+                context,
+                invocation,
+                authorization,
+                ..
+            } = envelope
+            else {
+                panic!("genuine completed management Invoke");
+            };
+            let first = exact_retained_management_member(&manifest, None, envelope)
+                .unwrap()
+                .unwrap()
+                .invoke()
+                .unwrap();
+            let reads = self.ledger.common_candidate_reads_for_test().1;
+            let recovered = self
+                .replay_durable_clean_terminal(CleanInvocationReplayRequest::Invoke {
+                    context: *context,
+                    work: (**invocation).clone(),
+                    authorization: (**authorization).clone(),
+                })
+                .unwrap();
+            assert_eq!(recovered, *first.outcome());
+            assert_eq!(
+                self.ledger.common_candidate_reads_for_test().1 - reads,
+                1,
+                "one exact terminal check must verify one fresh live manifest"
+            );
+        }
+        let reads = self.ledger.common_candidate_reads_for_test().1;
+        assert_eq!(
+            self.management_retirement_admission_requirement(envelopes)
+                .unwrap(),
+            Some(expected_entries)
+        );
+        assert_eq!(
+            self.ledger.common_candidate_reads_for_test().1 - reads,
+            1,
+            "one two-envelope retirement calculation must verify one fresh live manifest"
+        );
+        assert!(
+            self.management_retirement_set_admission_requirement(&[envelopes[0], envelopes[0]])
+                .is_err(),
+            "one retained capsule cannot evidence duplicate members"
+        );
+        let mut changed = (*envelopes[1]).clone();
+        let crate::agent_sdk::RuntimeWork::Invoke { observed_slot, .. } = &mut changed else {
+            unreachable!()
+        };
+        *observed_slot += 1;
+        assert!(
+            self.management_retirement_admission_requirement([envelopes[0], &changed])
+                .is_err(),
+            "an immutable preflight substitution cannot borrow a retained first result"
+        );
+
+        if check_corruption {
+            // This is the actual current generation's existing ledger table,
+            // not an alternate manifest source or a mocked verification count.
+            // The caller holds the real host mutex, excluding every applied
+            // manifest writer throughout corruption, refusal and restoration.
+            let database = self.ledger.database();
+            let table: redb::TableDefinition<&[u8], &[u8]> =
+                redb::TableDefinition::new("agent_shared_raft_recovery_manifest_v2");
+            let (key, original) = {
+                let transaction = database.begin_read().unwrap();
+                let table = transaction.open_table(table).unwrap();
+                let mut rows = table.iter().unwrap();
+                let (key, value) = rows.next().unwrap().unwrap();
+                let row = (key.value().to_vec(), value.value().to_vec());
+                assert!(rows.next().is_none());
+                row
+            };
+            let write = |bytes: &[u8]| {
+                let transaction = database.begin_write().unwrap();
+                transaction
+                    .open_table(table)
+                    .unwrap()
+                    .insert(key.as_slice(), bytes)
+                    .unwrap();
+                transaction.commit().unwrap();
+            };
+            let crate::agent_sdk::RuntimeWork::Invoke {
+                context,
+                invocation,
+                authorization,
+                ..
+            } = envelopes[0]
+            else {
+                unreachable!()
+            };
+            write(&[0]);
+            let reads = self.ledger.common_candidate_reads_for_test().1;
+            let terminal =
+                self.replay_durable_clean_terminal(CleanInvocationReplayRequest::Invoke {
+                    context: *context,
+                    work: (**invocation).clone(),
+                    authorization: (**authorization).clone(),
+                });
+            let retirement = self.management_retirement_admission_requirement(envelopes);
+            let stored = {
+                let transaction = database.begin_read().unwrap();
+                transaction
+                    .open_table(table)
+                    .unwrap()
+                    .get(key.as_slice())
+                    .unwrap()
+                    .unwrap()
+                    .value()
+                    .to_vec()
+            };
+            // Restore fixture-owned bytes before asserting either refusal,
+            // including if the preceding successful calls were incorrectly
+            // reused across this deliberately fresh invocation boundary.
+            write(&original);
+            assert!(matches!(
+                terminal,
+                Err(SharedJournalDriverError::Ledger(
+                    AgentRaftApplicationErrorV2::CorruptLedger
+                ))
+            ));
+            assert!(matches!(
+                retirement,
+                Err(SharedJournalDriverError::Ledger(
+                    AgentRaftApplicationErrorV2::CorruptLedger
+                ))
+            ));
+            assert_eq!(self.ledger.common_candidate_reads_for_test().1 - reads, 2);
+            assert_eq!(stored, [0]);
+        }
+        assert_eq!(self.store.heads().unwrap(), heads);
+        assert_eq!(self.verified_recovery_manifest().unwrap(), Some(manifest));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_management_budget_rechecks_common_closure_for_test(
+        &self,
+        pending: &[(
+            &super::clean_management_intent::ManagementJournalAnchor,
+            &crate::agent_sdk::RuntimeWork,
+        )],
+    ) {
+        use std::io::{Seek as _, SeekFrom};
+
+        assert!(!self.uses_external_state());
+        let heads = self.store.heads().unwrap();
+        let manifest = self.ledger.recovery_manifest_if_present().unwrap();
+        let checkpoint = self
+            .store
+            .get::<super::journal::CheckpointManifest>(
+                self.materialization.common_checkpoint().unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        let closure = self
+            .store
+            .get::<super::journal::ArtifactClosure>(checkpoint.artifacts)
+            .unwrap()
+            .unwrap();
+        let path = self
+            .store
+            .root()
+            .join("artifact-closures")
+            .join(encode_hex(checkpoint.artifacts.as_bytes()));
+        let original = fs::read(&path).unwrap();
+        assert_eq!(original, closure.encode());
+        let offset = original.len().checked_sub(1).unwrap();
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(offset as u64)).unwrap();
+        file.write_all(&[original[offset] ^ 1]).unwrap();
+        file.sync_all().unwrap();
+        let audits_before = self.ledger.common_recovery_audits_for_test();
+        let result = self.management_pending_admission_requirement(pending);
+        // Restore the exact same fixture-owned inode before asserting even
+        // when the real budget refuses the corrupted physical closure.
+        file.seek(SeekFrom::Start(offset as u64)).unwrap();
+        file.write_all(&[original[offset]]).unwrap();
+        file.sync_all().unwrap();
+        assert!(
+            result.is_err(),
+            "a previous healthy budget cannot hide fresh closure corruption"
+        );
+        assert_eq!(
+            self.ledger.common_recovery_audits_for_test() - audits_before,
+            1
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(self.store.heads().unwrap(), heads);
+        assert_eq!(
+            self.ledger.recovery_manifest_if_present().unwrap(),
+            manifest
+        );
+    }
+
     pub(crate) fn portable_checkpoint(
         &self,
         limits: PortableJournalLimits,
@@ -7411,9 +8489,9 @@ mod retained_external_reply_tests {
         InvocationReply,
         InvocationAcknowledgement,
     ) {
-        let registration = super::super::shared_recovery::recovery_registration_for_test(1, 7);
-        let mut retirement = InvocationRetirement::from_work(registration.request().work());
-        retirement.mode = MethodMode::Linear;
+        let registration =
+            super::super::shared_recovery::management_recovery_fixture_for_test(1, 7);
+        let retirement = InvocationRetirement::from_work(registration.work());
         assert!(retirement.validate());
         let authorization = Hash([0x93; 32]);
         let reply = InvocationReply {
@@ -7610,21 +8688,647 @@ mod retained_external_reply_tests {
 mod keyed_actor_cursor_tests {
 
     #[test]
-    fn acknowledged_projection_prefers_first_capsule_over_later_input_outcome() {
-        use super::super::shared_recovery::{
-            SharedRecoveryManifest, recovery_observation_for_test, recovery_registration_for_test,
+    fn management_pending_capsule_fallback_never_turns_absence_into_anchor_evidence() {
+        use super::super::journal::ReplayInputId;
+        let first = ReplayInputId([1; 32]);
+        let later = ReplayInputId([2; 32]);
+        for (recent, anchored, capsule, expected) in [
+            (None, None, None, true),
+            (Some(first), Some(first), None, true),
+            (Some(first), None, None, false),
+            (Some(first), None, Some(first), false),
+            (Some(first), Some(later), None, false),
+            (Some(first), Some(later), Some(first), false),
+            (None, Some(first), Some(first), true),
+            (Some(later), Some(first), Some(first), true),
+        ] {
+            assert_eq!(
+                super::management_pending_input_matches_anchor(recent, anchored, capsule),
+                expected,
+                "recent={recent:?} anchored={anchored:?} capsule={capsule:?}",
+            );
+        }
+    }
+
+    fn management_capsule_fixture(
+        acknowledged: bool,
+    ) -> (
+        super::SharedRecoveryManifest,
+        super::super::shared_recovery::management::SharedManagementRecoveryMember,
+        super::super::shared_recovery::VerifiedSharedRecoveryObservation,
+    ) {
+        management_capsule_fixture_for_owner(1, 7, acknowledged)
+    }
+
+    fn management_capsule_fixture_for_owner(
+        owner: u8,
+        nonce: u8,
+        acknowledged: bool,
+    ) -> (
+        super::SharedRecoveryManifest,
+        super::super::shared_recovery::management::SharedManagementRecoveryMember,
+        super::super::shared_recovery::VerifiedSharedRecoveryObservation,
+    ) {
+        use super::super::shared_recovery::management::{
+            SharedManagementRecoveryMember, SharedManagementRecoveryRegistration,
+            SharedManagementRecoveryRegistrationRequest,
         };
-        let registration = recovery_registration_for_test(1, 7);
+        use super::super::shared_recovery::{
+            management_observation_for_test, management_recovery_fixture_for_test,
+        };
+        use ed25519_dalek::{Signer as _, SigningKey};
+        let template = management_recovery_fixture_for_test(owner, nonce);
+        let first = management_observation_for_test(&template, 2, false);
+        let member = SharedManagementRecoveryMember::new(
+            None,
+            super::super::clean_management_intent::ManagementJournalAnchor {
+                genesis: template.generation().genesis(),
+                admission: template.generation().admission(),
+                runtime: first.observation().input().runtime.commitment(),
+                ordered: super::OrderedBase::post_genesis(),
+            },
+            template.envelope().clone(),
+        )
+        .unwrap();
+        let request = SharedManagementRecoveryRegistrationRequest::new(
+            template.generation(),
+            template.committee(),
+            template.owner(),
+            template.owner(),
+            1,
+            None,
+            vec![member.clone()],
+        )
+        .unwrap();
+        let signature = super::super::shared_commit::ReplicaCommitSignature::new(
+            template.owner(),
+            SigningKey::from_bytes(&[owner; 32])
+                .sign(&request.signing_message().0)
+                .to_bytes(),
+        )
+        .unwrap();
+        let registration = SharedManagementRecoveryRegistration::new(request, signature).unwrap();
         let committee = super::super::shared_commit::common_snapshot_claim_for_test()
             .active_committee()
             .clone();
         let mut manifest =
-            SharedRecoveryManifest::new(registration.generation(), committee).unwrap();
-        manifest.apply_registration(&registration, 1, 3).unwrap();
-        let first = recovery_observation_for_test(&registration, 2, false);
-        let ack = recovery_observation_for_test(&registration, 3, true);
+            super::SharedRecoveryManifest::new(template.generation(), committee).unwrap();
+        manifest
+            .apply_management_registration(&registration, 1, 3)
+            .unwrap();
         manifest.observe(&first).unwrap();
-        manifest.observe(&ack).unwrap();
+        if acknowledged {
+            manifest
+                .observe(&management_observation_for_test(&template, 3, true))
+                .unwrap();
+        }
+        (manifest, member, first)
+    }
+
+    fn management_clock_fixture(
+        owner: u8,
+        nonce: u8,
+        observed_slot: u64,
+    ) -> (
+        super::SharedRecoveryManifest,
+        super::super::shared_recovery::management::SharedManagementRecoveryMember,
+    ) {
+        use super::super::shared_recovery::management::{
+            SharedManagementRecoveryMember, SharedManagementRecoveryRegistration,
+            SharedManagementRecoveryRegistrationRequest,
+        };
+        use super::super::shared_recovery::management_recovery_fixture_at_slot_for_test;
+        use ed25519_dalek::{Signer as _, SigningKey};
+        let fixture = management_recovery_fixture_at_slot_for_test(owner, nonce, observed_slot);
+        let first =
+            super::super::shared_recovery::management_observation_for_test(&fixture, 2, false);
+        let member = SharedManagementRecoveryMember::new(
+            None,
+            super::super::clean_management_intent::ManagementJournalAnchor {
+                genesis: fixture.generation().genesis(),
+                admission: fixture.generation().admission(),
+                runtime: first.observation().input().runtime.commitment(),
+                ordered: super::OrderedBase::post_genesis(),
+            },
+            fixture.envelope().clone(),
+        )
+        .unwrap();
+        let request = SharedManagementRecoveryRegistrationRequest::new(
+            fixture.generation(),
+            fixture.committee(),
+            fixture.owner(),
+            fixture.owner(),
+            1,
+            None,
+            vec![member.clone()],
+        )
+        .unwrap();
+        let signature = super::super::shared_commit::ReplicaCommitSignature::new(
+            request.owner(),
+            SigningKey::from_bytes(&[owner; 32])
+                .sign(&request.signing_message().0)
+                .to_bytes(),
+        )
+        .unwrap();
+        let registration = SharedManagementRecoveryRegistration::new(request, signature).unwrap();
+        let committee = super::super::shared_commit::common_snapshot_claim_for_test()
+            .active_committee()
+            .clone();
+        let mut manifest =
+            super::SharedRecoveryManifest::new(fixture.generation(), committee).unwrap();
+        manifest
+            .apply_management_registration(&registration, 1, 3)
+            .unwrap();
+        (manifest, member)
+    }
+
+    #[test]
+    fn management_clock_orders_distinct_owners_without_restricting_equal_slots() {
+        use crate::service::wire::ServiceWire as _;
+        let (mut manifest, _) = management_clock_fixture(1, 7, 10);
+        let (second, _) = management_clock_fixture(2, 8, 11);
+        manifest
+            .apply_management_registration(second.management_slots()[0].registration(), 2, 3)
+            .unwrap();
+        let immutable = manifest.encode();
+        assert!(super::management_first_invoke_clock_ready(&manifest, 10).unwrap());
+        assert!(!super::management_first_invoke_clock_ready(&manifest, 11).unwrap());
+        assert!(!super::management_first_invoke_clock_ready(&manifest, 12).unwrap());
+        assert_eq!(manifest.encode(), immutable);
+        let (equal, _) = management_clock_fixture(2, 8, 10);
+        let (mut manifest, _) = management_clock_fixture(1, 7, 10);
+        manifest
+            .apply_management_registration(equal.management_slots()[0].registration(), 2, 3)
+            .unwrap();
+        assert!(super::management_first_invoke_clock_ready(&manifest, 10).unwrap());
+    }
+
+    #[test]
+    fn management_clock_fence_requires_first_invoke_not_ack_or_native_release() {
+        use super::super::shared_recovery::{
+            management_observation_for_test, management_recovery_fixture_for_test,
+        };
+        // The signed management call has observed slot ten. Its physical
+        // first evidence is sufficient; ACK/release need their unchanged proofs.
+        let (completed, _, first) = management_capsule_fixture(false);
+        let registration = completed.management_slots()[0].registration().clone();
+        let mut manifest = super::SharedRecoveryManifest::new(
+            completed.generation(),
+            completed.committee().clone(),
+        )
+        .unwrap();
+        manifest
+            .apply_management_registration(&registration, 1, 3)
+            .unwrap();
+        assert!(!super::management_first_invoke_clock_ready(&manifest, 11).unwrap());
+        manifest.observe(&first).unwrap();
+        assert!(super::management_first_invoke_clock_ready(&manifest, 11).unwrap());
+        let slot = &manifest.management_slots()[0];
+        assert!(slot.members_evidence()[0].acknowledgement().is_none());
+        assert!(!slot.is_released());
+        let template = management_recovery_fixture_for_test(1, 7);
+        manifest
+            .observe(&management_observation_for_test(&template, 3, true))
+            .unwrap();
+        assert!(super::management_first_invoke_clock_ready(&manifest, 11).unwrap());
+        assert!(!manifest.management_slots()[0].is_released());
+    }
+
+    #[test]
+    fn management_clock_child_finalization_fences_later_first_execution() {
+        use super::super::shared_recovery::management::{
+            SharedManagementRecoveryMember, SharedManagementRecoveryRegistration,
+            SharedManagementRecoveryRegistrationRequest,
+        };
+        use crate::service::wire::ServiceWire as _;
+        use ed25519_dalek::{Signer as _, SigningKey};
+        let (mut manifest, root, _) = management_capsule_fixture(false);
+        let (_, child) = management_clock_fixture(1, 8, 11);
+        let child = SharedManagementRecoveryMember::new(
+            Some(root.commitment()),
+            child.anchor().clone(),
+            child.envelope().clone(),
+        )
+        .unwrap();
+        let slot = &manifest.management_slots()[0];
+        let request = SharedManagementRecoveryRegistrationRequest::new(
+            manifest.generation(),
+            manifest.committee().id(),
+            slot.owner(),
+            slot.origin_owner(),
+            slot.sequence() + 1,
+            Some(slot.commitment()),
+            vec![root, child],
+        )
+        .unwrap();
+        let signature = super::super::shared_commit::ReplicaCommitSignature::new(
+            request.owner(),
+            SigningKey::from_bytes(&[1; 32])
+                .sign(&request.signing_message().0)
+                .to_bytes(),
+        )
+        .unwrap();
+        manifest
+            .apply_management_registration(
+                &SharedManagementRecoveryRegistration::new(request, signature).unwrap(),
+                3,
+                3,
+            )
+            .unwrap();
+        let immutable = manifest.encode();
+        assert!(super::management_first_invoke_clock_ready(&manifest, 11).unwrap());
+        assert!(!super::management_first_invoke_clock_ready(&manifest, 12).unwrap());
+        assert_eq!(manifest.encode(), immutable);
+    }
+
+    #[test]
+    fn management_retention_headroom_aggregates_owners_and_excludes_positive_acks() {
+        use super::super::journal::{JournalHeads, MergeFrontierId};
+        use super::super::shared_recovery::management::{
+            SharedManagementRecoveryRelease, SharedManagementRecoveryReleaseRequest,
+        };
+        use super::super::shared_recovery::{
+            management_observation_for_test, management_recovery_fixture_for_test,
+        };
+        use ed25519_dalek::{Signer as _, SigningKey};
+        let (mut manifest, first, _) = management_capsule_fixture(false);
+        let (second_manifest, second, _) = management_capsule_fixture_for_owner(2, 8, false);
+        let second_registration = second_manifest.management_slots()[0].registration().clone();
+        manifest
+            .apply_management_registration(&second_registration, 4, 3)
+            .unwrap();
+        let second_template = management_recovery_fixture_for_test(2, 8);
+        manifest
+            .observe(&management_observation_for_test(&second_template, 5, false))
+            .unwrap();
+        let common = super::super::shared_commit::common_snapshot_claim_for_test();
+        let heads = JournalHeads::initial(
+            common.ordered().genesis(),
+            common.ordered().admission(),
+            second_template.owner(),
+            MergeFrontierId([0x91; 32]),
+            common.ordered().runtime().clone(),
+        );
+        let first_future =
+            super::management_finalization_headroom(&heads, first.envelope()).unwrap();
+        let second_future =
+            super::management_finalization_headroom(&heads, second.envelope()).unwrap();
+        let (pending, entries, bytes) =
+            super::management_retention_headroom(&heads, &manifest, None).unwrap();
+        assert_eq!(
+            pending.len(),
+            2,
+            "both remote owners consume one joint budget"
+        );
+        assert_eq!(entries, first_future.0 + second_future.0);
+        assert_eq!(entries, 4);
+        assert_eq!(bytes, first_future.1 + second_future.1);
+        assert!(pending.iter().any(|(_, work)| *work == first.envelope()));
+        assert!(pending.iter().any(|(_, work)| *work == second.envelope()));
+
+        manifest
+            .observe(&management_observation_for_test(&second_template, 6, true))
+            .unwrap();
+        let (pending, after_entries, after_bytes) =
+            super::management_retention_headroom(&heads, &manifest, None).unwrap();
+        assert_eq!(pending, vec![(first.anchor(), first.envelope())]);
+        assert_eq!((after_entries, after_bytes), (entries, bytes));
+        // An ACKed approval leaves the family's future finalization reserve,
+        // but never re-enters the pending-denial validator.
+        let request = SharedManagementRecoveryReleaseRequest::for_slot(
+            manifest.management_slot(second_template.owner()).unwrap(),
+        )
+        .unwrap();
+        let signature = super::super::shared_commit::ReplicaCommitSignature::new(
+            second_template.owner(),
+            SigningKey::from_bytes(&[2; 32])
+                .sign(&request.signing_message().0)
+                .to_bytes(),
+        )
+        .unwrap();
+        let release = SharedManagementRecoveryRelease::new(request, signature).unwrap();
+        manifest.apply_management_release(&release, 7, 3).unwrap();
+        let (pending, after_entries, after_bytes) =
+            super::management_retention_headroom(&heads, &manifest, None).unwrap();
+        assert_eq!(pending, vec![(first.anchor(), first.envelope())]);
+        assert_eq!((after_entries, after_bytes), first_future);
+    }
+
+    #[test]
+    fn management_retention_headroom_replaces_only_incoming_owner_scope() {
+        use super::super::journal::{JournalHeads, MergeFrontierId};
+        use super::super::shared_recovery::management::{
+            SharedManagementRecoveryMember, SharedManagementRecoveryRegistrationRequest,
+        };
+        let (mut manifest, first, _) = management_capsule_fixture(false);
+        let (second_manifest, second, _) = management_capsule_fixture_for_owner(2, 8, true);
+        let second_registration = second_manifest.management_slots()[0].registration().clone();
+        manifest
+            .apply_management_registration(&second_registration, 4, 3)
+            .unwrap();
+        let template = super::super::shared_recovery::management_recovery_fixture_for_test(2, 8);
+        for acknowledgement in [false, true] {
+            manifest
+                .observe(
+                    &super::super::shared_recovery::management_observation_for_test(
+                        &template,
+                        if acknowledgement { 6 } else { 5 },
+                        acknowledgement,
+                    ),
+                )
+                .unwrap();
+        }
+        let (_, third, _) = management_capsule_fixture_for_owner(2, 9, false);
+        let child = SharedManagementRecoveryMember::new(
+            Some(second.commitment()),
+            third.anchor().clone(),
+            third.envelope().clone(),
+        )
+        .unwrap();
+        let slot = manifest.management_slot(template.owner()).unwrap();
+        let incoming = SharedManagementRecoveryRegistrationRequest::new(
+            manifest.generation(),
+            manifest.committee().id(),
+            template.owner(),
+            slot.origin_owner(),
+            slot.sequence() + 1,
+            Some(slot.commitment()),
+            vec![second.clone(), child.clone()],
+        )
+        .unwrap();
+        manifest
+            .validate_management_registration_request(&incoming)
+            .unwrap();
+        let common = super::super::shared_commit::common_snapshot_claim_for_test();
+        let heads = JournalHeads::initial(
+            common.ordered().genesis(),
+            common.ordered().admission(),
+            template.owner(),
+            MergeFrontierId([0x91; 32]),
+            common.ordered().runtime().clone(),
+        );
+        let (pending, entries, bytes) =
+            super::management_retention_headroom(&heads, &manifest, Some(&incoming)).unwrap();
+        assert_eq!(pending.len(), 2);
+        assert!(pending.contains(&(first.anchor(), first.envelope())));
+        assert!(pending.contains(&(child.anchor(), child.envelope())));
+        assert!(!pending.contains(&(second.anchor(), second.envelope())));
+        let first_future =
+            super::management_finalization_headroom(&heads, first.envelope()).unwrap();
+        let second_future =
+            super::management_finalization_headroom(&heads, second.envelope()).unwrap();
+        assert_eq!((entries, bytes), (4, first_future.1 + second_future.1));
+    }
+
+    #[test]
+    fn management_capsule_selection_requires_exact_saved_anchor_and_complete_envelope() {
+        let (manifest, member, first) = management_capsule_fixture(false);
+        assert_eq!(
+            super::exact_retained_management_member(
+                &manifest,
+                Some(member.anchor().ordered),
+                member.envelope()
+            )
+            .unwrap()
+            .unwrap()
+            .invoke(),
+            Some(first.observation())
+        );
+        assert!(
+            super::exact_retained_management_member(
+                &manifest,
+                Some(super::OrderedBase {
+                    index: 1,
+                    head: Some(super::super::journal::OrderedEntryId([0xf1; 32])),
+                }),
+                member.envelope()
+            )
+            .is_err()
+        );
+        let mut altered = member.envelope().clone();
+        let crate::agent_sdk::RuntimeWork::Invoke {
+            invocation,
+            authorization,
+            observed_slot,
+            ..
+        } = &mut altered
+        else {
+            panic!("Invoke fixture");
+        };
+        invocation.gas -= 1;
+        **authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+            crate::agent_sdk::PublicPreflight::for_work(invocation, *observed_slot),
+        );
+        assert!(
+            super::exact_retained_management_member(
+                &manifest,
+                Some(member.anchor().ordered),
+                &altered
+            )
+            .is_err()
+        );
+        let crate::agent_sdk::RuntimeWork::Invoke {
+            invocation,
+            authorization,
+            observed_slot,
+            context,
+            ..
+        } = &altered
+        else {
+            panic!("Invoke fixture");
+        };
+        assert!(
+            super::retained_management_operation(
+                &manifest,
+                &super::ReplayOperation::CleanInvoke {
+                    context: *context,
+                    work: (**invocation).clone(),
+                    authorization: (**authorization).clone(),
+                    observed_slot: *observed_slot,
+                }
+            )
+            .is_err()
+        );
+        let foreign = super::super::shared_recovery::management_recovery_fixture_for_test(1, 8);
+        let mut unknown = member.envelope().clone();
+        let crate::agent_sdk::RuntimeWork::Invoke {
+            invocation,
+            authorization,
+            ..
+        } = &mut unknown
+        else {
+            panic!("Invoke fixture");
+        };
+        **invocation = foreign.work().clone();
+        **authorization = foreign.authorization().clone();
+        assert!(
+            super::exact_retained_management_member(
+                &manifest,
+                Some(member.anchor().ordered),
+                &unknown
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn management_first_completed_capsule_and_positive_ack_are_distinct_retained_results() {
+        let (mut manifest, member, first) = management_capsule_fixture(true);
+        let duplicate = super::super::shared_recovery::management_observation_for_test(
+            &super::super::shared_recovery::management_recovery_fixture_for_test(1, 7),
+            4,
+            false,
+        );
+        manifest.observe(&duplicate).unwrap();
+        let input = first.observation().input();
+        assert_eq!(
+            super::retained_management_operation(&manifest, &input.operation).unwrap(),
+            Some(first.observation())
+        );
+        assert_eq!(
+            super::retained_acknowledged_projection_outcome(
+                Some(&manifest),
+                member.work(),
+                member.authorization(),
+                first.observation().input_id(),
+                || panic!("first retained response must win over later/absent cache")
+            ),
+            Some(first.observation().outcome().clone())
+        );
+        let evidence = super::exact_retained_management_member(
+            &manifest,
+            Some(member.anchor().ordered),
+            member.envelope(),
+        )
+        .unwrap()
+        .unwrap();
+        let ack = evidence.acknowledgement().unwrap();
+        assert!(matches!(
+            ack.outcome(),
+            crate::agent_sdk::RuntimeOutcome::Acknowledged(Ok(_))
+        ));
+        assert_eq!(
+            super::retained_management_operation(&manifest, &ack.input().operation).unwrap(),
+            Some(ack)
+        );
+        assert_ne!(ack.input_id(), first.observation().input_id());
+    }
+
+    #[test]
+    fn management_archived_availability_requires_exact_live_and_certified_first_observation() {
+        let (live, member, first) = management_capsule_fixture(true);
+        assert_eq!(
+            super::certified_live_recovery_observation(&live, Some(&live), first.observation()),
+            Some(first.observation())
+        );
+        assert!(
+            super::certified_live_recovery_observation(&live, None, first.observation()).is_none()
+        );
+        let changed = super::super::shared_recovery::management_observation_for_test(
+            &super::super::shared_recovery::management_recovery_fixture_for_test(1, 7),
+            4,
+            false,
+        );
+        assert_eq!(
+            first.observation().input_id(),
+            changed.observation().input_id()
+        );
+        assert!(
+            super::certified_live_recovery_observation(&live, Some(&live), changed.observation())
+                .is_none()
+        );
+        let unique = super::unique_recovery_observations(&live);
+        assert_eq!(unique.len(), 2);
+        assert!(unique.contains(&first.observation()));
+        let absent =
+            super::SharedRecoveryManifest::new(live.generation(), live.committee().clone())
+                .unwrap();
+        assert!(
+            super::certified_live_recovery_observation(&absent, Some(&live), first.observation())
+                .is_none()
+        );
+        let (without_ack, _, _) = management_capsule_fixture(false);
+        assert!(
+            super::retained_acknowledged_projection_outcome(
+                Some(&without_ack),
+                member.work(),
+                member.authorization(),
+                first.observation().input_id(),
+                || None
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn management_budget_archived_selection_binds_whole_live_view_and_each_first_capsule() {
+        let (live, _, first) = management_capsule_fixture(true);
+        let (before_ack, _, same_first) = management_capsule_fixture(false);
+        assert_eq!(first.observation(), same_first.observation());
+        let acknowledgement = live
+            .management_slots()
+            .iter()
+            .flat_map(|slot| slot.observations())
+            .find(|observation| observation.is_acknowledgement())
+            .unwrap();
+        for requested in [first.observation(), acknowledgement] {
+            let selected =
+                super::certified_budget_recovery_observation(&live, &live, Some(&live), requested)
+                    .unwrap();
+            assert_eq!(selected, requested);
+            assert_eq!(selected.claim(), requested.claim());
+        }
+        assert!(
+            super::certified_budget_recovery_observation(
+                &before_ack,
+                &live,
+                Some(&live),
+                first.observation(),
+            )
+            .is_none(),
+            "an identical requested capsule cannot excuse a different complete live view"
+        );
+        assert!(
+            super::certified_budget_recovery_observation(
+                &live,
+                &live,
+                Some(&before_ack),
+                acknowledgement,
+            )
+            .is_none(),
+            "every selected ACK needs its own exact certified baseline evidence"
+        );
+        assert!(
+            super::certified_budget_recovery_observation(&live, &live, None, first.observation(),)
+                .is_none()
+        );
+        let changed = super::super::shared_recovery::management_observation_for_test(
+            &super::super::shared_recovery::management_recovery_fixture_for_test(1, 7),
+            4,
+            false,
+        );
+        assert_eq!(
+            changed.observation().input_id(),
+            first.observation().input_id()
+        );
+        assert!(
+            super::certified_budget_recovery_observation(
+                &live,
+                &live,
+                Some(&live),
+                changed.observation(),
+            )
+            .is_none(),
+            "matching input identity does not authorize a changed first claim"
+        );
+    }
+
+    #[test]
+    fn acknowledged_management_prefers_first_capsule_over_later_input_outcome() {
+        use super::super::shared_recovery::management_recovery_fixture_for_test;
+        let registration = management_recovery_fixture_for_test(1, 7);
+        let (manifest, _, first) = management_capsule_fixture(true);
         let later = crate::agent_sdk::RuntimeOutcome::Completed(Err(
             crate::agent_sdk::InvocationError::NotFound,
         ));
@@ -7646,7 +9350,7 @@ mod keyed_actor_cursor_tests {
             ),
             Some(later)
         );
-        let foreign = recovery_registration_for_test(2, 8);
+        let foreign = management_recovery_fixture_for_test(2, 8);
         assert_eq!(
             super::retained_acknowledged_projection_outcome(
                 Some(&manifest),
@@ -7720,9 +9424,10 @@ mod keyed_actor_cursor_tests {
             .is_err()
         );
 
-        let registration = super::super::shared_recovery::recovery_registration_for_test(1, 7);
+        let registration =
+            super::super::shared_recovery::management_recovery_fixture_for_test(1, 7);
         let positive =
-            super::super::shared_recovery::recovery_observation_for_test(&registration, 10, true);
+            super::super::shared_recovery::management_observation_for_test(&registration, 10, true);
         let mut missing_positive = exact.clone();
         missing_positive.insert((third, ack), positive.observation().outcome().clone());
         assert!(
@@ -7745,16 +9450,18 @@ mod keyed_actor_cursor_tests {
     #[test]
     fn archived_recovery_lookup_requires_exact_live_and_certified_observation() {
         use super::super::shared_recovery::{
-            SharedRecoveryManifest, recovery_observation_for_test, recovery_registration_for_test,
+            SharedRecoveryManifest, management_observation_for_test,
+            management_recovery_fixture_for_test,
         };
-        let registration = recovery_registration_for_test(1, 7);
-        let committee = super::super::shared_commit::common_snapshot_claim_for_test()
-            .active_committee()
-            .clone();
+        let registration = management_recovery_fixture_for_test(1, 7);
+        let (registered, _, _) = management_capsule_fixture(false);
         let mut pending =
-            SharedRecoveryManifest::new(registration.generation(), committee).unwrap();
-        pending.apply_registration(&registration, 1, 3).unwrap();
-        let original = recovery_observation_for_test(&registration, 10, false);
+            SharedRecoveryManifest::new(registered.generation(), registered.committee().clone())
+                .unwrap();
+        pending
+            .apply_management_registration(registered.management_slots()[0].registration(), 1, 3)
+            .unwrap();
+        let original = management_observation_for_test(&registration, 10, false);
         let mut certified = pending.clone();
         certified.observe(&original).unwrap();
         assert_eq!(
@@ -7778,7 +9485,7 @@ mod keyed_actor_cursor_tests {
             .is_none(),
             "a certified baseline alone must not resurrect missing live evidence",
         );
-        let substituted = recovery_observation_for_test(&registration, 11, false);
+        let substituted = management_observation_for_test(&registration, 11, false);
         assert_eq!(
             substituted.observation().input_id(),
             original.observation().input_id()
@@ -7832,29 +9539,59 @@ mod keyed_actor_cursor_tests {
 
     #[test]
     fn recovery_hot_validation_checks_each_distinct_two_holder_observation_once() {
-        use super::super::shared_recovery::{
-            SharedRecoveryManifest, recovery_observation_for_test, recovery_registration_for_test,
+        use super::super::shared_recovery::management::{
+            SharedManagementRecoveryRegistration, SharedManagementRecoveryRegistrationRequest,
         };
-        let first = recovery_registration_for_test(1, 7);
-        let second = recovery_registration_for_test(2, 7);
-        let committee = super::super::shared_commit::common_snapshot_claim_for_test()
-            .active_committee()
-            .clone();
-        let mut manifest = SharedRecoveryManifest::new(first.generation(), committee).unwrap();
-        manifest.apply_registration(&first, 1, 3).unwrap();
-        manifest.apply_registration(&second, 2, 3).unwrap();
-        let invoke = recovery_observation_for_test(&first, 10, false);
-        let acknowledge = recovery_observation_for_test(&first, 11, true);
+        use super::super::shared_recovery::{
+            SharedRecoveryManifest, management_observation_for_test,
+            management_recovery_fixture_for_test,
+        };
+        use ed25519_dalek::{Signer as _, SigningKey};
+        let first = management_recovery_fixture_for_test(1, 7);
+        let second = management_recovery_fixture_for_test(2, 7);
+        assert_eq!(first.envelope(), second.envelope());
+        let (registered, member, _) = management_capsule_fixture(false);
+        let mut manifest =
+            SharedRecoveryManifest::new(first.generation(), registered.committee().clone())
+                .unwrap();
+        manifest
+            .apply_management_registration(registered.management_slots()[0].registration(), 1, 3)
+            .unwrap();
+        let request = SharedManagementRecoveryRegistrationRequest::new(
+            second.generation(),
+            second.committee(),
+            second.owner(),
+            first.owner(),
+            1,
+            None,
+            vec![member],
+        )
+        .unwrap();
+        let signature = super::super::shared_commit::ReplicaCommitSignature::new(
+            second.owner(),
+            SigningKey::from_bytes(&[2; 32])
+                .sign(&request.signing_message().0)
+                .to_bytes(),
+        )
+        .unwrap();
+        manifest
+            .apply_management_registration(
+                &SharedManagementRecoveryRegistration::new(request, signature).unwrap(),
+                2,
+                3,
+            )
+            .unwrap();
+        let invoke = management_observation_for_test(&first, 10, false);
+        let acknowledge = management_observation_for_test(&first, 11, true);
         manifest.observe(&invoke).unwrap();
         manifest.observe(&acknowledge).unwrap();
         assert_eq!(
             manifest
-                .slots()
+                .management_slots()
                 .iter()
-                .flat_map(|slot| [slot.invoke(), slot.acknowledgement()])
-                .flatten()
+                .flat_map(|slot| slot.observations())
                 .count(),
-            4
+            4,
         );
         let unique = super::unique_recovery_observations(&manifest);
         assert_eq!(

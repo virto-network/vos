@@ -1716,6 +1716,10 @@ fn encode_authority_projection_selector(
             });
         }
         AuthorityProjectionSelector::Credential => encoder.u8(0),
+        AuthorityProjectionSelector::GenesisDecision { agent } => {
+            encoder.u8(5);
+            encoder.fixed(agent.as_bytes());
+        }
         AuthorityProjectionSelector::Agents { after, limit } => {
             encoder.u8(1);
             encoder.option(&after, |encoder, value| encoder.fixed(value.as_bytes()));
@@ -1749,6 +1753,9 @@ fn decode_authority_projection_selector(
 ) -> Result<AuthorityProjectionSelector, DecodeError> {
     let value = match decoder.u8()? {
         0 => AuthorityProjectionSelector::Credential,
+        5 => AuthorityProjectionSelector::GenesisDecision {
+            agent: AgentId(decoder.fixed()?),
+        },
         4 => AuthorityProjectionSelector::Inventory {
             after: decoder.option(decode_inventory_cursor)?,
             limit: decoder.u16()?,
@@ -4319,6 +4326,23 @@ fn runtime_work_valid_with_nested(value: &RuntimeWork, nested_already_validated:
                 && (nested_already_validated || invocation.validate())
                 && authorization.matches_invoke(invocation, *observed_slot)
         }
+        #[cfg(feature = "experimental-state-blocks")]
+        RuntimeWork::Observe {
+            context,
+            state,
+            invocation,
+            authorization,
+            observed_slot,
+        } => {
+            context.is_direct()
+                && state.validate()
+                && (nested_already_validated || invocation.validate())
+                && invocation.mode == MethodMode::Query
+                && !invocation.recovery_only
+                && matches!(authorization.as_ref(),
+                    InvocationAuthorization::PublicPreflight(preflight)
+                        if preflight.matches(invocation, *observed_slot))
+        }
         RuntimeWork::Resume {
             context,
             state,
@@ -4444,6 +4468,21 @@ impl CanonicalWire for RuntimeWork {
                 encode_invocation_authorization(encoder, authorization);
                 encoder.u64(*observed_slot);
             }
+            #[cfg(feature = "experimental-state-blocks")]
+            RuntimeWork::Observe {
+                context,
+                state,
+                invocation,
+                authorization,
+                observed_slot,
+            } => {
+                encoder.u8(5);
+                encode_runtime_execution_context(encoder, *context);
+                encode_runtime_state(encoder, state);
+                encode_invocation_work(encoder, invocation);
+                encode_invocation_authorization(encoder, authorization);
+                encoder.u64(*observed_slot);
+            }
         }
     }
 
@@ -4484,6 +4523,14 @@ impl CanonicalWire for RuntimeWork {
                 context: decode_runtime_execution_context(decoder)?,
                 state: decode_runtime_state(decoder)?,
                 invocation: alloc::boxed::Box::new(InvocationRetirement::decode_body(decoder)?),
+                authorization: alloc::boxed::Box::new(decode_invocation_authorization(decoder)?),
+                observed_slot: decoder.u64()?,
+            },
+            #[cfg(feature = "experimental-state-blocks")]
+            5 => RuntimeWork::Observe {
+                context: decode_runtime_execution_context(decoder)?,
+                state: decode_runtime_state(decoder)?,
+                invocation: alloc::boxed::Box::new(decode_invocation_work(decoder)?),
                 authorization: alloc::boxed::Box::new(decode_invocation_authorization(decoder)?),
                 observed_slot: decoder.u64()?,
             },
@@ -6057,7 +6104,96 @@ mod tests {
     }
 
     #[test]
-    fn projection_delegation_preserves_legacy_bytes_and_is_query_only() {
+    fn projection_selector_tags_are_stable_and_genesis_decision_is_exact() {
+        use alloc::vec;
+
+        let agent = AgentId([0x81; 32]);
+        let agent_page = |tag| {
+            let mut bytes = vec![tag];
+            bytes.extend_from_slice(agent.as_bytes());
+            bytes.extend_from_slice(&[0, 1, 0]);
+            bytes
+        };
+        let mut genesis = vec![5];
+        genesis.extend_from_slice(agent.as_bytes());
+        for (selector, expected) in [
+            (AuthorityProjectionSelector::Credential, vec![0]),
+            (
+                AuthorityProjectionSelector::Agents {
+                    after: None,
+                    limit: 1,
+                },
+                vec![1, 0, 1, 0],
+            ),
+            (
+                AuthorityProjectionSelector::AgentReplicas {
+                    agent,
+                    after: None,
+                    limit: 1,
+                },
+                agent_page(2),
+            ),
+            (
+                AuthorityProjectionSelector::Actors {
+                    agent,
+                    after: None,
+                    limit: 1,
+                },
+                agent_page(3),
+            ),
+            (
+                AuthorityProjectionSelector::Inventory {
+                    after: None,
+                    limit: 1,
+                    known_head: None,
+                },
+                vec![4, 0, 1, 0, 0],
+            ),
+            (
+                AuthorityProjectionSelector::GenesisDecision { agent },
+                genesis,
+            ),
+        ] {
+            let mut bytes = Vec::new();
+            encode_authority_projection_selector(&mut Encoder(&mut bytes), selector);
+            assert_eq!(bytes, expected);
+            assert_eq!(
+                decode_authority_projection_selector(&mut Decoder::new(&expected)),
+                Ok(selector),
+            );
+        }
+        let mut query =
+            authority_projection_query(AuthorityProjectionSelector::GenesisDecision { agent });
+        let encoded = query.encode().unwrap();
+        assert_eq!(
+            AuthorityProjectionQuery::decode(&encoded),
+            Ok(query.clone())
+        );
+        assert!(encoded.len() <= MAX_AUTHORITY_PROJECTION_QUERY_WIRE_BYTES);
+        for end in 0..encoded.len() {
+            assert!(AuthorityProjectionQuery::decode(&encoded[..end]).is_err());
+        }
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(AuthorityProjectionQuery::decode(&trailing).is_err());
+        let mut altered = query.clone();
+        altered.selector = AuthorityProjectionSelector::GenesisDecision {
+            agent: AgentId([0x84; 32]),
+        };
+        assert_ne!(query.signing_bytes(), altered.signing_bytes());
+        assert_ne!(query.expected_invocation(), altered.expected_invocation());
+        query.selector = AuthorityProjectionSelector::GenesisDecision {
+            agent: AgentId::ZERO,
+        };
+        assert!(query.encode().is_err());
+        let mut zero_agent = vec![5];
+        zero_agent.extend_from_slice(AgentId::ZERO.as_bytes());
+        assert!(decode_authority_projection_selector(&mut Decoder::new(&zero_agent)).is_err());
+        assert!(decode_authority_projection_selector(&mut Decoder::new(&[6])).is_err());
+    }
+
+    #[test]
+    fn retired_delegation_is_refused_and_ordinary_query_bytes_stay_exact() {
         let mut query = authority_projection_query(AuthorityProjectionSelector::Credential);
         for ssh in [false, true] {
             query.authentication = if ssh {
@@ -6107,14 +6243,14 @@ mod tests {
                 accepted_slot: 42,
                 expires_at: 52,
             });
-            let delegated = query.encode().unwrap();
+            assert!(query.encode().is_err());
+            let mut delegated = b"APQ1".to_vec();
+            delegated.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+            encode_authority_projection_query_body(&mut Encoder(&mut delegated), &query);
             assert_eq!(delegated.len(), legacy.len() + 80);
             let tag_offset = HEADER_BYTES + authentication_offset;
             assert_eq!(delegated[tag_offset], if ssh { 3 } else { 2 });
-            assert_eq!(
-                AuthorityProjectionQuery::decode(&delegated),
-                Ok(query.clone())
-            );
+            assert!(AuthorityProjectionQuery::decode(&delegated).is_err());
             assert_eq!(&query.signing_bytes()[..4], b"APQD");
             assert!(
                 decode_authority_ingress_authentication(&mut Decoder::new(
@@ -7801,6 +7937,180 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "experimental-state-blocks")]
+    fn observation_work() -> RuntimeWork {
+        let mut invocation = invocation();
+        invocation.mode = MethodMode::Query;
+        invocation.origin = InvocationOrigin::anonymous();
+        let authorization =
+            InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&invocation, 45));
+        RuntimeWork::Observe {
+            context: RuntimeExecutionContext::Direct,
+            state: RuntimeState {
+                control: alloc::vec![0x51],
+                linear: alloc::vec![0x52],
+                merge: alloc::vec![0x53],
+                local: alloc::vec![0x54],
+            },
+            invocation: alloc::boxed::Box::new(invocation),
+            authorization: alloc::boxed::Box::new(authorization),
+            observed_slot: 45,
+        }
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn observation_wire_has_one_append_only_tag_and_no_mutation_header_change() {
+        let observation = observation_work();
+        let encoded = observation.encode().unwrap();
+        assert_eq!(&encoded[..4], b"AWRK");
+        assert_eq!(&encoded[4..HEADER_BYTES], RUNTIME_ABI_ID.as_bytes());
+        assert_eq!(encoded[HEADER_BYTES], 5);
+        assert_eq!(RuntimeWork::decode(&encoded).unwrap(), observation);
+        let RuntimeWork::Observe {
+            context,
+            state,
+            invocation,
+            authorization,
+            observed_slot,
+        } = observation
+        else {
+            unreachable!()
+        };
+        let invoke = RuntimeWork::Invoke {
+            context,
+            state,
+            invocation,
+            authorization,
+            observed_slot,
+        };
+        let invoke_bytes = invoke.encode().unwrap();
+        assert_eq!(invoke_bytes[HEADER_BYTES], 1);
+        let mut original_invoke = encoded.clone();
+        original_invoke[HEADER_BYTES] = 1;
+        assert_eq!(
+            invoke_bytes, original_invoke,
+            "existing Invoke wire is unchanged"
+        );
+        assert_eq!(RuntimeWork::decode(&invoke_bytes).unwrap(), invoke);
+        for end in 0..encoded.len() {
+            assert!(RuntimeWork::decode(&encoded[..end]).is_err());
+        }
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(RuntimeWork::decode(&trailing).is_err());
+        let mut wrong_abi = encoded;
+        wrong_abi[4..HEADER_BYTES].copy_from_slice(SYSTEM_OBSERVATION_ABI_ID.as_bytes());
+        assert!(
+            RuntimeWork::decode(&wrong_abi).is_err(),
+            "package opt-in is not a mutation frame header"
+        );
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn observation_refuses_other_modes_recovery_attestation_receipts_and_clock_reuse() {
+        let original = observation_work();
+        let mut invalid = Vec::new();
+        for mode in [
+            MethodMode::LinearizableQuery,
+            MethodMode::LocalQuery,
+            MethodMode::Linear,
+            MethodMode::Merge,
+            MethodMode::Local,
+        ] {
+            let mut other = original.clone();
+            let RuntimeWork::Observe {
+                invocation,
+                authorization,
+                ..
+            } = &mut other
+            else {
+                unreachable!()
+            };
+            invocation.mode = mode;
+            **authorization =
+                InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(invocation, 45));
+            invalid.push(other);
+        }
+        for variant in 0..9 {
+            let mut other = original.clone();
+            let RuntimeWork::Observe {
+                context,
+                invocation,
+                authorization,
+                observed_slot,
+                ..
+            } = &mut other
+            else {
+                unreachable!()
+            };
+            match variant {
+                0 => {
+                    *context = RuntimeExecutionContext::Attested {
+                        proof_system: Hash([0x71; 32]),
+                    }
+                }
+                1 => {
+                    invocation.recovery_only = true;
+                    **authorization = InvocationAuthorization::PublicPreflight(
+                        PublicPreflight::for_work(invocation, 45),
+                    );
+                }
+                2 => {
+                    **authorization =
+                        InvocationAuthorization::AuthorityReceipt(receipt_for(invocation))
+                }
+                3 => *observed_slot = 44,
+                4 => *observed_slot = 46,
+                5 => invocation.gas += 1,
+                6 => invocation.program = ProgramId([0x81; 32]),
+                7 => invocation.origin.transport_node = Some(NodeId([0x82; 32])),
+                8 => invocation.availability.push(RuntimeBlob {
+                    reference: blob(0x83),
+                    bytes: alloc::vec![0x84],
+                }),
+                _ => unreachable!(),
+            }
+            invalid.push(other);
+        }
+        for other in invalid {
+            assert!(!other.validate_wire());
+            assert_eq!(other.encode(), Err(WireError::InvalidValue));
+            // Exercise the hostile body decoder, not only the guarded encoder.
+            let mut body = Vec::new();
+            other.encode_body(&mut Encoder(&mut body));
+            assert!(RuntimeWork::decode_body(&mut Decoder::new(&body)).is_err());
+            let mut raw = RuntimeWork::MAGIC.to_vec();
+            raw.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+            raw.extend_from_slice(&body);
+            assert!(RuntimeWork::decode(&raw).is_err());
+        }
+    }
+
+    #[cfg(not(feature = "experimental-state-blocks"))]
+    #[test]
+    fn observation_tag_is_refused_without_feature() {
+        let mut invocation = invocation();
+        invocation.mode = MethodMode::Query;
+        invocation.origin = InvocationOrigin::anonymous();
+        let work = RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct,
+            state: RuntimeState::default(),
+            authorization: alloc::boxed::Box::new(InvocationAuthorization::PublicPreflight(
+                PublicPreflight::for_work(&invocation, 45),
+            )),
+            invocation: alloc::boxed::Box::new(invocation),
+            observed_slot: 45,
+        };
+        let mut encoded = work.encode().unwrap();
+        encoded[HEADER_BYTES] = 5;
+        assert_eq!(
+            RuntimeWork::decode(&encoded),
+            Err(WireError::Decode(DecodeError::InvalidTag))
+        );
+    }
+
     #[test]
     fn runtime_work_single_pass_rejects_invalid_nested_availability() {
         let mut invocation = invocation();
@@ -7981,7 +8291,7 @@ mod tests {
             );
         }
         let mut unknown_tag = encoded;
-        unknown_tag[HEADER_BYTES] = 5;
+        unknown_tag[HEADER_BYTES] = 6;
         assert_eq!(
             RuntimeWork::decode(&unknown_tag),
             Err(WireError::Decode(DecodeError::InvalidTag))

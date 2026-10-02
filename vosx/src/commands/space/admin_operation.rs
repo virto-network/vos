@@ -46,18 +46,8 @@ pub(crate) fn run(args: SetActorRoleArgs) -> anyhow::Result<()> {
         super::local_create::resolve_local_space(&args.space, args.http)?;
     let operator = crate::identity::load_existing()?;
     let identity = super::clean_identity::CleanOperatorIdentitySigner::new(&operator)?;
-    let runtime = crate::bundled::root_signed_agent_runtime_package(&operator)?;
-    let package = crate::bundled::root_signed_actor_package(
-        crate::bundled::system_authority_package_template_for_data_dir(&data)?,
-        "system-authority",
-        &operator,
-    )?;
-    let (authority, _) = super::clean_startup::derive_system_authority_target(
-        space,
-        identity.raw_public_key(),
-        &runtime,
-        &package,
-    )?;
+    let authority =
+        super::clean_startup::client_system_authority_target(&data, space, &operator, node_public)?;
     let public = libp2p::identity::ed25519::PublicKey::try_from_bytes(&node_public)?;
     let node = NodeId::of_authenticated_peer(
         &libp2p::identity::PublicKey::from(public)

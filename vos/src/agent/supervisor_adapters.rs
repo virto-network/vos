@@ -2246,25 +2246,10 @@ trait CleanAgentRouteBackend: Send + 'static {
     }
 
     #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
-    fn authority_projection(
+    fn authority_observation(
         &mut self,
         _query: AuthorityProjectionQuery,
     ) -> Result<Vec<u8>, AgentRouteError> {
-        Err(AgentRouteError::Rejected)
-    }
-
-    #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
-    fn recover_authority_projection(&mut self) -> Result<bool, AgentRouteError> {
-        Ok(false)
-    }
-
-    #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
-    fn peer_authority_projection(
-        &mut self,
-        _query: AuthorityProjectionQuery,
-        _recovering: bool,
-        _sender: NodeId,
-    ) -> Result<(), AgentRouteError> {
         Err(AgentRouteError::Rejected)
     }
 
@@ -2306,14 +2291,10 @@ enum RouteHostCommand {
     #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
     AuthorityTarget(SyncSender<Result<AuthorityActorTarget, AgentRouteError>>),
     #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
-    AuthorityProjection {
+    AuthorityObservation {
         query: AuthorityProjectionQuery,
         reply: SyncSender<Result<Vec<u8>, AgentRouteError>>,
     },
-    #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
-    RecoverAuthorityProjection(SyncSender<Result<bool, AgentRouteError>>),
-    #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
-    PeerAuthorityProjection(AuthorityProjectionQuery, bool, NodeId),
     Retire(SyncSender<Result<(), AgentRouteWorkerError>>),
 }
 
@@ -2843,44 +2824,25 @@ impl AgentRouteHostHandle {
     }
 
     #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
-    pub(crate) fn authority_projection(
+    pub(crate) fn invoke_authority_observation(
         &self,
         query: AuthorityProjectionQuery,
     ) -> Result<Vec<u8>, AgentRouteError> {
         let (reply, result) = mpsc::sync_channel(1);
-        self.send(RouteHostCommand::AuthorityProjection { query, reply })?;
+        self.send(RouteHostCommand::AuthorityObservation { query, reply })?;
         result.recv().unwrap_or(Err(AgentRouteError::Unavailable))
     }
 
     #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
-    pub(crate) fn authority_projection_bounded(
+    pub(crate) fn invoke_authority_observation_bounded(
         &self,
         query: AuthorityProjectionQuery,
     ) -> Result<Vec<u8>, AgentRouteError> {
         let (reply, result) = mpsc::sync_channel(1);
-        self.send(RouteHostCommand::AuthorityProjection { query, reply })?;
+        self.send(RouteHostCommand::AuthorityObservation { query, reply })?;
         result
             .recv_timeout(std::time::Duration::from_secs(120))
             .unwrap_or(Err(AgentRouteError::Unavailable))
-    }
-
-    #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
-    pub(crate) fn recover_authority_projection(&self) -> Result<bool, AgentRouteError> {
-        let (reply, result) = mpsc::sync_channel(1);
-        self.send(RouteHostCommand::RecoverAuthorityProjection(reply))?;
-        result.recv().unwrap_or(Err(AgentRouteError::Unavailable))
-    }
-
-    #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
-    fn enqueue_peer_projection(
-        &self,
-        query: AuthorityProjectionQuery,
-        recovering: bool,
-        sender: NodeId,
-    ) -> Result<(), AgentRouteError> {
-        self.send(RouteHostCommand::PeerAuthorityProjection(
-            query, recovering, sender,
-        ))
     }
 
     fn send(&self, command: RouteHostCommand) -> Result<(), AgentRouteError> {
@@ -3243,16 +3205,8 @@ fn execute_route_host_command(
             let _ = reply.send(backend.authority_target());
         }
         #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
-        RouteHostCommand::AuthorityProjection { query, reply } => {
-            let _ = reply.send(backend.authority_projection(query));
-        }
-        #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
-        RouteHostCommand::RecoverAuthorityProjection(reply) => {
-            let _ = reply.send(backend.recover_authority_projection());
-        }
-        #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
-        RouteHostCommand::PeerAuthorityProjection(query, recovering, sender) => {
-            let _ = backend.peer_authority_projection(query, recovering, sender);
+        RouteHostCommand::AuthorityObservation { query, reply } => {
+            let _ = reply.send(backend.authority_observation(query));
         }
         RouteHostCommand::Retire(reply) => {
             let retired = backend.retire();
@@ -4423,44 +4377,22 @@ where
             .authority_target())
     }
 
-    fn authority_projection(
+    fn authority_observation(
         &mut self,
         query: AuthorityProjectionQuery,
     ) -> Result<Vec<u8>, AgentRouteError> {
         self.owner
             .lock()
             .map_err(|_| AgentRouteError::Unavailable)?
-            .invoke_authority_projection(query)
+            .invoke_authority_observation(query)
             .map_err(|error| {
-                tracing::debug!(?error, "System authority projection failed");
+                tracing::debug!(?error, "System authority observation failed");
                 #[cfg(test)]
                 if std::env::var_os("VOS_TEST_INNER_DIAGNOSTICS").is_some() {
-                    eprintln!("system projection host error: {error:?}");
+                    eprintln!("system observation host error: {error:?}");
                 }
                 map_authority_read_error(error)
             })
-    }
-
-    fn recover_authority_projection(&mut self) -> Result<bool, AgentRouteError> {
-        self.owner
-            .lock()
-            .map_err(|_| AgentRouteError::Unavailable)?
-            .recover_pending_authority_projection()
-            .map_err(map_authority_read_error)
-    }
-
-    fn peer_authority_projection(
-        &mut self,
-        query: AuthorityProjectionQuery,
-        recovering: bool,
-        sender: NodeId,
-    ) -> Result<(), AgentRouteError> {
-        self.owner
-            .lock()
-            .map_err(|_| AgentRouteError::Unavailable)?
-            .invoke_peer_authority_projection(query, recovering, sender)
-            .map(|_| ())
-            .map_err(map_authority_read_error)
     }
 }
 
@@ -4497,22 +4429,11 @@ where
     R: super::clean_bootstrap::CleanSystemAgentBootstrapStore + Send + 'static,
     I: super::clean_authority_issuer::CleanManagementIssuerStore + Send + 'static,
 {
-    let attachment = spawn_backend(
-        SystemAgentRouteBackend {
-            owner: Arc::clone(&owner),
-        },
+    spawn_backend(
+        SystemAgentRouteBackend { owner },
         queue_capacity,
         "vos-system-agent-route",
-    )?;
-    let handle = attachment.handle();
-    owner
-        .lock()
-        .map_err(|_| AgentRouteAdapterError::Route(AgentRouteError::Unavailable))?
-        .install_projection_dispatch(Arc::new(move |query, recovering, sender| {
-            handle.enqueue_peer_projection(query, recovering, sender).is_ok()
-        }))
-        .map_err(|error| AgentRouteAdapterError::Route(map_shared_host_error(error)))?;
-    Ok(attachment)
+    )
 }
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
@@ -4524,7 +4445,6 @@ fn map_shared_host_error(error: super::shared_host::SharedAgentHostError) -> Age
         }
         SharedAgentHostError::CapacityExhausted
         | SharedAgentHostError::Conflict
-        | SharedAgentHostError::ProjectionExpired
         | SharedAgentHostError::InvalidProvision => AgentRouteError::Rejected,
         _ => AgentRouteError::Unavailable,
     }
@@ -4546,9 +4466,9 @@ fn map_shared_projection_error(error: super::shared_host::SharedAgentHostError) 
 // initial publication while retaining its consensus owner.
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 fn map_authority_read_error(error: super::shared_host::SharedAgentHostError) -> AgentRouteError {
+    tracing::debug!(?error, "Authority observation owner read failed");
     match error {
         super::shared_host::SharedAgentHostError::Unavailable => AgentRouteError::NotReady,
-        super::shared_host::SharedAgentHostError::ProjectionExpired => AgentRouteError::Rejected,
         _ => AgentRouteError::Unavailable,
     }
 }
@@ -4684,20 +4604,6 @@ pub fn dispatch_encoded_acknowledgement(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
-    #[test]
-    fn shared_projection_expiry_is_terminal_route_rejection() {
-        use crate::agent::shared_host::SharedAgentHostError as Error;
-        assert_eq!(
-            map_shared_host_error(Error::ProjectionExpired),
-            AgentRouteError::Rejected
-        );
-        assert_eq!(
-            map_authority_read_error(Error::ProjectionExpired),
-            AgentRouteError::Rejected
-        );
-    }
 
     #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
     #[test]
@@ -6761,6 +6667,43 @@ mod tests {
         assert!(!route_host.is_running());
     }
 
+    #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+    #[test]
+    fn authority_observation_uses_existing_worker_and_closed_handle_guard() {
+        let request = request(0x2f, RuntimeExecutionContext::Direct);
+        let projection = owner_projection(
+            owner_descriptor(0x45, AgentProfile::Shared, NodeId([0x46; 32])),
+            0x45,
+            true,
+        );
+        let target = owner_target(&projection);
+        let (attachment, _, _, _) =
+            fake_attachment(identity(&request), None, FakeReply::RequestBoundError);
+        let handle = attachment.handle();
+        use crate::agent::production_owner::AuthorityProjectionQueryAuthenticator as _;
+        let query = OwnerAuthenticator(0)
+            .authenticate(target, AuthorityProjectionSelector::Credential)
+            .unwrap();
+        // Only a System backend can serve the private observation command.
+        assert_eq!(
+            handle.invoke_authority_observation(query.clone()),
+            Err(AgentRouteError::Rejected),
+        );
+        assert_eq!(
+            handle.invoke_authority_observation_bounded(query.clone()),
+            Err(AgentRouteError::Rejected),
+        );
+        attachment.retire().unwrap();
+        assert_eq!(
+            handle.invoke_authority_observation(query.clone()),
+            Err(AgentRouteError::Unavailable),
+        );
+        assert_eq!(
+            handle.invoke_authority_observation_bounded(query),
+            Err(AgentRouteError::Unavailable),
+        );
+    }
+
     #[test]
     fn cross_request_error_replay_fails_closed_and_retires_host_worker() {
         let first = request(31, RuntimeExecutionContext::Direct);
@@ -7301,7 +7244,7 @@ mod tests {
     struct OwnerAuthenticator(u8);
 
     #[test]
-    fn peer_projection_queue_is_bounded_and_closed_handles_release_backend() {
+    fn authority_observation_queue_is_bounded_and_closed_handles_release_backend() {
         use crate::agent::production_owner::AuthorityProjectionQueryAuthenticator as _;
 
         let system = owner_projection(
@@ -7334,21 +7277,38 @@ mod tests {
         observed
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
-        // Acceptance means admission only: the worker is blocked and the
-        // default backend will reject these queries when it drains them.
-        let first = handle.enqueue_peer_projection(query.clone(), false, NodeId([0xc3; 32]));
-        let second = handle.enqueue_peer_projection(query.clone(), true, NodeId([0xc3; 32]));
-        let full = handle.enqueue_peer_projection(query.clone(), true, NodeId([0xc3; 32]));
+        // The shared worker's existing queue bounds fresh observations too.
+        // Queue admission is not a successful authenticated observation.
+        let (first_reply, first_result) = mpsc::sync_channel(1);
+        let first = handle.send(RouteHostCommand::AuthorityObservation {
+            query: query.clone(),
+            reply: first_reply,
+        });
+        let (second_reply, second_result) = mpsc::sync_channel(1);
+        let second = handle.send(RouteHostCommand::AuthorityObservation {
+            query: query.clone(),
+            reply: second_reply,
+        });
+        let (overflow_reply, _) = mpsc::sync_channel(1);
+        let full = handle.send(RouteHostCommand::AuthorityObservation {
+            query: query.clone(),
+            reply: overflow_reply,
+        });
         release.send(()).unwrap();
         operation.join().unwrap().unwrap();
-        attachment.retire().unwrap();
         assert_eq!(first, Ok(()));
         assert_eq!(second, Ok(()));
         assert_eq!(full, Err(AgentRouteError::NotReady));
+        assert_eq!(first_result.recv().unwrap(), Err(AgentRouteError::Rejected));
+        assert_eq!(
+            second_result.recv().unwrap(),
+            Err(AgentRouteError::Rejected)
+        );
+        attachment.retire().unwrap();
         assert!(retired.load(Ordering::Acquire));
         assert!(lifetime.upgrade().is_none());
         assert_eq!(
-            handle.enqueue_peer_projection(query, true, NodeId([0xc3; 32])),
+            handle.invoke_authority_observation(query),
             Err(AgentRouteError::Unavailable)
         );
     }
@@ -7396,6 +7356,11 @@ mod tests {
         dormant: AtomicBool,
         zero_routes: AtomicBool,
         retired: AtomicBool,
+        authority_target_unavailable: AtomicBool,
+        projection_busy: AtomicBool,
+        projection_not_ready: AtomicBool,
+        ready_gate: Mutex<Option<ReadyGate>>,
+        projection_queries: Mutex<Vec<AuthorityProjectionQuery>>,
     }
 
     struct OwnerRouteBackend {
@@ -7405,6 +7370,18 @@ mod tests {
     }
 
     impl CleanAgentRouteBackend for OwnerRouteBackend {
+        fn ready(&mut self) -> Result<(), AgentRouteError> {
+            if let Some(gate) = self.route.ready_gate.lock().unwrap().take() {
+                gate.started
+                    .send(())
+                    .map_err(|_| AgentRouteError::Unavailable)?;
+                gate.release
+                    .recv()
+                    .map_err(|_| AgentRouteError::Unavailable)?;
+            }
+            Ok(())
+        }
+
         fn identities(&mut self) -> Result<Vec<AgentRouteIdentity>, AgentRouteError> {
             self.route
                 .identity
@@ -7452,18 +7429,39 @@ mod tests {
         }
 
         fn authority_target(&mut self) -> Result<AuthorityActorTarget, AgentRouteError> {
+            if self
+                .route
+                .authority_target_unavailable
+                .load(Ordering::Acquire)
+            {
+                return Err(AgentRouteError::Unavailable);
+            }
             self.target.ok_or(AgentRouteError::Rejected)
         }
 
-        fn authority_projection(
+        fn authority_observation(
             &mut self,
             query: AuthorityProjectionQuery,
         ) -> Result<Vec<u8>, AgentRouteError> {
             let target = self.target.ok_or(AgentRouteError::Rejected)?;
             let inventory = self.inventory.as_ref().ok_or(AgentRouteError::Rejected)?;
-            if query.authority != target || query.validate_shape().is_err() {
+            if query.authority != target
+                || query.recovery.is_some()
+                || query.validate_shape().is_err()
+            {
                 return Err(AgentRouteError::Rejected);
             }
+            if self.route.projection_busy.load(Ordering::Acquire) {
+                return Err(AgentRouteError::Busy);
+            }
+            if self.route.projection_not_ready.load(Ordering::Acquire) {
+                return Err(AgentRouteError::NotReady);
+            }
+            self.route
+                .projection_queries
+                .lock()
+                .unwrap()
+                .push(query.clone());
             inventory.queries.fetch_add(1, Ordering::AcqRel);
             let counter = inventory.head.load(Ordering::Acquire);
             let head = owner_head(counter);
@@ -7565,6 +7563,9 @@ mod tests {
                     }
                     .encode()
                 }
+                AuthorityProjectionSelector::GenesisDecision { .. } => {
+                    return Err(AgentRouteError::Rejected);
+                }
             };
             bytes.map_err(|_| AgentRouteError::Rejected)
         }
@@ -7588,6 +7589,11 @@ mod tests {
             dormant: AtomicBool::new(false),
             zero_routes: AtomicBool::new(false),
             retired: AtomicBool::new(false),
+            authority_target_unavailable: AtomicBool::new(false),
+            projection_busy: AtomicBool::new(false),
+            projection_not_ready: AtomicBool::new(false),
+            ready_gate: Mutex::new(None),
+            projection_queries: Mutex::new(Vec::new()),
         });
         let attachment = spawn_backend(
             OwnerRouteBackend {
@@ -7768,6 +7774,345 @@ mod tests {
     }
 
     #[test]
+    fn production_owner_busy_hides_before_quarantine_and_republishes_fresh_routes() {
+        check_production_owner_hides_before_quarantine_and_republishes(false);
+    }
+
+    #[test]
+    fn production_owner_not_ready_hides_before_quarantine_and_republishes_fresh_routes() {
+        check_production_owner_hides_before_quarantine_and_republishes(true);
+    }
+
+    fn check_production_owner_hides_before_quarantine_and_republishes(not_ready: bool) {
+        use crate::agent::local_lifecycle::{LocalLifecycleIngressError, LocalLifecycleQueue};
+        use crate::agent::production_owner::{AgentProductionOwner, AgentProductionOwnerError};
+
+        let node = NodeId([0xd5; 32]);
+        let system = owner_projection(
+            owner_descriptor(0x81, AgentProfile::Shared, node),
+            0x91,
+            true,
+        );
+        let local = owner_projection(
+            owner_descriptor(0x82, AgentProfile::Local, node),
+            0x92,
+            false,
+        );
+        let shared = owner_projection(
+            owner_descriptor(0x83, AgentProfile::Shared, node),
+            0x93,
+            false,
+        );
+        let inventory = Arc::new(OwnerInventoryState {
+            head: std::sync::atomic::AtomicU64::new(1),
+            consistent: AtomicBool::new(true),
+            projections: vec![system.clone(), local.clone(), shared.clone()],
+            queries: AtomicUsize::new(0),
+        });
+        let (system_attachment, system_route) = owner_attachment(
+            &system,
+            1,
+            Some(owner_target(&system)),
+            Some(inventory.clone()),
+        );
+        let mut owner = AgentProductionOwner::start(
+            node,
+            limits(),
+            system_attachment,
+            Box::new(OwnerAuthenticator(0)),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let refusal = if not_ready {
+            AgentProductionOwnerError::ProjectionNotReady
+        } else {
+            AgentProductionOwnerError::ProjectionBusy
+        };
+        let set_refusal = |enabled| {
+            if not_ready {
+                system_route
+                    .projection_not_ready
+                    .store(enabled, Ordering::Release);
+            } else {
+                system_route
+                    .projection_busy
+                    .store(enabled, Ordering::Release);
+            }
+        };
+        let (local_attachment, local_route) = owner_attachment(&local, 2, None, None);
+        let (shared_attachment, shared_route) = owner_attachment(&shared, 3, None, None);
+        owner.install_local_host(local_attachment).unwrap();
+        owner.install_shared_host(shared_attachment).unwrap();
+        owner.reconcile().unwrap();
+        assert!(owner.is_ready());
+        let handle = owner.handle();
+        let old = handle.snapshots().unwrap();
+        assert_eq!(old.len(), 3);
+        let exposed = Arc::new(std::sync::RwLock::new(Some(owner.ingress().unwrap())));
+        let recovering = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let lifecycle = Arc::new(LocalLifecycleQueue::default());
+        lifecycle.open().unwrap();
+
+        inventory.head.store(2, Ordering::Release);
+        set_refusal(true);
+        assert_eq!(owner.reconcile(), Err(refusal));
+        assert!(!owner.is_ready());
+        assert!(matches!(
+            owner.ingress(),
+            Err(AgentProductionOwnerError::ProjectionNotReady)
+        ));
+        assert!(owner.needs_route_quarantine());
+        // A second attempt must not publish while quarantine is still pending.
+        assert_eq!(
+            owner.reconcile(),
+            Err(AgentProductionOwnerError::ProjectionBusy)
+        );
+
+        let (started, observed) = mpsc::sync_channel(1);
+        let (release, wait) = mpsc::sync_channel(1);
+        *system_route.ready_gate.lock().unwrap() = Some(ReadyGate {
+            started,
+            release: wait,
+        });
+        let hidden = exposed.clone();
+        let recovery_flag = recovering.clone();
+        let cancellation = shutdown.clone();
+        let queue = lifecycle.clone();
+        let quarantine = std::thread::spawn(move || {
+            let result = crate::agent::production_worker::quarantine_routes_for_test(
+                &mut owner,
+                hidden,
+                recovery_flag,
+                cancellation,
+                queue,
+            );
+            (owner, result)
+        });
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        let was_hidden = exposed.read().unwrap().is_none();
+        let was_recovering = recovering.load(Ordering::Acquire);
+        let backends_retained = [&system_route, &local_route, &shared_route]
+            .iter()
+            .all(|route| !route.retired.load(Ordering::Acquire));
+        // Release the blocked real refresh before asserting captured facts, so
+        // any failing assertion cannot strand the fixture's worker thread.
+        release.send(()).unwrap();
+        let (mut owner, result) = quarantine.join().unwrap();
+        result.unwrap();
+        assert!(was_hidden);
+        assert!(was_recovering);
+        assert!(backends_retained);
+        assert!(!shutdown.load(Ordering::Acquire));
+        assert!(matches!(
+            lifecycle.open(),
+            Err(LocalLifecycleIngressError::Busy)
+        ));
+        assert!(!owner.needs_route_quarantine());
+        assert!(!owner.is_ready());
+        assert!(handle.snapshots().unwrap().is_empty());
+        for snapshot in &old {
+            assert_eq!(
+                handle.dispatch(*snapshot, vec![1]),
+                Err(AgentSupervisorError::StaleSnapshot)
+            );
+        }
+        for route in [&system_route, &local_route, &shared_route] {
+            assert!(!route.retired.load(Ordering::Acquire));
+        }
+
+        set_refusal(false);
+        owner.reconcile().unwrap();
+        assert!(owner.is_ready());
+        assert!(owner.ingress().is_ok());
+        let fresh = handle.snapshots().unwrap();
+        assert_eq!(fresh.len(), 3);
+        for snapshot in &old {
+            let next = fresh
+                .iter()
+                .find(|candidate| candidate.key() == snapshot.key())
+                .unwrap();
+            assert_ne!(next.readiness_generation(), snapshot.readiness_generation());
+            assert_eq!(
+                handle.dispatch(*snapshot, vec![1]),
+                Err(AgentSupervisorError::StaleSnapshot)
+            );
+        }
+
+        // The accepted head remains an anti-rollback pin across quarantine.
+        // Hide again, then a lower authenticated head is fatal, never Busy.
+        set_refusal(true);
+        assert_eq!(owner.reconcile(), Err(refusal));
+        owner.quarantine_routes().unwrap();
+        set_refusal(false);
+        inventory.head.store(1, Ordering::Release);
+        assert_eq!(owner.reconcile(), Err(AgentProductionOwnerError::StaleHead));
+        assert!(!owner.is_ready());
+        assert!(handle.snapshots().unwrap().is_empty());
+        assert!(!owner.needs_route_quarantine());
+        owner.shutdown_and_join().unwrap();
+        for route in [&system_route, &local_route, &shared_route] {
+            assert!(route.retired.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn production_worker_not_ready_retains_backends_until_fresh_publication() {
+        use crate::agent::local_lifecycle::{LocalLifecycleIngressError, LocalLifecycleQueue};
+        use crate::agent::production_owner::AgentProductionOwner;
+        use crate::agent::production_worker::AgentProductionWorker;
+
+        let node = NodeId([0xd6; 32]);
+        let system = owner_projection(
+            owner_descriptor(0x84, AgentProfile::Shared, node),
+            0x94,
+            true,
+        );
+        let local = owner_projection(
+            owner_descriptor(0x85, AgentProfile::Local, node),
+            0x95,
+            false,
+        );
+        let shared = owner_projection(
+            owner_descriptor(0x86, AgentProfile::Shared, node),
+            0x96,
+            false,
+        );
+        let inventory = Arc::new(OwnerInventoryState {
+            head: std::sync::atomic::AtomicU64::new(1),
+            consistent: AtomicBool::new(true),
+            projections: vec![system.clone(), local.clone(), shared.clone()],
+            queries: AtomicUsize::new(0),
+        });
+        let (system_attachment, system_route) = owner_attachment(
+            &system,
+            1,
+            Some(owner_target(&system)),
+            Some(inventory.clone()),
+        );
+        let mut owner = AgentProductionOwner::start(
+            node,
+            limits(),
+            system_attachment,
+            Box::new(OwnerAuthenticator(0)),
+            // Test-only cadence: exercise the real worker's due branch, not a
+            // direct reconciliation call or a production deadline change.
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        let (local_attachment, local_route) = owner_attachment(&local, 2, None, None);
+        let (shared_attachment, shared_route) = owner_attachment(&shared, 3, None, None);
+        owner.install_local_host(local_attachment).unwrap();
+        owner.install_shared_host(shared_attachment).unwrap();
+        owner.reconcile().unwrap();
+        let handle = owner.handle();
+        let old = handle.snapshots().unwrap();
+        assert_eq!(old.len(), 3);
+        let exposed = Arc::new(std::sync::RwLock::new(Some(owner.ingress().unwrap())));
+        let recovering = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let lifecycle = Arc::new(LocalLifecycleQueue::default());
+        lifecycle.open().unwrap();
+        let queries = inventory.queries.load(Ordering::Acquire);
+        system_route
+            .projection_not_ready
+            .store(true, Ordering::Release);
+        let worker = AgentProductionWorker::start(
+            owner,
+            shutdown.clone(),
+            exposed.clone(),
+            recovering.clone(),
+            lifecycle.clone(),
+        )
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while worker.is_running()
+            && std::time::Instant::now() < deadline
+            && (!recovering.load(Ordering::Acquire)
+                || exposed.read().unwrap().is_some()
+                || !handle.snapshots().unwrap().is_empty())
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            worker.is_running(),
+            "typed NotReady stopped the real control worker"
+        );
+        assert!(!shutdown.load(Ordering::Acquire));
+        assert!(recovering.load(Ordering::Acquire));
+        assert!(exposed.read().unwrap().is_none());
+        assert!(handle.snapshots().unwrap().is_empty());
+        assert!(matches!(
+            lifecycle.open(),
+            Err(LocalLifecycleIngressError::Busy)
+        ));
+        for route in [&system_route, &local_route, &shared_route] {
+            assert!(!route.retired.load(Ordering::Acquire));
+        }
+        assert_eq!(
+            worker
+                .call(|owner| {
+                    let owner = owner.unwrap();
+                    (
+                        owner.is_running(),
+                        owner.is_ready(),
+                        owner.needs_route_quarantine(),
+                    )
+                })
+                .unwrap(),
+            (true, false, false)
+        );
+
+        // The same backend and queue recover only after a fresh verified read.
+        // A higher authenticated head must be observed, not stale republished.
+        inventory.head.store(2, Ordering::Release);
+        system_route
+            .projection_not_ready
+            .store(false, Ordering::Release);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while worker.is_running()
+            && std::time::Instant::now() < deadline
+            && (recovering.load(Ordering::Acquire) || exposed.read().unwrap().is_none())
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(worker.is_running());
+        assert!(!recovering.load(Ordering::Acquire));
+        assert!(exposed.read().unwrap().is_some());
+        assert!(inventory.queries.load(Ordering::Acquire) > queries);
+        assert!(matches!(
+            lifecycle.open(),
+            Err(LocalLifecycleIngressError::Busy)
+        ));
+        let fresh = handle.snapshots().unwrap();
+        assert_eq!(fresh.len(), 3);
+        for snapshot in &old {
+            let replacement = fresh
+                .iter()
+                .find(|next| next.key() == snapshot.key())
+                .unwrap();
+            assert_ne!(
+                replacement.readiness_generation(),
+                snapshot.readiness_generation()
+            );
+            assert_eq!(
+                handle.dispatch(*snapshot, vec![1]),
+                Err(AgentSupervisorError::StaleSnapshot)
+            );
+        }
+        for route in [&system_route, &local_route, &shared_route] {
+            assert!(!route.retired.load(Ordering::Acquire));
+        }
+        worker.shutdown_and_join().unwrap();
+        assert!(exposed.read().unwrap().is_none());
+        assert!(shutdown.load(Ordering::Acquire));
+        for route in [&system_route, &local_route, &shared_route] {
+            assert!(route.retired.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
     fn production_shutdown_signals_all_pending_hosts_before_join() {
         use crate::agent::production_owner::AgentProductionOwner;
 
@@ -7856,6 +8201,20 @@ mod tests {
 
         let mut node = crate::node::VosNode::new();
         assert!(node.clean_agent_supervisor().is_none());
+        #[cfg(feature = "ssh-ingress")]
+        let (ssh_public, ssh_signatures) = {
+            use ed25519_dalek::{Signer as _, SigningKey};
+            let key = SigningKey::from_bytes(&[0xd3; 32]);
+            let public = key.verifying_key();
+            let signatures = Arc::new(AtomicUsize::new(0));
+            let observed = signatures.clone();
+            node.set_ingress_node_attester(node_id, move |message| {
+                observed.fetch_add(1, Ordering::AcqRel);
+                Some(key.sign(message).to_bytes())
+            })
+            .unwrap();
+            (public, signatures)
+        };
         let ingress = node.ingress_handle();
         assert!(ingress.clean_agent_supervisor().is_none());
         node.attach_clean_agent_owner(owner).unwrap();
@@ -7886,6 +8245,7 @@ mod tests {
                 assert_eq!(projection.query.authority, target);
                 assert_eq!(projection.query.nonce, nonce);
                 assert_eq!(projection.query.credential, credential.credential_id());
+                assert_eq!(projection.query.recovery, None);
                 assert_eq!(
                     projection.query.selector,
                     AuthorityProjectionSelector::Credential
@@ -7896,6 +8256,155 @@ mod tests {
                     .unwrap();
             }
             assert_eq!(inventory.queries.load(Ordering::Acquire), before + 2);
+            // Repeated authentication signs a new nondelegated observation;
+            // the exposed worker has no retained read-recovery context.
+            let projection = ingress
+                .authenticate_clean_api(&credential, Hash([0xd6; 32]))
+                .unwrap();
+            assert_eq!(projection.query.recovery, None);
+            assert_eq!(projection.query.nonce, Hash([0xd6; 32]));
+            projection
+                .query
+                .verify_api_with(&crate::agent::clean_bootstrap::RawCredentialVerifier)
+                .unwrap();
+
+            // Already signed external requests retain their exact preimage.
+            let external = credential
+                .sign_projection_query(
+                    target,
+                    Hash([0xd7; 32]),
+                    AuthorityProjectionSelector::Credential,
+                )
+                .unwrap();
+            let external_before = external.clone();
+            let projection = ingress.query_clean_credential(external).unwrap();
+            assert_eq!(projection.query, external_before);
+            assert_eq!(
+                system_route.projection_queries.lock().unwrap().last(),
+                Some(&external_before)
+            );
+            // A freshness refusal never exposes an earlier successful read.
+            let queries_before = inventory.queries.load(Ordering::Acquire);
+            system_route
+                .projection_not_ready
+                .store(true, Ordering::Release);
+            assert_eq!(
+                ingress.authenticate_clean_api(&credential, Hash([0xd8; 32])),
+                Err(crate::node::IngressAuthenticationError::AuthorityUnavailable)
+            );
+            assert_eq!(inventory.queries.load(Ordering::Acquire), queries_before);
+            system_route
+                .projection_not_ready
+                .store(false, Ordering::Release);
+        }
+
+        #[cfg(feature = "ssh-ingress")]
+        {
+            let credential_public_key = ed25519_dalek::SigningKey::from_bytes(&[0xd9; 32])
+                .verifying_key()
+                .to_bytes();
+            let selector = AuthorityProjectionSelector::Credential;
+            let request_binding = Hash([0xda; 32]);
+            let first = ingress
+                .attest_ssh_projection_query(
+                    target,
+                    credential_public_key,
+                    Hash([0xdb; 32]),
+                    selector,
+                    request_binding,
+                )
+                .unwrap();
+            assert_eq!(first.recovery, None);
+            ssh_public
+                .verify_strict(
+                    &first.signing_bytes(),
+                    &ed25519_dalek::Signature::from_bytes(&first.authentication.signature()),
+                )
+                .unwrap();
+            let query = ingress
+                .attest_ssh_projection_query(
+                    target,
+                    credential_public_key,
+                    Hash([0xde; 32]),
+                    selector,
+                    request_binding,
+                )
+                .unwrap();
+            assert_eq!(query.recovery, None);
+            assert_eq!(query.nonce, Hash([0xde; 32]));
+            assert_ne!(query.nonce, first.nonce);
+            let signature = ed25519_dalek::Signature::from_bytes(&query.authentication.signature());
+            ssh_public
+                .verify_strict(&query.signing_bytes(), &signature)
+                .unwrap();
+            for field in 0..6 {
+                let mut altered = query.clone();
+                match field {
+                    0 => {
+                        altered.selector = AuthorityProjectionSelector::Agents {
+                            after: None,
+                            limit: 1,
+                        }
+                    }
+                    1 => {
+                        let AuthorityIngressAuthentication::SshNodeAttestation {
+                            request_binding,
+                            ..
+                        } = &mut altered.authentication
+                        else {
+                            unreachable!()
+                        };
+                        *request_binding = Hash([0xdf; 32]);
+                    }
+                    2 => altered.authority.space = SpaceId([0xe0; 32]),
+                    3 => altered.authority.system_agent = AgentId([0xe1; 32]),
+                    4 => altered.nonce = Hash([0xdc; 32]),
+                    5 => {
+                        let AuthorityIngressAuthentication::SshNodeAttestation { node, .. } =
+                            &mut altered.authentication
+                        else {
+                            unreachable!()
+                        };
+                        *node = NodeId([0xdd; 32]);
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    ssh_public
+                        .verify_strict(&altered.signing_bytes(), &signature)
+                        .is_err()
+                );
+            }
+            let signatures_before = ssh_signatures.load(Ordering::Acquire);
+            let mut foreign = target;
+            foreign.space = SpaceId([0xe2; 32]);
+            assert_eq!(
+                ingress.attest_ssh_projection_query(
+                    foreign,
+                    credential_public_key,
+                    Hash([0xe3; 32]),
+                    selector,
+                    request_binding
+                ),
+                Err(crate::node::IngressNodeAttestationError::AuthorityUnavailable)
+            );
+            system_route
+                .authority_target_unavailable
+                .store(true, Ordering::Release);
+            assert_eq!(
+                ingress.attest_ssh_projection_query(
+                    target,
+                    credential_public_key,
+                    Hash([0xe4; 32]),
+                    selector,
+                    request_binding
+                ),
+                Err(crate::node::IngressNodeAttestationError::AuthorityUnavailable)
+            );
+            assert_eq!(ssh_signatures.load(Ordering::Acquire), signatures_before);
+            system_route
+                .authority_target_unavailable
+                .store(false, Ordering::Release);
         }
 
         node.shutdown();
@@ -7912,5 +8421,63 @@ mod tests {
         node.collect_checked().unwrap();
         assert!(system_route.retired.load(Ordering::Acquire));
         assert!(!supervisor.is_running());
+    }
+
+    #[cfg(all(
+        feature = "ssh-ingress",
+        feature = "network",
+        feature = "storage",
+        target_os = "linux"
+    ))]
+    #[test]
+    fn ssh_projection_refuses_attester_not_bound_to_exposed_owner_node_before_signing() {
+        use crate::agent::production_owner::AgentProductionOwner;
+        let node_id = NodeId([0xe5; 32]);
+        let system = owner_projection(
+            owner_descriptor(0x51, AgentProfile::Shared, node_id),
+            0x61,
+            true,
+        );
+        let inventory = Arc::new(OwnerInventoryState {
+            head: std::sync::atomic::AtomicU64::new(1),
+            consistent: AtomicBool::new(true),
+            projections: vec![system.clone()],
+            queries: AtomicUsize::new(0),
+        });
+        let target = owner_target(&system);
+        let (attachment, _) = owner_attachment(&system, 1, Some(target), Some(inventory));
+        let owner = AgentProductionOwner::start(
+            node_id,
+            limits(),
+            attachment,
+            Box::new(OwnerAuthenticator(0)),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let mut node = crate::node::VosNode::new();
+        let signatures = Arc::new(AtomicUsize::new(0));
+        let observed = signatures.clone();
+        node.set_ingress_node_attester(NodeId([0xe6; 32]), move |_| {
+            observed.fetch_add(1, Ordering::AcqRel);
+            Some([1; 64])
+        })
+        .unwrap();
+        node.attach_clean_agent_owner(owner).unwrap();
+        let credential_public_key = ed25519_dalek::SigningKey::from_bytes(&[0xe7; 32])
+            .verifying_key()
+            .to_bytes();
+        assert_eq!(
+            node.ingress_handle().attest_ssh_projection_query(
+                target,
+                credential_public_key,
+                Hash([0xe8; 32]),
+                AuthorityProjectionSelector::Credential,
+                Hash([0xe9; 32])
+            ),
+            Err(crate::node::IngressNodeAttestationError::InvalidNode)
+        );
+        assert_eq!(signatures.load(Ordering::Acquire), 0);
+        node.shutdown();
+        node.collect_checked().unwrap();
     }
 }

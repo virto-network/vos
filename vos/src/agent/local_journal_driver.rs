@@ -591,6 +591,19 @@ impl CatalogBlobResolver for SuppliedCatalogBlobResolver {
     }
 }
 
+/// A reserved projection must either retain its exact result or retain an
+/// acknowledgeable rejection. A completed admission/resource error alone is
+/// not durable custody and must not consume the first Invoke slot.
+pub(crate) fn is_durable_clean_terminal_outcome(
+    outcome: &crate::agent_sdk::RuntimeOutcome,
+) -> bool {
+    match outcome {
+        crate::agent_sdk::RuntimeOutcome::Completed(Ok(_)) => true,
+        crate::agent_sdk::RuntimeOutcome::Completed(Err(error)) => error.is_durable_exact_outcome(),
+        _ => false,
+    }
+}
+
 fn lift_checkpoint_error(
     error: MaterializeError<core::convert::Infallible, core::convert::Infallible>,
 ) -> LocalReplayError {
@@ -828,14 +841,6 @@ pub trait LocalMergeAuthenticator: Send + Sync {
         None
     }
 
-    #[cfg(all(feature = "storage", target_os = "linux"))]
-    fn sign_recovery_expiry_candidate(
-        &self,
-        _candidate: &super::shared_host::VerifiedSharedRecoveryExpiryCandidate,
-    ) -> Option<super::shared_commit::ReplicaCommitSignature> {
-        None
-    }
-
     /// Bind this node's reconstructed physical checkpoint to a verified common
     /// certificate. This is node-local publication authority, not another vote.
     #[cfg(all(feature = "storage", target_os = "linux"))]
@@ -846,13 +851,24 @@ pub trait LocalMergeAuthenticator: Send + Sync {
         None
     }
 
-    /// Sign only a recovery-registration candidate minted by the bootstrap
-    /// lifecycle after its preceding local delivery obligation is durably
-    /// clear. Decoding an arbitrary registration never grants this authority.
+    /// Retention-only signature for an exact unfinished System management
+    /// scope reconstructed by its own live host. No execution authority is
+    /// delegated by this signature, and arbitrary registration bytes cannot
+    /// reach this seam.
     #[cfg(all(feature = "storage", target_os = "linux"))]
-    fn sign_projection_recovery_registration(
+    fn sign_management_recovery_registration(
         &self,
-        _candidate: &super::clean_bootstrap::VerifiedProjectionRecoveryRegistration,
+        _candidate: &super::shared_host::VerifiedSharedManagementRecoveryRegistrationCandidate,
+    ) -> Option<super::shared_commit::ReplicaCommitSignature> {
+        None
+    }
+
+    /// Owner terminal pledge minted only after native durable lifecycle clear,
+    /// with the exact all-ACK scope independently selected by its System host.
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    fn sign_management_recovery_release(
+        &self,
+        _candidate: &super::shared_host::VerifiedSharedManagementRecoveryReleaseCandidate,
     ) -> Option<super::shared_commit::ReplicaCommitSignature> {
         None
     }
@@ -970,28 +986,6 @@ impl LocalMergeAuthenticator for Ed25519NodeMergeAuthenticator {
     }
 
     #[cfg(all(feature = "storage", target_os = "linux"))]
-    fn sign_recovery_expiry_candidate(
-        &self,
-        candidate: &super::shared_host::VerifiedSharedRecoveryExpiryCandidate,
-    ) -> Option<super::shared_commit::ReplicaCommitSignature> {
-        let member = candidate.claim().committee().member_by_node(self.node)?;
-        if member.replica().role != super::ReplicaRole::Voter
-            || member.ed25519_public_key()
-                != &self.keypair.public().try_into_ed25519().ok()?.to_bytes()
-            || member.peer_id() != self.keypair.public().to_peer_id().to_bytes()
-        {
-            return None;
-        }
-        let signature = self
-            .keypair
-            .sign(&candidate.signing_message().0)
-            .ok()?
-            .try_into()
-            .ok()?;
-        super::shared_commit::ReplicaCommitSignature::new(self.node, signature).ok()
-    }
-
-    #[cfg(all(feature = "storage", target_os = "linux"))]
     fn sign_local_snapshot_candidate(
         &self,
         candidate: &super::shared_host::VerifiedSharedAgentLocalSnapshotCandidate,
@@ -1018,12 +1012,41 @@ impl LocalMergeAuthenticator for Ed25519NodeMergeAuthenticator {
     }
 
     #[cfg(all(feature = "storage", target_os = "linux"))]
-    fn sign_projection_recovery_registration(
+    fn sign_management_recovery_registration(
         &self,
-        candidate: &super::clean_bootstrap::VerifiedProjectionRecoveryRegistration,
+        candidate: &super::shared_host::VerifiedSharedManagementRecoveryRegistrationCandidate,
     ) -> Option<super::shared_commit::ReplicaCommitSignature> {
         let member = candidate.committee().member_by_node(self.node)?;
         if candidate.owner() != self.node
+            || candidate.request().committee() != candidate.committee().id()
+            || candidate.generation().space() != candidate.committee().space()
+            || candidate.generation().agent() != candidate.committee().agent()
+            || member.replica().role != super::ReplicaRole::Voter
+            || member.ed25519_public_key()
+                != &self.keypair.public().try_into_ed25519().ok()?.to_bytes()
+            || member.peer_id() != self.keypair.public().to_peer_id().to_bytes()
+        {
+            return None;
+        }
+        let signature = self
+            .keypair
+            .sign(&candidate.signing_message().0)
+            .ok()?
+            .try_into()
+            .ok()?;
+        super::shared_commit::ReplicaCommitSignature::new(self.node, signature).ok()
+    }
+
+    #[cfg(all(feature = "storage", target_os = "linux"))]
+    fn sign_management_recovery_release(
+        &self,
+        candidate: &super::shared_host::VerifiedSharedManagementRecoveryReleaseCandidate,
+    ) -> Option<super::shared_commit::ReplicaCommitSignature> {
+        let member = candidate.committee().member_by_node(self.node)?;
+        if candidate.owner() != self.node
+            || candidate.request().committee() != candidate.committee().id()
+            || candidate.generation().space() != candidate.committee().space()
+            || candidate.generation().agent() != candidate.committee().agent()
             || member.replica().role != super::ReplicaRole::Voter
             || member.ed25519_public_key()
                 != &self.keypair.public().try_into_ed25519().ok()?.to_bytes()
@@ -1356,6 +1379,37 @@ pub(crate) struct StandardLocalReplayExecutor<R> {
     staged_transition_proofs: Vec<StagedTransitionProof>,
     terminal_preflight: std::sync::Mutex<Option<TerminalPreflight>>,
     runtime_preparation: RuntimePreparationCache,
+}
+
+/// Runtime-independent purity/response validation. Even a custom admitted
+/// runtime must preserve every opaque state component, not merely actor rows.
+#[cfg(feature = "experimental-state-blocks")]
+fn system_observation_transition_matches(
+    work: &crate::agent_sdk::InvocationWork,
+    before: &RuntimeState,
+    returned: &crate::agent_sdk::RuntimeTransition,
+) -> bool {
+    if !returned.validate()
+        || returned.state.control != before.control
+        || returned.state.linear != before.linear
+        || returned.state.merge != before.merge
+        || returned.state.local != before.local
+    {
+        return false;
+    }
+    match &returned.outcome {
+        crate::agent_sdk::RuntimeOutcome::Completed(Ok(reply)) => {
+            reply.invocation == work.invocation
+                && reply.actor == work.actor
+                && reply.incarnation == work.incarnation
+                && reply.deployment == work.deployment
+                && reply.mode == crate::agent_sdk::MethodMode::Query
+                && reply.lane.is_none()
+                && reply.gas_remaining <= work.gas
+        }
+        crate::agent_sdk::RuntimeOutcome::Completed(Err(_)) => true,
+        _ => false,
+    }
 }
 
 /// One bounded immutable preparation per executor; no results or authorization
@@ -1822,6 +1876,70 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             || returned.state.local != before.local
             || !super::driver::sdk_management_reply_matches(&descriptor, request, &returned.outcome)
         {
+            return Err(LocalReplayExecutorError::InvalidState);
+        }
+        Ok(returned.outcome)
+    }
+
+    /// Execute a scoped System Authority observation against the current
+    /// authenticated image. This never prepares a replay row, takes result
+    /// custody, consumes authorization or publishes a successor. The caller
+    /// supplies the fresh ReadIndex/apply-through/lifecycle boundary.
+    #[cfg(feature = "experimental-state-blocks")]
+    pub(crate) fn observe_system_authority(
+        &self,
+        binding: &RuntimeBinding,
+        before: &RuntimeState,
+        invocation: &crate::agent_sdk::InvocationWork,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, LocalReplayExecutorError> {
+        if self.external.is_some()
+            || self.profile != AgentProfile::Shared
+            || !invocation.validate()
+            || invocation.mode != crate::agent_sdk::MethodMode::Query
+            || invocation.recovery_only
+            || invocation.gas > super::execution::MAX_EXECUTION_GAS
+        {
+            return Err(LocalReplayExecutorError::InvalidRequest);
+        }
+        let runtime = self.clean_runtime_package(binding)?;
+        let descriptor = Self::current_clean_descriptor(
+            self.clean_genesis_descriptor
+                .as_ref()
+                .ok_or(LocalReplayExecutorError::InvalidState)?,
+            binding,
+            &runtime,
+        )?;
+        if !runtime.manifest().contract.supports_system_observation()
+            || invocation.space != descriptor.identity.space
+            || invocation.agent != descriptor.identity.agent
+            || invocation.runtime_deployment != descriptor.identity.runtime_deployment
+            || invocation.actor != descriptor.authority.issuer.actor
+            || invocation.deployment != descriptor.authority.issuer.deployment
+            || invocation.program != descriptor.authority.issuer.program
+        {
+            return Err(LocalReplayExecutorError::InvalidRequest);
+        }
+        let observed_slot = self.current_logical_slot()?;
+        let work = crate::agent_sdk::RuntimeWork::Observe {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+            state: super::replay::sdk_runtime_state(before),
+            invocation: Box::new(invocation.clone()),
+            authorization: Box::new(crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+                crate::agent_sdk::PublicPreflight::for_work(invocation, observed_slot),
+            )),
+            observed_slot,
+        };
+        let encoded = work
+            .encode()
+            .map_err(|_| LocalReplayExecutorError::InvalidRequest)?;
+        // Never substitute native Authority/Standard logic for this admitted
+        // runtime, including in tests. Qualify the real physical boundary.
+        let returned: crate::agent_sdk::RuntimeTransition = self.execute_agent_wire(
+            runtime.program_bytes(),
+            self.management_gas.saturating_add(invocation.gas),
+            &encoded,
+        )?;
+        if !system_observation_transition_matches(invocation, before, &returned) {
             return Err(LocalReplayExecutorError::InvalidState);
         }
         Ok(returned.outcome)
@@ -2568,7 +2686,21 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         binding: &RuntimeBinding,
     ) -> Result<bool, LocalReplayExecutorError> {
         Ok(self
-            .clean_invocation_terminal_preflight(operation, state, binding, true)?
+            .clean_invocation_terminal_preflight(operation, state, binding, true, false, false)?
+            .is_some())
+    }
+
+    /// The same single-use computational preview, restricted to outcomes
+    /// which an exact projection ACK can retire. This grants no admission or
+    /// result authority and never changes the captured observation slot.
+    pub(crate) fn clean_projection_invocation_is_durable_terminal(
+        &self,
+        operation: &ReplayOperation,
+        state: &RuntimeState,
+        binding: &RuntimeBinding,
+    ) -> Result<bool, LocalReplayExecutorError> {
+        Ok(self
+            .clean_invocation_terminal_preflight(operation, state, binding, true, true, false)?
             .is_some())
     }
 
@@ -2578,7 +2710,37 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         state: &RuntimeState,
         binding: &RuntimeBinding,
     ) -> Result<Option<crate::agent_sdk::RuntimeOutcome>, LocalReplayExecutorError> {
-        self.clean_invocation_terminal_preflight(operation, state, binding, false)
+        self.clean_invocation_terminal_preflight(operation, state, binding, false, false, false)
+    }
+
+    /// Native retained System management can only finish a completed reply.
+    /// A refused preview must not become its immutable first custody capsule.
+    pub(crate) fn clean_management_invocation_is_successful_terminal(
+        &self,
+        operation: &ReplayOperation,
+        state: &RuntimeState,
+        binding: &RuntimeBinding,
+    ) -> Result<bool, LocalReplayExecutorError> {
+        Ok(self
+            .clean_invocation_terminal_preflight(operation, state, binding, true, false, true)?
+            .is_some())
+    }
+
+    /// Check new custody before its immutable envelope is published. This
+    /// computes no publication/authentication capability and retains no preview.
+    pub(crate) fn new_management_invocation_is_successful_terminal(
+        &self,
+        operation: &ReplayOperation,
+        state: &RuntimeState,
+        binding: &RuntimeBinding,
+    ) -> Result<bool, LocalReplayExecutorError> {
+        self.terminal_preflight
+            .lock()
+            .map_err(|_| LocalReplayExecutorError::InvalidState)?
+            .take();
+        Ok(self
+            .clean_invocation_terminal_preflight(operation, state, binding, false, false, true)?
+            .is_some())
     }
 
     fn clean_invocation_terminal_preflight(
@@ -2587,6 +2749,8 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         state: &RuntimeState,
         binding: &RuntimeBinding,
         retain: bool,
+        durable_only: bool,
+        successful_only: bool,
     ) -> Result<Option<crate::agent_sdk::RuntimeOutcome>, LocalReplayExecutorError> {
         if retain {
             self.terminal_preflight
@@ -2639,12 +2803,45 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
                 &encoded,
             )?
         };
-        if retain
-            && matches!(
-                returned.outcome,
-                crate::agent_sdk::RuntimeOutcome::Completed(_)
-            )
-        {
+        let terminal = matches!(
+            returned.outcome,
+            crate::agent_sdk::RuntimeOutcome::Completed(_)
+        ) && (!durable_only || is_durable_clean_terminal_outcome(&returned.outcome))
+            && (!successful_only
+                || matches!(
+                    returned.outcome,
+                    crate::agent_sdk::RuntimeOutcome::Completed(Ok(_))
+                ));
+        if (durable_only || successful_only) && !terminal {
+            let (outcome_kind, invocation_error) = match &returned.outcome {
+                crate::agent_sdk::RuntimeOutcome::Completed(Ok(_)) => ("completed_ok", None),
+                crate::agent_sdk::RuntimeOutcome::Completed(Err(error)) => {
+                    ("completed_error", Some(*error))
+                }
+                crate::agent_sdk::RuntimeOutcome::Yielded(_) => ("yielded", None),
+                crate::agent_sdk::RuntimeOutcome::Acknowledged(_) => ("acknowledged", None),
+                crate::agent_sdk::RuntimeOutcome::Management(_) => ("management", None),
+            };
+            let accepted_slot = match authorization {
+                crate::agent_sdk::InvocationAuthorization::PublicPreflight(preflight) => {
+                    Some(preflight.observed_slot)
+                }
+                crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(_) => None,
+            };
+            tracing::debug!(
+                phase = "image_durable_preview_refused",
+                invocation = ?work.invocation,
+                work = ?work.commitment(),
+                authorization = ?authorization.commitment(),
+                ?accepted_slot,
+                observed_slot = *observed_slot,
+                outcome_kind,
+                ?invocation_error,
+                successful_only,
+                "Retained invocation preview refused"
+            );
+        }
+        if retain && terminal {
             *self
                 .terminal_preflight
                 .lock()
@@ -2655,10 +2852,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
                 transition: returned.clone(),
             });
         }
-        Ok(match returned.outcome {
-            outcome @ crate::agent_sdk::RuntimeOutcome::Completed(_) => Some(outcome),
-            _ => None,
-        })
+        Ok(terminal.then_some(returned.outcome))
     }
 
     fn validate_clean_invocation_envelope(
@@ -2829,8 +3023,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
                 self.pending_clean_invocation_results.remove(&evicted);
             }
         }
-        self.pending_clean_invocation_results
-            .insert(input, result);
+        self.pending_clean_invocation_results.insert(input, result);
         if let Some(cached) = self.recent_clean_ordered_results.get_mut(&input) {
             *cached = recent;
             return;
@@ -7672,6 +7865,466 @@ where
 mod tests {
     use super::*;
 
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn system_observation_transition_requires_all_opaque_state_and_exact_terminal_reply() {
+        use crate::agent_sdk as sdk;
+        let before = RuntimeState {
+            control: vec![1, 2],
+            linear: vec![3, 4],
+            merge: vec![5, 6],
+            local: vec![7, 8],
+        };
+        let work = sdk::InvocationWork {
+            space: sdk::SpaceId([1; 32]),
+            agent: sdk::AgentId([2; 32]),
+            runtime_deployment: sdk::DeploymentId([3; 32]),
+            invocation: sdk::InvocationId([4; 32]),
+            actor: sdk::ActorId([5; 32]),
+            incarnation: sdk::Hash([6; 32]),
+            deployment: sdk::DeploymentId([7; 32]),
+            program: sdk::ProgramId([8; 32]),
+            mode: sdk::MethodMode::Query,
+            origin: sdk::InvocationOrigin::anonymous(),
+            roles: sdk::InvocationRoleClaims::none(),
+            message: Vec::new(),
+            installation_data: None,
+            availability: Vec::new(),
+            gas: 100,
+            recovery_only: false,
+        };
+        let exact = sdk::RuntimeTransition {
+            state: super::super::replay::sdk_runtime_state(&before),
+            outcome: sdk::RuntimeOutcome::Completed(Ok(sdk::InvocationReply {
+                invocation: work.invocation,
+                actor: work.actor,
+                incarnation: work.incarnation,
+                deployment: work.deployment,
+                mode: work.mode,
+                lane: None,
+                status: sdk::InvocationStatus::Done,
+                reply: vec![9],
+                gas_remaining: 99,
+                observation: sdk::InvocationObservation::default(),
+            })),
+        };
+        assert!(system_observation_transition_matches(
+            &work, &before, &exact
+        ));
+        for part in 0..4 {
+            let mut changed = exact.clone();
+            match part {
+                0 => changed.state.control.push(9),
+                1 => changed.state.linear.push(9),
+                2 => changed.state.merge.push(9),
+                3 => changed.state.local.push(9),
+                _ => unreachable!(),
+            }
+            assert!(!system_observation_transition_matches(
+                &work, &before, &changed
+            ));
+        }
+        for field in 0..7 {
+            let mut changed = exact.clone();
+            let sdk::RuntimeOutcome::Completed(Ok(reply)) = &mut changed.outcome else {
+                unreachable!()
+            };
+            match field {
+                0 => reply.invocation = sdk::InvocationId([10; 32]),
+                1 => reply.actor = sdk::ActorId([10; 32]),
+                2 => reply.incarnation = sdk::Hash([10; 32]),
+                3 => reply.deployment = sdk::DeploymentId([10; 32]),
+                4 => reply.mode = sdk::MethodMode::Linear,
+                5 => reply.lane = Some(sdk::StateLane::Linear),
+                6 => reply.gas_remaining = 101,
+                _ => unreachable!(),
+            }
+            assert!(!system_observation_transition_matches(
+                &work, &before, &changed
+            ));
+        }
+        for outcome in [
+            sdk::RuntimeOutcome::Management(Err(sdk::ManagementError::NotFound)),
+            sdk::RuntimeOutcome::Acknowledged(Err(sdk::InvocationError::NotFound)),
+        ] {
+            let mut changed = exact.clone();
+            changed.outcome = outcome;
+            assert!(!system_observation_transition_matches(
+                &work, &before, &changed
+            ));
+        }
+        let mut refused = exact;
+        refused.outcome =
+            sdk::RuntimeOutcome::Completed(Err(sdk::InvocationError::InvalidAuthorization));
+        assert!(system_observation_transition_matches(
+            &work, &before, &refused
+        ));
+        refused.state.control.push(9);
+        assert!(!system_observation_transition_matches(
+            &work, &before, &refused
+        ));
+    }
+
+    #[cfg(all(feature = "pvm", feature = "experimental-state-blocks"))]
+    #[test]
+    fn physical_custom_system_observation_accepts_only_unchanged_opaque_terminal_output() {
+        use super::super::package_admission::{
+            AdmittedRuntimePackage, ScriptedRuntimeCase, admit_runtime_package,
+            admitted_scripted_runtime_for_test,
+        };
+        use crate::actors::codec::Encode as _;
+        use crate::actors::value::{Msg, TAG_DYNAMIC};
+        use crate::agent_sdk as sdk;
+        use sdk::package::{PackageEnvelope, PackageManifest};
+
+        fn observation_work(descriptor: &sdk::AgentDescriptor, case: u8) -> sdk::InvocationWork {
+            let mut message = vec![TAG_DYNAMIC];
+            message.extend_from_slice(&Msg::new("genesis_signing_committee").encode());
+            sdk::InvocationWork {
+                space: descriptor.identity.space,
+                agent: descriptor.identity.agent,
+                runtime_deployment: descriptor.identity.runtime_deployment,
+                invocation: sdk::InvocationId([0xa0 + case; 32]),
+                actor: descriptor.authority.issuer.actor,
+                incarnation: sdk::Hash([0x71; 32]),
+                deployment: descriptor.authority.issuer.deployment,
+                program: descriptor.authority.issuer.program,
+                mode: sdk::MethodMode::Query,
+                origin: sdk::InvocationOrigin::anonymous(),
+                roles: sdk::InvocationRoleClaims::none(),
+                message,
+                installation_data: None,
+                availability: Vec::new(),
+                gas: 1_000,
+                recovery_only: false,
+            }
+        }
+
+        fn assert_no_observation_custody(
+            executor: &StandardLocalReplayExecutor<SuppliedCatalogBlobResolver>,
+        ) {
+            assert!(executor.last_management_result.is_none());
+            assert!(executor.pending_clean_invocation_results.is_empty());
+            assert!(executor.recent_clean_ordered_results.is_empty());
+            assert!(executor.recent_clean_ordered_order.is_empty());
+            assert!(executor.positioned_clean_results.is_empty());
+            assert!(executor.positioned_clean_order.is_empty());
+            assert!(executor.recent_clean_management_results.is_empty());
+            assert!(executor.recent_clean_management_order.is_empty());
+            assert!(executor.pending_transition_proof.is_none());
+            assert!(executor.staged_transition_proofs.is_empty());
+            assert!(executor.terminal_preflight.lock().unwrap().is_none());
+        }
+
+        let node = NodeId([0x70; 32]);
+        let authority_key = SigningKey::from_bytes(&[0x72; 32]);
+        let placeholder = admitted_scripted_runtime_for_test(
+            "observation-script-shape",
+            0x73,
+            vec![ScriptedRuntimeCase {
+                input: vec![0],
+                output: vec![0],
+                copies: Vec::new(),
+            }],
+        );
+        let placeholder_descriptor = clean_test_descriptor(&placeholder, node, &authority_key);
+        let before = RuntimeState {
+            control: b"alien-control-format\0not-standard-state".to_vec(),
+            linear: b"alien-linear-index".to_vec(),
+            merge: b"alien-merge-frontier".to_vec(),
+            local: b"alien-local-layout".to_vec(),
+        };
+        assert!(decode_standard_runtime_state(&before).is_err());
+        let mut cases = Vec::new();
+        let mut expected = Vec::new();
+        for case in 0..8 {
+            let work = observation_work(&placeholder_descriptor, case);
+            let mut transition = sdk::RuntimeTransition {
+                state: super::super::replay::sdk_runtime_state(&before),
+                outcome: sdk::RuntimeOutcome::Completed(Ok(sdk::InvocationReply {
+                    invocation: work.invocation,
+                    actor: work.actor,
+                    incarnation: work.incarnation,
+                    deployment: work.deployment,
+                    mode: work.mode,
+                    lane: None,
+                    status: sdk::InvocationStatus::Done,
+                    reply: b"opaque observation value".to_vec(),
+                    gas_remaining: 999,
+                    observation: sdk::InvocationObservation::default(),
+                })),
+            };
+            match case {
+                0 => {}
+                1 => transition.state.control.push(0xff),
+                2 => transition.state.linear.push(0xff),
+                3 => transition.state.merge.push(0xff),
+                4 => transition.state.local.push(0xff),
+                5 => {
+                    transition.outcome =
+                        sdk::RuntimeOutcome::Acknowledged(Err(sdk::InvocationError::NotFound));
+                }
+                6 => {
+                    transition.outcome = sdk::RuntimeOutcome::Yielded(sdk::YieldedInvocation {
+                        invocation: work.invocation,
+                        actor: work.actor,
+                        incarnation: work.incarnation,
+                        deployment: work.deployment,
+                        program: work.program,
+                        mode: work.mode,
+                        continuation: sdk::BlobRef::of_bytes(b"alien-continuation"),
+                        ready_sequence: 1,
+                        installation_data: None,
+                        required: Vec::new(),
+                        reason: sdk::YieldReason::Cooperative,
+                    });
+                }
+                7 => {
+                    transition.outcome = sdk::RuntimeOutcome::Completed(Err(
+                        sdk::InvocationError::InvalidAuthorization,
+                    ));
+                }
+                _ => unreachable!(),
+            }
+            let input = sdk::RuntimeWork::Observe {
+                context: sdk::RuntimeExecutionContext::Direct,
+                state: super::super::replay::sdk_runtime_state(&before),
+                authorization: Box::new(sdk::InvocationAuthorization::PublicPreflight(
+                    sdk::PublicPreflight::for_work(&work, 20),
+                )),
+                invocation: Box::new(work),
+                observed_slot: 20,
+            }
+            .encode()
+            .unwrap();
+            cases.push(ScriptedRuntimeCase {
+                input,
+                output: transition.encode().unwrap(),
+                // The reply has no runtime identity fields. Equal-length
+                // cases are selected only by their fixed invocation byte;
+                // the final signed deployment is still host-bound below.
+                copies: Vec::new(),
+            });
+            expected.push(transition.outcome);
+        }
+        let canonical = admitted_scripted_runtime_for_test("opaque-observation", 0x74, cases);
+        let mut envelope = PackageEnvelope::decode(canonical.exact_bytes()).unwrap();
+        let PackageManifest::AgentRuntime(manifest) = &mut envelope.manifest else {
+            unreachable!()
+        };
+        manifest.contract = sdk::contract::RuntimePackageContract::system_observation_image();
+        let signing_bytes = envelope.signing_bytes().unwrap();
+        envelope.manifest.signing_mut().signature = SigningKey::from_bytes(&[0x74; 32])
+            .sign(&signing_bytes)
+            .to_bytes();
+        let runtime = admit_runtime_package(&envelope.encode().unwrap()).unwrap();
+        assert_eq!(runtime.program(), canonical.program());
+        assert_ne!(runtime.deployment(), canonical.deployment());
+
+        let trust: Arc<dyn AgentTrustProvider> = Arc::new(CleanClockTrust {
+            slot: Arc::new(AtomicU64::new(20)),
+        });
+        assert!(!trust.use_native_clean_runtime_for_test());
+        let merge: Arc<dyn LocalMergeAuthenticator> = Arc::new(StaticMerge(node));
+        let make_executor = |runtime: &AdmittedRuntimePackage, profile: AgentProfile| {
+            let mut descriptor = clean_test_descriptor(runtime, node, &authority_key);
+            descriptor.identity.profile = match profile {
+                AgentProfile::Local => sdk::AgentProfile::Local,
+                AgentProfile::Shared => sdk::AgentProfile::Shared,
+                AgentProfile::Private => unreachable!(),
+            };
+            descriptor.validate().unwrap();
+            let binding = RuntimeBinding {
+                space: SpaceId(descriptor.identity.space.0),
+                agent: super::super::AgentId(descriptor.identity.agent.0),
+                deployment: DeploymentId(runtime.deployment().0),
+                program: ProgramId(runtime.program().0),
+                producer: ProducerId(runtime.producer().0),
+                package: BlobRef::of_bytes(runtime.exact_bytes()),
+                runtime_abi: super::super::RUNTIME_ABI_ID,
+                execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
+            };
+            let resolver = SuppliedCatalogBlobResolver::from_catalog(&[RuntimeBlob {
+                reference: binding.package.clone(),
+                bytes: runtime.exact_bytes().to_vec(),
+            }])
+            .unwrap();
+            let mut executor = match profile {
+                AgentProfile::Local => StandardLocalReplayExecutor::new(
+                    resolver,
+                    Arc::clone(&trust),
+                    Arc::clone(&merge),
+                ),
+                AgentProfile::Shared => StandardLocalReplayExecutor::new_shared(
+                    resolver,
+                    Arc::clone(&trust),
+                    Arc::clone(&merge),
+                    Vec::new(),
+                ),
+                AgentProfile::Private => unreachable!(),
+            };
+            executor.clean_genesis_descriptor = Some(descriptor.clone());
+            (executor, binding, descriptor)
+        };
+
+        for (package, profile) in [
+            (&canonical, AgentProfile::Shared),
+            (&runtime, AgentProfile::Local),
+        ] {
+            let (executor, binding, descriptor) = make_executor(package, profile);
+            assert!(matches!(
+                executor.observe_system_authority(
+                    &binding,
+                    &before,
+                    &observation_work(&descriptor, 0),
+                ),
+                Err(LocalReplayExecutorError::InvalidRequest)
+            ));
+            assert!(executor.runtime_preparation.entry.lock().unwrap().is_none());
+            assert_no_observation_custody(&executor);
+        }
+
+        let (mut closed, binding, descriptor) = make_executor(&runtime, AgentProfile::Shared);
+        let external_runtime = super::super::package_admission::tests::admitted_state_fixture(
+            runtime.program_bytes().to_vec(),
+        );
+        let mut external_descriptor = descriptor.clone();
+        external_descriptor.identity.profile = sdk::AgentProfile::Local;
+        external_descriptor.identity.runtime_deployment = external_runtime.deployment();
+        external_descriptor.identity.runtime_program = external_runtime.program();
+        external_descriptor.identity.runtime_producer =
+            external_runtime.manifest().signing.producer;
+        external_descriptor.runtime_package = external_runtime.package_ref().clone();
+        external_descriptor.runtime_contract = external_runtime.manifest().contract;
+        external_descriptor.capabilities = external_runtime.manifest().capabilities;
+        closed.external = Some(
+            super::super::external_local_executor::ExternalLocalReplayExecutor::new(
+                external_runtime,
+                external_descriptor,
+                SuppliedCatalogBlobResolver::from_catalog(&[]).unwrap(),
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            closed.observe_system_authority(&binding, &before, &observation_work(&descriptor, 0),),
+            Err(LocalReplayExecutorError::InvalidRequest)
+        ));
+        assert!(closed.runtime_preparation.entry.lock().unwrap().is_none());
+        assert_no_observation_custody(&closed);
+
+        let (executor, binding, descriptor) = make_executor(&runtime, AgentProfile::Shared);
+        for field in 0..6 {
+            let mut wrong = observation_work(&descriptor, 0);
+            match field {
+                0 => wrong.space = sdk::SpaceId([0x80; 32]),
+                1 => wrong.agent = sdk::AgentId([0x80; 32]),
+                2 => wrong.runtime_deployment = sdk::DeploymentId([0x80; 32]),
+                3 => wrong.actor = sdk::ActorId([0x80; 32]),
+                4 => wrong.deployment = sdk::DeploymentId([0x80; 32]),
+                5 => wrong.program = sdk::ProgramId([0x80; 32]),
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                executor.observe_system_authority(&binding, &before, &wrong),
+                Err(LocalReplayExecutorError::InvalidRequest)
+            ));
+            assert!(executor.runtime_preparation.entry.lock().unwrap().is_none());
+        }
+
+        // This executor has no journal writer. Its only mutable cache is
+        // prepared code; observations may not populate any result/candidate
+        // custody or change the input image/descriptor/catalog snapshot.
+        let immutable = (
+            before.clone(),
+            binding.clone(),
+            descriptor.clone(),
+            executor.resolver.blobs.clone(),
+        );
+        for (case, outcome) in expected.into_iter().enumerate() {
+            let work = observation_work(&descriptor, case as u8);
+            let work_before = work.clone();
+            let observed = executor.observe_system_authority(&binding, &before, &work);
+            if case == 0 || case == 7 {
+                assert_eq!(observed.unwrap(), outcome);
+            } else {
+                assert!(matches!(
+                    observed,
+                    Err(LocalReplayExecutorError::InvalidState)
+                ));
+            }
+            assert!(executor.runtime_preparation.entry.lock().unwrap().is_some());
+            assert_no_observation_custody(&executor);
+            assert_eq!(work, work_before);
+            assert_eq!(
+                (
+                    before.clone(),
+                    binding.clone(),
+                    executor.clean_genesis_descriptor.clone().unwrap(),
+                    executor.resolver.blobs.clone(),
+                ),
+                immutable,
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_projection_terminal_predicate_requires_exact_durable_outcomes() {
+        use crate::agent_sdk::{InvocationError as E, RuntimeOutcome};
+        for (error, durable) in [
+            (E::NotCreated, false),
+            (E::NotFound, true),
+            (E::StaleIncarnation, true),
+            (E::Suspended, true),
+            (E::StaleDeployment, true),
+            (E::WrongProgram, true),
+            (E::UnsupportedMethod, true),
+            (E::UnsupportedResultStorage, false),
+            (E::MissingState, false),
+            (E::InvalidAvailability, false),
+            (E::InvalidInput, true),
+            (E::InvalidActorOutput, true),
+            (E::DivergentInvocation, false),
+            (E::ResultCapacity, false),
+            (E::InvalidAuthorization, false),
+            (E::AuthorityExpired, false),
+            (E::AuthoritySlotRegressed, false),
+            (E::UnsupportedHostCall(0), true),
+            (E::UnsupportedHostCall(u64::MAX), true),
+            (E::StaleContinuation, false),
+            (E::NotReady, false),
+            (E::ExpiredBeforeExecution, true),
+        ] {
+            assert_eq!(
+                is_durable_clean_terminal_outcome(&RuntimeOutcome::Completed(Err(error))),
+                durable,
+                "reserved projection classification for {error:?}"
+            );
+            assert!(!is_durable_clean_terminal_outcome(
+                &RuntimeOutcome::Acknowledged(Err(error))
+            ));
+        }
+        let ReplayOperation::CleanInvoke { work, .. } = clean_scan_operation(0xb5) else {
+            unreachable!()
+        };
+        assert!(is_durable_clean_terminal_outcome(
+            &RuntimeOutcome::Completed(Ok(crate::agent_sdk::InvocationReply {
+                invocation: work.invocation,
+                actor: work.actor,
+                incarnation: work.incarnation,
+                deployment: work.deployment,
+                mode: work.mode,
+                lane: work.mode.write_lane(),
+                status: crate::agent_sdk::InvocationStatus::Done,
+                reply: Vec::new(),
+                gas_remaining: work.gas,
+                observation: crate::agent_sdk::InvocationObservation::default(),
+            }))
+        ));
+        assert!(!is_durable_clean_terminal_outcome(
+            &RuntimeOutcome::Management(Err(crate::agent_sdk::ManagementError::NotFound))
+        ));
+    }
+
     #[test]
     fn terminal_preflight_reuse_is_exact_and_single_use() {
         let transition = crate::agent_sdk::RuntimeTransition {
@@ -10164,6 +10817,258 @@ mod tests {
             Err(LocalReplayExecutorError::RuntimeStateTooLarge)
         ));
         assert!(executor.terminal_preflight.get_mut().unwrap().is_none());
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn reserved_projection_physical_preview_refuses_nondurable_errors_without_cached_transition() {
+        use super::super::package_admission::{
+            ScriptedRuntimeCase, admitted_scripted_runtime_for_test,
+        };
+        use crate::agent_sdk::{InvocationError, RuntimeOutcome, RuntimeTransition};
+        let (mut input, before, _) = scripted_attested_transition(0xb6);
+        let mut operations = Vec::new();
+        let mut cases = Vec::new();
+        for (index, error) in [
+            InvocationError::AuthoritySlotRegressed,
+            InvocationError::NotFound,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut operation = input.operation.clone();
+            let ReplayOperation::CleanInvoke {
+                context,
+                work,
+                authorization,
+                observed_slot,
+            } = &mut operation
+            else {
+                unreachable!()
+            };
+            *context = crate::agent_sdk::RuntimeExecutionContext::Direct;
+            work.mode = crate::agent_sdk::MethodMode::Query;
+            work.message = vec![0xb6; index + 1];
+            *authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+                crate::agent_sdk::PublicPreflight::for_work(work, *observed_slot),
+            );
+            let canonical = super::super::replay::canonical_clean_runtime_work(
+                &ReplayInput {
+                    runtime: input.runtime.clone(),
+                    operation: operation.clone(),
+                },
+                &before,
+            )
+            .unwrap();
+            cases.push(ScriptedRuntimeCase {
+                input: canonical.encode().unwrap(),
+                output: RuntimeTransition {
+                    state: crate::agent_sdk::RuntimeState {
+                        control: before.control.clone(),
+                        linear: before.linear.clone(),
+                        merge: before.merge.clone(),
+                        local: before.local.clone(),
+                    },
+                    outcome: RuntimeOutcome::Completed(Err(error)),
+                }
+                .encode()
+                .unwrap(),
+                copies: Vec::new(),
+            });
+            operations.push((operation, error));
+        }
+        let runtime =
+            admitted_scripted_runtime_for_test("reserved-preview-durability", 0xb7, cases);
+        input.runtime.deployment = DeploymentId(runtime.deployment().0);
+        input.runtime.program = ProgramId(runtime.program().0);
+        input.runtime.producer = ProducerId(runtime.producer().0);
+        input.runtime.package = BlobRef::of_bytes(runtime.exact_bytes());
+        let resolver = SuppliedCatalogBlobResolver::from_catalog(&[RuntimeBlob {
+            reference: input.runtime.package.clone(),
+            bytes: runtime.exact_bytes().to_vec(),
+        }])
+        .unwrap();
+        let trust: Arc<dyn AgentTrustProvider> = Arc::new(CleanClockTrust {
+            slot: Arc::new(AtomicU64::new(20)),
+        });
+        assert!(
+            !trust.use_native_clean_runtime_for_test(),
+            "this regression must execute the admitted scripted PVM, not the Standard native oracle"
+        );
+        let merge: Arc<dyn LocalMergeAuthenticator> = Arc::new(StaticMerge(NodeId([0xb8; 32])));
+        let mut executor = StandardLocalReplayExecutor::new(resolver, trust, merge);
+        for (operation, error) in operations {
+            let immutable = (operation.clone(), before.clone(), input.runtime.clone());
+            assert!(
+                executor
+                    .clean_invocation_is_terminal(&operation, &before, &input.runtime)
+                    .unwrap()
+            );
+            assert!(
+                executor.terminal_preflight.get_mut().unwrap().is_some(),
+                "ordinary terminal preview retains its existing completed-error behavior"
+            );
+            let durable = executor
+                .clean_projection_invocation_is_durable_terminal(
+                    &operation,
+                    &before,
+                    &input.runtime,
+                )
+                .unwrap();
+            assert_eq!(durable, error.is_durable_exact_outcome());
+            let cached = executor.terminal_preflight.get_mut().unwrap();
+            assert_eq!(
+                cached.is_some(),
+                durable,
+                "a refused projection preview must clear even an earlier ordinary preflight"
+            );
+            if let Some(cached) = cached {
+                assert_eq!(
+                    cached.transition.outcome,
+                    RuntimeOutcome::Completed(Err(error))
+                );
+            }
+            assert_eq!(
+                (operation, before.clone(), input.runtime.clone()),
+                immutable,
+                "preview cannot refresh work, authorization or the captured slot"
+            );
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn management_clock_previews_refuse_errors_without_custody_or_cached_transition() {
+        use super::super::package_admission::{
+            ScriptedRuntimeCase, admitted_scripted_runtime_for_test,
+        };
+        use crate::agent_sdk::{InvocationError, RuntimeOutcome, RuntimeTransition};
+        let (mut input, before, _) = scripted_attested_transition(0xbb);
+        let mut operations = Vec::new();
+        let mut cases = Vec::new();
+        for (index, error) in [
+            Some(InvocationError::AuthoritySlotRegressed),
+            Some(InvocationError::NotFound),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut operation = input.operation.clone();
+            let ReplayOperation::CleanInvoke {
+                context,
+                work,
+                authorization,
+                observed_slot,
+            } = &mut operation
+            else {
+                unreachable!()
+            };
+            *context = crate::agent_sdk::RuntimeExecutionContext::Direct;
+            work.message = vec![0xbb; index + 1];
+            *authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+                crate::agent_sdk::PublicPreflight::for_work(work, *observed_slot),
+            );
+            let outcome = match error {
+                Some(error) => RuntimeOutcome::Completed(Err(error)),
+                None => RuntimeOutcome::Completed(Ok(crate::agent_sdk::InvocationReply {
+                    invocation: work.invocation,
+                    actor: work.actor,
+                    incarnation: work.incarnation,
+                    deployment: work.deployment,
+                    mode: work.mode,
+                    lane: work.mode.write_lane(),
+                    status: crate::agent_sdk::InvocationStatus::Done,
+                    reply: Vec::new(),
+                    gas_remaining: work.gas,
+                    observation: crate::agent_sdk::InvocationObservation::default(),
+                })),
+            };
+            let canonical = super::super::replay::canonical_clean_runtime_work(
+                &ReplayInput {
+                    runtime: input.runtime.clone(),
+                    operation: operation.clone(),
+                },
+                &before,
+            )
+            .unwrap();
+            cases.push(ScriptedRuntimeCase {
+                input: canonical.encode().unwrap(),
+                output: RuntimeTransition {
+                    state: crate::agent_sdk::RuntimeState {
+                        control: before.control.clone(),
+                        linear: before.linear.clone(),
+                        merge: before.merge.clone(),
+                        local: before.local.clone(),
+                    },
+                    outcome: outcome.clone(),
+                }
+                .encode()
+                .unwrap(),
+                copies: Vec::new(),
+            });
+            operations.push((operation, outcome, error.is_none()));
+        }
+        let runtime = admitted_scripted_runtime_for_test("management-clock-preview", 0xbc, cases);
+        input.runtime.deployment = DeploymentId(runtime.deployment().0);
+        input.runtime.program = ProgramId(runtime.program().0);
+        input.runtime.producer = ProducerId(runtime.producer().0);
+        input.runtime.package = BlobRef::of_bytes(runtime.exact_bytes());
+        let resolver = SuppliedCatalogBlobResolver::from_catalog(&[RuntimeBlob {
+            reference: input.runtime.package.clone(),
+            bytes: runtime.exact_bytes().to_vec(),
+        }])
+        .unwrap();
+        let trust: Arc<dyn AgentTrustProvider> = Arc::new(CleanClockTrust {
+            slot: Arc::new(AtomicU64::new(20)),
+        });
+        assert!(!trust.use_native_clean_runtime_for_test());
+        let merge: Arc<dyn LocalMergeAuthenticator> = Arc::new(StaticMerge(NodeId([0xbd; 32])));
+        let mut executor = StandardLocalReplayExecutor::new(resolver, trust, merge);
+        for (operation, outcome, successful) in operations {
+            let immutable = (operation.clone(), before.clone(), input.runtime.clone());
+            assert!(
+                executor
+                    .clean_invocation_is_terminal(&operation, &before, &input.runtime,)
+                    .unwrap(),
+                "ordinary completed errors keep their old behavior"
+            );
+            assert!(executor.terminal_preflight.get_mut().unwrap().is_some());
+            assert_eq!(
+                executor
+                    .new_management_invocation_is_successful_terminal(
+                        &operation,
+                        &before,
+                        &input.runtime,
+                    )
+                    .unwrap(),
+                successful
+            );
+            assert!(
+                executor.terminal_preflight.get_mut().unwrap().is_none(),
+                "new admission retains no result, even after an earlier ordinary preview"
+            );
+            assert_eq!(
+                executor
+                    .clean_management_invocation_is_successful_terminal(
+                        &operation,
+                        &before,
+                        &input.runtime,
+                    )
+                    .unwrap(),
+                successful
+            );
+            let cached = executor.terminal_preflight.get_mut().unwrap();
+            assert_eq!(cached.is_some(), successful);
+            if let Some(cached) = cached {
+                assert_eq!(cached.transition.outcome, outcome);
+            }
+            assert_eq!(
+                (operation, before.clone(), input.runtime.clone()),
+                immutable,
+                "management preview never refreshes its accepted clock or work"
+            );
+        }
     }
 
     #[test]

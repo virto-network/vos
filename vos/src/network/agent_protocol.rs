@@ -16,26 +16,26 @@ use crate::agent::shared_commit::{
     MAX_REPLICA_COMMIT_SIGNATURE_BYTES, MAX_SHARED_AGENT_COMMON_SNAPSHOT_CLAIM_BYTES,
     ReplicaCommitSignature, SharedAgentCommonSnapshotClaim,
 };
-use crate::agent::shared_recovery::{
-    MAX_SHARED_RECOVERY_EXPIRY_CLAIM_BYTES, MAX_SHARED_RECOVERY_REGISTRATION_BYTES,
-    SharedRecoveryExpiryClaim, SharedRecoveryRegistration,
+use crate::agent::shared_raft::{
+    AgentRaftCommand, ArtifactChunk, MAX_AGENT_RAFT_COMMAND_BYTES, MAX_ARTIFACT_CHUNK_WIRE_BYTES,
 };
 use crate::service::wire::ServiceWire;
 use async_trait::async_trait;
 use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::request_response::Codec;
 use libp2p::{PeerId, StreamProtocol};
-use vos_agent_sdk::authority::AuthorityProjectionQuery;
+use vos_agent_sdk::authority::{AuthorityOperationKind, AuthorityReceipt};
 use vos_agent_sdk::wire::{
-    CanonicalWire, MAX_INVOCATION_AUTHORIZATION_WIRE_BYTES, MAX_RUNTIME_TRANSITION_WIRE_BYTES,
+    CanonicalWire, MAX_AUTHORITY_RECEIPT_WIRE_BYTES, MAX_INVOCATION_AUTHORIZATION_WIRE_BYTES,
+    MAX_MANAGEMENT_REQUEST_WIRE_BYTES, MAX_RUNTIME_TRANSITION_WIRE_BYTES,
     MAX_RUNTIME_WORK_WIRE_BYTES, WireError,
 };
 use vos_agent_sdk::{
     ActorId, AgentId, BlobRef, CapabilityId, CredentialId, DeploymentId, Hash,
     InvocationAuthorization, InvocationId, InvocationOrigin, InvocationRoleClaims, InvocationWork,
-    MAX_RUNTIME_AVAILABILITY_BYTES, MAX_RUNTIME_AVAILABILITY_ITEMS, MethodMode, NodeId,
-    PrincipalId, ProgramId, RoleId, RuntimeBlob, RuntimeOutcome, RuntimeState, RuntimeTransition,
-    SpaceId,
+    MAX_RUNTIME_AVAILABILITY_BYTES, MAX_RUNTIME_AVAILABILITY_ITEMS, ManagementRequest, MethodMode,
+    NodeId, PrincipalId, ProgramId, RoleId, RuntimeBlob, RuntimeOutcome, RuntimeState,
+    RuntimeTransition, SpaceId,
 };
 use vos_protocol::wire::{DecodeError, Decoder, Encoder};
 
@@ -68,23 +68,22 @@ pub(crate) const MAX_MERGE_HEADS: usize = 512;
 
 const _: () = assert!(MAX_RAFT_COMMAND_BYTES + 1024 < MAX_FRAME_BYTES);
 const _: () = assert!(MAX_MERGE_NODE_BYTES + 1024 < MAX_FRAME_BYTES);
+const _: () = assert!(MAX_AGENT_RAFT_COMMAND_BYTES + 1024 < MAX_FRAME_BYTES);
+const _: () = assert!(
+    MAX_MANAGEMENT_REQUEST_WIRE_BYTES
+        + MAX_AUTHORITY_RECEIPT_WIRE_BYTES
+        + MAX_ARTIFACT_CHUNK_WIRE_BYTES
+        + 1024
+        < MAX_FRAME_BYTES
+);
 
 const TAG_INVOKE_REQUEST: u8 = 0x10;
 const TAG_INVOKE_REPLY: u8 = 0x11;
 const TAG_INVOKE_REDIRECT: u8 = 0x12;
-const TAG_PROJECTION_REQUEST: u8 = 0x13;
-const TAG_PROJECTION_ACCEPTED: u8 = 0x14;
-const TAG_PROJECTION_RECOVERY_REQUEST: u8 = 0x15;
 const TAG_APPLIED_AVAILABILITY_REQUEST: u8 = 0x16;
 const TAG_APPLIED_AVAILABILITY_REPLY: u8 = 0x17;
 const TAG_COMMON_SNAPSHOT_VOTE_REQUEST: u8 = 0x18;
 const TAG_COMMON_SNAPSHOT_VOTE_REPLY: u8 = 0x19;
-const TAG_RECOVERY_REGISTRATION_REQUEST: u8 = 0x1a;
-const TAG_RECOVERY_REGISTRATION_REPLY: u8 = 0x1b;
-const TAG_RECOVERY_EXPIRY_VOTE_REQUEST: u8 = 0x1c;
-const TAG_RECOVERY_EXPIRY_VOTE_REPLY: u8 = 0x1d;
-const TAG_RECOVERY_EXPIRY_REQUEST: u8 = 0x1e;
-const TAG_RECOVERY_EXPIRY_REPLY: u8 = 0x1f;
 const TAG_RAFT_APPEND_REQUEST: u8 = 0x20;
 const TAG_RAFT_APPEND_REPLY: u8 = 0x21;
 const TAG_RAFT_VOTE_REQUEST: u8 = 0x22;
@@ -95,6 +94,14 @@ const TAG_RAFT_STATUS_REQUEST: u8 = 0x26;
 const TAG_RAFT_STATUS_REPLY: u8 = 0x27;
 const TAG_CURRENT_APPLIED_AVAILABILITY_REQUEST: u8 = 0x28;
 const TAG_CURRENT_APPLIED_AVAILABILITY_REPLY: u8 = 0x29;
+const TAG_MANAGEMENT_RECOVERY_COMMAND_REQUEST: u8 = 0x2a;
+const TAG_MANAGEMENT_RECOVERY_COMMAND_REPLY: u8 = 0x2b;
+const TAG_MANAGEMENT_RECOVERY_OPERATION_REQUEST: u8 = 0x2c;
+const TAG_MANAGEMENT_RECOVERY_OPERATION_REPLY: u8 = 0x2d;
+const TAG_FORWARDED_SHARED_INSTALL_REQUEST: u8 = 0x2e;
+const TAG_FORWARDED_SHARED_INSTALL_REPLY: u8 = 0x2f;
+const TAG_AUTHORITY_READ_BARRIER_REQUEST: u8 = 0x35;
+const TAG_AUTHORITY_READ_BARRIER_REPLY: u8 = 0x36;
 const TAG_MERGE_FETCH_HEADS: u8 = 0x30;
 const TAG_MERGE_HEADS: u8 = 0x31;
 const TAG_MERGE_FETCH_NODE: u8 = 0x32;
@@ -223,6 +230,143 @@ pub(crate) struct InvocationRedirect {
     pub(crate) leader: NodeId,
 }
 
+/// Only the authenticated original owner may ask the current leader to execute
+/// an exact retained member. This tag cannot carry new work or a resume grant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum ManagementRecoveryOperation {
+    Invoke = 0,
+    Acknowledge = 1,
+}
+
+/// Commitments select a member of the sender's freshly verified signed scope.
+/// Decoding does not establish that scope or confer execution authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ManagementRecoveryOperationRequest {
+    pub(crate) registration: Hash,
+    pub(crate) member: Hash,
+    pub(crate) operation: ManagementRecoveryOperation,
+}
+
+impl ManagementRecoveryOperationRequest {
+    pub(crate) fn is_valid(&self) -> bool {
+        self.registration != Hash::ZERO && self.member != Hash::ZERO
+    }
+
+    pub(crate) fn correlation(&self) -> Hash {
+        Hash::digest(
+            b"vos/agent/network/management-recovery-operation/v1",
+            &[
+                self.registration.as_bytes(),
+                self.member.as_bytes(),
+                &[self.operation as u8],
+            ],
+        )
+    }
+}
+
+/// Selects the original online owner's already registered System approval.
+/// Neither these commitments nor successful wire decoding confer authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ForwardedSharedInstallOwner {
+    pub(crate) system: AgentGenerationRoute,
+    pub(crate) registration: Hash,
+    pub(crate) member: Hash,
+}
+
+impl ForwardedSharedInstallOwner {
+    pub(crate) fn is_valid(&self) -> bool {
+        self.system.is_valid() && self.registration != Hash::ZERO && self.member != Hash::ZERO
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ForwardedSharedInstallOperation {
+    Progress,
+    Chunk(ArtifactChunk),
+    Finish,
+}
+
+/// One bounded package-transfer chunk, or an explicit online-owner request to
+/// finish that exact Install. Transfer staging is not Raft publication. The
+/// receiver independently verifies the sender's retained System approval,
+/// package admission and current managed generation before proposing anything.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ForwardedSharedInstallRequest {
+    pub(crate) owner: ForwardedSharedInstallOwner,
+    pub(crate) request: ManagementRequest,
+    pub(crate) authority: AuthorityReceipt,
+    pub(crate) operation: ForwardedSharedInstallOperation,
+}
+
+impl ForwardedSharedInstallRequest {
+    pub(crate) fn is_valid(&self, route: AgentGenerationRoute) -> bool {
+        let ManagementRequest::Install(install) = &self.request else {
+            return false;
+        };
+        let selector = &self.authority.selector;
+        self.owner.is_valid()
+            && self.owner.system.space == route.space
+            && self.owner.system.agent != route.agent
+            && self.request.is_valid()
+            && self.authority.encode().is_ok()
+            && selector.space == route.space
+            && selector.agent == route.agent
+            && selector.operation == AuthorityOperationKind::InstallActor
+            && selector.actor == Some(install.entry.actor)
+            && selector.actor_deployment == Some(install.entry.deployment)
+            && selector.request == self.request.commitment()
+            && match &self.operation {
+                ForwardedSharedInstallOperation::Progress
+                | ForwardedSharedInstallOperation::Finish => true,
+                ForwardedSharedInstallOperation::Chunk(chunk) => {
+                    let generation = chunk.manifest().route().generation();
+                    chunk.validate().is_ok()
+                        && generation.space().0 == route.space.0
+                        && generation.agent().0 == route.agent.0
+                        && generation.replication_id() == route.generation.0
+                        && chunk.artifact_index() == 0
+                        && chunk.manifest().artifacts().len() == 1
+                        && chunk.artifact().hash.0 == install.package.hash.0
+                        && chunk.artifact().len == install.package.len
+                }
+            }
+    }
+
+    pub(crate) fn correlation(&self) -> Hash {
+        let request = self.request.commitment();
+        let authority = self.authority.commitment();
+        let (kind, chunk) = match &self.operation {
+            ForwardedSharedInstallOperation::Progress => (0u8, [0; 32]),
+            ForwardedSharedInstallOperation::Chunk(chunk) => (1, chunk.commitment().0),
+            ForwardedSharedInstallOperation::Finish => (2, [0; 32]),
+        };
+        Hash::digest(
+            b"vos/agent/network/forwarded-shared-install/v1",
+            &[
+                self.owner.system.space.as_bytes(),
+                self.owner.system.agent.as_bytes(),
+                self.owner.system.generation.as_bytes(),
+                self.owner.registration.as_bytes(),
+                self.owner.member.as_bytes(),
+                request.as_bytes(),
+                authority.as_bytes(),
+                &[kind],
+                &chunk,
+            ],
+        )
+    }
+
+    pub(crate) fn admits_progress(&self, offset: u64) -> bool {
+        let ManagementRequest::Install(install) = &self.request else {
+            return false;
+        };
+        offset <= install.package.len
+            && (offset == install.package.len
+                || offset % crate::agent::shared_raft::ARTIFACT_CHUNK_DATA_BYTES as u64 == 0)
+    }
+}
+
 /// Exact already-published Ordered application whose durable closure a voter
 /// is asked to verify. The claim commitment binds the complete genesis,
 /// admission, committee, index/term and logical result; the frame binds the live route.
@@ -232,6 +376,37 @@ pub(crate) struct AppliedAvailabilityRequest {
     pub(crate) raft_index: u64,
     pub(crate) raft_term: u64,
     pub(crate) claim: Hash,
+}
+
+/// An ephemeral internal read barrier, not an invocation or a custody request.
+/// The complete signed query commitment is correlation only: the receiving
+/// voter independently executes and authenticates its own guest observation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AuthorityReadBarrierRequest {
+    pub(crate) request: Hash,
+}
+
+/// Authenticated-CFT freshness coordination, never portable finality or a
+/// peer-supplied Authority answer. The frame binds the exact live generation;
+/// the receiver must verify its own committed prefix and apply through R.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AuthorityReadBarrier {
+    pub(crate) request: Hash,
+    pub(crate) leader: NodeId,
+    pub(crate) raft_term: u64,
+    pub(crate) read_index: u64,
+    /// Zero is the legitimate initial static configuration boundary.
+    pub(crate) configuration_index: u64,
+}
+
+impl AuthorityReadBarrier {
+    pub(crate) fn is_valid(self) -> bool {
+        self.request != Hash::ZERO
+            && self.leader != NodeId::ZERO
+            && self.raft_term != 0
+            && self.read_index != 0
+            && self.configuration_index <= self.read_index
+    }
 }
 
 impl AppliedAvailabilityRequest {
@@ -405,18 +580,14 @@ pub(crate) enum MergeMessage {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AgentMessage {
+    AuthorityReadBarrierRequest(AuthorityReadBarrierRequest),
+    AuthorityReadBarrierReply {
+        request: Hash,
+        barrier: Option<AuthorityReadBarrier>,
+    },
     InvokeRequest(InvocationRequest),
     InvokeReply(InvocationReply),
     InvokeRedirect(InvocationRedirect),
-    /// Queue admission only. No peer-supplied projection result is trusted.
-    ProjectionRequest(AuthorityProjectionQuery),
-    /// Relay only for an already committed Invoke. The receiving owner must
-    /// prove that exact local evidence before admitting recovery.
-    ProjectionRecoveryRequest(AuthorityProjectionQuery),
-    ProjectionAccepted {
-        request: Hash,
-        accepted: bool,
-    },
     AppliedAvailabilityRequest(AppliedAvailabilityRequest),
     AppliedAvailabilityReply {
         request: AppliedAvailabilityRequest,
@@ -437,26 +608,26 @@ pub(crate) enum AgentMessage {
         claim: Hash,
         signature: Option<ReplicaCommitSignature>,
     },
-    RecoveryRegistrationRequest(SharedRecoveryRegistration),
-    /// True means this exact signed registration was durably applied, not
-    /// merely accepted into an in-memory projection queue.
-    RecoveryRegistrationReply {
-        registration: Hash,
+    /// Only owner-signed registration/release metadata is accepted here, never
+    /// an arbitrary Raft command or permission to execute its retained work.
+    ManagementRecoveryCommandRequest(AgentRaftCommand),
+    ManagementRecoveryCommandReply {
+        command: Hash,
         applied: bool,
     },
-    RecoveryExpiryVoteRequest(SharedRecoveryExpiryClaim),
-    RecoveryExpiryVoteReply {
-        claim: Hash,
-        signature: Option<ReplicaCommitSignature>,
-    },
-    /// Request a terminal fence for an already admitted exact request; this
-    /// never authorizes invocation and never reports a synthetic guest ACK.
-    RecoveryExpiryRequest {
-        request: Hash,
-    },
-    RecoveryExpiryReply {
+    ManagementRecoveryOperationRequest(ManagementRecoveryOperationRequest),
+    /// A bounded acknowledgement only. The origin independently verifies its
+    /// own committed first capsule; no peer outcome/finality is accepted.
+    ManagementRecoveryOperationReply {
         request: Hash,
         applied: bool,
+    },
+    ForwardedSharedInstallRequest(ForwardedSharedInstallRequest),
+    /// The next missing package offset, or refusal. This bounded transport
+    /// hint is never application evidence or permission for terminal cleanup.
+    ForwardedSharedInstallReply {
+        request: Hash,
+        next_offset: Option<u64>,
     },
     Raft(RaftMessage),
     Merge(MergeMessage),
@@ -617,14 +788,41 @@ fn decode_route(decoder: &mut Decoder<'_>) -> Result<AgentGenerationRoute, Agent
 
 fn message_is_valid(message: &AgentMessage, route: AgentGenerationRoute, sender: NodeId) -> bool {
     match message {
-        AgentMessage::ProjectionRequest(query) | AgentMessage::ProjectionRecoveryRequest(query) => {
-            query.validate_shape().is_ok()
-                && query.authority.space == route.space
-                && query.authority.system_agent == route.agent
-                && (matches!(message, AgentMessage::ProjectionRecoveryRequest(_))
-                    || query.attesting_node().is_none_or(|node| node == sender))
+        AgentMessage::AuthorityReadBarrierRequest(request) => request.request != Hash::ZERO,
+        AgentMessage::AuthorityReadBarrierReply { request, barrier } => {
+            *request != Hash::ZERO
+                && barrier.is_none_or(|barrier| {
+                    barrier.is_valid() && barrier.request == *request && barrier.leader == sender
+                })
         }
-        AgentMessage::ProjectionAccepted { request, .. } => *request != Hash::ZERO,
+        AgentMessage::ManagementRecoveryCommandRequest(command) => {
+            let owner = match command {
+                AgentRaftCommand::RegisterManagementRecovery { registration, .. } => {
+                    registration.owner()
+                }
+                AgentRaftCommand::ReleaseManagementRecovery { release, .. } => {
+                    release.request().owner()
+                }
+                _ => return false,
+            };
+            let generation = command.route().generation();
+            command.validate().is_ok()
+                && owner.0 == sender.0
+                && generation.space().0 == route.space.0
+                && generation.agent().0 == route.agent.0
+                && generation.replication_id() == route.generation.0
+        }
+        AgentMessage::ManagementRecoveryCommandReply { command, .. } => *command != Hash::ZERO,
+        AgentMessage::ManagementRecoveryOperationRequest(request) => request.is_valid(),
+        AgentMessage::ManagementRecoveryOperationReply { request, .. } => *request != Hash::ZERO,
+        AgentMessage::ForwardedSharedInstallRequest(request) => request.is_valid(route),
+        AgentMessage::ForwardedSharedInstallReply {
+            request,
+            next_offset,
+        } => {
+            *request != Hash::ZERO
+                && next_offset.is_none_or(|offset| offset <= MAX_FRAME_BYTES as u64)
+        }
         AgentMessage::AppliedAvailabilityRequest(request)
         | AgentMessage::AppliedAvailabilityReply { request, .. }
         | AgentMessage::CurrentAppliedAvailabilityRequest(request)
@@ -640,29 +838,6 @@ fn message_is_valid(message: &AgentMessage, route: AgentGenerationRoute, sender:
                     signature.validate().is_ok() && signature.signer().0 == sender.0
                 })
         }
-        AgentMessage::RecoveryRegistrationRequest(registration) => {
-            registration.validate().is_ok()
-                && registration.generation().space().0 == route.space.0
-                && registration.generation().agent().0 == route.agent.0
-                && registration.generation().replication_id() == route.generation.0
-        }
-        AgentMessage::RecoveryRegistrationReply { registration, .. } => {
-            *registration != Hash::ZERO
-        }
-        AgentMessage::RecoveryExpiryVoteRequest(claim) => {
-            claim.validate().is_ok()
-                && claim.generation().space().0 == route.space.0
-                && claim.generation().agent().0 == route.agent.0
-                && claim.generation().replication_id() == route.generation.0
-        }
-        AgentMessage::RecoveryExpiryVoteReply { claim, signature } => {
-            *claim != Hash::ZERO
-                && signature.as_ref().is_none_or(|signature| {
-                    signature.validate().is_ok() && signature.signer().0 == sender.0
-                })
-        }
-        AgentMessage::RecoveryExpiryRequest { request }
-        | AgentMessage::RecoveryExpiryReply { request, .. } => *request != Hash::ZERO,
         AgentMessage::InvokeRequest(request) => {
             request.work.validate()
                 && request.work.space == route.space
@@ -829,18 +1004,64 @@ fn encode_message(
     message: &AgentMessage,
 ) -> Result<(), AgentProtocolError> {
     match message {
-        AgentMessage::ProjectionRequest(query) => {
-            encoder.u8(TAG_PROJECTION_REQUEST);
-            encoder.bytes(&query.encode()?);
+        AgentMessage::AuthorityReadBarrierRequest(request) => {
+            encoder.u8(TAG_AUTHORITY_READ_BARRIER_REQUEST);
+            encoder.fixed(request.request.as_bytes());
         }
-        AgentMessage::ProjectionRecoveryRequest(query) => {
-            encoder.u8(TAG_PROJECTION_RECOVERY_REQUEST);
-            encoder.bytes(&query.encode()?);
-        }
-        AgentMessage::ProjectionAccepted { request, accepted } => {
-            encoder.u8(TAG_PROJECTION_ACCEPTED);
+        AgentMessage::AuthorityReadBarrierReply { request, barrier } => {
+            encoder.u8(TAG_AUTHORITY_READ_BARRIER_REPLY);
             encoder.fixed(request.as_bytes());
-            encoder.bool(*accepted);
+            encoder.option(barrier, |encoder, barrier| {
+                encoder.fixed(barrier.request.as_bytes());
+                encoder.fixed(barrier.leader.as_bytes());
+                encoder.u64(barrier.raft_term);
+                encoder.u64(barrier.read_index);
+                encoder.u64(barrier.configuration_index);
+            });
+        }
+        AgentMessage::ManagementRecoveryCommandRequest(command) => {
+            encoder.u8(TAG_MANAGEMENT_RECOVERY_COMMAND_REQUEST);
+            encoder.bytes(&command.encode());
+        }
+        AgentMessage::ManagementRecoveryCommandReply { command, applied } => {
+            encoder.u8(TAG_MANAGEMENT_RECOVERY_COMMAND_REPLY);
+            encoder.fixed(command.as_bytes());
+            encoder.bool(*applied);
+        }
+        AgentMessage::ManagementRecoveryOperationRequest(request) => {
+            encoder.u8(TAG_MANAGEMENT_RECOVERY_OPERATION_REQUEST);
+            encoder.fixed(request.registration.as_bytes());
+            encoder.fixed(request.member.as_bytes());
+            encoder.u8(request.operation as u8);
+        }
+        AgentMessage::ManagementRecoveryOperationReply { request, applied } => {
+            encoder.u8(TAG_MANAGEMENT_RECOVERY_OPERATION_REPLY);
+            encoder.fixed(request.as_bytes());
+            encoder.bool(*applied);
+        }
+        AgentMessage::ForwardedSharedInstallRequest(request) => {
+            encoder.u8(TAG_FORWARDED_SHARED_INSTALL_REQUEST);
+            encode_route(encoder, request.owner.system);
+            encoder.fixed(request.owner.registration.as_bytes());
+            encoder.fixed(request.owner.member.as_bytes());
+            encoder.bytes(&request.request.encode()?);
+            encoder.bytes(&request.authority.encode()?);
+            match &request.operation {
+                ForwardedSharedInstallOperation::Progress => encoder.u8(0),
+                ForwardedSharedInstallOperation::Chunk(chunk) => {
+                    encoder.u8(1);
+                    encoder.bytes(&chunk.encode());
+                }
+                ForwardedSharedInstallOperation::Finish => encoder.u8(2),
+            }
+        }
+        AgentMessage::ForwardedSharedInstallReply {
+            request,
+            next_offset,
+        } => {
+            encoder.u8(TAG_FORWARDED_SHARED_INSTALL_REPLY);
+            encoder.fixed(request.as_bytes());
+            encoder.option(next_offset, |encoder, offset| encoder.u64(*offset));
         }
         AgentMessage::AppliedAvailabilityRequest(request) => {
             encoder.u8(TAG_APPLIED_AVAILABILITY_REQUEST);
@@ -870,35 +1091,6 @@ fn encode_message(
             encoder.option(signature, |encoder, signature| {
                 encoder.bytes(&signature.encode());
             });
-        }
-        AgentMessage::RecoveryRegistrationRequest(registration) => {
-            encoder.u8(TAG_RECOVERY_REGISTRATION_REQUEST);
-            encoder.bytes(&registration.encode());
-        }
-        AgentMessage::RecoveryRegistrationReply { registration, applied } => {
-            encoder.u8(TAG_RECOVERY_REGISTRATION_REPLY);
-            encoder.fixed(registration.as_bytes());
-            encoder.bool(*applied);
-        }
-        AgentMessage::RecoveryExpiryVoteRequest(claim) => {
-            encoder.u8(TAG_RECOVERY_EXPIRY_VOTE_REQUEST);
-            encoder.bytes(&claim.encode());
-        }
-        AgentMessage::RecoveryExpiryVoteReply { claim, signature } => {
-            encoder.u8(TAG_RECOVERY_EXPIRY_VOTE_REPLY);
-            encoder.fixed(claim.as_bytes());
-            encoder.option(signature, |encoder, signature| {
-                encoder.bytes(&signature.encode())
-            });
-        }
-        AgentMessage::RecoveryExpiryRequest { request } => {
-            encoder.u8(TAG_RECOVERY_EXPIRY_REQUEST);
-            encoder.fixed(request.as_bytes());
-        }
-        AgentMessage::RecoveryExpiryReply { request, applied } => {
-            encoder.u8(TAG_RECOVERY_EXPIRY_REPLY);
-            encoder.fixed(request.as_bytes());
-            encoder.bool(*applied);
         }
         AgentMessage::InvokeRequest(request) => {
             encoder.u8(TAG_INVOKE_REQUEST);
@@ -1167,19 +1359,99 @@ fn encode_heads(encoder: &mut Encoder<'_>, heads: &[Hash]) {
 fn decode_message(decoder: &mut Decoder<'_>) -> Result<AgentMessage, AgentProtocolError> {
     let tag = decoder.u8()?;
     match tag {
-        TAG_PROJECTION_REQUEST => Ok(AgentMessage::ProjectionRequest(
-            AuthorityProjectionQuery::decode(decoder.bytes_ref_bounded(
-                vos_agent_sdk::wire::MAX_AUTHORITY_PROJECTION_QUERY_WIRE_BYTES,
-            )?)?,
-        )),
-        TAG_PROJECTION_RECOVERY_REQUEST => Ok(AgentMessage::ProjectionRecoveryRequest(
-            AuthorityProjectionQuery::decode(decoder.bytes_ref_bounded(
-                vos_agent_sdk::wire::MAX_AUTHORITY_PROJECTION_QUERY_WIRE_BYTES,
-            )?)?,
-        )),
-        TAG_PROJECTION_ACCEPTED => Ok(AgentMessage::ProjectionAccepted {
+        TAG_MANAGEMENT_RECOVERY_COMMAND_REQUEST => {
+            let bytes = decoder.bytes_ref_bounded(MAX_AGENT_RAFT_COMMAND_BYTES)?;
+            let command =
+                AgentRaftCommand::decode(bytes).map_err(|_| AgentProtocolError::InvalidValue)?;
+            if command.encode() != bytes {
+                return Err(AgentProtocolError::NonCanonical);
+            }
+            Ok(AgentMessage::ManagementRecoveryCommandRequest(command))
+        }
+        TAG_MANAGEMENT_RECOVERY_COMMAND_REPLY => Ok(AgentMessage::ManagementRecoveryCommandReply {
+            command: Hash(decoder.fixed()?),
+            applied: decoder.bool()?,
+        }),
+        TAG_MANAGEMENT_RECOVERY_OPERATION_REQUEST => {
+            let registration = Hash(decoder.fixed()?);
+            let member = Hash(decoder.fixed()?);
+            let operation = match decoder.u8()? {
+                0 => ManagementRecoveryOperation::Invoke,
+                1 => ManagementRecoveryOperation::Acknowledge,
+                _ => return Err(AgentProtocolError::InvalidValue),
+            };
+            Ok(AgentMessage::ManagementRecoveryOperationRequest(
+                ManagementRecoveryOperationRequest {
+                    registration,
+                    member,
+                    operation,
+                },
+            ))
+        }
+        TAG_MANAGEMENT_RECOVERY_OPERATION_REPLY => {
+            Ok(AgentMessage::ManagementRecoveryOperationReply {
+                request: Hash(decoder.fixed()?),
+                applied: decoder.bool()?,
+            })
+        }
+        TAG_FORWARDED_SHARED_INSTALL_REQUEST => {
+            let owner = ForwardedSharedInstallOwner {
+                system: decode_route(decoder)?,
+                registration: Hash(decoder.fixed()?),
+                member: Hash(decoder.fixed()?),
+            };
+            let request = ManagementRequest::decode(
+                decoder.bytes_ref_bounded(MAX_MANAGEMENT_REQUEST_WIRE_BYTES)?,
+            )?;
+            if !matches!(request, ManagementRequest::Install(_)) {
+                return Err(AgentProtocolError::InvalidValue);
+            }
+            let authority = AuthorityReceipt::decode(
+                decoder.bytes_ref_bounded(MAX_AUTHORITY_RECEIPT_WIRE_BYTES)?,
+            )?;
+            let operation = match decoder.u8()? {
+                0 => ForwardedSharedInstallOperation::Progress,
+                1 => {
+                    let bytes = decoder.bytes_ref_bounded(MAX_ARTIFACT_CHUNK_WIRE_BYTES)?;
+                    let chunk = ArtifactChunk::decode(bytes)
+                        .map_err(|_| AgentProtocolError::InvalidValue)?;
+                    if chunk.encode() != bytes {
+                        return Err(AgentProtocolError::NonCanonical);
+                    }
+                    ForwardedSharedInstallOperation::Chunk(chunk)
+                }
+                2 => ForwardedSharedInstallOperation::Finish,
+                _ => return Err(AgentProtocolError::InvalidValue),
+            };
+            Ok(AgentMessage::ForwardedSharedInstallRequest(
+                ForwardedSharedInstallRequest {
+                    owner,
+                    request,
+                    authority,
+                    operation,
+                },
+            ))
+        }
+        TAG_FORWARDED_SHARED_INSTALL_REPLY => Ok(AgentMessage::ForwardedSharedInstallReply {
             request: Hash(decoder.fixed()?),
-            accepted: decoder.bool()?,
+            next_offset: decoder.option(Decoder::u64)?,
+        }),
+        TAG_AUTHORITY_READ_BARRIER_REQUEST => Ok(AgentMessage::AuthorityReadBarrierRequest(
+            AuthorityReadBarrierRequest {
+                request: Hash(decoder.fixed()?),
+            },
+        )),
+        TAG_AUTHORITY_READ_BARRIER_REPLY => Ok(AgentMessage::AuthorityReadBarrierReply {
+            request: Hash(decoder.fixed()?),
+            barrier: decoder.option(|decoder| {
+                Ok(AuthorityReadBarrier {
+                    request: Hash(decoder.fixed()?),
+                    leader: NodeId(decoder.fixed()?),
+                    raft_term: decoder.u64()?,
+                    read_index: decoder.u64()?,
+                    configuration_index: decoder.u64()?,
+                })
+            })?,
         }),
         TAG_APPLIED_AVAILABILITY_REQUEST => Ok(AgentMessage::AppliedAvailabilityRequest(
             decode_applied_availability_request(decoder)?,
@@ -1213,38 +1485,6 @@ fn decode_message(decoder: &mut Decoder<'_>) -> Result<AgentMessage, AgentProtoc
                 )
                 .map_err(|_| DecodeError::NonCanonical)
             })?,
-        }),
-        TAG_RECOVERY_REGISTRATION_REQUEST => Ok(AgentMessage::RecoveryRegistrationRequest(
-            SharedRecoveryRegistration::decode(
-                decoder.bytes_ref_bounded(MAX_SHARED_RECOVERY_REGISTRATION_BYTES)?,
-            )
-            .map_err(|_| AgentProtocolError::InvalidValue)?,
-        )),
-        TAG_RECOVERY_REGISTRATION_REPLY => Ok(AgentMessage::RecoveryRegistrationReply {
-            registration: Hash(decoder.fixed()?),
-            applied: decoder.bool()?,
-        }),
-        TAG_RECOVERY_EXPIRY_VOTE_REQUEST => Ok(AgentMessage::RecoveryExpiryVoteRequest(
-            SharedRecoveryExpiryClaim::decode(
-                decoder.bytes_ref_bounded(MAX_SHARED_RECOVERY_EXPIRY_CLAIM_BYTES)?,
-            )
-            .map_err(|_| AgentProtocolError::InvalidValue)?,
-        )),
-        TAG_RECOVERY_EXPIRY_VOTE_REPLY => Ok(AgentMessage::RecoveryExpiryVoteReply {
-            claim: Hash(decoder.fixed()?),
-            signature: decoder.option(|decoder| {
-                ReplicaCommitSignature::decode(
-                    decoder.bytes_ref_bounded(MAX_REPLICA_COMMIT_SIGNATURE_BYTES)?,
-                )
-                .map_err(|_| DecodeError::NonCanonical)
-            })?,
-        }),
-        TAG_RECOVERY_EXPIRY_REQUEST => Ok(AgentMessage::RecoveryExpiryRequest {
-            request: Hash(decoder.fixed()?),
-        }),
-        TAG_RECOVERY_EXPIRY_REPLY => Ok(AgentMessage::RecoveryExpiryReply {
-            request: Hash(decoder.fixed()?),
-            applied: decoder.bool()?,
         }),
         TAG_INVOKE_REQUEST => {
             let work = decode_invocation_work(decoder)?;
@@ -1654,26 +1894,183 @@ where
 }
 
 #[cfg(test)]
-pub(super) fn recovery_expiry_claim_for_test() -> SharedRecoveryExpiryClaim {
-    let registration = crate::agent::shared_recovery::recovery_registration_for_test(1, 9);
+pub(super) fn management_recovery_commands_for_test() -> [AgentRaftCommand; 2] {
+    use crate::agent::clean_management_intent::ManagementJournalAnchor;
+    use crate::agent::journal::OrderedBase;
+    use crate::agent::shared_raft::AgentRouteKey;
+    use crate::agent::shared_recovery::management::{
+        SharedManagementRecoveryMember, SharedManagementRecoveryRegistration,
+        SharedManagementRecoveryRegistrationRequest, SharedManagementRecoveryRelease,
+        SharedManagementRecoveryReleaseRequest,
+    };
+    use crate::agent::shared_recovery::{
+        SharedRecoveryManifest, management_observation_for_test,
+        management_recovery_fixture_for_test,
+    };
+    use ed25519_dalek::{Signer as _, SigningKey};
+
+    let template = management_recovery_fixture_for_test(1, 9);
     let committee = crate::agent::shared_commit::common_snapshot_claim_for_test()
         .active_committee()
         .clone();
-    let mut manifest = crate::agent::shared_recovery::SharedRecoveryManifest::new(
-        registration.generation(),
-        committee,
+    let mut manifest = SharedRecoveryManifest::new(template.generation(), committee).unwrap();
+    let member = SharedManagementRecoveryMember::new(
+        None,
+        ManagementJournalAnchor {
+            genesis: template.generation().genesis(),
+            admission: template.generation().admission(),
+            runtime: management_observation_for_test(&template, 2, false)
+                .observation()
+                .input()
+                .runtime
+                .commitment(),
+            ordered: OrderedBase::post_genesis(),
+        },
+        template.envelope().clone(),
     )
     .unwrap();
-    manifest.apply_registration(&registration, 1, 3).unwrap();
+    let request = SharedManagementRecoveryRegistrationRequest::new(
+        template.generation(),
+        template.committee(),
+        template.owner(),
+        template.owner(),
+        1,
+        None,
+        vec![member],
+    )
+    .unwrap();
+    let key = SigningKey::from_bytes(&[1; 32]);
+    let signature = ReplicaCommitSignature::new(
+        template.owner(),
+        key.sign(&request.signing_message().0).to_bytes(),
+    )
+    .unwrap();
+    let registration = SharedManagementRecoveryRegistration::new(request, signature).unwrap();
     manifest
-        .expiry_claim(
-            registration.request(),
-            1,
-            3,
-            crate::agent::journal::OrderedBase::post_genesis(),
-            20,
+        .apply_management_registration(&registration, 1, 3)
+        .unwrap();
+    manifest
+        .observe(&management_observation_for_test(&template, 2, false))
+        .unwrap();
+    manifest
+        .observe(&management_observation_for_test(&template, 3, true))
+        .unwrap();
+    let request = SharedManagementRecoveryReleaseRequest::for_slot(
+        manifest.management_slot(template.owner()).unwrap(),
+    )
+    .unwrap();
+    let signature = ReplicaCommitSignature::new(
+        template.owner(),
+        key.sign(&request.signing_message().0).to_bytes(),
+    )
+    .unwrap();
+    let release = SharedManagementRecoveryRelease::new(request, signature).unwrap();
+    let route = AgentRouteKey::new(
+        template.generation().space(),
+        template.generation().agent(),
+        template.generation().genesis(),
+        template.generation().admission(),
+        template.committee(),
+    )
+    .unwrap();
+    [
+        AgentRaftCommand::RegisterManagementRecovery {
+            route,
+            registration,
+        },
+        AgentRaftCommand::ReleaseManagementRecovery { route, release },
+    ]
+}
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    feature = "storage",
+    feature = "experimental-state-blocks"
+))]
+pub(crate) fn forwarded_shared_install_for_test(
+    with_chunk: bool,
+) -> (AgentGenerationRoute, ForwardedSharedInstallRequest) {
+    // Real admitted package bytes qualify the transport shape only. The
+    // separate public fixed-three fixture proves retained owner authorization.
+    let (_, submission) = crate::agent::local_lifecycle::shared_submissions_for_test(false);
+    let command = management_recovery_commands_for_test()
+        .into_iter()
+        .next()
+        .unwrap();
+    let durable_route = command.route();
+    let generation = durable_route.generation();
+    let route = AgentGenerationRoute {
+        space: SpaceId(generation.space().0),
+        agent: AgentId(generation.agent().0),
+        generation: Hash(generation.replication_id()),
+    };
+    let install = submission.install().clone();
+    let request = ManagementRequest::Install(Box::new(install.clone()));
+    let public_key = [41; 32];
+    let authority = AuthorityReceipt {
+        selector: vos_agent_sdk::authority::AuthorityReceiptSelector {
+            policy: Hash([31; 32]),
+            issuer: vos_agent_sdk::authority::AuthorityIssuer {
+                principal: PrincipalId([32; 32]),
+                actor: ActorId([33; 32]),
+                deployment: DeploymentId([34; 32]),
+                program: ProgramId([35; 32]),
+                producer: vos_agent_sdk::ProducerId::of_public_key(&public_key),
+            },
+            space: route.space,
+            agent: route.agent,
+            operation: AuthorityOperationKind::InstallActor,
+            runtime_deployment: submission.call().managed.runtime_deployment,
+            actor: Some(install.entry.actor),
+            actor_deployment: Some(install.entry.deployment),
+            evidence: vos_agent_sdk::authority::AuthorityEvidence {
+                package: Some(install.package.clone()),
+                proof: None,
+                commitment: Hash([38; 32]),
+            },
+            lane_roots: vos_agent_sdk::authority::AuthorityLaneRoots::default(),
+            epoch: 1,
+            decision_sequence: 1,
+            acknowledged_through: 0,
+            valid_from: 4,
+            expires_at: 9,
+            request: request.commitment(),
+        },
+        public_key,
+        signature: [42; 64],
+    };
+    let owner = ForwardedSharedInstallOwner {
+        system: AgentGenerationRoute {
+            agent: AgentId([88; 32]),
+            ..route
+        },
+        registration: Hash([89; 32]),
+        member: Hash([90; 32]),
+    };
+    let chunk = with_chunk.then(|| {
+        let manifest = crate::agent::shared_raft::ArtifactBatchManifest::new(
+            durable_route,
+            vec![crate::service::BlobRef {
+                hash: crate::service::Hash(install.package.hash.0),
+                len: install.package.len,
+            }],
         )
-        .unwrap()
+        .unwrap();
+        ArtifactChunk::new(manifest, 0, 0, submission.package().exact_bytes().to_vec()).unwrap()
+    });
+    (
+        route,
+        ForwardedSharedInstallRequest {
+            owner,
+            request,
+            authority,
+            operation: chunk.map_or(
+                ForwardedSharedInstallOperation::Progress,
+                ForwardedSharedInstallOperation::Chunk,
+            ),
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1690,183 +2087,318 @@ mod tests {
 
     use super::*;
 
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    #[test]
+    fn forwarded_shared_install_wire_is_bounded_canonical_and_install_only() {
+        let peer = peer(87);
+        for with_chunk in [false, true] {
+            let (route, request) = forwarded_shared_install_for_test(with_chunk);
+            let frame = AgentFrame {
+                route,
+                sender: node(&peer),
+                message: AgentMessage::ForwardedSharedInstallRequest(request.clone()),
+            };
+            let bytes = frame.encode().unwrap();
+            assert!(bytes.len() < MAX_FRAME_BYTES);
+            assert_eq!(AgentFrame::decode(&bytes).unwrap(), frame);
+            authenticate_sender(&peer, frame.clone()).unwrap();
+            for end in [0, 5, 134, bytes.len() - 1] {
+                assert!(AgentFrame::decode(&bytes[..end]).is_err());
+            }
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            assert_eq!(
+                AgentFrame::decode(&trailing),
+                Err(AgentProtocolError::TrailingBytes)
+            );
+
+            let mut other = request.clone();
+            other.operation = ForwardedSharedInstallOperation::Finish;
+            if with_chunk {
+                assert_ne!(request.correlation(), other.correlation());
+            }
+            other.request = ManagementRequest::InspectResources;
+            let mut raw = Vec::from(MAGIC);
+            raw.extend_from_slice(&VERSION.to_le_bytes());
+            let mut e = Encoder(&mut raw);
+            encode_route(&mut e, route);
+            e.fixed(frame.sender.as_bytes());
+            encode_message(&mut e, &AgentMessage::ForwardedSharedInstallRequest(other)).unwrap();
+            assert!(AgentFrame::decode(&raw).is_err());
+
+            for field in 0..8 {
+                let mut changed = request.clone();
+                match field {
+                    0 => changed.owner.registration = Hash::ZERO,
+                    1 => changed.owner.member = Hash::ZERO,
+                    2 => changed.owner.system.agent = route.agent,
+                    3 => changed.owner.system.space = SpaceId([99; 32]),
+                    4 => changed.authority.selector.agent = AgentId([99; 32]),
+                    5 => changed.authority.selector.actor = Some(ActorId([99; 32])),
+                    6 => changed.authority.selector.request = Hash([99; 32]),
+                    _ => changed.authority.selector.operation = AuthorityOperationKind::InvokeActor,
+                }
+                assert!(!changed.is_valid(route));
+                assert_ne!(request.correlation(), changed.correlation());
+            }
+            for next_offset in [None, Some(0)] {
+                let reply = AgentFrame {
+                    message: AgentMessage::ForwardedSharedInstallReply {
+                        request: request.correlation(),
+                        next_offset,
+                    },
+                    ..frame.clone()
+                };
+                assert_eq!(AgentFrame::decode(&reply.encode().unwrap()).unwrap(), reply);
+            }
+            // The nested request limit is checked before its body is copied.
+            let length_at = 4 + 2 + 4 * 32 + 1 + 5 * 32;
+            let mut oversized = bytes;
+            oversized[length_at..length_at + 4]
+                .copy_from_slice(&((MAX_MANAGEMENT_REQUEST_WIRE_BYTES + 1) as u32).to_le_bytes());
+            assert!(AgentFrame::decode(&oversized).is_err());
+        }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    #[test]
+    fn forwarded_shared_install_chunks_cannot_stage_another_package_or_final_catalog() {
+        let (route, mut request) = forwarded_shared_install_for_test(true);
+        let ForwardedSharedInstallOperation::Chunk(chunk) = &request.operation else {
+            unreachable!();
+        };
+        let manifest = chunk.manifest().clone();
+        let mut refs = manifest.artifacts().to_vec();
+        refs.push(crate::service::BlobRef::of_bytes(b"another artifact"));
+        refs.sort_by_key(|reference| reference.hash);
+        let index = refs
+            .iter()
+            .position(|reference| reference == chunk.artifact())
+            .unwrap();
+        let final_catalog =
+            crate::agent::shared_raft::ArtifactBatchManifest::new(manifest.route(), refs).unwrap();
+        request.operation = ForwardedSharedInstallOperation::Chunk(
+            ArtifactChunk::new(final_catalog, index as u32, 0, chunk.bytes().to_vec()).unwrap(),
+        );
+        assert!(!request.is_valid(route));
+
+        let (route, mut request) = forwarded_shared_install_for_test(true);
+        let ForwardedSharedInstallOperation::Chunk(chunk) = &request.operation else {
+            unreachable!();
+        };
+        let wrong = b"replacement package".to_vec();
+        let manifest = crate::agent::shared_raft::ArtifactBatchManifest::new(
+            chunk.manifest().route(),
+            vec![crate::service::BlobRef::of_bytes(&wrong)],
+        )
+        .unwrap();
+        request.operation = ForwardedSharedInstallOperation::Chunk(
+            ArtifactChunk::new(manifest, 0, 0, wrong).unwrap(),
+        );
+        assert!(!request.is_valid(route));
+    }
+
     fn id<const BYTE: u8>() -> [u8; 32] {
         [BYTE; 32]
     }
 
     #[test]
-    fn recovery_expiry_wire_is_canonical_bounded_and_route_bound() {
-        let claim = recovery_expiry_claim_for_test();
-        let generation = claim.generation();
-        let sender = NodeId(claim.committee().members()[0].replica().node.0);
+    fn management_recovery_command_wire_is_owner_bound_canonical_and_metadata_only() {
+        let commands = management_recovery_commands_for_test();
+        let command_route = commands[0].route();
+        let template = crate::agent::shared_recovery::management_recovery_fixture_for_test(1, 9);
+        let generation = template.generation();
         let frame = AgentFrame {
             route: AgentGenerationRoute {
                 space: SpaceId(generation.space().0),
                 agent: AgentId(generation.agent().0),
                 generation: Hash(generation.replication_id()),
             },
-            sender,
-            message: AgentMessage::RecoveryExpiryVoteRequest(claim.clone()),
+            sender: NodeId(template.owner().0),
+            message: AgentMessage::ManagementRecoveryCommandRequest(commands[0].clone()),
         };
-        for field in 0..3 {
-            let mut wrong = frame.clone();
-            match field {
-                0 => wrong.route.space = SpaceId(id::<99>()),
-                1 => wrong.route.agent = AgentId(id::<99>()),
-                _ => wrong.route.generation = Hash(id::<99>()),
-            }
-            assert!(wrong.encode().is_err());
-        }
-        let encoded = frame.encode().unwrap();
-        let body = 4 + 2 + 4 * 32 + 1;
-        let mut oversized = encoded.clone();
-        oversized[body..body + 4]
-            .copy_from_slice(&((MAX_SHARED_RECOVERY_EXPIRY_CLAIM_BYTES + 1) as u32).to_le_bytes());
-        assert!(AgentFrame::decode(&oversized).is_err());
-        for message in [
-            frame.message.clone(),
-            AgentMessage::RecoveryExpiryRequest {
-                request: Hash(claim.request().0),
-            },
-            AgentMessage::RecoveryExpiryReply {
-                request: Hash(claim.request().0),
-                applied: false,
-            },
-            AgentMessage::RecoveryExpiryReply {
-                request: Hash(claim.request().0),
-                applied: true,
-            },
-            AgentMessage::RecoveryExpiryVoteReply {
-                claim: Hash(claim.commitment().0),
-                signature: None,
-            },
-            AgentMessage::RecoveryExpiryVoteReply {
-                claim: Hash(claim.commitment().0),
-                signature: Some(
-                    ReplicaCommitSignature::new(crate::service::NodeId(sender.0), [7; 64]).unwrap(),
-                ),
-            },
-        ] {
+        let owner_peer = Keypair::ed25519_from_bytes([1; 32])
+            .unwrap()
+            .public()
+            .to_peer_id();
+        let other_peer = Keypair::ed25519_from_bytes([2; 32])
+            .unwrap()
+            .public()
+            .to_peer_id();
+        assert!(authenticate_sender(&other_peer, frame.clone()).is_err());
+        for command in commands {
             let item = AgentFrame {
-                message,
+                message: AgentMessage::ManagementRecoveryCommandRequest(command.clone()),
                 ..frame.clone()
             };
             let bytes = item.encode().unwrap();
-            assert!(bytes.len() <= MAX_SHARED_RECOVERY_EXPIRY_CLAIM_BYTES + 256);
+            assert!(bytes.len() <= MAX_AGENT_RAFT_COMMAND_BYTES + 256);
             assert_eq!(AgentFrame::decode(&bytes).unwrap(), item);
+            authenticate_sender(&owner_peer, item.clone()).unwrap();
             for end in 0..bytes.len() {
                 assert!(AgentFrame::decode(&bytes[..end]).is_err());
             }
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            assert_eq!(
+                AgentFrame::decode(&trailing),
+                Err(AgentProtocolError::TrailingBytes)
+            );
+            let body = 4 + 2 + 4 * 32 + 1;
+            let mut oversized = bytes;
+            oversized[body..body + 4]
+                .copy_from_slice(&((MAX_AGENT_RAFT_COMMAND_BYTES + 1) as u32).to_le_bytes());
+            assert!(AgentFrame::decode(&oversized).is_err());
+            for field in 0..4 {
+                let mut wrong = item.clone();
+                match field {
+                    0 => wrong.sender = NodeId(id::<99>()),
+                    1 => wrong.route.space = SpaceId(id::<99>()),
+                    2 => wrong.route.agent = AgentId(id::<99>()),
+                    _ => wrong.route.generation = Hash(id::<99>()),
+                }
+                assert!(wrong.encode().is_err());
+            }
+            for applied in [false, true] {
+                let reply = AgentFrame {
+                    message: AgentMessage::ManagementRecoveryCommandReply {
+                        command: Hash(command.commitment().0),
+                        applied,
+                    },
+                    ..item.clone()
+                };
+                assert_eq!(AgentFrame::decode(&reply.encode().unwrap()).unwrap(), reply);
+            }
+        }
+        let observation =
+            crate::agent::shared_recovery::management_observation_for_test(&template, 2, false);
+        for ordinary in [AgentRaftCommand::Ordered {
+            route: command_route,
+            artifact_batch: None,
+            entry: crate::agent::journal::OrderedEntry {
+                genesis: generation.genesis(),
+                index: 1,
+                parent: None,
+                merge_frontier: observation.observation().claim().merge_frontier(),
+                merge_seal: None,
+                input: observation.observation().input().clone(),
+            },
+        }] {
+            ordinary.validate().unwrap();
+            let mut wrong = frame.clone();
+            wrong.message = AgentMessage::ManagementRecoveryCommandRequest(ordinary.clone());
+            assert!(wrong.encode().is_err());
+            // Exercise decode's whitelist independently of the encoder.
+            let mut bytes = Vec::from(MAGIC);
+            bytes.extend_from_slice(&VERSION.to_le_bytes());
+            let mut encoder = Encoder(&mut bytes);
+            encode_route(&mut encoder, frame.route);
+            encoder.fixed(frame.sender.as_bytes());
+            encoder.u8(TAG_MANAGEMENT_RECOVERY_COMMAND_REQUEST);
+            encoder.bytes(&ordinary.encode());
+            assert_eq!(
+                AgentFrame::decode(&bytes),
+                Err(AgentProtocolError::InvalidValue)
+            );
+        }
+    }
+
+    #[test]
+    fn management_recovery_operation_wire_binds_exact_kind_and_rejects_unknown_or_empty_scope() {
+        let route = AgentGenerationRoute {
+            space: SpaceId(id::<1>()),
+            agent: AgentId(id::<2>()),
+            generation: Hash(id::<3>()),
+        };
+        let request = ManagementRecoveryOperationRequest {
+            registration: Hash(id::<4>()),
+            member: Hash(id::<5>()),
+            operation: ManagementRecoveryOperation::Invoke,
+        };
+        let ack = ManagementRecoveryOperationRequest {
+            operation: ManagementRecoveryOperation::Acknowledge,
+            ..request
+        };
+        assert_ne!(request.correlation(), ack.correlation());
+        for request in [request, ack] {
+            let frame = AgentFrame {
+                route,
+                sender: NodeId(id::<6>()),
+                message: AgentMessage::ManagementRecoveryOperationRequest(request),
+            };
+            let bytes = frame.encode().unwrap();
+            assert_eq!(bytes.len(), 4 + 2 + 4 * 32 + 1 + 2 * 32 + 1);
+            assert_eq!(AgentFrame::decode(&bytes).unwrap(), frame);
+            for end in 0..bytes.len() {
+                assert!(AgentFrame::decode(&bytes[..end]).is_err());
+            }
+            let mut unknown_kind = bytes.clone();
+            *unknown_kind.last_mut().unwrap() = 2;
+            assert_eq!(
+                AgentFrame::decode(&unknown_kind),
+                Err(AgentProtocolError::InvalidValue)
+            );
             let mut trailing = bytes;
             trailing.push(0);
             assert_eq!(
                 AgentFrame::decode(&trailing),
                 Err(AgentProtocolError::TrailingBytes)
             );
+            for field in 0..2 {
+                let mut empty = request;
+                if field == 0 {
+                    empty.registration = Hash::ZERO;
+                } else {
+                    empty.member = Hash::ZERO;
+                }
+                assert!(
+                    AgentFrame {
+                        message: AgentMessage::ManagementRecoveryOperationRequest(empty),
+                        ..frame.clone()
+                    }
+                    .encode()
+                    .is_err()
+                );
+            }
+            for applied in [false, true] {
+                let reply = AgentFrame {
+                    message: AgentMessage::ManagementRecoveryOperationReply {
+                        request: request.correlation(),
+                        applied,
+                    },
+                    ..frame.clone()
+                };
+                assert_eq!(AgentFrame::decode(&reply.encode().unwrap()).unwrap(), reply);
+            }
         }
         for message in [
-            AgentMessage::RecoveryExpiryRequest {
-                request: Hash::ZERO,
-            },
-            AgentMessage::RecoveryExpiryReply {
-                request: Hash::ZERO,
+            AgentMessage::ManagementRecoveryCommandReply {
+                command: Hash::ZERO,
                 applied: true,
             },
-            AgentMessage::RecoveryExpiryVoteReply {
-                claim: Hash::ZERO,
-                signature: None,
-            },
-            AgentMessage::RecoveryExpiryVoteReply {
-                claim: Hash(claim.commitment().0),
-                signature: Some(
-                    ReplicaCommitSignature::new(crate::service::NodeId(id::<98>()), [7; 64])
-                        .unwrap(),
-                ),
+            AgentMessage::ManagementRecoveryOperationReply {
+                request: Hash::ZERO,
+                applied: true,
             },
         ] {
             assert!(
                 AgentFrame {
-                    message,
-                    ..frame.clone()
+                    route,
+                    sender: NodeId(id::<6>()),
+                    message
                 }
                 .encode()
                 .is_err()
             );
         }
-        let mut noncanonical = AgentFrame {
-            message: AgentMessage::RecoveryExpiryReply {
-                request: Hash(claim.request().0),
-                applied: true,
-            },
-            ..frame
-        }
-        .encode()
-        .unwrap();
-        *noncanonical.last_mut().unwrap() = 2;
-        assert!(AgentFrame::decode(&noncanonical).is_err());
-    }
-
-    #[test]
-    fn recovery_registration_wire_is_bounded_canonical_and_route_bound() {
-        let registration = crate::agent::shared_recovery::recovery_registration_for_test(1, 7);
-        let generation = registration.generation();
-        // The authenticated relay may differ from the custody owner; the
-        // latter's signature remains inside the unchanged registration.
-        let request = AgentFrame {
-            route: AgentGenerationRoute {
-                space: SpaceId(generation.space().0),
-                agent: AgentId(generation.agent().0),
-                generation: Hash(generation.replication_id()),
-            },
-            sender: node(&peer(80)),
-            message: AgentMessage::RecoveryRegistrationRequest(registration.clone()),
-        };
-        let encoded = request.encode().unwrap();
-        assert!(encoded.len() <= MAX_SHARED_RECOVERY_REGISTRATION_BYTES + 256);
-        assert_eq!(AgentFrame::decode(&encoded).unwrap(), request);
-        for field in 0..3 {
-            let mut wrong = request.clone();
-            match field {
-                0 => wrong.route.space = SpaceId(id::<99>()),
-                1 => wrong.route.agent = AgentId(id::<99>()),
-                _ => wrong.route.generation = Hash(id::<99>()),
-            }
-            assert!(wrong.encode().is_err());
-        }
-        let body = 4 + 2 + 4 * 32 + 1;
-        let mut oversized = encoded.clone();
-        oversized[body..body + 4]
-            .copy_from_slice(&((MAX_SHARED_RECOVERY_REGISTRATION_BYTES + 1) as u32).to_le_bytes());
-        assert!(AgentFrame::decode(&oversized).is_err());
-        for end in 0..encoded.len() {
-            assert!(AgentFrame::decode(&encoded[..end]).is_err());
-        }
-        let mut trailing = encoded;
-        trailing.push(0);
-        assert_eq!(
-            AgentFrame::decode(&trailing),
-            Err(AgentProtocolError::TrailingBytes)
-        );
-        for applied in [false, true] {
-            let response = AgentFrame {
-                message: AgentMessage::RecoveryRegistrationReply {
-                    registration: Hash(registration.commitment().0),
-                    applied,
-                },
-                ..request.clone()
-            };
-            let encoded = response.encode().unwrap();
-            assert_eq!(AgentFrame::decode(&encoded).unwrap(), response);
-            for end in 0..encoded.len() {
-                assert!(AgentFrame::decode(&encoded[..end]).is_err());
-            }
-        }
-        let mut zero = request;
-        zero.message = AgentMessage::RecoveryRegistrationReply {
-            registration: Hash([0; 32]),
-            applied: true,
-        };
-        assert!(zero.encode().is_err());
     }
 
     #[test]
@@ -1945,6 +2477,92 @@ mod tests {
 
     fn node(peer: &PeerId) -> NodeId {
         NodeId::of_authenticated_peer(&peer.to_bytes())
+    }
+
+    #[test]
+    fn authority_read_barrier_frames_are_exact_bounded_and_canonical() {
+        let sender = node(&peer(80));
+        let request = Hash(id::<4>());
+        let frame = AgentFrame {
+            route: route(),
+            sender,
+            message: AgentMessage::AuthorityReadBarrierRequest(AuthorityReadBarrierRequest {
+                request,
+            }),
+        };
+        let field_offset = 4 + 2 + 4 * 32 + 1;
+        let encoded = frame.encode().unwrap();
+        assert_eq!(encoded.len(), field_offset + 32);
+        assert_eq!(AgentFrame::decode(&encoded).unwrap(), frame);
+        let barrier = AuthorityReadBarrier {
+            request,
+            leader: sender,
+            raft_term: 3,
+            read_index: 7,
+            configuration_index: 0,
+        };
+        for barrier in [None, Some(barrier)] {
+            let reply = AgentFrame {
+                message: AgentMessage::AuthorityReadBarrierReply { request, barrier },
+                ..frame.clone()
+            };
+            let bytes = reply.encode().unwrap();
+            assert_eq!(
+                bytes.len(),
+                field_offset + 32 + 1 + barrier.map_or(0, |_| 88)
+            );
+            assert_eq!(AgentFrame::decode(&bytes).unwrap(), reply);
+            for end in 0..bytes.len() {
+                assert!(AgentFrame::decode(&bytes[..end]).is_err());
+            }
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            assert_eq!(
+                AgentFrame::decode(&trailing),
+                Err(AgentProtocolError::TrailingBytes)
+            );
+            let mut malformed = bytes;
+            malformed[field_offset + 32] = 2;
+            assert!(AgentFrame::decode(&malformed).is_err());
+        }
+        let mut zero_request = encoded;
+        zero_request[field_offset..].fill(0);
+        assert_eq!(
+            AgentFrame::decode(&zero_request),
+            Err(AgentProtocolError::InvalidValue)
+        );
+        for fault in 0..6 {
+            let mut altered = barrier;
+            match fault {
+                0 => altered.request = Hash::ZERO,
+                1 => altered.request = Hash(id::<5>()),
+                2 => altered.leader = NodeId::ZERO,
+                3 => altered.raft_term = 0,
+                4 => altered.read_index = 0,
+                5 => altered.configuration_index = 8,
+                _ => unreachable!(),
+            }
+            let reply = AgentFrame {
+                message: AgentMessage::AuthorityReadBarrierReply {
+                    request,
+                    barrier: Some(altered),
+                },
+                ..frame.clone()
+            };
+            assert_eq!(reply.encode(), Err(AgentProtocolError::InvalidValue));
+        }
+        let different_sender = AgentFrame {
+            sender: node(&peer(81)),
+            message: AgentMessage::AuthorityReadBarrierReply {
+                request,
+                barrier: Some(barrier),
+            },
+            ..frame
+        };
+        assert_eq!(
+            different_sender.encode(),
+            Err(AgentProtocolError::InvalidValue)
+        );
     }
 
     #[test]
@@ -2144,97 +2762,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn projection_queue_frames_bind_scope_sender_and_exact_query() {
-        use vos_agent_sdk::authority::{
-            AgentAuthorityBinding, AuthorityActorTarget, AuthorityIngressAuthentication,
-            AuthorityProjectionSelector,
-        };
-        let peer = peer(81);
-        let public_key = [82; 32];
-        let credential_public_key = [83; 32];
-        let route = route();
-        let query = AuthorityProjectionQuery {
-            recovery: None,
-            authority: AuthorityActorTarget {
-                space: route.space,
-                system_agent: route.agent,
-                system_runtime_deployment: DeploymentId([84; 32]),
-                binding: AgentAuthorityBinding {
-                    policy: Hash([85; 32]),
-                    issuer: AuthorityIssuer {
-                        principal: PrincipalId([86; 32]),
-                        actor: ActorId([87; 32]),
-                        deployment: DeploymentId([88; 32]),
-                        program: ProgramId([89; 32]),
-                        producer: ProducerId::of_public_key(&public_key),
-                    },
-                    public_key,
-                    initial_epoch: 1,
-                },
-            },
-            credential: CredentialId::of_public_key(&credential_public_key),
-            nonce: Hash([90; 32]),
-            selector: AuthorityProjectionSelector::Credential,
-            authentication: AuthorityIngressAuthentication::SshNodeAttestation {
-                credential_public_key,
-                node: node(&peer),
-                request_binding: Hash([91; 32]),
-                signature: [92; 64],
-            },
-        };
-        let frame = AgentFrame {
-            route,
-            sender: node(&peer),
-            message: AgentMessage::ProjectionRequest(query.clone()),
-        };
-        let bytes = frame.encode().unwrap();
-        assert_eq!(AgentFrame::decode(&bytes).unwrap(), frame);
-        for end in 0..bytes.len() {
-            assert!(AgentFrame::decode(&bytes[..end]).is_err());
-        }
-        let mut trailing = bytes.clone();
-        trailing.push(0);
-        assert!(AgentFrame::decode(&trailing).is_err());
-        let mut wrong = frame.clone();
-        wrong.route.agent = AgentId([93; 32]);
-        assert!(wrong.encode().is_err());
-        wrong = frame.clone();
-        wrong.sender = NodeId([94; 32]);
-        assert!(wrong.encode().is_err());
-        // Only the recovery-only message can relay another node's signed
-        // query. The receiving owner must additionally prove local Invoke
-        // evidence; this codec check is not execution authorization.
-        wrong.message = AgentMessage::ProjectionRecoveryRequest(query.clone());
-        let recovery_bytes = wrong.encode().unwrap();
-        assert_eq!(AgentFrame::decode(&recovery_bytes).unwrap(), wrong);
-        for end in 0..recovery_bytes.len() {
-            assert!(AgentFrame::decode(&recovery_bytes[..end]).is_err());
-        }
-        wrong.route.agent = AgentId([93; 32]);
-        assert!(wrong.encode().is_err());
-        for accepted in [false, true] {
-            let reply = AgentFrame {
-                route,
-                sender: node(&peer),
-                message: AgentMessage::ProjectionAccepted {
-                    request: query.commitment(),
-                    accepted,
-                },
-            };
-            assert_eq!(AgentFrame::decode(&reply.encode().unwrap()).unwrap(), reply);
-        }
-        let empty = AgentFrame {
-            route,
-            sender: node(&peer),
-            message: AgentMessage::ProjectionAccepted {
-                request: Hash::ZERO,
-                accepted: true,
-            },
-        };
-        assert!(empty.encode().is_err());
-    }
-
     fn receipt(work: &InvocationWork) -> AuthorityReceipt {
         let public_key = id::<41>();
         AuthorityReceipt {
@@ -2332,6 +2859,27 @@ mod tests {
         let bytes = frame.encode().expect("valid frame encodes");
         assert!(bytes.len() <= MAX_FRAME_BYTES);
         assert_eq!(AgentFrame::decode(&bytes), Ok(frame));
+    }
+
+    #[test]
+    fn retired_projection_recovery_tags_are_unknown_and_not_reused() {
+        let sender_peer = peer(81);
+        let bytes = AgentFrame {
+            route: route(),
+            sender: node(&sender_peer),
+            message: AgentMessage::Raft(RaftMessage::StatusRequest),
+        }
+        .encode()
+        .unwrap();
+        let message_offset = 4 + 2 + 4 * 32;
+        for tag in [0x13, 0x14, 0x15, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f] {
+            let mut retired = bytes.clone();
+            retired[message_offset] = tag;
+            assert_eq!(
+                AgentFrame::decode(&retired),
+                Err(AgentProtocolError::UnknownMessage(tag))
+            );
+        }
     }
 
     #[test]

@@ -102,6 +102,7 @@ impl Default for AgentSupervisorLimits {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentRouteError {
     NotReady,
+    Busy,
     Rejected,
     Unavailable,
 }
@@ -1253,7 +1254,10 @@ impl SupervisorWorker {
             return Err(());
         }
         if let Err(error) = result {
-            if error != AgentSupervisorError::Route(AgentRouteError::Rejected) {
+            if !matches!(
+                error,
+                AgentSupervisorError::Route(AgentRouteError::Rejected | AgentRouteError::Busy)
+            ) {
                 self.cancel_attachment_dispatches(pending.attachment, shared);
                 result = Err(self.fail_attachment(pending.attachment, shared, error));
             }
@@ -2811,6 +2815,31 @@ mod tests {
         assert_eq!(handle.snapshot(identity.key()).unwrap(), snapshot);
         assert_eq!(handle.dispatch(snapshot, vec![4]).unwrap(), vec![4]);
         owner.shutdown_and_join().unwrap();
+    }
+
+    #[test]
+    fn busy_request_retains_exact_attachment_and_next_dispatch() {
+        let mut owner = AgentSupervisorOwner::start(limits(4, 2, 2, 64)).unwrap();
+        let handle = owner.handle();
+        let identity = identity(1, 2, 3, AgentProfile::Shared);
+        let record = Arc::new(WorkerRecord::default());
+        owner
+            .attach(attachment(
+                vec![identity],
+                FakeRoute::with_dispatch(DispatchBehavior::Error(AgentRouteError::Busy)),
+                record.clone(),
+            ))
+            .unwrap();
+        let snapshot = handle.snapshot(identity.key()).unwrap();
+        assert_eq!(
+            handle.dispatch(snapshot, vec![3]),
+            Err(AgentSupervisorError::Route(AgentRouteError::Busy))
+        );
+        assert_eq!(handle.snapshot(identity.key()).unwrap(), snapshot);
+        assert!(!record.joined.load(Ordering::Acquire));
+        assert_eq!(handle.dispatch(snapshot, vec![4]).unwrap(), vec![4]);
+        owner.shutdown_and_join().unwrap();
+        assert!(record.joined.load(Ordering::Acquire));
     }
 
     #[test]

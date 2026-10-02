@@ -19,6 +19,9 @@ pub trait NativeAuthorityOperationCompletionStore {
     type Error;
     fn load(&mut self) -> Result<Vec<Vec<u8>>, Self::Error>;
     fn retain(&mut self, certificate: &[u8]) -> Result<(), Self::Error>;
+    fn remove_retired(&mut self, _certificate: &[u8], _terminal: &[u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 // Legacy/test construction has no completion persistence. It must never
@@ -178,8 +181,35 @@ where
         &mut self,
         invocations: &[InvocationId],
     ) -> Result<NativeAuthorityOperationStartupAdmission<'_>, SharedAgentHostError> {
+        let mut seen = std::collections::BTreeSet::new();
+        if invocations.len() > 2 * MAX_AUTHORITY_OPERATION_COORDINATOR_RECORDS
+            || invocations
+                .iter()
+                .any(|id| *id == InvocationId::ZERO || !seen.insert(*id))
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
         self.validate()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
+        // Reconciliation may have removed only archive-proved hot records.
+        // Re-read bounded discovery rather than treating the caller's earlier
+        // pre-compaction snapshot as fresh pending work.
+        let active = self
+            .journal
+            .active_invocations()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let invocations = if let Some(active) = active.as_ref() {
+            if active.iter().any(|id| !invocations.contains(id)) {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            for id in invocations.iter().filter(|id| !active.contains(id)) {
+                self.retired_pair(*id)?
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            }
+            active.as_slice()
+        } else {
+            invocations
+        };
         let certificates = self
             .completions
             .load()
@@ -207,6 +237,249 @@ where
         self.authority
     }
 
+    fn retired_pair(
+        &mut self,
+        invocation: InvocationId,
+    ) -> Result<
+        Option<(
+            [Vec<u8>; 3],
+            operation_dispatch::RetainedNativeOperationRetirement,
+        )>,
+        SharedAgentHostError,
+    > {
+        let Some(bytes) = self
+            .journal
+            .load_retired(invocation)
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        else {
+            return Ok(None);
+        };
+        if !operation_dispatch::native_operation_retired_pair_matches(
+            self.authority,
+            invocation,
+            &bytes[0],
+            &bytes[1],
+            &bytes[2],
+        ) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let authorization =
+            operation_dispatch::RetainedAuthorityOperationDispatch::decode(&bytes[0])
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let acknowledgement =
+            operation_dispatch::RetainedAuthorityOperationDispatch::decode(&bytes[1])
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let terminal = operation_dispatch::restore_retired_operation_pair(
+            self.authority,
+            &authorization,
+            &acknowledgement,
+            &bytes[2],
+        )?;
+        Ok(Some((bytes, terminal)))
+    }
+
+    fn retired_for_call(
+        &mut self,
+        call: &AuthorityOperationCall,
+        context: Option<&InvocationContext>,
+        issued_at: Option<u64>,
+    ) -> Result<Option<(InvocationContext, IssuedAuthorityOperation)>, SharedAgentHostError> {
+        if let Some((bytes, terminal)) = self.retired_pair(call.invocation)? {
+            let (authorization, _) = terminal.dispatches();
+            let issued = terminal.issued()?;
+            if authorization.request
+                != call
+                    .encode()
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+                || context.is_some_and(|context| context != &authorization.context)
+                || issued_at.is_some_and(|slot| slot != issued.issuance_ack.issued_at)
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            if !self
+                .journal
+                .retain_retired([&bytes[0], &bytes[1]], &bytes[2])
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            {
+                return Err(SharedAgentHostError::Unavailable);
+            }
+            return Ok(Some((authorization.context.clone(), issued)));
+        }
+        let acknowledgement = crate::agent::sdk::authority_operation::AuthorityOperationApproval
+            ::derive_acknowledgement_invocation(call);
+        if self.retired_pair(acknowledgement)?.is_some() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        Ok(None)
+    }
+
+    /// Reconcile one bounded hot set against targeted immutable terminal
+    /// witnesses before opening the strict coordinator/issuer pair. This is
+    /// restartable after either image or any hot-index publication fails.
+    fn compact_retired(&mut self) -> Result<(), SharedAgentHostError> {
+        if !self.journal.supports_retired_archive() {
+            return Ok(());
+        }
+        let mut jobs = std::collections::BTreeMap::new();
+        let mut covered = std::collections::BTreeSet::new();
+        let certificates = self
+            .retirements
+            .load()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if certificates.len() > MAX_AUTHORITY_OPERATION_COORDINATOR_RECORDS {
+            return Err(SharedAgentHostError::CapacityExhausted);
+        }
+        for certificate in certificates {
+            let completion = native_operation_retirement_completion(
+                &self.authority.binding.public_key,
+                &certificate,
+            )
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            let ids = native_operation_completion_invocations(
+                &self.authority.binding.public_key,
+                &completion,
+            )
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            let a = self
+                .journal
+                .load(ids[0])
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            let b = self
+                .journal
+                .load(ids[1])
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            let record = operation_dispatch::RetainedAuthorityOperationDispatch::decode(&a)
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            let call = AuthorityOperationCall::decode(&record.request().request)
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            if matches!(
+                call.intent,
+                crate::agent::sdk::authority_operation::AuthorityOperationIntent::InvokeActor { .. }
+            ) && call.intent.managed().profile != crate::agent::sdk::AgentProfile::Private
+            {
+                if ids.iter().any(|id| covered.contains(id)) {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                covered.extend(ids);
+                if jobs.insert(ids[0], [a, b, certificate]).is_some() {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+            }
+        }
+        // A crash may already have removed the hot certificate while leaving
+        // one NOD. Its archived exact proof, never absence, resumes cleanup.
+        for id in self
+            .journal
+            .active_invocations()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .unwrap_or_default()
+        {
+            if covered.contains(&id) {
+                continue;
+            }
+            if let Some((bytes, terminal)) = self.retired_pair(id)? {
+                let ids = [
+                    terminal.dispatches().0.context.invocation,
+                    terminal.dispatches().1.context.invocation,
+                ];
+                if ids.iter().any(|id| covered.contains(id)) {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                covered.extend(ids);
+                if jobs.insert(ids[0], bytes).is_some() {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+            }
+        }
+        if jobs.len() > MAX_AUTHORITY_OPERATION_COORDINATOR_RECORDS {
+            return Err(SharedAgentHostError::CapacityExhausted);
+        }
+        for (id, bytes) in jobs {
+            if !operation_dispatch::native_operation_retired_pair_matches(
+                self.authority,
+                id,
+                &bytes[0],
+                &bytes[1],
+                &bytes[2],
+            ) {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            let a = operation_dispatch::RetainedAuthorityOperationDispatch::decode(&bytes[0])
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            let b = operation_dispatch::RetainedAuthorityOperationDispatch::decode(&bytes[1])
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            let terminal = operation_dispatch::restore_retired_operation_pair(
+                self.authority,
+                &a,
+                &b,
+                &bytes[2],
+            )?;
+            let coordinator =
+                crate::agent::authority_operation_coordinator::compact_native_operation_terminal(
+                    &mut self.coordinator,
+                    self.authority,
+                    &terminal,
+                    false,
+                )
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            let issuer =
+                crate::agent::authority_operation_issuer::compact_native_operation_terminal(
+                    &mut self.issuer,
+                    self.authority,
+                    &terminal,
+                    false,
+                )
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            if !coordinator || !issuer {
+                continue;
+            }
+            if !self
+                .journal
+                .retain_retired([&bytes[0], &bytes[1]], &bytes[2])
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            {
+                return Err(SharedAgentHostError::Unavailable);
+            }
+            if !crate::agent::authority_operation_coordinator::compact_native_operation_terminal(
+                &mut self.coordinator,
+                self.authority,
+                &terminal,
+                true,
+            )
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            if !crate::agent::authority_operation_issuer::compact_native_operation_terminal(
+                &mut self.issuer,
+                self.authority,
+                &terminal,
+                true,
+            )
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            let completion = native_operation_retirement_completion(
+                &self.authority.binding.public_key,
+                &bytes[2],
+            )
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            self.completions
+                .remove_retired(&completion, &bytes[2])
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            self.retirements
+                .remove_retired(&bytes[2])
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            self.journal
+                .remove_retired([&bytes[0], &bytes[1]], &bytes[2])
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+        }
+        Ok(())
+    }
+
     /// Prepare signed call ingress at the authoritative host clock and persist
     /// native work before returning its immutable authorization context. This
     /// performs no policy execution, receipt issuance or reservation release.
@@ -225,17 +498,23 @@ where
         }
         self.validate()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if let Some((context, _)) = self.retired_for_call(call, None, None)? {
+            return Ok(context);
+        }
         operation_dispatch::NativeAuthorityOperationDispatcher::new(owner, &mut self.journal)
             .prepare_call(call)
     }
 
-    /// Read and cross-check both images without executing any operation.
+    /// Reconcile archive-certified older terminal rows, then cross-check both
+    /// active images without executing or signing any operation.
     pub fn validate(
         &mut self,
     ) -> Result<
         (),
         NativeAuthorityOperationControllerError<C::Error, B::Error, core::convert::Infallible>,
     > {
+        self.compact_retired()
+            .map_err(NativeAuthorityOperationControllerError::Completion)?;
         let issuer =
             DurableAuthorityOperationIssuer::open(BorrowedIssuer(&mut self.issuer), self.authority)
                 .map_err(NativeAuthorityOperationControllerError::OpenIssuer)?;
@@ -382,6 +661,12 @@ where
         {
             return Err(NativeAuthorityOperationControllerError::WrongAuthority);
         }
+        if let Some((_, issued)) = self
+            .retired_for_call(call, Some(&context), Some(issued_at))
+            .map_err(NativeAuthorityOperationControllerError::Completion)?
+        {
+            return Ok(issued);
+        }
         // Borrow rather than move the backing stores: even failed opens retain
         // the controller's leases. Every call rereads both canonical images.
         let issuer =
@@ -418,13 +703,18 @@ where
         I: CleanManagementIssuerStore,
         S: AuthorityOperationEvidenceSigner + NativeAuthorityOperationCompletionSigner,
     {
-        if NativeAuthorityOperationCompletionSigner::public_key(signer)
-            != self.authority.binding.public_key
+        if owner.authority_target() != self.authority
+            || call.authority != self.authority
+            || NativeAuthorityOperationCompletionSigner::public_key(signer)
+                != self.authority.binding.public_key
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         self.validate()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if let Some((_, issued)) = self.retired_for_call(call, Some(&context), Some(issued_at))? {
+            return Ok(issued);
+        }
         let issued = self
             .coordinate(owner, call, context, issued_at, signer)
             .map_err(|_| SharedAgentHostError::Unavailable)?;
@@ -470,6 +760,9 @@ where
         }
         self.validate()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if let Some((_, issued)) = self.retired_for_call(call, Some(&context), Some(issued_at))? {
+            return Ok(NativeAuthorityOperationDecision::Issued(issued));
+        }
         for certificate in self
             .denials
             .load()
@@ -707,8 +1000,10 @@ where
             + NativeAuthorityOperationCompletionSigner
             + NativeAuthorityOperationRetirementSigner,
     {
-        if NativeAuthorityOperationRetirementSigner::public_key(signer)
-            != self.authority.binding.public_key
+        if owner.authority_target() != self.authority
+            || call.authority != self.authority
+            || NativeAuthorityOperationRetirementSigner::public_key(signer)
+                != self.authority.binding.public_key
             || NativeAuthorityOperationCompletionSigner::public_key(signer)
                 != self.authority.binding.public_key
         {
@@ -716,6 +1011,9 @@ where
         }
         self.validate()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if let Some((_, issued)) = self.retired_for_call(call, Some(&context), Some(issued_at))? {
+            return Ok(issued);
+        }
         let issued = self
             .coordinate(owner, call, context, issued_at, signer)
             .map_err(|_| SharedAgentHostError::Unavailable)?;

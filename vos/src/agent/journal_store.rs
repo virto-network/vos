@@ -787,6 +787,28 @@ pub(crate) trait AgentJournalGarbageCollection: AgentJournalStore {
         expected_heads: JournalHeadsId,
         limits: GcLimits,
     ) -> Result<JournalGc, JournalStoreError>;
+
+    #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+    fn preflight_external_genesis_checkpoint_garbage(
+        &mut self,
+        _genesis: &super::replay::ReplaySealedExternalGenesis,
+        _expected_heads: JournalHeadsId,
+        _limits: GcLimits,
+        _budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<(), JournalStoreError> {
+        Err(JournalStoreError::Unavailable)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+    fn collect_external_genesis_checkpoint_garbage(
+        &mut self,
+        _genesis: &super::replay::ReplaySealedExternalGenesis,
+        _expected_heads: JournalHeadsId,
+        _limits: GcLimits,
+        _budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<JournalGc, JournalStoreError> {
+        Err(JournalStoreError::Unavailable)
+    }
 }
 
 /// Physical namespace for opaque bytes authenticated by a journal manifest.
@@ -5501,13 +5523,6 @@ pub(crate) fn validate_gc_limits(limits: GcLimits) -> Result<(), JournalStoreErr
     Ok(())
 }
 
-fn fresh_gc_checkpoint<S: AgentJournalStore>(
-    store: &S,
-    expected_heads: JournalHeadsId,
-) -> Result<(JournalHeads, CheckpointManifest), JournalStoreError> {
-    fresh_gc_checkpoint_with_availability(store, expected_heads, None)
-}
-
 fn fresh_gc_checkpoint_with_availability<S: AgentJournalStore>(
     store: &S,
     expected_heads: JournalHeadsId,
@@ -6302,12 +6317,14 @@ fn validate_history_retirement_coverage<S: AgentJournalStore>(
     store: &S,
     expected_heads: JournalHeadsId,
     queue: &HistoryRetirementQueue,
+    availability: Option<&ExternalCheckpointValidation<'_>>,
 ) -> Result<(), JournalStoreError> {
     queue.validate()?;
     if queue.records.is_empty() {
         return Ok(());
     }
-    let (heads, checkpoint) = fresh_gc_checkpoint(store, expected_heads)?;
+    let (heads, checkpoint) =
+        fresh_gc_checkpoint_with_availability(store, expected_heads, availability)?;
     if queue.genesis != heads.genesis || queue.node != heads.node {
         return Err(JournalStoreError::Corrupt);
     }
@@ -9429,7 +9446,7 @@ impl AgentJournalGarbageCollection for MemoryAgentJournalStore {
             .as_ref()
             .ok_or(JournalStoreError::NotInitialized)?
             .clone();
-        validate_history_retirement_coverage(self, expected_heads, &history_queue)?;
+        validate_history_retirement_coverage(self, expected_heads, &history_queue, None)?;
         // The complete named retirement batch is authenticated before the GC
         // intent is installed. A missing/tampered stale node is corruption;
         // permanent history is never discovered by sweeping its namespace.
@@ -15813,7 +15830,7 @@ impl FileAgentJournalStore {
             build_gc_mark_with_availability(self, expected_heads, limits, availability)?;
         let heads = self.heads()?.ok_or(JournalStoreError::NotInitialized)?;
         let (history_queue, staged_history) = self.history_queue_and_stage(heads.genesis)?;
-        validate_history_retirement_coverage(self, expected_heads, &history_queue)?;
+        validate_history_retirement_coverage(self, expected_heads, &history_queue, availability)?;
         let authorized_missing = staged_history
             .as_ref()
             .map_or(&[][..], |(_, ids)| ids.as_slice());
@@ -16530,6 +16547,71 @@ impl ReverifiedRootJournalStore for FileAgentJournalStore {
 }
 
 impl AgentJournalGarbageCollection for FileAgentJournalStore {
+    #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+    fn preflight_external_genesis_checkpoint_garbage(
+        &mut self,
+        genesis: &super::replay::ReplaySealedExternalGenesis,
+        expected_heads: JournalHeadsId,
+        limits: GcLimits,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<(), JournalStoreError> {
+        validate_gc_limits(limits)?;
+        let heads = self.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+        if heads.id() != expected_heads
+            || self.read_fixed::<JournalHeads>("", "heads.next")?.is_some()
+            || self.history_candidate.is_some()
+            || self
+                .read_history_candidate_intent_file(HISTORY_CANDIDATE_INTENT_NAME)?
+                .is_some()
+            || self
+                .read_history_candidate_intent_file(HISTORY_CANDIDATE_INTENT_STAGE_NAME)?
+                .is_some()
+        {
+            return Err(JournalStoreError::Conflict);
+        }
+        // No recovery/promotion or unlink occurs here: even a late namespace
+        // quota refusal must precede retirement of Shared authority bindings.
+        super::replay::with_external_genesis_checkpoint_heads(
+            self,
+            &heads,
+            genesis,
+            budget,
+            |store, availability| {
+                let (intent, _) =
+                    build_gc_mark_with_availability(store, expected_heads, limits, availability)?;
+                let (queue, stage) = store.history_queue_and_stage(heads.genesis)?;
+                validate_history_retirement_coverage(store, expected_heads, &queue, availability)?;
+                let authorized_missing = stage.as_ref().map_or(&[][..], |(_, ids)| ids.as_slice());
+                store.validate_history_retirement_nodes(&queue, authorized_missing)?;
+                if store
+                    .gc_intent()?
+                    .is_some_and(|existing| existing != intent)
+                {
+                    return Err(JournalStoreError::Corrupt);
+                }
+                store.scan_gc_namespace(limits)?;
+                Ok(())
+            },
+        )
+    }
+
+    #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+    fn collect_external_genesis_checkpoint_garbage(
+        &mut self,
+        genesis: &super::replay::ReplaySealedExternalGenesis,
+        expected_heads: JournalHeadsId,
+        limits: GcLimits,
+        budget: &mut crate::agent_sdk::state_blocks::ReadBudget,
+    ) -> Result<JournalGc, JournalStoreError> {
+        FileAgentJournalStore::collect_external_genesis_checkpoint_garbage(
+            self,
+            genesis,
+            expected_heads,
+            limits,
+            budget,
+        )
+    }
+
     fn collect_garbage(
         &mut self,
         expected_heads: JournalHeadsId,
@@ -18819,6 +18901,28 @@ mod tests {
                                 } else {
                                     // Maintenance cannot use a stale head or an exhausted
                                     // root audit to begin unlinking candidate garbage.
+                                    let mut small_scan = gc_limits();
+                                    small_scan.max_scanned_files = 1;
+                                    assert!(matches!(
+                                        AgentJournalGarbageCollection::preflight_external_genesis_checkpoint_garbage(
+                                            &mut reopened,
+                                            sealed,
+                                            current.id(),
+                                            small_scan,
+                                            &mut ReadBudget::new(1000, 1000000),
+                                        ),
+                                        Err(JournalStoreError::LimitExceeded)
+                                    ));
+                                    assert_eq!(file_tree_snapshot(&root), snapshot);
+                                    AgentJournalGarbageCollection::preflight_external_genesis_checkpoint_garbage(
+                                        &mut reopened,
+                                        sealed,
+                                        current.id(),
+                                        gc_limits(),
+                                        &mut ReadBudget::new(1000, 1000000),
+                                    )
+                                    .unwrap();
+                                    assert_eq!(file_tree_snapshot(&root), snapshot);
                                     assert!(
                                         reopened
                                             .collect_external_genesis_checkpoint_garbage(

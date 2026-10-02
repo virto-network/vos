@@ -21,8 +21,8 @@ On Linux the clean Local workflow also exposes `space create-local-agent`,
 `space install-local-actor`, `space invoke-local` and exact retained-request
 submission/recovery commands. Use each command's `--help`; these are not the
 retired generic Agent/actor commands. An unknown top-level word is a usage
-error, never a dynamic actor name. Ordinary Shared-Agent genesis/finality is
-still unavailable. See [Getting started](getting-started.md) for Local setup
+error, never a dynamic actor name. The supported released fixed-three Shared
+workflow remains gated and unqualified. See [Getting started](getting-started.md) for Local setup
 and [current status](agent-saga-status.md) for test evidence and release gaps.
 
 `space invoke-local SPACE --intent PATH` consumes canonical ATQ1 bytes with a

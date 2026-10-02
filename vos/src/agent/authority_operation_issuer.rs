@@ -7,13 +7,15 @@
 //! controls) one mutually exclusive PCA2 applied or PAR1 retired-unapplied
 //! terminal acknowledgement.
 //!
-//! Records are intentionally never compacted here. AOI1 proves that the host
+//! Issuance never compacts records automatically. AOI1 proves that the host
 //! durably issued one receipt. PCA2 proves that a Private runtime durably
 //! reopened one control; PAR1 proves only that the unused capability was
 //! retired, without retaining a guest denial. Neither proves that the
 //! authority actor durably consumed the acknowledgement. Until separately
 //! reopenable authenticated consumption evidence is available, deleting
-//! retained preimages would make exact retry and collision checks unsafe.
+//! retained preimages would make exact retry and collision checks unsafe. Native
+//! v1 pruning additionally requires independently restored NRT1 consumption
+//! evidence and synchronized immutable exact-retry archival of both dispatches.
 
 use core::{convert::Infallible, fmt};
 
@@ -1760,6 +1762,114 @@ fn decode_completed(record: &RetainedOperation) -> Option<IssuedAuthorityOperati
     })
 }
 
+/// Prune only through an independently restored, immutable NRT1 witness.
+/// The caller must publish and reload its exact archive before setting apply.
+/// Reloading here permits completing a half-pruned pair before strict cross-image
+/// open; no live issuer handle or signing path is reused after this mutation.
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+pub(crate) fn compact_native_operation_terminal<S: AuthorityOperationIssuerStore>(
+    store: &mut S,
+    authority: AuthorityActorTarget,
+    terminal: &crate::agent::clean_bootstrap::RetainedNativeOperationRetirement,
+    apply: bool,
+) -> Result<bool, AuthorityOperationIssuerError<S::Error>> {
+    let (authorization, acknowledgement) = terminal.dispatches();
+    let issued = terminal
+        .issued()
+        .map_err(|_| AuthorityOperationIssuerError::InvalidState)?;
+    if authority != authorization.target
+        || acknowledgement.target != authority
+        || acknowledgement.method != super::authority_operation_coordinator::AuthorityOperationActorMethod::AcknowledgeIssuance
+        || issued.issuance_ack.encode().ok().as_deref() != Some(acknowledgement.request.as_slice())
+    {
+        return Err(AuthorityOperationIssuerError::InvalidState);
+    }
+    let bytes = store
+        .load()
+        .map_err(AuthorityOperationIssuerError::Storage)?
+        .ok_or(AuthorityOperationIssuerError::InvalidState)?;
+    let mut image = AuthorityOperationIssuerImage::decode(&bytes)
+        .map_err(|_| AuthorityOperationIssuerError::InvalidState)?;
+    if image.authority != authority || image.encode() != bytes {
+        return Err(AuthorityOperationIssuerError::InvalidState);
+    }
+    let eligible = compact_native_terminal_image(&mut image, authorization, &issued)
+        .map_err(|_| AuthorityOperationIssuerError::InvalidState)?;
+    if apply && eligible && image.encode() != bytes {
+        store
+            .commit(&image.encode())
+            .map_err(AuthorityOperationIssuerError::Storage)?;
+    }
+    Ok(eligible)
+}
+
+// The production caller supplies an opaque restored retirement above. This
+// pure image step grants neither archive durability nor actor application.
+#[cfg(any(
+    test,
+    all(feature = "storage", feature = "network", target_os = "linux")
+))]
+fn compact_native_terminal_image(
+    image: &mut AuthorityOperationIssuerImage,
+    authorization: &super::authority_operation_coordinator::AuthorityOperationActorDispatch,
+    issued: &IssuedAuthorityOperation,
+) -> Result<bool, ()> {
+    use super::authority_operation_coordinator::AuthorityOperationActorMethod;
+    let call = AuthorityOperationCall::decode(&authorization.request).map_err(|_| ())?;
+    if image.authority != authorization.target
+        || authorization.method != AuthorityOperationActorMethod::AuthorizeOperation
+        || !authorization.has_valid_request()
+        || issued.issuance_ack.authority != image.authority
+        || issued.issuance_ack.authorization_invocation != call.invocation
+        || issued.issuance_ack.receipt != issued.receipt
+    {
+        return Err(());
+    }
+    // This release does not compact Private issuance/resolution lineages.
+    if call.intent.managed().profile == AgentProfile::Private {
+        return Ok(false);
+    }
+    let acknowledgement = issued.issuance_ack.acknowledgement_invocation;
+    let index = image.records.iter().position(|record| {
+        retained_invocations(record)
+            .is_some_and(|ids| ids.contains(&call.invocation) || ids.contains(&acknowledgement))
+    });
+    let Some(index) = index else {
+        // A previous certified prune is idempotent only under a surviving
+        // non-regressed image floor. Empty/missing images cannot be repaired.
+        return if !image.records.is_empty()
+            && image
+                .issuance_slot_high_water
+                .is_some_and(|slot| slot >= issued.issuance_ack.issued_at)
+        {
+            Ok(true)
+        } else {
+            Err(())
+        };
+    };
+    let record = &image.records[index];
+    if record.call != authorization.request
+        || record.issued_at != issued.issuance_ack.issued_at
+        || decode_completed(record).as_ref() != Some(issued)
+    {
+        return Err(());
+    }
+    if record.private_resolution.is_some()
+        || image
+            .records
+            .iter()
+            .rposition(RetainedOperation::is_complete)
+            == Some(index)
+    {
+        return Ok(false);
+    }
+    image.records.remove(index);
+    if !image.is_valid() {
+        return Err(());
+    }
+    Ok(true)
+}
+
 struct RawEd25519Verifier;
 
 fn operation_call_has_valid_ingress_envelope(
@@ -3035,6 +3145,75 @@ mod tests {
     }
 
     #[test]
+    fn native_terminal_compaction_keeps_latest_completed_and_pending_floor() {
+        use crate::agent::authority_operation_coordinator::{
+            AuthorityOperationActorDispatch, AuthorityOperationActorMethod,
+        };
+        use crate::agent::sdk::InvocationContext;
+        let store = MemoryImageStore::default();
+        let mut signer = CountingSigner::new(0x19);
+        let fixture = Fixture::new(&signer);
+        let mut issuer = open(store.clone(), &fixture);
+        let mut completed = Vec::new();
+        for sequence in 1..=2 {
+            let (call, approval) = fixture.approved(sequence, sequence);
+            let issued = issuer.issue(&call, &approval, 20, &mut signer).unwrap();
+            let authorization = AuthorityOperationActorDispatch {
+                target: fixture.authority,
+                method: AuthorityOperationActorMethod::AuthorizeOperation,
+                context: InvocationContext {
+                    invocation: call.invocation,
+                    actor: fixture.authority.binding.issuer.actor,
+                    mode: MethodMode::Linear,
+                    origin: InvocationOrigin {
+                        principal: Some(call.principal),
+                        transport_node: call.authenticated_node(),
+                        credential: Some(call.credential),
+                        actor: None,
+                        capability: None,
+                    },
+                    roles: InvocationRoleClaims::none(),
+                    observed_slot: 20,
+                },
+                request: call.encode().unwrap(),
+            };
+            completed.push((authorization, issued));
+        }
+        let (pending, approval) = fixture.approved(3, 3);
+        signer.fail_receipt = true;
+        assert!(issuer.issue(&pending, &approval, 20, &mut signer).is_err());
+        let mut image = AuthorityOperationIssuerImage::decode(&store.image().unwrap()).unwrap();
+        let original = image.encode();
+        assert!(
+            !compact_native_terminal_image(&mut image, &completed[1].0, &completed[1].1).unwrap()
+        );
+        assert_eq!(image.encode(), original);
+        let mut changed = completed[0].1.clone();
+        changed.issuance_ack.signature[0] ^= 1;
+        assert!(compact_native_terminal_image(&mut image, &completed[0].0, &changed).is_err());
+        assert_eq!(image.encode(), original);
+        assert!(
+            compact_native_terminal_image(&mut image, &completed[0].0, &completed[0].1).unwrap()
+        );
+        assert_eq!(image.records.len(), 2);
+        assert_eq!(image.issuance_slot_high_water, Some(20));
+        assert_eq!(
+            image.records.last().unwrap().call,
+            pending.encode().unwrap()
+        );
+        let pruned = image.encode();
+        assert!(
+            compact_native_terminal_image(&mut image, &completed[0].0, &completed[0].1).unwrap()
+        );
+        assert_eq!(image.encode(), pruned);
+        assert!(image.is_valid());
+        let mut missing = AuthorityOperationIssuerImage::empty(fixture.authority);
+        assert!(
+            compact_native_terminal_image(&mut missing, &completed[0].0, &completed[0].1).is_err()
+        );
+    }
+
+    #[test]
     fn retained_journal_is_bounded_and_has_no_unsafe_compaction_path() {
         let store = MemoryImageStore::default();
         let mut signer = CountingSigner::new(0x19);
@@ -3126,6 +3305,49 @@ mod tests {
             &issued.issuance_ack.signing_bytes(),
             &issued.issuance_ack.signature,
         ));
+    }
+
+    #[test]
+    fn native_terminal_compaction_does_not_remove_private_lineage() {
+        use crate::agent::authority_operation_coordinator::{
+            AuthorityOperationActorDispatch, AuthorityOperationActorMethod,
+        };
+        use crate::agent::sdk::InvocationContext;
+        let store = MemoryImageStore::default();
+        let mut signer = CountingSigner::new(0x19);
+        let fixture = Fixture::new(&signer);
+        let mut issuer = open(store.clone(), &fixture);
+        let control = private_control(&fixture, 1);
+        let (call, approval) = fixture.approved_private(1, 1, &control);
+        let issued = issuer.issue(&call, &approval, 20, &mut signer).unwrap();
+        let (later, later_approval) = fixture.approved(2, 2);
+        issuer
+            .issue(&later, &later_approval, 20, &mut signer)
+            .unwrap();
+        let authorization = AuthorityOperationActorDispatch {
+            target: fixture.authority,
+            method: AuthorityOperationActorMethod::AuthorizeOperation,
+            context: InvocationContext {
+                invocation: call.invocation,
+                actor: fixture.authority.binding.issuer.actor,
+                mode: MethodMode::Linear,
+                origin: InvocationOrigin {
+                    principal: Some(call.principal),
+                    transport_node: call.authenticated_node(),
+                    credential: Some(call.credential),
+                    actor: None,
+                    capability: None,
+                },
+                roles: InvocationRoleClaims::none(),
+                observed_slot: 20,
+            },
+            request: call.encode().unwrap(),
+        };
+        let mut image = AuthorityOperationIssuerImage::decode(&store.image().unwrap()).unwrap();
+        assert!(image.records[0].private_resolution.is_some());
+        let before = image.encode();
+        assert!(!compact_native_terminal_image(&mut image, &authorization, &issued).unwrap());
+        assert_eq!(image.encode(), before);
     }
 
     #[test]

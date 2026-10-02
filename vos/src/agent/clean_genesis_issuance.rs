@@ -29,19 +29,6 @@ pub(crate) enum GenesisIssuanceError {
     InvalidSignature,
 }
 
-/// Data retained before query dispatch, not evidence that dispatch or finality
-/// occurred. Recovery must authenticate `anchor` against the live system store.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RetainedCommitteeQuery {
-    candidate: crate::service::Hash,
-    authorization: crate::agent_sdk::InvocationId,
-    pub(crate) anchor: crate::agent::clean_management_intent::ManagementJournalAnchor,
-    pub(crate) work: crate::agent_sdk::RuntimeWork,
-}
-
-const MAX_QUERY_BYTES: usize =
-    crate::agent::clean_authority_issuer::MAX_CLEAN_GENESIS_QUERY_IMAGE_BYTES;
-
 pub(crate) fn committee_query_invocation(
     candidate: &AuthorizedSharedGenesisProposal,
 ) -> crate::agent_sdk::InvocationId {
@@ -55,388 +42,6 @@ pub(crate) fn committee_query_invocation(
         )
         .0,
     )
-}
-
-impl RetainedCommitteeQuery {
-    /// Read reservation data before the owner can reproduce an authorized
-    /// candidate. This is NOT an authorization capability. Startup must retain
-    /// the store lease, authenticate both anchors through journal reattachment,
-    /// then reproduce the candidate and call `load` before query execution.
-    pub(crate) fn load_for_recovery<S: CleanManagementIssuerStore>(
-        store: &mut S,
-        target: &crate::agent_sdk::authority::AuthorityActorTarget,
-        predecessor: &crate::agent::clean_management_intent::ManagementJournalAnchor,
-        original: &crate::agent_sdk::RuntimeWork,
-    ) -> Result<Option<Self>, GenesisIssuanceError> {
-        use crate::agent_sdk::{InvocationAuthorization, RuntimeExecutionContext, RuntimeWork};
-        use crate::service::ServiceWire as _;
-        let Some(bytes) = store
-            .load()
-            .map_err(|_| GenesisIssuanceError::Unavailable)?
-        else {
-            return Ok(None);
-        };
-        if bytes.len() > MAX_QUERY_BYTES {
-            return Err(GenesisIssuanceError::Corrupt);
-        }
-        let saved = Self::decode(&bytes).map_err(|_| GenesisIssuanceError::Corrupt)?;
-        let RuntimeWork::Invoke {
-            invocation: original,
-            ..
-        } = original
-        else {
-            return Err(GenesisIssuanceError::InvalidAuthority);
-        };
-        let RuntimeWork::Invoke {
-            context,
-            state,
-            invocation,
-            authorization,
-            observed_slot,
-        } = &saved.work
-        else {
-            return Err(GenesisIssuanceError::InvalidAuthority);
-        };
-        let InvocationAuthorization::PublicPreflight(preflight) = authorization.as_ref() else {
-            return Err(GenesisIssuanceError::InvalidAuthority);
-        };
-        let expected = crate::service::Hash::digest(
-            b"vos/ordinary-genesis/committee-query/v1",
-            &[saved.candidate.as_bytes(), saved.authorization.as_bytes()],
-        );
-        if saved.candidate == crate::service::Hash::ZERO
-            || saved.authorization != original.invocation
-            || !original.validate()
-            || original.mode != crate::agent_sdk::MethodMode::Linear
-            || original.space != target.space
-            || original.agent != target.system_agent
-            || original.runtime_deployment != target.system_runtime_deployment
-            || original.actor != target.binding.issuer.actor
-            || original.deployment != target.binding.issuer.deployment
-            || original.program != target.binding.issuer.program
-            || saved.anchor.genesis != predecessor.genesis
-            || saved.anchor.admission != predecessor.admission
-            || saved.anchor.runtime != predecessor.runtime
-            || saved.anchor.runtime == crate::service::Hash::ZERO
-            || predecessor.ordered.validate().is_err()
-            || saved.anchor.ordered.validate().is_err()
-            || saved.anchor.ordered.index < predecessor.ordered.index
-            || *context != RuntimeExecutionContext::Direct
-            || !state.is_empty()
-            || invocation.invocation.0 != expected.0
-            || invocation.recovery_only
-            || *observed_slot != preflight.observed_slot
-            || !committee_query_matches(invocation, authorization, target)
-        {
-            return Err(GenesisIssuanceError::InvalidAuthority);
-        }
-        Ok(Some(saved))
-    }
-
-    pub(crate) fn new(
-        candidate: &AuthorizedSharedGenesisProposal,
-        target: &crate::agent_sdk::authority::AuthorityActorTarget,
-        anchor: crate::agent::clean_management_intent::ManagementJournalAnchor,
-        work: crate::agent_sdk::RuntimeWork,
-    ) -> Result<Self, GenesisIssuanceError> {
-        let record = Self {
-            candidate: candidate.claim().authority_claim().claim_hash(),
-            authorization: candidate.authorization(),
-            anchor,
-            work,
-        };
-        record.validate_for(candidate, target)?;
-        Ok(record)
-    }
-
-    fn validate_for(
-        &self,
-        candidate: &AuthorizedSharedGenesisProposal,
-        target: &crate::agent_sdk::authority::AuthorityActorTarget,
-    ) -> Result<(), GenesisIssuanceError> {
-        use crate::agent_sdk::wire::CanonicalWire as _;
-        use crate::agent_sdk::{InvocationAuthorization, RuntimeExecutionContext, RuntimeWork};
-        let RuntimeWork::Invoke {
-            context,
-            state,
-            invocation,
-            authorization,
-            observed_slot,
-        } = &self.work
-        else {
-            return Err(GenesisIssuanceError::InvalidAuthority);
-        };
-        let InvocationAuthorization::PublicPreflight(preflight) = authorization.as_ref() else {
-            return Err(GenesisIssuanceError::InvalidAuthority);
-        };
-        if self.candidate != candidate.claim().authority_claim().claim_hash()
-            || self.authorization != candidate.authorization()
-            || self.anchor.genesis != candidate.claim().system_genesis()
-            || self.anchor.admission != candidate.claim().system_admission()
-            || self.anchor.runtime == crate::service::Hash::ZERO
-            || self.anchor.ordered.validate().is_err()
-            || target.system_agent.0 != candidate.claim().system_agent().0
-            || target.space.0 != candidate.claim().space().0
-            || target.binding.commitment().0 != candidate.claim().authority_binding().0
-            || *context != RuntimeExecutionContext::Direct
-            || !state.is_empty()
-            || *observed_slot != preflight.observed_slot
-            || invocation.invocation != committee_query_invocation(candidate)
-            || invocation.recovery_only
-            || !committee_query_matches(invocation, authorization, target)
-            || self.work.encode().is_err()
-        {
-            return Err(GenesisIssuanceError::InvalidAuthority);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn pledge<S: CleanManagementIssuerStore>(
-        &self,
-        store: &mut S,
-        candidate: &AuthorizedSharedGenesisProposal,
-        target: &crate::agent_sdk::authority::AuthorityActorTarget,
-    ) -> Result<(), GenesisIssuanceError> {
-        use crate::service::ServiceWire as _;
-        self.validate_for(candidate, target)?;
-        let bytes = self.encode();
-        if bytes.len() > MAX_QUERY_BYTES {
-            return Err(GenesisIssuanceError::Corrupt);
-        }
-        if store
-            .load()
-            .map_err(|_| GenesisIssuanceError::Unavailable)?
-            .is_some_and(|old| old != bytes)
-        {
-            return Err(GenesisIssuanceError::Conflict);
-        }
-        store
-            .commit(&bytes)
-            .map_err(|_| GenesisIssuanceError::Unavailable)?;
-        if store
-            .load()
-            .map_err(|_| GenesisIssuanceError::Unavailable)?
-            .as_deref()
-            != Some(bytes.as_slice())
-        {
-            return Err(GenesisIssuanceError::Corrupt);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn load<S: CleanManagementIssuerStore>(
-        store: &mut S,
-        candidate: &AuthorizedSharedGenesisProposal,
-        target: &crate::agent_sdk::authority::AuthorityActorTarget,
-    ) -> Result<Option<Self>, GenesisIssuanceError> {
-        use crate::service::ServiceWire as _;
-        let Some(bytes) = store
-            .load()
-            .map_err(|_| GenesisIssuanceError::Unavailable)?
-        else {
-            return Ok(None);
-        };
-        if bytes.len() > MAX_QUERY_BYTES {
-            return Err(GenesisIssuanceError::Corrupt);
-        }
-        let record = Self::decode(&bytes).map_err(|_| GenesisIssuanceError::Corrupt)?;
-        record.validate_for(candidate, target)?;
-        record.pledge(store, candidate, target)?;
-        Ok(Some(record))
-    }
-}
-
-impl crate::service::ServiceWire for RetainedCommitteeQuery {
-    const MAGIC: [u8; 4] = *b"GCW1";
-    fn encode_body(&self, out: &mut Vec<u8>) {
-        use crate::agent_sdk::wire::CanonicalWire as _;
-        let mut encoder = crate::service::wire::Encoder(out);
-        encoder.fixed(&self.candidate.0);
-        encoder.fixed(self.authorization.as_bytes());
-        encoder.bytes(&self.anchor.encode());
-        encoder.bytes(&self.work.encode().unwrap_or_default());
-    }
-    fn decode_body(
-        decoder: &mut crate::service::wire::Decoder<'_>,
-    ) -> Result<Self, crate::service::wire::DecodeError> {
-        use crate::agent_sdk::wire::CanonicalWire as _;
-        use crate::service::wire::DecodeError as Error;
-        if decoder.remaining() > MAX_QUERY_BYTES - 36 {
-            return Err(Error::LimitExceeded);
-        }
-        let candidate = crate::service::Hash(decoder.fixed()?);
-        let authorization = crate::agent_sdk::InvocationId(decoder.fixed()?);
-        let anchor = decoder.bytes_ref()?;
-        if anchor.len() > 256 {
-            return Err(Error::LimitExceeded);
-        }
-        let anchor =
-            crate::agent::clean_management_intent::ManagementJournalAnchor::decode(anchor)?;
-        let work = decoder.bytes_ref()?;
-        if work.len() > crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES {
-            return Err(Error::LimitExceeded);
-        }
-        let work = crate::agent_sdk::RuntimeWork::decode(work).map_err(|_| Error::NonCanonical)?;
-        Ok(Self {
-            candidate,
-            authorization,
-            anchor,
-            work,
-        })
-    }
-}
-
-fn committee_query_matches(
-    work: &crate::agent_sdk::InvocationWork,
-    authorization: &crate::agent_sdk::InvocationAuthorization,
-    target: &crate::agent_sdk::authority::AuthorityActorTarget,
-) -> bool {
-    use crate::actors::codec::Encode as _;
-    let mut message = vec![crate::actors::value::TAG_DYNAMIC];
-    message.extend(crate::actors::value::Msg::new("genesis_signing_committee").encode());
-    target.binding.is_valid()
-        && work.validate()
-        && authorization.matches_work(work)
-        && matches!(
-            authorization,
-            crate::agent_sdk::InvocationAuthorization::PublicPreflight(_)
-        )
-        && work.mode == crate::agent_sdk::MethodMode::Query
-        && work.space == target.space
-        && work.agent == target.system_agent
-        && work.runtime_deployment == target.system_runtime_deployment
-        && work.actor == target.binding.issuer.actor
-        && work.deployment == target.binding.issuer.deployment
-        && work.program == target.binding.issuer.program
-        && work.message == message
-}
-
-/// Classify a freshly replayed journal result for pending-capacity recovery.
-/// This is not committee authority or evidence of reply-file durability.
-pub(crate) fn is_committee_query_reply(
-    work: &crate::agent_sdk::InvocationWork,
-    reply: &[u8],
-) -> bool {
-    use crate::actors::codec::{Decode as _, Encode as _};
-    use crate::service::ServiceWire as _;
-    if work.mode != crate::agent_sdk::MethodMode::Query
-        || reply.len() > crate::agent::committee::MAX_AUTHORITY_COMMITTEE_WIRE_BYTES + 5
-    {
-        return false;
-    }
-    let mut message = vec![crate::actors::value::TAG_DYNAMIC];
-    message.extend(crate::actors::value::Msg::new("genesis_signing_committee").encode());
-    if work.message != message {
-        return false;
-    }
-    let Some(crate::actors::value::Value::Bytes(bytes)) =
-        crate::actors::value::Value::try_decode(reply)
-    else {
-        return false;
-    };
-    AuthorityCommittee::decode(&bytes).is_ok_and(|committee| committee.space().0 == work.space.0)
-}
-
-/// Retain a validated committee reply before its invocation is acknowledged.
-/// The caller must obtain `reply` from authenticated execution, not a network
-/// payload. This persistence boundary does not itself confer committee trust.
-/// The exact work and authorization commitments prevent cross-query reuse.
-pub(crate) fn retain_committee_reply<S: CleanManagementIssuerStore>(
-    store: &mut S,
-    work: &crate::agent_sdk::InvocationWork,
-    authorization: &crate::agent_sdk::InvocationAuthorization,
-    reply: &crate::agent_sdk::InvocationReply,
-    target: &crate::agent_sdk::authority::AuthorityActorTarget,
-) -> Result<AuthorityCommittee, GenesisIssuanceError> {
-    use crate::actors::codec::Decode as _;
-    use crate::service::ServiceWire as _;
-    use GenesisIssuanceError as Error;
-    if !committee_query_matches(work, authorization, target)
-        || reply.invocation != work.invocation
-        || reply.actor != work.actor
-        || reply.incarnation != work.incarnation
-        || reply.deployment != work.deployment
-        || reply.mode != work.mode
-        || reply.status != crate::agent_sdk::InvocationStatus::Done
-    {
-        return Err(Error::InvalidAuthority);
-    }
-    if reply.reply.len() > crate::agent::committee::MAX_AUTHORITY_COMMITTEE_WIRE_BYTES + 5 {
-        return Err(Error::Corrupt);
-    }
-    let Some(crate::actors::value::Value::Bytes(bytes)) =
-        crate::actors::value::Value::try_decode(&reply.reply)
-    else {
-        return Err(Error::Corrupt);
-    };
-    if bytes.len() > crate::agent::committee::MAX_AUTHORITY_COMMITTEE_WIRE_BYTES {
-        return Err(Error::Corrupt);
-    }
-    let committee = AuthorityCommittee::decode(&bytes).map_err(|_| Error::Corrupt)?;
-    if committee.space().0 != target.space.0
-        || committee.authority_binding().0 != target.binding.commitment().0
-    {
-        return Err(Error::InvalidAuthority);
-    }
-    let mut retained = Vec::with_capacity(68 + bytes.len());
-    retained.extend_from_slice(b"GCR1");
-    retained.extend_from_slice(work.commitment().as_bytes());
-    retained.extend_from_slice(authorization.commitment().as_bytes());
-    retained.extend_from_slice(&bytes);
-    if store
-        .load()
-        .map_err(|_| Error::Unavailable)?
-        .is_some_and(|previous| previous != retained)
-    {
-        return Err(Error::Conflict);
-    }
-    // Exact recommit finishes an ambiguous earlier publication before ACK.
-    store.commit(&retained).map_err(|_| Error::Unavailable)?;
-    if store.load().map_err(|_| Error::Unavailable)?.as_deref() != Some(retained.as_slice()) {
-        return Err(Error::Corrupt);
-    }
-    Ok(committee)
-}
-
-/// Recover exact reply data after ACK without redispatching a consumed query.
-/// The caller must independently reauthenticate the retained query/anchor;
-/// an integrity-valid local file is not itself committee authority.
-pub(crate) fn load_committee_reply<S: CleanManagementIssuerStore>(
-    store: &mut S,
-    work: &crate::agent_sdk::InvocationWork,
-    authorization: &crate::agent_sdk::InvocationAuthorization,
-    target: &crate::agent_sdk::authority::AuthorityActorTarget,
-) -> Result<Option<AuthorityCommittee>, GenesisIssuanceError> {
-    use crate::actors::codec::Encode as _;
-    use GenesisIssuanceError as Error;
-    let Some(bytes) = store.load().map_err(|_| Error::Unavailable)? else {
-        return Ok(None);
-    };
-    if bytes.len() < 68
-        || bytes.len() > crate::agent::clean_authority_issuer::MAX_CLEAN_GENESIS_REPLY_IMAGE_BYTES
-        || &bytes[..4] != b"GCR1"
-    {
-        return Err(Error::Corrupt);
-    }
-    if &bytes[4..36] != work.commitment().as_bytes()
-        || &bytes[36..68] != authorization.commitment().as_bytes()
-    {
-        return Err(Error::Conflict);
-    }
-    let reply = crate::agent_sdk::InvocationReply {
-        invocation: work.invocation,
-        actor: work.actor,
-        incarnation: work.incarnation,
-        deployment: work.deployment,
-        mode: work.mode,
-        lane: None,
-        status: crate::agent_sdk::InvocationStatus::Done,
-        reply: crate::actors::value::Value::Bytes(bytes[68..].to_vec()).encode(),
-        gas_remaining: 0,
-        observation: Default::default(),
-    };
-    // Reuse route/schema checks and reestablish the exact durability barrier.
-    retain_committee_reply(store, work, authorization, &reply, target).map(Some)
 }
 
 /// Classify a freshly replayed publication result for reservation recovery.
@@ -676,7 +281,9 @@ impl RetainedGenesisPublication {
     pub(crate) fn load_for_recovery<S: CleanManagementIssuerStore>(
         store: &mut S,
         target: &crate::agent_sdk::authority::AuthorityActorTarget,
-        query: &RetainedCommitteeQuery,
+        candidate_hash: crate::service::Hash,
+        original_anchor: &crate::agent::clean_management_intent::ManagementJournalAnchor,
+        original_work: &crate::agent_sdk::RuntimeWork,
     ) -> Result<Option<Self>, GenesisIssuanceError> {
         use crate::agent_sdk::{InvocationAuthorization, RuntimeExecutionContext, RuntimeWork};
         use crate::service::ServiceWire as _;
@@ -691,10 +298,12 @@ impl RetainedGenesisPublication {
         }
         let saved = Self::decode(&bytes).map_err(|_| GenesisIssuanceError::Corrupt)?;
         let RuntimeWork::Invoke {
+            context: original_context,
+            state: original_state,
             invocation: previous,
             authorization: previous_auth,
-            ..
-        } = &query.work
+            observed_slot: original_slot,
+        } = original_work
         else {
             return Err(GenesisIssuanceError::InvalidAuthority);
         };
@@ -711,20 +320,26 @@ impl RetainedGenesisPublication {
         let InvocationAuthorization::PublicPreflight(preflight) = authorization.as_ref() else {
             return Err(GenesisIssuanceError::InvalidAuthority);
         };
-        let expected_query = crate::service::Hash::digest(
-            b"vos/ordinary-genesis/committee-query/v1",
-            &[query.candidate.as_bytes(), query.authorization.as_bytes()],
-        );
-        if !committee_query_matches(previous, previous_auth, target)
-            || query.candidate == crate::service::Hash::ZERO
-            || previous.invocation.0 != expected_query.0
-            || saved.anchor.genesis != query.anchor.genesis
-            || saved.anchor.admission != query.anchor.admission
-            || saved.anchor.runtime != query.anchor.runtime
+        let InvocationAuthorization::PublicPreflight(original_preflight) = previous_auth.as_ref()
+        else {
+            return Err(GenesisIssuanceError::InvalidAuthority);
+        };
+        if candidate_hash == crate::service::Hash::ZERO
+            || *original_context != RuntimeExecutionContext::Direct
+            || !original_state.is_empty()
+            || *original_slot != original_preflight.observed_slot
+            || !original_preflight.matches_work(previous)
+            || saved.anchor.genesis != original_anchor.genesis
+            || saved.anchor.admission != original_anchor.admission
+            || saved.anchor.runtime != original_anchor.runtime
             || saved.anchor.runtime == crate::service::Hash::ZERO
-            || query.anchor.ordered.validate().is_err()
+            || original_anchor.genesis == crate::agent::journal::AgentJournalGenesisId::ZERO
+            || original_anchor.admission == crate::agent::genesis::AgentGenesisAdmissionId::ZERO
+            || original_anchor.ordered.validate().is_err()
             || saved.anchor.ordered.validate().is_err()
-            || saved.anchor.ordered.index < query.anchor.ordered.index
+            || saved.anchor.ordered.index < original_anchor.ordered.index
+            || (saved.anchor.ordered.index == original_anchor.ordered.index
+                && saved.anchor.ordered.head != original_anchor.ordered.head)
             || *context != RuntimeExecutionContext::Direct
             || !state.is_empty()
             || !invocation.validate()
@@ -742,24 +357,20 @@ impl RetainedGenesisPublication {
         let provision = crate::agent::genesis::AgentGenesisProvision::decode(&blob.bytes)
             .map_err(|_| GenesisIssuanceError::Corrupt)?;
         let claim = provision.evidence().claim();
-        if claim.authority_claim().claim_hash() != query.candidate
+        if !authorized_create_matches(previous, target, &provision)
+            || claim.authority_claim().claim_hash() != candidate_hash
             || claim.system_genesis() != saved.anchor.genesis
             || claim.system_admission() != saved.anchor.admission
             || claim.authority_binding().0 != target.binding.commitment().0
-            || provision.publication_invocation(query.authorization).ok()
+            || provision.publication_invocation(previous.invocation).ok()
                 != Some(invocation.invocation)
         {
             return Err(GenesisIssuanceError::InvalidAuthority);
         }
-        // No origin, installation, artifact or other work field may drift from
-        // the query used to select this publication's committee.
-        let mut base = (**invocation).clone();
-        base.mode = previous.mode;
-        base.invocation = previous.invocation;
-        base.message = previous.message.clone();
-        base.availability
-            .retain(|entry| entry.reference != blob.reference);
-        if &base != previous.as_ref() {
+        // Only the publication's ID/mode/message and one provision blob may
+        // differ from the original signed Create. Committee observations have
+        // no durable work or reply capsule and cannot be a predecessor.
+        if !publication_preserves_create(invocation, previous, blob) {
             return Err(GenesisIssuanceError::InvalidAuthority);
         }
         store
@@ -774,6 +385,39 @@ impl RetainedGenesisPublication {
             return Err(GenesisIssuanceError::Corrupt);
         }
         Ok(Some(saved))
+    }
+
+    /// Decode retained candidate data without publishing, resyncing or granting
+    /// authorization. Recovery must bind it to the issued Create, independently
+    /// retained replica selection and original work before using the full loader.
+    pub(crate) fn load_candidate_for_recovery<S: CleanManagementIssuerStore>(
+        store: &mut S,
+    ) -> Result<Option<crate::agent::genesis::AgentGenesisProvision>, GenesisIssuanceError> {
+        use crate::service::ServiceWire as _;
+        let Some(bytes) = store
+            .load()
+            .map_err(|_| GenesisIssuanceError::Unavailable)?
+        else {
+            return Ok(None);
+        };
+        if bytes.len() > Self::MAX_IMAGE_BYTES {
+            return Err(GenesisIssuanceError::Corrupt);
+        }
+        let saved = Self::decode(&bytes).map_err(|_| GenesisIssuanceError::Corrupt)?;
+        let crate::agent_sdk::RuntimeWork::Invoke { invocation, .. } = &saved.work else {
+            return Err(GenesisIssuanceError::InvalidAuthority);
+        };
+        let mut blobs = invocation
+            .availability
+            .iter()
+            .filter(|blob| publication_blob_matches(invocation, blob));
+        let blob = blobs.next().ok_or(GenesisIssuanceError::InvalidAuthority)?;
+        if blobs.next().is_some() {
+            return Err(GenesisIssuanceError::InvalidAuthority);
+        }
+        crate::agent::genesis::AgentGenesisProvision::decode(&blob.bytes)
+            .map(Some)
+            .map_err(|_| GenesisIssuanceError::Corrupt)
     }
     pub(crate) fn validate(
         &self,
@@ -915,6 +559,89 @@ impl crate::service::ServiceWire for RetainedGenesisPublication {
         let work = crate::agent_sdk::RuntimeWork::decode(work).map_err(|_| Error::NonCanonical)?;
         Ok(Self { anchor, work })
     }
+}
+
+fn authorized_create_matches(
+    work: &crate::agent_sdk::InvocationWork,
+    target: &crate::agent_sdk::authority::AuthorityActorTarget,
+    provision: &crate::agent::genesis::AgentGenesisProvision,
+) -> bool {
+    use crate::actors::codec::{Decode as _, Encode as _};
+    use crate::agent_sdk::wire::CanonicalWire as _;
+    use crate::agent_sdk::{InvocationRoleClaims, ManagementRequest, MethodMode};
+    let crate::agent::journal::ReplayOperation::CleanManage { request, .. } =
+        &provision.proposal().create().operation
+    else {
+        return false;
+    };
+    if !matches!(request, ManagementRequest::Create(_))
+        || !target.binding.is_valid()
+        || !work.validate()
+        || work.mode != MethodMode::Linear
+        || work.recovery_only
+        || work.space != target.space
+        || work.agent != target.system_agent
+        || work.runtime_deployment != target.system_runtime_deployment
+        || work.actor != target.binding.issuer.actor
+        || work.deployment != target.binding.issuer.deployment
+        || work.program != target.binding.issuer.program
+        || work.message.first() != Some(&crate::actors::value::TAG_DYNAMIC)
+    {
+        return false;
+    }
+    let Some(message) = crate::actors::value::Msg::try_decode(&work.message[1..]) else {
+        return false;
+    };
+    if message.encode() != work.message[1..] {
+        return false;
+    }
+    let Some(bytes) = message.args.get_bytes("call") else {
+        return false;
+    };
+    let Ok(call) = crate::agent_sdk::authority::AuthorityCredentialCall::decode(&bytes) else {
+        return false;
+    };
+    let Ok(intent) = crate::agent::clean_management_intent::CleanManagementIntent::new(
+        *target,
+        call.managed,
+        request.clone(),
+        call,
+        &super::RawCredentialVerifier,
+    ) else {
+        return false;
+    };
+    work.invocation == intent.call().invocation
+        && work.origin == intent.authorization_origin()
+        && work.roles == InvocationRoleClaims::none()
+        && work.message == intent.authorization_message()
+}
+
+fn publication_preserves_create(
+    publication: &crate::agent_sdk::InvocationWork,
+    original: &crate::agent_sdk::InvocationWork,
+    provision: &crate::agent_sdk::RuntimeBlob,
+) -> bool {
+    if publication.availability.len() != original.availability.len() + 1
+        || original
+            .availability
+            .iter()
+            .any(|entry| entry.reference == provision.reference)
+        || publication
+            .availability
+            .iter()
+            .filter(|entry| *entry == provision)
+            .count()
+            != 1
+    {
+        return false;
+    }
+    let mut base = publication.clone();
+    base.mode = original.mode;
+    base.invocation = original.invocation;
+    base.message = original.message.clone();
+    base.availability
+        .retain(|entry| entry.reference != provision.reference);
+    &base == original
 }
 
 /// Exact compact publication request derived from the selected archive. This
@@ -1105,4 +832,133 @@ pub(crate) fn issue<S: CleanManagementIssuerStore, K: GenesisClaimSigner>(
         return Err(Error::Corrupt);
     }
     AuthoritySignature::new(signer_id, signature).map_err(|_| Error::InvalidSignature)
+}
+
+#[cfg(test)]
+mod publication_binding_tests {
+    use super::publication_preserves_create;
+    use crate::agent_sdk::{
+        ActorId, AgentId, BlobRef, DeploymentId, Hash, InvocationId, InvocationOrigin,
+        InvocationRoleClaims, InvocationWork, MethodMode, ProgramId, RuntimeBlob, SpaceId,
+    };
+
+    fn inputs() -> (InvocationWork, InvocationWork, RuntimeBlob) {
+        let artifact = RuntimeBlob {
+            reference: BlobRef::of_bytes(b"installed actor"),
+            bytes: b"installed actor".to_vec(),
+        };
+        let arguments = RuntimeBlob {
+            reference: BlobRef::of_bytes(b"constructor arguments"),
+            bytes: b"constructor arguments".to_vec(),
+        };
+        let mut availability = vec![artifact, arguments.clone()];
+        availability.sort_unstable_by(|a, b| a.reference.cmp(&b.reference));
+        let original = InvocationWork {
+            space: SpaceId([1; 32]),
+            agent: AgentId([2; 32]),
+            runtime_deployment: DeploymentId([3; 32]),
+            invocation: InvocationId([4; 32]),
+            actor: ActorId([5; 32]),
+            incarnation: Hash([6; 32]),
+            deployment: DeploymentId([7; 32]),
+            program: ProgramId([8; 32]),
+            mode: MethodMode::Linear,
+            origin: InvocationOrigin::anonymous(),
+            roles: InvocationRoleClaims::none(),
+            message: b"original signed Create authorization".to_vec(),
+            installation_data: Some(arguments.reference),
+            availability,
+            gas: 1_000_000_000,
+            recovery_only: false,
+        };
+        let provision = RuntimeBlob {
+            reference: BlobRef::of_bytes(b"exact provision"),
+            bytes: b"exact provision".to_vec(),
+        };
+        let mut publication = original.clone();
+        publication.invocation = InvocationId([9; 32]);
+        publication.message = b"publication request bound separately to provision".to_vec();
+        publication.availability.push(provision.clone());
+        publication
+            .availability
+            .sort_unstable_by(|a, b| a.reference.cmp(&b.reference));
+        assert!(original.validate());
+        assert!(publication.validate());
+        (original, publication, provision)
+    }
+
+    #[test]
+    fn publication_binding_preserves_every_original_work_field() {
+        let (original, publication, provision) = inputs();
+        assert!(publication_preserves_create(
+            &publication,
+            &original,
+            &provision
+        ));
+        let mutations: &[fn(&mut InvocationWork)] = &[
+            |work| work.space = SpaceId([99; 32]),
+            |work| work.agent = AgentId([99; 32]),
+            |work| work.runtime_deployment = DeploymentId([99; 32]),
+            |work| work.actor = ActorId([99; 32]),
+            |work| work.incarnation = Hash([99; 32]),
+            |work| work.deployment = DeploymentId([99; 32]),
+            |work| work.program = ProgramId([99; 32]),
+            |work| work.origin.principal = Some(crate::agent_sdk::PrincipalId([99; 32])),
+            |work| work.origin.transport_node = Some(crate::agent_sdk::NodeId([99; 32])),
+            |work| work.origin.credential = Some(crate::agent_sdk::CredentialId([99; 32])),
+            |work| work.origin.actor = Some(ActorId([99; 32])),
+            |work| work.origin.capability = Some(crate::agent_sdk::CapabilityId([99; 32])),
+            |work| work.roles.actor = Some(crate::agent_sdk::RoleId([99; 32])),
+            |work| work.installation_data = None,
+            |work| work.gas = 1,
+            |work| work.recovery_only = true,
+        ];
+        for (index, mutate) in mutations.iter().enumerate() {
+            let mut changed = publication.clone();
+            mutate(&mut changed);
+            assert!(
+                !publication_preserves_create(&changed, &original, &provision),
+                "unauthorized field mutation {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn publication_binding_allows_only_one_new_exact_provision() {
+        let (original, publication, provision) = inputs();
+        let mut changed = publication.clone();
+        changed.availability.push(provision.clone());
+        assert!(!publication_preserves_create(
+            &changed, &original, &provision
+        ));
+        let mut changed = publication.clone();
+        changed
+            .availability
+            .iter_mut()
+            .find(|blob| blob.reference == provision.reference)
+            .unwrap()
+            .bytes
+            .push(0);
+        assert!(!publication_preserves_create(
+            &changed, &original, &provision
+        ));
+        let mut changed = publication.clone();
+        changed
+            .availability
+            .iter_mut()
+            .find(|blob| blob.reference == original.availability[0].reference)
+            .unwrap()
+            .bytes
+            .push(0);
+        assert!(!publication_preserves_create(
+            &changed, &original, &provision
+        ));
+        let mut changed_original = original;
+        changed_original.availability.push(provision.clone());
+        assert!(!publication_preserves_create(
+            &publication,
+            &changed_original,
+            &provision
+        ));
+    }
 }

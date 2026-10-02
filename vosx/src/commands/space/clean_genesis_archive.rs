@@ -315,6 +315,16 @@ struct ArchiveImage {
     catalog: Vec<RuntimeBlob>,
 }
 
+/// Decode the retained public certificate/catalog without opening the
+/// archive's writer owner. The caller must still authenticate the full plan
+/// with its configured Root and actual local node before selecting a target.
+pub(crate) fn client_archive_parts(
+    bytes: &[u8],
+) -> Result<(SystemAgentGenesisProvision, Vec<RuntimeBlob>), SystemAgentGenesisProviderError> {
+    let image = decode_archive(bytes)?;
+    Ok((image.provision, image.catalog))
+}
+
 fn encode_archive(image: &ArchiveImage) -> Result<Vec<u8>, SystemAgentGenesisProviderError> {
     validate_system_agent_genesis_catalog(image.provision.proposal(), &image.catalog)
         .map_err(|_| SystemAgentGenesisProviderError::Corrupt)?;

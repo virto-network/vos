@@ -533,7 +533,8 @@ fn decode_clean_invocation_errors(
             if transition.state != crate::agent_sdk::RuntimeState::default()
                 || !error.is_durable_exact_outcome()
                 || value.storage() != storage
-                || !StandardAgentRuntime::clean_error_authorization_window_is_valid(
+                || !super::standard::clean_accepted_error_authorization_window_is_valid(
+                    &value.binding.accepted,
                     &value.binding.authorization,
                     error,
                     value.binding.observed_slot,
@@ -1827,7 +1828,11 @@ fn decode_clean_invocation_result(
     decoder: &mut Decoder<'_>,
 ) -> Result<super::standard::StandardCleanInvocationResult, DecodeError> {
     let value = decode_clean_invocation_result_binding(decoder)?;
-    if !super::standard::clean_authorization_is_live_at(&value.authorization, value.observed_slot) {
+    if !super::standard::clean_accepted_authorization_is_live_at(
+        &value.accepted,
+        &value.authorization,
+        value.observed_slot,
+    ) {
         return Err(DecodeError::NonCanonical);
     }
     Ok(value)
@@ -2365,6 +2370,7 @@ fn apply_standard_external_runtime_input_with_reader<
             let scope = work.lanes()[0].base.context().scope();
             (scope.space(), scope.agent(), None, state, true)
         }
+        RuntimeWork::Observe { .. } => return Err(DecodeError::InvalidPlatform),
     };
     if supported {
         let mut decoded = encode_standard_runtime_state(&StandardRuntimeState::default());
@@ -2607,6 +2613,7 @@ fn apply_standard_external_runtime_input_with_reader<
                 }
                 (successor, result.outcome)
             }
+            RuntimeWork::Observe { .. } => return Err(DecodeError::InvalidPlatform),
         };
         if successor.encoded_len().is_none_or(|bytes| bytes > limit) {
             return Err(DecodeError::LimitExceeded);
@@ -2836,6 +2843,14 @@ pub fn apply_standard_runtime_work(
             ..
         } => apply_clean_acknowledge(state, *invocation, *authorization),
         #[cfg(feature = "experimental-state-blocks")]
+        crate::agent_sdk::RuntimeWork::Observe {
+            state,
+            invocation,
+            authorization,
+            observed_slot,
+            ..
+        } => apply_clean_observe(state, *invocation, *authorization, observed_slot),
+        #[cfg(feature = "experimental-state-blocks")]
         crate::agent_sdk::RuntimeWork::InspectInvocation {
             state,
             invocation,
@@ -2922,7 +2937,8 @@ pub fn apply_proof_host_attested_standard_runtime_work(
         | crate::agent_sdk::RuntimeWork::Invoke { .. }
         | crate::agent_sdk::RuntimeWork::Resume { .. } => Err(DecodeError::NonCanonical),
         #[cfg(feature = "experimental-state-blocks")]
-        crate::agent_sdk::RuntimeWork::InspectInvocation { .. } => Err(DecodeError::NonCanonical),
+        crate::agent_sdk::RuntimeWork::InspectInvocation { .. }
+        | crate::agent_sdk::RuntimeWork::Observe { .. } => Err(DecodeError::NonCanonical),
     }
 }
 
@@ -2987,7 +3003,8 @@ pub(crate) fn apply_authenticated_attested_standard_runtime_work(
         | crate::agent_sdk::RuntimeWork::Invoke { .. }
         | crate::agent_sdk::RuntimeWork::Resume { .. } => Err(DecodeError::NonCanonical),
         #[cfg(feature = "experimental-state-blocks")]
-        crate::agent_sdk::RuntimeWork::InspectInvocation { .. } => Err(DecodeError::NonCanonical),
+        crate::agent_sdk::RuntimeWork::InspectInvocation { .. }
+        | crate::agent_sdk::RuntimeWork::Observe { .. } => Err(DecodeError::NonCanonical),
     }
 }
 
@@ -3043,6 +3060,91 @@ impl CleanExecutionAdmission<'_> {
     fn direct() -> Self {
         Self::Direct(core::marker::PhantomData)
     }
+}
+
+/// Execute an observation without invoking any exact-result, continuation,
+/// authorization-consumption or publication path. Runtime state remains owned
+/// and interpreted by the guest; the host independently checks all returned
+/// opaque components byte-for-byte.
+#[cfg(all(feature = "pvm", feature = "experimental-state-blocks"))]
+fn apply_clean_observe(
+    state: crate::agent_sdk::RuntimeState,
+    work: crate::agent_sdk::InvocationWork,
+    authorization: crate::agent_sdk::InvocationAuthorization,
+    observed_slot: u64,
+) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
+    use crate::agent_sdk::InvocationError;
+    if !state.validate() {
+        return Err(DecodeError::LimitExceeded);
+    }
+    let (runtime, _) = restore_standard_runtime_state(&clean_state_to_legacy(&state))?;
+    let result = (|| {
+        runtime.validate_system_authority_observation(&work, &authorization, observed_slot)?;
+        let resolved = runtime.resolve_clean_invocation_for_execution(&work)?;
+        let (invocation, actor_pvm, schema, policies, installation_data) = resolved.parts();
+        runtime
+            .validate_clean_execution_installation_data(&work, installation_data.as_ref())
+            .and_then(|()| runtime.validate_clean_execution_schema(&work, schema))
+            .map_err(clean_error)?;
+        if !runtime
+            .authorize_clean_execution(&work, &authorization, schema, policies)
+            .map_err(clean_error)?
+        {
+            return Err(InvocationError::InvalidAuthorization);
+        }
+        let before = runtime
+            .prepare_observation_state(invocation)
+            .map_err(clean_error)?;
+        let visible = before.visible_for(invocation.mode);
+        let storage = runtime
+            .resolve_clean_storage_reader(&work, schema)
+            .map_err(clean_error)?;
+        let outcome = super::execution::run_inner_actor_observation_with_storage(
+            invocation,
+            Some(crate::agent_sdk::InvocationContext::from_work(
+                &work,
+                observed_slot,
+            )),
+            actor_pvm,
+            installation_data.as_ref().map(|data| data.bytes.as_slice()),
+            &visible,
+            Some(&storage),
+        )
+        .map_err(clean_error)?;
+        let super::execution::ActorRunOutcome::Completed {
+            mut reply,
+            state: after,
+            rows,
+        } = outcome
+        else {
+            return Err(InvocationError::InvalidActorOutput);
+        };
+        if !rows.is_empty()
+            || reply.invocation != invocation.invocation
+            || reply.actor != invocation.actor
+            || reply.incarnation != invocation.incarnation
+            || reply.deployment != invocation.deployment
+            || reply.mode != invocation.mode
+            || reply.lane.is_some()
+            || reply.gas_remaining > invocation.gas
+            || reply.observation != super::execution::ActorObservation::default()
+        {
+            return Err(InvocationError::InvalidActorOutput);
+        }
+        for lane in [StateLane::Linear, StateLane::Merge, StateLane::Local] {
+            // A generated first read returns present-empty sentinels for
+            // absent/hidden lanes. No nonempty lane or altered readable lane
+            // may escape, even on Forbidden/Panicked/OutOfGas outcomes.
+            if after.get(lane).unwrap_or_default() != visible.get(lane).unwrap_or_default() {
+                return Err(InvocationError::InvalidActorOutput);
+            }
+        }
+        reply.observation = runtime
+            .observation(reply.actor, reply.mode)
+            .map_err(clean_error)?;
+        Ok(clean_reply(reply))
+    })();
+    Ok(clean_completed(state, result))
 }
 
 #[cfg(feature = "pvm")]
@@ -3336,7 +3438,7 @@ fn apply_clean_invoke_restored(
         // unsupported method or target must retain its exact rejection.
         if error.is_durable_exact_outcome() {
             if let Err(error) = runtime
-                .validate_clean_unseen_invocation_slot(&authorization, observed_slot)
+                .validate_clean_unseen_invocation_work_slot(&work, &authorization, observed_slot)
                 .and_then(|()| {
                     runtime.retain_clean_invocation_error(
                         &work,
@@ -3410,9 +3512,11 @@ fn apply_clean_invoke_restored(
     let resolved = match runtime.resolve_clean_invocation_for_execution(&work) {
         Ok(resolved) => resolved,
         Err(error) if error.is_durable_exact_outcome() => {
-            if let Err(slot_error) =
-                runtime.validate_clean_unseen_invocation_slot(&authorization, observed_slot)
-            {
+            if let Err(slot_error) = runtime.validate_clean_unseen_invocation_work_slot(
+                &work,
+                &authorization,
+                observed_slot,
+            ) {
                 return Ok(clean_completed(
                     legacy_state_to_clean(original_state),
                     Err(slot_error),
@@ -3459,7 +3563,11 @@ fn apply_clean_invoke_restored(
                 ));
             }
             unseen => {
-                match runtime.validate_clean_unseen_invocation_slot(&authorization, observed_slot) {
+                match runtime.validate_clean_unseen_invocation_work_slot(
+                    &work,
+                    &authorization,
+                    observed_slot,
+                ) {
                     Err(error) => {
                         return Ok(clean_completed(
                             legacy_state_to_clean(original_state),
@@ -9976,7 +10084,8 @@ pub(crate) mod tests {
             crate::agent_sdk::RuntimeWork::Manage { .. }
             | crate::agent_sdk::RuntimeWork::Acknowledge { .. } => unreachable!(),
             #[cfg(feature = "experimental-state-blocks")]
-            crate::agent_sdk::RuntimeWork::InspectInvocation { .. } => unreachable!(),
+            crate::agent_sdk::RuntimeWork::InspectInvocation { .. }
+            | crate::agent_sdk::RuntimeWork::Observe { .. } => unreachable!(),
         };
         let decoded = decode_standard_runtime_state(&clean_state_to_legacy(state)).unwrap();
         let package = decoded
@@ -15183,7 +15292,7 @@ pub(crate) mod tests {
             nonce[..2].copy_from_slice(&ordinal.to_be_bytes());
             nonce[31] = 1;
             let query = AuthorityProjectionQuery {
-            recovery: None,
+                recovery: None,
                 authority: target,
                 credential: crate::agent_sdk::CredentialId::of_public_key(&public_key),
                 nonce: crate::agent_sdk::Hash(nonce),

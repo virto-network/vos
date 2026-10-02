@@ -2213,6 +2213,7 @@ pub enum IngressNodeAttestationError {
     InvalidNode,
     AlreadyConfigured,
     NotConfigured,
+    AuthorityUnavailable,
     InvalidCredential,
     SigningFailed,
     InvalidQuery(crate::agent::sdk::authority::AuthorityActorProtocolError),
@@ -2294,6 +2295,7 @@ impl IngressHandle {
         };
         use crate::agent::sdk::wire::CanonicalWire as _;
         if query.selector != AuthorityProjectionSelector::Credential
+            || query.recovery.is_some()
             || query
                 .verify_api_with(&crate::agent::clean_bootstrap::RawCredentialVerifier)
                 .is_err()
@@ -2310,7 +2312,7 @@ impl IngressHandle {
             .and_then(|ingress| ingress.as_ref().map(|ingress| ingress.authority.clone()))
             .ok_or(IngressAuthenticationError::AuthorityUnavailable)?;
         let bytes = authority
-            .authority_projection_bounded(query.clone())
+            .invoke_authority_observation_bounded(query.clone())
             .map_err(|_| IngressAuthenticationError::AuthorityUnavailable)?;
         let projection = AuthorityCredentialProjection::decode(&bytes)
             .map_err(|_| IngressAuthenticationError::AuthorityUnavailable)?;
@@ -2337,9 +2339,10 @@ impl IngressHandle {
             AuthorityProjectionSelector::Agents { .. }
                 | AuthorityProjectionSelector::AgentReplicas { .. }
                 | AuthorityProjectionSelector::Inventory { .. }
-        ) || query
-            .verify_api_with(&crate::agent::clean_bootstrap::RawCredentialVerifier)
-            .is_err()
+        ) || query.recovery.is_some()
+            || query
+                .verify_api_with(&crate::agent::clean_bootstrap::RawCredentialVerifier)
+                .is_err()
         {
             return Err(IngressAuthenticationError::Invalid);
         }
@@ -2353,7 +2356,7 @@ impl IngressHandle {
             .and_then(|ingress| ingress.as_ref().map(|ingress| ingress.authority.clone()))
             .ok_or(IngressAuthenticationError::AuthorityUnavailable)?;
         let bytes = authority
-            .authority_projection_bounded(query.clone())
+            .invoke_authority_observation_bounded(query.clone())
             .map_err(|_| IngressAuthenticationError::AuthorityUnavailable)?;
         let bound = match query.selector {
             AuthorityProjectionSelector::Agents { .. } => {
@@ -2414,6 +2417,72 @@ impl IngressHandle {
             return Err(crate::agent::local_lifecycle::LocalLifecycleIngressError::Unavailable);
         }
         self.clean_local_lifecycle_queue.submit_install(submission)
+    }
+
+    /// Queue exact signed external Shared Create. The application result is
+    /// not a Ready claim; other members still need independent admission.
+    #[cfg(all(
+        feature = "network",
+        feature = "storage",
+        feature = "experimental-state-blocks",
+        target_os = "linux"
+    ))]
+    pub fn create_clean_shared_agent(
+        &self,
+        submission: crate::agent::local_lifecycle::SharedCreateSubmission,
+    ) -> Result<
+        mpsc::Receiver<crate::agent::local_lifecycle::SharedCreateResult>,
+        crate::agent::local_lifecycle::LocalLifecycleIngressError,
+    > {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(crate::agent::local_lifecycle::LocalLifecycleIngressError::Unavailable);
+        }
+        self.clean_local_lifecycle_queue
+            .submit_shared_create(submission, self.clean_agent_recovering())
+    }
+
+    /// Queue exact signed Shared Install on the same bounded lifecycle queue.
+    /// Disconnecting never cancels accepted durable work; retry exact bytes.
+    #[cfg(all(
+        feature = "network",
+        feature = "storage",
+        feature = "experimental-state-blocks",
+        target_os = "linux"
+    ))]
+    pub fn install_clean_shared_actor(
+        &self,
+        submission: crate::agent::local_lifecycle::SharedInstallSubmission,
+    ) -> Result<
+        mpsc::Receiver<crate::agent::local_lifecycle::SharedInstallResult>,
+        crate::agent::local_lifecycle::LocalLifecycleIngressError,
+    > {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(crate::agent::local_lifecycle::LocalLifecycleIngressError::Unavailable);
+        }
+        self.clean_local_lifecycle_queue
+            .submit_shared_install(submission)
+    }
+
+    /// Queue exact OGAR for warm member admission on an existing local voter.
+    /// Success is local admission/attachment, never management or Ready finality.
+    #[cfg(all(
+        feature = "network",
+        feature = "storage",
+        feature = "experimental-state-blocks",
+        target_os = "linux"
+    ))]
+    pub fn admit_clean_shared_member(
+        &self,
+        submission: crate::agent::local_lifecycle::SharedMemberAdmissionSubmission,
+    ) -> Result<
+        mpsc::Receiver<crate::agent::local_lifecycle::SharedMemberAdmissionResult>,
+        crate::agent::local_lifecycle::LocalLifecycleIngressError,
+    > {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(crate::agent::local_lifecycle::LocalLifecycleIngressError::Unavailable);
+        }
+        self.clean_local_lifecycle_queue
+            .submit_shared_member_admission(submission)
     }
 
     /// Queue a signed call for durable native clock capture. Queue acceptance
@@ -2510,10 +2579,6 @@ impl IngressHandle {
         request_binding: crate::agent::sdk::Hash,
     ) -> Result<crate::agent::sdk::authority::AuthorityProjectionQuery, IngressNodeAttestationError>
     {
-        use crate::agent::sdk::authority::{
-            AuthorityIngressAuthentication, AuthorityProjectionQuery,
-        };
-
         let credential_key = ed25519_dalek::VerifyingKey::from_bytes(&credential_public_key)
             .map_err(|_| IngressNodeAttestationError::InvalidCredential)?;
         if credential_key.is_weak() {
@@ -2523,32 +2588,69 @@ impl IngressHandle {
             .ingress_node_attester
             .as_ref()
             .ok_or(IngressNodeAttestationError::NotConfigured)?;
-        let mut query = AuthorityProjectionQuery {
-            recovery: None,
-            authority,
-            credential: crate::agent::sdk::CredentialId::of_public_key(&credential_public_key),
-            nonce,
-            selector,
-            authentication: AuthorityIngressAuthentication::SshNodeAttestation {
+        #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+        {
+            use crate::agent::sdk::authority::{
+                AuthorityIngressAuthentication, AuthorityProjectionQuery,
+            };
+            if self.shutdown.load(Ordering::Acquire) {
+                return Err(IngressNodeAttestationError::AuthorityUnavailable);
+            }
+            let exposed = self
+                .clean_agent_supervisor
+                .read()
+                .ok()
+                .and_then(|ingress| ingress.as_ref().cloned())
+                .ok_or(IngressNodeAttestationError::AuthorityUnavailable)?;
+            // This identity is exposed only by authenticated owner startup,
+            // not selected by the SSH caller or its requested authority.
+            if attester.node != exposed.node {
+                return Err(IngressNodeAttestationError::InvalidNode);
+            }
+            let installed_authority = exposed
+                .authority
+                .authority_target()
+                .map_err(|_| IngressNodeAttestationError::AuthorityUnavailable)?;
+            if authority != installed_authority {
+                return Err(IngressNodeAttestationError::AuthorityUnavailable);
+            }
+            let mut query = AuthorityProjectionQuery {
+                recovery: None,
+                authority,
+                credential: crate::agent::sdk::CredentialId::of_public_key(&credential_public_key),
+                nonce,
+                selector,
+                authentication: AuthorityIngressAuthentication::SshNodeAttestation {
+                    credential_public_key,
+                    node: attester.node,
+                    request_binding,
+                    signature: [1; 64],
+                },
+            };
+            query
+                .validate_shape()
+                .map_err(IngressNodeAttestationError::InvalidQuery)?;
+            let signature = (attester.signer)(&query.signing_bytes())
+                .filter(|signature| *signature != [0; 64])
+                .ok_or(IngressNodeAttestationError::SigningFailed)?;
+            query.authentication = AuthorityIngressAuthentication::SshNodeAttestation {
                 credential_public_key,
                 node: attester.node,
                 request_binding,
-                signature: [0; 64],
-            },
-        };
-        let signature = (attester.signer)(&query.signing_bytes())
-            .filter(|signature| *signature != [0; 64])
-            .ok_or(IngressNodeAttestationError::SigningFailed)?;
-        query.authentication = AuthorityIngressAuthentication::SshNodeAttestation {
-            credential_public_key,
-            node: attester.node,
-            request_binding,
-            signature,
-        };
-        query
-            .validate_shape()
-            .map_err(IngressNodeAttestationError::InvalidQuery)?;
-        Ok(query)
+                signature,
+            };
+            query
+                .validate_shape()
+                .map_err(IngressNodeAttestationError::InvalidQuery)?;
+            Ok(query)
+        }
+        #[cfg(not(all(feature = "network", feature = "storage", target_os = "linux")))]
+        {
+            // No clean-owner capability exists in this build. Attestation may
+            // not manufacture a legacy scope merely because a key is present.
+            let _ = (authority, nonce, selector, request_binding, attester);
+            Err(IngressNodeAttestationError::AuthorityUnavailable)
+        }
     }
 
     /// Resolve a locally catalogued service root by its operator-visible name.
@@ -13884,7 +13986,7 @@ fn is_private_read_method(method: &str) -> bool {
 /// (status + zero-length state). Both the length and the leading
 /// status byte are load-bearing for the client-side detection.
 #[cfg(feature = "network")]
-#[allow(dead_code)]// Retained as host-side fallback; see doc comment above.
+#[allow(dead_code)] // Retained as host-side fallback; see doc comment above.
 fn forbidden_envelope() -> Vec<u8> {
     use crate::actors::run::STATUS_FORBIDDEN;
     encode_invoke_envelope(STATUS_FORBIDDEN, &[], &[])
@@ -16884,6 +16986,44 @@ mod tests {
             handle.query_clean_agent_inventory(query.clone()),
             Err(IngressAuthenticationError::AuthorityUnavailable)
         );
+        // A correctly signed old read delegation is not an observation. Reject
+        // it before looking up a live owner or dispatching any retained work.
+        let mut delegated = query.clone();
+        delegated.recovery = Some(
+            crate::agent::sdk::authority::AuthorityProjectionRecoveryDelegation {
+                generation: Hash([0x3a; 32]),
+                committee: Hash([0x3b; 32]),
+                accepted_slot: 10,
+                expires_at: 20,
+            },
+        );
+        let delegated_signature = key.sign(&delegated.signing_bytes()).to_bytes();
+        if let AuthorityIngressAuthentication::ApiCredentialSignature {
+            signature: value, ..
+        } = &mut delegated.authentication
+        {
+            *value = delegated_signature;
+        }
+        assert_eq!(
+            delegated.verify_api_with(&crate::agent::clean_bootstrap::RawCredentialVerifier),
+            Ok(())
+        );
+        assert_eq!(
+            handle.query_clean_agent_inventory(delegated.clone()),
+            Err(IngressAuthenticationError::Invalid)
+        );
+        delegated.selector = AuthorityProjectionSelector::Credential;
+        let delegated_signature = key.sign(&delegated.signing_bytes()).to_bytes();
+        if let AuthorityIngressAuthentication::ApiCredentialSignature {
+            signature: value, ..
+        } = &mut delegated.authentication
+        {
+            *value = delegated_signature;
+        }
+        assert_eq!(
+            handle.query_clean_credential(delegated),
+            Err(IngressAuthenticationError::Invalid)
+        );
         query.selector = AuthorityProjectionSelector::Inventory {
             after: None,
             limit: 1,
@@ -16897,10 +17037,10 @@ mod tests {
 
     #[cfg(feature = "ssh-ingress")]
     #[test]
-    fn ssh_ingress_attester_is_set_once_and_signs_only_the_exact_query() {
+    fn ssh_ingress_attester_is_set_once_and_refuses_queries_without_clean_owner() {
         use crate::agent::sdk::authority::{
-            AgentAuthorityBinding, AuthorityActorTarget, AuthorityIngressAuthentication,
-            AuthorityIssuer, AuthorityProjectionSelector,
+            AgentAuthorityBinding, AuthorityActorTarget, AuthorityIssuer,
+            AuthorityProjectionSelector,
         };
         use crate::agent::sdk::{
             ActorId, AgentId, DeploymentId, Hash, NodeId, PrincipalId, ProducerId, ProgramId,
@@ -16930,7 +17070,6 @@ mod tests {
             },
         };
         let node_key = SigningKey::from_bytes(&[0x41; 32]);
-        let node_public_key = node_key.verifying_key();
         let node = NodeId([0x42; 32]);
         let nonce = Hash([0x43; 32]);
         let request_binding = Hash([0x44; 32]);
@@ -16963,63 +17102,15 @@ mod tests {
             Err(IngressNodeAttestationError::AlreadyConfigured),
         );
 
-        let query = vos_node
-            .ingress_handle()
-            .attest_ssh_projection_query(
+        assert_eq!(
+            vos_node.ingress_handle().attest_ssh_projection_query(
                 authority,
                 credential_public_key,
                 nonce,
                 selector,
                 request_binding,
-            )
-            .unwrap();
-        let AuthorityIngressAuthentication::SshNodeAttestation {
-            node: attesting_node,
-            request_binding: signed_request_binding,
-            signature,
-            ..
-        } = query.authentication
-        else {
-            panic!("SSH transport must use node attestation");
-        };
-        assert_eq!(attesting_node, node);
-        assert_eq!(signed_request_binding, request_binding);
-        node_public_key
-            .verify_strict(
-                &query.signing_bytes(),
-                &ed25519_dalek::Signature::from_bytes(&signature),
-            )
-            .unwrap();
-
-        let mut substituted_selector = query.clone();
-        substituted_selector.selector = AuthorityProjectionSelector::Actors {
-            agent: AgentId([0x45; 32]),
-            after: Some(ActorId([0x47; 32])),
-            limit: 8,
-        };
-        assert!(
-            node_public_key
-                .verify_strict(
-                    &substituted_selector.signing_bytes(),
-                    &ed25519_dalek::Signature::from_bytes(&signature),
-                )
-                .is_err(),
-        );
-
-        let mut substituted_binding = query;
-        substituted_binding.authentication = AuthorityIngressAuthentication::SshNodeAttestation {
-            credential_public_key,
-            node,
-            request_binding: Hash([0x48; 32]),
-            signature,
-        };
-        assert!(
-            node_public_key
-                .verify_strict(
-                    &substituted_binding.signing_bytes(),
-                    &ed25519_dalek::Signature::from_bytes(&signature),
-                )
-                .is_err(),
+            ),
+            Err(IngressNodeAttestationError::AuthorityUnavailable),
         );
         assert_eq!(
             vos_node.ingress_handle().attest_ssh_projection_query(

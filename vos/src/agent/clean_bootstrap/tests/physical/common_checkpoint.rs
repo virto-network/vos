@@ -5,6 +5,15 @@
 //! automatic network image discovery/transfer qualification.
 
 use super::*;
+
+#[cfg(feature = "experimental-state-blocks")]
+#[path = "authority_observation.rs"]
+mod authority_observation;
+#[cfg(feature = "experimental-state-blocks")]
+#[path = "forwarded_install_origin.rs"]
+mod forwarded_install_origin;
+#[path = "management_retention.rs"]
+mod management_retention;
 use crate::agent::shared_commit::SharedAgentCommonSnapshotClaim;
 use crate::agent::shared_host::{
     CommonCheckpointCrashStage, SharedAgentPortableBackupLimits, SharedAgentSnapshotState,
@@ -15,103 +24,53 @@ use crate::network::agent_protocol::AgentGenerationRoute;
 #[test]
 #[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
 fn candidate_common_checkpoint_compacts_catches_up_reopens_and_continues() {
-    check_fixed_system_pending_cluster_with_checkpoint(true, None, false, Some(Exercise::Healthy));
+    check_fixed_system_pending_cluster_with_checkpoint(true, Some(Exercise::Healthy));
 }
 
 #[derive(Clone, Copy)]
 pub(super) enum Exercise {
     Healthy,
     Crash(CommonCheckpointCrashStage),
-    Recovery(RecoveryBoundary),
-    ContendedIntent,
-    ExpiredContendedIntent,
-    SameLeaderRetry,
-    OverwrittenRegistration,
-    ExpiredCustody,
-    ExpiredContendedCustody,
+    #[cfg(feature = "experimental-state-blocks")]
+    AuthorityObservation,
+    ManagementRetention,
+    ManagementRetentionFollower,
+    #[cfg(feature = "experimental-state-blocks")]
+    ForwardedInstallOrigin,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum RecoveryBoundary {
-    BeforeInvoke,
-    AfterAcknowledgement,
-    FollowerDelivery,
-}
-
+#[cfg(feature = "experimental-state-blocks")]
 #[test]
-#[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
-fn candidate_registered_projection_is_discovered_with_origin_offline_and_survives_checkpoints() {
+#[ignore = "requires fresh Authority/System IMAGE, external runtime, Clerk package and three authenticated loopback transports"]
+fn candidate_forwarded_shared_install_refuses_shadow_and_absent_origin_at_receiver() {
+    assert!(std::env::var_os("AUTHORITY_CANDIDATE_ELF").is_some());
+    assert!(std::env::var_os("VOS_AGENT_RUNTIME_COST_CANDIDATE").is_some());
+    assert!(std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some());
+    assert!(std::env::var_os("CLERK_AGENT_PACKAGE").is_some());
     check_fixed_system_pending_cluster_with_checkpoint(
         true,
-        None,
-        false,
-        Some(Exercise::Recovery(RecoveryBoundary::BeforeInvoke)),
+        Some(Exercise::ForwardedInstallOrigin),
     );
 }
 
 #[test]
-#[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
-fn candidate_registered_post_ack_projection_survives_repeated_checkpoint_import_and_reopen() {
-    check_fixed_system_pending_cluster_with_checkpoint(
-        true,
-        None,
-        false,
-        Some(Exercise::Recovery(RecoveryBoundary::AfterAcknowledgement)),
-    );
+#[ignore = "requires fresh Authority/System IMAGE candidates and three authenticated loopback transports"]
+fn candidate_management_create_retention_survives_offline_pruning_then_installs() {
+    assert!(std::env::var_os("AUTHORITY_CANDIDATE_ELF").is_some());
+    assert!(std::env::var_os("VOS_AGENT_RUNTIME_COST_CANDIDATE").is_some());
+    assert!(std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some());
+    check_fixed_system_pending_cluster_with_checkpoint(true, Some(Exercise::ManagementRetention));
 }
 
 #[test]
-#[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
-fn candidate_registered_follower_delivery_survives_leader_reads_and_repeated_checkpoints() {
+#[ignore = "requires fresh Authority/System IMAGE candidates and three authenticated loopback transports"]
+fn candidate_management_retention_recovers_and_releases_on_original_returning_follower() {
+    assert!(std::env::var_os("AUTHORITY_CANDIDATE_ELF").is_some());
+    assert!(std::env::var_os("VOS_AGENT_RUNTIME_COST_CANDIDATE").is_some());
+    assert!(std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some());
     check_fixed_system_pending_cluster_with_checkpoint(
         true,
-        None,
-        false,
-        Some(Exercise::Recovery(RecoveryBoundary::FollowerDelivery)),
-    );
-}
-
-#[test]
-#[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
-fn candidate_registered_request_precedes_competing_unadmitted_wal_after_election() {
-    check_fixed_system_pending_cluster_with_checkpoint(
-        true,
-        None,
-        false,
-        Some(Exercise::ContendedIntent),
-    );
-}
-
-#[test]
-#[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
-fn candidate_expired_unadmitted_intent_cannot_acquire_custody_after_election() {
-    check_fixed_system_pending_cluster_with_checkpoint(
-        true,
-        None,
-        false,
-        Some(Exercise::ExpiredContendedIntent),
-    );
-}
-
-#[test]
-#[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
-fn candidate_registered_same_leader_timeout_and_duplicate_rows_survive_reopen() {
-    check_fixed_system_pending_cluster_with_checkpoint(
-        true,
-        None,
-        false,
-        Some(Exercise::SameLeaderRetry),
-    );
-}
-
-#[test]
-#[ignore = "requires AUTHORITY_CANDIDATE_ELF and three authenticated loopback transports"]
-fn candidate_overwritten_registration_releases_remote_exclusion_without_reattachment() {
-    check_fixed_system_pending_cluster_with_checkpoint(
-        true,
-        None,
-        false,
-        Some(Exercise::OverwrittenRegistration),
+        Some(Exercise::ManagementRetentionFollower),
     );
 }
 
@@ -120,8 +79,6 @@ fn candidate_overwritten_registration_releases_remote_exclusion_without_reattach
 fn candidate_common_checkpoint_recovers_source_and_destination_marker_crashes() {
     check_fixed_system_pending_cluster_with_checkpoint(
         true,
-        None,
-        false,
         Some(Exercise::Crash(CommonCheckpointCrashStage::Marker)),
     );
 }
@@ -131,8 +88,6 @@ fn candidate_common_checkpoint_recovers_source_and_destination_marker_crashes() 
 fn candidate_common_checkpoint_recovers_source_and_destination_journal_crashes() {
     check_fixed_system_pending_cluster_with_checkpoint(
         true,
-        None,
-        false,
         Some(Exercise::Crash(CommonCheckpointCrashStage::Journal)),
     );
 }
@@ -142,8 +97,6 @@ fn candidate_common_checkpoint_recovers_source_and_destination_journal_crashes()
 fn candidate_common_checkpoint_recovers_source_and_destination_ledger_crashes() {
     check_fixed_system_pending_cluster_with_checkpoint(
         true,
-        None,
-        false,
         Some(Exercise::Crash(CommonCheckpointCrashStage::Ledger)),
     );
 }
@@ -211,36 +164,60 @@ fn query(owner: &MemoryBootstrapOwner, index: usize, nonce: u8) -> AuthorityProj
     query
 }
 
-pub(super) fn delegated_query(
+/// Exercise the ordinary public Invoke/ACK Query contract, not an internal
+/// Authority observation producer or compatibility recovery path.
+fn public_query_work(
     owner: &MemoryBootstrapOwner,
-    index: usize,
-    nonce: u8,
-) -> AuthorityProjectionQuery {
-    let mut query = query(owner, index, nonce);
-    let agent = HostAgentId(owner.pins.agent.0);
-    let mut host = owner.host.lock().unwrap();
-    let attachment = host.supervisor_attachment_status(agent).unwrap().unwrap();
-    let accepted_slot = host.current_logical_slot(agent).unwrap();
-    drop(host);
-    query.recovery = Some(
-        crate::agent_sdk::authority::AuthorityProjectionRecoveryDelegation {
-            generation: Hash(attachment.replication_id),
-            committee: Hash(*attachment.route.committee().as_bytes()),
-            accepted_slot,
-            expires_at: accepted_slot
-                + crate::agent_sdk::authority::MAX_AUTHORITY_PROJECTION_RECOVERY_SLOTS,
+    request: &AuthorityProjectionQuery,
+) -> (
+    InvocationWork,
+    InvocationAuthorization,
+    crate::agent::supervisor::AgentRouteIdentity,
+) {
+    let target = owner.authority_target();
+    assert_eq!(request.authority, target);
+    let mut material = owner
+        .supervisor_invocation_material(owner.pins.agent, target.binding.issuer.actor)
+        .unwrap();
+    material.root_provenance = false;
+    let identity =
+        crate::agent::supervisor_adapters::physical_material_identity(&material).unwrap();
+    let mut availability = vec![material.program, material.schema, material.policies];
+    availability.extend(material.installation_data);
+    availability.sort_unstable_by(|a, b| a.reference.cmp(&b.reference));
+    let work = InvocationWork {
+        space: target.space,
+        agent: target.system_agent,
+        runtime_deployment: target.system_runtime_deployment,
+        invocation: request.expected_invocation(),
+        actor: target.binding.issuer.actor,
+        incarnation: material.actor.incarnation,
+        deployment: target.binding.issuer.deployment,
+        program: target.binding.issuer.program,
+        mode: MethodMode::Query,
+        origin: InvocationOrigin {
+            principal: None,
+            transport_node: request.attesting_node(),
+            credential: None,
+            actor: None,
+            capability: None,
         },
-    );
-    let key = SigningKey::from_bytes(&[[NODE_SEED, 0xd2, 0xd3][index]; 32]);
-    let signature = key.sign(&query.signing_bytes()).to_bytes();
-    let AuthorityIngressAuthentication::SshNodeAttestation {
-        signature: actual, ..
-    } = &mut query.authentication
-    else {
-        unreachable!()
+        roles: InvocationRoleClaims::none(),
+        message: dynamic_message(
+            "credential_projection",
+            "query",
+            crate::actors::value::Value::Bytes(request.encode().unwrap()),
+        ),
+        installation_data: material.actor.entry.installation_data,
+        availability,
+        gas: owner.invocation_gas,
+        recovery_only: false,
     };
-    *actual = signature;
-    query
+    assert!(work.validate());
+    let authorization = InvocationAuthorization::PublicPreflight(
+        crate::agent_sdk::PublicPreflight::for_work(&work, material.observed_slot),
+    );
+    (work, authorization, identity)
 }
 
 pub(super) fn restart_network(index: usize) -> Arc<Network> {
@@ -261,1296 +238,6 @@ pub(super) fn restart_network(index: usize) -> Arc<Network> {
     network
 }
 
-/// Forced small checkpoint cycles qualify custody retention, not the full
-/// replay-window capacity or service throughput. The harness transfers only
-/// certified checkpoint bytes; it never supplies the lost query to a successor.
-fn exercise_contended_intent(
-    leader: usize,
-    owners: &mut [Option<MemoryBootstrapOwner>],
-    fixtures: &[PhysicalFixture],
-    networks: &mut Vec<Arc<Network>>,
-    expire_other: bool,
-) {
-    let agent = HostAgentId(fixtures[leader].plan.pins.agent.0);
-    let mut intents = Vec::new();
-    for index in 0..3 {
-        let owner = owners[index].as_mut().unwrap();
-        let query = delegated_query(owner, index, 0xe1 + index as u8);
-        let mut pending = owner.prepare_authority_projection(query).unwrap();
-        owner
-            .prepare_projection_recovery_registration(&mut pending)
-            .unwrap();
-        let (work, authorization) = pending.invocation().unwrap();
-        if index == leader {
-            owner
-                ._network_host
-                .reserve_projection_pair(agent, work, authorization, false)
-                .unwrap();
-        } else {
-            owner
-                ._network_host
-                .reserve_forwarded_projection_pair(agent, work, authorization)
-                .unwrap();
-        }
-        owner.record.pending_projection = Some(pending.clone());
-        commit_bootstrap_record(&mut owner.record_store, &owner.record).unwrap();
-        intents.push(pending);
-    }
-    let admitted = &intents[leader];
-    owners[leader]
-        .as_ref()
-        .unwrap()
-        .register_pending_projection(admitted)
-        .unwrap();
-    let (work, authorization) = admitted.invocation().unwrap();
-    let work = work.clone();
-    let authorization = authorization.clone();
-    for index in 0..3 {
-        if index == leader {
-            continue;
-        }
-        let owner = owners[index].as_ref().unwrap();
-        let before = owner.record.encode();
-        assert!(owner.register_pending_projection(&intents[index]).is_err());
-        assert_eq!(owner.record.encode(), before);
-    }
-    drop(owners[leader].take());
-    let mut live_networks: Vec<_> = networks.drain(..).map(Some).collect();
-    stop_network(live_networks[leader].take().unwrap());
-    assert!(wait_until(std::time::Duration::from_secs(30), || owners
-        .iter()
-        .flatten()
-        .any(|owner| owner
-            ._network_host
-            .bootstrap_is_local_leader(agent)
-            .unwrap_or(false))));
-    let successor = owners
-        .iter()
-        .position(|owner| {
-            owner.as_ref().is_some_and(|owner| {
-                owner
-                    ._network_host
-                    .bootstrap_is_local_leader(agent)
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap();
-    let owner = owners[successor].as_mut().unwrap();
-    let before_record = owner.record.encode();
-    let before_index = owner.ordered_index_for_test().unwrap();
-    owner
-        .recover_registered_projection_dependency(&intents[successor])
-        .unwrap();
-    assert_eq!(
-        owner.record.encode(),
-        before_record,
-        "help must not replace or clear the losing WAL"
-    );
-    assert_eq!(
-        owner
-            .record_store
-            .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
-            .unwrap(),
-        Some(before_record)
-    );
-    assert_eq!(owner.ordered_index_for_test().unwrap(), before_index + 2);
-    assert!(
-        owner
-            .host
-            .lock()
-            .unwrap()
-            .retained_positive_clean_acknowledgement(agent, &work, &authorization)
-            .unwrap()
-    );
-    let response = owner.committed_projection_response(&work).unwrap().unwrap();
-    let projection =
-        crate::agent_sdk::authority::AuthorityCredentialProjection::decode(&response).unwrap();
-    let AuthorityReadRequest::Projection(expected_query) = &admitted.query else {
-        unreachable!()
-    };
-    assert_eq!(&projection.query, expected_query);
-    assert!(owner.recover_pending_authority_projection().unwrap());
-    assert!(owner.record.pending_projection.is_none());
-    assert_eq!(owner.ordered_index_for_test().unwrap(), before_index + 4);
-    let manifest = owner
-        ._network_host
-        .projection_recovery_manifest(agent)
-        .unwrap();
-    assert!(
-        manifest
-            .slot(HostNodeId(fixtures[leader].plan.pins.node.0))
-            .unwrap()
-            .is_acknowledged()
-    );
-    assert!(
-        manifest
-            .slot(HostNodeId(fixtures[successor].plan.pins.node.0))
-            .unwrap()
-            .is_acknowledged()
-    );
-    // The other follower's rejected local intent was never custody-admitted;
-    // it remains durable until that owner explicitly retries it.
-    let other = (0..3)
-        .find(|index| *index != leader && *index != successor)
-        .unwrap();
-    assert_eq!(
-        owners[other]
-            .as_ref()
-            .unwrap()
-            .record
-            .pending_projection
-            .as_ref(),
-        Some(&intents[other])
-    );
-    assert!(
-        manifest
-            .slot(HostNodeId(fixtures[other].plan.pins.node.0))
-            .is_none()
-    );
-    if expire_other {
-        let expired_owner = owners[other].as_ref().unwrap();
-        let expired_record = expired_owner.record.encode();
-        let AuthorityReadRequest::Projection(expired_query) = &intents[other].query else {
-            unreachable!()
-        };
-        for fixture in fixtures {
-            fixture.logical_slot.as_ref().unwrap().store(
-                expired_query.recovery.unwrap().expires_at,
-                Ordering::Release,
-            );
-        }
-        let leader_before = owners[successor]
-            .as_ref()
-            .unwrap()
-            ._network_host
-            .projection_admission_state_for_test(agent)
-            .unwrap();
-        assert_eq!(leader_before.0, leader_before.1);
-        assert!(leader_before.2.is_none());
-        // A rejected local WAL is not shared custody. Its owner must not
-        // poison the leader's admission after the signed window has closed.
-        assert!(
-            owners[other]
-                .as_mut()
-                .unwrap()
-                .recover_pending_authority_projection()
-                .is_err()
-        );
-        let leader_owner = owners[successor].as_ref().unwrap();
-        assert_eq!(
-            leader_owner
-                ._network_host
-                .projection_admission_state_for_test(agent)
-                .unwrap(),
-            leader_before
-        );
-        assert_eq!(
-            leader_owner
-                ._network_host
-                .projection_recovery_manifest(agent)
-                .unwrap(),
-            manifest
-        );
-        let expired_owner = owners[other].as_ref().unwrap();
-        assert_eq!(expired_owner.record.encode(), expired_record);
-        assert_eq!(
-            expired_owner
-                .record_store
-                .clone()
-                .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
-                .unwrap(),
-            Some(expired_record)
-        );
-        let fresh = delegated_query(leader_owner, successor, 0xf1);
-        let sender = leader_owner.pins.node;
-        assert!(
-            owners[successor]
-                .as_mut()
-                .unwrap()
-                .invoke_peer_authority_projection(fresh.clone(), false, sender)
-                .is_ok()
-        );
-        let after = owners[successor]
-            .as_ref()
-            .unwrap()
-            ._network_host
-            .projection_recovery_manifest(agent)
-            .unwrap();
-        let fresh_slot = after.slot(HostNodeId(sender.0)).unwrap();
-        assert_eq!(fresh_slot.registration().query(), &fresh);
-        assert!(fresh_slot.is_acknowledged());
-        assert!(
-            after
-                .slot(HostNodeId(fixtures[other].plan.pins.node.0))
-                .is_none()
-        );
-    }
-    // The enclosing fixture needs only live handles for its normal cleanup.
-    *networks = live_networks.into_iter().flatten().collect();
-}
-
-fn exercise_overwritten_registration(
-    leader: usize,
-    owners: &mut [Option<MemoryBootstrapOwner>],
-    fixtures: &[PhysicalFixture],
-    networks: &[Arc<Network>],
-) {
-    let agent = HostAgentId(fixtures[leader].plan.pins.agent.0);
-    let origin = (leader + 1) % 3;
-    let owner = owners[origin].as_mut().unwrap();
-    let query = delegated_query(owner, origin, 0xf4);
-    let mut pending = owner.prepare_authority_projection(query.clone()).unwrap();
-    owner
-        .prepare_projection_recovery_registration(&mut pending)
-        .unwrap();
-    let (work, authorization) = pending.invocation().unwrap();
-    owner
-        ._network_host
-        .reserve_forwarded_projection_pair(agent, work, authorization)
-        .unwrap();
-    owner.record.pending_projection = Some(pending.clone());
-    commit_bootstrap_record(&mut owner.record_store, &owner.record).unwrap();
-    let saved_record = owner.record.encode();
-    let initial = owner
-        ._network_host
-        .projection_recovery_manifest(agent)
-        .unwrap();
-    let registration = pending
-        .registration(initial.generation(), initial.committee().id())
-        .unwrap()
-        .unwrap();
-
-    let original = owners[leader].as_ref().unwrap();
-    let before = original
-        ._network_host
-        .projection_admission_state_for_test(agent)
-        .unwrap();
-    assert_eq!(before.0, before.1);
-    assert!(before.2.is_none());
-    assert!(original.record.pending_projection.is_none());
-    let (route, database) = {
-        let host = original.host.lock().unwrap();
-        let status = host.supervisor_attachment_status(agent).unwrap().unwrap();
-        (
-            AgentGenerationRoute {
-                space: original.pins.space,
-                agent: original.pins.agent,
-                generation: Hash(status.replication_id),
-            },
-            host.raft_database(agent).unwrap(),
-        )
-    };
-    // Keep the actual owner, coordinator and application RPC live. Only Raft
-    // traffic is cut, so the timed-out remote append really loses an election.
-    original
-        ._network_host
-        .set_raft_isolated_for_test(agent, true)
-        .unwrap();
-    let reply = networks[origin]
-        .send_agent_recovery_registration(original.pins.node, route, registration.clone())
-        .recv_timeout(std::time::Duration::from_secs(10));
-    assert!(!matches!(reply, Ok(Ok(true))));
-    let attempt = original
-        ._network_host
-        .pending_registration_append_for_test(agent)
-        .unwrap()
-        .unwrap();
-    assert_eq!(attempt.0, before.0 + 1);
-    let uncommitted = original
-        ._network_host
-        .projection_admission_state_for_test(agent)
-        .unwrap();
-    assert_eq!(uncommitted.0, attempt.0);
-    assert_eq!(uncommitted.1, before.1);
-    assert!(uncommitted.2.is_some());
-    let raw = crate::raft::RaftLog::open(database.clone())
-        .unwrap()
-        .entries(attempt.0, attempt.0)
-        .unwrap()
-        .pop()
-        .unwrap();
-    assert_eq!(raw.term, attempt.1);
-    let vos_raft::EntryKind::Data { payload } =
-        crate::agent::shared_raft::decode_agent_raft_entry_kind(&raw.payload).unwrap()
-    else {
-        panic!("registration must be a real Raft data append");
-    };
-    let crate::agent::shared_raft::AgentRaftCommand::RegisterRecovery {
-        registration: actual,
-        ..
-    } = crate::agent::shared_raft::AgentRaftCommand::decode(&payload).unwrap()
-    else {
-        panic!("timed-out row must retain the exact registration");
-    };
-    assert_eq!(actual, registration);
-
-    assert!(wait_until(std::time::Duration::from_secs(30), || owners
-        .iter()
-        .enumerate()
-        .any(|(index, owner)| {
-            index != leader
-                && owner
-                    .as_ref()
-                    .unwrap()
-                    ._network_host
-                    .bootstrap_is_local_leader(agent)
-                    .unwrap_or(false)
-        })));
-    for (index, owner) in owners.iter().enumerate() {
-        if index != leader {
-            assert_eq!(
-                owner
-                    .as_ref()
-                    .unwrap()
-                    ._network_host
-                    .projection_recovery_manifest(agent)
-                    .unwrap(),
-                initial
-            );
-        }
-    }
-    original
-        ._network_host
-        .set_raft_isolated_for_test(agent, false)
-        .unwrap();
-    assert!(wait_until(std::time::Duration::from_secs(30), || {
-        let state = original
-            ._network_host
-            .projection_admission_state_for_test(agent)
-            .unwrap();
-        let replacement = crate::raft::RaftLog::open(database.clone())
-            .unwrap()
-            .entries(attempt.0, attempt.0)
-            .unwrap()
-            .pop();
-        state.0 == state.1
-            && state.1 >= attempt.0
-            && replacement
-                .is_some_and(|entry| entry.term > raw.term && entry.payload != raw.payload)
-    }));
-    assert_eq!(
-        original
-            ._network_host
-            .projection_recovery_manifest(agent)
-            .unwrap(),
-        initial
-    );
-    // Reconciliation must release only the remote append's volatile exclusion.
-    // A fresh local WAL can progress without dropping or reattaching this owner.
-    let original = owners[leader].as_mut().unwrap();
-    let fresh = delegated_query(original, leader, 0xf5);
-    let mut fresh_pending = original
-        .prepare_authority_projection(fresh.clone())
-        .unwrap();
-    original
-        .prepare_projection_recovery_registration(&mut fresh_pending)
-        .unwrap();
-    let (fresh_work, fresh_auth) = fresh_pending.invocation().unwrap();
-    original
-        ._network_host
-        .reserve_forwarded_projection_pair(agent, fresh_work, fresh_auth)
-        .unwrap();
-    assert!(
-        original
-            ._network_host
-            .pending_registration_append_for_test(agent)
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(
-        original
-            ._network_host
-            .projection_recovery_manifest(agent)
-            .unwrap(),
-        initial
-    );
-    original.record.pending_projection = Some(fresh_pending);
-    commit_bootstrap_record(&mut original.record_store, &original.record).unwrap();
-
-    let owner = owners[origin].as_mut().unwrap();
-    assert_eq!(owner.record.encode(), saved_record);
-    assert_eq!(
-        owner
-            .record_store
-            .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
-            .unwrap(),
-        Some(saved_record)
-    );
-    let before_ordered = owner.ordered_index_for_test().unwrap();
-    // This harness has authenticated registration RPCs and real Raft traffic,
-    // but no node-loop ProjectionRequest dispatcher. Use the actual elected
-    // owner's peer handler, first resolving the original still-durable WAL.
-    // The overwritten leader's exclusion has already been proved released.
-    for (index, request) in [(origin, query), (leader, fresh)] {
-        let sender = fixtures[index].plan.pins.node;
-        assert!(wait_until(std::time::Duration::from_secs(30), || {
-            match owners[index].as_ref().unwrap().register_pending_projection(
-                owners[index]
-                    .as_ref()
-                    .unwrap()
-                    .record
-                    .pending_projection
-                    .as_ref()
-                    .unwrap(),
-            ) {
-                Ok(()) => true,
-                Err(SharedAgentHostError::Unavailable) => false,
-                Err(error) => panic!("exact origin registration failed: {error:?}"),
-            }
-        }));
-        assert!(wait_until(std::time::Duration::from_secs(30), || {
-            let Some(current) = owners.iter().position(|owner| {
-                owner
-                    .as_ref()
-                    .unwrap()
-                    ._network_host
-                    .bootstrap_is_local_leader(agent)
-                    .unwrap_or(false)
-            }) else {
-                return false;
-            };
-            match owners[current]
-                .as_mut()
-                .unwrap()
-                .invoke_peer_authority_projection(request.clone(), false, sender)
-            {
-                Ok(response) => {
-                    let projection =
-                        crate::agent_sdk::authority::AuthorityCredentialProjection::decode(
-                            &response,
-                        )
-                        .unwrap();
-                    assert_eq!(projection.query, request);
-                    true
-                }
-                Err(SharedAgentHostError::Unavailable) => false,
-                Err(error) => panic!("exact peer query failed: {error:?}"),
-            }
-        }));
-        let owner = owners[index].as_mut().unwrap();
-        assert!(wait_until(std::time::Duration::from_secs(30), || {
-            match owner.recover_pending_authority_projection() {
-                Ok(_) => true,
-                Err(SharedAgentHostError::Unavailable) => false,
-                Err(error) => panic!("exact origin cleanup failed: {error:?}"),
-            }
-        }));
-        assert!(owner.record.pending_projection.is_none());
-        assert_eq!(
-            owner.ordered_index_for_test().unwrap(),
-            before_ordered + if index == origin { 2 } else { 4 }
-        );
-    }
-    let final_manifest = owners[leader]
-        .as_ref()
-        .unwrap()
-        ._network_host
-        .projection_recovery_manifest(agent)
-        .unwrap();
-    for index in [leader, origin] {
-        assert!(
-            final_manifest
-                .slot(HostNodeId(fixtures[index].plan.pins.node.0))
-                .unwrap()
-                .is_acknowledged()
-        );
-    }
-}
-
-fn exercise_same_leader_retry(
-    leader: usize,
-    owners: &mut [Option<MemoryBootstrapOwner>],
-    fixtures: &[PhysicalFixture],
-    directories: &[TestDirectory],
-    stores: &[(
-        BootstrapMemoryStore,
-        BootstrapMemoryStore,
-        IssuerMemoryStore,
-    )],
-    providers: &[Arc<MemoryProvider>],
-    networks: &mut Vec<Arc<Network>>,
-    signer: &mut CountingSigner,
-) {
-    let agent = HostAgentId(fixtures[leader].plan.pins.agent.0);
-    let slow = (leader + 1) % 3;
-    let offline = (leader + 2) % 3;
-    let owner = owners[leader].as_mut().unwrap();
-    let request = delegated_query(owner, leader, 0xf2);
-    let mut pending = owner.prepare_authority_projection(request).unwrap();
-    owner
-        .prepare_projection_recovery_registration(&mut pending)
-        .unwrap();
-    let (work, authorization) = pending.invocation().unwrap();
-    let work = work.clone();
-    let authorization = authorization.clone();
-    owner
-        ._network_host
-        .reserve_projection_pair(agent, &work, &authorization, false)
-        .unwrap();
-    owner.record.pending_projection = Some(pending.clone());
-    commit_bootstrap_record(&mut owner.record_store, &owner.record).unwrap();
-    owner.register_pending_projection(&pending).unwrap();
-    let initial = owner
-        ._network_host
-        .projection_recovery_manifest(agent)
-        .unwrap();
-    let holder = HostNodeId(owner.pins.node.0);
-    let identity = owner
-        .pending_authority_projection_identity(&pending, true)
-        .unwrap();
-    let saved_record = owner.record.encode();
-    let before_ordered = owner.ordered_index_for_test().unwrap();
-    for owner in owners.iter().flatten() {
-        assert!(wait_until(std::time::Duration::from_secs(30), || owner
-            ._network_host
-            .projection_recovery_manifest(agent)
-            .is_ok_and(|manifest| manifest == initial)));
-    }
-    drop(owners[offline].take());
-    let mut live_networks: Vec<_> = networks.drain(..).map(Some).collect();
-    stop_network(live_networks[offline].take().unwrap());
-    let slow_database = owners[slow]
-        .as_ref()
-        .unwrap()
-        .host
-        .lock()
-        .unwrap()
-        .raft_database(agent)
-        .unwrap();
-    let mut canonical_invoke = None;
-    for acknowledgement in [false, true] {
-        let owner = owners[leader].as_mut().unwrap();
-        let before = owner
-            ._network_host
-            .projection_admission_state_for_test(agent)
-            .unwrap();
-        assert_eq!(before.0, before.1);
-        assert!(before.2.is_some());
-        // Hold the real follower database writer, not a fake reply. With the
-        // other voter offline, the first command cannot commit before its
-        // response waiter expires. The blocked follower cannot start elections.
-        let blocked_writer = slow_database.begin_write().unwrap();
-        let started = std::time::Instant::now();
-        let timed_out = if acknowledgement {
-            owner.supervisor_acknowledge_reserved(identity, work.clone(), authorization.clone())
-        } else {
-            owner.supervisor_invoke_terminal_reserved(identity, work.clone(), authorization.clone())
-        };
-        assert!(timed_out.is_err());
-        assert!(started.elapsed() >= std::time::Duration::from_millis(1_800));
-        // Bootstrap readiness is deliberately false while this prefix is
-        // uncommitted. The repeated-input append below independently requires the same
-        // worker to remain the actual Raft leader, not merely route-ready.
-        let uncommitted = owner
-            ._network_host
-            .projection_admission_state_for_test(agent)
-            .unwrap();
-        assert_eq!(uncommitted.0, before.0 + 1);
-        assert_eq!(uncommitted.1, before.1);
-        assert_eq!(uncommitted.2, before.2);
-        // Reusing the key must recheck the raw prefix; so must submission by
-        // a caller that already took its reservation before the timed-out call.
-        assert!(
-            owner
-                ._network_host
-                .reserve_projection_pair(agent, &work, &authorization, true,)
-                .is_err()
-        );
-        let retry = if acknowledgement {
-            owner.supervisor_acknowledge_reserved(identity, work.clone(), authorization.clone())
-        } else {
-            owner.supervisor_invoke_terminal_reserved(identity, work.clone(), authorization.clone())
-        };
-        assert!(retry.is_err());
-        assert_eq!(
-            owner
-                ._network_host
-                .projection_admission_state_for_test(agent)
-                .unwrap(),
-            uncommitted
-        );
-        assert_eq!(owner.record.encode(), saved_record);
-        assert_eq!(
-            owner
-                .record_store
-                .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
-                .unwrap(),
-            Some(saved_record.clone())
-        );
-        drop(blocked_writer);
-        for owner in owners.iter().flatten() {
-            assert!(wait_until(std::time::Duration::from_secs(30), || {
-                owner
-                    .host
-                    .lock()
-                    .unwrap()
-                    .capacity(agent)
-                    .is_ok_and(|capacity| capacity.0 >= before.0 + 1)
-            }));
-        }
-        // Admission now prevents an append while the original is uncommitted.
-        // Independently qualify committed replay of the same input at a new
-        // valid Ordered position. Reassigning the original immutable Ordered
-        // entry to another Raft index would violate its publication binding,
-        // rather than represent a runtime retry.
-        let duplicate_index = owners[leader]
-            .as_ref()
-            .unwrap()
-            ._network_host
-            .append_repeated_projection_for_test(agent, &work, &authorization, acknowledgement)
-            .unwrap();
-        assert_eq!(duplicate_index, before.0 + 2);
-        for owner in owners.iter().flatten() {
-            assert!(wait_until(std::time::Duration::from_secs(30), || {
-                owner
-                    ._network_host
-                    .projection_recovery_manifest(agent)
-                    .is_ok_and(|manifest| {
-                        owner
-                            .host
-                            .lock()
-                            .unwrap()
-                            .capacity(agent)
-                            .is_ok_and(|capacity| capacity.0 >= duplicate_index)
-                            && manifest.slot(holder).is_some_and(|slot| {
-                                slot.invoke().is_some() && slot.is_acknowledged() == acknowledgement
-                            })
-                    })
-            }));
-            let manifest = owner
-                ._network_host
-                .projection_recovery_manifest(agent)
-                .unwrap();
-            let slot = manifest.slot(holder).unwrap();
-            let evidence = if acknowledgement {
-                slot.acknowledgement()
-            } else {
-                slot.invoke()
-            }
-            .unwrap();
-            assert_eq!(
-                evidence.raft_index(),
-                before.0 + 1,
-                "custody must retain the first physical observation"
-            );
-            if acknowledgement {
-                assert_eq!(slot.invoke(), canonical_invoke.as_ref());
-            }
-        }
-        if !acknowledgement {
-            canonical_invoke = owners[leader]
-                .as_ref()
-                .unwrap()
-                ._network_host
-                .projection_recovery_manifest(agent)
-                .unwrap()
-                .slot(holder)
-                .unwrap()
-                .invoke()
-                .cloned();
-        }
-    }
-    drop(slow_database);
-    let owner = owners[leader].as_mut().unwrap();
-    let final_duplicate_index = owner
-        ._network_host
-        .projection_admission_state_for_test(agent)
-        .unwrap()
-        .0;
-    let expected = owner
-        ._network_host
-        .projection_recovery_manifest(agent)
-        .unwrap();
-    let response = owner.committed_projection_response(&work).unwrap().unwrap();
-    assert_eq!(owner.ordered_index_for_test().unwrap(), before_ordered + 4);
-    assert!(owner.recover_pending_authority_projection().unwrap());
-    assert!(owner.record.pending_projection.is_none());
-    assert_eq!(owner.ordered_index_for_test().unwrap(), before_ordered + 4);
-    live_networks[offline] = Some(restart_network(offline));
-    for index in 0..3 {
-        if index != offline {
-            live_networks[offline]
-                .as_ref()
-                .unwrap()
-                .connect(live_networks[index].as_ref().unwrap().listen_addrs()[0].clone());
-        }
-    }
-    owners[offline] = Some(reopen_owner(
-        &fixtures[offline],
-        &directories[offline],
-        &stores[offline],
-        providers[offline].clone(),
-        live_networks[offline].as_ref().unwrap().clone(),
-        signer,
-    ));
-    for owner in owners.iter().flatten() {
-        assert!(wait_until(std::time::Duration::from_secs(30), || owner
-            ._network_host
-            .projection_recovery_manifest(agent)
-            .is_ok_and(|manifest| manifest == expected
-                && owner.host.lock().unwrap().capacity(agent).is_ok_and(
-                    |capacity| capacity.0 >= final_duplicate_index
-                ))));
-        assert_eq!(
-            owner.committed_projection_response(&work).unwrap(),
-            Some(response.clone())
-        );
-    }
-    // Reopening both original active owners must reproduce first-position
-    // evidence even though their latest applied rows were duplicate copies.
-    for index in [slow, leader] {
-        drop(owners[index].take());
-        owners[index] = Some(reopen_owner(
-            &fixtures[index],
-            &directories[index],
-            &stores[index],
-            providers[index].clone(),
-            live_networks[index].as_ref().unwrap().clone(),
-            signer,
-        ));
-        let owner = owners[index].as_ref().unwrap();
-        assert_eq!(
-            owner
-                ._network_host
-                .projection_recovery_manifest(agent)
-                .unwrap(),
-            expected
-        );
-        assert!(owner.host.lock().unwrap().capacity(agent).unwrap().0 >= final_duplicate_index);
-        assert_eq!(
-            owner.committed_projection_response(&work).unwrap(),
-            Some(response.clone())
-        );
-    }
-    *networks = live_networks.into_iter().map(Option::unwrap).collect();
-}
-
-fn exercise_registered_recovery(
-    leader: usize,
-    owners: &mut [Option<MemoryBootstrapOwner>],
-    fixtures: &[PhysicalFixture],
-    directories: &[TestDirectory],
-    stores: &[(
-        BootstrapMemoryStore,
-        BootstrapMemoryStore,
-        IssuerMemoryStore,
-    )],
-    providers: &[Arc<MemoryProvider>],
-    networks: &mut Vec<Arc<Network>>,
-    signer: &mut CountingSigner,
-    boundary: RecoveryBoundary,
-) {
-    let agent = HostAgentId(fixtures[leader].plan.pins.agent.0);
-    let origin = if boundary == RecoveryBoundary::FollowerDelivery {
-        (leader + 1) % 3
-    } else {
-        leader
-    };
-    let owner = owners[origin].as_mut().unwrap();
-    let request = delegated_query(owner, origin, 0xc1);
-    let mut pending = owner.prepare_authority_projection(request.clone()).unwrap();
-    owner
-        .prepare_projection_recovery_registration(&mut pending)
-        .unwrap();
-    let (work, authorization) = pending.invocation().unwrap();
-    let work = work.clone();
-    let authorization = authorization.clone();
-    if origin == leader {
-        owner
-            ._network_host
-            .reserve_projection_pair(agent, &work, &authorization, false)
-            .unwrap();
-    } else {
-        owner
-            ._network_host
-            .reserve_forwarded_projection_pair(agent, &work, &authorization)
-            .unwrap();
-    }
-    owner.record.pending_projection = Some(pending.clone());
-    commit_bootstrap_record(&mut owner.record_store, &owner.record).unwrap();
-    // Until this succeeds PAP2 is a local WAL attempt, not a recoverably
-    // admitted request. No survivor is expected to discover that earlier cut.
-    owner.register_pending_projection(&pending).unwrap();
-    let manifest = owner
-        ._network_host
-        .projection_recovery_manifest(agent)
-        .unwrap();
-    let registration = pending
-        .registration(manifest.generation(), manifest.committee().id())
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        manifest.slot(registration.owner()).unwrap().registration(),
-        &registration
-    );
-    let mut expected_response = None;
-    if boundary == RecoveryBoundary::AfterAcknowledgement {
-        let identity = owner
-            .pending_authority_projection_identity(&pending, true)
-            .unwrap();
-        let outcome = owner
-            .supervisor_invoke_terminal_reserved(identity, work.clone(), authorization.clone())
-            .unwrap();
-        let RuntimeOutcome::Completed(Ok(reply)) = outcome else {
-            panic!("registered Query must complete")
-        };
-        let Some(crate::actors::value::Value::Bytes(response)) =
-            crate::actors::value::Value::try_decode(&reply.reply)
-        else {
-            panic!("projection bytes")
-        };
-        expected_response = Some(response);
-        let outcome = owner
-            .supervisor_acknowledge_reserved(identity, work.clone(), authorization.clone())
-            .unwrap();
-        let RuntimeOutcome::Acknowledged(Ok(ack)) = outcome else {
-            panic!("positive exact ACK required")
-        };
-        assert_eq!(ack.invocation, work.invocation);
-        assert_eq!(ack.work, work.commitment());
-        assert_eq!(ack.authorization, authorization.commitment());
-    } else if boundary == RecoveryBoundary::FollowerDelivery {
-        // The forwarding node keeps its own durable delivery obligation even
-        // when a different lifecycle owner executes and retires the result.
-        expected_response = Some(
-            owners[leader]
-                .as_mut()
-                .unwrap()
-                .invoke_peer_authority_projection(
-                    request.clone(),
-                    false,
-                    fixtures[origin].plan.pins.node,
-                )
-                .unwrap(),
-        );
-    }
-    for owner in owners.iter().flatten() {
-        assert!(wait_until(std::time::Duration::from_secs(30), || {
-            owner
-                ._network_host
-                .projection_recovery_manifest(agent)
-                .is_ok_and(|manifest| {
-                    manifest.slot(registration.owner()).is_some_and(|slot| {
-                        slot.registration() == &registration
-                            && slot.is_acknowledged()
-                                == (boundary != RecoveryBoundary::BeforeInvoke)
-                    })
-                })
-        }));
-    }
-    let offline_host = owners[origin].as_ref().unwrap().host.clone();
-    let saved_record = owners[origin].as_ref().unwrap().record.encode();
-    drop(owners[origin].take());
-    let mut live_networks: Vec<_> = networks.drain(..).map(Some).collect();
-    stop_network(live_networks[origin].take().unwrap());
-    let offline_peer =
-        libp2p::identity::Keypair::ed25519_from_bytes([[NODE_SEED, 0xd2, 0xd3][origin]; 32])
-            .unwrap()
-            .public()
-            .to_peer_id();
-    assert!(wait_until(std::time::Duration::from_secs(10), || {
-        live_networks
-            .iter()
-            .flatten()
-            .all(|network| !network.connected_peers().contains(&offline_peer))
-    }));
-    assert!(wait_until(std::time::Duration::from_secs(30), || owners
-        .iter()
-        .flatten()
-        .any(|owner| owner
-            ._network_host
-            .bootstrap_is_local_leader(agent)
-            .unwrap_or(false))));
-    let mut successor = owners
-        .iter()
-        .position(|owner| {
-            owner.as_ref().is_some_and(|owner| {
-                owner
-                    ._network_host
-                    .bootstrap_is_local_leader(agent)
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap();
-    if boundary == RecoveryBoundary::BeforeInvoke {
-        assert!(
-            owners[successor]
-                .as_ref()
-                .unwrap()
-                .record
-                .pending_projection
-                .is_none()
-        );
-        // Discovery consumes the committed manifest, not a harness-supplied
-        // original query or a request reconstructed at today's clock.
-        let mut last_error = None;
-        assert!(
-            wait_until(std::time::Duration::from_secs(30), || {
-                let Some(current) = owners.iter().position(|owner| {
-                    owner.as_ref().is_some_and(|owner| {
-                        owner
-                            ._network_host
-                            .bootstrap_is_local_leader(agent)
-                            .unwrap_or(false)
-                    })
-                }) else {
-                    return false;
-                };
-                successor = current;
-                let owner = owners[current].as_mut().unwrap();
-                let recovered = owner.recover_pending_authority_projection();
-                if let Err(error) = &recovered {
-                    let message = format!(
-                        "{error:?}; pending={:?}",
-                        owner.record.pending_projection.as_ref().map(|pending| (
-                            &pending.query,
-                            pending.recovery_registration.is_some()
-                        ))
-                    );
-                    if last_error.as_ref() != Some(&message) {
-                        eprintln!("registered recovery: {message}");
-                    }
-                    last_error = Some(message);
-                }
-                recovered.is_ok()
-                    && owner
-                        ._network_host
-                        .projection_recovery_manifest(agent)
-                        .is_ok_and(|manifest| {
-                            manifest
-                                .slot(registration.owner())
-                                .is_some_and(|slot| slot.is_acknowledged())
-                        })
-            }),
-            "registered recovery failed: {last_error:?}"
-        );
-        expected_response = owners[successor]
-            .as_ref()
-            .unwrap()
-            .committed_projection_response(&work)
-            .unwrap();
-    }
-    for owner in owners.iter_mut().flatten() {
-        if owner.record.pending_projection.is_some() {
-            assert!(wait_until(std::time::Duration::from_secs(30), || owner
-                .recover_pending_authority_projection()
-                .is_ok()));
-            assert!(owner.record.pending_projection.is_none());
-        }
-    }
-    let expected_response = expected_response.unwrap();
-    let archived = owners[successor]
-        .as_ref()
-        .unwrap()
-        ._network_host
-        .projection_recovery_manifest(agent)
-        .unwrap()
-        .slot(registration.owner())
-        .unwrap()
-        .clone();
-    assert!(archived.is_acknowledged());
-    assert_eq!(archived.registration(), &registration);
-    // An archived result remains recoverable after the original execution
-    // delegation has expired; it does not reauthorize a new execution.
-    let expired = request.recovery.unwrap().expires_at;
-    for fixture in fixtures {
-        fixture
-            .logical_slot
-            .as_ref()
-            .unwrap()
-            .store(expired, Ordering::Release);
-    }
-    let limits = SharedAgentPortableBackupLimits {
-        max_objects: 4096,
-        max_blobs: 4096,
-        max_index_nodes: 4096,
-        max_bytes: 64 * 1024 * 1024,
-    };
-    let crash = match boundary {
-        RecoveryBoundary::BeforeInvoke => CommonCheckpointCrashStage::Marker,
-        RecoveryBoundary::AfterAcknowledgement => CommonCheckpointCrashStage::Journal,
-        RecoveryBoundary::FollowerDelivery => CommonCheckpointCrashStage::Ledger,
-    };
-    for cycle in 0..3u8 {
-        let owner = owners[successor].as_ref().unwrap();
-        let next_query = delegated_query(owner, successor, 0xc3 + cycle * 2);
-        let sender = owner.pins.node;
-        let mut last_error = None;
-        assert!(
-            wait_until(std::time::Duration::from_secs(30), || {
-                let Some(current) = owners.iter().position(|owner| {
-                    owner.as_ref().is_some_and(|owner| {
-                        owner
-                            ._network_host
-                            .bootstrap_is_local_leader(agent)
-                            .unwrap_or(false)
-                    })
-                }) else {
-                    return false;
-                };
-                successor = current;
-                match owners[current]
-                    .as_mut()
-                    .unwrap()
-                    .invoke_peer_authority_projection(next_query.clone(), false, sender)
-                {
-                    Ok(_) => true,
-                    Err(error) => {
-                        last_error = Some(error);
-                        false
-                    }
-                }
-            }),
-            "exact next query did not complete: {last_error:?}"
-        );
-        for owner in owners.iter_mut().flatten() {
-            if owner.record.pending_projection.is_some() {
-                assert!(wait_until(std::time::Duration::from_secs(30), || owner
-                    .recover_pending_authority_projection()
-                    .is_ok()));
-                assert!(owner.record.pending_projection.is_none());
-            }
-        }
-        // Pending-owner cleanup and the previous checkpoint's reopen can
-        // complete across an election. Choose the current leader at this
-        // boundary, not the node that happened to finish the preceding read.
-        // The checkpoint itself is still attempted exactly once.
-        assert!(wait_until(std::time::Duration::from_secs(30), || {
-            let Some(current) = owners.iter().position(|owner| {
-                owner.as_ref().is_some_and(|owner| {
-                    owner
-                        ._network_host
-                        .bootstrap_is_local_leader(agent)
-                        .unwrap_or(false)
-                })
-            }) else {
-                return false;
-            };
-            successor = current;
-            true
-        }));
-        let owner = owners[successor].as_mut().unwrap();
-        let checkpoint = owner
-            .prepare_authority_projection(query(owner, successor, 0xd1 + cycle))
-            .unwrap();
-        let (checkpoint_work, checkpoint_auth) = checkpoint.invocation().unwrap();
-        let committee = owner.pins.replicas.clone();
-        if cycle == 0 {
-            owner
-                .host
-                .lock()
-                .unwrap()
-                .set_common_checkpoint_crash_for_test(crash);
-        }
-        let installed = owner
-            ._network_host
-            .certified_common_checkpoint_for_admission(
-                agent,
-                checkpoint_work,
-                checkpoint_auth,
-                &committee,
-                fixtures[successor].merge.as_ref(),
-            );
-        if cycle == 0 {
-            assert!(
-                installed.is_err(),
-                "source nonempty capsule checkpoint must hit {crash:?}"
-            );
-            assert!(owner.host.lock().unwrap().show(agent).unwrap().is_none());
-            drop(owners[successor].take());
-            owners[successor] = Some(reopen_owner(
-                &fixtures[successor],
-                &directories[successor],
-                &stores[successor],
-                providers[successor].clone(),
-                live_networks[successor].as_ref().unwrap().clone(),
-                signer,
-            ));
-        } else {
-            if let Err(error) = &installed {
-                eprintln!(
-                    "checkpoint_cycle_failure cycle={cycle} selected={successor} error={error:?}"
-                );
-                for (index, owner) in owners
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, owner)| owner.as_ref().map(|owner| (index, owner)))
-                {
-                    eprintln!(
-                        "checkpoint_voter index={index} leader={:?}",
-                        owner._network_host.bootstrap_is_local_leader(agent)
-                    );
-                    let mut host = owner.host.lock().unwrap();
-                    match host.request_common_snapshot_compaction(agent) {
-                        Ok(candidate) => {
-                            let manifest = host.recovery_manifest(agent).unwrap();
-                            crate::network::shared_agent::trace_common_checkpoint_material_for_test(
-                                "fixture_failure",
-                                HostNodeId(owner.pins.node.0),
-                                candidate.claim(),
-                                &manifest,
-                            );
-                        }
-                        Err(error) => {
-                            eprintln!("checkpoint_voter index={index} candidate_error={error:?}")
-                        }
-                    }
-                }
-            }
-            installed.unwrap();
-        }
-        let owner = owners[successor].as_mut().unwrap();
-        let bytes = owner
-            .host
-            .lock()
-            .unwrap()
-            .export_common_checkpoint(agent, limits)
-            .unwrap();
-        let source_manifest = owner
-            ._network_host
-            .projection_recovery_manifest(agent)
-            .unwrap();
-        assert_eq!(source_manifest.slot(registration.owner()), Some(&archived));
-        assert_eq!(
-            owner.committed_projection_response(&work).unwrap(),
-            Some(expected_response.clone())
-        );
-        let mut destination = offline_host.lock().unwrap();
-        if cycle == 2 {
-            destination.set_common_checkpoint_crash_for_test(crash);
-        }
-        let imported = destination.restore_common_checkpoint(&bytes, limits);
-        if cycle == 2 {
-            assert!(
-                imported.is_err(),
-                "destination nonempty capsule import must hit {crash:?}"
-            );
-            assert!(destination.show(agent).unwrap().is_none());
-        } else {
-            imported.unwrap();
-            assert_eq!(
-                destination.recovery_manifest(agent).unwrap(),
-                source_manifest
-            );
-            assert!(
-                destination
-                    .retained_positive_clean_acknowledgement(agent, &work, &authorization)
-                    .unwrap()
-            );
-        }
-        assert_eq!(
-            stores[origin]
-                .1
-                .clone()
-                .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
-                .unwrap(),
-            Some(saved_record.clone())
-        );
-        drop(destination);
-        assert!(wait_until(std::time::Duration::from_secs(30), || owners
-            .iter()
-            .flatten()
-            .any(|owner| owner
-                ._network_host
-                .bootstrap_is_local_leader(agent)
-                .unwrap_or(false))));
-        successor = owners
-            .iter()
-            .position(|owner| {
-                owner.as_ref().is_some_and(|owner| {
-                    owner
-                        ._network_host
-                        .bootstrap_is_local_leader(agent)
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap();
-    }
-    drop(offline_host);
-    // Complete the interrupted destination journal/ledger import without
-    // opening its bootstrap lifecycle or network. This captures the exact
-    // restored Ordered cursor before startup is allowed to retire its PAP.
-    let restored = SharedAgentHost::open_with_root(
-        directories[origin].host(),
-        directories[origin].lock(),
-        AgentHostScope {
-            space: HostSpaceId(fixtures[origin].plan.pins.space.0),
-            node: HostNodeId(fixtures[origin].plan.pins.node.0),
-        },
-        fixtures[origin].trust.clone(),
-        fixtures[origin].merge.clone(),
-        fixtures[origin].finality.clone(),
-        fixtures[origin].plan.pins.root.clone(),
-    )
-    .unwrap();
-    let restored_ordered = restored.journal_position(agent).unwrap().ordered_index;
-    drop(restored);
-    assert!(
-        stores[origin]
-            .1
-            .clone()
-            .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
-            .unwrap()
-            .as_deref()
-            == Some(saved_record.as_slice()),
-        "detached import must preserve the exact signed pending record"
-    );
-    live_networks[origin] = Some(restart_network(origin));
-    for index in 0..3 {
-        if index != origin {
-            live_networks[origin]
-                .as_ref()
-                .unwrap()
-                .connect(live_networks[index].as_ref().unwrap().listen_addrs()[0].clone());
-        }
-    }
-    owners[origin] = Some(reopen_owner(
-        &fixtures[origin],
-        &directories[origin],
-        &stores[origin],
-        providers[origin].clone(),
-        live_networks[origin].as_ref().unwrap().clone(),
-        signer,
-    ));
-    let owner = owners[origin].as_mut().unwrap();
-    // Startup proves the retained positive ACK and durably clears PAP before
-    // attaching the route. It must not leave the already-completed PAP live,
-    // replace any other bootstrap field, or execute another Ordered entry.
-    let mut cleared_record = CleanSystemAgentBootstrapRecord::decode(&saved_record).unwrap();
-    cleared_record.pending_projection = None;
-    assert!(owner.record == cleared_record);
-    assert!(
-        owner
-            .record_store
-            .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
-            .unwrap()
-            .as_deref()
-            == Some(cleared_record.encode().as_slice()),
-        "startup must durably retire only the completed pending record"
-    );
-    assert_eq!(owner.ordered_index_for_test().unwrap(), restored_ordered);
-    assert_eq!(
-        owner.committed_projection_response(&work).unwrap(),
-        Some(expected_response.clone())
-    );
-    assert!(!owner.recover_pending_authority_projection().unwrap());
-    assert!(owner.record.pending_projection.is_none());
-    assert_eq!(owner.ordered_index_for_test().unwrap(), restored_ordered);
-    assert_eq!(
-        owner.committed_projection_response(&work).unwrap(),
-        Some(expected_response)
-    );
-    assert_eq!(
-        owner
-            ._network_host
-            .projection_recovery_manifest(agent)
-            .unwrap()
-            .slot(registration.owner()),
-        Some(&archived)
-    );
-    *networks = live_networks.into_iter().map(Option::unwrap).collect();
-}
-
 pub(super) fn exercise(
     leader: usize,
     owners: &mut [Option<MemoryBootstrapOwner>],
@@ -1566,12 +253,9 @@ pub(super) fn exercise(
     signer: &mut CountingSigner,
     exercise: Exercise,
 ) {
-    if let Exercise::ExpiredContendedCustody = exercise {
-        super::recovery_expiry::exercise_contended(leader, owners, fixtures, networks);
-        return;
-    }
-    if let Exercise::ExpiredCustody = exercise {
-        super::recovery_expiry::exercise(
+    #[cfg(feature = "experimental-state-blocks")]
+    if matches!(exercise, Exercise::AuthorityObservation) {
+        authority_observation::exercise(
             leader,
             owners,
             fixtures,
@@ -1583,38 +267,16 @@ pub(super) fn exercise(
         );
         return;
     }
-    if let Exercise::OverwrittenRegistration = exercise {
-        exercise_overwritten_registration(leader, owners, fixtures, networks);
-        return;
-    }
-    if let Exercise::SameLeaderRetry = exercise {
-        exercise_same_leader_retry(
-            leader,
-            owners,
-            fixtures,
-            directories,
-            stores,
-            providers,
-            networks,
-            signer,
-        );
+    #[cfg(feature = "experimental-state-blocks")]
+    if matches!(exercise, Exercise::ForwardedInstallOrigin) {
+        forwarded_install_origin::exercise(leader, owners, fixtures, directories, networks, signer);
         return;
     }
     if matches!(
         exercise,
-        Exercise::ContendedIntent | Exercise::ExpiredContendedIntent
+        Exercise::ManagementRetention | Exercise::ManagementRetentionFollower
     ) {
-        exercise_contended_intent(
-            leader,
-            owners,
-            fixtures,
-            networks,
-            matches!(exercise, Exercise::ExpiredContendedIntent),
-        );
-        return;
-    }
-    if let Exercise::Recovery(boundary) = exercise {
-        exercise_registered_recovery(
+        management_retention::exercise(
             leader,
             owners,
             fixtures,
@@ -1623,20 +285,18 @@ pub(super) fn exercise(
             providers,
             networks,
             signer,
-            boundary,
+            matches!(exercise, Exercise::ManagementRetentionFollower),
         );
         return;
     }
     let crash = match exercise {
         Exercise::Healthy => None,
         Exercise::Crash(stage) => Some(stage),
-        Exercise::Recovery(_) => unreachable!(),
-        Exercise::ContendedIntent => unreachable!(),
-        Exercise::ExpiredContendedIntent => unreachable!(),
-        Exercise::SameLeaderRetry => unreachable!(),
-        Exercise::OverwrittenRegistration => unreachable!(),
-        Exercise::ExpiredCustody => unreachable!(),
-        Exercise::ExpiredContendedCustody => unreachable!(),
+        #[cfg(feature = "experimental-state-blocks")]
+        Exercise::AuthorityObservation => unreachable!(),
+        Exercise::ManagementRetention | Exercise::ManagementRetentionFollower => unreachable!(),
+        #[cfg(feature = "experimental-state-blocks")]
+        Exercise::ForwardedInstallOrigin => unreachable!(),
     };
     let agent = HostAgentId(fixtures[leader].plan.pins.agent.0);
     let lagger = (leader + 1) % 3;
@@ -1657,10 +317,7 @@ pub(super) fn exercise(
         .bootstrap_is_local_leader(agent)
         .unwrap_or(false)));
     let older_query = query(source, leader, 0xaf);
-    let older_pending = source
-        .prepare_authority_projection(older_query.clone())
-        .unwrap();
-    let (older_work, older_auth) = older_pending.invocation().unwrap();
+    let (older_work, older_auth, older_identity) = public_query_work(source, &older_query);
     let older_input = source
         .host
         .lock()
@@ -1675,19 +332,22 @@ pub(super) fn exercise(
         )
         .unwrap()
         .input();
-    source.invoke_authority_projection(older_query).unwrap();
+    assert!(matches!(
+        source
+            .supervisor_invoke(older_identity, older_work.clone(), older_auth.clone())
+            .unwrap(),
+        RuntimeOutcome::Completed(Ok(_))
+    ));
+    assert!(matches!(
+        source
+            .supervisor_acknowledge(older_identity, older_work, older_auth)
+            .unwrap(),
+        RuntimeOutcome::Acknowledged(Ok(_))
+    ));
     let request = query(source, leader, 0xb1);
-    let pending = source
-        .prepare_authority_projection(request.clone())
-        .unwrap();
-    let (work, authorization) = pending.invocation().unwrap();
-    let work = work.clone();
-    let authorization = authorization.clone();
-    // A public caller may lose its result before ACK. Keep that exact live
-    // result at the checkpoint boundary; do not fabricate unresolved PAP2.
-    let identity = source
-        .pending_authority_projection_identity(&pending, false)
-        .unwrap();
+    // An ordinary public actor Query may lose its result before ACK.
+    // Preserve that exact retained result at the authenticated boundary.
+    let (work, authorization, identity) = public_query_work(source, &request);
     let invoked = source
         .supervisor_invoke(identity, work.clone(), authorization.clone())
         .unwrap();
@@ -1703,7 +363,6 @@ pub(super) fn exercise(
         crate::agent::sdk::authority::AuthorityCredentialProjection::decode(&response).unwrap();
     assert_eq!(projection.query, request);
     assert_ne!(projection.principal, PrincipalId::ZERO);
-    assert!(source.record.pending_projection.is_none());
     let source_state = source
         .host
         .lock()
@@ -1814,18 +473,16 @@ pub(super) fn exercise(
         old_snapshot
     );
 
-    let checkpoint_pending = source
-        .prepare_authority_projection(query(source, leader, 0xb3))
-        .unwrap();
-    let (checkpoint_work, checkpoint_auth) = checkpoint_pending.invocation().unwrap();
+    let (checkpoint_work, checkpoint_auth, _) =
+        public_query_work(source, &query(source, leader, 0xb3));
     let committee = source.pins.replicas.clone();
     assert_eq!(
         source
             ._network_host
             .certified_common_checkpoint_for_admission(
                 agent,
-                checkpoint_work,
-                checkpoint_auth,
+                &checkpoint_work,
+                &checkpoint_auth,
                 &committee,
                 &RefusingSnapshotSigner(HostNodeId(source.pins.node.0)),
             ),
@@ -1855,8 +512,8 @@ pub(super) fn exercise(
         ._network_host
         .certified_common_checkpoint_for_admission(
             agent,
-            checkpoint_work,
-            checkpoint_auth,
+            &checkpoint_work,
+            &checkpoint_auth,
             &committee,
             fixtures[leader].merge.as_ref(),
         );
@@ -2101,7 +758,6 @@ pub(super) fn exercise(
             );
             assert_eq!(owner.ordered_index_for_test().unwrap(), before);
         }
-        assert!(owner.record.pending_projection.is_none());
     }
     let successor = owners
         .iter()
@@ -2116,9 +772,6 @@ pub(super) fn exercise(
         .unwrap();
     let owner = owners[successor].as_mut().unwrap();
     let before_retry = owner.ordered_index_for_test().unwrap();
-    let identity = owner
-        .pending_authority_projection_identity(&pending, false)
-        .unwrap();
     assert_eq!(
         owner
             .supervisor_invoke(identity, work.clone(), authorization.clone())
@@ -2139,7 +792,28 @@ pub(super) fn exercise(
     assert_eq!(owner.ordered_index_for_test().unwrap(), before_retry + 1);
     let fresh = query(owner, successor, 0xb5);
     let before = owner.ordered_index_for_test().unwrap();
-    let fresh_response = owner.invoke_authority_projection(fresh.clone()).unwrap();
+    let (fresh_work, fresh_authorization, fresh_identity) = public_query_work(owner, &fresh);
+    let outcome = owner
+        .supervisor_invoke(
+            fresh_identity,
+            fresh_work.clone(),
+            fresh_authorization.clone(),
+        )
+        .unwrap();
+    let RuntimeOutcome::Completed(Ok(reply)) = outcome else {
+        panic!("ordinary public Query must continue after imported checkpoint");
+    };
+    let Some(crate::actors::value::Value::Bytes(fresh_response)) =
+        crate::actors::value::Value::try_decode(&reply.reply)
+    else {
+        panic!("ordinary public Query response bytes");
+    };
+    assert!(matches!(
+        owner
+            .supervisor_acknowledge(fresh_identity, fresh_work, fresh_authorization)
+            .unwrap(),
+        RuntimeOutcome::Acknowledged(Ok(_))
+    ));
     let projection =
         crate::agent::sdk::authority::AuthorityCredentialProjection::decode(&fresh_response)
             .unwrap();
@@ -2213,21 +887,17 @@ pub(super) fn exercise(
                 .unwrap_or(false)
         })
         .unwrap();
-    // This qualification-only second compaction demonstrates the explicit
-    // contract limit: acknowledged old projection bytes are not a durable
-    // response archive. Production compaction stays disabled while remote
-    // unresolved PAP2 metadata can still require that history.
+    // Acknowledged ordinary public Query bytes are not an indefinite response
+    // archive. A later certified foundation may prune their exact replay rows.
     let owner = owners[successor].as_mut().unwrap();
-    let checkpoint = owner
-        .prepare_authority_projection(query(owner, successor, 0xb7))
-        .unwrap();
-    let (checkpoint_work, checkpoint_auth) = checkpoint.invocation().unwrap();
+    let (checkpoint_work, checkpoint_auth, _) =
+        public_query_work(owner, &query(owner, successor, 0xb7));
     owner
         ._network_host
         .certified_common_checkpoint_for_admission(
             agent,
-            checkpoint_work,
-            checkpoint_auth,
+            &checkpoint_work,
+            &checkpoint_auth,
             &committee,
             fixtures[successor].merge.as_ref(),
         )
@@ -2241,6 +911,5 @@ pub(super) fn exercise(
             .unwrap(),
         None
     );
-    assert_eq!(owner.committed_projection_response(&work).unwrap(), None);
     *networks = live_networks.into_iter().map(Option::unwrap).collect();
 }

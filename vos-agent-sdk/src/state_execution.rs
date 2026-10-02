@@ -54,7 +54,7 @@ fn state(work: &RuntimeWork) -> &RuntimeState {
         | RuntimeWork::Resume { state, .. }
         | RuntimeWork::Acknowledge { state, .. } => state,
         #[cfg(feature = "experimental-state-blocks")]
-        RuntimeWork::InspectInvocation { state, .. } => state,
+        RuntimeWork::InspectInvocation { state, .. } | RuntimeWork::Observe { state, .. } => state,
     }
 }
 
@@ -87,6 +87,12 @@ impl StateExecutionWork {
         lanes: Vec<ExternalLaneWork>,
         limits: ExternalStateResourceLimits,
     ) -> Result<Self, DecodeError> {
+        #[cfg(feature = "experimental-state-blocks")]
+        if matches!(work, RuntimeWork::Observe { .. }) {
+            // Observation is explicitly image-System-only. The external-state
+            // frame cannot turn it into a candidate root or replay operation.
+            return Err(DecodeError::InvalidPlatform);
+        }
         if !limits.is_valid() {
             return Err(DecodeError::NonCanonical);
         }
@@ -107,6 +113,10 @@ impl StateExecutionWork {
             }
             #[cfg(feature = "experimental-state-blocks")]
             RuntimeWork::InspectInvocation { invocation, .. } => {
+                Some((invocation.space, invocation.agent))
+            }
+            #[cfg(feature = "experimental-state-blocks")]
+            RuntimeWork::Observe { invocation, .. } => {
                 Some((invocation.space, invocation.agent))
             }
             // Resume identity comes from the independently authenticated retained
@@ -158,6 +168,10 @@ impl StateExecutionWork {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, DecodeError> {
+        #[cfg(feature = "experimental-state-blocks")]
+        if matches!(self.work, RuntimeWork::Observe { .. }) {
+            return Err(DecodeError::InvalidPlatform);
+        }
         let work = self.work.encode().map_err(|_| DecodeError::NonCanonical)?;
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"XSW2");
@@ -668,6 +682,72 @@ mod tests {
         bad.transition.state.control.push(1);
         assert!(bad.validate_for(&work).is_err());
         assert!(StateExecutionOutput::decode_for(&output.encode().unwrap(), &work).is_ok());
+    }
+
+    #[cfg(feature = "experimental-state-blocks")]
+    #[test]
+    fn system_image_observation_cannot_enter_external_work_or_output_frames() {
+        use crate::{
+            InvocationAuthorization, InvocationOrigin, InvocationRoleClaims, InvocationWork,
+            PublicPreflight,
+        };
+        let (original, _) = fixture();
+        let invocation = InvocationWork {
+            space: SpaceId([1; 32]),
+            agent: AgentId([2; 32]),
+            runtime_deployment: DeploymentId([1; 32]),
+            invocation: InvocationId([3; 32]),
+            actor: ActorId([4; 32]),
+            incarnation: Hash([5; 32]),
+            deployment: DeploymentId([6; 32]),
+            program: ProgramId([7; 32]),
+            mode: MethodMode::Query,
+            origin: InvocationOrigin::anonymous(),
+            roles: InvocationRoleClaims::none(),
+            message: vec![],
+            installation_data: None,
+            availability: vec![],
+            gas: 100,
+            recovery_only: false,
+        };
+        let authorization =
+            InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&invocation, 1));
+        let work = RuntimeWork::Observe {
+            context: RuntimeExecutionContext::Direct,
+            state: state(&original.work).clone(),
+            invocation: Box::new(invocation),
+            authorization: Box::new(authorization),
+            observed_slot: 1,
+        };
+        assert_eq!(RuntimeWork::decode(&work.encode().unwrap()).unwrap(), work);
+        assert_eq!(
+            fixture_work(work.clone(), original.lanes.clone()),
+            Err(DecodeError::InvalidPlatform)
+        );
+        let forged = StateExecutionWork {
+            work: work.clone(),
+            ..original
+        };
+        assert_eq!(forged.encode(), Err(DecodeError::InvalidPlatform));
+        let mut encoded = b"XSW2".to_vec();
+        let mut encoder = Encoder(&mut encoded);
+        encoder.u64(forged.limits.max_rows_per_lane);
+        encoder.u64(forged.limits.max_row_bytes_per_lane);
+        encoder.bytes(&work.encode().unwrap());
+        encoder.u8(forged.lanes.len() as u8);
+        for lane in &forged.lanes {
+            encoder.bytes(&lane.base.encode());
+            encoder.bytes(&StateRootDescriptor::new(lane.next, None).encode());
+        }
+        assert_eq!(
+            StateExecutionWork::decode(&encoded),
+            Err(DecodeError::InvalidPlatform)
+        );
+        let transition = RuntimeTransition {
+            state: state(&work).clone(),
+            outcome: RuntimeOutcome::Completed(Err(InvocationError::NotFound)),
+        };
+        assert!(StateExecutionOutput::new(&forged, transition, vec![]).is_err());
     }
 
     #[cfg(feature = "experimental-state-blocks")]

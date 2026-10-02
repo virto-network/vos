@@ -3,7 +3,7 @@
 You can create and run a local Space, author AgentActor packages, and on Linux
 create a Local Agent and install a signed actor. This is a disposable-test
 checkpoint, not production sign-off: startup and operations remain slow,
-ordinary Shared-Agent genesis/finality is not connected, and further recovery
+the released fixed-three Shared workflow remains gated and unqualified, and recovery
 and proof gates remain. See [current status](agent-saga-status.md). There is no
 compatibility fallback for older Agent generations.
 

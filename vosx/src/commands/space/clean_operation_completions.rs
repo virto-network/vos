@@ -1,4 +1,4 @@
-//! Bounded, append-only signed operation evidence in role-separated CSF1 images.
+//! Bounded active signed operation evidence in role-separated CSF1 images.
 use super::*;
 #[cfg(test)]
 #[path = "clean_operation_denial_store_tests.rs"]
@@ -26,6 +26,7 @@ pub(crate) struct CleanNativeAuthorityOperationCompletions {
     file: ExactFileStore,
     authority: AuthorityActorTarget,
     kind: CertificateKind,
+    archive: Option<Arc<operation_terminal_archive::NativeOperationTerminalArchive>>,
 }
 
 pub(crate) struct CleanNativeAuthorityOperationDenials(CleanNativeAuthorityOperationCompletions);
@@ -80,6 +81,20 @@ pub(crate) struct CleanNativeAuthorityOperationRetirements(
 );
 
 impl CleanNativeAuthorityOperationRetirements {
+    pub(crate) fn open_or_create_archived(
+        path: impl AsRef<Path>,
+        authority: AuthorityActorTarget,
+        archive: Arc<operation_terminal_archive::NativeOperationTerminalArchive>,
+    ) -> Result<Self, CleanFileStoreError> {
+        CleanNativeAuthorityOperationCompletions::open_kind_with_archive(
+            path.as_ref(),
+            authority,
+            true,
+            CertificateKind::Retirement,
+            Some(archive),
+        )
+        .map(Self)
+    }
     pub(crate) fn open_or_create(
         path: impl AsRef<Path>,
         authority: AuthorityActorTarget,
@@ -122,6 +137,9 @@ impl vos::agent::clean_bootstrap::NativeAuthorityOperationRetirementStore
     fn retain(&mut self, certificate: &[u8]) -> Result<(), Self::Error> {
         CleanNativeAuthorityOperationRetirements::retain(self, certificate)
     }
+    fn remove_retired(&mut self, certificate: &[u8]) -> Result<(), Self::Error> {
+        self.0.remove_archived(certificate, true)
+    }
 }
 
 impl vos::agent::clean_bootstrap::NativeAuthorityOperationCompletionStore
@@ -135,6 +153,15 @@ impl vos::agent::clean_bootstrap::NativeAuthorityOperationCompletionStore
 
     fn retain(&mut self, certificate: &[u8]) -> Result<(), Self::Error> {
         CleanNativeAuthorityOperationCompletions::retain(self, certificate)
+    }
+    fn remove_retired(&mut self, certificate: &[u8], terminal: &[u8]) -> Result<(), Self::Error> {
+        if native_operation_retirement_completion(&self.authority.binding.public_key, terminal)
+            .as_deref()
+            != Some(certificate)
+        {
+            return Err(CleanFileStoreError::Corrupt);
+        }
+        self.remove_archived(certificate, false)
     }
 }
 
@@ -456,6 +483,82 @@ mod tests {
     }
 
     #[test]
+    fn operation_terminal_archive_removal_recovery_requires_exact_terminal_witness() {
+        use super::super::operation_terminal_archive::tests::pair;
+        use vos::agent::clean_bootstrap::NativeAuthorityOperationJournalStore as _;
+        for valid_archive in [false, true] {
+            let fixture = Fixture::new("operation-terminal-index-stage");
+            let (authority, ids, bytes) = pair(1);
+            let mut journal =
+                CleanNativeAuthorityOperationJournal::open_or_create(&fixture.root, authority)
+                    .unwrap()
+                    .with_terminal_archive(&fixture.parent.join("terminal-archive"))
+                    .unwrap();
+            let archive = journal.terminal_archive().unwrap();
+            let path = fixture.parent.join("completions");
+            let completion =
+                native_operation_retirement_completion(&authority.binding.public_key, &bytes[2])
+                    .unwrap();
+            let mut store = CleanNativeAuthorityOperationCompletions::open_or_create_archived(
+                &path,
+                authority,
+                archive.clone(),
+            )
+            .unwrap();
+            store.retain(&completion).unwrap();
+            if valid_archive {
+                assert!(
+                    journal
+                        .retain_retired([&bytes[0], &bytes[1]], &bytes[2])
+                        .unwrap()
+                );
+            }
+            let predecessor = store
+                .file
+                .read_optional(store.file.file(), store.maximum_image())
+                .unwrap()
+                .unwrap();
+            stage(
+                &store.file,
+                Some(predecessor.commitment()),
+                &store.encode(&[]).unwrap(),
+            );
+            let canonical = fs::read(path.join(store.file.file())).unwrap();
+            let staged = fs::read(path.join(store.file.stage_file())).unwrap();
+            drop(store);
+            let reopened = CleanNativeAuthorityOperationCompletions::open_or_create_archived(
+                &path,
+                authority,
+                archive.clone(),
+            );
+            if valid_archive {
+                assert!(reopened.unwrap().load().unwrap().is_empty());
+                let path = fixture.parent.join("retirements");
+                let mut store = CleanNativeAuthorityOperationRetirements::open_or_create_archived(
+                    &path,
+                    authority,
+                    archive.clone(),
+                )
+                .unwrap();
+                store.retain(&bytes[2]).unwrap();
+                vos::agent::clean_bootstrap::NativeAuthorityOperationRetirementStore::remove_retired(&mut store, &bytes[2]).unwrap();
+                assert!(store.load().unwrap().is_empty());
+                assert_eq!(archive.load(ids[1]).unwrap(), Some(bytes));
+            } else {
+                assert!(reopened.is_err());
+                assert_eq!(
+                    fs::read(path.join(StoreRole::OperationCompletions.file())).unwrap(),
+                    canonical
+                );
+                assert_eq!(
+                    fs::read(path.join(StoreRole::OperationCompletions.stage_file())).unwrap(),
+                    staged
+                );
+            }
+        }
+    }
+
+    #[test]
     fn completion_index_enforces_count_bound_without_eviction() {
         assert_eq!(StoreRole::OperationCompletions.maximum_bytes(), MAX_IMAGE);
         let fixture = Fixture::new("completion-capacity");
@@ -482,6 +585,19 @@ mod tests {
 }
 
 impl CleanNativeAuthorityOperationCompletions {
+    pub(crate) fn open_or_create_archived(
+        path: impl AsRef<Path>,
+        authority: AuthorityActorTarget,
+        archive: Arc<operation_terminal_archive::NativeOperationTerminalArchive>,
+    ) -> Result<Self, CleanFileStoreError> {
+        Self::open_kind_with_archive(
+            path.as_ref(),
+            authority,
+            true,
+            CertificateKind::Completion,
+            Some(archive),
+        )
+    }
     pub(crate) fn open_or_create(
         path: impl AsRef<Path>,
         authority: AuthorityActorTarget,
@@ -509,6 +625,16 @@ impl CleanNativeAuthorityOperationCompletions {
         authority: AuthorityActorTarget,
         create: bool,
         kind: CertificateKind,
+    ) -> Result<Self, CleanFileStoreError> {
+        Self::open_kind_with_archive(path, authority, create, kind, None)
+    }
+
+    fn open_kind_with_archive(
+        path: &Path,
+        authority: AuthorityActorTarget,
+        create: bool,
+        kind: CertificateKind,
+        archive: Option<Arc<operation_terminal_archive::NativeOperationTerminalArchive>>,
     ) -> Result<Self, CleanFileStoreError> {
         if !authority.is_valid() {
             return Err(CleanFileStoreError::InvalidPath);
@@ -543,6 +669,7 @@ impl CleanNativeAuthorityOperationCompletions {
             file: ExactFileStore::new(root, role),
             authority,
             kind,
+            archive,
         };
         store.load()?;
         Ok(store)
@@ -687,11 +814,18 @@ impl CleanNativeAuthorityOperationCompletions {
             .map(|image| self.decode(&image.payload))
             .transpose()?;
         if let (Some(current), Some(next)) = (&current, &next) {
-            if next.len() < current.len()
-                || next.len() > current.len() + 1
-                || current.iter().any(|record| !next.contains(record))
+            if next.len() > current.len() + 1
+                || next.iter().filter(|record| !current.contains(record)).count() > 1
             {
                 return Err(CleanFileStoreError::RequestConflict);
+            }
+            for removed in current.iter().filter(|record| !next.contains(record)) {
+                let valid = match (&self.archive, self.kind) {
+                    (Some(archive), CertificateKind::Completion) => archive.proves_certificate(removed, false)?,
+                    (Some(archive), CertificateKind::Retirement) => archive.proves_certificate(removed, true)?,
+                    _ => false,
+                };
+                if !valid { return Err(CleanFileStoreError::RequestConflict); }
             }
         }
         let image = self.file.reconcile(self.maximum_image())?;
@@ -722,6 +856,36 @@ impl CleanNativeAuthorityOperationCompletions {
         }
         records.push(certificate.to_vec());
         records.sort_unstable_by_key(|record| self.ids(record).expect("validated certificate")[0]);
+        self.file.commit(&self.encode(&records)?)
+    }
+
+    fn remove_archived(
+        &mut self,
+        certificate: &[u8],
+        retirement: bool,
+    ) -> Result<(), CleanFileStoreError> {
+        if !matches!(
+            (self.kind, retirement),
+            (CertificateKind::Completion, false) | (CertificateKind::Retirement, true)
+        ) {
+            return Err(CleanFileStoreError::WrongStoreRole);
+        }
+        let archive = self.archive.as_ref().ok_or(CleanFileStoreError::Corrupt)?;
+        if !archive.proves_certificate(certificate, retirement)? {
+            return Err(CleanFileStoreError::Corrupt);
+        }
+        let ids = self.ids(certificate)?;
+        let mut records = self.load()?;
+        for existing in &records {
+            if existing != certificate && self.ids(existing)?.iter().any(|id| ids.contains(id)) {
+                return Err(CleanFileStoreError::RequestConflict);
+            }
+        }
+        let before = records.len();
+        records.retain(|record| record != certificate);
+        if before == records.len() {
+            return Ok(());
+        }
         self.file.commit(&self.encode(&records)?)
     }
 }

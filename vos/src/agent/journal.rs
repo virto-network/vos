@@ -97,6 +97,7 @@ pub const MAX_INVOCATION_OUTCOME_REF_BYTES: usize = 128;
 const MAX_AUTHORITY_RECEIPT_BYTES: usize = 4 * 1024;
 /// Four-byte magic plus the canonical 32-byte platform identifier.
 const SERVICE_WIRE_HEADER_BYTES: usize = 4 + 32;
+const REPLAY_INPUT_ID_DOMAIN: &[u8] = b"vos/agent/journal/replay-input/v3";
 
 macro_rules! journal_id_type {
     ($name:ident, $label:literal) => {
@@ -1624,6 +1625,29 @@ impl ReplayInput {
         self.operation.persisted_lane()
     }
 
+    /// Serialization only for a privately owned retained recovery observation.
+    /// Construction, strict decoding and every explicit observation validation
+    /// still authenticate the complete input, including its blob preimages.
+    /// Reuse the existing journal size-pass encoder for those immutable bytes;
+    /// public encoding and IDs must retain their checked invocation path.
+    ///
+    /// Do not add a complete-input bound assertion here: an input ID may be
+    /// selected before explicit validation rejects its size or operation.
+    /// The original bounds remain in validate() and strict decoding.
+    pub(in crate::agent) fn encode_retained_recovery(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&Self::MAGIC);
+        bytes.extend_from_slice(&crate::service::PLATFORM_ID.0);
+        let mut encoder = Encoder(&mut bytes);
+        encode_runtime_binding(&mut encoder, &self.runtime);
+        encode_replay_operation_inner(&mut encoder, &self.operation, true);
+        bytes
+    }
+
+    pub(in crate::agent) fn retained_recovery_id(&self) -> ReplayInputId {
+        ReplayInputId(Hash::digest(REPLAY_INPUT_ID_DOMAIN, &[&self.encode_retained_recovery()]).0)
+    }
+
     fn validate_inner(&self) -> Result<(), DecodeError> {
         match &self.operation {
             ReplayOperation::CleanInvoke { work, .. }
@@ -1800,7 +1824,7 @@ impl CanonicalJournalRecord for ReplayInput {
     }
 
     fn id(&self) -> Self::Id {
-        ReplayInputId(content_id(b"vos/agent/journal/replay-input/v3", self))
+        ReplayInputId(content_id(REPLAY_INPUT_ID_DOMAIN, self))
     }
 }
 
@@ -3417,8 +3441,9 @@ fn encode_replay_operation_inner(
     }
 }
 
-/// Only the immutable size pass after ReplayInput::validate_inner may bypass
-/// repeated Invoke validation. The public ServiceWire encoder passes false.
+/// Immutable journal size passes and private retained-observation serialization
+/// may bypass repeated Invoke validation. Explicit validation remains mandatory;
+/// the public ServiceWire encoder always passes false.
 fn encode_journal_invoke(
     work: &crate::agent_sdk::RuntimeWork,
     already_validated: bool,

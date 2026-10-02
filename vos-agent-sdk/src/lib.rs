@@ -56,6 +56,12 @@ pub use vos_protocol::{
 /// Stable clean-generation management/runtime ABI identity.
 pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-260920-r19");
 
+/// Signed opt-in for scoped, non-retaining System Authority observations.
+/// Mutation work and opaque image state retain the r19 wire contract. This
+/// identity does not grant generic actor observation or a new storage profile.
+/// Unsupported builds can name it for fail-closed admission, but cannot execute it.
+pub const SYSTEM_OBSERVATION_ABI_ID: Hash = Hash(*b"vos-system-observation-261002-r1");
+
 /// Maximum bytes named by one content-addressed artifact reference.
 pub const MAX_CATALOG_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
 /// Maximum canonical constructor-argument bytes admitted for one actor

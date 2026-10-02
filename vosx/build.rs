@@ -58,6 +58,24 @@ fn main() {
         &SYSTEM_CATALOG_PACKAGE_BLAKE2B_256,
         "system-catalog package template",
     );
+    // Pending coherent role repin: these are deliberately unavailable, not
+    // aliases of Local's image guest or developer-target candidates. Replace
+    // these two calls with the existing digest-checked bundler after the two
+    // independent signed-artifact builds and guest probes qualify.
+    for (file, env_var) in [
+        (
+            "bundled_system_image_runtime.vos",
+            "VOSX_BUNDLED_SYSTEM_IMAGE_RUNTIME_PACKAGE",
+        ),
+        (
+            "bundled_shared_external_runtime.vos",
+            "VOSX_BUNDLED_SHARED_EXTERNAL_RUNTIME_PACKAGE",
+        ),
+    ] {
+        let dest = out_dir.join(file);
+        fs::write(&dest, []).expect("write unavailable runtime-role marker");
+        println!("cargo:rustc-env={env_var}={}", dest.display());
+    }
     println!("cargo:rerun-if-env-changed=VOSX_EXPERIMENTAL_AUTHORITY_TEMPLATE");
     println!("cargo:rerun-if-env-changed=VOSX_EXPERIMENTAL_STATE_RUNTIME_PVM");
     assert!(

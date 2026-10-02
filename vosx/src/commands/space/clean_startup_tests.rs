@@ -5,7 +5,58 @@ use vos::agent::clean_bootstrap::GenesisClaimSigner;
 use vos::agent::committee::AuthoritySignerId;
 use vos::network::{Network, NetworkConfig, derive_node_prefix};
 
+#[cfg(feature = "experimental-state-blocks")]
+#[path = "clean_startup/member_handoff_tests.rs"]
+mod member_handoff;
+
+#[cfg(feature = "experimental-state-blocks")]
+#[path = "clean_startup/member_workflow_tests.rs"]
+mod member_workflow;
+
+#[cfg(feature = "experimental-state-blocks")]
+#[path = "clean_startup/member_cold_install_tests.rs"]
+mod member_cold_install;
+
 struct Scratch(PathBuf);
+
+#[test]
+fn production_genesis_endorsement_requires_the_exact_single_root_voter() {
+    use vos::agent::committee::{
+        AuthorityCommittee, AuthorityCommitteeMember, AuthorityMemberRole,
+    };
+    use vos::agent::shared_host::SharedAgentHostError;
+    let public = raw_public_key(&Keypair::ed25519_from_bytes([0x49; 32]).unwrap()).unwrap();
+    let other = raw_public_key(&Keypair::ed25519_from_bytes([0x4a; 32]).unwrap()).unwrap();
+    let root =
+        AuthorityCommitteeMember::new(HostNodeId([0x4b; 32]), public, AuthorityMemberRole::Voter)
+            .unwrap();
+    let committee = |mut members: Vec<AuthorityCommitteeMember>| {
+        members.sort_by_key(AuthorityCommitteeMember::signer);
+        AuthorityCommittee::new(
+            HostSpaceId([0x4c; 32]),
+            HostHash([0x4d; 32]),
+            1,
+            None,
+            members,
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        production_genesis_signer(&committee(vec![root.clone()]), &public),
+        Ok(root.signer())
+    );
+    assert_eq!(
+        production_genesis_signer(&committee(vec![root.clone()]), &other),
+        Err(SharedAgentHostError::ScopeMismatch)
+    );
+    for role in [AuthorityMemberRole::Voter, AuthorityMemberRole::Observer] {
+        let member = AuthorityCommitteeMember::new(HostNodeId([0x4e; 32]), other, role).unwrap();
+        assert_eq!(
+            production_genesis_signer(&committee(vec![root.clone(), member]), &public),
+            Err(SharedAgentHostError::ScopeMismatch)
+        );
+    }
+}
 
 #[test]
 fn bootstrap_roster_requires_exact_signed_owner_and_node_inputs() {
@@ -124,7 +175,7 @@ impl Scratch {
 }
 
 #[test]
-fn bootstrap_roster_constructs_exact_singleton_and_fixed_authority_configuration() {
+fn bootstrap_roster_refuses_old_contracts_and_binds_exact_system_observation_configuration() {
     let operator = Keypair::ed25519_from_bytes([0x61; 32]).unwrap();
     let public = raw_public_key(&operator).unwrap();
     let owner = PrincipalId::of_public_key(&public);
@@ -189,6 +240,81 @@ fn bootstrap_roster_constructs_exact_singleton_and_fixed_authority_configuration
                 SystemAuthorityConfiguration::decode(&bytes),
                 Some(configuration)
             );
+            assert!(
+                validate_system_observation_bootstrap_configuration(&descriptor, &bytes).is_err(),
+                "SAC5/SAC6 or the old canonical contract must not become v1 startup inputs"
+            );
+            #[cfg(feature = "experimental-state-blocks")]
+            if count == 3 {
+                // Positive matching uses the distinct signed System image,
+                // never a canonical Local PVM with relabelled metadata.
+                let observation_runtime =
+                    crate::bundled::root_signed_system_agent_runtime_package(&operator).unwrap();
+                assert_eq!(
+                    observation_runtime.manifest().contract.lifecycle_abi,
+                    vos::agent::sdk::SYSTEM_OBSERVATION_ABI_ID,
+                );
+                assert_ne!(observation_runtime.program(), runtime.program());
+                let (observation_target, observation_nonce) =
+                    derive_system_authority_target(space, public, &observation_runtime, &authority)
+                        .unwrap();
+                let observation_roster = SystemBootstrapRoster::from_enrollments(
+                    space,
+                    observation_target.system_agent,
+                    owner,
+                    primary.node,
+                    selected,
+                )
+                .unwrap();
+                let mut observation = descriptor.clone();
+                observation.creation_nonce = observation_nonce;
+                observation.identity.agent = observation_target.system_agent;
+                observation.identity.runtime_deployment = observation_runtime.deployment();
+                observation.identity.runtime_program = observation_runtime.program();
+                observation.identity.runtime_producer = observation_runtime.producer();
+                observation.authority = observation_target.binding;
+                observation.runtime_package = observation_runtime.package_ref().clone();
+                observation.runtime_contract = observation_runtime.manifest().contract;
+                observation.capabilities = observation_runtime.capabilities();
+                observation.replicas = observation_roster.descriptor_replicas();
+                let observation_configuration = observation_roster
+                    .authority_configuration(&observation, public)
+                    .unwrap();
+                let observation_bytes = observation_configuration.encode();
+                assert_eq!(&observation_bytes[..4], b"SAC7");
+                validate_system_observation_bootstrap_configuration(
+                    &observation,
+                    &observation_bytes,
+                )
+                .unwrap();
+                for field in 0..5 {
+                    let mut changed = observation.clone();
+                    match field {
+                        0 => changed.runtime_contract.resources.max_runtime_state_bytes -= 1,
+                        1 => changed.replicas.pop().map(|_| ()).unwrap(),
+                        2 => changed.replicas[2].role = ReplicaRole::Observer,
+                        3 => {
+                            changed.identity.runtime_program =
+                                vos::agent::sdk::ProgramId([0x98; 32])
+                        }
+                        4 => changed.identity.owner = PrincipalId([0x97; 32]),
+                        _ => unreachable!(),
+                    }
+                    assert!(
+                        validate_system_observation_bootstrap_configuration(
+                            &changed,
+                            &observation_bytes,
+                        )
+                        .is_err()
+                    );
+                }
+                let mut legacy_tag = observation_bytes.clone();
+                legacy_tag[..4].copy_from_slice(b"SAC6");
+                assert!(
+                    validate_system_observation_bootstrap_configuration(&observation, &legacy_tag)
+                        .is_err()
+                );
+            }
             assert_eq!(configuration.bootstrap_node, primary.node.0);
             assert_eq!(configuration.bootstrap_principal, owner.0);
             assert_eq!(
@@ -214,6 +340,314 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+#[test]
+fn pending_system_observation_release_gate_leaves_fresh_and_experimental_roots_untouched() {
+    use crate::commands::space::clean_store::ensure_private_directory;
+    use crate::commands::space::local_config::LocalAgentStorage;
+    let scratch = Scratch::new();
+    let operator = Keypair::ed25519_from_bytes([0x58; 32]).unwrap();
+    let before = journal_files(&scratch.0);
+    for _ in 0..2 {
+        let error = preflight_released_system_startup(
+            &scratch.0,
+            LocalAgentStorage::Image,
+            None,
+            &operator,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "requires a supplied root-certified plan or canonical retained CSB5 plan"
+            )
+        );
+        assert_eq!(journal_files(&scratch.0), before);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    // A malformed/partial old control root is not permission to reconcile its
+    // stages, create missing images or silently select another runtime role.
+    let control = scratch.0.join(SYSTEM_AGENT_CONTROL_DIRECTORY);
+    drop(ensure_private_directory(&control).unwrap());
+    std::fs::write(
+        control.join("experimental-space-marker"),
+        b"preserve old inputs",
+    )
+    .unwrap();
+    let before = journal_files(&scratch.0);
+    assert!(
+        preflight_released_system_startup(&scratch.0, LocalAgentStorage::Image, None, &operator)
+            .is_err()
+    );
+    assert_eq!(journal_files(&scratch.0), before);
+
+    // The retired Local spelling is refused before any System selection or
+    // mutation, even in a build that understands external Shared runtimes.
+    let error = preflight_released_system_startup(
+        &scratch.0,
+        LocalAgentStorage::ExternalState,
+        None,
+        &operator,
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("external-state Local deployment is unsupported")
+    );
+    assert_eq!(journal_files(&scratch.0), before);
+}
+
+#[test]
+fn system_preflight_refuses_retired_or_incomplete_retained_records_without_writes() {
+    use crate::commands::space::local_config::LocalAgentStorage;
+    let operator = Keypair::ed25519_from_bytes([0x59; 32]).unwrap();
+    for version in [3, 4, 5] {
+        let scratch = Scratch::new();
+        let control = scratch.0.join(SYSTEM_AGENT_CONTROL_DIRECTORY);
+        let (mut pins, mut bootstrap, issuer, mut genesis) =
+            CleanSystemAgentFileStores::open_or_create(&control)
+                .unwrap()
+                .into_production_parts();
+        // Valid file-store envelopes ensure preflight reaches the read-only
+        // bootstrap decoder. Retired headers refuse before their body, while
+        // the current header still needs a complete certified plan.
+        let mut record = b"CSB2".to_vec();
+        record.extend_from_slice(vos::agent::sdk::RUNTIME_ABI_ID.as_bytes());
+        record.push(version);
+        pins.commit(b"uninterpreted pins for record-header rejection")
+            .unwrap();
+        bootstrap.commit(&record).unwrap();
+        genesis
+            .commit(b"uninterpreted genesis for record-header rejection")
+            .unwrap();
+        drop((pins, bootstrap, issuer, genesis));
+        let before = journal_files(&scratch.0);
+        for _ in 0..2 {
+            let error = preflight_released_system_startup(
+                &scratch.0,
+                LocalAgentStorage::Image,
+                None,
+                &operator,
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("invalid persisted bootstrap plan")
+            );
+            assert_eq!(journal_files(&scratch.0), before);
+            assert!(!scratch.0.join(SHARED_AGENT_HOST_DIRECTORY).exists());
+            assert!(!scratch.0.join(LOCAL_AGENT_HOST_DIRECTORY).exists());
+        }
+    }
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+fn fixed_three_materials_for_packaged_preflight(
+    operator: &Keypair,
+    runtime: vos::agent::package_admission::AdmittedRuntimePackage,
+    authority: AdmittedActorPackage,
+) -> SystemBootstrapMaterials {
+    let space = SpaceId([0x5a; 32]);
+    let public = raw_public_key(operator).unwrap();
+    let owner = PrincipalId::of_public_key(&public);
+    let enrollments: Vec<_> = [0x5b, 0x5c, 0x5d]
+        .into_iter()
+        .map(|seed| {
+            let daemon = Keypair::ed25519_from_bytes([seed; 32]).unwrap();
+            sign_node_encryption_enrollment(
+                &daemon,
+                space,
+                owner,
+                derive_node_encryption_public(&daemon, space).unwrap(),
+            )
+            .unwrap()
+        })
+        .collect();
+    SystemBootstrapMaterials::new(
+        space,
+        public,
+        enrollments[0].node,
+        runtime,
+        authority,
+        crate::bundled::root_signed_actor_package(
+            crate::bundled::system_catalog_package_template(),
+            SYSTEM_CATALOG_NAME,
+            operator,
+        )
+        .unwrap(),
+        &enrollments,
+    )
+    .unwrap()
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+#[test]
+fn packaged_system_prewrite_binding_refuses_same_sac7_other_runtime_and_authority_closures() {
+    use vos::agent::package_admission::{admit_actor_package, admit_runtime_package};
+    use vos::agent::sdk::contract::RuntimePackageContract;
+    use vos::agent::sdk::package::{PackageEnvelope, PackageManifest};
+    use vos_pvm_compiler::assembler::{Assembler, Reg};
+
+    let scratch = Scratch::new();
+    let before = journal_files(&scratch.0);
+    let operator = Keypair::ed25519_from_bytes([0x5e; 32]).unwrap();
+    let authority = crate::bundled::root_signed_actor_package(
+        crate::bundled::system_authority_package_template(),
+        SYSTEM_AUTHORITY_NAME,
+        &operator,
+    )
+    .unwrap();
+    let candidate_program = Assembler::new()
+        .load_imm_64(Reg::A0, 0x5f)
+        .trap()
+        .build_standard();
+    assert_ne!(candidate_program, crate::bundled::agent_runtime_pvm());
+    let candidate_runtime = admit_runtime_package(
+        &crate::bundled::root_signed_runtime_package_bytes(
+            &operator,
+            &candidate_program,
+            "system-image-runtime",
+            RuntimePackageContract::system_observation_image(),
+            vos::agent::sdk::RuntimeCapabilities::standard(),
+            None,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let check = |materials: &SystemBootstrapMaterials| {
+        let ManagementRequest::Install(install) = &materials.authority_request else {
+            unreachable!()
+        };
+        let bytes = &install.installation_data.as_ref().unwrap().bytes;
+        assert!(bytes.starts_with(b"SAC7"));
+        validate_system_observation_bootstrap_configuration(&materials.descriptor, bytes).unwrap();
+        validate_packaged_system_observation_bootstrap_materials(
+            &materials.descriptor,
+            materials.runtime.exact_bytes(),
+            materials.authority_package.exact_bytes(),
+            &materials.authority_request,
+            &operator,
+        )
+    };
+    let candidate = fixed_three_materials_for_packaged_preflight(
+        &operator,
+        candidate_runtime,
+        authority.clone(),
+    );
+    let runtime = match crate::bundled::root_signed_system_agent_runtime_package(&operator) {
+        Ok(runtime) => runtime,
+        Err(unavailable) => {
+            // Missing packaged bytes must refuse even a signed, admitted
+            // same-ABI/SAC7 closure. This is not a fixture promotion fallback.
+            let error = check(&candidate).unwrap_err();
+            assert_eq!(error.to_string(), unavailable.to_string());
+            assert!(
+                error
+                    .to_string()
+                    .contains("release artifact is not yet qualified and pinned")
+            );
+            assert_eq!(journal_files(&scratch.0), before);
+            assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+            return;
+        }
+    };
+    let canonical =
+        fixed_three_materials_for_packaged_preflight(&operator, runtime.clone(), authority.clone());
+    check(&canonical).unwrap();
+    assert_eq!(
+        canonical.runtime.manifest().contract,
+        candidate.runtime.manifest().contract
+    );
+    assert_ne!(canonical.runtime.program(), candidate.runtime.program());
+    assert!(
+        check(&candidate)
+            .unwrap_err()
+            .to_string()
+            .contains("System runtime differs from the exact packaged System observation role")
+    );
+
+    // A root-signed actor with the same admitted schema/policy but a different
+    // program is still not the packaged Authority. Preserve its full closure
+    // and re-sign it normally rather than forging an admitted value.
+    let mut envelope = PackageEnvelope::decode(authority.exact_bytes()).unwrap();
+    let PackageManifest::Actor(manifest) = &mut envelope.manifest else {
+        unreachable!()
+    };
+    let previous_program = manifest.program.clone();
+    let replacement = BlobRef::of_bytes(&candidate_program);
+    manifest.program = replacement.clone();
+    let artifact = envelope
+        .artifacts
+        .iter_mut()
+        .find(|artifact| artifact.identity == previous_program)
+        .unwrap();
+    artifact.identity = replacement;
+    artifact.bytes = candidate_program;
+    envelope
+        .artifacts
+        .sort_unstable_by(|left, right| left.identity.cmp(&right.identity));
+    envelope.manifest.signing_mut().signature = operator
+        .sign(&envelope.signing_bytes().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let other_authority = admit_actor_package(&envelope.encode().unwrap()).unwrap();
+    let other_authority_materials =
+        fixed_three_materials_for_packaged_preflight(&operator, runtime, other_authority);
+    assert!(
+        check(&other_authority_materials)
+            .unwrap_err()
+            .to_string()
+            .contains("Authority differs from the exact packaged Authority template")
+    );
+
+    let mut changed = canonical.descriptor.clone();
+    changed.runtime_package.hash.0[0] ^= 1;
+    let mut changed_request = canonical.authority_request.clone();
+    let ManagementRequest::Install(install) = &mut changed_request else {
+        unreachable!()
+    };
+    let mut configuration =
+        SystemAuthorityConfiguration::decode(&install.installation_data.as_ref().unwrap().bytes)
+            .unwrap();
+    configuration.system_runtime_package.hash = changed.runtime_package.hash.0;
+    let bytes = configuration.encode();
+    let reference = BlobRef::of_bytes(&bytes);
+    install.entry.installation_data = Some(reference.clone());
+    install.installation_data = Some(InstallationData { reference, bytes });
+    assert!(
+        validate_packaged_system_observation_bootstrap_materials(
+            &changed,
+            canonical.runtime.exact_bytes(),
+            canonical.authority_package.exact_bytes(),
+            &changed_request,
+            &operator,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("descriptor differs from its exact packaged runtime and Authority closure")
+    );
+    assert_eq!(journal_files(&scratch.0), before);
+    assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+}
+
+fn assert_released_system_plan_refused(error: &anyhow::Error) {
+    let message = error.to_string();
+    assert!(
+        [
+            "requires the exact signed System image observation contract",
+            "System observation runtime release artifact is not yet qualified and pinned",
+            "System runtime differs from the exact packaged System observation role",
+            "Authority differs from the exact packaged Authority template",
+            "pending release qualification",
+        ]
+        .iter()
+        .any(|reason| message.contains(reason)),
+        "{error:#}"
+    );
 }
 
 fn journal_files(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
@@ -374,14 +808,17 @@ fn expiry_test_clock_tracks_wall_time_and_preserves_forward_jump() {
     assert!(first >= wall);
     let future = first + 10_000;
     inputs.clock.fetch_max(future, Ordering::AcqRel);
-    assert!(trust.current_logical_slot().unwrap() >= future);
-    assert!(trust.current_logical_slot().unwrap() > future);
+    let at_future = trust.current_logical_slot().unwrap();
+    assert_eq!(at_future, future);
+    let repeated = trust.current_logical_slot().unwrap();
+    assert_eq!(repeated, at_future);
+    assert_eq!(inputs.clock.load(Ordering::Acquire), future);
 }
 
 fn expiry_startup_inputs(operator: &Keypair) -> StartupTestInputs {
     // Qualify exactly the shipped packages. Only the logical clock is
     // controlled; no candidate environment variable can replace guest bytes.
-    let runtime = crate::bundled::root_signed_agent_runtime_package(operator).unwrap();
+    let runtime = crate::bundled::root_signed_system_agent_runtime_package(operator).unwrap();
     let authority = crate::bundled::root_signed_actor_package(
         crate::bundled::system_authority_package_template(),
         SYSTEM_AUTHORITY_NAME,
@@ -464,18 +901,63 @@ fn candidate_fixed_roster_production_routes_start_from_common_bundle() {
     check_fixed_roster_preparation(FixedRosterStage::Routes);
 }
 
+#[cfg(feature = "experimental-state-blocks")]
+#[test]
+#[ignore = "requires fresh Authority/System IMAGE/external runtime guests and authenticated loopback; public handoff through production file owners"]
+fn candidate_public_shared_member_handoff_retries_and_reopens_production_owners() {
+    check_fixed_roster_preparation(FixedRosterStage::WarmMembers);
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+#[test]
+#[ignore = "requires fresh Authority/System IMAGE/external runtime/CLERK_AGENT_PACKAGE and loopback; real public nonleader Install, lost result and all-owner reopen"]
+fn candidate_public_shared_clerk_nonleader_install_lost_result_and_reopen() {
+    check_fixed_roster_preparation(FixedRosterStage::PublicWorkflow);
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+#[test]
+#[ignore = "requires fresh candidate Authority/System IMAGE/external/Clerk guests and loopback; 257 real public Root-authorized actor Invoke/ACKs, exact archived issuance and locked restart"]
+fn candidate_public_shared_clerk_native_authorization_exceeds_256_and_reopens() {
+    check_fixed_roster_preparation(FixedRosterStage::OperationCapacity);
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+#[test]
+#[ignore = "requires fresh candidate Authority/System IMAGE/external/Clerk guests and loopback; pending Install all-owner locked startup with whole30s recovery"]
+fn candidate_pending_shared_install_all_cold_public_startup() {
+    check_fixed_roster_preparation(FixedRosterStage::ColdInstallAll);
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+#[test]
+#[ignore = "requires fresh candidate Authority/System IMAGE/external/Clerk guests and loopback; pending Install returning-Follower locked startup with whole30s recovery"]
+fn candidate_pending_shared_install_returning_follower_public_startup() {
+    check_fixed_roster_preparation(FixedRosterStage::ColdInstallReturning);
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FixedRosterStage {
     Bundle,
     Owners,
     Participants,
     Routes,
+    #[cfg(feature = "experimental-state-blocks")]
+    WarmMembers,
+    #[cfg(feature = "experimental-state-blocks")]
+    PublicWorkflow,
+    #[cfg(feature = "experimental-state-blocks")]
+    OperationCapacity,
+    #[cfg(feature = "experimental-state-blocks")]
+    ColdInstallAll,
+    #[cfg(feature = "experimental-state-blocks")]
+    ColdInstallReturning,
     ProductionGate,
 }
 
 #[test]
-#[ignore = "requires AUTHORITY_CANDIDATE_ELF; production roster rejection before writes and singleton retry"]
-fn candidate_production_roster_gate_preserves_fresh_root_for_singleton_retry() {
+#[ignore = "requires AUTHORITY_CANDIDATE_ELF; production qualification rejection before writes, no singleton fallback"]
+fn candidate_production_roster_gate_preserves_fresh_root_without_singleton_fallback() {
     check_fixed_roster_preparation(FixedRosterStage::ProductionGate);
 }
 
@@ -512,6 +994,11 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
         &operator,
         &PathBuf::from(std::env::var("AUTHORITY_CANDIDATE_ELF").unwrap()),
     );
+    #[cfg(feature = "experimental-state-blocks")]
+    let inputs = StartupTestInputs {
+        runtime: member_handoff::fresh_system_runtime(&operator),
+        ..inputs
+    };
     let make_materials = || {
         SystemBootstrapMaterials::new(
             space,
@@ -612,15 +1099,12 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
         )
         .err()
         .expect("production must reject a three-node import");
-        assert!(
-            error.to_string().contains("requires singleton bootstrap"),
-            "{error:#}"
-        );
+        assert_released_system_plan_refused(&error);
         assert_eq!(journal_files(&data), before);
         assert_eq!(std::fs::read_dir(&data).unwrap().count(), 0);
-        // Removing the bundle is enough: the rejected input left no plan,
-        // archive, issuer, journal or host lock to poison supported startup.
-        let (_, owner) = open_clean_system_lifecycle_with_roster_policy(
+        // Removing the bundle must not select the old singleton image. The
+        // unqualified v1 path stays closed without creating any roots.
+        let error = open_clean_system_lifecycle_with_roster_policy(
             network,
             &data,
             space.0,
@@ -632,8 +1116,15 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
             false,
             Some(&inputs),
         )
-        .unwrap();
-        drop(owner);
+        .err()
+        .expect("public startup must not fall back to a singleton");
+        assert!(
+            error.to_string().contains(
+                "requires a supplied root-certified plan or canonical retained CSB5 plan"
+            )
+        );
+        assert_eq!(journal_files(&data), before);
+        assert_eq!(std::fs::read_dir(&data).unwrap().count(), 0);
         return;
     }
     for (index, daemon) in daemons.iter().enumerate() {
@@ -718,7 +1209,27 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
         // Drop every lifecycle/file owner, then recover solely from persisted
         // plans. The networking processes stay alive; this is not a daemon
         // crash or public-route qualification.
-        for restart in [false, true] {
+        #[cfg(feature = "experimental-state-blocks")]
+        let mut handoff = None;
+        #[cfg(feature = "experimental-state-blocks")]
+        let mut workflow = None;
+        #[cfg(feature = "experimental-state-blocks")]
+        let mut operation_capacity = None;
+        #[cfg(feature = "experimental-state-blocks")]
+        let mut cold_install = None;
+        #[cfg(feature = "experimental-state-blocks")]
+        let restarts: &[bool] = if stage == FixedRosterStage::OperationCapacity {
+            &[false, true, true]
+        } else {
+            &[false, true]
+        };
+        #[cfg(not(feature = "experimental-state-blocks"))]
+        let restarts: &[bool] = &[false, true];
+        for &restart in restarts {
+            // Include every locked constructor and production attachment in
+            // the pending-recovery measurement, not just the later HTTP retry.
+            #[cfg(feature = "experimental-state-blocks")]
+            let recovery_started = std::time::Instant::now();
             let owners = std::thread::scope(|scope| {
                 let handles: Vec<_> = (0..3)
                     .map(|index| {
@@ -727,8 +1238,13 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
                         let daemon = &daemons[index];
                         let operator = &operator;
                         let bundle = &bundle;
+                        let inputs = &inputs;
                         scope.spawn(move || {
-                            open_clean_system_lifecycle(
+                            let certified = (!restart).then(|| {
+                                read_certified_bootstrap_bundle(bundle, space.0, operator, daemon)
+                                    .unwrap()
+                            });
+                            open_clean_system_lifecycle_with_inputs(
                                 network,
                                 data,
                                 space.0,
@@ -736,7 +1252,16 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
                                 daemon,
                                 crate::commands::space::local_config::LocalAgentStorage::Image,
                                 &data.join("host.lock"),
-                                (!restart).then_some(bundle.as_path()),
+                                certified.as_ref(),
+                                match stage {
+                                    #[cfg(feature = "experimental-state-blocks")]
+                                    FixedRosterStage::WarmMembers
+                                    | FixedRosterStage::PublicWorkflow
+                                    | FixedRosterStage::OperationCapacity
+                                    | FixedRosterStage::ColdInstallAll
+                                    | FixedRosterStage::ColdInstallReturning => Some(inputs),
+                                    _ => None,
+                                },
                             )
                         })
                     })
@@ -754,10 +1279,23 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
             for (index, (node, _)) in owners.iter().enumerate() {
                 assert_eq!(*node, enrollments[index].node);
             }
-            if matches!(
+            #[cfg(feature = "experimental-state-blocks")]
+            let warm = matches!(
                 stage,
-                FixedRosterStage::Participants | FixedRosterStage::Routes
-            ) {
+                FixedRosterStage::WarmMembers
+                    | FixedRosterStage::PublicWorkflow
+                    | FixedRosterStage::OperationCapacity
+                    | FixedRosterStage::ColdInstallAll
+                    | FixedRosterStage::ColdInstallReturning
+            );
+            #[cfg(not(feature = "experimental-state-blocks"))]
+            let warm = false;
+            if warm
+                || matches!(
+                    stage,
+                    FixedRosterStage::Participants | FixedRosterStage::Routes
+                )
+            {
                 let nodes = std::thread::scope(|scope| {
                     let handles: Vec<_> = owners
                         .into_iter()
@@ -787,8 +1325,15 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
                         .map(|handle| handle.join().unwrap())
                         .collect::<Vec<_>>()
                 });
-                for (index, (_, result)) in nodes.iter().enumerate() {
+                for (index, (node, result)) in nodes.iter().enumerate() {
                     eprintln!("replica {index} route attachment (restart={restart}): {result:?}");
+                    if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                        eprintln!(
+                            "shared_create_initial_readiness replica={index} restart={restart} recovering={} supervisor_exposed={}",
+                            node.ingress_handle().clean_agent_recovering(),
+                            node.clean_agent_supervisor().is_some(),
+                        );
+                    }
                 }
                 for (index, (node, result)) in nodes.iter().enumerate() {
                     assert!(
@@ -801,19 +1346,147 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
                             .load(std::sync::atomic::Ordering::Acquire),
                         "replica {index} stopped during initial reconciliation"
                     );
-                    if stage == FixedRosterStage::Routes {
-                        assert!(
-                            node.clean_agent_supervisor().is_some(),
-                            "replica {index} routes not ready"
-                        );
-                    }
                 }
-                assert!(
-                    nodes
-                        .iter()
-                        .any(|(node, _)| node.clean_agent_supervisor().is_some()),
-                    "no leader published verified routes"
-                );
+                // Initial construction may retain all owners unpublished while
+                // their workers complete the exact read custody. Observe actual
+                // fresh publication; never drive recovery or set readiness here.
+                // This bounded phase wait is not whole-startup latency evidence.
+                let readiness_deadline = std::time::Instant::now() + Duration::from_secs(30);
+                loop {
+                    assert!(
+                        nodes.iter().all(|(node, _)| !node
+                            .shutdown_handle()
+                            .load(std::sync::atomic::Ordering::Acquire)),
+                        "replica stopped before initial verified route publication"
+                    );
+                    assert!(
+                        std::time::Instant::now() < readiness_deadline,
+                        "required initial verified routes not published within 30s"
+                    );
+                    let published = if stage == FixedRosterStage::Routes {
+                        nodes
+                            .iter()
+                            .all(|(node, _)| node.clean_agent_supervisor().is_some())
+                    } else {
+                        nodes
+                            .iter()
+                            .any(|(node, _)| node.clean_agent_supervisor().is_some())
+                    };
+                    if published {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                #[cfg(feature = "experimental-state-blocks")]
+                if warm {
+                    let mut nodes: Vec<_> = nodes
+                        .into_iter()
+                        .map(|(node, result)| {
+                            result.unwrap();
+                            node
+                        })
+                        .collect();
+                    let handoff_result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let cold = matches!(
+                                stage,
+                                FixedRosterStage::ColdInstallAll
+                                    | FixedRosterStage::ColdInstallReturning
+                            );
+                            // Pending recovery must not first rerun public Create
+                            // or handoff operations just to establish test readiness.
+                            if !(cold && restart) {
+                                member_handoff::public_handoff(
+                                    &mut nodes,
+                                    &data,
+                                    &operator,
+                                    &daemons,
+                                    &enrollments,
+                                    space,
+                                    target,
+                                    &inputs,
+                                    restart,
+                                    &mut handoff,
+                                );
+                            }
+                            if stage == FixedRosterStage::PublicWorkflow
+                                || (stage == FixedRosterStage::OperationCapacity
+                                    && operation_capacity.is_none())
+                            {
+                                member_workflow::exercise(
+                                    &mut nodes,
+                                    &networks,
+                                    &data,
+                                    &operator,
+                                    &daemons,
+                                    &enrollments,
+                                    space,
+                                    target,
+                                    &inputs,
+                                    &handoff.as_ref().unwrap().1,
+                                    restart,
+                                    &mut workflow,
+                                );
+                            }
+                            if stage == FixedRosterStage::OperationCapacity && restart {
+                                member_workflow::exercise_capacity(
+                                    &mut nodes,
+                                    &data[0],
+                                    &operator,
+                                    space,
+                                    raw_public_key(&daemons[0]).unwrap(),
+                                    workflow.as_ref().unwrap(),
+                                    &mut operation_capacity,
+                                );
+                            }
+                            if cold {
+                                member_cold_install::exercise(
+                                    member_cold_install::Inputs {
+                                        nodes: &mut nodes,
+                                        networks: &networks,
+                                        data: &data,
+                                        operator: &operator,
+                                        daemons: &daemons,
+                                        enrollments: &enrollments,
+                                        space,
+                                        authority: target,
+                                        startup: &inputs,
+                                        archive: &handoff.as_ref().unwrap().1,
+                                    },
+                                    restart,
+                                    stage == FixedRosterStage::ColdInstallReturning,
+                                    recovery_started,
+                                    &mut cold_install,
+                                );
+                            }
+                        }));
+                    if let Err(original_panic) = handoff_result {
+                        // Stop every participant before joining any of them.
+                        // Checked collection logs the retained production-owner
+                        // error instead of losing it during ordinary Drop.
+                        for node in &nodes {
+                            node.shutdown();
+                        }
+                        for (index, node) in nodes.into_iter().enumerate() {
+                            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                node.collect_checked()
+                            })) {
+                                Ok(Ok(_)) => {}
+                                Ok(Err(error)) => eprintln!(
+                                    "replica {index} checked handoff cleanup (restart={restart}): {error:?}"
+                                ),
+                                Err(_) => eprintln!(
+                                    "replica {index} handoff cleanup panicked (restart={restart}); preserving original failure"
+                                ),
+                            }
+                        }
+                        std::panic::resume_unwind(original_panic);
+                    }
+                    drop(nodes);
+                } else {
+                    drop(nodes);
+                }
+                #[cfg(not(feature = "experimental-state-blocks"))]
                 drop(nodes);
             } else {
                 drop(owners);
@@ -836,10 +1509,7 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
                 )
                 .err()
                 .expect("production must reject the persisted roster");
-                assert!(
-                    error.to_string().contains("requires singleton bootstrap"),
-                    "{error:#}"
-                );
+                assert_released_system_plan_refused(&error);
                 assert_eq!(journal_files(data), before);
             }
         }
@@ -952,6 +1622,144 @@ fn candidate_certified_genesis_import_is_scoped_immutable_and_restartable() {
     std::fs::write(&bundle_path, certified.encode_import().unwrap()).unwrap();
     let certified =
         read_certified_bootstrap_bundle(&bundle_path, space.0, &operator, &daemon).unwrap();
+    // A deployed nondefault plan selects the client's expected target even
+    // without a bootstrap-bundle option. Reading beside the live archive's
+    // lease must not acquire another writer, repair a stage or reserve a call.
+    crate::secure_file::write_owner_only_atomic(
+        &data.join("node.key"),
+        &daemon.to_protobuf_encoding().unwrap(),
+    )
+    .unwrap();
+    let sdk_space = SpaceId(space.0);
+    let daemon_public = raw_public_key(&daemon).unwrap();
+    let bundled_target = derive_system_authority_target(
+        sdk_space,
+        raw_public_key(&operator).unwrap(),
+        &crate::bundled::root_signed_system_agent_runtime_package(&operator).unwrap(),
+        &crate::bundled::root_signed_actor_package(
+            crate::bundled::system_authority_package_template(),
+            SYSTEM_AUTHORITY_NAME,
+            &operator,
+        )
+        .unwrap(),
+    )
+    .unwrap()
+    .0;
+    assert_ne!(authority, bundled_target);
+    let mut client_config = super::super::local_config::LocalConfig::default();
+    super::super::local_config::save(&data, &client_config).unwrap();
+    let client_files = journal_files(&data);
+    assert_eq!(
+        client_system_authority_target(&data, sdk_space, &operator, daemon_public).unwrap(),
+        authority
+    );
+    assert_eq!(journal_files(&data), client_files);
+    let client_foreign = Keypair::ed25519_from_bytes([0x96; 32]).unwrap();
+    for (selected_space, selected_root, selected_node) in [
+        (SpaceId([0x97; 32]), &operator, daemon_public),
+        (sdk_space, &client_foreign, daemon_public),
+        (
+            sdk_space,
+            &operator,
+            raw_public_key(&client_foreign).unwrap(),
+        ),
+    ] {
+        assert!(
+            client_system_authority_target(&data, selected_space, selected_root, selected_node,)
+                .is_err()
+        );
+        assert_eq!(journal_files(&data), client_files);
+        assert!(!data.join("agent-client").exists());
+    }
+    let bootstrap_path = data
+        .join(SYSTEM_AGENT_CONTROL_DIRECTORY)
+        .join("system-agent.bootstrap");
+    let saved_bootstrap = scratch.0.join("saved-client-bootstrap");
+    std::fs::rename(&bootstrap_path, &saved_bootstrap).unwrap();
+    let partial_files = journal_files(&data);
+    assert!(
+        super::super::local_create::create_local(
+            &data,
+            "127.0.0.1:1".parse().unwrap(),
+            &operator,
+            sdk_space,
+            daemon_public,
+            false,
+        )
+        .is_err()
+    );
+    assert_eq!(journal_files(&data), partial_files);
+    assert!(!data.join("agent-client").exists());
+    std::fs::rename(&saved_bootstrap, &bootstrap_path).unwrap();
+    client_config.system_bootstrap_bundle = Some(bundle_path.clone());
+    super::super::local_config::save(&data, &client_config).unwrap();
+    assert_eq!(
+        client_system_authority_target(&data, sdk_space, &operator, daemon_public).unwrap(),
+        authority
+    );
+
+    let alternate_materials = SystemBootstrapMaterials::new(
+        sdk_space,
+        raw_public_key(&operator).unwrap(),
+        node_id_from_authenticated_peer(&daemon.public().to_peer_id()),
+        crate::bundled::root_signed_system_agent_runtime_package(&operator).unwrap(),
+        crate::bundled::root_signed_actor_package(
+            crate::bundled::system_authority_package_template(),
+            SYSTEM_AUTHORITY_NAME,
+            &operator,
+        )
+        .unwrap(),
+        crate::bundled::root_signed_actor_package(
+            crate::bundled::system_catalog_package_template(),
+            SYSTEM_CATALOG_NAME,
+            &operator,
+        )
+        .unwrap(),
+        &[sign_node_encryption_enrollment(
+            &daemon,
+            sdk_space,
+            PrincipalId::of_public_key(&raw_public_key(&operator).unwrap()),
+            derive_node_encryption_public(&daemon, sdk_space).unwrap(),
+        )
+        .unwrap()],
+    )
+    .unwrap();
+    let alternate_output = scratch.0.join("alternate-client-certificate");
+    bootstrap_prepare::prepare_materials(
+        alternate_materials,
+        &operator,
+        &daemon,
+        &alternate_output,
+    )
+    .unwrap();
+    let alternate_path = alternate_output.join("common.bundle");
+    let alternate =
+        read_certified_bootstrap_bundle(&alternate_path, sdk_space.0, &operator, &daemon).unwrap();
+    assert_ne!(alternate.plan().commitment(), certified.plan().commitment());
+    client_config.system_bootstrap_bundle = Some(alternate_path);
+    super::super::local_config::save(&data, &client_config).unwrap();
+    let client_files = journal_files(&data);
+    assert!(client_system_authority_target(&data, sdk_space, &operator, daemon_public).is_err());
+    assert!(
+        super::super::local_create::create_local(
+            &data,
+            "127.0.0.1:1".parse().unwrap(),
+            &operator,
+            sdk_space,
+            daemon_public,
+            false,
+        )
+        .is_err()
+    );
+    assert_eq!(journal_files(&data), client_files);
+    assert!(!data.join("agent-client").exists());
+    // Removing the optional import input does not remove the deployed plan.
+    client_config.system_bootstrap_bundle = None;
+    super::super::local_config::save(&data, &client_config).unwrap();
+    assert_eq!(
+        client_system_authority_target(&data, sdk_space, &operator, daemon_public).unwrap(),
+        authority
+    );
     assert!(read_certified_bootstrap_bundle(&bundle_path, [0x94; 32], &operator, &daemon).is_err());
     let foreign = Keypair::ed25519_from_bytes([0x95; 32]).unwrap();
     assert!(read_certified_bootstrap_bundle(&bundle_path, space.0, &foreign, &daemon).is_err());
@@ -984,6 +1792,27 @@ fn candidate_certified_genesis_import_is_scoped_immutable_and_restartable() {
         )
         .unwrap();
         drop(recovered);
+        // Certified import and stored-plan reopen retain the same exact
+        // packages; fresh bundled defaults must never replace their inputs.
+        let retained = CleanSystemAgentFileStores::read_client_bootstrap(
+            &imported_data.join(SYSTEM_AGENT_CONTROL_DIRECTORY),
+        )
+        .unwrap()
+        .unwrap();
+        let reopened_plan =
+            CleanSystemAgentBootstrapRecord::authorized_plan(&retained.bootstrap).unwrap();
+        assert_eq!(
+            reopened_plan.runtime_package_bytes(),
+            plan.runtime_package_bytes()
+        );
+        assert_eq!(
+            reopened_plan.authority_package_bytes(),
+            plan.authority_package_bytes()
+        );
+        assert_eq!(
+            reopened_plan.catalog_package_bytes(),
+            plan.catalog_package_bytes()
+        );
         let archived = make_archive(
             &imported_data.join(SYSTEM_AGENT_CONTROL_DIRECTORY),
             space,
@@ -1186,13 +2015,101 @@ fn candidate_certified_genesis_import_is_scoped_immutable_and_restartable() {
 }
 
 fn candidate_authority_inputs(operator: &Keypair, path: &Path) -> StartupTestInputs {
+    use vos::agent::sdk::introspection::{
+        ActorIntrospectionArtifact, ActorMethodIntrospection, CliExposure, MethodDispatch,
+    };
+    use vos::agent::sdk::method_policy::{
+        ActorMethodPolicy, ActorMethodPolicyArtifact, AttestationRequirement,
+        AuthorizationPolicySelector, IdempotencyRequirement, MethodArgument,
+    };
     use vos::agent::sdk::package::{
         PackageArtifact, PackageEnvelope, PackageManifest, PackageSigning,
     };
+    use vos::agent::sdk::wire::CanonicalWire as _;
     let mut inputs = expiry_startup_inputs(operator);
     let elf = std::fs::read(path).unwrap();
     let program = vos_pvm_compiler::link_elf_spi(&elf).unwrap();
     let schema = vos::agent::schema::raw_section_from_elf(&elf).unwrap();
+    let parsed_schema = vos::agent::sdk::schema::decode(&schema).unwrap();
+    let metadata =
+        vos::metadata::decode(&vos::metadata::raw_section_from_elf(&elf).unwrap()).unwrap();
+    let authorizations = vos::metadata::decode_agent_authorizations(
+        &vos::metadata::raw_agent_authorizations_from_elf(&elf).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(metadata.messages.len(), parsed_schema.methods.len());
+    assert_eq!(metadata.messages.len(), authorizations.len());
+    let mut methods = Vec::new();
+    let mut introspection_methods = Vec::new();
+    for ((message, method), authorization) in metadata
+        .messages
+        .iter()
+        .zip(&parsed_schema.methods)
+        .zip(&authorizations)
+    {
+        assert_eq!(message.name, method.name);
+        assert_eq!(message.name, authorization.name);
+        assert_eq!(message.is_query, method.mode.write_lane().is_none());
+        // Authority checks its signed requests in the guest. Require the
+        // freshly emitted Public selector rather than inventing a policy.
+        assert!(!message.attested);
+        assert_eq!(message.space_role, None);
+        assert_eq!(message.actor_role, None);
+        assert_eq!(message.capability, None);
+        assert_eq!(
+            authorization.selector,
+            vos::metadata::ParsedAgentAuthorizationSelector::Public
+        );
+        methods.push(ActorMethodPolicy {
+            name: message.name.clone(),
+            mode: method.mode,
+            arguments: message
+                .fields
+                .iter()
+                .map(|field| MethodArgument {
+                    name: field.name.clone(),
+                    type_identity: field.ty.clone(),
+                })
+                .collect(),
+            return_type_identity: message.returns.clone(),
+            authorization_policy: AuthorizationPolicySelector::Public,
+            idempotency: IdempotencyRequirement::for_mode(method.mode),
+            attestation: AttestationRequirement::None,
+        });
+        introspection_methods.push(ActorMethodIntrospection {
+            name: message.name.clone(),
+            doc: message.doc.clone(),
+            cli_exposure: if message.exposed_to_cli {
+                CliExposure::Exposed
+            } else {
+                CliExposure::Hidden
+            },
+            timeout_ms: message.timeout_ms,
+            dispatch: match message.mode {
+                0 => MethodDispatch::Sync,
+                1 => MethodDispatch::Job,
+                other => panic!("unknown Authority method dispatch mode {other}"),
+            },
+        });
+    }
+    methods.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    introspection_methods.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    let policy = ActorMethodPolicyArtifact {
+        actor_schema: vos::agent::sdk::BlobRef::of_bytes(&schema),
+        methods,
+    };
+    policy.validate_against_schema_bytes(&schema).unwrap();
+    let policies = policy.encode().unwrap();
+    let introspection = ActorIntrospectionArtifact {
+        actor_schema: vos::agent::sdk::BlobRef::of_bytes(&schema),
+        method_policy: vos::agent::sdk::BlobRef::of_bytes(&policies),
+        actor_doc: metadata.doc,
+        methods: introspection_methods,
+    };
+    introspection
+        .validate_against_artifact_bytes(&schema, &policies)
+        .unwrap();
+    let introspection = introspection.encode().unwrap();
     let mut package =
         PackageEnvelope::decode(crate::bundled::system_authority_package_template()).unwrap();
     let PackageManifest::Actor(manifest) = &mut package.manifest else {
@@ -1206,10 +2123,21 @@ fn candidate_authority_inputs(operator: &Keypair, path: &Path) -> StartupTestInp
         &mut manifest.state_lane_schema,
         vos::agent::sdk::BlobRef::of_bytes(&schema),
     );
-    package
-        .artifacts
-        .retain(|artifact| artifact.identity != old_program && artifact.identity != old_schema);
-    for bytes in [program, schema] {
+    let old_policies = std::mem::replace(
+        &mut manifest.method_policy,
+        vos::agent::sdk::BlobRef::of_bytes(&policies),
+    );
+    let old_introspection = std::mem::replace(
+        &mut manifest.introspection,
+        vos::agent::sdk::BlobRef::of_bytes(&introspection),
+    );
+    package.artifacts.retain(|artifact| {
+        artifact.identity != old_program
+            && artifact.identity != old_schema
+            && artifact.identity != old_policies
+            && artifact.identity != old_introspection
+    });
+    for bytes in [program, schema, policies, introspection] {
         package.artifacts.push(PackageArtifact {
             identity: vos::agent::sdk::BlobRef::of_bytes(&bytes),
             bytes,
@@ -1229,6 +2157,45 @@ fn candidate_authority_inputs(operator: &Keypair, path: &Path) -> StartupTestInp
     inputs.authority =
         vos::agent::package_admission::admit_actor_package(&package.encode().unwrap()).unwrap();
     inputs
+}
+
+#[test]
+#[ignore = "requires AUTHORITY_CANDIDATE_ELF; validates the complete freshly emitted candidate closure"]
+fn candidate_authority_metadata_binds_fresh_guest_method_surface() {
+    use vos::agent::sdk::introspection::ActorIntrospectionArtifact;
+    use vos::agent::sdk::method_policy::{ActorMethodPolicyArtifact, AuthorizationPolicySelector};
+    use vos::agent::sdk::wire::CanonicalWire as _;
+
+    let operator = Keypair::ed25519_from_bytes([0x71; 32]).unwrap();
+    let inputs = candidate_authority_inputs(
+        &operator,
+        &PathBuf::from(std::env::var("AUTHORITY_CANDIDATE_ELF").unwrap()),
+    );
+    let package = &inputs.authority;
+    let schema = vos::agent::sdk::schema::decode(package.state_lane_schema_bytes()).unwrap();
+    let policy = ActorMethodPolicyArtifact::decode(package.method_policy_bytes()).unwrap();
+    let introspection = ActorIntrospectionArtifact::decode(package.introspection_bytes()).unwrap();
+    assert_eq!(policy.methods.len(), schema.methods.len());
+    assert_eq!(introspection.methods.len(), schema.methods.len());
+    assert_eq!(policy.actor_schema, package.manifest().state_lane_schema);
+    assert_eq!(
+        introspection.actor_schema,
+        package.manifest().state_lane_schema
+    );
+    assert_eq!(
+        introspection.method_policy,
+        package.manifest().method_policy
+    );
+    let signed_read = policy.method("genesis_decision_projection").unwrap();
+    assert_eq!(signed_read.mode, vos::agent::sdk::MethodMode::Query);
+    assert_eq!(
+        signed_read.authorization_policy,
+        AuthorizationPolicySelector::Public
+    );
+    assert_eq!(signed_read.arguments.len(), 1);
+    assert_eq!(signed_read.arguments[0].name, "query");
+    assert_eq!(signed_read.arguments[0].type_identity, "Vec<u8>");
+    assert_eq!(signed_read.return_type_identity, "Vec<u8>");
 }
 
 fn check_shared_file_recovery_with_candidate(
@@ -1283,6 +2250,8 @@ fn check_shared_file_recovery_with_candidate(
     };
     let (node, mut lifecycle) = open();
     let runtime = crate::bundled::root_signed_agent_runtime_package(&operator).unwrap();
+    let system_runtime =
+        crate::bundled::root_signed_system_agent_runtime_package(&operator).unwrap();
     let authority_package = crate::bundled::root_signed_actor_package(
         crate::bundled::system_authority_package_template_for_storage(
             crate::commands::space::local_config::LocalAgentStorage::Image,
@@ -1292,15 +2261,15 @@ fn check_shared_file_recovery_with_candidate(
         &operator,
     )
     .unwrap();
-    let (runtime, authority_package) = expiry
+    let (system_runtime, authority_package) = expiry
         .as_ref()
-        .map_or((runtime, authority_package), |inputs| {
+        .map_or((system_runtime, authority_package), |inputs| {
             (inputs.runtime.clone(), inputs.authority.clone())
         });
     let public = raw_public_key(&operator).unwrap();
     let owner = PrincipalId::of_public_key(&public);
     let (authority, _) =
-        derive_system_authority_target(space, public, &runtime, &authority_package).unwrap();
+        derive_system_authority_target(space, public, &system_runtime, &authority_package).unwrap();
     let nonce = Hash([0x74; 32]);
     let agent = AgentId::derive(space, owner, nonce.as_bytes());
     let descriptor = AgentDescriptor {
@@ -1383,6 +2352,17 @@ fn check_shared_file_recovery_with_candidate(
         .endorse(&mut signature_store, &mut signer)
         .unwrap();
     assert_eq!(signer.1, 1);
+    // Exercise the configured production endorser, not a replacement test
+    // signer. It uses the same sealed native claim and independently leased
+    // pledge/result store; exact retries return the original signature.
+    assert_eq!(
+        lifecycle.endorse_shared_create(locator).unwrap(),
+        vec![signature.clone()]
+    );
+    assert_eq!(
+        lifecycle.endorse_shared_create(locator).unwrap(),
+        vec![signature.clone()]
+    );
     assert!(matches!(
         discover_shared_genesis_startup(&data, authority, 4096),
         Err(CleanFileStoreError::Busy)
