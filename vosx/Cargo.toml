@@ -23,8 +23,9 @@ include = [
 ]
 
 [features]
-# Candidate artifact build/probe tools only. Local startup remains image-based;
-# this feature does not expose external Local management or serving routes.
+# The supported v1 binary selects System observations and external Shared.
+# This existing feature never exposes external Local management/serving.
+default = ["experimental-state-blocks"]
 experimental-state-blocks = ["vos/experimental-state-blocks", "system-authority/experimental-state-blocks"]
 
 [dependencies]

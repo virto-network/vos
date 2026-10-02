@@ -12,11 +12,28 @@ host_toolchain = "nightly-2025-05-09"
 
 # Public, non-authoritative signed templates. Space creation re-signs these
 # packages with its actual root; this signer is never an operator credential.
-system_templates_source_revision = "7316e52ddd98b083941ead6dd3ca5ba18b2e1a2c"
-system_templates_builder_revision = "7316e52ddd98b083941ead6dd3ca5ba18b2e1a2c"
+system_templates_source_revision = "8128e677eb269516b57d11e387f11a59e205775f"
+system_templates_builder_revision = "8128e677eb269516b57d11e387f11a59e205775f"
 system_templates_public_signing_seed_hex = "5454545454545454545454545454545454545454545454545454545454545454"
-system_authority_package_blake2b_256 = "380c8ec939d0058c484f030fe36805aa1c5f48d3106fd7d1b17e4e9a2161bf9a"
-system_catalog_package_blake2b_256 = "a56230af10e7ea5a5793d81ffcf362f7addb2782ec062c8529d836596eb1aff6"
+system_authority_package_blake2b_256 = "8ae37a3de1173f76c62397812f1766446e27b97d657c97701e5c5b34c4c899e1"
+system_catalog_package_blake2b_256 = "118a773ed4021696bc285db1a425d60e01c95e7b32ab81e4c02d7f34e5785d49"
+
+# Separate signed roles reproduced twice from this immutable source. These
+# pins make packaged integration possible; startup/recovery/capacity acceptance
+# is tracked in the one live checklist, not implied by artifact reproduction.
+runtime_roles_source_revision = "8128e677eb269516b57d11e387f11a59e205775f"
+runtime_roles_materializer_revision = "8128e677eb269516b57d11e387f11a59e205775f"
+system_image_runtime_package_blake2b_256 = "28b3077c5bc0e179c03bb9f53087c223ebd5e8175100e9b6ff093c20c7394de0"
+system_image_runtime_program_id = "c87286e026878c17f2c77b354510a2e32332f6248ea65800f645ff10c5f2c1f6"
+system_image_runtime_elf_blake2b_256 = "a33cb3006974075476d4f79505735df5fafb7c23e0882e2477b8df1fe068101b"
+system_image_runtime_pvm_blake2b_256 = "ff1911c220685d40f31e392ce30c7c8280815046e36eb4a434d5f64102e87da3"
+shared_external_runtime_package_blake2b_256 = "5efd4227788ed069515b34442bb03fa30fed409873e6b29dc5b967b1880069c1"
+shared_external_runtime_program_id = "583f56615cd409fed5753871c918e791537d973bd5e3412ccc43c0f71355671f"
+shared_external_runtime_elf_blake2b_256 = "03c14350769427f95fae4bc6781665ceea836fe61f442c14314eb60676c7078b"
+shared_external_runtime_pvm_blake2b_256 = "679aa625d7e94795343b889feb7125bbebc93923b96b38c28dd87d4a6ee32527"
+# Exact signed declarations, not measured capacity or new acceptance targets.
+shared_external_max_rows_per_lane = 1000000
+shared_external_max_row_bytes_per_lane = 1073741824
 
 service_program_id = "38207480731d47af5194a3e1e61b0f9667983edbbf16c90f2bde7d2153de4481"
 service_elf_blake2b_256 = "e7b9a82d22702e8522e8b36faa1118fcced759cb6632b4377f4d8475890a32f0"
