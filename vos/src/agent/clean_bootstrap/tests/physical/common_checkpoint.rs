@@ -42,6 +42,10 @@ pub(super) enum Exercise {
     ForwardedInstallOrigin,
     #[cfg(feature = "experimental-state-blocks")]
     GenesisPublicationRetry,
+    #[cfg(feature = "experimental-state-blocks")]
+    AdminJournalPrewrite,
+    #[cfg(feature = "experimental-state-blocks")]
+    AdminRegistrationTimeout,
 }
 
 #[cfg(feature = "experimental-state-blocks")]
@@ -55,6 +59,26 @@ fn candidate_shared_publication_exact_retry_readmits_original_leased_stores() {
         true,
         Some(Exercise::GenesisPublicationRetry),
     );
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+#[test]
+#[ignore = "requires coherent Authority/System IMAGE components and three authenticated loopback transports"]
+fn candidate_admin_journal_prewrite_exact_retry_passes_production_recovery_admission() {
+    assert!(std::env::var_os("AUTHORITY_CANDIDATE_ELF").is_some());
+    assert!(std::env::var_os("VOS_AGENT_RUNTIME_COST_CANDIDATE").is_some());
+    assert!(std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some());
+    check_fixed_system_pending_cluster_with_checkpoint(true, Some(Exercise::AdminJournalPrewrite));
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+#[test]
+#[ignore = "requires coherent Authority/System IMAGE components and three authenticated loopback transports"]
+fn candidate_admin_registration_timeout_exact_retry_passes_production_recovery_admission() {
+    assert!(std::env::var_os("AUTHORITY_CANDIDATE_ELF").is_some());
+    assert!(std::env::var_os("VOS_AGENT_RUNTIME_COST_CANDIDATE").is_some());
+    assert!(std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some());
+    check_fixed_system_pending_cluster_with_checkpoint(true, Some(Exercise::AdminRegistrationTimeout));
 }
 
 #[cfg(feature = "experimental-state-blocks")]
@@ -295,6 +319,17 @@ pub(super) fn exercise(
         genesis_publication_retry::exercise(leader, owners, signer);
         return;
     }
+    #[cfg(feature = "experimental-state-blocks")]
+    if matches!(exercise, Exercise::AdminJournalPrewrite | Exercise::AdminRegistrationTimeout) {
+        exercise_admin_missing_journal(
+            leader,
+            owners,
+            fixtures,
+            directories,
+            matches!(exercise, Exercise::AdminRegistrationTimeout),
+        );
+        return;
+    }
     if matches!(
         exercise,
         Exercise::ManagementRetention | Exercise::ManagementRetentionFollower
@@ -322,6 +357,8 @@ pub(super) fn exercise(
         Exercise::ForwardedInstallOrigin => unreachable!(),
         #[cfg(feature = "experimental-state-blocks")]
         Exercise::GenesisPublicationRetry => unreachable!(),
+        #[cfg(feature = "experimental-state-blocks")]
+        Exercise::AdminJournalPrewrite | Exercise::AdminRegistrationTimeout => unreachable!(),
     };
     let agent = HostAgentId(fixtures[leader].plan.pins.agent.0);
     let lagger = (leader + 1) % 3;
@@ -937,4 +974,601 @@ pub(super) fn exercise(
         None
     );
     *networks = live_networks.into_iter().map(Option::unwrap).collect();
+}
+
+
+/// Both cuts retain the real original owner. This proves live retry admission,
+/// not cold missing-WAL adoption or released-bundle CLI qualification.
+#[cfg(feature = "experimental-state-blocks")]
+fn exercise_admin_missing_journal(
+    origin: usize,
+    owners: &mut [Option<MemoryBootstrapOwner>],
+    fixtures: &[PhysicalFixture],
+    directories: &[TestDirectory],
+    registration_timeout: bool,
+) {
+    use crate::actors::codec::Decode as _;
+    use crate::agent::clean_bootstrap::admin_dispatch::RetainedAuthorityAdminDispatch;
+    use crate::agent::local_lifecycle::{LocalLifecycleController, LocalLifecycleStoreFactory};
+    use crate::agent::production_owner::{AgentProductionOwner, AgentProductionOwnerError};
+    use crate::agent_sdk::authority::{
+        AuthorityAdminCall, AuthorityAdminOperation, AuthorityCredentialProjection,
+    };
+    use crate::agent_sdk::wire::CanonicalWire as _;
+    use crate::service::wire::ServiceWire as _;
+
+    struct AdminSigner;
+    impl NativeAuthorityAdminPreparationSigner for AdminSigner {
+        type Error = std::io::Error;
+        fn public_key(&self) -> [u8; 32] {
+            SigningKey::from_bytes(&[RECEIPT_SEED; 32])
+                .verifying_key()
+                .to_bytes()
+        }
+        fn sign_admin_preparation(&mut self, bytes: &[u8]) -> Result<[u8; 64], Self::Error> {
+            Ok(SigningKey::from_bytes(&[RECEIPT_SEED; 32])
+                .sign(bytes)
+                .to_bytes())
+        }
+    }
+    impl NativeAuthorityAdminTerminalSigner for AdminSigner {
+        type Error = std::io::Error;
+        fn public_key(&self) -> [u8; 32] {
+            SigningKey::from_bytes(&[RECEIPT_SEED; 32])
+                .verifying_key()
+                .to_bytes()
+        }
+        fn sign_admin_terminal(&mut self, bytes: &[u8]) -> Result<[u8; 64], Self::Error> {
+            Ok(SigningKey::from_bytes(&[RECEIPT_SEED; 32])
+                .sign(bytes)
+                .to_bytes())
+        }
+    }
+    struct AdminJournal {
+        inner: OperationTestJournal,
+        refuse_before_write: bool,
+        writes: Arc<AtomicUsize>,
+    }
+    impl NativeAuthorityAdminJournalStore for AdminJournal {
+        type Error = std::io::Error;
+        fn load(&mut self, id: InvocationId) -> Result<Option<Vec<u8>>, Self::Error> {
+            NativeAuthorityOperationJournalStore::load(&mut self.inner, id)
+        }
+        fn retain(&mut self, id: InvocationId, bytes: &[u8]) -> Result<(), Self::Error> {
+            self.writes.fetch_add(1, Ordering::AcqRel);
+            if core::mem::take(&mut self.refuse_before_write) {
+                return Err(std::io::Error::other(
+                    "injected admin journal prewrite failure",
+                ));
+            }
+            NativeAuthorityOperationJournalStore::retain(&mut self.inner, id, bytes)
+        }
+    }
+    struct AdminTerminals(OperationTestJournal);
+    impl NativeAuthorityAdminTerminalStore for AdminTerminals {
+        type Error = std::io::Error;
+        fn load(
+            &mut self,
+            id: InvocationId,
+            retired: bool,
+        ) -> Result<Option<Vec<u8>>, Self::Error> {
+            let key = InvocationId(
+                Hash::digest(
+                    b"fixed-three-admin-terminal-test",
+                    &[&id.0, &[u8::from(retired)]],
+                )
+                .0,
+            );
+            NativeAuthorityOperationJournalStore::load(&mut self.0, key)
+        }
+        fn retain(
+            &mut self,
+            id: InvocationId,
+            retired: bool,
+            bytes: &[u8],
+        ) -> Result<(), Self::Error> {
+            let key = InvocationId(
+                Hash::digest(
+                    b"fixed-three-admin-terminal-test",
+                    &[&id.0, &[u8::from(retired)]],
+                )
+                .0,
+            );
+            NativeAuthorityOperationJournalStore::retain(&mut self.0, key, bytes)
+        }
+    }
+    struct NoLifecycleStores;
+    impl LocalLifecycleStoreFactory for NoLifecycleStores {
+        type Intent = IssuerMemoryStore;
+        type Issuer = IssuerMemoryStore;
+        type Error = ();
+        fn discover(&mut self, _: SpaceId, _: usize) -> Result<Vec<AgentId>, ()> {
+            panic!("admin retry must not discover lifecycle stores")
+        }
+        fn open(&mut self, _: SpaceId, _: AgentId) -> Result<(Self::Intent, Self::Issuer), ()> {
+            panic!("admin retry must not create lifecycle stores")
+        }
+        fn open_existing(
+            &mut self,
+            _: SpaceId,
+            _: AgentId,
+        ) -> Result<(Self::Intent, Self::Issuer), ()> {
+            panic!("admin retry must not reopen lifecycle stores")
+        }
+    }
+    fn retry_until<T>(
+        deadline: std::time::Instant,
+        phase: &str,
+        mut operation: impl FnMut() -> Result<T, SharedAgentHostError>,
+    ) -> T {
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{phase} exceeded the whole recovery bound"
+            );
+            let result = operation();
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "{phase} exceeded the whole recovery bound"
+            );
+            match result {
+                Ok(value) => return value,
+                Err(SharedAgentHostError::Unavailable | SharedAgentHostError::Conflict) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("{phase} failed: {error:?}"),
+            }
+        }
+    }
+
+    assert_eq!(owners.len(), 3);
+    let agent = HostAgentId(fixtures[origin].plan.pins.agent.0);
+    for owner in owners.iter().map(|owner| owner.as_ref().unwrap()) {
+        assert_eq!(owner.pins.replicas.members().len(), 3);
+        assert!(!owner.management_admission_held().unwrap());
+    }
+    assert!(
+        owners[origin]
+            .as_ref()
+            .unwrap()
+            ._network_host
+            .bootstrap_is_local_leader(agent)
+            .unwrap()
+    );
+    let current = {
+        let owner = owners[origin].as_ref().unwrap();
+        let request = query(owner, origin, 0xd8);
+        let work = owner.prepare_authority_observation_work(&request).unwrap();
+        let outcome =
+            management_retention::exact_management_retry("admin initial observation", || {
+                owner._network_host.with_authority_observation(
+                    agent,
+                    request.commitment(),
+                    |host| host.observe_system_authority(agent, &work),
+                )
+            });
+        let RuntimeOutcome::Completed(Ok(reply)) = outcome else {
+            panic!("admin fixture observation did not complete");
+        };
+        assert_eq!(reply.status, InvocationStatus::Done);
+        let Some(crate::actors::value::Value::Bytes(bytes)) =
+            crate::actors::value::Value::try_decode(&reply.reply)
+        else {
+            panic!("admin fixture observation returned no projection bytes");
+        };
+        let projection = AuthorityCredentialProjection::decode(&bytes).unwrap();
+        assert_eq!(projection.query, request);
+        assert_eq!(projection.status, AuthorityCredentialStatus::Active);
+        projection
+    };
+    let credential_key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
+    let public = credential_key.verifying_key().to_bytes();
+    let target = owners[origin].as_ref().unwrap().authority_target();
+    let mut draft = AuthorityAdminCall {
+        invocation: InvocationId::ZERO,
+        authority: target,
+        administrator: current.principal,
+        credential: CredentialId::of_public_key(&public),
+        request_sequence: NonZeroU64::new(current.admin_request_high_water + 1).unwrap(),
+        credential_public_key: public,
+        authenticated_node: owners[origin].as_ref().unwrap().pins.node,
+        observed_slot: 0,
+        expected_generation: current.head.administration_generation,
+        operation: AuthorityAdminOperation::SetSpaceRole {
+            principal: current.principal,
+            role: crate::agent_sdk::RoleId([0x53; 32]),
+            granted: true,
+        },
+        signature: [1; 64],
+    };
+    let sign_draft = |draft: &mut AuthorityAdminCall| {
+        draft.invocation = draft.expected_invocation();
+        draft.signature = credential_key.sign(&draft.signing_bytes()).to_bytes();
+        draft.verify_with(&RawCredentialVerifier).unwrap();
+    };
+    sign_draft(&mut draft);
+    let preparation = owners[origin]
+        .as_ref()
+        .unwrap()
+        .prepare_authority_admin(&draft, &mut AdminSigner)
+        .unwrap();
+    let mut call = preparation.call_to_sign(&draft).unwrap();
+    sign_draft(&mut call);
+    assert!(preparation.matches_call(&call));
+    let mut absent_draft = draft.clone();
+    absent_draft.request_sequence = NonZeroU64::new(draft.request_sequence.get() + 1).unwrap();
+    absent_draft.operation = AuthorityAdminOperation::SetSpaceRole {
+        principal: current.principal,
+        role: crate::agent_sdk::RoleId([0x56; 32]),
+        granted: true,
+    };
+    sign_draft(&mut absent_draft);
+    let absent_preparation = owners[origin]
+        .as_ref()
+        .unwrap()
+        .prepare_authority_admin(&absent_draft, &mut AdminSigner)
+        .unwrap();
+    let mut absent_call = absent_preparation.call_to_sign(&absent_draft).unwrap();
+    sign_draft(&mut absent_call);
+    let other = (origin + 1) % 3;
+    let mut other_draft = draft.clone();
+    other_draft.authenticated_node = owners[other].as_ref().unwrap().pins.node;
+    sign_draft(&mut other_draft);
+    let other_preparation = owners[other]
+        .as_ref()
+        .unwrap()
+        .prepare_authority_admin(&other_draft, &mut AdminSigner)
+        .unwrap();
+    let mut other_call = other_preparation.call_to_sign(&other_draft).unwrap();
+    sign_draft(&mut other_call);
+    let mut changed_call = call.clone();
+    changed_call.operation = absent_draft.operation.clone();
+    sign_draft(&mut changed_call);
+    let mut bad_proof_bytes = preparation.encode().unwrap();
+    *bad_proof_bytes.last_mut().unwrap() ^= 1;
+    let bad_proof = NativeAuthorityAdminPreparation::decode(&bad_proof_bytes).unwrap();
+    assert!(!bad_proof.matches_call(&call));
+    for fixture in fixtures {
+        fixture
+            .logical_slot
+            .as_ref()
+            .unwrap()
+            .fetch_max(call.observed_slot + 1, Ordering::AcqRel);
+    }
+    let journal_path = directories[origin].0.clone();
+    let writes = Arc::new(AtomicUsize::new(0));
+    let mut journal = AdminJournal {
+        inner: OperationTestJournal(journal_path.clone()),
+        refuse_before_write: !registration_timeout,
+        writes: Arc::clone(&writes),
+    };
+    let state_before = owners[origin]
+        .as_ref()
+        .unwrap()
+        .host
+        .lock()
+        .unwrap()
+        .clean_state_commitment(agent)
+        .unwrap();
+    let recovery_started = std::time::Instant::now();
+    let deadline = recovery_started + std::time::Duration::from_secs(30);
+    let delayed_registration = if registration_timeout {
+        let database = owners[origin]
+            .as_ref()
+            .unwrap()
+            .host
+            .lock()
+            .unwrap()
+            .raft_database(agent)
+            .unwrap();
+        let meta_before = crate::raft::RaftMeta::load(&database).unwrap();
+        let last_before = crate::raft::RaftLog::open(Arc::clone(&database))
+            .unwrap()
+            .last_index();
+        assert_eq!(meta_before.commit_index, last_before);
+        for owner in owners.iter().map(|owner| owner.as_ref().unwrap()) {
+            owner
+                ._network_host
+                .set_raft_isolated_for_test(agent, true)
+                .unwrap();
+        }
+        let cut_started = std::time::Instant::now();
+        let cut = owners[origin].as_mut().unwrap().retain_authority_admin(
+            &call,
+            &preparation,
+            &mut journal,
+        );
+        let cut_elapsed = cut_started.elapsed();
+        // Always restore the existing transport cut before inspecting/asserting
+        // the result. A reply loss alone would not hold the local commit cursor.
+        let observed = (|| {
+            let meta = crate::raft::RaftMeta::load(&database)?;
+            let raw = crate::raft::RaftLog::open(Arc::clone(&database))?;
+            let last = raw.last_index();
+            let entries = raw.entries(last, last)?;
+            Ok::<_, crate::commit::CommitError>((meta, last, entries))
+        })();
+        for owner in owners.iter().map(|owner| owner.as_ref().unwrap()) {
+            owner
+                ._network_host
+                .set_raft_isolated_for_test(agent, false)
+                .unwrap();
+        }
+        let (meta_after, last_after, entries) = observed.unwrap();
+        assert!(matches!(cut, Err(SharedAgentHostError::Unavailable)));
+        assert!(cut_elapsed >= std::time::Duration::from_millis(1_800));
+        assert!(std::time::Instant::now() < deadline);
+        assert_eq!(writes.load(Ordering::Acquire), 0);
+        assert!(journal.load(call.invocation).unwrap().is_none());
+        assert_eq!(meta_after.commit_index, meta_before.commit_index);
+        assert_eq!(last_after, last_before + 1);
+        assert_eq!(entries.len(), 1);
+        let vos_raft::EntryKind::Data { payload } =
+            crate::agent::shared_raft::decode_agent_raft_entry_kind(&entries[0].payload).unwrap()
+        else {
+            panic!("admin timeout must append the actual signed metadata command");
+        };
+        let crate::agent::shared_raft::AgentRaftCommand::RegisterManagementRecovery {
+            registration,
+            ..
+        } = crate::agent::shared_raft::AgentRaftCommand::decode(&payload).unwrap()
+        else {
+            panic!("admin timeout must append RegisterManagementRecovery");
+        };
+        Some(registration)
+    } else {
+        retry_until(deadline, "admin journal prewrite cut", || {
+            let result = owners[origin].as_mut().unwrap().retain_authority_admin(
+                &call,
+                &preparation,
+                &mut journal,
+            );
+            if writes.load(Ordering::Acquire) == 1 {
+                assert!(matches!(result, Err(SharedAgentHostError::Unavailable)));
+                Ok(())
+            } else {
+                result
+                    .map(|_| panic!("admin prewrite cut must precede durable journal publication"))
+            }
+        });
+        assert!(journal.load(call.invocation).unwrap().is_none());
+        None
+    };
+    let owner = owners[origin].as_ref().unwrap();
+    let retained = retry_until(deadline, "admin committed original registration", || {
+        let manifest = owner._network_host.management_recovery_manifest(agent)?;
+        let Some(slot) = manifest
+            .management_slot(HostNodeId(owner.pins.node.0))
+            .filter(|slot| {
+                !slot.is_released()
+                    && slot
+                        .members()
+                        .first()
+                        .is_some_and(|member| member.work().invocation == call.invocation)
+            })
+        else {
+            return Err(SharedAgentHostError::Unavailable);
+        };
+        if let Some(expected) = &delayed_registration {
+            assert_eq!(slot.registration(), expected);
+        }
+        Ok(slot.clone())
+    });
+    assert_eq!(retained.owner(), HostNodeId(owner.pins.node.0));
+    assert_eq!(retained.origin_owner(), retained.owner());
+    assert!(!retained.is_released());
+    assert_eq!(retained.members().len(), 1);
+    assert_eq!(retained.members()[0].parent(), None);
+    assert!(retained.members_evidence()[0].invoke().is_none());
+    assert!(retained.members_evidence()[0].acknowledgement().is_none());
+    let expected_record = RetainedAuthorityAdminDispatch {
+        call: call.clone(),
+        envelope: retained.members()[0].envelope().clone(),
+        anchor: retained.members()[0].anchor().clone(),
+        preparation: preparation.clone(),
+    };
+    let expected_bytes = expected_record.encode().unwrap();
+    assert_eq!(
+        RetainedAuthorityAdminDispatch::decode(&expected_bytes).unwrap(),
+        expected_record
+    );
+    assert_eq!(
+        owner
+            .host
+            .lock()
+            .unwrap()
+            .clean_state_commitment(agent)
+            .unwrap(),
+        state_before
+    );
+    assert!(owner.management_admission_held().unwrap());
+    let protected = owner._network_host.ensure_management_pending_member(
+        agent,
+        &expected_record.anchor,
+        &expected_record.envelope,
+    );
+    if registration_timeout {
+        assert!(matches!(protected, Err(SharedAgentHostError::Conflict)));
+        assert_eq!(writes.load(Ordering::Acquire), 0);
+    } else {
+        protected.unwrap();
+        assert_eq!(writes.load(Ordering::Acquire), 1);
+    }
+    let mut wrong_anchor = expected_record.anchor.clone();
+    wrong_anchor.ordered.index += 1;
+    assert!(
+        owner
+            ._network_host
+            .ensure_management_pending_member(agent, &wrong_anchor, &expected_record.envelope)
+            .is_err()
+    );
+    let mut changed_envelope = expected_record.envelope.clone();
+    let RuntimeWork::Invoke { observed_slot, .. } = &mut changed_envelope else {
+        unreachable!()
+    };
+    *observed_slot += 1;
+    {
+        // The absent-map cut must reject substituted physical evidence too;
+        // a map-miss alone would not prove the retained signed family boundary.
+        let mut hosted = owner.host.lock().unwrap();
+        assert!(
+            hosted
+                .management_pending_admission_requirement(
+                    agent,
+                    &[(&wrong_anchor, &expected_record.envelope)]
+                )
+                .is_err()
+        );
+        assert!(
+            hosted
+                .management_pending_admission_requirement(
+                    agent,
+                    &[(&expected_record.anchor, &changed_envelope)]
+                )
+                .is_err()
+        );
+    }
+    let missing_family = RetainedAuthorityAdminDispatch {
+        call: absent_call.clone(),
+        preparation: absent_preparation.clone(),
+        ..expected_record.clone()
+    };
+    assert!(missing_family.encode().is_err());
+    let before = native_owner_physical_state(owner);
+    let host = Arc::clone(&owner.host);
+    let controller = NativeAuthorityAdminController::new(
+        target,
+        journal,
+        AdminTerminals(OperationTestJournal(journal_path.clone())),
+    );
+    let local = crate::agent::local_sdk_host::LocalAgentHost::create(
+        directories[origin].0.join("admin-recovery-local-host"),
+        target.space,
+        fixtures[origin].plan.pins.node,
+        fixtures[origin].trust.clone(),
+    )
+    .unwrap();
+    let lifecycle = LocalLifecycleController::new(
+        owners[origin].take().unwrap(),
+        local,
+        NoLifecycleStores,
+        CountingSigner::new(),
+    )
+    .unwrap()
+    .with_admins(controller, AdminSigner)
+    .unwrap();
+    let observation_calls = Arc::new(AtomicUsize::new(0));
+    let mut production = AgentProductionOwner::start_local(
+        fixtures[origin].plan.pins.node,
+        crate::agent::supervisor::AgentSupervisorLimits::default(),
+        Box::new(lifecycle),
+        4,
+        Box::new(NeverProjectionAuthenticator(Arc::clone(&observation_calls))),
+        std::time::Duration::from_secs(5),
+    )
+    .unwrap();
+    assert!(std::time::Instant::now() < deadline);
+    assert!(production.is_running());
+    assert!(!production.is_ready());
+    assert!(matches!(
+        production.ingress(),
+        Err(AgentProductionOwnerError::ProjectionNotReady)
+    ));
+    assert_eq!(observation_calls.load(Ordering::Acquire), 0);
+    assert!(matches!(
+        production.prepare_admin(&draft),
+        Err(SharedAgentHostError::Unavailable)
+    ));
+    for (refused_call, refused_preparation) in [
+        (&absent_call, &absent_preparation),
+        (&changed_call, &preparation),
+        (&call, &bad_proof),
+        (&call, &absent_preparation),
+        (&other_call, &other_preparation),
+    ] {
+        assert!(matches!(
+            production.submit_admin(refused_call, refused_preparation),
+            Err(SharedAgentHostError::ScopeMismatch)
+        ));
+    }
+    let mut journal_view = OperationTestJournal(journal_path);
+    assert!(
+        NativeAuthorityOperationJournalStore::load(&mut journal_view, call.invocation)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        NativeAuthorityOperationJournalStore::load(&mut journal_view, absent_call.invocation)
+            .unwrap()
+            .is_none()
+    );
+    {
+        let mut hosted = host.lock().unwrap();
+        assert_eq!(hosted.journal_position(agent).unwrap(), before.0);
+        assert_eq!(hosted.clean_state_commitment(agent).unwrap(), before.1);
+        assert_eq!(hosted.show(agent).unwrap().unwrap(), before.2);
+        assert_eq!(
+            hosted
+                .recovery_manifest(agent)
+                .unwrap()
+                .management_slot(retained.owner()),
+            Some(&retained)
+        );
+    }
+    // The normal recovery guard must authenticate the complete existing family
+    // before permitting this exact original owner's submission. The timeout cut
+    // still has no volatile pending map or independent NAD2 journal.
+    let completion = retry_until(deadline, "normal retained admin recovery", || {
+        production.submit_admin(&call, &preparation)
+    });
+    assert!(completion.result().is_some());
+    assert_eq!(
+        NativeAuthorityAdminCompletion::verify(&call, &preparation, completion.exact_bytes())
+            .unwrap(),
+        completion
+    );
+    let bytes = NativeAuthorityOperationJournalStore::load(&mut journal_view, call.invocation)
+        .unwrap()
+        .unwrap();
+    assert_eq!(bytes, expected_bytes);
+    let final_manifest = host.lock().unwrap().recovery_manifest(agent).unwrap();
+    let final_slot = final_manifest.management_slot(retained.owner()).unwrap();
+    assert_eq!(final_slot.registration(), retained.registration());
+    assert_eq!(final_slot.members(), retained.members());
+    assert!(final_slot.is_released());
+    assert_eq!(final_slot.members_evidence().len(), 1);
+    assert!(final_slot.members_evidence()[0].invoke().is_some());
+    assert!(final_slot.members_evidence()[0].acknowledgement().is_some());
+    let completed_position = host.lock().unwrap().journal_position(agent).unwrap();
+    let completed_state = host.lock().unwrap().clean_state_commitment(agent).unwrap();
+    let retry = retry_until(deadline, "normal terminal admin exact retry", || {
+        production.submit_admin(&call, &preparation)
+    });
+    assert_eq!(retry, completion);
+    assert_eq!(
+        host.lock().unwrap().journal_position(agent).unwrap(),
+        completed_position
+    );
+    assert_eq!(
+        host.lock().unwrap().clean_state_commitment(agent).unwrap(),
+        completed_state
+    );
+    assert_eq!(
+        NativeAuthorityOperationJournalStore::load(&mut journal_view, call.invocation)
+            .unwrap()
+            .unwrap(),
+        expected_bytes
+    );
+    assert!(
+        NativeAuthorityOperationJournalStore::load(&mut journal_view, absent_call.invocation)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(observation_calls.load(Ordering::Acquire), 0);
+    assert!(recovery_started.elapsed() <= std::time::Duration::from_secs(30));
+    eprintln!(
+        "fixed_three_admin_recovery phase=terminal_exact_retry registration_timeout={registration_timeout} elapsed_ms={}",
+        recovery_started.elapsed().as_millis()
+    );
+    production.shutdown_and_join().unwrap();
 }

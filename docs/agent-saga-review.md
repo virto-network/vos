@@ -351,6 +351,28 @@ do not establish an admin recovery defect. The new singleton test is removed;
 reuse the existing signed three-node fixture, with no singleton exception or
 test-policy bypass. No production admission correction is qualified.
 
+Scoped admin harness R39q builds from clean `594c5ff8` **pass 6m35s** with
+portable flags and recorded provenance. Public R39r **fails 375.26s** after
+verified nonleader Install at cumulative **105115ms**. Exactly one ready admin
+submit has no NAD2/current pending member and capture returns Unavailable
+before its journal callback. Private exact metadata/work correlation ties that
+admin registration's origin timeout (**1.897s**) to its later leader commit
+(**7.909s**); this leader trace does not prove original-owner application.
+Then **733** unready submissions fail retained admission with NAD2 absent.
+Lost mutation response/reopen remain unreached. Review the narrow same-open
+attempt correction against this demonstrated gap, preserving cold
+missing-journal refusal and complete original-owner family restrictions.
+R39s supported fixed-three regressions compile **1m05s**; both fail at the
+intended normal-owner exact submission with ScopeMismatch: registration
+timeout/later exact commit (**25.64s**) and journal-prewrite interruption
+(**23.91s**). Their earlier signed custody, no Invoke/ACK, absent NAD2,
+unchanged actor state and input-negative assertions pass. These are before-fix
+component reproductions, not completion or released qualification. Evidence:
+`release-observation-o3-admin-stage-cli-{build,provenance}-r39q.*`,
+`release-observation-o3-packaged-public-admin-stages-r39r.log`, and
+`release-observation-o3-fixed-three-admin-{registration,prewrite}-before-r39s.log`.
+Temporary admin diagnostics must be removed after attribution.
+
 The final >256 locked-owner reopen now includes all constructors/attachments,
 readiness and exact archived native-result verification under one unchanged
 30s deadline, including both HTTP retries and post-call elapsed checks. Source

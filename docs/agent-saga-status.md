@@ -208,6 +208,28 @@ The active diff closes demonstrated M1 defects, not new capabilities:
   test is removed; reuse the existing three-node fixture for the signed cut,
   without adding singleton support or test-policy bypass. R39p/R39p2 logs retain
   this precondition boundary; an earlier missing Duration namespace was corrected.
+- Scoped admin harness R39q builds from clean `594c5ff8` in **6m35s** with
+  portable flags and recorded provenance. Public R39r **fails 375.26s** after
+  verified nonleader Install at cumulative **105115ms**. Its one ready admin
+  submission finds no NAD2 or volatile pending member; capture returns
+  Unavailable before its journal callback. Exact private trace correlation
+  identifies that admin registration's origin timeout (**1.897s**) and later
+  leader commit (**7.909s**). Then **733** unready submissions find no NAD2
+  and fail retained admission. Original-owner application is not established
+  by the leader trace. This is an admin-specific recovery-admission gap, not a
+  new guest failure or permission to relax freshness. Lost mutation response
+  and reopen remain unreached. Evidence:
+  `release-observation-o3-admin-stage-cli-{build,provenance}-r39q.*` and
+  `release-observation-o3-packaged-public-admin-stages-r39r.log`.
+  The supported fixed-three component regressions compile **1m05s** and both
+  reproduce the intended normal-owner ScopeMismatch: late registration after
+  timeout (**25.64s**) and journal-prewrite interruption (**23.91s**). Before
+  either failure, signed original-owner custody, absent NAD2, unchanged actor
+  state and strict input refusals are verified. R39s build/provenance and
+  `release-observation-o3-fixed-three-admin-{registration,prewrite}-before-r39s.log`
+  preserve this boundary. The narrow same-open exact-attempt correction is
+  under review; cold missing-journal admission remains closed. No correction
+  or complete public workflow pass is claimed.
 - The >256 fixture's final locked-owner reopen now measures from before all
   constructors through production attachment/readiness, retained handoff and
   exact archived native-result verification using one unchanged **30s** bound.
@@ -511,13 +533,17 @@ Separate forecasts and unknowns:
   exceed existing public retry caps at admin/Install. R39m verifies nonleader
   Install and visible guest completion but still exceeds the role-grant bound;
   R39o attributes outer refusals to existing deadlines but not the later admin
-  recovery gap. The component regression's singleton precondition must be
-  replaced by the existing three-node harness, not a production exception.
-  This adds fixture preparation within the same mandatory recovery gate;
-  no admission correction is qualified yet. The **2–6 elapsed-hour**
+  recovery gap. R39r establishes the admin-specific pre-journal capture timeout,
+  later leader commit and subsequent admission rejection. R39s reproduces both
+  cuts through supported fixed-three custody and the normal production guard.
+  Replacing the unsupported singleton fixture added preparation within the
+  same mandatory recovery gate; the same-open correction remains unqualified.
+  The earlier **1–4 source-hour** band now has low confidence and is not a
+  reliable remaining estimate until correction and terminal release pass.
+  The **2–6 elapsed-hour**
   execution band remains conditional and is not a reliable remaining estimate
-  while failure attribution is open. Scoped diagnostics must distinguish guest,
-  freshness and terminal completion before further source work; current evidence
+  while the remaining recovery gates are open. Scoped attribution has identified
+  the admission defect; terminal completion still needs verification. Evidence
   does not establish a new guest execution defect or performance-only cause.
   Optimized R38r main and harness builds each take about seven minutes;
   R38s/R38t and first CLI failure establish the current variance. Cold recovery,
