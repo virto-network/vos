@@ -13,11 +13,27 @@ use crate::agent::clean_management_intent::CleanManagementIntent;
 pub(super) struct Fault {
     load_once: bool,
     commit_then_error_at: Option<usize>,
+    committed_writes: usize,
+    commit_then_error_failures: usize,
     install_authorization_prewrite_once: bool,
     install_authorization_prewrite_failures: usize,
 }
 
 impl Fault {
+    pub(super) fn fail_next_commit_after_write(&mut self) -> usize {
+        assert!(self.commit_then_error_at.is_none());
+        self.commit_then_error_at = Some(1);
+        self.committed_writes
+    }
+
+    pub(super) fn committed_writes(&self) -> usize {
+        self.committed_writes
+    }
+
+    pub(super) fn commit_then_error_failures(&self) -> usize {
+        self.commit_then_error_failures
+    }
+
     pub(super) fn refuse_install_authorization_before_write_once(&mut self) {
         assert!(!self.install_authorization_prewrite_once);
         assert_eq!(self.install_authorization_prewrite_failures, 0);
@@ -89,10 +105,12 @@ impl CleanManagementIssuerStore for LeaseStore {
         }
         self.inner.commit(bytes)?;
         let mut fault = self.fault.lock().unwrap();
+        fault.committed_writes += 1;
         if let Some(remaining) = fault.commit_then_error_at.as_mut() {
             *remaining -= 1;
             if *remaining == 0 {
                 fault.commit_then_error_at = None;
+                fault.commit_then_error_failures += 1;
                 return Err(MemoryError);
             }
         }

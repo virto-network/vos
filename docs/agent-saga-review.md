@@ -475,9 +475,21 @@ original pair pledge before new material and matching-confirmed CMI clear.
 Ready pre-append retries recapture the same envelope; quarantined and cold
 requests cannot create proof. Memento-backed callbacks require whole-envelope
 equality before pledge. A prewrite regression reuses the unchanged whole 30s.
-Compilation, A/B/cold/family and public/main qualification remain open. Compound
-handoff-store-write ambiguity is a separate open cut, not waived by this patch;
-the first original CLI interruption remains unattributed.
+Debug R40b builds **85.62s** from `e8bc5e45`. Quiet B verifies original work,
+native finality, issuer ACK, exact released custody and Local route but **fails
+65.61s** at the unchanged whole30 immediately after terminal retry. Quiet A
+R40c **passes 63.72s / 28.316s whole30**; diagnostic B **passes 67.95s / 29.747s
+whole30**, including unchanged journal/state/client/CMI bytes and cached exact
+publication reuse. Preserve the quiet failure; no measured performance cause
+or robust timing qualification is claimed. The live checklist references logs.
+Reviewed test-only cold/family and compound handoff-write regressions are applied:
+actual owner drop and normal same-root cold refusal; authenticated whole-family
+substitutions; actual canonical signed handoff commit-then-error before the same
+late registration cut. Only compound permits an absent same-open marker before
+the intended normal guard. All cuts retain the whole30; lifecycle memory stores
+do not prove filesystem durability or all-cold cluster recovery. Current portable
+optimized core compilation/execution, cold/compound and public/main remain open;
+the first original CLI interruption remains unattributed. No tuning pass used.
 
 The final >256 locked-owner reopen now includes all constructors/attachments,
 readiness and exact archived native-result verification under one unchanged

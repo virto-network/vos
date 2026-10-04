@@ -11,7 +11,7 @@ use crate::agent::shared_recovery::management::{
 use crate::agent::shared_recovery::SharedRecoveryManifest;
 use crate::agent_sdk::wire::CanonicalWire as _;
 
-fn sign_registration(
+pub(super) fn sign_registration(
     manifest: &SharedRecoveryManifest,
     owner: HostNodeId,
     origin: HostNodeId,
@@ -48,7 +48,7 @@ fn sign_registration(
     registration
 }
 
-fn apply_detached(
+pub(super) fn apply_detached(
     manifest: &mut SharedRecoveryManifest,
     registration: &SharedManagementRecoveryRegistration,
 ) -> Result<bool, crate::agent::shared_recovery::SharedRecoveryError> {

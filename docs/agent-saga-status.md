@@ -349,10 +349,29 @@ The active diff closes demonstrated M1 defects, not new capabilities:
   matching CMI retention. Generic/cold helpers cannot mint proof. Ready retries
   before append recapture the same whole work; quarantine stays closed without
   applied custody. A separate pre-authorization-write regression shares the
-  fixture and original whole 30s. Compilation, A/B completion, cold/family
-  negatives and current public/main integration remain open. A compound
-  ambiguous handoff-store-write cut is separately open; original R39w first
-  interruption remains unattributed.
+  fixture and original whole 30s. Current debug core R40b builds **85.62s** from
+  `e8bc5e45`. Quiet B verifies original work, native finality, exact issuer ACK,
+  released two-member custody and the Local route, but **fails 65.61s** at the
+  unchanged 30s bound immediately after terminal retry; subsequent no-write
+  assertions are not established. Quiet A R40c **passes 63.72s**, whole recovery
+  **28.316s**. Scoped diagnostic B R40c **passes 67.95s**, whole recovery
+  **29.747s**, including unchanged journal/state/client/CMI bytes on terminal
+  retry and cached exact publication reuse. The quiet failure is preserved;
+  no performance-only cause or robust timing qualification is claimed. Evidence:
+  `release-observation-o3-local-install-live-attempt-core-{build,provenance}-r40b.*`,
+  `release-observation-o3-local-install-registration-live-attempt-after-r40b.log`,
+  `release-observation-o3-local-install-prewrite-r40c.log` and
+  `release-observation-o3-local-install-registration-diagnostic-r40c.log`.
+  Independently reviewed test-only cold/family and compound handoff-write cuts
+  are applied. Cold refusal drops the actual original owner and normally reopens
+  the same roots without adopting missing work; signed family substitutions
+  preserve the original whole envelope and live state. Compound handoff proves
+  a real canonical signed write-then-error before the late registration cut,
+  under the same whole 30s. Current portable optimized core compilation and
+  execution are next; cold, compound and current public/main remain unqualified.
+  Lifecycle stores in these cuts are memory-backed; this is not filesystem
+  lifecycle durability or all-cold cluster evidence. Original R39w first
+  interruption remains unattributed. No service-tuning pass is consumed.
 - The >256 fixture's final locked-owner reopen now measures from before all
   constructors through production attachment/readiness, retained handoff and
   exact archived native-result verification using one unchanged **30s** bound.

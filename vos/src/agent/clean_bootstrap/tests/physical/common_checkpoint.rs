@@ -58,6 +58,10 @@ pub(super) enum Exercise {
     LocalImageInstallRegistrationTimeout,
     #[cfg(feature = "experimental-state-blocks")]
     LocalImageInstallAuthorizationPrewrite,
+    #[cfg(feature = "experimental-state-blocks")]
+    LocalImageInstallHandoffWriteThenRegistrationTimeout,
+    #[cfg(feature = "experimental-state-blocks")]
+    LocalImageInstallRegistrationTimeoutCold,
 }
 
 #[cfg(feature = "experimental-state-blocks")]
@@ -109,6 +113,19 @@ fn candidate_admin_registration_timeout_cold_missing_journal_refuses_adoption() 
 #[cfg(feature = "experimental-state-blocks")]
 #[test]
 #[ignore = "requires coherent Authority/System IMAGE components and three authenticated loopback transports"]
+fn candidate_local_image_install_registration_timeout_cold_missing_work_refuses_adoption() {
+    assert!(std::env::var_os("AUTHORITY_CANDIDATE_ELF").is_some());
+    assert!(std::env::var_os("VOS_AGENT_RUNTIME_COST_CANDIDATE").is_some());
+    assert!(std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some());
+    check_fixed_system_pending_cluster_with_checkpoint(
+        true,
+        Some(Exercise::LocalImageInstallRegistrationTimeoutCold),
+    );
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+#[test]
+#[ignore = "requires coherent Authority/System IMAGE components and three authenticated loopback transports"]
 fn candidate_local_image_install_authorization_prewrite_exact_retry_passes_production_recovery_admission() {
     assert!(std::env::var_os("AUTHORITY_CANDIDATE_ELF").is_some());
     assert!(std::env::var_os("VOS_AGENT_RUNTIME_COST_CANDIDATE").is_some());
@@ -129,6 +146,19 @@ fn candidate_local_image_install_registration_timeout_exact_retry_passes_product
     check_fixed_system_pending_cluster_with_checkpoint(
         true,
         Some(Exercise::LocalImageInstallRegistrationTimeout),
+    );
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+#[test]
+#[ignore = "requires coherent Authority/System IMAGE components and three authenticated loopback transports"]
+fn candidate_local_image_install_handoff_write_then_registration_timeout_exact_retry_passes_production_recovery_admission() {
+    assert!(std::env::var_os("AUTHORITY_CANDIDATE_ELF").is_some());
+    assert!(std::env::var_os("VOS_AGENT_RUNTIME_COST_CANDIDATE").is_some());
+    assert!(std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some());
+    check_fixed_system_pending_cluster_with_checkpoint(
+        true,
+        Some(Exercise::LocalImageInstallHandoffWriteThenRegistrationTimeout),
     );
 }
 
@@ -371,13 +401,14 @@ pub(super) fn exercise(
         return;
     }
     #[cfg(feature = "experimental-state-blocks")]
-    if matches!(exercise, Exercise::LocalImageInstallRegistrationTimeout | Exercise::LocalImageInstallAuthorizationPrewrite) {
+    if matches!(exercise, Exercise::LocalImageInstallRegistrationTimeout | Exercise::LocalImageInstallAuthorizationPrewrite | Exercise::LocalImageInstallRegistrationTimeoutCold | Exercise::LocalImageInstallHandoffWriteThenRegistrationTimeout) {
         local_install_recovery::exercise(
-            leader, owners, fixtures, directories,
-            if matches!(exercise, Exercise::LocalImageInstallRegistrationTimeout) {
-                local_install_recovery::Cut::RegistrationTimeout
-            } else {
-                local_install_recovery::Cut::AuthorizationPrewrite
+            leader, owners, fixtures, directories, stores, providers, networks.as_slice(), signer,
+            match exercise {
+                Exercise::LocalImageInstallRegistrationTimeout => local_install_recovery::Cut::RegistrationTimeout,
+                Exercise::LocalImageInstallHandoffWriteThenRegistrationTimeout => local_install_recovery::Cut::HandoffWriteThenRegistrationTimeout,
+                Exercise::LocalImageInstallRegistrationTimeoutCold => local_install_recovery::Cut::RegistrationTimeoutCold,
+                _ => local_install_recovery::Cut::AuthorizationPrewrite,
             },
         );
         return;
@@ -435,7 +466,7 @@ pub(super) fn exercise(
         | Exercise::AdminRegistrationTimeout
         | Exercise::AdminRegistrationTimeoutCold => unreachable!(),
         #[cfg(feature = "experimental-state-blocks")]
-        Exercise::LocalImageInstallRegistrationTimeout | Exercise::LocalImageInstallAuthorizationPrewrite => unreachable!(),
+        Exercise::LocalImageInstallRegistrationTimeout | Exercise::LocalImageInstallAuthorizationPrewrite | Exercise::LocalImageInstallRegistrationTimeoutCold | Exercise::LocalImageInstallHandoffWriteThenRegistrationTimeout => unreachable!(),
     };
     let agent = HostAgentId(fixtures[leader].plan.pins.agent.0);
     let lagger = (leader + 1) % 3;

@@ -6,6 +6,11 @@
 
 use super::super::genesis_readmission::{Fault, LeaseStore};
 use super::*;
+#[path = "local_install_cold_recovery.rs"]
+mod cold_recovery;
+#[path = "local_install_pending_validation.rs"]
+mod pending_validation;
+
 use crate::actors::codec::{Decode as _, Encode as _};
 use crate::agent::clean_management_intent::CleanManagementIntentSlot;
 use crate::agent::local_lifecycle::{
@@ -25,6 +30,8 @@ use std::os::unix::fs::OpenOptionsExt as _;
 pub(super) enum Cut {
     AuthorizationPrewrite,
     RegistrationTimeout,
+    HandoffWriteThenRegistrationTimeout,
+    RegistrationTimeoutCold,
 }
 
 struct Stores {
@@ -222,12 +229,20 @@ fn wait_original_registration(
     })
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn exercise(
     origin: usize,
     owners: &mut [Option<MemoryBootstrapOwner>],
     fixtures: &[PhysicalFixture],
     directories: &[TestDirectory],
+    bootstrap_stores: &[(
+        BootstrapMemoryStore,
+        BootstrapMemoryStore,
+        IssuerMemoryStore,
+    )],
+    providers: &[Arc<MemoryProvider>],
+    networks: &[Arc<Network>],
+    signer: &mut CountingSigner,
     cut: Cut,
 ) {
     assert_eq!(owners.len(), 3);
@@ -501,6 +516,71 @@ pub(super) fn exercise(
         .last_index();
     let recovery_started = std::time::Instant::now();
     let deadline = recovery_started + std::time::Duration::from_secs(30);
+    if cut == Cut::HandoffWriteThenRegistrationTimeout {
+        let previous = CleanManagementIntentSlot::open(intent_store.clone()).unwrap();
+        assert!(previous.retirement_complete().unwrap());
+        assert!(previous.intent().unwrap().request() == &create_request);
+        assert!(previous.intent().unwrap().call() == &create_call);
+        previous
+            .intent()
+            .unwrap()
+            .verify(target, create_call.managed, &RawCredentialVerifier)
+            .unwrap();
+        drop(previous);
+        assert!(intent_store.actor.lock().unwrap().is_none());
+        let writes_before = intent_fault.lock().unwrap().fail_next_commit_after_write();
+        let handoff = controller.install(install.clone(), call.clone(), package.clone());
+        assert!(matches!(handoff, Err(SharedAgentHostError::Unavailable)));
+        assert!(std::time::Instant::now() < deadline);
+        {
+            let fault = intent_fault.lock().unwrap();
+            assert_eq!(fault.committed_writes(), writes_before + 1);
+            assert_eq!(fault.commit_then_error_failures(), 1);
+        }
+        // The first successful intent write is the real canonical retired
+        // Create -> new bare signed Install transition, not a snapshot repair.
+        let handoff_image = intent_store.image.lock().unwrap().clone().unwrap();
+        assert!(handoff_image.starts_with(b"CMI4"));
+        let handoff_intent =
+            crate::agent::clean_management_intent::CleanManagementIntent::decode(&handoff_image)
+                .unwrap();
+        assert!(handoff_intent.request() == &request && handoff_intent.call() == &call);
+        handoff_intent
+            .verify(target, call.managed, &RawCredentialVerifier)
+            .unwrap();
+        let handoff_slot = CleanManagementIntentSlot::open(intent_store.clone()).unwrap();
+        assert!(handoff_slot.authorization_work().unwrap().is_none());
+        assert!(handoff_slot.authorization_anchor().unwrap().is_none());
+        assert!(handoff_slot.finalization_work().unwrap().is_none());
+        assert!(handoff_slot.finalization_anchor().unwrap().is_none());
+        assert!(!handoff_slot.retirement_complete().unwrap());
+        drop(handoff_slot);
+        assert!(intent_store.actor.lock().unwrap().is_none());
+        assert!(issuer_store.image.lock().unwrap().clone() == issuer_before);
+        assert!(std::fs::read(&image_path).unwrap() == image_before);
+        assert!(std::fs::read(&request_path).unwrap() == exact_request);
+        assert_eq!(opens.load(Ordering::Acquire), 1);
+        assert_eq!(live.load(Ordering::Acquire), 2);
+        let original = controller.system_for_test();
+        assert!(!original.management_admission_held().unwrap());
+        assert!(original
+            ._network_host
+            .current_management_pending(agent, call.invocation)
+            .unwrap()
+            .is_none());
+        assert!(host.lock().unwrap().clean_state_commitment(agent).unwrap() == state_before);
+        let meta = crate::raft::RaftMeta::load(&database).unwrap();
+        let last = crate::raft::RaftLog::open(Arc::clone(&database))
+            .unwrap()
+            .last_index();
+        assert_eq!(meta.commit_index, meta_before.commit_index);
+        assert_eq!(last, last_before);
+        eprintln!(
+            "fixed_three_local_install phase=handoff_committed_error bare_intent=true authorization_work=false memento_present={} elapsed_ms={}",
+            original.unpublished_local_install_attempt.is_some(),
+            recovery_started.elapsed().as_millis(),
+        );
+    }
     let retained = match cut {
         Cut::AuthorizationPrewrite => {
             intent_fault
@@ -530,7 +610,7 @@ pub(super) fn exercise(
             );
             wait_original_registration(deadline, &controller, agent, node, call.invocation, None)
         }
-        Cut::RegistrationTimeout => {
+        Cut::RegistrationTimeout | Cut::RegistrationTimeoutCold | Cut::HandoffWriteThenRegistrationTimeout => {
             let mut restore = RestoreIsolationOnDrop {
                 original: &mut controller,
                 owners,
@@ -633,7 +713,7 @@ pub(super) fn exercise(
                     .ensure_management_pending_member(agent, &saved_anchor, &saved_work)
                     .unwrap();
             }
-            Cut::RegistrationTimeout => {
+            Cut::RegistrationTimeout | Cut::RegistrationTimeoutCold | Cut::HandoffWriteThenRegistrationTimeout => {
                 assert!(current_pending.is_none());
                 assert!(matches!(
                     original._network_host.ensure_management_pending_member(
@@ -668,8 +748,8 @@ pub(super) fn exercise(
     let bare_intent = intent_store.image.lock().unwrap().clone();
     assert!(bare_intent.as_ref().unwrap().starts_with(b"CMI4"));
     let mut slot = CleanManagementIntentSlot::open(intent_store.clone()).unwrap();
-    let current = slot.intent().unwrap();
-    assert!(current.request() == &request && current.call() == &call);
+    let bare = slot.intent().unwrap().clone();
+    assert!(bare.request() == &request && bare.call() == &call);
     assert!(slot.authorization_work().unwrap().is_none());
     assert!(slot.authorization_anchor().unwrap().is_none());
     assert!(slot.finalization_work().unwrap().is_none());
@@ -686,6 +766,86 @@ pub(super) fn exercise(
         cut == Cut::AuthorizationPrewrite,
         recovery_started.elapsed().as_millis()
     );
+    // A different valid signed same-Agent Install reaches the existing
+    // unretired-intent refusal, preserving the first open-owner memento. This
+    // is not a second-Agent fresh-minter or compound handoff qualification.
+    let marker_before = controller
+        .system_for_test()
+        .unpublished_local_install_attempt
+        .clone();
+    if marker_before.is_some() || cut != Cut::HandoffWriteThenRegistrationTimeout {
+        assert!(marker_before == Some((bare.clone(), saved_work.clone())));
+    }
+    let pending_before = controller
+        .system_for_test()
+        ._network_host
+        .current_management_pending(agent, call.invocation)
+        .unwrap();
+    let mut unmatched = call.clone();
+    unmatched.request_sequence = NonZeroU64::new(call.request_sequence.get() + 1).unwrap();
+    sign(&mut unmatched);
+    LocalInstallSubmission::new(install.clone(), unmatched.clone(), package.clone()).unwrap();
+    assert!(matches!(
+        controller.install(install.clone(), unmatched, package.clone()),
+        Err(SharedAgentHostError::Conflict)
+    ));
+    assert!(
+        controller
+            .system_for_test()
+            .unpublished_local_install_attempt
+            == marker_before
+    );
+    assert!(
+        controller
+            .system_for_test()
+            ._network_host
+            .current_management_pending(agent, call.invocation)
+            .unwrap()
+            == pending_before
+    );
+    assert!(intent_store.image.lock().unwrap().clone() == bare_intent);
+    assert!(issuer_store.image.lock().unwrap().clone() == issuer_before);
+    if marker_before.is_some() || cut != Cut::HandoffWriteThenRegistrationTimeout {
+        pending_validation::pending(
+            &mut controller,
+            &retained,
+            &bare,
+            &saved_work,
+            &intent_store,
+            &issuer_store,
+        );
+    }
+    assert!(std::time::Instant::now() <= deadline);
+    if cut == Cut::RegistrationTimeoutCold {
+        // No old owner, host or database reference may survive the cold open.
+        drop(host);
+        drop(database);
+        cold_recovery::exercise(
+            origin,
+            owners,
+            fixtures,
+            directories,
+            bootstrap_stores,
+            providers,
+            networks,
+            signer,
+            controller,
+            &descriptor,
+            &local_root,
+            &image_path,
+            &request_path,
+            &install,
+            &call,
+            &package,
+            &intent_store,
+            &issuer_store,
+            &retained,
+            Arc::clone(&live),
+            recovery_started,
+            deadline,
+        );
+        return;
+    }
     let calls = Arc::new(AtomicUsize::new(0));
     let mut production = AgentProductionOwner::start_local(
         node,
@@ -861,6 +1021,7 @@ pub(super) fn exercise(
             .iter()
             .all(|evidence| evidence.invoke().is_some() && evidence.acknowledgement().is_some())
     );
+    pending_validation::released(&bare, &saved_work, retained.owner(), final_slot);
     let completed_position = host.lock().unwrap().journal_position(agent).unwrap();
     let completed_state = host.lock().unwrap().clean_state_commitment(agent).unwrap();
     let completed_intent = intent_store.image.lock().unwrap().clone();
