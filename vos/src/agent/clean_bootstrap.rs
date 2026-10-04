@@ -8065,6 +8065,7 @@ where
                     let result = host.observe_system_authority(
                         crate::service::AgentId(self.pins.agent.0), &work,
                     );
+                    #[cfg(test)]
                     if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
                         match &result {
                             Ok(super::sdk::RuntimeOutcome::Completed(Ok(reply))) => {
@@ -8081,6 +8082,7 @@ where
                     result
                 },
             ).map_err(|error| {
+                #[cfg(test)]
                 if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
                     tracing::debug!(?error, "Authority observation freshness or callback refused");
                 }

@@ -186,6 +186,28 @@ The active diff closes demonstrated M1 defects, not new capabilities:
   freshness refusal without changing guard order, ownership or the **1.8s**
   observation bound; remove them after attribution. Log:
   `release-observation-o3-packaged-public-outcomes-r39m.log`.
+- Scoped guard harness R39n builds from clean `32b12b0b` **passes 7m06s**.
+  Public R39o **fails 369.77s** at the same Operator role-grant 120s retry cap
+  after verified nonleader Install at cumulative **133140ms**. All **70** visible
+  guests return `Done`, with no guest/host refusal or non-completed outcome.
+  Its **15** outer refusals are attributed: five post-guest deadline failures
+  (**1.854–2.040s** total), four pre-guest deadline failures (**1.983–3.450s**),
+  and six barrier-delivery timeouts (about **1.800s**). No term/configuration,
+  ownership or stale-generation rejection appears. These are correct enforced
+  freshness failures, not permission to relax the 1.8s bound. The role-grant
+  recovery cause is still unproven: registration times out at its origin and
+  commits later, followed by quarantine. Observation diagnostic visibility and
+  guard labels are removed after attribution; only scoped admin phase/boolean
+  diagnostics are now provisional. Logs/provenance:
+  `release-observation-o3-observation-guards-cli-{build,provenance}-r39n.*`,
+  `release-observation-o3-packaged-public-guards-r39o.log`.
+  The attempted native admin regression builds **52.07s**, but both it (**2.64s**)
+  and the unchanged baseline (**2.43s**) fail before the intended cut: their
+  historical singleton fixture cannot pass authenticated fixed-three manifest
+  inspection. Neither establishes the proposed admin defect. The new singleton
+  test is removed; reuse the existing three-node fixture for the signed cut,
+  without adding singleton support or test-policy bypass. R39p/R39p2 logs retain
+  this precondition boundary; an earlier missing Duration namespace was corrected.
 - The >256 fixture's final locked-owner reopen now measures from before all
   constructors through production attachment/readiness, retained handoff and
   exact archived native-result verification using one unchanged **30s** bound.
@@ -411,7 +433,8 @@ snapshot return and leased comparison remain mandatory.
 
 Remaining release work, in dependency order:
 
-1. Attribute the R39m observation/admin recovery refusal and fix only the
+1. Attribute the admin recovery refusal after the enforced observation deadlines
+   in R39o, using the supported three-node fixture, and fix only the
    demonstrated cause. Typed CLI transport causes and exact admin-claim retry
    selection pass focused checks; they do not resolve this later gate. Then
    qualify the packaged public lost-result/reopen workflow and returning/all-cold
@@ -487,7 +510,11 @@ Separate forecasts and unknowns:
   fixture handling; their correction passes focused checks. R39j/R39k still
   exceed existing public retry caps at admin/Install. R39m verifies nonleader
   Install and visible guest completion but still exceeds the role-grant bound;
-  outer freshness and terminal recovery attribution remain open. The **2–6 elapsed-hour**
+  R39o attributes outer refusals to existing deadlines but not the later admin
+  recovery gap. The component regression's singleton precondition must be
+  replaced by the existing three-node harness, not a production exception.
+  This adds fixture preparation within the same mandatory recovery gate;
+  no admission correction is qualified yet. The **2–6 elapsed-hour**
   execution band remains conditional and is not a reliable remaining estimate
   while failure attribution is open. Scoped diagnostics must distinguish guest,
   freshness and terminal completion before further source work; current evidence

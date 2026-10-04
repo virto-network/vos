@@ -206,6 +206,10 @@ where
             crate::service::AgentId(self.pins.agent.0),
             call.invocation,
         )? {
+            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                tracing::debug!(phase = "retained_pending_lookup", dispatch_record_present = false,
+                    current_pending_present = true, "Authority admin lifecycle diagnostic");
+            }
             let retained = RetainedAuthorityAdminDispatch {
                 call: call.clone(),
                 envelope,
@@ -219,6 +223,10 @@ where
                 .retain(call.invocation, &bytes)
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
             return Ok(retained);
+        }
+        if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+            tracing::debug!(phase = "retained_pending_lookup", dispatch_record_present = false,
+                current_pending_present = false, "Authority admin lifecycle diagnostic");
         }
         let mut material = self
             .supervisor_invocation_material(self.pins.agent, call.authority.binding.issuer.actor)?;
@@ -285,13 +293,20 @@ where
             authorization: Box::new(authorization),
             observed_slot: call.observed_slot,
         };
-        self._network_host
+        if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+            tracing::debug!(phase = "capture_start", "Authority admin lifecycle diagnostic");
+        }
+        let result = self._network_host
             .capture_management_pending_with_checkpoint(
                 crate::service::AgentId(self.pins.agent.0),
                 &proposed,
                 &self.pins.replicas,
                 self.snapshot_signer.as_ref(),
                 |(anchor, envelope)| {
+                    if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                        tracing::debug!(phase = "capture_callback", dispatch_record_present = false,
+                            current_pending_present = true, "Authority admin lifecycle diagnostic");
+                    }
                     let retained = RetainedAuthorityAdminDispatch {
                         call: call.clone(),
                         envelope: envelope.clone(),
@@ -306,7 +321,12 @@ where
                         .map_err(|_| SharedAgentHostError::Unavailable)?;
                     Ok(retained)
                 },
-            )
+            );
+        if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+            tracing::debug!(phase = "capture_complete", error = ?result.as_ref().err(),
+                "Authority admin lifecycle diagnostic");
+        }
+        result
     }
 
     /// None means a durable actor denial, not a transport failure. Neither

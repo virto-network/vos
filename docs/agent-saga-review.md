@@ -330,6 +330,27 @@ ownership and the **1.8s** observation bound remain unchanged. Evidence:
 `release-observation-o3-observation-outcome-cli-{build,provenance}-r39l.*` and
 `release-observation-o3-packaged-public-outcomes-r39m.log` under the shared target.
 
+R39n guard harness builds from clean `32b12b0b` **pass 7m06s**. Public R39o
+**fails 369.77s** at the unchanged Operator role-grant 120s retry cap after
+verified nonleader Install at cumulative **133140ms**. All **70** visible guests
+return `Done`; no guest/host refusal or non-completed outcome appears. Its
+**15** outer refusals are five post-guest deadline failures (**1.854–2.040s**
+total), four pre-guest deadline failures (**1.983–3.450s**), and six barrier
+delivery timeouts (about **1.800s**). No term/configuration, ownership or stale
+rejection is recorded. Preserve the enforced 1.8s bound; this is not proof of
+a performance-only cause or of admin finalization. Registration times out and
+later commits before quarantine, but admin-specific attribution remains open.
+The temporary observation visibility/guard labels are removed; scoped admin
+phase/boolean diagnostics remain provisional. Evidence is
+`release-observation-o3-observation-guards-cli-{build,provenance}-r39n.*` and
+`release-observation-o3-packaged-public-guards-r39o.log`.
+The new native regression builds **52.07s**, but it (**2.64s**) and the unchanged
+baseline (**2.43s**) fail authenticated manifest inspection before the intended
+cut: their historical fixture has one voter. These R39p2 precondition failures
+do not establish an admin recovery defect. The new singleton test is removed;
+reuse the existing signed three-node fixture, with no singleton exception or
+test-policy bypass. No production admission correction is qualified.
+
 The final >256 locked-owner reopen now includes all constructors/attachments,
 readiness and exact archived native-result verification under one unchanged
 30s deadline, including both HTTP retries and post-call elapsed checks. Source
