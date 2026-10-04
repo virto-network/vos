@@ -270,15 +270,71 @@ pub(super) fn exercise(
         },
         0xe1,
     );
-    let (authorization_root, _) = commands::local_operation::authorize(
-        &data[0],
-        address,
-        operator,
-        space,
-        node_public,
-        Some(&intent),
+    let intent_bytes = intent.encode().unwrap();
+    let operation_root = data[0].join("agent-client/operations").join(format!(
+        "{}-{}",
+        hex::encode(identity.credential().0),
+        hex::encode(intent.intent().invocation().0),
+    ));
+    let mut retained_authorization = None;
+    let (authorization_root, authorization_response) = super::member_handoff::retry_exact(
+        "real Authority bootstrap issuance",
+        || {
+            // The same ATQ1 derives the same reservation nonce on every attempt.
+            // Once AOQ1 exists the ordinary CLI loads it without discovery,
+            // physical preparation or replacement signing.
+            let result = commands::local_operation::authorize(
+                &data[0],
+                address,
+                operator,
+                space,
+                node_public,
+                Some(&intent),
+            );
+            assert_eq!(
+                retained_operation(&data[0], space, &identity, false),
+                operation_root,
+            );
+            let mut preparation =
+                commands::clean_store::CleanPreparationClientFile::open_or_create(
+                    operation_root.join("preparation"),
+                )
+                .unwrap();
+            assert_eq!(preparation.load_request().unwrap().unwrap(), intent_bytes);
+            drop(preparation);
+            let mut authorization =
+                commands::clean_store::CleanOperationClientFile::open_or_create(
+                    operation_root.join("request"),
+                )
+                .unwrap();
+            if let Some(bytes) = authorization.load_request().unwrap() {
+                match &retained_authorization {
+                    Some(previous) => assert_eq!(&bytes, previous),
+                    None => retained_authorization = Some(bytes),
+                }
+            }
+            result
+        },
+    );
+    assert_eq!(authorization_root, operation_root.join("request"));
+    let submission = vos::agent::local_lifecycle::AuthorityOperationSubmission::decode(
+        &retained_authorization.expect("real issuance has a retained AOQ1"),
     )
-    .expect("real Authority bootstrap issuance");
+    .unwrap();
+    let vos::agent::clean_bootstrap::NativeAuthorityOperationDecision::Issued(issued) = submission
+        .decode_response(&authorization_response)
+        .unwrap()
+    else {
+        panic!("real Authority bootstrap authorization was denied")
+    };
+    assert_eq!(
+        issued.issuance_ack.authorization_invocation,
+        submission.call().invocation,
+    );
+    eprintln!(
+        "public_clerk_workflow phase=bootstrap_issuance elapsed_ms={}",
+        started.elapsed().as_millis(),
+    );
     let application_root = authorization_root.parent().unwrap().join("application");
     let mut application =
         commands::clean_store::CleanInvocationFile::open_or_create(&application_root).unwrap();

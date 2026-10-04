@@ -293,7 +293,36 @@ The active diff closes demonstrated M1 defects, not new capabilities:
   handoff, exact Install/invocation result and positive ACK, and all three Shared
   actor routes. Normal admission and initial 120s setup remain unchanged; fresh
   serving query is separate. This is locked-owner reopen with live transports,
-  not process-outage coverage. The patched optimized harness/run remain pending.
+  not process-outage coverage. Current optimized harness R39x compiles from
+  clean `74de3df4` **passes 7m29s**, with empty RUSTFLAGS and exact provenance.
+- Quiet public R39x **fails 310.50s**, after verified nonleader Install at
+  cumulative **120692ms** and completed ordinary Operator role grant. The next
+  one-shot bootstrap authorization fails credential discovery with HTTP 503,
+  before its AOC5 preparation/signing or AOQ request. Stable ATQ1 and invocation
+  nonce are already retained. The test-only correction uses the existing 120s
+  exact retry, fences complete ATQ/AOQ bytes and verifies signed issuance;
+  normal CLI, clocks and recovery bounds remain unchanged. Source review passes;
+  corrected compilation and public execution remain open. Lost mutation response
+  and whole locked-owner reopen are unreached. Logs/provenance:
+  `release-observation-o3-whole-reopen-cli-{build,provenance}-r39x.*` and
+  `release-observation-o3-packaged-public-admin-corrected-whole-reopen-r39x.log`.
+- Separate same-root R39y diagnostics use the preserved R39w main, artifacts,
+  identities, configuration and original retained Local Install request.
+  All three normal attachments return but actual HTTP status remains recovery
+  **503** (**10.223s**); exact CLI resume is refused **503, 0.658s** before the
+  excluded Local Install handler/queue/guest path. Existing scoped logs record
+  no authorization material/capture/Invoke phase. Client/configuration fences
+  remain exact; every owned process stops normally (**0.301s**). This establishes
+  the current cold closed-admission boundary, not the first R39w interruption
+  or a whole recovery pass. Private diagnostic evidence is beside the original
+  run; safe summary is `release-observation-o3-normal-local-install-reopen-diagnostic-r39y.log`.
+  The supported fixed-three Local Install regression is source-reviewed and
+  applied for a before-fix run: real registration timeout/late exact commit,
+  bare intent, absent pending map, strict substitutions, then normal owner
+  completion under whole 30s. System/Local images are physical; lifecycle
+  intent/issuer use owned non-clone memory store wrappers. It does not qualify
+  filesystem lifecycle durability or cold recovery. Compilation and intended
+  cut reproduction remain open; no speculative original-work restore is applied.
 - The >256 fixture's final locked-owner reopen now measures from before all
   constructors through production attachment/readiness, retained handoff and
   exact archived native-result verification using one unchanged **30s** bound.

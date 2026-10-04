@@ -429,7 +429,32 @@ retained Create/member handoff, exact Install/invocation result, normal positive
 ACK/durable progress and all three Shared actor routes. It uses normal admission
 and rejects late completion; initial 120s setup is unchanged. Existing transports
 stay live, so its scope is locked-owner reopen. The later fresh serving query is
-separate. Optimized harness compilation and actual qualification remain open.
+separate. Current optimized R39x harness from clean `74de3df4` **passes 7m29s**,
+empty RUSTFLAGS with exact provenance. Quiet public R39x **fails 310.50s**
+after verified nonleader Install (cumulative **120692ms**) and completed ordinary
+Operator role grant. One-shot bootstrap authorization credential discovery
+returns HTTP 503 before AOC5 preparation/signing or AOQ publication. Review its
+test-only existing 120s exact retry with immutable ATQ/invocation nonce and full
+ATQ/AOQ fences plus signed issuance verification. Normal CLI and later loss/ACK/
+reopen checks are unchanged; corrected compilation/execution remain open.
+The live checklist references R39x logs/provenance.
+
+Separate R39y normal same-root diagnostics keep the preserved R39w main,
+artifacts, identities, configuration and original retained request. All three
+attachments return while actual HTTP remains recovery 503 (**10.223s**).
+Exact Local Install resume is refused **503, 0.658s** before its handler/queue;
+no authorization material/capture/Invoke or guest phase appears. Client/config
+fences stay exact and every owned process stops normally (**0.301s**). This is
+the current cold closed-admission boundary, not first-failure attribution or
+whole recovery qualification. Private evidence is preserved; the safe summary
+and original evidence pointer are referenced by the live checklist.
+The source-reviewed Local Install regression retains the same controller,
+physical System/Local images and owned non-clone memory lifecycle stores through
+real registration timeout/late commit, bare intent/absent map and strict
+substitutions before normal owner completion. Its whole 30s starts before the
+cut. Run it against the unchanged guard first; no cut or completion pass is
+claimed before execution. Memory lifecycle wrappers do not qualify filesystem
+durability or cold recovery. No speculative missing-envelope restore is applied.
 
 The final >256 locked-owner reopen now includes all constructors/attachments,
 readiness and exact archived native-result verification under one unchanged

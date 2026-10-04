@@ -18,6 +18,9 @@ mod genesis_publication_retry;
 #[cfg(feature = "experimental-state-blocks")]
 #[path = "admin_pending_validation.rs"]
 mod admin_pending_validation;
+#[cfg(feature = "experimental-state-blocks")]
+#[path = "local_install_recovery.rs"]
+mod local_install_recovery;
 #[path = "management_retention.rs"]
 mod management_retention;
 use crate::agent::shared_commit::SharedAgentCommonSnapshotClaim;
@@ -51,6 +54,8 @@ pub(super) enum Exercise {
     AdminRegistrationTimeout,
     #[cfg(feature = "experimental-state-blocks")]
     AdminRegistrationTimeoutCold,
+    #[cfg(feature = "experimental-state-blocks")]
+    LocalImageInstallRegistrationTimeout,
 }
 
 #[cfg(feature = "experimental-state-blocks")]
@@ -96,6 +101,19 @@ fn candidate_admin_registration_timeout_cold_missing_journal_refuses_adoption() 
     check_fixed_system_pending_cluster_with_checkpoint(
         true,
         Some(Exercise::AdminRegistrationTimeoutCold),
+    );
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+#[test]
+#[ignore = "requires coherent Authority/System IMAGE components and three authenticated loopback transports"]
+fn candidate_local_image_install_registration_timeout_exact_retry_passes_production_recovery_admission() {
+    assert!(std::env::var_os("AUTHORITY_CANDIDATE_ELF").is_some());
+    assert!(std::env::var_os("VOS_AGENT_RUNTIME_COST_CANDIDATE").is_some());
+    assert!(std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some());
+    check_fixed_system_pending_cluster_with_checkpoint(
+        true,
+        Some(Exercise::LocalImageInstallRegistrationTimeout),
     );
 }
 
@@ -338,6 +356,11 @@ pub(super) fn exercise(
         return;
     }
     #[cfg(feature = "experimental-state-blocks")]
+    if matches!(exercise, Exercise::LocalImageInstallRegistrationTimeout) {
+        local_install_recovery::exercise(leader, owners, fixtures, directories);
+        return;
+    }
+    #[cfg(feature = "experimental-state-blocks")]
     if matches!(
         exercise,
         Exercise::AdminJournalPrewrite
@@ -389,6 +412,8 @@ pub(super) fn exercise(
         Exercise::AdminJournalPrewrite
         | Exercise::AdminRegistrationTimeout
         | Exercise::AdminRegistrationTimeoutCold => unreachable!(),
+        #[cfg(feature = "experimental-state-blocks")]
+        Exercise::LocalImageInstallRegistrationTimeout => unreachable!(),
     };
     let agent = HostAgentId(fixtures[leader].plan.pins.agent.0);
     let lagger = (leader + 1) % 3;
