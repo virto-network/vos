@@ -1,6 +1,8 @@
 //! Genuine cumulative native-authorize qualification, not a signing fixture or
-//! throughput/load/recovery-deadline qualification. Uses Root's normal public
-//! credential and actual Clerk query Invokes/positive ACKs through locked owners.
+//! throughput/load qualification. The final cycle measures scoped <=30s locked
+//! owner reopen and exact archived native-result recovery. Uses Root's normal
+//! public credential and actual Clerk query Invokes/positive ACKs. Transports
+//! remain running; whole-process and every-member readiness are separate gates.
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 use vos::Encode as _;
@@ -22,6 +24,7 @@ pub(in super::super) struct RetainedCapacity {
     completed: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(in super::super) fn exercise(
     nodes: &mut [VosNode],
     data: &Path,
@@ -29,21 +32,33 @@ pub(in super::super) fn exercise(
     space: SpaceId,
     node_public: [u8; 32],
     workflow: &RetainedWorkflow,
+    recovery_started: Option<std::time::Instant>,
     retained: &mut Option<RetainedCapacity>,
 ) {
     let started = std::time::Instant::now();
     let address = listen(&mut nodes[0], "public-native-operation-capacity");
     if let Some(first) = retained.as_ref() {
+        let recovery_started = recovery_started.expect("capacity reopen includes constructor start");
+        let deadline = recovery_started + Duration::from_secs(30);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "whole capacity reopen exceeded 30s before archived retry"
+        );
         assert!(first.completed > 256);
         assert_archived(data, first);
         let before = native_snapshot(data, first);
-        assert_native_retry(address, first);
+        assert_native_retry(address, first, Some(deadline));
         assert_eq!(native_snapshot(data, first), before);
         assert_client_retained(first);
+        assert!(
+            std::time::Instant::now() <= deadline,
+            "whole constructor/attachment/readiness/archived result recovery exceeded 30s"
+        );
         eprintln!(
-            "public_native_capacity phase=locked_reopen_exact_native_result completed={} elapsed_ms={}",
+            "public_native_capacity phase=locked_reopen_exact_native_result completed={} elapsed_ms={} whole_reopen_ms={}",
             first.completed,
-            started.elapsed().as_millis()
+            started.elapsed().as_millis(),
+            recovery_started.elapsed().as_millis()
         );
         for node in nodes {
             assert!(!node.shutdown_handle().load(Ordering::Acquire));
@@ -226,7 +241,7 @@ pub(in super::super) fn exercise(
     assert_eq!(repeated, response);
     assert_archived(data, &first);
     let before = native_snapshot(data, &first);
-    assert_native_retry(address, &first);
+    assert_native_retry(address, &first, None);
     assert_eq!(native_snapshot(data, &first), before);
     assert_client_retained(&first);
     eprintln!(
@@ -338,10 +353,16 @@ fn native_snapshot(data: &Path, first: &RetainedCapacity) -> BTreeMap<PathBuf, V
     files
 }
 
-fn assert_native_retry(address: SocketAddr, first: &RetainedCapacity) {
+fn assert_native_retry(
+    address: SocketAddr,
+    first: &RetainedCapacity,
+    deadline: Option<std::time::Instant>,
+) {
     let submission = AuthorityOperationSubmission::decode(&first.authorization_request).unwrap();
-    let prepared =
-        super::super::member_handoff::retry_exact("old native context HTTP retry", || {
+    let prepared = super::super::member_handoff::retry_exact_until(
+        "old native context HTTP retry",
+        deadline.unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(120)),
+        || {
             commands::local_create::post_binary(
                 address,
                 "/__agents/prepare-authorization",
@@ -349,10 +370,13 @@ fn assert_native_retry(address: SocketAddr, first: &RetainedCapacity) {
                 &submission.call().encode().unwrap(),
                 AuthorityOperationSubmission::MAX_ENCODED_BYTES,
             )
-        });
+        },
+    );
     assert_eq!(prepared, first.authorization_request);
-    let response =
-        super::super::member_handoff::retry_exact("old archived native result HTTP retry", || {
+    let response = super::super::member_handoff::retry_exact_until(
+        "old archived native result HTTP retry",
+        deadline.unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(120)),
+        || {
             commands::local_create::post_binary(
                 address,
                 "/__agents/authorize",
@@ -360,7 +384,8 @@ fn assert_native_retry(address: SocketAddr, first: &RetainedCapacity) {
                 &first.authorization_request,
                 AuthorityOperationSubmission::MAX_RESPONSE_BYTES,
             )
-        });
+        },
+    );
     assert_eq!(response, first.authorization_response);
     assert!(matches!(
         submission.decode_response(&response).unwrap(),

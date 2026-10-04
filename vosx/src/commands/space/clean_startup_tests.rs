@@ -2177,6 +2177,7 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
                                     space,
                                     raw_public_key(&daemons[0]).unwrap(),
                                     workflow.as_ref().unwrap(),
+                                    operation_capacity.as_ref().map(|_| recovery_started),
                                     &mut operation_capacity,
                                 );
                             }

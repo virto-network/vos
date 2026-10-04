@@ -300,8 +300,26 @@ preparation/submission/terminal bytes. An earlier completed claim cannot select
 resume. Independent review finds no blocker. Native R39h build **passes 40.48s**;
 three new regressions **pass 0.28s**, and related CLI checks **14 pass**, 1 ignored,
 **4.24s** (`release-observation-o3-cli-transport-{test-build,regressions,related}-r39h.log`).
-Portable integrated execution remains pending; no observation admission bypass,
-authorization or deadline change is introduced.
+Correction is frozen at `d5459f66`; portable R39i main/harness **pass
+3m29s / 3m28s**, with exact main provenance recorded. Public R39j **fails
+418.17s** after verified nonleader Install at cumulative **129470ms**, at the
+existing role-grant retry cap on `/__agents/admin` HTTP 503; discovery and
+preparation advanced. Scoped R39k **fails 333.13s** earlier at the nonleader
+Install retry cap. It verifies Authority approval/receipt and local retained
+Install replay, but not terminal finalization/release/SIR1 delivery. Neither
+reaches lost mutation response/reopen. Observation Unavailable alone cannot
+attribute guest versus freshness failure: existing inner outcome diagnostics
+were test-only in the CLI-linked dependency. Review the temporary visibility of
+those two existing diagnostic blocks under the same flag, then remove it after
+attribution. A pre-NAD2 admin retention seam remains a source hypothesis. No
+observation admission bypass, authorization, deadline or service-tuning change
+is introduced.
+
+The final >256 locked-owner reopen now includes all constructors/attachments,
+readiness and exact archived native-result verification under one unchanged
+30s deadline, including both HTTP retries and post-call elapsed checks. Source
+review passes; actual execution remains pending. Running transports and one
+published supervisor do not qualify whole-process/every-member readiness.
 
 The portable full CLI suite previously **passes 375 tests**, 52 ignored, 39.53s
 (`release-observation-o3-cli-unit-release-r37a.log`); that boundary predates the

@@ -157,8 +157,27 @@ The active diff closes demonstrated M1 defects, not new capabilities:
   finds no blocker. Native R39h build **passes 40.48s**; three new regressions
   **pass 0.28s**, and related CLI checks **14 pass**, 1 ignored, **4.24s**
   (`release-observation-o3-cli-transport-{test-build,regressions,related}-r39h.log`).
-  Portable integrated execution remains pending. No observation
-  bypass, authorization change or service-tuning pass is introduced.
+  The correction is frozen at `d5459f66`; portable R39i main/harness **pass
+  3m29s / 3m28s** with provenance recorded. Public R39j **fails 418.17s**:
+  verified nonleader Install at cumulative **129470ms**, then the existing
+  role-grant retry cap expires on `/__agents/admin` HTTP 503. Discovery and
+  preparation advanced. Scoped R39k **fails 333.13s** earlier at the nonleader
+  Install retry cap: Authority approval/receipt and local retained Install
+  replay are verified, but finalization/release/SIR1 delivery are not.
+  Neither run reaches lost mutation response/reopen. Observation errors alone
+  cannot distinguish guest execution from freshness failure because their
+  outcome diagnostics were test-only in the CLI-linked core dependency. The
+  existing two scoped outcome blocks are temporarily enabled behind the same
+  diagnostic flag; remove that temporary visibility after attribution. A
+  possible pre-NAD2 admin retention seam is a source hypothesis, not yet the
+  established R39j cause. No observation bypass, authorization change, deadline
+  increase or service-tuning pass is introduced.
+- The >256 fixture's final locked-owner reopen now measures from before all
+  constructors through production attachment/readiness, retained handoff and
+  exact archived native-result verification using one unchanged **30s** bound.
+  Its two HTTP retries share that absolute deadline and late completion fails.
+  Source review passes; execution remains pending. Running transports and one
+  published supervisor do not prove whole-process/every-member readiness.
 - First actual three-process CLI run R38u uses the provenance-recorded portable
   binary and exact six-file bundle. Readiness passes **9.744s**, then initial
   Local Create returns an ambiguous HTTP 503 after **10.776s**. The script exits
@@ -448,9 +467,13 @@ Separate forecasts and unknowns:
   no further defect appears. This is not a combined M1/M2/M3 forecast.
   R39b/R39c exposed a retained-Install quarantine admission gap; its narrow
   correction passes focused checks and R39g reaches verified nonleader Install.
-  R39f/R39g next expose lost typed transport causes and one-shot role-grant
-  fixture handling. Qualification remains conditional on those focused
-  corrections; current evidence does not establish a new guest execution defect.
+  R39f/R39g next exposed lost typed transport causes and one-shot role-grant
+  fixture handling; their correction passes focused checks. R39j/R39k still
+  exceed existing public retry caps at admin/Install. The **2–6 elapsed-hour**
+  execution band remains conditional and is not a reliable remaining estimate
+  while failure attribution is open. Scoped diagnostics must distinguish guest,
+  freshness and terminal completion before further source work; current evidence
+  does not establish a new guest execution defect or performance-only cause.
   Optimized R38r main and harness builds each take about seven minutes;
   R38s/R38t and first CLI failure establish the current variance. Cold recovery,
   actual leader-loss coverage, cumulative pruning and cleanup may expose more
