@@ -142,6 +142,23 @@ The active diff closes demonstrated M1 defects, not new capabilities:
   and HTTP checks **61 pass, 1.53s** after a **1m45s** build; exact, changed,
   missing and member-only inputs and both readiness races are covered. These
   are admission checks, not physical Install/finality qualification.
+- Portable R39e main and optimized harness build from clean `d3408382` in
+  **7m00s / 8m18s**, with empty RUSTFLAGS and recorded provenance. Quiet public
+  R39f **fails 133.10s** on a credential-discovery HTTP 503 whose typed cause
+  was lost by its diagnostic wrapper. Scoped R39g **fails 312.19s** after
+  verified nonleader Install, at a one-shot credential query for the next
+  Clerk Operator role grant. Lost mutation response and reopen are not reached.
+  The cumulative Install stage marker is not a standalone Install duration.
+  The current narrow correction preserves typed HTTP/transport causes in
+  credential/admin delivery and gives the fixture the existing 120s retry
+  bound. Before a new durable admin claim it retries discovery/preparation;
+  afterward it resumes only the exact signed role grant, fencing all retained
+  evidence. Earlier completed claims cannot select resume. Independent review
+  finds no blocker. Native R39h build **passes 40.48s**; three new regressions
+  **pass 0.28s**, and related CLI checks **14 pass**, 1 ignored, **4.24s**
+  (`release-observation-o3-cli-transport-{test-build,regressions,related}-r39h.log`).
+  Portable integrated execution remains pending. No observation
+  bypass, authorization change or service-tuning pass is introduced.
 - First actual three-process CLI run R38u uses the provenance-recorded portable
   binary and exact six-file bundle. Readiness passes **9.744s**, then initial
   Local Create returns an ambiguous HTTP 503 after **10.776s**. The script exits
@@ -361,7 +378,8 @@ snapshot return and leased comparison remain mandatory.
 
 Remaining release work, in dependency order:
 
-1. Qualify the packaged public lost-result/reopen workflow and returning/all-cold
+1. Review and verify typed CLI transport causes and exact admin-claim retry
+   selection, then qualify the packaged public lost-result/reopen workflow and returning/all-cold
    pending Install. Exercise Pins-before-record, first Intent stage, fresh
    initialization and locked reopen through normal startup, with unchanged whole
    **<=30s** recovery and no test-policy bypass.
@@ -428,9 +446,11 @@ Separate forecasts and unknowns:
   The focused remaining correction/review band is **1–4 source hours**,
   medium-low confidence, plus **2–6 elapsed hours** of isolated M1 execution if
   no further defect appears. This is not a combined M1/M2/M3 forecast.
-  R39b/R39c expose a further retained-Install quarantine admission gap, so
-  elapsed qualification remains conditional on resolving and reviewing that
-  demonstrated correctness defect; guest execution is not the current failure.
+  R39b/R39c exposed a retained-Install quarantine admission gap; its narrow
+  correction passes focused checks and R39g reaches verified nonleader Install.
+  R39f/R39g next expose lost typed transport causes and one-shot role-grant
+  fixture handling. Qualification remains conditional on those focused
+  corrections; current evidence does not establish a new guest execution defect.
   Optimized R38r main and harness builds each take about seven minutes;
   R38s/R38t and first CLI failure establish the current variance. Cold recovery,
   actual leader-loss coverage, cumulative pruning and cleanup may expose more

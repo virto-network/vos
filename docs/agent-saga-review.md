@@ -284,6 +284,25 @@ after a **1m45s** build (`release-observation-o3-retained-install-{core,regressi
 They cover exact/changed/missing/member-only inputs and both readiness races;
 they do not qualify physical Install execution, finality or restart recovery.
 
+Portable R39e main and optimized harness build from clean `d3408382`
+**pass 7m00s / 8m18s** with empty RUSTFLAGS; binary provenance is recorded in
+`release-observation-o3-portable-main-provenance-r39e.txt`. Quiet R39f public
+workflow **fails 133.10s** when credential-discovery HTTP 503 loses its typed
+transport cause. Scoped R39g **fails 312.19s**, but completes verified nonleader
+Install before a one-shot credential query for the next Clerk Operator role
+grant fails HTTP 503. Lost mutation response and reopen are not reached; the
+cumulative stage marker is not a standalone Install duration or SLA result.
+Review the current CLI-only correction: unchanged diagnostic text preserves the
+typed cause in credential/admin delivery. The fixture uses the existing 120s
+retry bound, retries discovery before a new durable admin claim, then resumes
+only the complete matching signed operation and fences retained nonce/draft/
+preparation/submission/terminal bytes. An earlier completed claim cannot select
+resume. Independent review finds no blocker. Native R39h build **passes 40.48s**;
+three new regressions **pass 0.28s**, and related CLI checks **14 pass**, 1 ignored,
+**4.24s** (`release-observation-o3-cli-transport-{test-build,regressions,related}-r39h.log`).
+Portable integrated execution remains pending; no observation admission bypass,
+authorization or deadline change is introduced.
+
 The portable full CLI suite previously **passes 375 tests**, 52 ignored, 39.53s
 (`release-observation-o3-cli-unit-release-r37a.log`); that boundary predates the
 latest startup/decoder edits. Prior packaged failure timelines remain in

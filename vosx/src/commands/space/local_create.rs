@@ -482,7 +482,10 @@ fn query_credential_for(
         query_bytes,
         MAX_AUTHORITY_CREDENTIAL_PROJECTION_WIRE_BYTES,
     )
-    .map_err(|error| anyhow::anyhow!("{error}; retry the identical retained credential query"))?;
+    .map_err(|error| {
+        let diagnostic = format!("{error}; retry the identical retained credential query");
+        error.context(diagnostic)
+    })?;
     validate_credential_response_for(&query, expected_principal, &bytes, domain)
 }
 
@@ -1544,6 +1547,128 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn retained_credential_discovery_preserves_transport_causes_and_exact_signed_query() {
+        use super::super::clean_store::{
+            CleanCredentialQueryFile, CleanCredentialReservation, CredentialReservationStatus,
+            tests::Fixture,
+        };
+        use vos::agent::production_owner::AuthorityProjectionQueryAuthenticator as _;
+        use vos::agent::sdk::authority::{
+            AuthorityBuiltinRole, AuthorityCredentialKind, AuthorityCredentialProjection,
+            AuthorityCredentialStatus, AuthorityProjectionHead, AuthorityProjectionSelector,
+        };
+        use vos::agent::sdk::wire::CanonicalWire as _;
+        let (operator, authority, descriptor, _) = fixture();
+        let fixture = Fixture::new("retained-credential-transport");
+        let identity = CleanOperatorIdentitySigner::new(&operator).unwrap();
+        let mut reservation = CleanCredentialReservation::open_or_create(
+            &fixture.parent,
+            descriptor.identity.space,
+            identity.credential(),
+        )
+        .unwrap();
+        let nonce = Hash([0x71; 32]);
+        reservation.reserve(nonce).unwrap();
+        let mut signer = super::super::authority_projection_authenticator::OperatorAuthorityProjectionAuthenticator::new(operator.clone()).unwrap();
+        let query = signer
+            .authenticate(authority, AuthorityProjectionSelector::Credential)
+            .unwrap();
+        let exact = query.encode().unwrap();
+        CleanCredentialQueryFile::open_or_create(&fixture.root, authority, identity.credential())
+            .unwrap()
+            .publish(&exact)
+            .unwrap();
+        let unavailable = b"HTTP/1.1 503 Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        for response in [Some(unavailable.as_slice()), None] {
+            let (address, server) =
+                binary_response_for_test("/__agents/credential", &exact, response);
+            let error =
+                discover_credential(&fixture.root, address, &operator, authority).unwrap_err();
+            server.join().unwrap();
+            let cause = error
+                .downcast_ref::<ureq::Error>()
+                .expect("typed HTTP/transport cause");
+            assert!(match response {
+                Some(_) => matches!(cause, ureq::Error::Status(503, _)),
+                None => matches!(cause, ureq::Error::Transport(_)),
+            });
+            assert_eq!(
+                error.to_string(),
+                format!("{cause}; retry the identical retained credential query")
+            );
+            let retained = CleanCredentialQueryFile::open_or_create(
+                &fixture.root,
+                authority,
+                identity.credential(),
+            )
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+            assert!(
+                retained == exact,
+                "credential query changed after ambiguity"
+            );
+            assert_eq!(
+                reservation.current().unwrap(),
+                Some((nonce, CredentialReservationStatus::Pending))
+            );
+        }
+        let one = NonZeroU64::new(1).unwrap();
+        let projection = AuthorityCredentialProjection {
+            query,
+            head: AuthorityProjectionHead {
+                state_revision: one,
+                epoch: one,
+                authorization_sequence: one,
+                administration_generation: one,
+                state_commitment: Hash([0x72; 32]),
+            },
+            principal: identity.principal(),
+            status: AuthorityCredentialStatus::Active,
+            kind: AuthorityCredentialKind::Api,
+            builtin_role: AuthorityBuiltinRole::Admin,
+            management_request_high_water: 1,
+            operation_request_high_water: 0,
+            admin_request_high_water: 0,
+            space_roles: Vec::new(),
+            actor_roles: Vec::new(),
+            capabilities: Vec::new(),
+        };
+        // A shaped discovery reply exercises client binding, not Authority
+        // execution or policy approval. The signed mutation remains unissued.
+        let body = projection.encode().unwrap();
+        let mut response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
+        response.extend_from_slice(&body);
+        let (address, server) =
+            binary_response_for_test("/__agents/credential", &exact, Some(&response));
+        let (received, sequence) =
+            discover_credential(&fixture.root, address, &operator, authority).unwrap();
+        server.join().unwrap();
+        assert!(
+            received == projection,
+            "credential response differs from signed query"
+        );
+        assert_eq!(sequence.get(), 2);
+        assert!(
+            CleanCredentialQueryFile::open_or_create(
+                &fixture.root,
+                authority,
+                identity.credential()
+            )
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap()
+                == exact
+        );
+        assert_eq!(
+            reservation.current().unwrap(),
+            Some((nonce, CredentialReservationStatus::Pending))
+        );
+    }
+
+    #[test]
     fn credential_discovery_binds_query_owner_status_and_management_sequence() {
         use vos::agent::production_owner::AuthorityProjectionQueryAuthenticator as _;
         use vos::agent::sdk::authority::{
@@ -1851,6 +1976,58 @@ pub(crate) mod tests {
         identity.runtime_program = ProgramId([13; 32]);
         sign(&mut forged);
         assert!(verify_acknowledgement(&request, &forged.encode().unwrap()).is_err());
+    }
+
+    pub(in crate::commands::space) fn binary_response_for_test(
+        path: &'static str,
+        expected: &[u8],
+        response: Option<&[u8]>,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        use std::io::{Read as _, Write as _};
+        let expected = expected.to_vec();
+        let response = response.map(<[u8]>::to_vec);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "client never connected"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                assert!(header.len() < 8192);
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                header.push(byte[0]);
+            }
+            assert!(header.starts_with(format!("POST {path} HTTP/1.1\r\n").as_bytes()));
+            let mut body = vec![0; expected.len()];
+            stream.read_exact(&mut body).unwrap();
+            assert!(
+                body == expected,
+                "transport changed the exact retained request"
+            );
+            if let Some(response) = response {
+                stream.write_all(&response).unwrap();
+            }
+            // None drops the connection only after the exact body arrived,
+            // reproducing an ambiguous response loss without a timeout waiver.
+        });
+        (address, server)
     }
 
     fn submit_fixture(

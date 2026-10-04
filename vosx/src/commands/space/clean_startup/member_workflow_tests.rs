@@ -208,15 +208,38 @@ pub(super) fn exercise(
         role: operator_role,
         granted: true,
     };
-    let (_, _, status) = commands::admin_operation::execute(
-        &data[0],
-        address,
-        operator,
-        authority,
-        enrollments[0].node,
-        Some(&operation),
-    )
-    .expect("real Authority Clerk operator role grant");
+    let admin_baseline = admin_claim(&data[0], authority, &identity).unwrap();
+    assert!(!matches!(
+        admin_baseline,
+        Some((_, commands::clean_store::CredentialReservationStatus::Pending))
+    ));
+    let mut retained_admin = None;
+    let (_, _, status) = super::member_handoff::retry_exact(
+        "real Authority Clerk operator role grant",
+        || {
+            let result = commands::admin_operation::execute(
+                &data[0],
+                address,
+                operator,
+                authority,
+                enrollments[0].node,
+                retained_admin.is_none().then_some(&operation),
+            );
+            retain_admin_role_grant(
+                &data[0],
+                authority,
+                enrollments[0].node,
+                &identity,
+                &operation,
+                admin_baseline,
+                &mut retained_admin,
+            )?;
+            if result.is_ok() {
+                anyhow::ensure!(retained_admin.is_some(), "role grant has no new admin claim");
+            }
+            result
+        },
+    );
     assert_eq!(
         status,
         commands::clean_store::CredentialReservationStatus::Completed
@@ -642,6 +665,232 @@ pub(super) fn returned_follower(
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn admin_claim(
+    data: &Path,
+    authority: AuthorityActorTarget,
+    identity: &commands::clean_identity::CleanOperatorIdentitySigner<'_>,
+) -> anyhow::Result<
+    Option<(
+        vos::agent::sdk::Hash,
+        commands::clean_store::CredentialReservationStatus,
+    )>,
+> {
+    let root = data.join("admin-client");
+    commands::clean_store::ensure_private_directory(&root)?;
+    let claims = root.join("credentials");
+    commands::clean_store::ensure_private_directory(&claims)?;
+    let mut reservation = commands::clean_store::CleanAdminCredentialReservation::open_or_create(
+        &claims,
+        authority.space,
+        identity.credential(),
+    )?;
+    Ok(reservation.current()?)
+}
+
+struct RetainedAdminRoleGrant {
+    nonce: vos::agent::sdk::Hash,
+    draft: Vec<u8>,
+    preparation: Option<Vec<u8>>,
+    submission: Option<Vec<u8>>,
+    response: Option<Vec<u8>>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn retain_admin_role_grant(
+    data: &Path,
+    authority: AuthorityActorTarget,
+    node: vos::agent::sdk::NodeId,
+    identity: &commands::clean_identity::CleanOperatorIdentitySigner<'_>,
+    operation: &vos::agent::sdk::authority::AuthorityAdminOperation,
+    baseline: Option<(
+        vos::agent::sdk::Hash,
+        commands::clean_store::CredentialReservationStatus,
+    )>,
+    retained: &mut Option<RetainedAdminRoleGrant>,
+) -> anyhow::Result<()> {
+    let current = admin_claim(data, authority, identity)?;
+    if current == baseline {
+        // Credential discovery precedes draft retention and claim publication.
+        // No new mutation exists yet, and the previous claim is not resumable
+        // as this role grant, even when it was already completed.
+        anyhow::ensure!(retained.is_none(), "new admin claim disappeared");
+        return Ok(());
+    }
+    let (nonce, status) = current.ok_or_else(|| anyhow::anyhow!("admin claim disappeared"))?;
+    anyhow::ensure!(
+        baseline.is_none_or(|(previous, _)| previous != nonce),
+        "previous admin claim changed without a new operation"
+    );
+    let root = data.join("admin-client/requests").join(hex::encode(nonce.0));
+    let mut preparation = commands::clean_store::CleanOperationClientFile::open_admin_preparation(
+        root.join("preparation"),
+    )?;
+    let draft_bytes = preparation
+        .load_request()?
+        .ok_or_else(|| anyhow::anyhow!("new admin claim has no retained draft"))?;
+    let draft = vos::agent::sdk::authority::AuthorityAdminCall::decode(&draft_bytes)
+        .map_err(|_| anyhow::anyhow!("invalid retained admin draft"))?;
+    anyhow::ensure!(
+        draft.authority == authority
+            && draft.authenticated_node == node
+            && draft.administrator == identity.principal()
+            && draft.credential == identity.credential()
+            && draft.credential_public_key == identity.raw_public_key()
+            && draft.observed_slot == 0
+            && &draft.operation == operation
+            && draft.verify_with(&commands::local_create::CredentialVerifier).is_ok(),
+        "new admin claim differs from the exact role grant"
+    );
+    let preparation_bytes = preparation.load_response()?;
+    drop(preparation);
+    let mut delivery = commands::clean_store::CleanOperationClientFile::open_admin_submission(
+        root.join("submission"),
+    )?;
+    let submission_bytes = delivery.load_request()?;
+    let response = delivery.load_response()?;
+    if let Some(bytes) = &submission_bytes {
+        let submission = vos::agent::clean_bootstrap::NativeAuthorityAdminSubmission::decode(bytes)
+            .map_err(|_| anyhow::anyhow!("invalid retained admin submission"))?;
+        let prepared = submission
+            .preparation()
+            .encode()
+            .map_err(|_| anyhow::anyhow!("invalid retained admin preparation"))?;
+        anyhow::ensure!(
+            preparation_bytes.as_deref() == Some(prepared.as_slice()),
+            "admin submission lost its exact retained preparation"
+        );
+        let mut expected = submission
+            .preparation()
+            .call_to_sign(&draft)
+            .map_err(|_| anyhow::anyhow!("admin submission differs from retained draft"))?;
+        expected.signature = submission.call().signature;
+        anyhow::ensure!(
+            &expected == submission.call(),
+            "admin submission differs from retained draft"
+        );
+    }
+    if status != commands::clean_store::CredentialReservationStatus::Pending {
+        anyhow::ensure!(
+            submission_bytes.is_some() && response.is_some(),
+            "terminal admin claim lost retained delivery evidence"
+        );
+    }
+    let snapshot = RetainedAdminRoleGrant {
+        nonce,
+        draft: draft_bytes,
+        preparation: preparation_bytes,
+        submission: submission_bytes,
+        response,
+    };
+    if let Some(previous) = retained {
+        anyhow::ensure!(
+            previous.nonce == snapshot.nonce && previous.draft == snapshot.draft,
+            "role grant changed its retained operation or draft"
+        );
+        for (before, after) in [
+            (&previous.preparation, &snapshot.preparation),
+            (&previous.submission, &snapshot.submission),
+            (&previous.response, &snapshot.response),
+        ] {
+            if let Some(bytes) = before {
+                anyhow::ensure!(
+                    after.as_deref() == Some(bytes.as_slice()),
+                    "role grant changed previously retained evidence"
+                );
+            }
+        }
+    }
+    *retained = Some(snapshot);
+    Ok(())
+}
+
+#[test]
+fn role_grant_retry_requires_a_new_claim_bound_to_the_complete_operation() {
+    use commands::clean_store::{
+        CleanAdminCredentialReservation, CleanOperationClientFile, CredentialReservationStatus,
+    };
+    use vos::agent::sdk::authority::{AuthorityAdminCall, AuthorityAdminOperation};
+    use vos::agent::sdk::{DeploymentId, Hash, InvocationId, NodeId, RoleId};
+
+    let fixture = commands::clean_store::tests::Fixture::new("role-grant-retry");
+    let (operator, authority, _, _) = commands::local_create::tests::fixture();
+    let identity = commands::clean_identity::CleanOperatorIdentitySigner::new(&operator).unwrap();
+    let node = NodeId([0x91; 32]);
+    let operation = AuthorityAdminOperation::SetActorRole {
+        principal: identity.principal(),
+        agent: AgentId([0x92; 32]),
+        actor: ActorId([0x93; 32]),
+        deployment: DeploymentId([0x94; 32]),
+        role: RoleId([0x95; 32]),
+        granted: true,
+    };
+    let mut draft = AuthorityAdminCall {
+        invocation: InvocationId::ZERO,
+        authority,
+        administrator: identity.principal(),
+        credential: identity.credential(),
+        request_sequence: std::num::NonZeroU64::new(1).unwrap(),
+        credential_public_key: identity.raw_public_key(),
+        authenticated_node: node,
+        observed_slot: 0,
+        expected_generation: std::num::NonZeroU64::new(1).unwrap(),
+        operation: operation.clone(),
+        signature: [0; 64],
+    };
+    draft.invocation = draft.expected_invocation();
+    draft.signature = operator.sign(&draft.signing_bytes()).unwrap().try_into().unwrap();
+    let baseline = admin_claim(&fixture.parent, authority, &identity).unwrap();
+    assert!(baseline.is_none());
+    let nonce = Hash([0x96; 32]);
+    let root = fixture.parent.join("admin-client/requests").join(hex::encode(nonce.0));
+    commands::clean_store::ensure_private_directory(&fixture.parent.join("admin-client/requests"))
+        .unwrap();
+    commands::clean_store::ensure_private_directory(&root).unwrap();
+    let mut preparation = CleanOperationClientFile::open_admin_preparation(root.join("preparation"))
+        .unwrap();
+    preparation.publish_request(&draft.encode().unwrap()).unwrap();
+    drop(preparation);
+    let mut retained = None;
+    // A retained discovery or draft does not publish a credential claim.
+    retain_admin_role_grant(
+        &fixture.parent, authority, node, &identity, &operation, baseline, &mut retained,
+    )
+    .unwrap();
+    assert!(retained.is_none());
+    let mut reservation = CleanAdminCredentialReservation::open_or_create(
+        &fixture.parent.join("admin-client/credentials"), authority.space, identity.credential(),
+    )
+    .unwrap();
+    assert_eq!(reservation.reserve(nonce, &draft).unwrap(), CredentialReservationStatus::Pending);
+    drop(reservation);
+    retain_admin_role_grant(
+        &fixture.parent, authority, node, &identity, &operation, baseline, &mut retained,
+    )
+    .unwrap();
+    assert_eq!(retained.as_ref().unwrap().nonce, nonce);
+    assert_eq!(retained.as_ref().unwrap().draft, draft.encode().unwrap());
+    let mut wrong_operation = operation.clone();
+    let AuthorityAdminOperation::SetActorRole { granted, .. } = &mut wrong_operation else {
+        unreachable!()
+    };
+    *granted = false;
+    assert!(retain_admin_role_grant(
+        &fixture.parent, authority, node, &identity, &wrong_operation, baseline, &mut retained,
+    ).is_err());
+    assert!(retain_admin_role_grant(
+        &fixture.parent, authority, NodeId([0x97; 32]), &identity, &operation, baseline, &mut retained,
+    ).is_err());
+    // A changed phase on the old nonce cannot establish a new role grant.
+    assert!(retain_admin_role_grant(
+        &fixture.parent, authority, node, &identity, &operation,
+        Some((nonce, CredentialReservationStatus::Completed)), &mut None,
+    ).is_err());
+    retain_admin_role_grant(
+        &fixture.parent, authority, node, &identity, &operation, baseline, &mut retained,
+    )
+    .unwrap();
 }
 
 pub(super) fn current_operation(

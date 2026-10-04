@@ -50,7 +50,10 @@ pub(crate) fn deliver(
         }
         store.publish_response(&response)?;
         Ok(response)
-    })().map_err(|error: anyhow::Error| anyhow::anyhow!("{error}; exact admin request retained; outcome may be unknown; retry the same request directory"))
+    })().map_err(|error: anyhow::Error| {
+        let diagnostic = format!("{error}; exact admin request retained; outcome may be unknown; retry the same request directory");
+        error.context(diagnostic)
+    })
 }
 
 pub(crate) fn run(
@@ -114,6 +117,79 @@ mod tests {
                 ])
                 .is_ok()
             );
+        }
+    }
+
+    #[test]
+    fn retained_admin_preparation_preserves_transport_causes_and_signed_request() {
+        use super::super::clean_store::tests::Fixture;
+        use super::*;
+        use vos::agent::sdk::{
+            CredentialId, InvocationId, NodeId, RoleId, authority::AuthorityAdminOperation,
+        };
+        let fixture = Fixture::new("retained-admin-transport");
+        let (operator, authority, descriptor, _) = super::super::local_create::tests::fixture();
+        let public = operator.public().try_into_ed25519().unwrap().to_bytes();
+        let mut draft = AuthorityAdminCall {
+            invocation: InvocationId::ZERO,
+            authority,
+            administrator: descriptor.identity.owner,
+            credential: CredentialId::of_public_key(&public),
+            request_sequence: core::num::NonZeroU64::new(1).unwrap(),
+            credential_public_key: public,
+            authenticated_node: NodeId([9; 32]),
+            observed_slot: 0,
+            expected_generation: core::num::NonZeroU64::new(1).unwrap(),
+            operation: AuthorityAdminOperation::SetSpaceRole {
+                principal: descriptor.identity.owner,
+                role: RoleId([0x51; 32]),
+                granted: true,
+            },
+            signature: [1; 64],
+        };
+        draft.invocation = draft.expected_invocation();
+        draft.signature = operator
+            .sign(&draft.signing_bytes())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        draft
+            .verify_with(&super::super::local_create::CredentialVerifier)
+            .unwrap();
+        let exact = draft.encode().unwrap();
+        CleanOperationClientFile::open_admin_preparation(&fixture.root)
+            .unwrap()
+            .publish_request(&exact)
+            .unwrap();
+        let unavailable = b"HTTP/1.1 503 Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        for response in [Some(unavailable.as_slice()), None] {
+            let (address, server) = super::super::local_create::tests::binary_response_for_test(
+                "/__agents/admin/prepare",
+                &exact,
+                response,
+            );
+            let error = deliver(&fixture.root, None, address, true).unwrap_err();
+            server.join().unwrap();
+            let cause = error
+                .downcast_ref::<ureq::Error>()
+                .expect("typed HTTP/transport cause");
+            assert!(match response {
+                Some(_) => matches!(cause, ureq::Error::Status(503, _)),
+                None => matches!(cause, ureq::Error::Transport(_)),
+            });
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "{cause}; exact admin request retained; outcome may be unknown; retry the same request directory"
+                )
+            );
+            let mut retained =
+                CleanOperationClientFile::open_admin_preparation(&fixture.root).unwrap();
+            assert!(
+                retained.load_request().unwrap().unwrap() == exact,
+                "admin draft changed after ambiguity"
+            );
+            assert!(retained.load_response().unwrap().is_none());
         }
     }
 }
