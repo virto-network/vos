@@ -54,6 +54,10 @@ pub(super) enum Exercise {
     #[cfg(feature = "experimental-state-blocks")]
     OperationPrepareRegistrationTimeout,
     #[cfg(feature = "experimental-state-blocks")]
+    OperationPrepareJournalPrewrite,
+    #[cfg(feature = "experimental-state-blocks")]
+    OperationPrepareJournalWriteThenError,
+    #[cfg(feature = "experimental-state-blocks")]
     OperationPrepareRegistrationTimeoutCold,
     #[cfg(feature = "experimental-state-blocks")]
     AdminJournalPrewrite,
@@ -93,6 +97,30 @@ fn candidate_operation_prepare_registration_timeout_exact_retry_passes_productio
     assert!(std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some());
     check_fixed_system_pending_cluster_with_checkpoint(
         true, Some(Exercise::OperationPrepareRegistrationTimeout),
+    );
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+#[test]
+#[ignore = "requires coherent Authority/System IMAGE components and three authenticated loopback transports"]
+fn candidate_operation_prepare_journal_prewrite_exact_retry_checks_complete_live_family() {
+    assert!(std::env::var_os("AUTHORITY_CANDIDATE_ELF").is_some());
+    assert!(std::env::var_os("VOS_AGENT_RUNTIME_COST_CANDIDATE").is_some());
+    assert!(std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some());
+    check_fixed_system_pending_cluster_with_checkpoint(
+        true, Some(Exercise::OperationPrepareJournalPrewrite),
+    );
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+#[test]
+#[ignore = "requires coherent Authority/System IMAGE components and three authenticated loopback transports"]
+fn candidate_operation_prepare_journal_write_then_error_confirms_exact_retention_and_clears_live_proof() {
+    assert!(std::env::var_os("AUTHORITY_CANDIDATE_ELF").is_some());
+    assert!(std::env::var_os("VOS_AGENT_RUNTIME_COST_CANDIDATE").is_some());
+    assert!(std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some());
+    check_fixed_system_pending_cluster_with_checkpoint(
+        true, Some(Exercise::OperationPrepareJournalWriteThenError),
     );
 }
 
@@ -445,10 +473,15 @@ pub(super) fn exercise(
         return;
     }
     #[cfg(feature = "experimental-state-blocks")]
-    if matches!(exercise, Exercise::OperationPrepareRegistrationTimeout | Exercise::OperationPrepareRegistrationTimeoutCold) {
+    if matches!(exercise, Exercise::OperationPrepareRegistrationTimeout | Exercise::OperationPrepareJournalPrewrite | Exercise::OperationPrepareJournalWriteThenError | Exercise::OperationPrepareRegistrationTimeoutCold) {
         operation_prepare_recovery::exercise(
             leader, owners, fixtures, directories, stores, providers, networks.as_slice(), signer,
-            matches!(exercise, Exercise::OperationPrepareRegistrationTimeoutCold),
+            match exercise {
+                Exercise::OperationPrepareJournalPrewrite => operation_prepare_recovery::Cut::PreparationPrewrite,
+                Exercise::OperationPrepareJournalWriteThenError => operation_prepare_recovery::Cut::PreparationWriteThenError,
+                Exercise::OperationPrepareRegistrationTimeoutCold => operation_prepare_recovery::Cut::RegistrationTimeoutCold,
+                _ => operation_prepare_recovery::Cut::RegistrationTimeout,
+            },
         );
         return;
     }
@@ -501,7 +534,7 @@ pub(super) fn exercise(
         #[cfg(feature = "experimental-state-blocks")]
         Exercise::GenesisPublicationRetry => unreachable!(),
         #[cfg(feature = "experimental-state-blocks")]
-        Exercise::OperationPrepareRegistrationTimeout | Exercise::OperationPrepareRegistrationTimeoutCold => unreachable!(),
+        Exercise::OperationPrepareRegistrationTimeout | Exercise::OperationPrepareJournalPrewrite | Exercise::OperationPrepareJournalWriteThenError | Exercise::OperationPrepareRegistrationTimeoutCold => unreachable!(),
         #[cfg(feature = "experimental-state-blocks")]
         Exercise::AdminJournalPrewrite
         | Exercise::AdminRegistrationTimeout

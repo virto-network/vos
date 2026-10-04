@@ -22,6 +22,17 @@ use crate::agent_sdk::InvocationContext;
 use crate::agent_sdk::wire::CanonicalWire as _;
 use crate::actors::codec::{Decode as _, Encode as _};
 
+#[path = "operation_pending_validation.rs"]
+mod operation_pending_validation;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Cut {
+    RegistrationTimeout,
+    PreparationPrewrite,
+    PreparationWriteThenError,
+    RegistrationTimeoutCold,
+}
+
 struct NoLifecycleStores;
 impl LocalLifecycleStoreFactory for NoLifecycleStores {
     type Intent = IssuerMemoryStore;
@@ -74,6 +85,8 @@ impl NativeAuthorityOperationDenialSigner for NoSigning {
 struct Journal {
     inner: OperationTestJournal,
     writes: Arc<AtomicUsize>,
+    fail_before: bool,
+    fail_after: bool,
 }
 impl NativeAuthorityOperationJournalStore for Journal {
     type Error = std::io::Error;
@@ -82,7 +95,14 @@ impl NativeAuthorityOperationJournalStore for Journal {
     }
     fn retain(&mut self, id: InvocationId, bytes: &[u8]) -> Result<(), Self::Error> {
         self.writes.fetch_add(1, Ordering::AcqRel);
-        self.inner.retain(id, bytes)
+        if core::mem::take(&mut self.fail_before) {
+            return Err(std::io::Error::other("native preparation journal prewrite cut"));
+        }
+        self.inner.retain(id, bytes)?;
+        if core::mem::take(&mut self.fail_after) {
+            return Err(std::io::Error::other("native preparation journal committed before error"));
+        }
+        Ok(())
     }
 }
 
@@ -141,8 +161,13 @@ pub(super) fn exercise(
     providers: &[Arc<MemoryProvider>],
     networks: &[Arc<Network>],
     signer: &mut CountingSigner,
-    cold_reopen: bool,
+    cut: Cut,
 ) {
+    let cold_reopen = cut == Cut::RegistrationTimeoutCold;
+    let preparation_prewrite = cut == Cut::PreparationPrewrite;
+    let journal_written = cut == Cut::PreparationWriteThenError;
+    let cut_writes = usize::from(preparation_prewrite || journal_written);
+    let confirmation_writes = usize::from(journal_written);
     assert_eq!(owners.len(), 3);
     let agent = HostAgentId(fixtures[origin].plan.pins.agent.0);
     for owner in owners.iter().flatten() {
@@ -291,65 +316,81 @@ pub(super) fn exercise(
         target,
         OperationTestImageFile(coordinator_path.clone()),
         OperationTestImageFile(issuer_path.clone()),
-        Journal { inner: OperationTestJournal(journal_path.clone()), writes: Arc::clone(&writes) },
+        Journal { inner: OperationTestJournal(journal_path.clone()), writes: Arc::clone(&writes), fail_before: preparation_prewrite, fail_after: journal_written },
     );
     assert!(!operations.retains_call(&call, None).unwrap());
     assert!(owner._network_host.current_management_pending(agent, call.invocation).unwrap().is_none());
     let position_before = owner.host.lock().unwrap().journal_position(agent).unwrap();
     let recovery_started = std::time::Instant::now();
     let deadline = recovery_started + std::time::Duration::from_secs(30);
-    let database = owner.host.lock().unwrap().raft_database(agent).unwrap();
-    let meta_before = crate::raft::RaftMeta::load(&database).unwrap();
-    let last_before = crate::raft::RaftLog::open(Arc::clone(&database)).unwrap().last_index();
-    assert_eq!(meta_before.commit_index, last_before);
-    let mut restore = RestoreIsolationOnDrop { owners, agent, armed: true };
-    for owner in restore.owners.iter().flatten() {
-        owner._network_host.set_raft_isolated_for_test(agent, true).unwrap();
-    }
-    let cut_started = std::time::Instant::now();
-    let cut = operations.prepare_call(restore.owners[origin].as_mut().unwrap(), &call);
-    let cut_elapsed = cut_started.elapsed();
-    // Decode the exact actual append before permitting replication. A delayed
-    // response alone would not prove commit occurred after preparation returned
-    // without reaching the journal callback.
-    let observed = (|| {
-        let meta = crate::raft::RaftMeta::load(&database)?;
-        let raw = crate::raft::RaftLog::open(Arc::clone(&database))?;
-        let last = raw.last_index();
-        let entries = raw.entries(last, last)?;
-        Ok::<_, crate::commit::CommitError>((meta, last, entries))
-    })();
-    for index in [origin, (origin + 1) % 3] {
-        restore.owners[index].as_ref().unwrap()._network_host.set_raft_isolated_for_test(agent, false).unwrap();
-    }
-    let (meta_after, last_after, entries) = observed.unwrap();
-    assert!(matches!(cut, Err(SharedAgentHostError::Unavailable)));
-    assert!(cut_elapsed >= std::time::Duration::from_millis(1_800));
-    assert!(std::time::Instant::now() < deadline);
-    assert_eq!(writes.load(Ordering::Acquire), 0);
-    assert_eq!(meta_after.commit_index, meta_before.commit_index);
-    assert_eq!(last_after, last_before + 1);
-    assert_eq!(entries.len(), 1);
-    let vos_raft::EntryKind::Data { payload } = crate::agent::shared_raft::decode_agent_raft_entry_kind(&entries[0].payload).unwrap() else {
-        panic!("operation cut must append actual signed metadata");
-    };
-    let crate::agent::shared_raft::AgentRaftCommand::RegisterManagementRecovery { registration, .. } = crate::agent::shared_raft::AgentRaftCommand::decode(&payload).unwrap() else {
-        panic!("operation cut must append RegisterManagementRecovery");
-    };
-    drop(database);
-    let retained = {
-        let owner = restore.owners[origin].as_ref().unwrap();
-        retry_until(deadline, "operation original late registration", || {
-        let manifest = owner._network_host.management_recovery_manifest(agent)?;
-        let Some(slot) = manifest.management_slot(HostNodeId(owner.pins.node.0)).filter(|slot| {
+    let retained = if preparation_prewrite || journal_written {
+        // The exact existing fsync journal either refuses before its first
+        // write or commits that write before returning an error. Both cuts
+        // follow real signed registration and exact map publication.
+        let result = operations.prepare_call(owners[origin].as_mut().unwrap(), &call);
+        assert!(matches!(result, Err(SharedAgentHostError::Unavailable)));
+        assert_eq!(writes.load(Ordering::Acquire), 1);
+        assert!(std::time::Instant::now() < deadline);
+        let owner = owners[origin].as_ref().unwrap();
+        let manifest = owner._network_host.management_recovery_manifest(agent).unwrap();
+        manifest.management_slot(HostNodeId(owner.pins.node.0)).filter(|slot| {
             !slot.is_released() && slot.members().first().is_some_and(|member| member.work().invocation == call.invocation)
-        }) else { return Err(SharedAgentHostError::Unavailable); };
-        assert!(slot.registration() == &registration);
-        Ok(slot.clone())
-        })
+        }).expect("prewrite callback requires the actual signed original root").clone()
+    } else {
+        let database = owner.host.lock().unwrap().raft_database(agent).unwrap();
+        let meta_before = crate::raft::RaftMeta::load(&database).unwrap();
+        let last_before = crate::raft::RaftLog::open(Arc::clone(&database)).unwrap().last_index();
+        assert_eq!(meta_before.commit_index, last_before);
+        let mut restore = RestoreIsolationOnDrop { owners, agent, armed: true };
+        for owner in restore.owners.iter().flatten() {
+            owner._network_host.set_raft_isolated_for_test(agent, true).unwrap();
+        }
+        let cut_started = std::time::Instant::now();
+        let cut = operations.prepare_call(restore.owners[origin].as_mut().unwrap(), &call);
+        let cut_elapsed = cut_started.elapsed();
+        // Decode the exact actual append before permitting replication. A delayed
+        // response alone would not prove commit occurred after preparation returned
+        // without reaching the journal callback.
+        let observed = (|| {
+            let meta = crate::raft::RaftMeta::load(&database)?;
+            let raw = crate::raft::RaftLog::open(Arc::clone(&database))?;
+            let last = raw.last_index();
+            let entries = raw.entries(last, last)?;
+            Ok::<_, crate::commit::CommitError>((meta, last, entries))
+        })();
+        for index in [origin, (origin + 1) % 3] {
+            restore.owners[index].as_ref().unwrap()._network_host.set_raft_isolated_for_test(agent, false).unwrap();
+        }
+        let (meta_after, last_after, entries) = observed.unwrap();
+        assert!(matches!(cut, Err(SharedAgentHostError::Unavailable)));
+        assert!(cut_elapsed >= std::time::Duration::from_millis(1_800));
+        assert!(std::time::Instant::now() < deadline);
+        assert_eq!(writes.load(Ordering::Acquire), cut_writes);
+        assert_eq!(meta_after.commit_index, meta_before.commit_index);
+        assert_eq!(last_after, last_before + 1);
+        assert_eq!(entries.len(), 1);
+        let vos_raft::EntryKind::Data { payload } = crate::agent::shared_raft::decode_agent_raft_entry_kind(&entries[0].payload).unwrap() else {
+            panic!("operation cut must append actual signed metadata");
+        };
+        let crate::agent::shared_raft::AgentRaftCommand::RegisterManagementRecovery { registration, .. } = crate::agent::shared_raft::AgentRaftCommand::decode(&payload).unwrap() else {
+            panic!("operation cut must append RegisterManagementRecovery");
+        };
+        drop(database);
+        let retained = {
+            let owner = restore.owners[origin].as_ref().unwrap();
+            retry_until(deadline, "operation original late registration", || {
+            let manifest = owner._network_host.management_recovery_manifest(agent)?;
+            let Some(slot) = manifest.management_slot(HostNodeId(owner.pins.node.0)).filter(|slot| {
+                !slot.is_released() && slot.members().first().is_some_and(|member| member.work().invocation == call.invocation)
+            }) else { return Err(SharedAgentHostError::Unavailable); };
+            assert!(slot.registration() == &registration);
+            Ok(slot.clone())
+            })
+        };
+        restore.restore_checked().unwrap();
+        drop(restore);
+        retained
     };
-    restore.restore_checked().unwrap();
-    drop(restore);
     let owner = owners[origin].as_ref().unwrap();
     assert_eq!(retained.owner(), HostNodeId(owner.pins.node.0));
     assert_eq!(retained.origin_owner(), retained.owner());
@@ -377,28 +418,69 @@ pub(super) fn exercise(
     let original_anchor = member.anchor().clone();
     assert!(retained.members_evidence()[0].invoke().is_none());
     assert!(retained.members_evidence()[0].acknowledgement().is_none());
-    assert!(owner._network_host.current_management_pending(agent, call.invocation).unwrap().is_none());
-    assert!(matches!(owner._network_host.ensure_management_pending_member(agent, &original_anchor, &original_work), Err(SharedAgentHostError::Conflict)));
-    assert!(!operations.retains_call(&call, None).unwrap());
+    let pending_at_cut = owner._network_host.current_management_pending(agent, call.invocation).unwrap();
+    if preparation_prewrite || journal_written {
+        assert!(pending_at_cut == Some((original_anchor.clone(), original_work.clone())));
+        owner._network_host.ensure_management_pending_member(agent, &original_anchor, &original_work).unwrap();
+    } else {
+        assert!(pending_at_cut.is_none());
+        assert!(matches!(owner._network_host.ensure_management_pending_member(agent, &original_anchor, &original_work), Err(SharedAgentHostError::Conflict)));
+    }
+    let marker = owner.unpublished_operation_attempt.as_ref().unwrap();
+    assert!(marker.request() == &request);
+    assert!(marker.envelope() == &original_work);
+    assert!(marker.anchor() == &original_anchor);
+    assert_eq!(operations.retains_call(&call, None).unwrap(), journal_written);
     let mut view = OperationTestJournal(journal_path.clone());
-    assert!(view.load(call.invocation).unwrap().is_none());
-    assert_eq!(writes.load(Ordering::Acquire), 0);
+    let journal_at_cut = view.load(call.invocation).unwrap();
+    assert_eq!(journal_at_cut.is_some(), journal_written);
+    if let Some(bytes) = &journal_at_cut {
+        let recorded = RetainedAuthorityOperationDispatch::decode(bytes).unwrap();
+        assert!(recorded.encode().unwrap() == *bytes);
+        assert!(recorded == *marker);
+    }
+    assert_eq!(writes.load(Ordering::Acquire), cut_writes);
     assert!(!coordinator_path.exists());
     assert!(!issuer_path.exists());
     assert!(owner.management_admission_held().unwrap());
     assert!(owner.host.lock().unwrap().journal_position(agent).unwrap() == position_before);
     assert!(owner.host.lock().unwrap().clean_state_commitment(agent).unwrap() == state_before);
     assert!(call.encode().unwrap() == exact_call);
-    eprintln!("fixed_three_operation_prepare phase=late_exact_root nod_present=false map_present=false elapsed_ms={}", recovery_started.elapsed().as_millis());
+    eprintln!("fixed_three_operation_prepare phase=exact_root nod_present={} map_present={} journal_prewrite={} journal_write_error={} elapsed_ms={}", journal_written, pending_at_cut.is_some(), preparation_prewrite, journal_written, recovery_started.elapsed().as_millis());
     let bootstrap_bytes = || (stores[origin].0.image(), stores[origin].0.commits(), stores[origin].1.image(), stores[origin].1.commits(), stores[origin].2.image.lock().unwrap().clone());
     let durable_before = bootstrap_bytes();
     let record_before = owner.record.encode();
+    operation_pending_validation::pending(
+        owners[origin].as_mut().unwrap(), &mut operations, &retained, &request,
+        &original_work, &original_anchor, &absent_call, &changed_call,
+        &journal_path, &coordinator_path, &issuer_path, &writes, journal_at_cut.as_deref(),
+    );
+    assert!(std::time::Instant::now() <= deadline);
+    if journal_written {
+        // A bytes-present retry must confirm actual durable NOD retention,
+        // then clear only this exact same-open proof. No guest or issuer runs.
+        let owner = owners[origin].as_mut().unwrap();
+        let original_marker = owner.unpublished_operation_attempt.clone().unwrap();
+        assert!(original_marker.encode().unwrap() == journal_at_cut.as_ref().unwrap().as_slice());
+        let confirmed = operations.prepare_call(owner, &call).unwrap();
+        assert!(confirmed == context);
+        assert!(owner.unpublished_operation_attempt.is_none());
+        assert!(view.load(call.invocation).unwrap() == journal_at_cut);
+        assert_eq!(writes.load(Ordering::Acquire), cut_writes + confirmation_writes);
+        assert!(owner.host.lock().unwrap().journal_position(agent).unwrap() == position_before);
+        assert!(owner.host.lock().unwrap().clean_state_commitment(agent).unwrap() == state_before);
+        assert!(owner.host.lock().unwrap().recovery_manifest(agent).unwrap().management_slot(retained.owner()) == Some(&retained));
+        assert!(!coordinator_path.exists());
+        assert!(!issuer_path.exists());
+        assert!(std::time::Instant::now() <= deadline);
+        eprintln!("fixed_three_operation_prepare phase=journal_retention_confirmed marker_cleared=true elapsed_ms={}", recovery_started.elapsed().as_millis());
+    }
     let chosen = if cold_reopen {
         owners[origin].as_mut().unwrap()._network_host.retire_attachment_for_test(agent).unwrap();
         drop(owners[origin].take().unwrap());
         let assert_no_adoption = || {
             assert!(bootstrap_bytes() == durable_before);
-            assert_eq!(writes.load(Ordering::Acquire), 0);
+            assert_eq!(writes.load(Ordering::Acquire), cut_writes);
             let mut view = OperationTestJournal(journal_path.clone());
             for call in [&call, &absent_call, &changed_call] {
                 assert!(view.load(call.invocation).unwrap().is_none());
@@ -453,6 +535,7 @@ pub(super) fn exercise(
         };
         drop(pending);
         assert!(reopened.record.encode() == record_before);
+        assert!(reopened.unpublished_operation_attempt.is_none());
         assert!(reopened.management_admission_held().unwrap());
         assert!(reopened._network_host.current_management_pending(agent, call.invocation).unwrap().is_none());
         assert!(reopened._network_host.management_recovery_manifest(agent).unwrap().management_slot(retained.owner()) == Some(&retained));
@@ -486,8 +569,9 @@ pub(super) fn exercise(
     let assert_no_dispatch = || {
         assert!(bootstrap_bytes() == durable_before);
         let mut view = OperationTestJournal(journal_path.clone());
-        for call in [&call, &absent_call, &changed_call] { assert!(view.load(call.invocation).unwrap().is_none()); }
-        assert_eq!(writes.load(Ordering::Acquire), 0);
+        assert!(view.load(call.invocation).unwrap() == journal_at_cut);
+        for call in [&absent_call, &changed_call] { assert!(view.load(call.invocation).unwrap().is_none()); }
+        assert_eq!(writes.load(Ordering::Acquire), cut_writes + confirmation_writes);
         assert!(!coordinator_path.exists());
         assert!(!issuer_path.exists());
         let mut hosted = host.lock().unwrap();
@@ -514,7 +598,7 @@ pub(super) fn exercise(
         return;
     }
     assert_no_dispatch();
-    eprintln!("fixed_three_operation_prepare phase=normal_guard_retry nod_present=false elapsed_ms={}", recovery_started.elapsed().as_millis());
+    eprintln!("fixed_three_operation_prepare phase=normal_guard_retry nod_present={} elapsed_ms={}", journal_written, recovery_started.elapsed().as_millis());
     // The supported BEFORE reproduction reaches this real unready owner
     // guard. Preparation must repair the original exact native input; issuing
     // a receipt or executing guest policy is deliberately outside this test.
@@ -531,7 +615,7 @@ pub(super) fn exercise(
     assert!(nod.request() == &request);
     assert!(nod.envelope() == &original_work);
     assert!(nod.anchor() == &original_anchor);
-    assert_eq!(writes.load(Ordering::Acquire), 1);
+    assert_eq!(writes.load(Ordering::Acquire), cut_writes + confirmation_writes + 1);
     assert!(host.lock().unwrap().journal_position(agent).unwrap() == position_before);
     assert!(host.lock().unwrap().clean_state_commitment(agent).unwrap() == state_before);
     assert!(host.lock().unwrap().recovery_manifest(agent).unwrap().management_slot(retained.owner()) == Some(&retained));
@@ -541,7 +625,7 @@ pub(super) fn exercise(
     let repeated = retry_until(deadline, "prepared exact operation retry", || production.prepare_operation(&call));
     assert!(repeated == prepared);
     assert!(view.load(call.invocation).unwrap() == Some(saved));
-    assert_eq!(writes.load(Ordering::Acquire), 2);
+    assert_eq!(writes.load(Ordering::Acquire), cut_writes + confirmation_writes + 2);
     assert!(view.load(absent_call.invocation).unwrap().is_none());
     assert!(view.load(changed_call.invocation).unwrap().is_none());
     assert!(host.lock().unwrap().journal_position(agent).unwrap() == position_before);
