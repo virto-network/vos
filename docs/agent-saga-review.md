@@ -102,32 +102,44 @@ Current O3 component evidence (logs under the native worktree's `target`):
 
 ### Current integration delta and blocking result
 
-Current portable host boundary `a1000b15` builds main/harness **389.592s /
-454.561s**, empty RUSTFLAGS with encoded/target overrides unset; frozen hashes
-and strict six-file verification **0.101s** are recorded. Three adjacent Local
-frontend checks pass: two **0.384s / 0.111s**, plus the transport check's exact
-permitted rerun **0.19s** after sandbox bind EPERM (**0.031s**). No bound is
-waived. Review the exact selected Clerk/release and private provenance referenced
-by the live plan; packaging/frontend passes do not close M1.
+Current portable host boundary `5c2bf99c` builds main/harness **191.197s /
+252.859s**, empty RUSTFLAGS with encoded/target overrides unset; exact frozen
+hashes and strict six-file verification **0.101s** are recorded. Reviewed
+retained-client context corrections preserve typed transport causes and exact
+requests. Their final three exact regressions pass **0.41s / 0.88s / 0.04s**;
+adjacent Local frontend checks remain qualified, including the permitted exact
+transport rerun after sandbox bind EPERM. Unrelated zero-selection filters are
+not passes. Component and packaging checks do not close M1.
 
-The first serial public gate **fails 310.133s**, last verified nonleader Install
-at cumulative **109.011s**. It does not reach bootstrap Issued authorization,
-Clerk execution/lost response, positive ACK or whole locked-owner reopen.
-The saved recompiler/refinement fixture environment does not qualify ordinary
-production-default or hardware behavior.
-`/__agents/prepare-authorization` returns HTTP 503; the diagnostic wrapper in
-`operation_authorization::prepare_retained` discards the typed cause, so the
-existing exact retry helper mistakes a transient refusal for a nonretryable error.
-Review the narrow context-preserving correction and real retained-client
-regressions. Preparation **fails before 0.22s**; adjacent authorization-submit
-and ordinary Invoke independently reproduce type loss (**0.28s / 0.01s**).
-Their final exact regressions **pass 0.41s / 0.88s / 0.04s**, including genuinely
-lost replies, fatal malformed/substituted response refusal, original request
-bytes/writer ownership and cached reopen. Unrelated zero-selection filters are
-not passes. Public attribution remains preparation only. Current portable
-rebuild/public execution stay open; these component fixes do not establish the
-backend HTTP 503 cause, guest outcome or timing qualification. No tuning pass
-is consumed. The live plan owns exact evidence paths and remaining dependencies.
+Quiet public execution **fails 379.809s** at the unchanged **120s** bootstrap
+issuance retry cap after verified nonleader Install at cumulative **113.317s**.
+The isolated scoped rerun **fails 426.664s** at the same preparation endpoint/cap,
+last verified Install **116.573s**. Neither reaches bootstrap Issued, Clerk
+mutation/lost response, positive ACK or whole locked-owner reopen; the other
+four serial gates are unexecuted. Saved recompiler/refinement fixture evidence
+is distinct from ordinary production-default and hardware qualification. Both
+owned command groups exit.
+
+Existing scoped warnings show one initial native preparation **Unavailable**,
+then **175 ScopeMismatch** results delivered as
+`/__agents/prepare-authorization` HTTP 503. The first call takes **7.205s** and
+contains origin register custody timeout **1.806s**; a peer subsequently completes
+the matching displayed registration at **4.188s** in its own episode. Debug
+digests are truncated, so this correlates phases without proving full-byte
+identity. After that delayed episode, existing scoped diagnostics have no subsequent
+metadata/custody trace.
+Review `clean_operation_dispatch::prepare_call` and
+`shared_agent::extend_management_pending`: timeout precedes the NOD1 callback
+and current-map insertion. `retains_call` consults NOD1 only, and normal unready
+production admission rejects unretained preparation. This is a source hypothesis
+consistent with the observed failures; actual missing NOD1/map state and the
+precise guard have **not yet been proven**. A real signed fixed-three regression
+through normal production admission must establish the cause before correction.
+Current observation guest outcome blocks are test-only in the CLI-linked core
+dependency; absent outcome traces do not establish the guest result. No guest-failure or
+performance-only conclusion, deadline increase or tuning pass is justified.
+The live plan owns exact evidence paths, prior typed-error component results and
+remaining dependencies; current public qualification stays open.
 
 The earlier corrected role-source boundary `2e19cd17` freezes these changes,
 which close demonstrated M1 defects without changing authorization, wire bounds

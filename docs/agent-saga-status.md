@@ -37,38 +37,50 @@ deployment is automatic.
 
 ## Current position
 
-Latest host boundary: portable main and harness from clean `a1000b15` **pass
-389.592s / 454.561s**, with empty RUSTFLAGS, encoded/target overrides unset,
-exact frozen binary hashes and current strict six-file verification **0.101s**.
-Three adjacent Local frontend checks pass; the transport check first refuses
-sandbox loopback bind (**EPERM, 0.031s**) and passes its permitted exact rerun
-(**0.19s**). The other two pass **0.384s / 0.111s**. These are component and
-packaging checks, not an integrated milestone.
+Latest host boundary: portable main and harness from clean `5c2bf99c` **pass
+191.197s / 252.859s**, with empty RUSTFLAGS, encoded/target overrides unset,
+exact frozen binary hashes and strict six-file verification **0.101s**. The
+reviewed retained-client diagnostic-context corrections preserve typed transport
+causes without changing signed bytes or deadlines. Their three exact component
+regressions pass **0.41s / 0.88s / 0.04s**; adjacent Local frontend checks remain
+qualified, including the exact permitted loopback rerun after sandbox EPERM.
+Component and packaging passes do not close M1.
 
-The first serial packaged public gate **fails 310.133s**. Its last verified
-marker is nonleader Install at cumulative **109.011s**; bootstrap issuance,
-Clerk mutation/lost response, exact result/ACK and locked reopen are unreached.
-This uses the saved recompiler/refinement fixture environment, not ordinary
-production-default or hardware qualification.
-The failing `/__agents/prepare-authorization` HTTP 503 loses its typed cause
-when `operation_authorization::prepare_retained` converts the error to a new
-string-only diagnostic. The existing retry helper therefore treats the transient
-response as nonretryable instead of retrying the retained AOC5. This establishes a
-client classification defect, not the backend reason for HTTP 503 or a guest,
-freshness, finalization or performance-only failure.
+The first serial packaged public gate **fails 379.809s** at the unchanged
+**120s** bootstrap issuance retry cap. Its last verified marker is nonleader
+Install at cumulative **113.317s**. The isolated scoped rerun **fails 426.664s**
+at the same preparation endpoint/cap after nonleader Install **116.573s**.
+Neither reaches bootstrap Issued authorization, Clerk mutation/lost response,
+exact result/ACK or whole locked-owner reopen. The remaining four serial gates
+are unexecuted. This is saved recompiler/refinement fixture evidence, not
+ordinary production-default or hardware qualification; owned groups exit.
 
-The existing preparation regression **fails before, 0.22s**. Adjacent retained
-authorization-submit and ordinary Invoke regressions independently reproduce
-the same type loss (**0.28s / 0.01s**); the public run attributes only preparation.
-Identical narrow diagnostic-context corrections preserve original typed errors
-and requests. Final three exact regressions **pass 0.41s / 0.88s / 0.04s**,
-including genuinely lost transport replies, invalid/wrong/old response refusal,
-exact bytes, exclusive ownership and cached reopen. Unrelated zero-selection
-integration filters are not evidence. Current portable rebuild/public execution
-remain open; no server-503 cause or service-tuning pass is established.
-Evidence under the native worktree's target:
-`task-tmp/r40-cli-build-a1000b15/{provenance.json,local-install-related.log,local-install-transport-loopback-rerun.log}`,
-`task-tmp/r40-packaged-five-a1000b15/public.{stdout,stderr,result.json}` and
+The corrected client now retries retained AOC5 after
+`/__agents/prepare-authorization` HTTP 503. Scoped evidence establishes one
+initial native preparation **Unavailable**, then **175 ScopeMismatch** results.
+That first call takes **7.205s**: origin registration custody times out at
+**1.806s**, then a peer completes a matching displayed registration at
+**4.188s** in its own commit episode. The displayed digests are truncated;
+this is phase correlation, not independent full-byte identity proof. Subsequent
+503s continue; after that delayed episode, existing scoped diagnostics have no
+subsequent metadata/custody trace. Source shows the timeout
+precedes the NOD1 callback and current pending-map insertion, while retained
+operation admission requires NOD1. Actual missing-NOD1/map state and the precise
+normal readiness refusal are **not yet proven**; a supported fixed-three signed
+regression must establish the cause before a correction. Current packaged
+observation guest outcome blocks are test-only in the linked core dependency,
+so their absence establishes no guest outcome. No performance-only conclusion,
+deadline increase or service-tuning pass is warranted.
+
+The earlier typed-error defect and before/after component evidence remain in
+the R40f logs; unrelated zero-selection integration filters are not evidence.
+Current provenance and public evidence under the native worktree's target:
+`task-tmp/r40-cli-build-5c2bf99c/provenance.json`,
+`task-tmp/r40-packaged-five-5c2bf99c/public.{stdout,stderr,result.json}` and
+`task-tmp/r40-public-scoped-diagnostics-5c2bf99c/public.{stdout,stderr,result.json}`.
+Earlier frontend evidence is
+`task-tmp/r40-cli-build-a1000b15/{local-install-related.log,local-install-transport-loopback-rerun.log}`;
+client component logs are
 `release-observation-o3-{preparation,authorization,invocation}-typed-error-{before,final}-r40f.log`.
 
 | Mandatory gate | Implementation | Integration / qualification |
@@ -672,12 +684,14 @@ snapshot return and leased comparison remain mandatory.
 
 Remaining release work, in dependency order:
 
-1. Integrate the qualified same-open Admin and image Local corrections into
-   the packaged public workflow. The `a1000b15` portable builds and strict bundle
-   verify pass, but public execution stops before bootstrap issuance. Freeze the
-   reviewed retained-client typed-cause corrections, rebuild current portable
-   host binaries with exact provenance, then rerun the same public gate before later
-   selectors. Preserve its existing 120s correctness retry and whole30 recovery.
+1. Resolve native operation preparation after ambiguous registration in the
+   packaged public workflow. Current `5c2bf99c` portable builds/strict bundle pass;
+   the typed-cause correction is integrated, but quiet/scoped public runs still
+   stop at preparation before bootstrap issuance. Prove the missing-NOD1/readiness
+   seam with real signed fixed-three registration and normal production admission,
+   fix only the demonstrated defect, then freeze/rebuild current portable hosts
+   and rerun the same public gate before later selectors. Preserve the existing
+   120s correctness retry and whole30 recovery.
    Supported fixed-three Local late-registration, prewrite, compound handoff
    and normal cold-refusal cuts pass R40e under original whole30. They do not
    retrospectively attribute the first R39w CLI interruption or prove filesystem
@@ -781,9 +795,9 @@ Separate forecasts and unknowns:
   resulting correction is qualified.
   The **2–6 elapsed-hour**
   execution band remains conditional and is not a reliable remaining estimate
-  while the remaining recovery gates are open. Current `a1000b15` portable
-  main/harness builds take **389.592s / 454.561s**; recent optimized builds span
-  about **6–8 minutes** each. These measured build costs are not an aggregate
+  while the remaining recovery gates are open. Current `5c2bf99c` portable
+  main/harness builds take **191.197s / 252.859s**; recent optimized builds span
+  about **3–8 minutes** each. These measured build costs are not an aggregate
   milestone estimate.
   Current optimized core R40d takes **13m05s**; three Local component cuts
   pass, while real compound handoff ambiguity exposes a separate normal
@@ -793,9 +807,11 @@ Separate forecasts and unknowns:
   no new authority or service-tuning pass is warranted.
   Admin and supported image Local component terminal completion are verified;
   filesystem lifecycle and public workflow completion remain open. The next
-  public run verifies nonleader Install but stops before bootstrap issuance on
-  lost typed preparation-error classification. The three client component fixes do
-  not attribute the backend HTTP 503 or establish a new guest execution defect
+  quiet/scoped public runs verify nonleader Install, then exhaust the existing
+  bootstrap issuance retry cap on preparation HTTP 503. The initial registration
+  timeout and later matching displayed custody completion narrow the source
+  hypothesis to pre-NOD1 recovery admission, but actual journal/map/guard state
+  remains unproven. The client fixes do not establish a guest execution defect
   or performance-only cause. No reliable aggregate qualification range exists.
   Optimized R38r main and harness builds each take about seven minutes;
   R38s/R38t and first CLI failure establish the current variance. Cold recovery,
