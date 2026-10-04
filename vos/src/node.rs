@@ -2460,7 +2460,7 @@ impl IngressHandle {
             return Err(crate::agent::local_lifecycle::LocalLifecycleIngressError::Unavailable);
         }
         self.clean_local_lifecycle_queue
-            .submit_shared_install(submission)
+            .submit_shared_install(submission, self.clean_agent_recovering())
     }
 
     /// Queue exact OGAR for warm member admission on an existing local voter.

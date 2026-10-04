@@ -692,6 +692,7 @@ pub(crate) enum PendingLocalLifecycle {
     ))]
     InstallShared {
         submission: SharedInstallSubmission,
+        retained_only: bool,
         reply: mpsc::SyncSender<SharedInstallResult>,
     },
     #[cfg(all(
@@ -985,9 +986,14 @@ impl LocalLifecycleQueue {
     pub(crate) fn submit_shared_install(
         &self,
         submission: SharedInstallSubmission,
+        retained_only: bool,
     ) -> Result<mpsc::Receiver<SharedInstallResult>, LocalLifecycleIngressError> {
         let (reply, receiver) = mpsc::sync_channel(1);
-        self.enqueue(PendingLocalLifecycle::InstallShared { submission, reply })?;
+        self.enqueue(PendingLocalLifecycle::InstallShared {
+            submission,
+            retained_only,
+            reply,
+        })?;
         Ok(receiver)
     }
 
@@ -2407,6 +2413,16 @@ pub(crate) trait NativeLocalLifecycle: Send {
     ) -> Result<(), SharedAgentHostError> {
         Err(SharedAgentHostError::Unavailable)
     }
+    /// Inspect exact already-owned Install inputs without creating custody.
+    /// Backends without retained Shared management grant no recovery exception.
+    fn retained_shared_install_locator(
+        &mut self,
+        _install: &super::sdk::InstallActor,
+        _call: &AuthorityCredentialCall,
+        _package: &super::package_admission::AdmittedActorPackage,
+    ) -> Result<Option<super::genesis::AgentGenesisLocator>, SharedAgentHostError> {
+        Err(SharedAgentHostError::Unavailable)
+    }
     fn prepare_shared_install(
         &mut self,
         _install: super::sdk::InstallActor,
@@ -2714,6 +2730,14 @@ where
         locator: super::genesis::AgentGenesisLocator,
     ) -> Result<(), SharedAgentHostError> {
         LocalLifecycleController::initialize_shared_management(self, locator)
+    }
+    fn retained_shared_install_locator(
+        &mut self,
+        install: &super::sdk::InstallActor,
+        call: &AuthorityCredentialCall,
+        package: &super::package_admission::AdmittedActorPackage,
+    ) -> Result<Option<super::genesis::AgentGenesisLocator>, SharedAgentHostError> {
+        LocalLifecycleController::retained_shared_install_locator(self, install, call, package)
     }
     fn prepare_shared_install(
         &mut self,
@@ -3030,6 +3054,15 @@ where
         call: &AuthorityCredentialCall,
     ) -> Result<Option<SharedInstallDenial>, SharedAgentHostError>;
 
+    fn retained_install_locator(
+        &mut self,
+        _: &super::sdk::InstallActor,
+        _: &AuthorityCredentialCall,
+        _: &super::package_admission::AdmittedActorPackage,
+    ) -> Result<Option<super::genesis::AgentGenesisLocator>, SharedAgentHostError> {
+        Err(SharedAgentHostError::Unavailable)
+    }
+
     fn reserve_create(
         &mut self,
         _: &AgentDescriptor,
@@ -3161,6 +3194,15 @@ where
         signer: &mut S,
     ) -> Result<(), SharedAgentHostError> {
         self.0.initialize_management(owner, locator, signer)
+    }
+
+    fn retained_install_locator(
+        &mut self,
+        install: &super::sdk::InstallActor,
+        call: &AuthorityCredentialCall,
+        package: &super::package_admission::AdmittedActorPackage,
+    ) -> Result<Option<super::genesis::AgentGenesisLocator>, SharedAgentHostError> {
+        self.0.retained_install_locator(install, call, package)
     }
 
     fn prepare_install(
@@ -3308,6 +3350,17 @@ where
     ) -> Result<(), SharedAgentHostError> {
         super::clean_bootstrap::NativeSharedGenesisController::initialize_management(
             self, owner, locator, signer,
+        )
+    }
+
+    fn retained_install_locator(
+        &mut self,
+        install: &super::sdk::InstallActor,
+        call: &AuthorityCredentialCall,
+        package: &super::package_admission::AdmittedActorPackage,
+    ) -> Result<Option<super::genesis::AgentGenesisLocator>, SharedAgentHostError> {
+        super::clean_bootstrap::NativeSharedGenesisController::retained_install_locator(
+            self, install, call, package,
         )
     }
 
@@ -4072,6 +4125,20 @@ where
             .as_mut()
             .ok_or(SharedAgentHostError::Conflict)?
             .initialize_management(&mut system, locator, &mut self.signer)
+    }
+
+    /// Inspect already-owned signed Install and exact immutable package only.
+    /// No System execution, intent initialization or storage factory is used.
+    pub(crate) fn retained_shared_install_locator(
+        &mut self,
+        install: &super::sdk::InstallActor,
+        call: &AuthorityCredentialCall,
+        package: &super::package_admission::AdmittedActorPackage,
+    ) -> Result<Option<super::genesis::AgentGenesisLocator>, SharedAgentHostError> {
+        self.shared_genesis
+            .as_mut()
+            .ok_or(SharedAgentHostError::Conflict)?
+            .retained_install_locator(install, call, package)
     }
 
     /// Retain signed Shared Install inputs without executing Authority or the

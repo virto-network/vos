@@ -1170,14 +1170,14 @@ mod tests {
             Err(LocalLifecycleIngressError::Unavailable)
         ));
         assert!(matches!(
-            queue.submit_shared_install(install.clone()),
+            queue.submit_shared_install(install.clone(), false),
             Err(LocalLifecycleIngressError::Unavailable)
         ));
         queue.open().unwrap();
         let create_reply = queue.submit_shared_create(create.clone(), true).unwrap();
         let mut install_replies = Vec::new();
         for _ in 1..LOCAL_LIFECYCLE_QUEUE_CAPACITY {
-            install_replies.push(queue.submit_shared_install(install.clone()).unwrap());
+            install_replies.push(queue.submit_shared_install(install.clone(), true).unwrap());
         }
         assert!(matches!(
             queue.submit_shared_create(create.clone(), false),
@@ -1197,6 +1197,18 @@ mod tests {
         reply.try_send(Err(error)).unwrap();
         assert_eq!(create_reply.recv().unwrap(), Err(error));
         let create_reply = queue.submit_shared_create(create, false).unwrap();
+        let PendingLocalLifecycle::InstallShared {
+            submission,
+            retained_only,
+            reply,
+        } = queue.pop().unwrap().unwrap()
+        else {
+            panic!("wrong queue variant");
+        };
+        assert_eq!(submission.encode(), install.encode());
+        assert!(retained_only);
+        reply.try_send(Err(error)).unwrap();
+        assert_eq!(install_replies.remove(0).recv().unwrap(), Err(error));
         // Dropping a caller does not cancel the already accepted operation.
         drop(install_replies.remove(0));
         queue.close();
@@ -1206,7 +1218,7 @@ mod tests {
         }
         assert!(queue.pop().unwrap().is_none());
         assert!(matches!(
-            queue.submit_shared_install(install),
+            queue.submit_shared_install(install, false),
             Err(LocalLifecycleIngressError::Unavailable)
         ));
     }

@@ -445,8 +445,12 @@ fn dispatch(owner: &mut AgentProductionOwner, request: PendingLocalLifecycle) {
             feature = "storage",
             feature = "experimental-state-blocks"
         ))]
-        PendingLocalLifecycle::InstallShared { submission, reply } => {
-            let _ = reply.try_send(owner.install_shared_disposition(submission));
+        PendingLocalLifecycle::InstallShared {
+            submission,
+            retained_only,
+            reply,
+        } => {
+            let _ = reply.try_send(owner.install_shared_disposition(submission, retained_only));
         }
         #[cfg(all(
             target_os = "linux",

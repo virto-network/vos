@@ -122,6 +122,26 @@ The active diff closes demonstrated M1 defects, not new capabilities:
   its unchanged retained root/SIQ1 within the existing 120s correctness cap.
   The corrected portable integrated workflow remains unqualified. Preserve
   forwarding/recovery bounds; no service-tuning pass is consumed.
+- Portable R39a main and optimized harness build from clean `7d08ee95` in
+  **7m04s / 7m07s**, with empty RUSTFLAGS and recorded binary provenance.
+  Public R39b **fails 241.95s**: Create completes, but normal exact nonleader
+  Install retries exhaust the unchanged 120s correctness cap. Scoped R39c
+  **fails 255.73s** and establishes a recovery-admission deadlock before
+  Authority management Invoke: original registration custody waits **2.058s**,
+  the leader commits after **7.599s**, and the same origin quarantines on
+  observation Unavailable. Protected admission prevents inventory refresh;
+  HTTP quarantine refuses all subsequent Install retries before dispatch.
+  No Install guest execution, application or terminal release is established.
+  The correction carries retained-only admission through the queue,
+  matches the original coordinator's exact signed intent and admitted package,
+  then uses existing completion. Fresh custody remains forbidden while
+  quarantined; normal leased sidecar reconciliation remains intact. This is
+  correctness integration, not a service-tuning pass. Public qualification is
+  still open; R39b/R39c finish without the earlier shutdown liveness error.
+  Independent review finds no blocker. Native R39d signed-input, owner/queue
+  and HTTP checks **61 pass, 1.53s** after a **1m45s** build; exact, changed,
+  missing and member-only inputs and both readiness races are covered. These
+  are admission checks, not physical Install/finality qualification.
 - First actual three-process CLI run R38u uses the provenance-recorded portable
   binary and exact six-file bundle. Readiness passes **9.744s**, then initial
   Local Create returns an ambiguous HTTP 503 after **10.776s**. The script exits
@@ -358,6 +378,14 @@ Remaining release work, in dependency order:
 4. Progress through unchanged M2 retained-data/parity/resource/recovery/Agent
    backup gates, then locally possible M3 tooling and qualification. Hardware
    qualification remains explicitly open.
+   Backup integration must use the existing certified System/AXJ1 checkpoint
+   and ACX1 restore mechanisms under production ownership, plus authenticated
+   opaque image Local capture and exact client retry state. Permanent freshness
+   ledgers and lock nonces remain outside replaceable journal archives; raw
+   filesystem copying does not qualify this gate. Existing-identity catch-up is
+   in scope; replacement authority after loss of that permanent domain is not
+   established by the existing mechanisms. Local preparation cannot qualify the
+   actual three-node hardware workload, latency, load or soak targets.
 
 Separate forecasts and unknowns:
 
@@ -400,6 +428,9 @@ Separate forecasts and unknowns:
   The focused remaining correction/review band is **1–4 source hours**,
   medium-low confidence, plus **2–6 elapsed hours** of isolated M1 execution if
   no further defect appears. This is not a combined M1/M2/M3 forecast.
+  R39b/R39c expose a further retained-Install quarantine admission gap, so
+  elapsed qualification remains conditional on resolving and reviewing that
+  demonstrated correctness defect; guest execution is not the current failure.
   Optimized R38r main and harness builds each take about seven minutes;
   R38s/R38t and first CLI failure establish the current variance. Cold recovery,
   actual leader-loss coverage, cumulative pruning and cleanup may expose more

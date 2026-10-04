@@ -263,6 +263,27 @@ bytes remain mandatory. Final CLI debug harness compilation passes **4.08s**
 (`release-observation-o3-leader-loss-cli-test-final-r38x.log`); portable build and
 actual execution remain pending.
 
+R39a portable main and optimized harness build from clean `7d08ee95`
+**pass 7m04s / 7m07s** with empty RUSTFLAGS; exact binary provenance is recorded
+in `release-observation-o3-portable-main-provenance-r39a.txt`. R39b public workflow
+**fails 241.95s** despite completed Create and normal exact Install resumes.
+R39c scoped diagnostics **fail 255.73s** and establish a pre-Invoke recovery
+deadlock: original Install custody timeout **2.058s**, later leader registration
+commit **7.599s**, same-origin observation Unavailable/quarantine, no route
+republish, then HTTP rejection of every Install resume. Protected admission
+prevents inventory refresh. No Install guest execution or terminal release is
+established. Review the narrow correction: exact current coordinator
+intent/call/package lookup, retained-only queue restriction through both
+readiness races, then existing completion without fresh initialization or
+preparation. Lookup uses existing leased sidecar loading/reconciliation; it
+cannot create missing inputs or custody. Fresh Install remains blocked during
+quarantine. R39 logs are under the shared target; public qualification remains
+open and no service-tuning pass is consumed. Independent review finds no blocking
+issue. Native R39d signed-input, owner/queue and HTTP checks **61 pass, 1.53s**
+after a **1m45s** build (`release-observation-o3-retained-install-{core,regressions}-r39d.log`).
+They cover exact/changed/missing/member-only inputs and both readiness races;
+they do not qualify physical Install execution, finality or restart recovery.
+
 The portable full CLI suite previously **passes 375 tests**, 52 ignored, 39.53s
 (`release-observation-o3-cli-unit-release-r37a.log`); that boundary predates the
 latest startup/decoder edits. Prior packaged failure timelines remain in

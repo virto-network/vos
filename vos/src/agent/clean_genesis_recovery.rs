@@ -718,6 +718,96 @@ where
         }
     }
 
+    /// Select only an already-owned exact continuing Install. This reads its
+    /// current signed intent and admitted package without opening a lease,
+    /// initializing management, pledging work, or granting route readiness.
+    /// Package loading keeps the existing leased sidecar reconciliation.
+    pub(crate) fn retained_install_locator(
+        &mut self,
+        install: &super::super::sdk::InstallActor,
+        call: &AuthorityCredentialCall,
+        package: &AdmittedActorPackage,
+    ) -> Result<Option<super::super::genesis::AgentGenesisLocator>, SharedAgentHostError>
+    where
+        I: super::super::clean_authority_issuer::CleanManagementActorStore,
+    {
+        if !self.recovered {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let locator = super::super::genesis::AgentGenesisLocator {
+            space: crate::service::SpaceId(call.managed.space.0),
+            agent: crate::service::AgentId(call.managed.agent.0),
+        };
+        if locator.validate().is_err()
+            || call.managed.space != self.authority.space
+            || call.managed.agent == self.authority.system_agent
+            || call.managed.profile != AgentProfile::Shared
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let signed = CleanManagementIntent::new(
+            self.authority,
+            call.managed,
+            ManagementRequest::Install(Box::new(install.clone())),
+            call.clone(),
+            &RawCredentialVerifier,
+        )
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if self
+            .member_archives
+            .iter()
+            .any(|(member, _)| member.agent == locator.agent)
+        {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let Ok(index) = self
+            .entries
+            .binary_search_by_key(&locator.agent, |(entry, _)| entry.locator.agent)
+        else {
+            return Ok(None);
+        };
+        let recovery = &mut self.entries[index].0;
+        if recovery.authority != self.authority || recovery.locator != locator {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let original = recovery
+            .intent
+            .intent()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let ManagementRequest::Create(descriptor) = original.request() else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        signed
+            .verify(self.authority, original.call().managed, &RawCredentialVerifier)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        validate_actor_install(descriptor, signed.request(), package)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let Some(slot) = recovery.management_intent.as_mut() else {
+            return Ok(None);
+        };
+        let Some(retained) = slot.intent() else {
+            return Ok(None);
+        };
+        retained
+            .verify(self.authority, original.call().managed, &RawCredentialVerifier)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if retained.request() != signed.request() || retained.call() != signed.call() {
+            // A terminal current intent may still be retried. A predecessor
+            // or prospective successor is not the current retained operation.
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let Some(retained_package) = slot
+            .load_actor()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        else {
+            return Ok(None);
+        };
+        if retained_package.exact_bytes() != package.exact_bytes() {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        Ok(Some(locator))
+    }
+
     #[cfg(test)]
     pub(super) fn into_entries_for_test(
         self,
@@ -1850,6 +1940,399 @@ fn validate_member_archive_locators(
         return Err(SharedAgentHostError::Conflict);
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "experimental-state-blocks"))]
+mod retained_install_tests {
+    use super::*;
+    use crate::agent::clean_authority_issuer::{
+        CleanExternalLocalCreateArchiveStore, CleanManagementActorStore,
+        CleanManagementRuntimeStore, CleanSharedGenesisReplicaStore,
+    };
+    use crate::agent::sdk::{
+        ActorEntry, AgentIdentity, CredentialId, DeploymentId, InstallActor, InstallationId,
+        PrincipalId, ProducerId, ProgramId, ReplicaRole,
+    };
+    use core::num::NonZeroU64;
+    use ed25519_dalek::{Signer as _, SigningKey};
+
+    #[derive(Clone, Default, PartialEq, Eq)]
+    struct Images {
+        intent: Option<Vec<u8>>,
+        runtime: Option<Vec<u8>>,
+        actor: Option<Vec<u8>>,
+        replicas: Option<Vec<u8>>,
+        archive: Option<Vec<u8>>,
+        commits: usize,
+    }
+    #[derive(Clone, Default)]
+    struct Store(Arc<Mutex<Images>>);
+    impl CleanManagementIssuerStore for Store {
+        type Error = ();
+        fn load(&mut self) -> Result<Option<Vec<u8>>, ()> {
+            Ok(self.0.lock().unwrap().intent.clone())
+        }
+        fn commit(&mut self, bytes: &[u8]) -> Result<(), ()> {
+            let mut image = self.0.lock().unwrap();
+            image.intent = Some(bytes.to_vec());
+            image.commits += 1;
+            Ok(())
+        }
+    }
+    macro_rules! sidecar {
+        ($trait:ident, $load:ident, $commit:ident, $field:ident) => {
+            impl $trait for Store {
+                fn $load(&mut self) -> Result<Option<Vec<u8>>, ()> {
+                    Ok(self.0.lock().unwrap().$field.clone())
+                }
+                fn $commit(&mut self, bytes: &[u8]) -> Result<(), ()> {
+                    let mut image = self.0.lock().unwrap();
+                    image.$field = Some(bytes.to_vec());
+                    image.commits += 1;
+                    Ok(())
+                }
+            }
+        };
+    }
+    sidecar!(
+        CleanManagementRuntimeStore,
+        load_runtime,
+        commit_runtime,
+        runtime
+    );
+    sidecar!(CleanManagementActorStore, load_actor, commit_actor, actor);
+    sidecar!(
+        CleanSharedGenesisReplicaStore,
+        load_replicas,
+        commit_replicas,
+        replicas
+    );
+    sidecar!(
+        CleanExternalLocalCreateArchiveStore,
+        load_external_create_archive,
+        commit_external_create_archive,
+        archive
+    );
+    impl super::super::super::genesis_archive::AgentGenesisArchiveStore for Store {
+        type Error = ();
+        fn load(
+            &self,
+            _: super::super::super::genesis::AgentGenesisLocator,
+        ) -> Result<Option<Vec<u8>>, ()> {
+            Ok(self.0.lock().unwrap().archive.clone())
+        }
+        fn insert_if_absent(
+            &self,
+            _: super::super::super::genesis::AgentGenesisLocator,
+            _: &[u8],
+        ) -> Result<(), ()> {
+            Err(())
+        }
+    }
+    type Controller =
+        NativeSharedGenesisController<Store, Store, Store, Store, Store, Store, Store>;
+
+    fn call(
+        authority: AuthorityActorTarget,
+        descriptor: &AgentDescriptor,
+        request: &ManagementRequest,
+        key: &SigningKey,
+        sequence: u64,
+    ) -> AuthorityCredentialCall {
+        let public = key.verifying_key().to_bytes();
+        let mut call = AuthorityCredentialCall {
+            invocation: InvocationId::ZERO,
+            authority,
+            managed: ManagedAgentTarget {
+                space: descriptor.identity.space,
+                agent: descriptor.identity.agent,
+                owner: descriptor.identity.owner,
+                profile: descriptor.identity.profile,
+                runtime_deployment: descriptor.identity.runtime_deployment,
+                transition_producer: descriptor.identity.transition_producer,
+            },
+            principal: PrincipalId::of_public_key(&public),
+            credential: CredentialId::of_public_key(&public),
+            request_sequence: NonZeroU64::new(sequence).unwrap(),
+            credential_public_key: public,
+            authenticated_node: None,
+            requested_valid_from: 10,
+            requested_expires_at: 30,
+            plan: request.authorization_plan().unwrap(),
+            signature: [0; 64],
+        };
+        call.invocation = call.expected_invocation();
+        call.signature = key.sign(&call.signing_bytes()).to_bytes();
+        call.verify_with(&RawCredentialVerifier).unwrap();
+        call
+    }
+
+    fn install(agent: AgentId, package: &AdmittedActorPackage, marker: u8) -> InstallActor {
+        let schema = crate::agent::sdk::schema::decode(package.state_lane_schema_bytes()).unwrap();
+        InstallActor {
+            installation_id: InstallationId([marker; 32]),
+            registry_reservation: Hash([marker + 1; 32]),
+            entry: ActorEntry {
+                actor: ActorId::top_level(agent, &package.manifest().name),
+                name: package.manifest().name.clone(),
+                parent: None,
+                deployment: package.deployment(),
+                program: package.program(),
+                package: package.package_ref().clone(),
+                agent_schema: package.manifest().state_lane_schema.clone(),
+                method_policy: package.manifest().method_policy.clone(),
+                constructor_abi: schema.constructor_abi().unwrap(),
+                installation_data: None,
+                state_layout: schema.state_layout_hash().unwrap(),
+                lanes: package.requirements().lanes,
+                suspended: false,
+            },
+            producer: package.producer(),
+            package: package.package_ref().clone(),
+            agent_schema: package.manifest().state_lane_schema.clone(),
+            method_policy: package.manifest().method_policy.clone(),
+            constructor_abi: schema.constructor_abi().unwrap(),
+            installation_data: None,
+            state_layout: schema.state_layout_hash().unwrap(),
+            contract: package.manifest().contract,
+            requirements: package.requirements(),
+        }
+    }
+
+    #[test]
+    fn retained_install_lookup_requires_signed_current_owner_intent_and_exact_package() {
+        let key = SigningKey::from_bytes(&[31; 32]);
+        let public = key.verifying_key().to_bytes();
+        let authority = AuthorityActorTarget {
+            space: SpaceId([1; 32]),
+            system_agent: AgentId([2; 32]),
+            system_runtime_deployment: DeploymentId([3; 32]),
+            binding: AgentAuthorityBinding {
+                policy: Hash([4; 32]),
+                issuer: AuthorityIssuer {
+                    principal: PrincipalId::of_public_key(&public),
+                    actor: ActorId([6; 32]),
+                    deployment: DeploymentId([7; 32]),
+                    program: ProgramId([8; 32]),
+                    producer: ProducerId::of_public_key(&public),
+                },
+                public_key: public,
+                initial_epoch: 1,
+            },
+        };
+        let runtime = crate::agent::package_admission::admitted_standard_runtime_for_test(
+            "retained-lookup-runtime",
+            32,
+        );
+        let nonce = Hash([33; 32]);
+        let owner = PrincipalId::of_public_key(&public);
+        let agent = AgentId::derive(authority.space, owner, nonce.as_bytes());
+        let mut members = (34..37)
+            .map(|seed| {
+                let peer = libp2p::identity::Keypair::ed25519_from_bytes([seed; 32])
+                    .unwrap()
+                    .public()
+                    .to_peer_id()
+                    .to_bytes();
+                let public = SigningKey::from_bytes(&[seed; 32])
+                    .verifying_key()
+                    .to_bytes();
+                super::super::super::genesis::AgentReplicaMember::new(
+                    super::super::super::AgentReplica {
+                        node: crate::service::NodeId::of_authenticated_peer(&peer),
+                        principal: crate::service::PrincipalId::of_public_key(&public),
+                        role: super::super::super::ReplicaRole::Voter,
+                    },
+                    peer.clone(),
+                    public,
+                    Some(super::super::super::genesis::derive_replica_raft_slot(
+                        &peer,
+                    )),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        members.sort_unstable_by_key(|member| member.replica().node);
+        let descriptor = AgentDescriptor {
+            identity: AgentIdentity {
+                space: authority.space,
+                agent,
+                owner,
+                profile: AgentProfile::Shared,
+                runtime_deployment: runtime.deployment(),
+                runtime_program: runtime.program(),
+                runtime_producer: runtime.producer(),
+                transition_producer: ProducerId([38; 32]),
+            },
+            creation_nonce: nonce,
+            authority: authority.binding,
+            private_recovery: None,
+            runtime_package: runtime.package_ref().clone(),
+            runtime_contract: runtime.manifest().contract,
+            capabilities: runtime.capabilities(),
+            replicas: members
+                .iter()
+                .map(|member| super::super::super::sdk::AgentReplica {
+                    node: NodeId(member.replica().node.0),
+                    principal: PrincipalId(member.replica().principal.0),
+                    role: ReplicaRole::Voter,
+                })
+                .collect(),
+        };
+        let locator = super::super::super::genesis::AgentGenesisLocator {
+            space: crate::service::SpaceId(authority.space.0),
+            agent: crate::service::AgentId(agent.0),
+        };
+        let committee = AgentReplicaCommittee::new(
+            locator.space,
+            locator.agent,
+            super::super::super::AgentProfile::Shared,
+            members,
+        )
+        .unwrap();
+        let create = ManagementRequest::Create(Box::new(descriptor.clone()));
+        let recovery = NativeSharedGenesisRecovery::reserve_create_with_replicas(
+            authority,
+            locator,
+            descriptor.clone(),
+            call(authority, &descriptor, &create, &key, 1),
+            runtime,
+            committee,
+            (
+                Store::default(),
+                Store::default(),
+                Store::default(),
+                Store::default(),
+                Store::default(),
+                Store::default(),
+            ),
+        )
+        .unwrap();
+        let package = crate::agent::package_admission::admitted_standard_actor_for_test(
+            "retained-lookup-actor",
+            vos_agent_sdk::StateLane::Linear,
+            39,
+        );
+        let install = install(agent, &package, 40);
+        let request = ManagementRequest::Install(Box::new(install.clone()));
+        let signed_call = call(authority, &descriptor, &request, &key, 2);
+        let signed = CleanManagementIntent::new(
+            authority,
+            signed_call.managed,
+            request,
+            signed_call.clone(),
+            &RawCredentialVerifier,
+        )
+        .unwrap();
+        let retained = Store::default();
+        let mut slot = CleanManagementIntentSlot::open(retained.clone()).unwrap();
+        slot.pledge(signed).unwrap();
+        slot.retain_actor(&package).unwrap();
+        let slot = CleanManagementIntentSlot::open(slot.into_store()).unwrap();
+        let mut controller = Controller::new(authority, vec![(recovery, None)]).unwrap();
+        controller.entries[0].0.management_intent = Some(slot);
+        // This test isolates selection over real signed, reopened memory
+        // stores. It does not claim physical recovery, finality or readiness.
+        controller.recovered = true;
+        let before = retained.0.lock().unwrap().clone();
+        assert_eq!(
+            controller.retained_install_locator(&install, &signed_call, &package),
+            Ok(Some(locator))
+        );
+        let changed_call = call(
+            authority,
+            &descriptor,
+            &ManagementRequest::Install(Box::new(install.clone())),
+            &key,
+            3,
+        );
+        assert_eq!(
+            controller.retained_install_locator(&install, &changed_call, &package),
+            Err(SharedAgentHostError::Conflict)
+        );
+        let mut changed = install.clone();
+        changed.registry_reservation = Hash([44; 32]);
+        let changed_call = call(
+            authority,
+            &descriptor,
+            &ManagementRequest::Install(Box::new(changed.clone())),
+            &key,
+            2,
+        );
+        assert_eq!(
+            controller.retained_install_locator(&changed, &changed_call, &package),
+            Err(SharedAgentHostError::Conflict)
+        );
+        let mut forged = signed_call.clone();
+        forged.signature[0] ^= 1;
+        assert_eq!(
+            controller.retained_install_locator(&install, &forged, &package),
+            Err(SharedAgentHostError::ScopeMismatch)
+        );
+        let mut wrong_owner = descriptor.clone();
+        wrong_owner.identity.owner = PrincipalId([45; 32]);
+        let wrong_call = call(
+            authority,
+            &wrong_owner,
+            &ManagementRequest::Install(Box::new(install.clone())),
+            &key,
+            2,
+        );
+        assert_eq!(
+            controller.retained_install_locator(&install, &wrong_call, &package),
+            Err(SharedAgentHostError::ScopeMismatch)
+        );
+        let other_package = crate::agent::package_admission::admitted_standard_actor_for_test(
+            "retained-lookup-actor",
+            vos_agent_sdk::StateLane::Linear,
+            46,
+        );
+        assert_eq!(
+            controller.retained_install_locator(&install, &signed_call, &other_package),
+            Err(SharedAgentHostError::ScopeMismatch)
+        );
+        let successor_install = self::install(agent, &other_package, 47);
+        let successor_call = call(
+            authority,
+            &descriptor,
+            &ManagementRequest::Install(Box::new(successor_install.clone())),
+            &key,
+            4,
+        );
+        assert_eq!(
+            controller.retained_install_locator(
+                &successor_install,
+                &successor_call,
+                &other_package
+            ),
+            Err(SharedAgentHostError::Conflict)
+        );
+        assert!(retained.0.lock().unwrap().clone() == before);
+        retained.0.lock().unwrap().actor = None;
+        let before_missing = retained.0.lock().unwrap().clone();
+        assert_eq!(
+            controller.retained_install_locator(&install, &signed_call, &package),
+            Ok(None)
+        );
+        assert!(retained.0.lock().unwrap().clone() == before_missing);
+        let slot = controller.entries[0].0.management_intent.take();
+        assert_eq!(
+            controller.retained_install_locator(&install, &signed_call, &package),
+            Ok(None)
+        );
+        controller.entries[0].0.management_intent = slot;
+        controller.entries.clear();
+        assert_eq!(
+            controller.retained_install_locator(&install, &signed_call, &package),
+            Ok(None)
+        );
+        controller.member_archives.push((locator, Store::default()));
+        assert_eq!(
+            controller.retained_install_locator(&install, &signed_call, &package),
+            Err(SharedAgentHostError::Conflict)
+        );
+        assert!(retained.0.lock().unwrap().clone() == before_missing);
+    }
 }
 
 #[cfg(all(test, feature = "experimental-state-blocks"))]

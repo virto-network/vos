@@ -972,6 +972,37 @@ impl AgentProductionOwner {
             .map_err(AgentProductionOwnerError::Lifecycle)
     }
 
+    /// Quarantine permits only the original retained Install. Keep this
+    /// restriction even if readiness returns after recovery-only enqueue.
+    /// A lookup cannot initialize management, allocate an intent or publish
+    /// routes; normal completion still verifies durable custody.
+    fn shared_install_locator(
+        &mut self,
+        install: &super::sdk::InstallActor,
+        call: &super::sdk::authority::AuthorityCredentialCall,
+        package: &super::package_admission::AdmittedActorPackage,
+        retained_only: bool,
+    ) -> Result<super::genesis::AgentGenesisLocator, AgentProductionOwnerError> {
+        let locator = super::genesis::AgentGenesisLocator {
+            space: crate::service::SpaceId(call.managed.space.0),
+            agent: crate::service::AgentId(call.managed.agent.0),
+        };
+        if !retained_only && self.is_ready() {
+            self.initialize_shared_management(locator)?;
+            self.prepare_shared_install(install.clone(), call.clone(), package)?;
+            return Ok(locator);
+        }
+        let retained = self
+            .retained_shared_lifecycle()?
+            .retained_shared_install_locator(install, call, package)
+            .map_err(AgentProductionOwnerError::Lifecycle)?
+            .ok_or(AgentProductionOwnerError::ProjectionNotReady)?;
+        if retained != locator {
+            return Err(AgentProductionOwnerError::InvalidProjection);
+        }
+        Ok(retained)
+    }
+
     pub(crate) fn complete_shared_install(
         &mut self,
         locator: super::genesis::AgentGenesisLocator,
@@ -1095,6 +1126,7 @@ impl AgentProductionOwner {
     pub(crate) fn install_shared_disposition(
         &mut self,
         submission: super::local_lifecycle::SharedInstallSubmission,
+        retained_only: bool,
     ) -> super::local_lifecycle::SharedInstallResult {
         use super::local_lifecycle::SharedInstallDisposition;
         let install = submission.install().clone();
@@ -1104,8 +1136,7 @@ impl AgentProductionOwner {
             agent: crate::service::AgentId(call.managed.agent.0),
         };
         let result = (|| {
-            self.initialize_shared_management(locator)?;
-            self.prepare_shared_install(install.clone(), call.clone(), submission.package())?;
+            self.shared_install_locator(&install, &call, submission.package(), retained_only)?;
             self.complete_shared_install(locator)
         })();
         let disposition = match result {
@@ -4603,6 +4634,185 @@ mod tests {
             Err(AgentProductionOwnerError::ShutdownRequested)
         );
         assert_eq!(*calls.lock().unwrap(), expected_calls);
+        queue.close();
+        owner.shutdown_and_join().unwrap();
+    }
+
+    #[test]
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    fn queued_exact_shared_install_reuses_retained_continuation_after_busy_quarantine() {
+        use super::super::genesis::AgentGenesisLocator;
+        use super::super::local_lifecycle::{
+            LocalLifecycleQueue, NativeLocalLifecycle, PendingLocalLifecycle,
+            SharedInstallSubmission,
+        };
+        use super::super::shared_host::SharedAgentHostError;
+
+        // Dispatch ordering only. The real controller tests authenticate the
+        // durable intent and package; this backend never fabricates a terminal.
+        struct Retained {
+            submission: SharedInstallSubmission,
+            calls: Arc<Mutex<Vec<&'static str>>>,
+        }
+        impl NativeLocalLifecycle for Retained {
+            fn node(&self) -> Result<NodeId, SharedAgentHostError> {
+                unreachable!()
+            }
+            fn system_attachment(
+                &self,
+                _: usize,
+            ) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError> {
+                unreachable!()
+            }
+            fn local_attachment(
+                &self,
+                _: usize,
+            ) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError> {
+                unreachable!()
+            }
+            fn create(
+                &mut self,
+                _: super::super::sdk::AgentDescriptor,
+                _: super::super::sdk::authority::AuthorityCredentialCall,
+                _: super::super::package_admission::AdmittedRuntimePackage,
+            ) -> Result<
+                (AgentId, super::super::sdk::authority::ManagementApplicationAck),
+                SharedAgentHostError,
+            > {
+                unreachable!()
+            }
+            fn initialize_shared_management(
+                &mut self,
+                _: AgentGenesisLocator,
+            ) -> Result<(), SharedAgentHostError> {
+                panic!("restricted Install cannot initialize management");
+            }
+            fn prepare_shared_install(
+                &mut self,
+                _: super::super::sdk::InstallActor,
+                _: super::super::sdk::authority::AuthorityCredentialCall,
+                _: &super::super::package_admission::AdmittedActorPackage,
+            ) -> Result<(), SharedAgentHostError> {
+                panic!("restricted Install cannot prepare fresh custody");
+            }
+            fn retained_shared_install_locator(
+                &mut self,
+                install: &super::super::sdk::InstallActor,
+                call: &super::super::sdk::authority::AuthorityCredentialCall,
+                package: &super::super::package_admission::AdmittedActorPackage,
+            ) -> Result<Option<AgentGenesisLocator>, SharedAgentHostError> {
+                self.calls.lock().unwrap().push("lookup");
+                if call.managed.agent != self.submission.call().managed.agent {
+                    return Ok(None);
+                }
+                if install != self.submission.install()
+                    || call != self.submission.call()
+                    || package.exact_bytes() != self.submission.package().exact_bytes()
+                {
+                    return Err(SharedAgentHostError::Conflict);
+                }
+                Ok(Some(AgentGenesisLocator {
+                    space: crate::service::SpaceId(call.managed.space.0),
+                    agent: crate::service::AgentId(call.managed.agent.0),
+                }))
+            }
+            fn complete_shared_install(
+                &mut self,
+                _: AgentGenesisLocator,
+            ) -> Result<
+                super::super::clean_authority_issuer::SignedManagementTerminal,
+                SharedAgentHostError,
+            > {
+                self.calls.lock().unwrap().push("complete");
+                Err(SharedAgentHostError::CapacityExhausted)
+            }
+        }
+        let (_, submission) = super::super::local_lifecycle::shared_submissions_for_test(false);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (mut owner, _, _) = held_inventory_owner();
+        owner.lifecycle = Some((
+            Box::new(Retained {
+                submission: submission.clone(),
+                calls: calls.clone(),
+            }),
+            1,
+        ));
+        owner.accepted_head = Some(head(1));
+        owner.routes_verified = true;
+        let accepted = owner.accepted_head;
+        let queue = LocalLifecycleQueue::default();
+        queue.open().unwrap();
+        let result = queue.submit_shared_install(submission.clone(), false).unwrap();
+        owner.source = Box::new(FailedInventory(AgentProductionOwnerError::ProjectionBusy));
+        assert_eq!(owner.reconcile(), Err(AgentProductionOwnerError::ProjectionBusy));
+        owner.quarantine_routes().unwrap();
+        assert!(!owner.is_ready());
+        let PendingLocalLifecycle::InstallShared { submission: queued, retained_only, reply } =
+            queue.pop().unwrap().unwrap()
+        else {
+            panic!("wrong lifecycle variant");
+        };
+        assert!(!retained_only);
+        reply.try_send(owner.install_shared_disposition(queued, retained_only)).unwrap();
+        assert_eq!(result.recv().unwrap(), Err(AgentProductionOwnerError::Lifecycle(
+            SharedAgentHostError::CapacityExhausted
+        )));
+        assert_eq!(*calls.lock().unwrap(), ["lookup", "complete"]);
+        assert_eq!(owner.accepted_head, accepted);
+        assert!(!owner.is_ready());
+        assert!(owner.ingress().is_err());
+        assert_eq!(
+            owner.prepare_shared_install(submission.install().clone(), submission.call().clone(), submission.package()),
+            Err(AgentProductionOwnerError::InvalidConfiguration)
+        );
+
+        // Recovery-only enqueue stays restricted when routes become ready
+        // before dispatch. Its exact bytes and retained result remain owned.
+        let exact_bytes = submission.encode();
+        let result = queue.submit_shared_install(submission.clone(), true).unwrap();
+        owner.routes_verified = true;
+        assert!(owner.is_ready());
+        let PendingLocalLifecycle::InstallShared { submission: queued, retained_only, reply } =
+            queue.pop().unwrap().unwrap()
+        else {
+            panic!("wrong lifecycle variant");
+        };
+        assert!(retained_only);
+        assert_eq!(queued.encode(), exact_bytes);
+        reply.try_send(owner.install_shared_disposition(queued, retained_only)).unwrap();
+        assert_eq!(result.recv().unwrap(), Err(AgentProductionOwnerError::Lifecycle(
+            SharedAgentHostError::CapacityExhausted
+        )));
+        assert_eq!(*calls.lock().unwrap(), ["lookup", "complete", "lookup", "complete"]);
+
+        let mut absent = submission.call().clone();
+        absent.managed.agent = super::super::sdk::AgentId([0xf1; 32]);
+        assert_eq!(
+            owner.shared_install_locator(submission.install(), &absent, submission.package(), true),
+            Err(AgentProductionOwnerError::ProjectionNotReady)
+        );
+        let mut altered_call = submission.call().clone();
+        altered_call.requested_expires_at += 1;
+        assert_eq!(
+            owner.shared_install_locator(submission.install(), &altered_call, submission.package(), true),
+            Err(AgentProductionOwnerError::Lifecycle(SharedAgentHostError::Conflict))
+        );
+        let mut altered_install = submission.install().clone();
+        altered_install.registry_reservation = super::super::sdk::Hash([0xf2; 32]);
+        assert_eq!(
+            owner.shared_install_locator(&altered_install, submission.call(), submission.package(), true),
+            Err(AgentProductionOwnerError::Lifecycle(SharedAgentHostError::Conflict))
+        );
+        assert_eq!(*calls.lock().unwrap(), ["lookup", "complete", "lookup", "complete", "lookup", "lookup", "lookup"]);
+        assert_eq!(submission.encode(), exact_bytes);
+        assert_eq!(owner.accepted_head, accepted);
+        assert!(owner.is_ready());
+        owner.request_shutdown();
+        assert_eq!(owner.install_shared_disposition(submission, true), Err(AgentProductionOwnerError::ShutdownRequested));
         queue.close();
         owner.shutdown_and_join().unwrap();
     }

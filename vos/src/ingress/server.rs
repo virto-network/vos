@@ -299,7 +299,10 @@ async fn handle_request(
                 | "/__agents/prepare-authorization"
                 | "/__agents/admin"
         ) || (cfg!(feature = "experimental-state-blocks")
-            && path == "/_vos/agents/shared/create"))
+            && matches!(
+                path.as_str(),
+                "/_vos/agents/shared/create" | "/_vos/agents/shared/install"
+            )))
     {
         shared_create_http_phase(
             &path,
@@ -2238,7 +2241,7 @@ mod tests {
                 "/__agents/admin/prepare",
                 "/__agents/admin/",
                 "/_vos/agents/shared/create/",
-                "/_vos/agents/shared/install",
+                "/_vos/agents/shared/install/",
                 "/_vos/agents/shared/admit",
             ] {
                 let response = request(port, path);
@@ -2252,7 +2255,7 @@ mod tests {
                 let response = request(port, path);
                 assert!(response.starts_with("HTTP/1.1 405"), "{path}: {response}");
             }
-            // Only the exact supported Create handler may reach its bounded
+            // Only the exact supported lifecycle handlers may reach their bounded
             // retained-only queue. Unsupported builds and adjacent routes
             // remain quarantined; no application fallback is opened.
             let shared_create = request(port, "/_vos/agents/shared/create");
@@ -2262,6 +2265,8 @@ mod tests {
                 "HTTP/1.1 503"
             };
             assert!(shared_create.starts_with(expected), "{shared_create}");
+            let shared_install = request(port, "/_vos/agents/shared/install");
+            assert!(shared_install.starts_with(expected), "{shared_install}");
             ingress.set_clean_agent_recovering_for_test(false);
             assert!(request(port, "/__status").starts_with("HTTP/1.1 200"));
             assert!(query_method.starts_with("HTTP/1.1 405"), "{query_method}");
