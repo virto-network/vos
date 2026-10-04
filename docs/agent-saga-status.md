@@ -367,8 +367,33 @@ The active diff closes demonstrated M1 defects, not new capabilities:
   the same roots without adopting missing work; signed family substitutions
   preserve the original whole envelope and live state. Compound handoff proves
   a real canonical signed write-then-error before the late registration cut,
-  under the same whole 30s. Current portable optimized core compilation and
-  execution are next; cold, compound and current public/main remain unqualified.
+  under the same whole 30s. Portable optimized core R40d from `dc5292d3`
+  **builds 785.31s**, with empty RUSTFLAGS and unchanged clean source. Quiet
+  B **passes 52.72s / 26.851s whole30**; A **passes 52.11s / 25.011s whole30**;
+  normal cold refusal **passes 42.13s / 15.088s whole30**. All positive cuts
+  verify exact terminal no-write retry; five existing owner/queue/HTTP checks
+  **pass 0.27s**. Compound **fails 34.58s** at normal ProjectionNotReady after
+  real signed handoff commit-then-error (**0.616s**), original late registration
+  (**6.456s**) and strict no-Invoke negatives (**6.706s**). The same-open
+  eligibility assignment follows the ambiguous handoff write and is skipped
+  on exact retry; no full-work proof is minted. This is a demonstrated admission
+  defect, not a timing-only failure. The independently reviewed correction is applied:
+  preserve exact eligibility before that write only after signed retired
+  predecessor, issuer ACK and physical image validation; eligibility alone
+  grants no recovery, and full work still requires existing physical validation
+  and complete original-owner guarded family admission. The same bounded
+  memento now carries optional full work; cold constructors remain empty and
+  exact pledge confirmation alone clears it. An unconditional exact-intent
+  Conflict fence precedes native store reads/writes, including another Agent's
+  already-bare intent. Signed compound negatives preserve eligibility with no
+  whole work or mutation, then require the original full work after capture.
+  Different-Agent reachability is source-reviewed, not a new physical claim.
+  Current corrected optimized compilation and all-four-cut execution are open.
+  Logs/provenance:
+  `release-observation-o3-local-install-qualified-cuts-core-{build,provenance}-r40d.*`,
+  `release-observation-o3-local-install-{registration,prewrite,cold-refusal,compound-handoff}-optimized-r40d.log`,
+  `release-observation-o3-local-install-optimized-{cuts-summary,related}-r40d.*`.
+  Compound correction and current public/main integration remain unqualified.
   Lifecycle stores in these cuts are memory-backed; this is not filesystem
   lifecycle durability or all-cold cluster evidence. Original R39w first
   interruption remains unattributed. No service-tuning pass is consumed.
@@ -703,6 +728,10 @@ Separate forecasts and unknowns:
   while the remaining recovery gates are open. The current portable main builds
   in **6m32s**; recent optimized main/harness builds span about **6–8 minutes**
   each. These measured build costs are not an aggregate milestone estimate.
+  Current optimized core R40d takes **13m05s**; three Local component cuts
+  pass, while real compound handoff ambiguity exposes a separate normal
+  admission defect. Its correction remains within the same exact-retry gate;
+  no new authority or service-tuning pass is warranted.
   Admin component terminal completion is verified; Local Install and public
   workflow completion still need verification. Evidence
   does not establish a new guest execution defect or performance-only cause.

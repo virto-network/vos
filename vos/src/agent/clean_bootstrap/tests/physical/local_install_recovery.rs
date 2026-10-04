@@ -554,7 +554,41 @@ pub(super) fn exercise(
         assert!(handoff_slot.finalization_work().unwrap().is_none());
         assert!(handoff_slot.finalization_anchor().unwrap().is_none());
         assert!(!handoff_slot.retirement_complete().unwrap());
+        {
+            let mut original = controller.system_for_test();
+            let eligibility = Some((handoff_intent.clone(), None));
+            assert!(original.unpublished_local_install_attempt == eligibility);
+            let manifest = host.lock().unwrap().recovery_manifest(agent).unwrap();
+            // Handoff eligibility without physical whole work grants neither
+            // quarantine admission nor volatile reservation restoration.
+            assert!(matches!(
+                original.retained_local_install_family(&handoff_slot),
+                Err(SharedAgentHostError::Unavailable)
+            ));
+            original.confirm_local_install_authorization(&handoff_slot);
+            assert!(original.unpublished_local_install_attempt == eligibility);
+            assert!(original
+                ._network_host
+                .current_management_pending(agent, call.invocation)
+                .unwrap()
+                .is_none());
+            assert!(host.lock().unwrap().recovery_manifest(agent).unwrap() == manifest);
+        }
         drop(handoff_slot);
+        // A separately signed same-Agent request exercises the eligibility
+        // fence before store access. This is no different-Agent fixture.
+        let mut unmatched = call.clone();
+        unmatched.request_sequence = NonZeroU64::new(call.request_sequence.get() + 1).unwrap();
+        sign(&mut unmatched);
+        LocalInstallSubmission::new(install.clone(), unmatched.clone(), package.clone()).unwrap();
+        assert!(matches!(
+            controller.install(install.clone(), unmatched, package.clone()),
+            Err(SharedAgentHostError::Conflict)
+        ));
+        assert!(controller.system_for_test().unpublished_local_install_attempt
+            == Some((handoff_intent, None)));
+        assert_eq!(intent_fault.lock().unwrap().committed_writes(), writes_before + 1);
+        assert!(intent_store.image.lock().unwrap().as_deref() == Some(handoff_image.as_slice()));
         assert!(intent_store.actor.lock().unwrap().is_none());
         assert!(issuer_store.image.lock().unwrap().clone() == issuer_before);
         assert!(std::fs::read(&image_path).unwrap() == image_before);
@@ -766,16 +800,14 @@ pub(super) fn exercise(
         cut == Cut::AuthorizationPrewrite,
         recovery_started.elapsed().as_millis()
     );
-    // A different valid signed same-Agent Install reaches the existing
-    // unretired-intent refusal, preserving the first open-owner memento. This
-    // is not a second-Agent fresh-minter or compound handoff qualification.
+    // A different valid signed same-Agent Install reaches the exact open
+    // attempt fence before store access, preserving the whole original work.
+    // This does not exercise a second-Agent fresh handoff.
     let marker_before = controller
         .system_for_test()
         .unpublished_local_install_attempt
         .clone();
-    if marker_before.is_some() || cut != Cut::HandoffWriteThenRegistrationTimeout {
-        assert!(marker_before == Some((bare.clone(), saved_work.clone())));
-    }
+    assert!(marker_before == Some((bare.clone(), Some(saved_work.clone()))));
     let pending_before = controller
         .system_for_test()
         ._network_host
@@ -805,16 +837,14 @@ pub(super) fn exercise(
     );
     assert!(intent_store.image.lock().unwrap().clone() == bare_intent);
     assert!(issuer_store.image.lock().unwrap().clone() == issuer_before);
-    if marker_before.is_some() || cut != Cut::HandoffWriteThenRegistrationTimeout {
-        pending_validation::pending(
-            &mut controller,
-            &retained,
-            &bare,
-            &saved_work,
-            &intent_store,
-            &issuer_store,
-        );
-    }
+    pending_validation::pending(
+        &mut controller,
+        &retained,
+        &bare,
+        &saved_work,
+        &intent_store,
+        &issuer_store,
+    );
     assert!(std::time::Instant::now() <= deadline);
     if cut == Cut::RegistrationTimeoutCold {
         // No old owner, host or database reference may survive the cold open.

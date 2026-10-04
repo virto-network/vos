@@ -488,8 +488,27 @@ substitutions; actual canonical signed handoff commit-then-error before the same
 late registration cut. Only compound permits an absent same-open marker before
 the intended normal guard. All cuts retain the whole30; lifecycle memory stores
 do not prove filesystem durability or all-cold cluster recovery. Current portable
-optimized core compilation/execution, cold/compound and public/main remain open;
-the first original CLI interruption remains unattributed. No tuning pass used.
+optimized core R40d builds **785.31s** from clean `dc5292d3`, empty RUSTFLAGS.
+Quiet B **passes 52.72s / 26.851s whole30**, A **passes 52.11s / 25.011s** and
+normal cold refusal **passes 42.13s / 15.088s**. Five existing owner/queue/HTTP
+checks pass **0.27s**. Compound **fails 34.58s** at normal ProjectionNotReady
+after authentic signed handoff write-then-error (**0.616s**), late original
+registration (**6.456s**) and strict no-Invoke refusals (**6.706s**). Eligibility
+is assigned after the ambiguous write; exact retry skips the retired predecessor
+branch and cannot mint full work. Review the applied narrow same-open proof
+lifetime correction separately: eligibility before store I/O only after exact
+signed predecessor/issuer ACK/physical image validation; full work before
+metadata only after existing physical validation, with no eligibility-only
+recovery or cold/family bypass. The same bounded field holds optional whole work;
+an unconditional exact-intent Conflict fence precedes store reads/native writes,
+including another Agent's already-bare intent. Independent review caught the
+first draft's branch-only fence; it was corrected before application. Compound
+signed negatives verify eligibility-only no-admission/no-write/no-clear, then
+exact full work after capture. Different-Agent coverage is source proof only.
+Corrected optimized compilation and all four cuts remain open. The live plan
+references evidence. Compound and
+public/main remain open; first original CLI interruption remains unattributed.
+No tuning pass used.
 
 The final >256 locked-owner reopen now includes all constructors/attachments,
 readiness and exact archived native-result verification under one unchanged

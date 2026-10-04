@@ -1665,10 +1665,14 @@ where
     // publication. This is not a WAL or new custody; cold opens never restore
     // it. Keep its whole work until matching NAD2 retention is confirmed.
     unpublished_admin_attempt: Option<(NativeAuthorityAdminSubmission, RuntimeWork)>,
-    // Exact live image Local Install handoff, physically validated before
-    // metadata I/O. Cold opens and generic helpers cannot mint this proof.
-    unpublished_local_install_attempt:
-        Option<(super::clean_management_intent::CleanManagementIntent, RuntimeWork)>,
+    // Exact signed live image Local Install eligibility, verified before
+    // handoff I/O. Its whole work is attached after physical validation and
+    // before metadata I/O; eligibility alone grants no recovery admission.
+    // Cold opens and generic helpers cannot mint either stage.
+    unpublished_local_install_attempt: Option<(
+        super::clean_management_intent::CleanManagementIntent,
+        Option<RuntimeWork>,
+    )>,
     shared_lifecycle_recovery_pending: bool,
     // Process-only exact proofs minted by this owner. Cold startup must obtain
     // them again from Authority replay; no archive bytes can repopulate this set.
@@ -3306,7 +3310,8 @@ where
                 slot.pledge_authorization_work(work, anchor)
                     .map_err(|_| SharedAgentHostError::Unavailable)?;
                 self.confirm_local_install_authorization(slot);
-            } else if let Some((previous, expected_work)) = &self.unpublished_local_install_attempt
+            } else if let Some((previous, Some(expected_work))) =
+                &self.unpublished_local_install_attempt
                 && previous == intent
             {
                 // A failure before append may leave no registered member.
@@ -3427,16 +3432,17 @@ where
                 {
                     return Err(SharedAgentHostError::ScopeMismatch);
                 }
-                if let Some((previous, work)) = &self.unpublished_local_install_attempt {
-                    if previous != intent || work != &envelope {
-                        return Err(SharedAgentHostError::Conflict);
-                    }
-                } else {
-                    // Only the successful signed live handoff selects this
-                    // branch. Package admission and physical work validation
-                    // precede this proof and every metadata/callback write.
-                    self.unpublished_local_install_attempt =
-                        Some((intent.clone(), envelope.clone()));
+                let Some((previous, work)) = &mut self.unpublished_local_install_attempt else {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                };
+                if previous != intent || work.as_ref().is_some_and(|work| work != &envelope) {
+                    return Err(SharedAgentHostError::Conflict);
+                }
+                if work.is_none() {
+                    // Only this open owner's exact signed live handoff can
+                    // attach work. Package admission and physical validation
+                    // precede this transition and every metadata/callback write.
+                    *work = Some(envelope.clone());
                 }
             }
             trace("capture_start", None);
@@ -6737,6 +6743,15 @@ where
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
+        // A verified handoff without physically validated whole work is not
+        // a retained admission proof, even if a registration is visible.
+        if self
+            .unpublished_local_install_attempt
+            .as_ref()
+            .is_some_and(|(previous, work)| previous == intent && work.is_none())
+        {
+            return Ok(None);
+        }
         let agent = crate::service::AgentId(self.pins.agent.0);
         if let Some((anchor, work)) = self
             ._network_host
@@ -6746,13 +6761,16 @@ where
                 || self
                     .unpublished_local_install_attempt
                     .as_ref()
-                    .is_some_and(|(previous, expected)| previous == intent && expected != &work)
+                    .is_some_and(|(previous, expected)| {
+                        previous == intent
+                            && expected.as_ref().is_some_and(|expected| expected != &work)
+                    })
             {
                 return Err(SharedAgentHostError::ScopeMismatch);
             }
             return Ok(Some((anchor, work)));
         }
-        let Some((previous, expected_work)) = &self.unpublished_local_install_attempt else {
+        let Some((previous, Some(expected_work))) = &self.unpublished_local_install_attempt else {
             return Ok(None);
         };
         if previous != intent {
@@ -6790,10 +6808,12 @@ where
             .unpublished_local_install_attempt
             .as_ref()
             .is_some_and(|(previous, work)| {
-                slot.intent().is_some_and(|intent| {
-                    previous.request() == intent.request()
-                        && previous.call() == intent.call()
-                        && intent.authorization_work() == Some(work)
+                work.as_ref().is_some_and(|work| {
+                    slot.intent().is_some_and(|intent| {
+                        previous.request() == intent.request()
+                            && previous.call() == intent.call()
+                            && intent.authorization_work() == Some(work)
+                    })
                 })
             })
         {
@@ -6819,6 +6839,15 @@ where
         S: CleanManagementReceiptSigner,
     {
         let next = self.local_install_intent(local, &request, &call, package)?;
+        if self
+            .unpublished_local_install_attempt
+            .as_ref()
+            .is_some_and(|(intent, _)| intent != &next)
+        {
+            // Any different Agent or signed request preserves this owner's
+            // ambiguous attempt before store reads or native Install writes.
+            return Err(SharedAgentHostError::Conflict);
+        }
         let target = self.authority_target();
         let managed = call.managed;
         let mut slot =
@@ -6835,7 +6864,6 @@ where
             .intent()
             .ok_or(SharedAgentHostError::ScopeMismatch)?
             .clone();
-        let mut fresh_local_install = false;
         if previous.call() != next.call() || previous.request() != next.request() {
             if !slot
                 .retirement_complete()
@@ -6872,12 +6900,21 @@ where
                 return Err(SharedAgentHostError::ScopeMismatch);
             }
             self.finish_live_management_intent(&mut slot, managed, &ack, &issuer)?;
+            if self.pins.replicas.members().len() == 3
+                && self.unpublished_local_install_attempt.is_none()
+            {
+                // The exact signed retired predecessor, issuer ACK and its
+                // physical image were verified above. Preserve eligibility
+                // before an ambiguous handoff write; no whole work exists yet.
+                self.unpublished_local_install_attempt = Some((next.clone(), None));
+            }
             slot.handoff_retired(&previous, next, &RawCredentialVerifier)
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
-            // The exact signed retired predecessor and its physical image
-            // were checked above. Generic/cold helper calls cannot select it.
-            fresh_local_install = self.pins.replicas.members().len() == 3;
         }
+        let fresh_local_install = self
+            .unpublished_local_install_attempt
+            .as_ref()
+            .is_some_and(|(intent, _)| slot.intent() == Some(intent));
         slot.retain_actor(package)
             .map_err(|_| SharedAgentHostError::Unavailable)?;
         if let Some((receipt, ack)) = issuer

@@ -21,7 +21,7 @@ pub(super) fn pending(
     let agent = HostAgentId(owner.pins.agent.0);
     let node = HostNodeId(owner.pins.node.0);
     let marker_before = owner.unpublished_local_install_attempt.clone();
-    assert!(marker_before == Some((intent.clone(), expected_work.clone())));
+    assert!(marker_before == Some((intent.clone(), Some(expected_work.clone()))));
     let pending_before = owner
         ._network_host
         .current_management_pending(agent, intent.call().invocation)
