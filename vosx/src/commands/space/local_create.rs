@@ -388,7 +388,7 @@ fn post_binary_response_inner(
     );
     anyhow::ensure!(
         response.header("Content-Type") == Some("application/octet-stream"),
-        "Agent control reply has unexpected content type"
+        "Agent control reply has unexpected content type (HTTP {actual_status})"
     );
     let mut reply = Vec::new();
     response
@@ -403,18 +403,20 @@ fn post_binary_response_inner(
 }
 
 pub(super) fn retained_submission_error(error: anyhow::Error) -> anyhow::Error {
-    if matches!(
+    let diagnostic = if matches!(
         error.downcast_ref::<ureq::Error>(),
         Some(ureq::Error::Status(409, _))
     ) {
-        anyhow::anyhow!(
+        format!(
             "{error}; request retained: lifecycle conflicts with retained state; inspect operation evidence before retrying. HTTP conflict is not a signed outcome and does not prove the original operation failed"
         )
     } else {
-        anyhow::anyhow!(
-            "{error}; request retained: retry these exact bytes, outcome may be unknown"
-        )
-    }
+        format!("{error}; request retained: retry these exact bytes, outcome may be unknown")
+    };
+    // Keep the original typed HTTP/transport cause available to callers.
+    // Retaining a diagnostic must not turn retryable unavailability into an
+    // unclassifiable string, or turn a conflict into signed finality.
+    error.context(diagnostic)
 }
 
 pub(super) struct CredentialVerifier;
@@ -644,7 +646,7 @@ pub(crate) fn prepare_fresh(
     valid_from: u64,
     expires_at: u64,
 ) -> anyhow::Result<LocalCreateSubmission> {
-    let runtime = crate::bundled::root_signed_agent_runtime_package(operator)?;
+    let runtime = crate::bundled::root_signed_system_agent_runtime_package(operator)?;
     let package = crate::bundled::root_signed_actor_package(
         crate::bundled::system_authority_package_template(),
         "system-authority",
@@ -967,6 +969,87 @@ pub(crate) mod tests {
         ActorId, AgentId, AgentIdentity, AgentProfile, AgentReplica, DeploymentId, Hash, NodeId,
         ProducerId, ProgramId, ReplicaRole, SpaceId,
     };
+
+    #[test]
+    fn retained_submission_diagnostic_preserves_http_and_transport_classification() {
+        let unavailable = ureq::Error::Status(503, ureq::Response::new(503, "Busy", "").unwrap());
+        let original = unavailable.to_string();
+        let error = retained_submission_error(unavailable.into());
+        assert!(matches!(
+            error.downcast_ref::<ureq::Error>(),
+            Some(ureq::Error::Status(503, _))
+        ));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "{original}; request retained: retry these exact bytes, outcome may be unknown"
+            )
+        );
+
+        let transport = ureq::Error::from(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "response lost after dispatch",
+        ));
+        let original = transport.to_string();
+        let error = retained_submission_error(transport.into());
+        assert!(matches!(
+            error.downcast_ref::<ureq::Error>(),
+            Some(ureq::Error::Transport(_))
+        ));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "{original}; request retained: retry these exact bytes, outcome may be unknown"
+            )
+        );
+    }
+
+    #[test]
+    fn retained_submission_conflict_keeps_inspection_warning_and_original_cause() {
+        let conflict = ureq::Error::Status(409, ureq::Response::new(409, "Conflict", "").unwrap());
+        let original = conflict.to_string();
+        let error = retained_submission_error(conflict.into());
+        assert!(matches!(
+            error.downcast_ref::<ureq::Error>(),
+            Some(ureq::Error::Status(409, _))
+        ));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "{original}; request retained: lifecycle conflicts with retained state; inspect operation evidence before retrying. HTTP conflict is not a signed outcome and does not prove the original operation failed"
+            )
+        );
+        assert!(!error.to_string().contains("retry these exact bytes"));
+    }
+
+    #[test]
+    fn plaintext_forbidden_response_reports_status_without_becoming_signed_denial() {
+        let (operator, authority, descriptor, runtime) = fixture();
+        let request = prepare(
+            &operator,
+            authority,
+            descriptor,
+            runtime,
+            NonZeroU64::new(2).unwrap(),
+            10,
+            30,
+        )
+        .unwrap()
+        .encode();
+        let error = submit_fixture(
+            &request,
+            b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 6\r\nConnection: close\r\n\r\nrefuse",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Agent control reply has unexpected content type (HTTP 403)")
+        );
+        assert!(error.to_string().contains("request retained"));
+        assert!(!error.to_string().contains("refuse"));
+        assert!(error.downcast_ref::<ureq::Error>().is_none());
+    }
 
     #[test]
     fn retired_external_create_is_not_accepted_by_client_decoders() {
@@ -1366,6 +1449,8 @@ pub(crate) mod tests {
             encoded
         );
         let (descriptor, call, runtime) = first.into_parts();
+        let system_runtime =
+            crate::bundled::root_signed_system_agent_runtime_package(&operator).unwrap();
         let authority_package = crate::bundled::root_signed_actor_package(
             crate::bundled::system_authority_package_template(),
             "system-authority",
@@ -1378,11 +1463,18 @@ pub(crate) mod tests {
         let (expected, nonce) = super::super::clean_startup::derive_system_authority_target(
             space,
             root_public,
-            &runtime,
+            &system_runtime,
             &authority_package,
         )
         .unwrap();
         assert_eq!(call.authority, expected);
+        assert_eq!(
+            runtime.manifest().contract,
+            vos::agent::sdk::contract::RuntimePackageContract::canonical()
+        );
+        assert_eq!(runtime.program_bytes(), crate::bundled::agent_runtime_pvm());
+        assert_eq!(descriptor.identity.runtime_deployment, runtime.deployment());
+        assert_eq!(descriptor.runtime_contract, runtime.manifest().contract);
         assert_eq!(
             nonce,
             Hash::digest(
@@ -1432,7 +1524,7 @@ pub(crate) mod tests {
             super::super::clean_startup::derive_system_authority_target(
                 space,
                 public,
-                &runtime,
+                &system_runtime,
                 &authority_package
             )
             .is_err()

@@ -11,9 +11,7 @@ use crate::agent::clean_bootstrap::SharedGenesisRuntimePackage;
 use crate::agent::clean_management_intent::CleanManagementIntentSlot;
 use crate::agent::genesis::{AgentGenesisArchiveRecord, AgentGenesisLocator};
 use crate::agent::local_lifecycle::SharedInstallSubmission;
-use crate::agent::package_admission::{
-    AdmittedStateRuntimePackage, admit_state_runtime_package, tests::admitted_state_fixture_limits,
-};
+use crate::agent::package_admission::{AdmittedStateRuntimePackage, admit_state_runtime_package};
 use crate::agent::shared_recovery::SharedRecoveryManifest;
 use crate::network::agent_protocol::{
     ForwardedSharedInstallOperation, ForwardedSharedInstallOwner, ForwardedSharedInstallRequest,
@@ -45,36 +43,12 @@ impl crate::agent::clean_bootstrap::GenesisClaimSigner for GenesisSigner {
 }
 
 fn external_inputs() -> (AdmittedStateRuntimePackage, AdmittedActorPackage) {
-    // The same signed candidate/limits as external_shared.rs. This test does
-    // not promote a pin, change limits or synthesize an actor implementation.
-    let target = PathBuf::from(std::env::var_os("CARGO_TARGET_DIR").unwrap());
-    let runtime = admitted_state_fixture_limits(
-        vos_pvm_compiler::link_elf_spi(
-            &std::fs::read(
-                target.join("agent-state-standard/riscv64em-vos/release/agent_runtime.elf"),
-            )
-            .unwrap(),
-        )
-        .unwrap(),
-        LaneSet::of(StateLane::Linear),
-        crate::agent_sdk::state_execution::MAX_ADMITTED_EXTERNAL_RUNTIME_STATE_BYTES as u32,
-    );
-    let mut envelope = PackageEnvelope::decode(runtime.exact_bytes()).unwrap();
-    let PackageManifest::AgentRuntime(manifest) = &mut envelope.manifest else {
-        unreachable!()
-    };
-    manifest.capabilities.scheduling = false;
-    manifest.capabilities.proof_systems = ProofSystemSet::EMPTY;
-    let key = SigningKey::from_bytes(&[0x67; 32]);
-    let public_key = key.verifying_key().to_bytes();
-    *envelope.manifest.signing_mut() = PackageSigning {
-        producer: ProducerId::of_public_key(&public_key),
-        public_key,
-        signature: [0; 64],
-    };
-    envelope.manifest.signing_mut().signature =
-        key.sign(&envelope.signing_bytes().unwrap()).to_bytes();
-    let runtime = admit_state_runtime_package(&envelope.encode().unwrap()).unwrap();
+    // Exercise the emitted signed Shared role unchanged, not a reconstructed
+    // candidate with relabelled limits, capabilities or package signer.
+    let runtime = admit_state_runtime_package(include_bytes!(
+        "../../../../../../vosx/blobs/shared_external_runtime.vos"
+    ))
+    .unwrap();
     let clerk = admit_actor_package(
         &std::fs::read(std::env::var_os("CLERK_AGENT_PACKAGE").unwrap()).unwrap(),
     )
@@ -98,16 +72,41 @@ fn descriptor_and_roster(
     descriptor.identity.runtime_deployment = runtime.deployment();
     descriptor.identity.runtime_program = runtime.program();
     descriptor.identity.runtime_producer = runtime.manifest().signing.producer;
+    let origin = owner
+        .pins
+        .replicas
+        .member_by_node(crate::service::NodeId(owner.pins.node.0))
+        .unwrap();
+    descriptor.identity.transition_producer =
+        ProducerId::of_public_key(origin.ed25519_public_key());
     descriptor.runtime_package = runtime.package_ref().clone();
     descriptor.runtime_contract = runtime.manifest().contract;
     descriptor.capabilities = runtime.manifest().capabilities;
-    // All nodes were actually enrolled by this System's signed configuration.
-    // Preserve their real principals, peers, keys and Raft slots.
+    // System placement uses transport principals, while SAC7 node enrollments
+    // bind ordinary replicas to the Root. Preserve their real transport
+    // identities and slots, but bind the enrolled owner the Authority checks.
+    let members = owner
+        .pins
+        .replicas
+        .members()
+        .iter()
+        .map(|member| {
+            let mut replica = member.replica();
+            replica.principal = crate::service::PrincipalId(descriptor.identity.owner.0);
+            crate::agent::genesis::AgentReplicaMember::new(
+                replica,
+                member.peer_id().to_vec(),
+                *member.ed25519_public_key(),
+                member.raft_slot(),
+            )
+            .unwrap()
+        })
+        .collect();
     let roster = AgentReplicaCommittee::new(
         crate::service::SpaceId(descriptor.identity.space.0),
         HostAgentId(descriptor.identity.agent.0),
         crate::agent::AgentProfile::Shared,
-        owner.pins.replicas.members().to_vec(),
+        members,
     )
     .unwrap();
     descriptor.replicas = roster

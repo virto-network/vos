@@ -12,6 +12,9 @@ mod authority_observation;
 #[cfg(feature = "experimental-state-blocks")]
 #[path = "forwarded_install_origin.rs"]
 mod forwarded_install_origin;
+#[cfg(feature = "experimental-state-blocks")]
+#[path = "genesis_publication_retry.rs"]
+mod genesis_publication_retry;
 #[path = "management_retention.rs"]
 mod management_retention;
 use crate::agent::shared_commit::SharedAgentCommonSnapshotClaim;
@@ -37,6 +40,21 @@ pub(super) enum Exercise {
     ManagementRetentionFollower,
     #[cfg(feature = "experimental-state-blocks")]
     ForwardedInstallOrigin,
+    #[cfg(feature = "experimental-state-blocks")]
+    GenesisPublicationRetry,
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+#[test]
+#[ignore = "requires fresh Authority/System IMAGE candidates and three authenticated loopback transports"]
+fn candidate_shared_publication_exact_retry_readmits_original_leased_stores() {
+    assert!(std::env::var_os("AUTHORITY_CANDIDATE_ELF").is_some());
+    assert!(std::env::var_os("VOS_AGENT_RUNTIME_COST_CANDIDATE").is_some());
+    assert!(std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some());
+    check_fixed_system_pending_cluster_with_checkpoint(
+        true,
+        Some(Exercise::GenesisPublicationRetry),
+    );
 }
 
 #[cfg(feature = "experimental-state-blocks")]
@@ -272,6 +290,11 @@ pub(super) fn exercise(
         forwarded_install_origin::exercise(leader, owners, fixtures, directories, networks, signer);
         return;
     }
+    #[cfg(feature = "experimental-state-blocks")]
+    if matches!(exercise, Exercise::GenesisPublicationRetry) {
+        genesis_publication_retry::exercise(leader, owners, signer);
+        return;
+    }
     if matches!(
         exercise,
         Exercise::ManagementRetention | Exercise::ManagementRetentionFollower
@@ -297,6 +320,8 @@ pub(super) fn exercise(
         Exercise::ManagementRetention | Exercise::ManagementRetentionFollower => unreachable!(),
         #[cfg(feature = "experimental-state-blocks")]
         Exercise::ForwardedInstallOrigin => unreachable!(),
+        #[cfg(feature = "experimental-state-blocks")]
+        Exercise::GenesisPublicationRetry => unreachable!(),
     };
     let agent = HostAgentId(fixtures[leader].plan.pins.agent.0);
     let lagger = (leader + 1) % 3;

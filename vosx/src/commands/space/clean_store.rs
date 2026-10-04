@@ -659,6 +659,43 @@ pub(crate) struct RetainedClientBootstrap {
     pub genesis: Vec<u8>,
 }
 
+/// Fixed System-store inspection for startup admission only. Every candidate
+/// remains available for semantic validation before a writer may reconcile it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StartupBootstrapImage {
+    canonical: Option<StoredImage>,
+    staged: Option<StoredImage>,
+    resolution: StoreImageResolution,
+}
+
+impl StartupBootstrapImage {
+    pub(crate) fn selected_payload(&self) -> Option<&[u8]> {
+        let selected = match self.resolution {
+            StoreImageResolution::Missing => None,
+            StoreImageResolution::Canonical | StoreImageResolution::RetireDuplicateStage => {
+                self.canonical.as_ref()
+            }
+            StoreImageResolution::PublishStage => self.staged.as_ref(),
+        };
+        selected.map(|image| image.payload.as_slice())
+    }
+
+    pub(crate) fn payloads(&self) -> impl Iterator<Item = &[u8]> {
+        self.canonical
+            .iter()
+            .chain(self.staged.iter())
+            .map(|image| image.payload.as_slice())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RetainedStartupBootstrap {
+    pub pins: StartupBootstrapImage,
+    pub bootstrap: StartupBootstrapImage,
+    pub issuer: StartupBootstrapImage,
+    pub genesis: StartupBootstrapImage,
+}
+
 impl CleanSystemAgentFileStores {
     /// Inspect only a completely published deployment. The live owner alone
     /// may reconcile a stage; clients never repair, create, sync or take its
@@ -711,6 +748,58 @@ impl CleanSystemAgentFileStores {
         Ok(Some(images))
     }
 
+    /// Admit only the existing predecessor-bound stage decisions, without
+    /// publishing, deleting, syncing, creating files, or taking a writer lease.
+    /// Startup must validate *all* payloads against its exact current signed
+    /// plan before allowing the existing locked owner to reconcile any stage.
+    /// Client target selection deliberately keeps its stricter reader above.
+    pub(crate) fn read_startup_bootstrap(
+        path: &Path,
+    ) -> Result<Option<RetainedStartupBootstrap>, CleanFileStoreError> {
+        validate_new_path(path)?;
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+            Ok(_) => (),
+        }
+        let parent_path = path.parent().ok_or(CleanFileStoreError::InvalidPath)?;
+        let parent = open_private_directory(parent_path, true)?;
+        let directory = open_child_directory(&parent, path)?;
+        let inspect = || -> Result<(), CleanFileStoreError> {
+            validate_opened_directory(&parent, parent_path, true)?;
+            validate_opened_directory(&directory, path, false)?;
+            audit_named_entries(path, &ALLOWED_ENTRIES, false)?;
+            match named_metadata(path, LOCK_FILE) {
+                Ok(lock) => {
+                    validate_private_regular_metadata(&lock)?;
+                    if lock.len() != 0 {
+                        return Err(CleanFileStoreError::Corrupt);
+                    }
+                }
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound
+                        && fs::read_dir(path)?.next().is_none() => {}
+                Err(error) => return Err(error.into()),
+            }
+            Ok(())
+        };
+        read_startup_bootstrap_images(&directory, path, inspect)
+    }
+
+    /// Fence readonly admission to this actual pinned writer owner before any
+    /// load can reconcile a stage. The existing root lease remains held after
+    /// this call; all four stores share its directory and exclusive lock.
+    pub(crate) fn matches_startup_inspection(
+        &self,
+        expected: &Option<RetainedStartupBootstrap>,
+    ) -> Result<bool, CleanFileStoreError> {
+        let root = &self.pins.0.root;
+        let _guard = root.guard()?;
+        let observed =
+            read_startup_bootstrap_images(&root.directory, &root.path, || root.audit_entries())?;
+        Ok(&observed == expected)
+    }
+
     /// Open or create one dedicated clean store directory.
     ///
     /// The immediate parent must already be an absolute, canonical, private
@@ -755,6 +844,59 @@ impl CleanSystemAgentFileStores {
         CleanSystemAgentGenesisFile,
     ) {
         (self.pins, self.bootstrap, self.issuer, self.genesis)
+    }
+}
+
+/// The same bounded inspection through either readonly directory handles or
+/// the actual leased writer's pinned handle. No staged action is performed.
+fn read_startup_bootstrap_images(
+    directory: &File,
+    path: &Path,
+    inspect: impl Fn() -> Result<(), CleanFileStoreError>,
+) -> Result<Option<RetainedStartupBootstrap>, CleanFileStoreError> {
+    let read = |role: StoreRole| -> Result<StartupBootstrapImage, CleanFileStoreError> {
+        let canonical = read_store_image(directory, path, role.file(), role, role.maximum_bytes())?;
+        let staged = read_store_image(
+            directory,
+            path,
+            role.stage_file(),
+            role,
+            role.maximum_bytes(),
+        )?;
+        let resolution = resolve_store_images(role, canonical.as_ref(), staged.as_ref())?;
+        Ok(StartupBootstrapImage {
+            canonical,
+            staged,
+            resolution,
+        })
+    };
+    let read_set = || -> Result<RetainedStartupBootstrap, CleanFileStoreError> {
+        inspect()?;
+        let images = RetainedStartupBootstrap {
+            pins: read(StoreRole::Pins)?,
+            bootstrap: read(StoreRole::Bootstrap)?,
+            issuer: read(StoreRole::ManagementIssuer)?,
+            genesis: read(StoreRole::GenesisArchive)?,
+        };
+        inspect()?;
+        Ok(images)
+    };
+    let images = read_set()?;
+    if read_set()? != images {
+        return Err(CleanFileStoreError::AmbiguousPublication);
+    }
+    if [
+        &images.pins,
+        &images.bootstrap,
+        &images.issuer,
+        &images.genesis,
+    ]
+    .into_iter()
+    .all(|image| image.selected_payload().is_none())
+    {
+        Ok(None)
+    } else {
+        Ok(Some(images))
     }
 }
 
@@ -3525,64 +3667,20 @@ impl ExactFileStore {
         self.root.audit_entries()?;
         let canonical = self.read_optional(self.file(), maximum_bytes)?;
         let staged = self.read_optional(self.stage_file(), maximum_bytes)?;
-        if matches!(
-            self.role,
-            StoreRole::LocalCreateRequest
-                | StoreRole::ExternalLocalCreateArchive
-                | StoreRole::OrdinaryGenesisArchive
-                | StoreRole::OrdinaryGenesisQuery
-                | StoreRole::OrdinaryGenesisReply
-                | StoreRole::OrdinaryGenesisPublication
-                | StoreRole::OrdinaryGenesisPublicationReply
-                | StoreRole::OrdinaryGenesisReplicas
-                | StoreRole::SharedManagementHandoff
-                | StoreRole::CredentialQuery
-                | StoreRole::LocalCreateAcknowledgement
-                | StoreRole::LocalCreateDenial
-                | StoreRole::OperationDispatch
-                | StoreRole::AdminDispatch
-                | StoreRole::AdminResult
-                | StoreRole::AdminRetirement
-                | StoreRole::AdminPreparationRequest
-                | StoreRole::AdminPreparationResponse
-                | StoreRole::AdminClientRequest
-                | StoreRole::AdminClientResponse
-                | StoreRole::OperationRequest
-                | StoreRole::OperationResponse
-                | StoreRole::PreparationRequest
-                | StoreRole::PreparationResponse
-                | StoreRole::AuthorizationPreparationRequest
-                | StoreRole::AuthorizationPreparationResponse
-                | StoreRole::SharedCreateRequest
-                | StoreRole::SharedCreateResponse
-                | StoreRole::SharedInstallRequest
-                | StoreRole::SharedInstallResponse
-        ) && canonical
-            .iter()
-            .chain(staged.iter())
-            .any(|image| image.predecessor.is_some())
-        {
-            return Err(CleanFileStoreError::RequestConflict);
-        }
-        let resolved = match (canonical, staged) {
-            (None, None) => None,
-            (Some(canonical), None) => Some(canonical),
-            (None, Some(staged)) if staged.predecessor.is_none() => {
-                self.publish_stage(None, &staged)?;
-                Some(staged)
-            }
-            (Some(canonical), Some(staged)) if canonical == staged => {
+        let resolution = resolve_store_images(self.role, canonical.as_ref(), staged.as_ref())?;
+        let resolved = match resolution {
+            StoreImageResolution::Missing => None,
+            StoreImageResolution::Canonical => canonical,
+            StoreImageResolution::RetireDuplicateStage => {
                 self.unlink_stage()?;
-                Some(canonical)
+                canonical
             }
-            (Some(canonical), Some(staged))
-                if staged.predecessor == Some(canonical.commitment()) =>
-            {
-                self.publish_stage(Some(&canonical), &staged)?;
-                Some(staged)
-            }
-            (None, Some(_)) | (Some(_), Some(_)) => {
-                return Err(CleanFileStoreError::AmbiguousPublication);
+            StoreImageResolution::PublishStage => {
+                let next = staged
+                    .as_ref()
+                    .ok_or(CleanFileStoreError::AmbiguousPublication)?;
+                self.publish_stage(canonical.as_ref(), next)?;
+                staged
             }
         };
         self.root.audit_entries()?;
@@ -3771,6 +3869,76 @@ struct StoredImage {
     role: StoreRole,
     predecessor: Option<[u8; 32]>,
     payload: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoreImageResolution {
+    Missing,
+    Canonical,
+    PublishStage,
+    RetireDuplicateStage,
+}
+
+/// The existing file-owner decision, shared without exposing any commit power.
+/// Only `ExactFileStore::reconcile` performs its publication/retirement actions.
+fn resolve_store_images(
+    role: StoreRole,
+    canonical: Option<&StoredImage>,
+    staged: Option<&StoredImage>,
+) -> Result<StoreImageResolution, CleanFileStoreError> {
+    if matches!(
+        role,
+        StoreRole::LocalCreateRequest
+            | StoreRole::ExternalLocalCreateArchive
+            | StoreRole::OrdinaryGenesisArchive
+            | StoreRole::OrdinaryGenesisQuery
+            | StoreRole::OrdinaryGenesisReply
+            | StoreRole::OrdinaryGenesisPublication
+            | StoreRole::OrdinaryGenesisPublicationReply
+            | StoreRole::OrdinaryGenesisReplicas
+            | StoreRole::SharedManagementHandoff
+            | StoreRole::CredentialQuery
+            | StoreRole::LocalCreateAcknowledgement
+            | StoreRole::LocalCreateDenial
+            | StoreRole::OperationDispatch
+            | StoreRole::AdminDispatch
+            | StoreRole::AdminResult
+            | StoreRole::AdminRetirement
+            | StoreRole::AdminPreparationRequest
+            | StoreRole::AdminPreparationResponse
+            | StoreRole::AdminClientRequest
+            | StoreRole::AdminClientResponse
+            | StoreRole::OperationRequest
+            | StoreRole::OperationResponse
+            | StoreRole::PreparationRequest
+            | StoreRole::PreparationResponse
+            | StoreRole::AuthorizationPreparationRequest
+            | StoreRole::AuthorizationPreparationResponse
+            | StoreRole::SharedCreateRequest
+            | StoreRole::SharedCreateResponse
+            | StoreRole::SharedInstallRequest
+            | StoreRole::SharedInstallResponse
+    ) && canonical
+        .into_iter()
+        .chain(staged)
+        .any(|image| image.predecessor.is_some())
+    {
+        return Err(CleanFileStoreError::RequestConflict);
+    }
+    match (canonical, staged) {
+        (None, None) => Ok(StoreImageResolution::Missing),
+        (Some(_), None) => Ok(StoreImageResolution::Canonical),
+        (None, Some(staged)) if staged.predecessor.is_none() => {
+            Ok(StoreImageResolution::PublishStage)
+        }
+        (Some(canonical), Some(staged)) if canonical == staged => {
+            Ok(StoreImageResolution::RetireDuplicateStage)
+        }
+        (Some(canonical), Some(staged)) if staged.predecessor == Some(canonical.commitment()) => {
+            Ok(StoreImageResolution::PublishStage)
+        }
+        (None, Some(_)) | (Some(_), Some(_)) => Err(CleanFileStoreError::AmbiguousPublication),
+    }
 }
 
 impl StoredImage {
@@ -4261,12 +4429,12 @@ pub(crate) use member_genesis::{CleanSharedMemberGenesisEntry, CleanSharedMember
 #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
 #[path = "clean_store/shared_client.rs"]
 mod shared_client;
-#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
-pub(crate) use shared_client::{CleanSharedCreateFile, CleanSharedInstallFile};
-#[cfg(all(test, target_os = "linux", feature = "experimental-state-blocks"))]
-pub(super) use shared_client::tests::submissions as shared_client_submissions_for_test;
 #[cfg(all(test, target_os = "linux", feature = "experimental-state-blocks"))]
 pub(super) use shared_client::tests::acknowledgement as shared_client_acknowledgement_for_test;
+#[cfg(all(test, target_os = "linux", feature = "experimental-state-blocks"))]
+pub(super) use shared_client::tests::submissions as shared_client_submissions_for_test;
+#[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
+pub(crate) use shared_client::{CleanSharedCreateFile, CleanSharedInstallFile};
 
 #[cfg(target_os = "linux")]
 #[path = "clean_operation_completions.rs"]
@@ -4418,6 +4586,222 @@ pub(crate) mod tests {
         let staged = decode_envelope(store.role, &encoded, payload.len()).expect("decode stage");
         store.write_stage(&encoded).expect("write stage");
         staged
+    }
+
+    pub(in crate::commands::space) fn stage_startup_images(
+        path: &Path,
+        payloads: [Option<&[u8]>; 4],
+    ) {
+        let stores = CleanSystemAgentFileStores::open_or_create(path).unwrap();
+        let files = [
+            &stores.pins.0,
+            &stores.bootstrap.0,
+            &stores.issuer.0,
+            &stores.genesis.0,
+        ];
+        for (file, payload) in files.into_iter().zip(payloads) {
+            if let Some(payload) = payload {
+                let predecessor = file
+                    .read_optional(file.file(), file.role.maximum_bytes())
+                    .unwrap()
+                    .map(|image| image.commitment());
+                stage(file, predecessor, payload);
+            }
+        }
+    }
+
+    #[test]
+    fn startup_stage_selection_preserves_exact_owner_decisions() {
+        let image = |role, predecessor, payload: &[u8]| StoredImage {
+            role,
+            predecessor,
+            payload: payload.to_vec(),
+        };
+        let canonical = image(StoreRole::Bootstrap, None, b"old");
+        let initial = image(StoreRole::Bootstrap, None, b"new");
+        let successor = image(StoreRole::Bootstrap, Some(canonical.commitment()), b"new");
+        for (current, next, expected) in [
+            (None, None, StoreImageResolution::Missing),
+            (Some(&canonical), None, StoreImageResolution::Canonical),
+            (None, Some(&initial), StoreImageResolution::PublishStage),
+            (
+                Some(&canonical),
+                Some(&canonical),
+                StoreImageResolution::RetireDuplicateStage,
+            ),
+            (
+                Some(&canonical),
+                Some(&successor),
+                StoreImageResolution::PublishStage,
+            ),
+        ] {
+            assert_eq!(
+                resolve_store_images(StoreRole::Bootstrap, current, next).unwrap(),
+                expected
+            );
+        }
+        for (current, next) in [(None, Some(&successor)), (Some(&canonical), Some(&initial))] {
+            assert!(matches!(
+                resolve_store_images(StoreRole::Bootstrap, current, next),
+                Err(CleanFileStoreError::AmbiguousPublication)
+            ));
+        }
+        let immutable = image(StoreRole::SharedCreateRequest, Some([1; 32]), b"request");
+        assert!(matches!(
+            resolve_store_images(StoreRole::SharedCreateRequest, Some(&immutable), None),
+            Err(CleanFileStoreError::RequestConflict)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn startup_file_snapshot(root: &Path) -> Vec<(String, Vec<u8>, u64, i64, i64)> {
+        let mut files = fs::read_dir(root)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let metadata = entry.metadata().unwrap();
+                (
+                    entry.file_name().into_string().unwrap(),
+                    fs::read(entry.path()).unwrap(),
+                    metadata.ino(),
+                    metadata.mtime(),
+                    metadata.mtime_nsec(),
+                )
+            })
+            .collect::<Vec<_>>();
+        files.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        files
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_reader_selects_all_four_stores_without_writes_then_owner_reconciles() {
+        for role in [
+            StoreRole::Pins,
+            StoreRole::Bootstrap,
+            StoreRole::ManagementIssuer,
+            StoreRole::GenesisArchive,
+        ] {
+            for scenario in 0..3 {
+                let fixture = Fixture::new("startup-stage-read");
+                let stores = fixture.stores();
+                let mut file = ExactFileStore::new(Arc::clone(&stores.pins.0.root), role);
+                let expected = if scenario == 1 { b"old" } else { b"new" };
+                let predecessor = if scenario == 0 {
+                    None
+                } else {
+                    file.commit(b"old").unwrap();
+                    (scenario == 2).then(|| {
+                        file.read_optional(role.file(), role.maximum_bytes())
+                            .unwrap()
+                            .unwrap()
+                            .commitment()
+                    })
+                };
+                stage(&file, predecessor, expected);
+                let before = startup_file_snapshot(&fixture.root);
+                for _ in 0..2 {
+                    let inspection =
+                        CleanSystemAgentFileStores::read_startup_bootstrap(&fixture.root)
+                            .unwrap()
+                            .unwrap();
+                    let image = match role {
+                        StoreRole::Pins => &inspection.pins,
+                        StoreRole::Bootstrap => &inspection.bootstrap,
+                        StoreRole::ManagementIssuer => &inspection.issuer,
+                        StoreRole::GenesisArchive => &inspection.genesis,
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(image.selected_payload(), Some(expected.as_slice()));
+                    assert_eq!(image.payloads().count(), if scenario == 0 { 1 } else { 2 });
+                    assert!(
+                        CleanSystemAgentFileStores::read_client_bootstrap(&fixture.root).is_err()
+                    );
+                    assert_eq!(startup_file_snapshot(&fixture.root), before);
+                }
+                drop((file, stores));
+                let stores = fixture.stores();
+                let mut file = ExactFileStore::new(Arc::clone(&stores.pins.0.root), role);
+                assert_eq!(
+                    file.load(role.maximum_bytes()).unwrap().as_deref(),
+                    Some(expected.as_slice())
+                );
+                assert!(!fixture.root.join(role.stage_file()).exists());
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_reader_refuses_conflicting_malformed_role_and_namespace_residue_unchanged() {
+        for corruption in 0..5 {
+            let fixture = Fixture::new("startup-stage-refusal");
+            let (mut pins, bootstrap, issuer) = fixture.stores().into_parts();
+            pins.commit(b"old").unwrap();
+            match corruption {
+                0 => {
+                    stage(&pins.0, Some([1; 32]), b"wrong predecessor");
+                }
+                1 => write_private(
+                    &fixture.root.join(PINS_STAGE_FILE),
+                    &encode_envelope(StoreRole::Bootstrap, None, b"wrong role").unwrap(),
+                ),
+                2 => {
+                    let mut malformed = encode_envelope(StoreRole::Pins, None, b"stage").unwrap();
+                    *malformed.last_mut().unwrap() ^= 1;
+                    write_private(&fixture.root.join(PINS_STAGE_FILE), &malformed);
+                }
+                3 => write_private(&fixture.root.join("unknown.next"), b"preserve residue"),
+                4 => fs::remove_file(fixture.root.join(LOCK_FILE)).unwrap(),
+                _ => unreachable!(),
+            }
+            let before = startup_file_snapshot(&fixture.root);
+            assert!(CleanSystemAgentFileStores::read_startup_bootstrap(&fixture.root).is_err());
+            assert_eq!(startup_file_snapshot(&fixture.root), before);
+            drop((pins, bootstrap, issuer));
+        }
+        let absent = Fixture::new("startup-absent");
+        assert!(
+            CleanSystemAgentFileStores::read_startup_bootstrap(&absent.root)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!absent.root.exists());
+        let empty = Fixture::new("startup-empty");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&empty.root)
+            .unwrap();
+        assert!(
+            CleanSystemAgentFileStores::read_startup_bootstrap(&empty.root)
+                .unwrap()
+                .is_none()
+        );
+        assert!(fs::read_dir(&empty.root).unwrap().next().is_none());
+        assert!(CleanSystemAgentFileStores::read_client_bootstrap(&empty.root).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_writer_fences_the_complete_inspection_before_reconciling() {
+        let fixture = Fixture::new("startup-owner-fence");
+        let stores = fixture.stores();
+        let mut pins = ExactFileStore::new(Arc::clone(&stores.pins.0.root), StoreRole::Pins);
+        pins.commit(b"canonical").unwrap();
+        let predecessor = pins
+            .read_optional(PINS_FILE, 64)
+            .unwrap()
+            .unwrap()
+            .commitment();
+        let admitted = CleanSystemAgentFileStores::read_startup_bootstrap(&fixture.root).unwrap();
+        assert!(stores.matches_startup_inspection(&admitted).unwrap());
+        stage(&pins, Some(predecessor), b"changed after admission");
+        let before = startup_file_snapshot(&fixture.root);
+        assert!(!stores.matches_startup_inspection(&admitted).unwrap());
+        assert_eq!(startup_file_snapshot(&fixture.root), before);
+        let admitted = CleanSystemAgentFileStores::read_startup_bootstrap(&fixture.root).unwrap();
+        assert!(stores.matches_startup_inspection(&admitted).unwrap());
+        assert_eq!(startup_file_snapshot(&fixture.root), before);
     }
 
     #[test]

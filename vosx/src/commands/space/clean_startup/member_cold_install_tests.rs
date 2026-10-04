@@ -31,7 +31,7 @@ pub(super) struct Inputs<'a> {
 
 impl Inputs<'_> {
     fn open_origin(&self) -> (vos::agent::sdk::NodeId, CleanProductionLifecycle) {
-        open_clean_system_lifecycle_with_inputs(
+        open_clean_system_lifecycle_with_roster_policy(
             self.networks[0].clone(),
             &self.data[0],
             self.space.0,
@@ -40,6 +40,7 @@ impl Inputs<'_> {
             commands::local_config::LocalAgentStorage::Image,
             &self.data[0].join("host.lock"),
             None,
+            false,
             Some(self.startup),
         )
         .expect("same locked persisted owner startup")

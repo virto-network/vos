@@ -991,6 +991,13 @@ where
             .iter_mut()
             .find(|(recovery, _)| recovery.locator == locator)
             .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        if !recovery.admission_valid {
+            // Publication can fail after selecting the immutable archive or
+            // retaining its successor envelope. Re-admit the exact original
+            // stores under their existing leases before resuming; an archive
+            // alone is not authorization or proof that publication completed.
+            recovery.readmit_creation_from_leased_stores()?;
+        }
         if recovery.retired {
             return Err(SharedAgentHostError::Conflict);
         }

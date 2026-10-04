@@ -1414,23 +1414,25 @@ impl ServiceWire for AgentGenesisProvision {
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         enforce_complete_bound(decoder, MAX_AGENT_GENESIS_PROVISION_BYTES)?;
+        // Do not keep by-value component scratch in this frame while nested
+        // proposal decoding and certificate validation use the guest stack.
         let provision = Self {
-            proposal: Box::new(decode_nested::<AgentGenesisProposal>(
+            proposal: decode_boxed_nested::<AgentGenesisProposal>(
                 decoder,
                 MAX_AGENT_GENESIS_PROPOSAL_BYTES,
-            )?),
-            replicas: Box::new(decode_nested::<AgentReplicaCommittee>(
+            )?,
+            replicas: decode_boxed_nested::<AgentReplicaCommittee>(
                 decoder,
                 MAX_AGENT_REPLICA_COMMITTEE_BYTES,
-            )?),
-            evidence: Box::new(decode_nested::<AgentGenesisEvidence>(
+            )?,
+            evidence: decode_boxed_nested::<AgentGenesisEvidence>(
                 decoder,
                 MAX_AGENT_GENESIS_EVIDENCE_BYTES,
-            )?),
-            decision: Box::new(decode_nested::<AgentGenesisDecision>(
+            )?,
+            decision: decode_boxed_nested::<AgentGenesisDecision>(
                 decoder,
                 MAX_AGENT_GENESIS_DECISION_BYTES,
-            )?),
+            )?,
         };
         provision.validate().map_err(map_decode_error)?;
         Ok(provision)
@@ -1923,7 +1925,14 @@ fn decode_boxed_nested<T: ServiceWire>(
     decoder: &mut Decoder<'_>,
     maximum: usize,
 ) -> Result<Box<T>, DecodeError> {
-    decode_nested(decoder, maximum).map(Box::new)
+    // Decode into this allocation frame directly. Calling the by-value
+    // non-inlined helper keeps both large return-value scratch slots alive
+    // throughout the nested decoder, including its certificate checks.
+    let bytes = decoder.bytes_ref()?;
+    if bytes.len() > maximum {
+        return Err(DecodeError::LimitExceeded);
+    }
+    T::decode(bytes).map(Box::new)
 }
 
 fn enforce_encoded_bound<T: ServiceWire>(

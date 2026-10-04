@@ -316,31 +316,7 @@ impl SystemBootstrapMaterials {
             .map_err(|error| anyhow::anyhow!("invalid system-Agent descriptor: {error:?}"))?;
         let authority_configuration =
             roster.authority_configuration(&descriptor, operator_public)?;
-        let authority = target.binding;
-        let catalog_configuration = SystemCatalogConfiguration {
-            space: space.0,
-            system_agent: target.system_agent.0,
-            system_runtime_deployment: runtime.deployment().0,
-            actor: ActorId::top_level(target.system_agent, SYSTEM_CATALOG_NAME).0,
-            deployment: catalog_package.deployment().0,
-            program: catalog_package.program().0,
-            authority: CatalogAuthorityState {
-                policy: authority.policy.0,
-                issuer: CatalogIssuerState {
-                    principal: authority.issuer.principal.0,
-                    actor: authority.issuer.actor.0,
-                    deployment: authority.issuer.deployment.0,
-                    program: authority.issuer.program.0,
-                    producer: authority.issuer.producer.0,
-                },
-                public_key: authority.public_key,
-                initial_epoch: authority.initial_epoch,
-            },
-        };
-        anyhow::ensure!(
-            catalog_configuration.is_valid(),
-            "derived system-catalog configuration is invalid"
-        );
+        let catalog_configuration = system_catalog_configuration(&descriptor, &catalog_package)?;
         let authority_request = install_request(
             target.system_agent,
             &authority_package,
@@ -440,6 +416,40 @@ impl SystemBootstrapMaterials {
     }
 }
 
+/// The existing Catalog binding, shared by construction and prewrite release
+/// validation. A certified request is never repaired to this expected value.
+fn system_catalog_configuration(
+    descriptor: &AgentDescriptor,
+    catalog_package: &AdmittedActorPackage,
+) -> anyhow::Result<SystemCatalogConfiguration> {
+    let authority = descriptor.authority;
+    let configuration = SystemCatalogConfiguration {
+        space: descriptor.identity.space.0,
+        system_agent: descriptor.identity.agent.0,
+        system_runtime_deployment: descriptor.identity.runtime_deployment.0,
+        actor: ActorId::top_level(descriptor.identity.agent, SYSTEM_CATALOG_NAME).0,
+        deployment: catalog_package.deployment().0,
+        program: catalog_package.program().0,
+        authority: CatalogAuthorityState {
+            policy: authority.policy.0,
+            issuer: CatalogIssuerState {
+                principal: authority.issuer.principal.0,
+                actor: authority.issuer.actor.0,
+                deployment: authority.issuer.deployment.0,
+                program: authority.issuer.program.0,
+                producer: authority.issuer.producer.0,
+            },
+            public_key: authority.public_key,
+            initial_epoch: authority.initial_epoch,
+        },
+    };
+    anyhow::ensure!(
+        configuration.is_valid(),
+        "derived system-catalog configuration is invalid"
+    );
+    Ok(configuration)
+}
+
 /// Shared immutable bootstrap derivation for startup and fresh CLI requests.
 /// This derives an expected target, not proof of the daemon's live state.
 pub(crate) fn derive_system_authority_target(
@@ -489,6 +499,39 @@ pub(crate) fn derive_system_authority_target(
         "derived system-authority target is invalid"
     );
     Ok((target, nonce))
+}
+
+/// Recover the target from the complete retained/certified descriptor, never
+/// by synthesizing a new one-voter configuration for the reopening replica.
+fn system_startup_target_from_descriptor(
+    descriptor: &AgentDescriptor,
+    space: SpaceId,
+    operator_public: [u8; 32],
+    runtime: &vos::agent::package_admission::AdmittedRuntimePackage,
+    authority_package: &AdmittedActorPackage,
+    catalog_package: &AdmittedActorPackage,
+) -> anyhow::Result<AuthorityActorTarget> {
+    let (target, nonce) =
+        derive_system_authority_target(space, operator_public, runtime, authority_package)?;
+    catalog_package.require_runtime(AgentProfile::Shared, runtime)?;
+    anyhow::ensure!(
+        descriptor.validate().is_ok()
+            && descriptor.identity.profile == AgentProfile::Shared
+            && descriptor.identity.space == space
+            && descriptor.identity.agent == target.system_agent
+            && descriptor.identity.owner == PrincipalId::of_public_key(&operator_public)
+            && descriptor.creation_nonce == nonce
+            && descriptor.authority == target.binding
+            && descriptor.private_recovery.is_none()
+            && descriptor.identity.runtime_deployment == runtime.deployment()
+            && descriptor.identity.runtime_program == runtime.program()
+            && descriptor.identity.runtime_producer == runtime.producer()
+            && &descriptor.runtime_package == runtime.package_ref()
+            && descriptor.runtime_contract == runtime.manifest().contract
+            && descriptor.capabilities == runtime.capabilities(),
+        "retained System descriptor differs from its exact root-signed runtime and Authority closure"
+    );
+    Ok(target)
 }
 
 /// Start or exactly reopen the native system Agent after the node network has
@@ -823,6 +866,8 @@ fn validate_packaged_system_observation_bootstrap_plan(
         plan.runtime_package_bytes(),
         plan.authority_package_bytes(),
         plan.authority_request(),
+        plan.catalog_package_bytes(),
+        plan.catalog_request(),
         operator,
     )
 }
@@ -832,6 +877,8 @@ fn validate_packaged_system_observation_bootstrap_materials(
     runtime_package_bytes: &[u8],
     authority_package_bytes: &[u8],
     authority_request: &ManagementRequest,
+    catalog_package_bytes: &[u8],
+    catalog_request: &ManagementRequest,
     operator: &Keypair,
 ) -> anyhow::Result<()> {
     let ManagementRequest::Install(install) = authority_request else {
@@ -882,6 +929,25 @@ fn validate_packaged_system_observation_bootstrap_materials(
         authority_request == &expected_installation,
         "root-certified Authority installation differs from its exact packaged program, package and descriptor closure"
     );
+    let catalog = crate::bundled::root_signed_actor_package(
+        crate::bundled::system_catalog_package_template(),
+        SYSTEM_CATALOG_NAME,
+        operator,
+    )?;
+    anyhow::ensure!(
+        catalog_package_bytes == catalog.exact_bytes(),
+        "root-certified Catalog differs from the exact packaged Catalog template"
+    );
+    let expected_catalog = install_request(
+        target.system_agent,
+        &catalog,
+        system_catalog_configuration(descriptor, &catalog)?.encode(),
+        b"catalog",
+    )?;
+    anyhow::ensure!(
+        catalog_request == &expected_catalog,
+        "root-certified Catalog installation differs from its exact packaged program, package and descriptor closure"
+    );
     Ok(())
 }
 
@@ -892,20 +958,66 @@ fn preflight_released_system_startup(
     local_storage: super::local_config::LocalAgentStorage,
     certified_inputs: Option<&PreparedCleanSystemAgentBootstrap>,
     operator: &Keypair,
-) -> anyhow::Result<()> {
+    space: [u8; 32],
+    daemon: &Keypair,
+) -> anyhow::Result<Option<super::clean_store::RetainedStartupBootstrap>> {
+    inspect_released_system_startup(
+        data_dir,
+        local_storage,
+        certified_inputs,
+        operator,
+        space,
+        daemon,
+    )?;
+    anyhow::bail!(
+        "fixed-three SAC7 System observation startup is pending release qualification; no bootstrap or deployment roots were created"
+    );
+}
+
+/// Readonly admission, not release qualification or permission to serve. Keep
+/// its exact snapshot until the actual locked stores compare it before loads.
+fn inspect_released_system_startup(
+    data_dir: &Path,
+    local_storage: super::local_config::LocalAgentStorage,
+    certified_inputs: Option<&PreparedCleanSystemAgentBootstrap>,
+    operator: &Keypair,
+    space: [u8; 32],
+    daemon: &Keypair,
+) -> anyhow::Result<Option<super::clean_store::RetainedStartupBootstrap>> {
     super::local_config::validate_local_storage_roots(data_dir, local_storage)?;
+    let validate_identity = |plan: &AuthorizedCleanSystemAgentBootstrap| -> anyhow::Result<()> {
+        verify_client_plan_identity(plan, space, operator, daemon)?;
+        anyhow::ensure!(
+            plan.pins().node() == node_id_from_authenticated_peer(&daemon.public().to_peer_id()),
+            "retained bootstrap plan belongs to another local node"
+        );
+        Ok(())
+    };
     if let Some(inputs) = certified_inputs {
         validate_packaged_system_observation_bootstrap_plan(inputs.plan(), operator)?;
+        validate_identity(inputs.plan())?;
     }
-    let retained = CleanSystemAgentFileStores::read_client_bootstrap(
+    let retained = CleanSystemAgentFileStores::read_startup_bootstrap(
         &data_dir.join(SYSTEM_AGENT_CONTROL_DIRECTORY),
     )?;
-    if let Some(images) = &retained {
-        // This decoder accepts only the canonical current CSB2/version-5
-        // record and its fully root-certified plan, before a writer opens.
-        let plan = CleanSystemAgentBootstrapRecord::authorized_plan(&images.bootstrap)
-            .map_err(|error| anyhow::anyhow!("invalid persisted bootstrap plan: {error:?}"))?;
-        validate_packaged_system_observation_bootstrap_plan(&plan, operator)?;
+    let retained_plan = retained
+        .as_ref()
+        .and_then(|images| images.bootstrap.selected_payload())
+        .map(|bytes| {
+            CleanSystemAgentBootstrapRecord::validated_startup_plan(bytes)
+                .map_err(|error| anyhow::anyhow!("invalid persisted bootstrap plan: {error:?}"))
+        })
+        .transpose()?;
+    if retained_plan.is_none() {
+        anyhow::ensure!(
+            matches!(std::fs::symlink_metadata(data_dir.join(SHARED_AGENT_HOST_DIRECTORY)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+            "Shared deployment residue lacks its retained System bootstrap plan"
+        );
+    }
+    if let Some(plan) = &retained_plan {
+        validate_packaged_system_observation_bootstrap_plan(plan, operator)?;
+        validate_identity(plan)?;
         if let Some(inputs) = certified_inputs {
             anyhow::ensure!(
                 plan.commitment() == inputs.plan().commitment(),
@@ -913,13 +1025,142 @@ fn preflight_released_system_startup(
             );
         }
     }
-    anyhow::ensure!(
-        certified_inputs.is_some() || retained.is_some(),
+    let plan = certified_inputs
+        .map(|inputs| inputs.plan())
+        .or(retained_plan.as_ref())
+        .ok_or_else(|| anyhow::anyhow!(
         "released fixed-three System startup requires a supplied root-certified plan or canonical retained CSB5 plan; no fresh singleton fallback exists"
-    );
-    anyhow::bail!(
-        "fixed-three SAC7 System observation startup is pending release qualification; no bootstrap or deployment roots were created"
-    );
+    ))?;
+    if let Some(images) = &retained {
+        // Validate both predecessor and successor, not just the selected one:
+        // an old or cross-plan canonical image must never become migration.
+        for bytes in images.bootstrap.payloads() {
+            let candidate = CleanSystemAgentBootstrapRecord::validated_startup_plan(bytes)
+                .map_err(|error| anyhow::anyhow!("invalid persisted bootstrap plan: {error:?}"))?;
+            anyhow::ensure!(
+                candidate.commitment() == plan.commitment(),
+                "staged bootstrap differs from its immutable authorized plan"
+            );
+        }
+        for bytes in images.pins.payloads() {
+            anyhow::ensure!(
+                Hash::digest(b"vos/clean-system-agent-pins/v2", &[bytes])
+                    == plan.pins().commitment(),
+                "retained bootstrap pins differ from its authorized plan"
+            );
+        }
+        if retained_plan.is_some() {
+            anyhow::ensure!(
+                images.pins.selected_payload().is_some()
+                    && images.genesis.selected_payload().is_some(),
+                "retained bootstrap plan lacks its exact pins or genesis archive"
+            );
+        } else {
+            anyhow::ensure!(
+                certified_inputs.is_some() && images.issuer.selected_payload().is_none(),
+                "partial bootstrap issuer lacks its exact retained plan"
+            );
+        }
+        for bytes in images.issuer.payloads() {
+            vos::agent::clean_authority_issuer::DurableCleanManagementIssuer::open(
+                ReadonlyStartupIssuer(bytes),
+                plan.pins().descriptor().authority,
+                plan.pins().space(),
+                plan.pins().agent(),
+            )
+            .map_err(|_| anyhow::anyhow!("invalid retained bootstrap issuer"))?;
+        }
+        if let Some(bytes) = images.genesis.selected_payload() {
+            let (provision, catalog) = super::clean_genesis_archive::client_archive_parts(bytes)?;
+            for candidate in images.genesis.payloads() {
+                anyhow::ensure!(
+                    super::clean_genesis_archive::client_archive_parts(candidate)?
+                        == (provision.clone(), catalog.clone()),
+                    "staged genesis differs from its immutable certified archive"
+                );
+            }
+            if let Some(inputs) = certified_inputs {
+                anyhow::ensure!(
+                    &provision == inputs.provision() && catalog == inputs.catalog(),
+                    "stored genesis evidence differs from import"
+                );
+            } else {
+                let descriptor = plan.pins().descriptor();
+                let trust = Arc::new(SystemAgentTrust::new(
+                    plan.pins().observed_slot(),
+                    HostSpaceId(space),
+                    host_authority_binding(descriptor.identity.agent, descriptor.authority),
+                ));
+                let merge =
+                    Arc::new(Ed25519NodeMergeAuthenticator::new(daemon.clone()).map_err(
+                        |error| anyhow::anyhow!("construct bootstrap verifier: {error:?}"),
+                    )?);
+                PreparedCleanSystemAgentBootstrap::from_certified_parts(
+                    plan.clone(),
+                    provision,
+                    catalog,
+                    trust,
+                    merge,
+                )?;
+            }
+        }
+    }
+    Ok(retained)
+}
+
+/// Reuse the canonical issuer decoder/signature checks without exposing any
+/// persistence or repair path to startup's readonly candidate inspection.
+struct ReadonlyStartupIssuer<'a>(&'a [u8]);
+impl vos::agent::clean_authority_issuer::CleanManagementIssuerStore for ReadonlyStartupIssuer<'_> {
+    type Error = super::clean_store::CleanFileStoreError;
+    fn load(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(Some(self.0.to_vec()))
+    }
+    fn commit(&mut self, _image: &[u8]) -> Result<(), Self::Error> {
+        Err(super::clean_store::CleanFileStoreError::RequestConflict)
+    }
+}
+
+fn import_certified_system_bootstrap(
+    pins: Option<&[u8]>,
+    record: Option<&[u8]>,
+    archive: &CleanSystemAgentGenesisArchive,
+    inputs: &PreparedCleanSystemAgentBootstrap,
+    shared_root: &Path,
+) -> anyhow::Result<()> {
+    match (pins, record) {
+        (pins, None) => {
+            if let Some(bytes) = pins {
+                anyhow::ensure!(
+                    Hash::digest(b"vos/clean-system-agent-pins/v2", &[bytes])
+                        == inputs.plan().pins().commitment(),
+                    "partial bootstrap pins differ from the exact supplied plan"
+                );
+            }
+            match std::fs::symlink_metadata(shared_root) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                _ => anyhow::bail!("cannot import bootstrap beside a preexisting Shared host"),
+            }
+            archive.import_certified(inputs.provision(), inputs.catalog())?;
+        }
+        (Some(_), Some(bytes)) => {
+            let stored = CleanSystemAgentBootstrapRecord::authorized_plan(bytes)
+                .map_err(|error| anyhow::anyhow!("invalid stored bootstrap plan: {error:?}"))?;
+            anyhow::ensure!(
+                stored.commitment() == inputs.plan().commitment(),
+                "certified bootstrap differs from stored plan"
+            );
+            // Import is not repair permission for missing/corrupt evidence
+            // after plan publication. This exact check remains read-only.
+            anyhow::ensure!(
+                archive.create(inputs.provision().proposal(), inputs.catalog())?
+                    == *inputs.provision(),
+                "stored genesis evidence differs from import"
+            );
+        }
+        _ => anyhow::bail!("cannot import bootstrap into partial plan stores"),
+    }
+    Ok(())
 }
 
 fn open_clean_system_lifecycle_with_inputs(
@@ -962,9 +1203,18 @@ fn open_clean_system_lifecycle_with_roster_policy(
 ) -> anyhow::Result<(vos::agent::sdk::NodeId, CleanProductionLifecycle)> {
     // The public v1 role is not promoted yet. Refuse old or unqualified input
     // before opening writable stores; no canonical singleton fallback exists.
-    if !allow_candidate_roster {
-        preflight_released_system_startup(data_dir, local_storage, certified_inputs, operator)?;
-    }
+    let startup_inspection = if !allow_candidate_roster {
+        Some(preflight_released_system_startup(
+            data_dir,
+            local_storage,
+            certified_inputs,
+            operator,
+            space_bytes,
+            daemon,
+        )?)
+    } else {
+        None
+    };
     // Candidate fixtures remain explicit preparation/evidence, never a grant
     // to the public release gate or a selection of production artifacts.
     if let Some(inputs) = certified_inputs {
@@ -997,6 +1247,12 @@ fn open_clean_system_lifecycle_with_roster_policy(
 
     let stores =
         CleanSystemAgentFileStores::open_or_create(data_dir.join(SYSTEM_AGENT_CONTROL_DIRECTORY))?;
+    if let Some(expected) = startup_inspection {
+        anyhow::ensure!(
+            stores.matches_startup_inspection(&expected)?,
+            "bootstrap candidates changed after readonly startup admission"
+        );
+    }
     let (mut pins_store, mut record_store, issuer_store, genesis_store) =
         stores.into_production_parts();
     let stored_plan = record_store
@@ -1010,10 +1266,10 @@ fn open_clean_system_lifecycle_with_roster_policy(
         validate_production_bootstrap_roster(plan, allow_candidate_roster)?;
     }
 
-    let (runtime, authority_package, catalog_package) = match certified_inputs
+    let selected_plan = certified_inputs
         .map(|inputs| inputs.plan())
-        .or(stored_plan.as_ref())
-    {
+        .or(stored_plan.as_ref());
+    let (runtime, authority_package, catalog_package) = match selected_plan {
         Some(plan) => {
             anyhow::ensure!(
                 plan.pins().space() == space && plan.pins().node() == clean_node,
@@ -1055,16 +1311,33 @@ fn open_clean_system_lifecycle_with_roster_policy(
         anyhow::bail!("node enrollment does not bind the authenticated transport identity");
     }
 
-    let materials = SystemBootstrapMaterials::new(
-        space,
-        operator_public,
-        clean_node,
-        runtime,
-        authority_package,
-        catalog_package,
-        &[enrollment],
-    )?;
-    let authority_target = materials.authority_target();
+    let (authority_target, materials) = if let Some(plan) = selected_plan {
+        (
+            system_startup_target_from_descriptor(
+                plan.pins().descriptor(),
+                space,
+                operator_public,
+                &runtime,
+                &authority_package,
+                &catalog_package,
+            )?,
+            None,
+        )
+    } else {
+        // Released startup already requires a supplied or retained fixed-three
+        // plan before taking any writer lease. This fresh branch remains only
+        // for the existing explicit legacy/candidate preparation fixtures.
+        let materials = SystemBootstrapMaterials::new(
+            space,
+            operator_public,
+            clean_node,
+            runtime,
+            authority_package,
+            catalog_package,
+            &[enrollment],
+        )?;
+        (materials.authority_target(), Some(materials))
+    };
     let system_agent = authority_target.system_agent;
     let authority = authority_target.binding;
     report_phase("bootstrap_material");
@@ -1084,31 +1357,13 @@ fn open_clean_system_lifecycle_with_roster_policy(
         );
         let pins = pins_store.load(MAX_CLEAN_SYSTEM_AGENT_PINS_BYTES)?;
         let record = record_store.load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)?;
-        match (pins, record) {
-            (None, None) => {
-                match std::fs::symlink_metadata(data_dir.join(SHARED_AGENT_HOST_DIRECTORY)) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-                    _ => anyhow::bail!("cannot import bootstrap beside a preexisting Shared host"),
-                }
-                archive.import_certified(inputs.provision(), inputs.catalog())?;
-            }
-            (Some(_), Some(bytes)) => {
-                let stored = CleanSystemAgentBootstrapRecord::authorized_plan(&bytes)
-                    .map_err(|error| anyhow::anyhow!("invalid stored bootstrap plan: {error:?}"))?;
-                anyhow::ensure!(
-                    stored.commitment() == inputs.plan().commitment(),
-                    "certified bootstrap differs from stored plan"
-                );
-                // Import is not repair permission for a missing/corrupt archive
-                // after plan publication. Existing startup remains read-only.
-                anyhow::ensure!(
-                    archive.create(inputs.provision().proposal(), inputs.catalog())?
-                        == *inputs.provision(),
-                    "stored genesis evidence differs from import"
-                );
-            }
-            _ => anyhow::bail!("cannot import bootstrap into partial plan stores"),
-        }
+        import_certified_system_bootstrap(
+            pins.as_deref(),
+            record.as_deref(),
+            &archive,
+            inputs,
+            &data_dir.join(SHARED_AGENT_HOST_DIRECTORY),
+        )?;
     }
     let observed_slot = archive
         .stored_observed_slot()?
@@ -1142,6 +1397,9 @@ fn open_clean_system_lifecycle_with_roster_policy(
             return Ok(inputs.plan().clone());
         }
         materials
+            .ok_or(CleanSystemAgentBootstrapError::Rejected(
+                vos::agent::clean_bootstrap::CleanSystemAgentBootstrapRejection::WrongScope,
+            ))?
             .prepare(
                 operator,
                 observed_slot,

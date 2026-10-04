@@ -10,21 +10,25 @@ use crate::agent::clean_authority_issuer::{
 use crate::agent::clean_management_intent::CleanManagementIntent;
 
 #[derive(Default)]
-struct Fault {
+pub(super) struct Fault {
     load_once: bool,
     commit_then_error_at: Option<usize>,
 }
 
 /// Non-clone owner used to observe that borrowed reload never releases or
 /// replaces the original six leases. The underlying observer is not a writer.
-struct LeaseStore {
+pub(super) struct LeaseStore {
     inner: IssuerMemoryStore,
     fault: Arc<Mutex<Fault>>,
     live: Arc<AtomicUsize>,
 }
 
 impl LeaseStore {
-    fn new(inner: IssuerMemoryStore, fault: Arc<Mutex<Fault>>, live: Arc<AtomicUsize>) -> Self {
+    pub(super) fn new(
+        inner: IssuerMemoryStore,
+        fault: Arc<Mutex<Fault>>,
+        live: Arc<AtomicUsize>,
+    ) -> Self {
         live.fetch_add(1, Ordering::SeqCst);
         Self { inner, fault, live }
     }
@@ -151,10 +155,7 @@ fn check_readmission(ambiguous_issuer: bool, corruptions: bool) {
     check_readmission_case(ambiguous_issuer, corruptions);
 }
 
-fn check_readmission_case(
-    ambiguous_issuer: bool,
-    corruptions: bool,
-) {
+fn check_readmission_case(ambiguous_issuer: bool, corruptions: bool) {
     let fixture = native_authority_package_fixture(false, &candidate_authority_package());
     let mut harness = NativeProjectionOwnerHarness::with_real_bootstrap(
         "shared-create-inplace-readmission",

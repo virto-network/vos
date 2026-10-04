@@ -346,8 +346,9 @@ mod tests {
         use std::io::{Read as _, Write as _};
         use vos::agent::sdk::{Hash, ProducerId};
         let fixture = Fixture::new("managed-operation");
-        let (operator, old_authority, _, runtime) =
+        let (operator, old_authority, _, _) =
             crate::commands::space::local_create::tests::fixture();
+        let runtime = crate::bundled::root_signed_system_agent_runtime_package(&operator).unwrap();
         let identity =
             crate::commands::space::clean_identity::CleanOperatorIdentitySigner::new(&operator)
                 .unwrap();

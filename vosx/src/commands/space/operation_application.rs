@@ -75,8 +75,9 @@ mod tests {
     fn issued(
         prepared: &vos::agent::supervisor_adapters::PreparedAgentInvocation,
     ) -> (AuthorityOperationSubmission, Vec<u8>) {
-        let (operator, old_authority, descriptor, runtime) =
+        let (operator, old_authority, descriptor, _) =
             crate::commands::space::local_create::tests::fixture();
+        let runtime = crate::bundled::root_signed_system_agent_runtime_package(&operator).unwrap();
         let public = operator.public().try_into_ed25519().unwrap().to_bytes();
         let package = crate::bundled::root_signed_actor_package(
             crate::bundled::system_authority_package_template(),

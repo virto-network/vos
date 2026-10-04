@@ -567,9 +567,11 @@ mod tests {
     fn fixture_with_target(
         native: bool,
     ) -> (Vec<u8>, ManagementApplicationAck, libp2p::identity::Keypair) {
-        let (operator, mut authority, mut descriptor, runtime) =
+        let (operator, mut authority, mut descriptor, _) =
             super::super::local_create::tests::fixture();
         if native {
+            let runtime =
+                crate::bundled::root_signed_system_agent_runtime_package(&operator).unwrap();
             let identity =
                 super::super::clean_identity::CleanOperatorIdentitySigner::new(&operator).unwrap();
             let package = crate::bundled::root_signed_actor_package(

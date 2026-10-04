@@ -4,13 +4,16 @@ This is the sole reviewer handoff. [The live checklist](agent-saga-status.md)
 owns scope, dependency order, forecasts, open gates and acceptance targets.
 Review read-only and return findings for the implementation branch, not competing
 fixes on the review branch.
-Start with [R37 replacement](#active-priority-r37-observation-replacement); older evidence is
-explicitly frozen and cannot qualify later source.
+Start with [the observation replacement](#active-priority-r37-observation-replacement)
+and its current scoped R38 decoder correction. Older evidence is explicitly
+frozen and cannot qualify later source.
 
 ## Boundary and release claim
 
-Starting checkpoint is `e6f2bb45` on `saga/agents` and
-`wip/ch08-runtime-directory`; inspect the latter's active diff.
+The review branch remains `e6f2bb45` on `saga/agents`. Immutable replacement
+source is `8128e677` on `wip/ch08-runtime-directory`, with the reproduced role
+bundle at `7085c220`; inspect the subsequent packaged integration diff as well.
+These commits are not a release promotion.
 Verify actual heads and cleanliness before assuming fast-forward promotion.
 `master` remains `d2378274`. No released fixed-three workflow or service capacity
 is qualified by this diff yet.
@@ -21,8 +24,8 @@ demonstrated limits and does not waive any final workload, latency, recovery or
 correctness gate. Review a frozen source/artifact boundary plus its acceptance
 evidence and delta; internal passing suites are not a milestone exit.
 
-Production Local remains image-based. Fixed-three prewrite gates and production
-artifact pins remain closed pending coherent packaged workflow qualification.
+Production Local remains image-based. Exact paired-role artifact pins are
+staged; fixed-three startup stays closed pending packaged recovery qualification.
 Test signers, candidate guests and fixture resource policies are not release proof.
 The replacement release requires fresh v1 System/control and Shared roots;
 existing experimental spaces remain untouched and unsupported by the new binary.
@@ -51,10 +54,23 @@ Current O3 component evidence (logs under the native worktree's `target`):
   86.19s**, actual own leader/follower guest state, 40 distinct no-ACK reads,
   credential enrollment/revocation and exact old request, unchanged retained
   state, callback, cancellation, retirement, reopen and minority/return.
+- `release-observation-o3-single-audit-physical-debug-r37b.log`: **1 passed,
+  67.75s**, the same physical observation slice plus an explicit exactly-one
+  caught-up capacity audit assertion. The earlier `r37a` single-audit log ran
+  zero tests due to a wrong filter and is not evidence.
 - `release-observation-o3-critical-unit-debug-r37b.log`: **241 passed,
   10 ignored, 29.86s**. Six earlier failures were invalid management test
   fixtures (first-owner, anchor and reused identity), corrected without changing
   production invariants.
+- `release-observation-o3-critical-unit-release-r37a.log`: the same **241 passed,
+  10 ignored, 7.09s** in the portable optimized build.
+- `release-observation-o3-local-image-regressions-r37a.log`: **2 passed, 2.58s**,
+  canonical unchanged Local create/install/invoke/retry/locked reopen with
+  candidate runtime overrides explicitly unset.
+- `release-observation-o3-pinned-package-prewrite-r37d.log`: **40 passed,
+  2 ignored, 8.47s**. Exact runtime/Authority/Catalog closure, old-format
+  prewrite refusal, immutable retained startup target and typed exact CLI retry
+  classification. This is component evidence, not daemon startup qualification.
 - `release-observation-o3-cli-unit-debug-r37b.log`: **362 passed,
   52 ignored, 323.23s**, with allowed local loopback. This precedes the last
   packaged-role/prewrite source edits, so those edits still need fresh tests.
@@ -62,10 +78,104 @@ Current O3 component evidence (logs under the native worktree's `target`):
   New System and external guests build/link; the actual paired signed-role and
   purity probe **passes 4.64s** (`release-observation-o3-runtime-role-probe-r37a.log`).
   Its explicit 1,000,000-row/1GiB ceilings are declarations, not capacity proof.
-- `release-observation-o3-management-pruning-physical-debug-r37b.log`:
-  **fails 156.67s**, `management_retention.rs:546`, offline authenticated common
-  checkpoint restore returns `SnapshotReplay`. This is an open mandatory
-  correctness gate; unit tests and observation success cannot waive it.
+- `release-observation-o3-role-reproduction-r37a.log`: independent immutable
+  `8128e677` builds match both runtime roles, Authority, Catalog and signed Clerk
+  bytes; detailed evidence is in the active worktree's
+  `target/agent-release-reproduction/run.OvqoaS`. Explicit limits remain unmeasured.
+- `release-observation-o3-full-pinned-reproduction-r37a.log`: **passes**, using
+  frozen builder `7085c220` and source `8128e677` for templates; unchanged Local
+  runtime and strict six-file packaged closure match pins. Independent role
+  rebuild evidence remains the separate two-pass reproduction above.
+- `release-observation-o3-management-pruning-physical-release-r37a.log`:
+  **fails 545.31s**. Restore, exact Create/Install and checkpoint votes pass;
+  Install finalization takes **32.979s**, beyond unchanged 30s. Expensive repeated
+  admission audits overlap heavy builds; isolate before changing execution.
+  Earlier `SnapshotReplay` did not recur.
+- `release-observation-o3-management-pruning-physical-release-r37b.log`:
+  **passes 419.04s**, isolated with no concurrent builds/physical fixtures.
+  Offline restore, exact Create/Install, checkpoint/pruning, ACK and custody
+  release pass. Install finalization **21.588s** meets unchanged 30s. This closes
+  that component regression, not the public Shared cold-start or M1 exit.
+
+### Current integration delta and blocking result
+
+The active diff is not a frozen checkpoint. These changes close demonstrated
+M1 defects without changing authorization, wire bounds or deadlines:
+
+- Ambiguous publication exact retry re-admits the original leased stores.
+  `release-observation-o3-publication-exact-retry-physical-debug-r37b.log`
+  **passes 36.44s**, including missing/substituted material refusal, preserved
+  signed bytes/leases and no new rows on acknowledged retry. Finalization now
+  keeps publication protection until exact terminal cleanup and checks fresh
+  full GenesisDecision equality before normal management retirement.
+- Caught-up observation reuses only one call's fresh audited cursor under the
+  uninterrupted host guard and re-audits after application progress. The physical
+  single-audit slice above passes; the complete packaged workflow must rerun.
+- Readonly startup reuses the existing stage resolver, validates every canonical/
+  staged signed candidate and fences the complete snapshot under the actual
+  writer lease before reconciliation. Configured Space/local node/pins and exact
+  packaged System/Authority/Catalog closure are bound before writes. Focused
+  `release-observation-o3-staged-startup-{store,strict-client,semantic,core-factory}-r37a.log`
+  pass **4 / 2 / 2 / 3 tests**. Strict clients and old-format refusal remain
+  unchanged. Exact Pins-before-record requires the verified supplied plan and
+  no Shared residue/lifecycle/history. Packaged interruption/cold-open and owner
+  reopen now select normal admission, but are not qualified while both bails
+  remain closed.
+
+Exact Create finalization/recovery was the current component blocker.
+`release-observation-o3-finalization-exact-retry-physical-debug-r37d.log`
+**fails 92.09s** with GenesisDecision **Panicked** before retirement ACK.
+Exact captured-input interpreter/recompiler replay
+(`release-observation-o3-captured-backend-replay-r37a.log`, **3.49s**)
+and ELF mapping reproduce nested genesis decoder stack overflow with gas
+remaining. This is failure parity, not successful execution or performance
+evidence.
+
+The reviewed provisional R38 correction changes four provision component
+decodes to the existing boxed, non-inlined helper in
+`vos/src/agent/genesis.rs::AgentGenesisProvision::decode_body`; canonical wire,
+signature/component validation and guest limits stay unchanged. Native genesis
+checks **15 pass, 0.21s**
+(`release-observation-o3-boxed-provision-genesis-tests-r38a.log`); Authority
+guest build **passes 38.30s**
+(`release-observation-o3-boxed-provision-authority-build-r38a.log`).
+The expanded physical regression nevertheless **fails 99.03s**: post-handoff
+exact retry takes **31.064s**, beyond unchanged **30s**
+(`release-observation-o3-boxed-provision-finalization-physical-r38b.log`).
+R38c scoped diagnostics establish repeated **Panicked** guest outcomes after
+successful retirement handoff and before terminal cleanup (**98.79s**, post-handoff
+bound failure **30.596s**, `release-observation-o3-boxed-provision-finalization-diagnostics-r38c.log`).
+R38d fault-status diagnostics, without guest-memory collection, locate a stack
+page fault in `ProofSystemSet::from_sorted` during nested Create-capability decode,
+with gas remaining. Exact ELF/program mapping passes
+(`release-observation-o3-boxed-provision-fault-map-r38d.log`). The four-call provision
+correction is insufficient. Direct decode in the existing boxed helper removes
+its extra by-value helper frame with identical byte bounds, decode errors and
+successful allocation. Native genesis checks **15 pass, 0.19s**
+(`release-observation-o3-direct-boxed-genesis-tests-r38e.log`); uninstrumented
+Authority build **passes 31.96s**
+(`release-observation-o3-direct-boxed-authority-build-r38e.log`). R38e execution
+completes but refuses the fixture's unenrolled API observation credential.
+R38g scoped phase diagnostics confirm authentication refusal after provision,
+publication binding and certificate verification; no authentication check is removed.
+
+The fixture now enrolls that credential through ordinary signed Admin Invoke/ACK,
+asserts non-retaining refusal before enrollment and authenticated acceptance after
+it. `release-observation-o3-enrolled-finalization-physical-r38h.log` **passes
+81.37s**: pre-Invoke and post-handoff interruption, original leased stores,
+fresh exact GenesisDecision, finalization/retirement ACKs and custody release.
+Post-handoff retry **8.846s** meets unchanged **30s**. This is candidate Authority
+plus prior System runtime component evidence. Isolated quiet confirmation
+`release-observation-o3-enrolled-finalization-quiet-r38i.log` **passes 91.91s**.
+Coherent signed-artifact reproduction precedes cutover. Packaged recovery and M1
+remain open. Temporary guest/host probes and private-input capture helpers have
+been removed; regression coverage and disk evidence remain.
+
+The portable full CLI suite previously **passes 375 tests**, 52 ignored, 39.53s
+(`release-observation-o3-cli-unit-release-r37a.log`); that boundary predates the
+latest startup/decoder edits. Prior packaged failure timelines remain in
+`release-observation-o3-packaged-public-{release-r37b,release-r37c,debug-r37d}.log`.
+They do not qualify current workflow or release latency.
 
 Earlier frozen O2 evidence is retained at `release-observation-o2-r37j-test-binary`
 (BLAKE2b-256 `3fa8049f1587f1202d86d30a3c7995e1052739bab343f2ed197fdc76b78852c9`),
@@ -77,11 +187,13 @@ current checks; generic execution was structurally audited.
 
 No packaged workflow/SLA, blanket filesystem-write trace, hard wall-clock bound
 under stalled locks/disk, live-root replacement or mid-guest term/config-change
-qualification is claimed. No artifact pins, release gates or branches have been
-promoted. The next boundary must bind exact packaged System/Authority closure
-before writes: SAC7 alone cannot identify O3's management-only RMF4 lineage.
+qualification is claimed. Artifact repins are staged, not release-qualified;
+no release gate or review branch has been promoted. Packaged startup binds exact
+System/Authority/Catalog closure before writes: SAC7 alone cannot identify O3's
+management-only RMF4 lineage. The full reproducer passes with artifact-bearing
+builder `7085c220`. The direct CLI acceptance script is unrun.
 
-### Settled preliminary contract
+### Implemented contract; integrated qualification remains open
 
 - Internal reads are observations at a committed revision, not durable operation
   identities. Lost reply/restart obtains a fresh observation. Preserve public
@@ -98,7 +210,7 @@ before writes: SAC7 alone cannot identify O3's management-only RMF4 lineage.
   **A >= R** may coexist with older actor-state publication **J < R** after
   no-ops; validate that linkage. Recheck lifecycle/fingerprint after I/O and do
   not hold host/proposal mutexes across barrier/peer waits.
-- One explicit scoped guest observation operation is needed: normal Query still
+- One explicit scoped guest observation operation exists: normal Query still
   retains results. Require whole opaque state unchanged, no root/row/metadata
   mutation, retained reply, ACK, consumed authorization, effect, Yield or
   continuation. No host-private Standard/Authority decoding or raw actor bypass.
@@ -115,20 +227,21 @@ before writes: SAC7 alone cannot identify O3's management-only RMF4 lineage.
   frames and attested/public image execution cannot select Observe. Coherent
   fresh artifact/version cutover still requires integration qualification.
 
-Reusable sources: `support/vos-raft/src/worker.rs:3390` (ReadIndex),
-`vos/src/service/service.rs:1707` (apply-through precedent),
-`vos/src/agent/shared_journal_driver.rs:4085` (non-publishing inspections),
-`vos-agent-sdk/src/runtime.rs:779` (missing first-execution observation),
-`actors/system-authority/src/lib.rs:1645` (pure Authority handlers),
-`vos-agent-sdk/src/authority.rs:1294` (revision head),
-`vos/src/network/shared_agent.rs:2736,5309` (I/O/lifecycle fencing).
+Current review seams: `vos-agent-sdk/src/runtime.rs` / `contract.rs` (Observe
+and explicit signed opt-in), `vos/src/agent/wire.rs::apply_clean_observe`,
+`local_journal_driver.rs::observe_system_authority` (physical opaque-state
+validation), `network/shared_agent/authority_observation.rs` (ReadIndex,
+apply-through and lifecycle fencing), `clean_bootstrap.rs::invoke_authority_observation`
+(internal consumer), and `actors/system-authority/src/lib.rs` (SAC7 binding,
+signed query authentication and pure handlers). Existing ReadIndex is in
+`support/vos-raft/src/worker.rs`; the global ABI/mutation wire is unchanged.
 
-### Required consumer cutover and removal inventory
+### Completed deletion inventory to verify in the final diff
 
-| Boundary | Remove after all consumers switch | Must remain / implementation trap |
+| Boundary | Removed internal-read path | Must remain / implementation trap |
 | --- | --- | --- |
-| Inventory/credential client | `production_owner.rs:170–397` pending recovery/context/live continuation and `in_flight_query`; query-specific scheduling where unused | Signed query auth, exact head/claims, complete inventory assembly and route publication; no mixed pages/cache-on-error. |
-| System bootstrap reads | `clean_bootstrap.rs:1579–2073,8908–10504` PAP2/PPR1, bootstrap pending read, read registration/dependency/expiry/Invoke/ACK | Bootstrap Authority/Catalog receipts, exact signed plan admission and management lifecycle/reopen. No unsigned legacy-record clearing. |
+| Inventory/credential client | Pending recovery/context/live continuation and `in_flight_query` in `production_owner.rs`; unused query-specific scheduling | Signed query auth, exact head/claims, complete inventory assembly and route publication; no mixed pages/cache-on-error. |
+| System bootstrap reads | PAP2/PPR1, bootstrap pending read, read registration/dependency/expiry/Invoke/ACK in `clean_bootstrap.rs` | Bootstrap Authority/Catalog receipts, exact signed plan admission and management lifecycle/reopen. No unsigned legacy-record clearing. |
 | Genesis decision | Ordinary delegated and management-anchored read variants, `invoke_genesis_recovery_read` and read-only child anchors | Guest validates permanent decision and exact provision; fresh complete descriptor/roster before application/readiness. |
 | Member admission/cold Install | Custody-specific `ColdMemberProjectionScope`, read pair and combined read replay budgeting | Complete independently leased required set, scoped Root authorization, exact retained parent, fresh facts, generation recheck and staged publication; no blanket readiness exemption. |
 | Genesis committee selection | `RetainedCommitteeQuery` GCW1/read reply, deterministic read invocation and ACK child | Authenticated committee observation; immutable selected roster/lease; exact certified candidate/signatures/archive; publication successor of original authorization. |
@@ -140,21 +253,19 @@ Reusable sources: `support/vos-raft/src/worker.rs:3390` (ReadIndex),
 
 Critical shared-store/code checks:
 
-- `SharedRecoveryObservation` serves management root/successor evidence
-  (`shared_recovery/management.rs:593–819`). `SharedRecoveryManifest` and
-  snapshot/ASR commitments cannot vanish; remove the read portion coherently.
-- `NativeSharedCreateRecovery.query` also owns selected replica material
-  (`clean_genesis_recovery.rs:2548–2586`). Delete GCW1/read replies, not its
-  immutable roster or lease.
-- `prepare_genesis_publication` extends the retained committee-read predecessor
-  (`clean_bootstrap.rs:6600`). After removing that child, publication must extend
-  the original retained authorization while preserving owner/capacity/signature
-  and durable terminal release.
+- `SharedRecoveryObservation` still serves management root/successor evidence
+  in `shared_recovery/management.rs`. Management-only RMF4 and snapshot/ASR
+  commitments remain; ordinary public Query Invoke/ACK keeps exact semantics.
+- `NativeSharedCreateRecovery.query` still owns immutable selected replica
+  material and its lease; GCW1/read replies are gone, not that recovery authority.
+- Genesis publication extends the original retained authorization after removal
+  of the committee-read child. Verify full work/predecessor/owner binding,
+  capacity/signatures and durable terminal release through live and cold retry.
 - Existing image Local program/space bindings must not be silently rebound.
   Global ABI/version changes require coherent admitted artifacts and Local
   regression evidence, not an assumption of backward compatibility.
 
-### Preliminary evidence and review acceptance
+### Existing ReadIndex primitive evidence and review acceptance
 
 Independently rerun on unchanged `support/vos-raft` source at `e6f2bb45`:
 
@@ -175,8 +286,8 @@ wrapper, PVM or replacement workflow pass.
 
 Log (disk-backed target): `release-observation-preliminary-read-index-r37.log`,
 SHA-256 `60c1d7268f2b21478b38a65adbcfb4d065a7e64f878862c873752875ee8ac721`.
-Source audit independently confirms the receiver-owned authenticated-CFT design
-and mixed read/management deletion boundary; no source edits were delegated.
+The preliminary source audit confirmed the receiver-owned authenticated-CFT
+design and mixed read/management deletion boundary. It predates implementation.
 
 For O1–O3, require each selector's physical purity/authentication/no-publication
 negative tests; fresh leader/follower apply/retirement fencing; observation-loss/
@@ -193,182 +304,33 @@ runtime switch survives. Preserve all management/public exact semantics. Record
 actual deleted paths, surviving shared helpers and source/ABI/artifact identities.
 Do not infer code shrinkage, M1 readiness or service capacity from the audit.
 
-Superseded live-plan/reviewer text is recoverable in
+## Archived legacy evidence
+
+R36 is forensic evidence, not an active task, supported fallback or qualification
+of observation. Source and full prior reviewer chronology are recoverable at
+`e6f2bb45:docs/agent-saga-review.md` and the disk-backed target archive
 `release-observation-docs-before-replacement-r37.tar.gz`, SHA-256
 `10ecf3d7b5b9c6aa094ba97d234e52051e8dcbc825fc4b4cbbc11132fb56af7a`.
-The following R36 boundaries remain forensic source/evidence, not another active
-plan or authority to keep their read design alongside observation.
+Preserve these files; do not replay old formats as permission to reopen or clear
+experimental spaces.
 
-## Current source-specific evidence
+Frozen logs retain the legacy boundary without duplicating its chronology here:
 
-All paths below are relative to disk-backed `.worktrees/ch08-c2-native/target`.
-Ignored/zero-selected fixtures and source review are not physical passes.
-Later source cannot inherit a frozen boundary's timings or tests.
+- R36s root/child retention and pruning:
+  `release-integration-observation-serialization-root-child-physical-opt-r36s.log`.
+- R36x retained-only Create/duplicate/reopen and failed public workflow:
+  `release-integration-retained-create-{duplicate-read,warm-public}-physical-opt-r36x.log`.
+- R36y expiry-eligibility diagnostic, failed public attempt and controlled
+  never-admitted refusal:
+  `release-integration-expiry-eligibility-{selected-phase,warm-public-physical,expired-unadmitted-physical}-debug-r36y.log`.
 
-### Frozen foundations and packaging boundary
+Absence of current custody never proved historical absence or authorized
+retirement. The additional never-admitted read-finality proposal is superseded
+by the approved replacement. Management clocks, exact terminal evidence and
+public retry remain authoritative. Old draft role patches and guest hashes are
+not current packaged selection or artifact evidence.
 
-Earlier R36p–R36v corrections remain in the focused regression set: authenticated
-snapshot binding, leased inert staging, checked retained serialization/budgeting,
-inventory hint continuity and dominating validation. Their individual failed
-timelines, complete source/binary identities and reproduction details are in
-`release-observation-docs-before-replacement-r37.tar.gz` (identity above).
-They are forensic evidence, not active tasks or qualification of R36y/replacement.
-
-Frozen R36s root/child retention, two pruning cycles, archived exact retry,
-returning owner and Local Install through final ACK/release **PASS485.11s**.
-Its late peer vote **1.754s** is close to the unchanged **1.8s** bound. Log:
-`release-integration-observation-serialization-root-child-physical-opt-r36s.log`.
-It does not qualify later source, whole-cold Shared <=30s or service.
-
-Role tooling remains unapplied:
-`task-tmp/release-runtime-role-materialization-current.patch`, SHA-256
-`5ecddde0fbb95245919f53f4c094215b06871ed9a40845fae2c4c0eede4479f1`.
-No build, guest or reproduction pass exists for this draft. Observation changes
-require renewed contract/artifact review before applying it.
-Ordinary enrollment/common-genesis and Shared Create/admit/Install/call/exact-
-resume seams already exist; no new CLI or signing framework is needed.
-The packaged acceptance must lose the initial successful mutation response,
-not merely an ACK reply, and demonstrate exact replay.
-
-### Frozen legacy diagnostic boundary: R36y
-
-R36y adds only an environment-gated diagnostic to the existing drained/audited
-expiry-eligibility lookup. The identical full query/work/authorization find
-reports public IDs/commitments, manifest identity/count and exact-slot/Invoke/
-ACK/expiry presence. No new read, write, outcome, signature, payload log or
-terminal cleanup is introduced. Current absence does not prove pruned-history
-absence. Independent review reports no findings. Debug compilation **PASS39.77s**;
-all 149 unchanged focused checks pass. The unchanged debug public diagnostic
-**FAIL80.29s** before its targeted expiry: Create custody times out, then the
-exact retry returns ScopeMismatch and the client rejects its reply. It cannot
-classify R36x's expired member read or qualify optimized behavior. The existing
-controlled expired-unadmitted fixture **PASS50.25s**, unchanged on frozen R36y.
-The losing owner `5df09f4d` / invocation `3c18d576` / work `8ac4a321` /
-authorization `d619f3d5` never acquired custody. Its drained/audited manifest
-`ab7a4b65` contains two slots and no exact slot, Invoke, ACK or expiry proof;
-the leader refuses the original window at trusted slot **142**, with accepted
-slot **22** and exclusive expiry **142**. The fixture asserts unchanged leader
-proposal/admission state, full manifest, in-memory pending record and durable
-WAL bytes. A fresh voter read subsequently reaches acknowledged custody while
-the losing owner still has no slot. This proves safe refusal and preservation,
-not retirement or M1. It does not prove historical absence for the separate
-R36x public read or pruned history. No new fixture or production capability is
-added; R36y has no optimized qualification.
-
-Current quorum expiry cannot settle this controlled never-admitted intent.
-The proposed additional terminal variant is superseded by the approved R37
-replacement, not an active task. Frozen legacy records must not be cleared or
-re-signed; fresh-space format rejection replaces migration/fallback. No
-fabricated Invoke/ACK, mutation delegation, management Busy change or deadline
-increase is authorized. No commit, branch/artifact promotion or master change.
-
-Frozen tracked source (excluding docs):
-`release-integration-expiry-eligibility-tracked-source-r36y.patch`, SHA-256
-`104d27edb950a48f357f6247b0f71b5ca709d4be3a5759659824f2c6001f5278`;
-tracked Rust `release-integration-expiry-eligibility-tracked-rust-r36y.patch`,
-`d8ae5b84df9fe191167d7fe387ad0cf9e471a38eb13befb5607b961127d1470c`;
-untracked `release-integration-expiry-eligibility-untracked-source-r36y.tar.gz`,
-`c7c6257e83678a2f4a0241a6d7b58187957428da17ce6451eb3c11a7b1596de7`.
-Pinned debug `release-integration-pinned-debug-r36y.WeiiZ5/{core,cli}`:
-core `de24109a0ef73a154b7094aa0418f0c5f4fc874a16a6576757643c4d8f02f8bc`,
-CLI `74d2efb0185de7abd1f6035f44eb1ff3de217369c4d70fd792401878d970f7b6`.
-Logs: `release-integration-expiry-eligibility-{build,selected-phase}-debug-r36y.log`,
-`release-integration-expiry-eligibility-warm-public-physical-debug-r36y.log`,
-`release-integration-expiry-eligibility-expired-unadmitted-physical-debug-r36y.log`
-(exact controlled fixture:
-`agent::clean_bootstrap::tests::physical::common_checkpoint::candidate_expired_unadmitted_intent_cannot_acquire_custody_after_election`,
-`--exact --ignored --test-threads=1 --nocapture`).
-
-### Qualified regression boundary: R36x
-
-R36x applies a narrow correction to the demonstrated R36w public retry cycle.
-Only the feature-enabled exact `/_vos/agents/shared/create` handler can reach
-the existing bounded lifecycle queue while recovering. The shared recovery
-atomic marks that queue item retained-only, independently of caller-controlled
-bytes. The owner must use its native full signed request/call/descriptor/runtime/
-committee lookup even if readiness returns before dispatch. Absent or altered
-material cannot invoke the fresh factory, sign, allocate or publish. The existing
-not-ready queued continuation, terminal verification and route readiness remain
-unchanged; all other HTTP quarantine routes remain closed.
-
-Two independent source reviews report no findings. Applied owner tests cover the
-readiness race and refusal ordering; actual native signed regression checks six
-retained stores, journal index and allocation count unchanged for exact/absent/
-validly altered/unowned lookup. HTTP/queue negatives retain feature boundaries,
-capacity and shutdown. These qualify lookup/ordering, not released fixed-three custody.
-Initial debug compilation **PASS1m31s**. The newly selected old singleton fixture
-also fails on frozen R36w (**2.40s**) because fixed-three custody cannot form in
-one-voter scope. All added actual signed-tuple/no-write checks pass before that
-assertion. The fixture now explicitly asserts its fail-closed `ScopeMismatch`;
-it does not claim fixed-three custody qualification or change production guards.
-Final debug compilation **PASS30.25s**, and **all 149 count-checked focused checks
-pass** on final frozen debug binaries. Normal optimized compilation
-**PASS14m18s**; **149 focused checks pass in each profile**. The full physical
-same-leader duplicate/no-write/locked-reopen check **PASS35.57s**; the unchanged
-public workflow **FAIL286.55s** at its original lost-successful-member-admission
-phase bound (`member_handoff_tests.rs:299`). Leader-origin Create completes
-**103.045s**; no `retained_only=true` dispatch is observed, so the original
-Follower-origin cycle remains unqualified. d799's exact initial inventory
-`14379b01` / work `6103e338` / authorization `de19425b` loses registration before
-its window closes: accepted slot **1790914235**, expiry **1790914355**, first
-explicit refusal trusted slot **1790914356**. Different read `ef58d205` completes
-and 934 republishes routes; d799 remains quarantined. No exact Invoke/ACK/expiry
-is logged, but these logs lack a complete custody view. R36y records that existing
-checked view without treating absent evidence or a timeout as terminal. Cleanup
-after the assertion is not causal. Install/reopen and packaged startup stay open.
-No protocol/artifact change, Busy reply,
-timeout/window extension, new scheduler or offline mutation delegation is added.
-
-Frozen tracked source (excluding docs):
-`release-integration-retained-create-tracked-source-r36x.patch`, SHA-256
-`d26519148aaece9a54960032204470e48cb437cf20fecd64cd58cb26e90d1dcb`;
-tracked Rust `release-integration-retained-create-tracked-rust-r36x.patch`,
-`b5f69ac3020e0d334810bffc78fdcec8ac3204a49d8faf86bab739fab4b7c292`;
-untracked `release-integration-retained-create-untracked-source-r36x.tar.gz`,
-`c7c6257e83678a2f4a0241a6d7b58187957428da17ce6451eb3c11a7b1596de7`.
-Pinned final debug `release-integration-pinned-debug-final-r36x.JvSamU/{core,cli}`:
-core `34176e539182a7a25d6b20f161dab49f6a0b93de68ff62cfc54d61eeb0d8540f`,
-CLI `5c8f365daa9e2411f171821654085ea2826c0856147af712c6427e1e0cca2943`.
-Logs: `release-integration-retained-create-build-debug-final-r36x.log`,
-`release-integration-retained-create-selected-phase-debug-final-r36x.log`.
-Pinned optimized `release-integration-pinned-opt-r36x.stzHvF/{core,cli}`:
-core `73805e981f5fed100cf6d0d8bae85b8ebaf1c420615b04863cea3208553ebb84`,
-CLI `509ae05ed2d35eccfc31df35c1766d1a619bf533c8096568876fa569a8f0b273`.
-Logs: `release-integration-retained-create-build-opt-r36x.log`,
-`release-integration-retained-create-selected-phase-opt-r36x.log`.
-Physical regression log:
-`release-integration-retained-create-duplicate-read-physical-opt-r36x.log`.
-Public log (closed FAIL286.55s):
-`release-integration-retained-create-warm-public-physical-opt-r36x.log`.
-
-### Archived diagnostic and correctness history
-
-The full R36w finite pre-admission handoff, retained-only Create retry-cycle
-evidence, all earlier frozen source/binary hashes, failed timelines and old
-archive identities are preserved in
-`release-observation-docs-before-replacement-r37.tar.gz` (identity above).
-No legacy read scheduling/expiry task survives as a competing active plan.
-Deletion still requires proving that a helper is read-only rather than shared
-with signed management admission or public invocation.
-
-Frozen R36k duplicate/reopen, expired-unadmitted/fresh-voter progress and
-follower checkpoint/reopen fixtures passed **44.66s / 56.65s / 228.61s**.
-Logs:
-`release-integration-management-refusal-{duplicate-read,expired-unadmitted,follower-delivery}-physical-opt-r36k.log`.
-They do not qualify later source, whole recovery or public lifecycle.
-
-Management clock ordering and CSF1/NRT1 native terminal archives remain
-implemented but not fully release-qualified. Preserve exact mutation clocks,
-unfinished management work and old exact terminal retries; synthetic 257 pairs
-do not prove genuine >256 public authorizations.
-
-The two-Member public smoke remains unapplied/uncompiled/unqualified:
-`task-tmp/member-clerk-nonroot-public-smoke-current.patch`, SHA-256
-`92689a418790a432b2233a48f067d25882948bccb1f609c9c9b492fdc985ae25`.
-It covers two Member mutations, denial non-effect, lost-result reopen and six
-count/composite reads, not independent six-map parity, full loading or service.
-
-### Offline signed corpus tooling
+## Offline signed corpus tooling
 
 Three debug smoke checks pass (**0.57s**, build **2m23s**).
 Normal optimized build passes (**4m11s**), SHA-256
@@ -381,25 +343,6 @@ Private parent/output 0700, files 0600; business keys/openings must not be expos
 Peak memory is unmeasured. This closes offline corpus only, not public loading,
 capacity, service or hardware. Public parity requires actual accepted batch seed
 timestamps and execution order, not synthetic offline roots or client reply order.
-
-### Unchanged guests and prior boundaries
-
-Frozen R30e clock/retry/ACK/reopen and R32c selected expiry fixtures remain
-historical correctness evidence, not later public or packaged qualification.
-Starting foundation: `git show e6f2bb45:docs/agent-saga-review.md`.
-
-| Unchanged output | SHA-256 |
-| --- | --- |
-| Authority ELF | `3272da2da7d7d2c76c4dcbbb3edcf802476d376f5db3b3b5ac7876416cf61124` |
-| System-image ELF | `a3c17d033a4dcdf9d626e323729c340e454dd1fb62cfc4f0693105d58bcd695a` |
-| System-image PVM | `f1bdab8272bf5aebeaf7a3b7a66cdbe9cb8fa81ac412e56ac9da110815f12264` |
-| External runtime ELF | `2d92c4350093a9b37825db4f9e6fc7688f7410ac6d48a15e48750af638173d21` |
-
-System-image program ID:
-`41d4073836b785457df23bf8fce9803b7c1dd88df713a57bd332bd5454b7078e`.
-No production pin or fixed-three gate is promoted.
-Superseded chronology remains in target evidence/source archives, including
-`release-integration-docs-pre-consolidation-r31.txt`; it is not another live plan.
 
 ## Reproduction and working rules
 

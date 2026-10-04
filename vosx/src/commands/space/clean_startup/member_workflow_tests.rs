@@ -97,7 +97,7 @@ pub(super) fn exercise(
         .collect_checked()
         .expect("healthy issuer retirement");
     let leader = peer_leader(networks, enrollments, record);
-    let (node, lifecycle) = open_clean_system_lifecycle_with_inputs(
+    let (node, lifecycle) = open_clean_system_lifecycle_with_roster_policy(
         networks[0].clone(),
         &data[0],
         space.0,
@@ -106,6 +106,7 @@ pub(super) fn exercise(
         commands::local_config::LocalAgentStorage::Image,
         &data[0].join("host.lock"),
         None,
+        false,
         Some(inputs),
     )
     .unwrap();
@@ -349,7 +350,7 @@ pub(super) fn returned_follower(
     }
 }
 
-fn current_operation(
+pub(super) fn current_operation(
     data: &Path,
     space: SpaceId,
     identity: &commands::clean_identity::CleanOperatorIdentitySigner<'_>,

@@ -255,13 +255,19 @@ impl SharedAgentNetworkHost {
             }
             // Apply only through the needed committed frontier, not an
             // unbounded drain chasing unrelated concurrent future proposals.
-            while host.capacity(agent)?.0 < barrier.read_index {
+            // Keep this call-local audited cursor under the uninterrupted
+            // host guard. Re-audit only after actual application progress;
+            // collecting volatile replies cannot advance this cursor.
+            let mut applied = host.capacity(agent)?.0;
+            while applied < barrier.read_index {
                 if Instant::now() >= deadline {
                     return Err(SharedAgentHostError::Unavailable);
                 }
                 match host.apply_next(agent)? {
                     SharedAgentApplyOutcome::Applied { .. }
-                    | SharedAgentApplyOutcome::Duplicate { .. } => {}
+                    | SharedAgentApplyOutcome::Duplicate { .. } => {
+                        applied = host.capacity(agent)?.0;
+                    }
                     SharedAgentApplyOutcome::Idle => break,
                 }
             }
@@ -269,7 +275,6 @@ impl SharedAgentNetworkHost {
                 .coordinator
                 .ordered_replies
                 .collect_from(&mut host, agent)?;
-            let applied = host.capacity(agent)?.0;
             if applied < barrier.read_index {
                 drop(host);
                 std::thread::sleep(Duration::from_millis(10));

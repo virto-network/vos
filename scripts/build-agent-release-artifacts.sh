@@ -64,7 +64,7 @@ done
 
 # Never default to /tmp: it may be RAM-backed. Keep failed candidates and logs
 # for diagnosis; no release pin is overwritten by this verifier.
-scratch_root="$repository_root/target/agent-release-reproduction"
+scratch_root="${CARGO_TARGET_DIR:-$repository_root/target}/agent-release-reproduction"
 if [[ $mode == shared-candidate ]]; then
     # Candidate output is public, but the explicit signer copy must stay private.
     umask 077

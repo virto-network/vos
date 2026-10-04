@@ -541,6 +541,7 @@ fn prune_and_catch_up_offline_management(
         assert_eq!(owner.ordered_index_for_test().unwrap(), before);
         let offline_database = offline_host.lock().unwrap().raft_database(system).unwrap();
         let offline_raft = crate::raft::RaftMeta::load(&offline_database).unwrap();
+        drop(offline_database);
         let offline_applied = offline_host.lock().unwrap().capacity(system).unwrap().0;
         let target = certificate.claim().ordered();
         offline_host

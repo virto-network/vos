@@ -203,6 +203,51 @@ fn api_query(
     request
 }
 
+/// Receipt signing alone does not enroll a credential. Use the existing signed
+/// administrator path before a recovery fixture asks for an API observation.
+pub(super) fn enroll_api_projection_credential(
+    owner: &MemoryBootstrapOwner,
+    index: usize,
+    key: &SigningKey,
+) {
+    let request = api_query(owner, key, 0xec, AuthorityProjectionSelector::Credential);
+    let before = owner.ordered_index_for_test().unwrap();
+    let rejected =
+        management_retention::exact_management_retry("unregistered API observation", || {
+            owner.invoke_authority_observation(request.clone())
+        });
+    assert!(
+        rejected.is_empty(),
+        "an unenrolled signer cannot observe Authority"
+    );
+    assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+    let current = read(owner, &query(owner, index, 0xed));
+    apply_signed_admin(
+        owner,
+        &current,
+        AuthorityAdminOperation::AddCredential {
+            principal: current.principal,
+            credential: AuthorityCredentialEnrollment::from_public_key(
+                AuthorityCredentialKind::Api,
+                key.verifying_key().to_bytes(),
+            ),
+        },
+    );
+    let outcome = management_retention::exact_management_retry("enrolled API observation", || {
+        observe(owner, &request)
+    });
+    let projection = credential_projection(&outcome).unwrap();
+    assert_eq!(projection.query, request);
+    assert_eq!(projection.principal, current.principal);
+    assert_eq!(projection.kind, AuthorityCredentialKind::Api);
+    assert_eq!(projection.status, AuthorityCredentialStatus::Active);
+    assert_eq!(
+        owner.ordered_index_for_test().unwrap(),
+        before + 2,
+        "only signed enrollment Invoke/ACK"
+    );
+}
+
 fn exercise_revocation(
     owners: &[Option<MemoryBootstrapOwner>],
     stores: &[(
@@ -396,6 +441,29 @@ pub(super) fn exercise(
             .expect("production callback returns the authenticated credential bytes");
         assert_eq!(returned, expected);
     }
+    // This receiver already owns the committed frontier. One fresh physical
+    // suffix audit is required, but repeating it under the same host guard
+    // used to consume the bounded observation window without new evidence.
+    let caught_up = owners[leader].as_ref().unwrap();
+    let audits_before = caught_up
+        .host
+        .lock()
+        .unwrap()
+        .capacity_audits_for_test(agent)
+        .unwrap();
+    let outcome = observe(caught_up, &request)
+        .expect("caught-up observation succeeds within the unchanged bound");
+    assert_eq!(credential_projection(&outcome), Some(expected.clone()));
+    assert_eq!(
+        caught_up
+            .host
+            .lock()
+            .unwrap()
+            .capacity_audits_for_test(agent)
+            .unwrap(),
+        audits_before + 1,
+        "caught-up observation performs one fresh capacity audit, not two",
+    );
     let physical: Vec<_> = owners
         .iter()
         .map(|owner| native_owner_physical_state(owner.as_ref().unwrap()))

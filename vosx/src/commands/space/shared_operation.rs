@@ -594,6 +594,20 @@ fn create_response_status(disposition: &SharedCreateDisposition) -> u16 {
     }
 }
 
+// The integrated packaged fixture supplies the actual selected root and HTTP
+// endpoint. All discovery, signing, custody and delivery remain the CLI path.
+#[cfg(test)]
+pub(super) fn create_shared_for_test(
+    data: &Path,
+    address: SocketAddr,
+    operator: &Keypair,
+    space: SpaceId,
+    node_public: [u8; 32],
+    args: &CreateSharedArgs,
+) -> anyhow::Result<SharedCreateDisposition> {
+    create_shared(data, address, operator, space, node_public, args)
+}
+
 fn prepare_install(
     operator: &Keypair,
     authority: AuthorityActorTarget,

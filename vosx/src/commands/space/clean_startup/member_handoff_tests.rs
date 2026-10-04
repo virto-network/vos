@@ -1,6 +1,6 @@
-//! Public warm handoff through actual locked production owners. Candidate
-//! guests and the test-only roster policy do not qualify released startup,
-//! service latency, or cold recovery with unfinished management.
+//! Public warm handoff through actual locked production owners. The packaged
+//! workflow uses the ordinary retained CLI Create path; separate candidate
+//! cases retain their fault fixtures. This is not daemon or load qualification.
 
 use super::*;
 use std::io::Write as _;
@@ -80,6 +80,7 @@ pub(super) fn public_handoff(
     space: SpaceId,
     authority: AuthorityActorTarget,
     inputs: &StartupTestInputs,
+    packaged: bool,
     restart: bool,
     retained: &mut Option<(SharedCreateSubmission, AgentGenesisArchiveRecord)>,
 ) {
@@ -121,43 +122,72 @@ pub(super) fn public_handoff(
 
     if retained.is_none() {
         assert!(!restart);
-        let runtime = external_runtime(operator);
-        let (descriptor, committee) = super::super::super::shared_operation::create_materials(
-            operator,
-            authority,
-            raw_public_key(&daemons[0]).unwrap(),
-            Hash([0xc1; 32]),
-            &runtime,
-            enrollments,
-        )
-        .unwrap();
-        let public = raw_public_key(operator).unwrap();
-        let request = ManagementRequest::Create(Box::new(descriptor.clone()));
-        let mut call = AuthorityCredentialCall {
-            invocation: InvocationId::ZERO,
-            authority,
-            managed: ManagedAgentTarget {
+        let (submission, archive) = if packaged {
+            assert_eq!(
+                inputs.runtime.exact_bytes(),
+                crate::bundled::root_signed_system_agent_runtime_package(operator)
+                    .unwrap()
+                    .exact_bytes(),
+            );
+            assert_eq!(
+                inputs.authority.exact_bytes(),
+                crate::bundled::root_signed_actor_package(
+                    crate::bundled::system_authority_package_template(),
+                    SYSTEM_AUTHORITY_NAME,
+                    operator,
+                )
+                .unwrap()
+                .exact_bytes(),
+            );
+            create_packaged(
+                &data[0],
+                addresses[0],
+                operator,
                 space,
-                agent: descriptor.identity.agent,
-                owner: descriptor.identity.owner,
-                profile: AgentProfile::Shared,
-                runtime_deployment: runtime.deployment(),
-                transition_producer: descriptor.identity.transition_producer,
-            },
-            principal: descriptor.identity.owner,
-            credential: CredentialId::of_public_key(&public),
-            request_sequence: NonZeroU64::new(2).unwrap(),
-            credential_public_key: public,
-            authenticated_node: None,
-            requested_valid_from: inputs.clock.load(std::sync::atomic::Ordering::Acquire),
-            requested_expires_at: u64::MAX,
-            plan: request.authorization_plan().unwrap(),
-            signature: [0; 64],
+                raw_public_key(&daemons[0]).unwrap(),
+                enrollments,
+            )
+        } else {
+            let runtime = external_runtime(operator);
+            let (descriptor, committee) = super::super::super::shared_operation::create_materials(
+                operator,
+                authority,
+                raw_public_key(&daemons[0]).unwrap(),
+                Hash([0xc1; 32]),
+                &runtime,
+                enrollments,
+            )
+            .unwrap();
+            let public = raw_public_key(operator).unwrap();
+            let request = ManagementRequest::Create(Box::new(descriptor.clone()));
+            let mut call = AuthorityCredentialCall {
+                invocation: InvocationId::ZERO,
+                authority,
+                managed: ManagedAgentTarget {
+                    space,
+                    agent: descriptor.identity.agent,
+                    owner: descriptor.identity.owner,
+                    profile: AgentProfile::Shared,
+                    runtime_deployment: runtime.deployment(),
+                    transition_producer: descriptor.identity.transition_producer,
+                },
+                principal: descriptor.identity.owner,
+                credential: CredentialId::of_public_key(&public),
+                request_sequence: NonZeroU64::new(2).unwrap(),
+                credential_public_key: public,
+                authenticated_node: None,
+                requested_valid_from: inputs.clock.load(std::sync::atomic::Ordering::Acquire),
+                requested_expires_at: u64::MAX,
+                plan: request.authorization_plan().unwrap(),
+                signature: [0; 64],
+            };
+            call.invocation = call.expected_invocation();
+            call.signature = sign_exact(operator, &call.signing_bytes()).unwrap();
+            let submission =
+                SharedCreateSubmission::new(descriptor, call, runtime, committee).unwrap();
+            let archive = create_public(addresses[0], &submission);
+            (submission, archive)
         };
-        call.invocation = call.expected_invocation();
-        call.signature = sign_exact(operator, &call.signing_bytes()).unwrap();
-        let submission = SharedCreateSubmission::new(descriptor, call, runtime, committee).unwrap();
-        let archive = create_public(addresses[0], &submission);
         *retained = Some((submission, archive));
     }
     let (submission, record) = retained.as_ref().unwrap();
@@ -228,6 +258,124 @@ pub(super) fn public_handoff(
                 .load(std::sync::atomic::Ordering::Acquire)
         );
     }
+}
+
+fn write_fresh_input(path: &Path, bytes: &[u8]) {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .unwrap();
+    file.write_all(bytes).unwrap();
+    file.sync_all().unwrap();
+}
+
+fn create_packaged(
+    data: &Path,
+    address: SocketAddr,
+    operator: &Keypair,
+    space: SpaceId,
+    node_public: [u8; 32],
+    enrollments: &[vos::agent::sdk::private::NodeEncryptionEnrollment],
+) -> (SharedCreateSubmission, AgentGenesisArchiveRecord) {
+    use super::super::super::{clean_identity, clean_store, shared_operation};
+
+    // Supply the emitted, admitted role package unchanged. In particular, do
+    // not relink a target-directory guest or construct fixture resource limits.
+    let runtime = crate::bundled::shared_external_runtime_package_template().unwrap();
+    let runtime_path = data.join("packaged-shared-runtime.vos");
+    write_fresh_input(&runtime_path, runtime);
+    let enrollment_paths = enrollments
+        .iter()
+        .enumerate()
+        .map(|(index, enrollment)| {
+            let path = data.join(format!("packaged-member-{index}.nen"));
+            write_fresh_input(&path, &enrollment.encode().unwrap());
+            path
+        })
+        .collect();
+    let mut args = shared_operation::CreateSharedArgs {
+        space: "explicit-packaged-public-workflow".into(),
+        runtime: Some(runtime_path.clone()),
+        enrollments: enrollment_paths,
+        archive_out: data.join("public-create.ogar"),
+        http: Some(address),
+        resume: false,
+    };
+    let disposition = retry_exact("ordinary packaged CLI Shared Create", || {
+        let result = shared_operation::create_shared_for_test(
+            data,
+            address,
+            operator,
+            space,
+            node_public,
+            &args,
+        );
+        // A transient response can follow durable request publication. Reuse
+        // the existing CLI reservation/WAL and unchanged supplied artifacts;
+        // never allocate another nonce or re-sign a replacement Create.
+        args.resume = true;
+        result
+    });
+    let SharedCreateDisposition::Applied(applied) = disposition else {
+        panic!("packaged Root Shared Create did not apply: {disposition:?}")
+    };
+    let archive = applied.archive().clone();
+    super::super::publish_shared_archive(&args.archive_out, &archive.encode()).unwrap();
+
+    let identity = clean_identity::CleanOperatorIdentitySigner::new(operator).unwrap();
+    let operation = super::member_workflow::current_operation(data, space, &identity);
+    let mut store =
+        clean_store::CleanSharedCreateFile::open_or_create(operation.join("request")).unwrap();
+    let request = store.load_request().unwrap().unwrap();
+    let response = store.load_response().unwrap().unwrap();
+    let submission = SharedCreateSubmission::decode(&request).unwrap();
+    assert_eq!(submission.encode(), request);
+    assert_eq!(submission.runtime().exact_bytes(), runtime);
+    assert_eq!(std::fs::read(&runtime_path).unwrap(), runtime);
+    assert_eq!(submission.call().principal, identity.principal());
+    assert_eq!(submission.call().credential, identity.credential());
+    assert_eq!(
+        submission.call().managed.transition_producer,
+        ProducerId::of_public_key(&node_public),
+    );
+    // Exercise the existing CLI's signed window, not the candidate fixture's
+    // unbounded authorization. This is its current now-60 .. now+3600 policy.
+    assert_ne!(submission.call().requested_expires_at, u64::MAX);
+    assert_eq!(
+        submission.call().requested_expires_at - submission.call().requested_valid_from,
+        3660,
+    );
+    let SharedCreateDisposition::Applied(retained) = submission.decode_response(&response).unwrap()
+    else {
+        panic!("ordinary Create WAL did not retain its exact Applied terminal")
+    };
+    assert_eq!(retained.archive(), &archive);
+    assert_eq!(std::fs::read(&args.archive_out).unwrap(), archive.encode());
+    drop(store);
+
+    let resume = shared_operation::CreateSharedArgs {
+        space: args.space,
+        runtime: None,
+        enrollments: Vec::new(),
+        archive_out: args.archive_out,
+        http: Some(address),
+        resume: true,
+    };
+    let SharedCreateDisposition::Applied(repeated) = shared_operation::create_shared_for_test(
+        data,
+        address,
+        operator,
+        space,
+        node_public,
+        &resume,
+    )
+    .expect("ordinary retained Create resume without replacing signed inputs") else {
+        panic!("retained packaged Shared Create did not remain Applied")
+    };
+    assert_eq!(repeated.archive(), &archive);
+    (submission, archive)
 }
 
 fn lose_successful_admission_response(
@@ -376,6 +524,24 @@ fn target_refusal_retries_only_recovering_then_requires_forbidden() {
             .is_err()
         );
     }
+}
+
+#[test]
+fn exact_retry_recognizes_retained_submission_unavailability() {
+    let mut attempts = 0;
+    let result = retry_exact("retained unavailable response", || {
+        attempts += 1;
+        if attempts == 1 {
+            return Err(
+                super::super::super::local_create::retained_submission_error(
+                    ureq::Error::Status(503, ureq::Response::new(503, "Busy", "").unwrap()).into(),
+                ),
+            );
+        }
+        Ok(7)
+    });
+    assert_eq!(attempts, 2);
+    assert_eq!(result, 7);
 }
 
 #[test]

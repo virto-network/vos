@@ -348,6 +348,7 @@ fn pending_system_observation_release_gate_leaves_fresh_and_experimental_roots_u
     use crate::commands::space::local_config::LocalAgentStorage;
     let scratch = Scratch::new();
     let operator = Keypair::ed25519_from_bytes([0x58; 32]).unwrap();
+    let daemon = Keypair::ed25519_from_bytes([0x5b; 32]).unwrap();
     let before = journal_files(&scratch.0);
     for _ in 0..2 {
         let error = preflight_released_system_startup(
@@ -355,6 +356,8 @@ fn pending_system_observation_release_gate_leaves_fresh_and_experimental_roots_u
             LocalAgentStorage::Image,
             None,
             &operator,
+            [0x5a; 32],
+            &daemon,
         )
         .unwrap_err();
         assert!(
@@ -377,8 +380,15 @@ fn pending_system_observation_release_gate_leaves_fresh_and_experimental_roots_u
     .unwrap();
     let before = journal_files(&scratch.0);
     assert!(
-        preflight_released_system_startup(&scratch.0, LocalAgentStorage::Image, None, &operator)
-            .is_err()
+        preflight_released_system_startup(
+            &scratch.0,
+            LocalAgentStorage::Image,
+            None,
+            &operator,
+            [0x5a; 32],
+            &daemon,
+        )
+        .is_err()
     );
     assert_eq!(journal_files(&scratch.0), before);
 
@@ -389,6 +399,8 @@ fn pending_system_observation_release_gate_leaves_fresh_and_experimental_roots_u
         LocalAgentStorage::ExternalState,
         None,
         &operator,
+        [0x5a; 32],
+        &daemon,
     )
     .unwrap_err();
     assert!(
@@ -400,9 +412,49 @@ fn pending_system_observation_release_gate_leaves_fresh_and_experimental_roots_u
 }
 
 #[test]
+fn system_preflight_refuses_shared_residue_without_retained_plan_before_writes() {
+    use crate::commands::space::clean_store::ensure_private_directory;
+    use crate::commands::space::local_config::LocalAgentStorage;
+    let operator = Keypair::ed25519_from_bytes([0x5f; 32]).unwrap();
+    let daemon = Keypair::ed25519_from_bytes([0x5b; 32]).unwrap();
+    for directory in [true, false] {
+        let scratch = Scratch::new();
+        let shared = scratch.0.join(SHARED_AGENT_HOST_DIRECTORY);
+        if directory {
+            drop(ensure_private_directory(&shared).unwrap());
+            std::fs::write(shared.join("retained-marker"), b"preserve Shared residue").unwrap();
+        } else {
+            std::fs::write(&shared, b"preserve non-directory Shared residue").unwrap();
+        }
+        let before = journal_files(&scratch.0);
+        for _ in 0..2 {
+            let error = preflight_released_system_startup(
+                &scratch.0,
+                LocalAgentStorage::Image,
+                None,
+                &operator,
+                [0x5a; 32],
+                &daemon,
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Shared deployment residue lacks its retained System bootstrap plan")
+            );
+            assert_eq!(journal_files(&scratch.0), before);
+            assert!(!scratch.0.join(SYSTEM_AGENT_CONTROL_DIRECTORY).exists());
+            assert!(!scratch.0.join(LOCAL_AGENT_HOST_DIRECTORY).exists());
+            assert!(!scratch.0.join(LOCAL_LIFECYCLE_DIRECTORY).exists());
+        }
+    }
+}
+
+#[test]
 fn system_preflight_refuses_retired_or_incomplete_retained_records_without_writes() {
     use crate::commands::space::local_config::LocalAgentStorage;
     let operator = Keypair::ed25519_from_bytes([0x59; 32]).unwrap();
+    let daemon = Keypair::ed25519_from_bytes([0x5b; 32]).unwrap();
     for version in [3, 4, 5] {
         let scratch = Scratch::new();
         let control = scratch.0.join(SYSTEM_AGENT_CONTROL_DIRECTORY);
@@ -430,6 +482,8 @@ fn system_preflight_refuses_retired_or_incomplete_retained_records_without_write
                 LocalAgentStorage::Image,
                 None,
                 &operator,
+                [0x5a; 32],
+                &daemon,
             )
             .unwrap_err();
             assert!(
@@ -484,6 +538,374 @@ fn fixed_three_materials_for_packaged_preflight(
 }
 
 #[cfg(feature = "experimental-state-blocks")]
+fn prepared_startup_stage_fixture(
+    scratch: &Scratch,
+    operator: &Keypair,
+    daemon: &Keypair,
+) -> (PreparedCleanSystemAgentBootstrap, Vec<u8>, PathBuf) {
+    let materials = fixed_three_materials_for_packaged_preflight(
+        operator,
+        crate::bundled::root_signed_system_agent_runtime_package(operator).unwrap(),
+        crate::bundled::root_signed_actor_package(
+            crate::bundled::system_authority_package_template(),
+            SYSTEM_AUTHORITY_NAME,
+            operator,
+        )
+        .unwrap(),
+    );
+    let output = scratch.0.join("prepared-stages");
+    bootstrap_prepare::prepare_materials(materials, operator, daemon, &output).unwrap();
+    let bundle = output.join("common.bundle");
+    let prepared = read_certified_bootstrap_bundle(&bundle, [0x5a; 32], operator, daemon).unwrap();
+    let archive = CleanSystemAgentFileStores::read_startup_bootstrap(&output.join("certification"))
+        .unwrap()
+        .unwrap()
+        .genesis
+        .selected_payload()
+        .unwrap()
+        .to_vec();
+    (prepared, archive, bundle)
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+fn startup_record_fixture(
+    prepared: &PreparedCleanSystemAgentBootstrap,
+    receipt: Option<&vos::agent::sdk::authority::AuthorityReceipt>,
+) -> (Vec<u8>, Vec<u8>) {
+    use vos::agent::sdk::wire::CanonicalWire as _;
+    // Host CSB5 test bytes embed the immutable public plan/pins transported by
+    // the real certified bundle; no signed input or certificate is invented.
+    let imported = prepared.encode_import().unwrap();
+    let length = usize::try_from(u64::from_le_bytes(imported[36..44].try_into().unwrap())).unwrap();
+    let plan = &imported[44..44 + length];
+    let pins_length = u32::from_le_bytes(plan[36..40].try_into().unwrap()) as usize;
+    let pins = plan[40..40 + pins_length].to_vec();
+    assert_eq!(
+        Hash::digest(b"vos/clean-system-agent-pins/v2", &[&pins]),
+        prepared.plan().pins().commitment()
+    );
+    let mut record = b"CSB2".to_vec();
+    record.extend_from_slice(vos::agent::sdk::RUNTIME_ABI_ID.as_bytes());
+    record.extend_from_slice(&[5, u8::from(receipt.is_some())]);
+    record.extend_from_slice(prepared.plan().pins().commitment().as_bytes());
+    record.extend_from_slice(prepared.plan().commitment().as_bytes());
+    record.extend_from_slice(&(plan.len() as u64).to_le_bytes());
+    record.extend_from_slice(plan);
+    match receipt {
+        Some(receipt) => {
+            let bytes = receipt.encode().unwrap();
+            record.push(1);
+            record.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            record.extend_from_slice(&bytes);
+        }
+        None => record.push(0),
+    }
+    record.extend_from_slice(&[0; 4]);
+    assert_eq!(
+        CleanSystemAgentBootstrapRecord::authorized_plan(&record)
+            .unwrap()
+            .commitment(),
+        prepared.plan().commitment()
+    );
+    (pins, record)
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+#[test]
+fn system_startup_stage_admission_validates_every_candidate_before_locked_recovery() {
+    use crate::commands::space::clean_store::{
+        ensure_private_directory, tests::stage_startup_images,
+    };
+    use crate::commands::space::local_config::LocalAgentStorage;
+    use vos::agent::clean_authority_issuer::CleanManagementIssuerStore as _;
+    let scratch = Scratch::new();
+    let operator = Keypair::ed25519_from_bytes([0x66; 32]).unwrap();
+    let daemon = Keypair::ed25519_from_bytes([0x5b; 32]).unwrap();
+    let (prepared, genesis_bytes, bundle) =
+        prepared_startup_stage_fixture(&scratch, &operator, &daemon);
+    let vos::agent::journal::ReplayOperation::CleanManage {
+        authority: receipt, ..
+    } = &prepared.provision().proposal().create().operation
+    else {
+        unreachable!()
+    };
+    let (pins_bytes, record_bytes) = startup_record_fixture(&prepared, None);
+    let alternate_daemon = Keypair::ed25519_from_bytes([0x5c; 32]).unwrap();
+    let alternate =
+        read_certified_bootstrap_bundle(&bundle, [0x5a; 32], &operator, &alternate_daemon).unwrap();
+    let (_, alternate_record) = startup_record_fixture(&alternate, None);
+    let mut forged = receipt.clone();
+    forged.signature[0] ^= 1;
+    let (_, forged_record) = startup_record_fixture(&prepared, Some(&forged));
+    assert!(CleanSystemAgentBootstrapRecord::validated_startup_plan(&forged_record).is_err());
+
+    for corruption in 0..7 {
+        let data = scratch.0.join(format!("stage-{corruption}"));
+        drop(ensure_private_directory(&data).unwrap());
+        let control = data.join(SYSTEM_AGENT_CONTROL_DIRECTORY);
+        let (mut pins, mut bootstrap, issuer, mut genesis) =
+            CleanSystemAgentFileStores::open_or_create(&control)
+                .unwrap()
+                .into_production_parts();
+        pins.commit(&pins_bytes).unwrap();
+        let mut canonical_record = record_bytes.clone();
+        if corruption == 1 {
+            canonical_record[36] = 4;
+        }
+        bootstrap.commit(&canonical_record).unwrap();
+        genesis.commit(&genesis_bytes).unwrap();
+        drop((pins, bootstrap, issuer, genesis));
+        let candidates = match corruption {
+            0 => [
+                Some(pins_bytes.as_slice()),
+                Some(record_bytes.as_slice()),
+                None,
+                Some(genesis_bytes.as_slice()),
+            ],
+            1 => [None, Some(record_bytes.as_slice()), None, None],
+            2 => [None, Some(alternate_record.as_slice()), None, None],
+            3 => [None, Some(forged_record.as_slice()), None, None],
+            4 => [None, None, Some(b"malformed issuer".as_slice()), None],
+            5 => [None, None, None, Some(b"malformed archive".as_slice())],
+            6 => [Some(b"different pins".as_slice()), None, None, None],
+            _ => unreachable!(),
+        };
+        stage_startup_images(&control, candidates);
+        let before = journal_files(&data);
+        let result = inspect_released_system_startup(
+            &data,
+            LocalAgentStorage::Image,
+            Some(&prepared),
+            &operator,
+            [0x5a; 32],
+            &daemon,
+        );
+        assert_eq!(journal_files(&data), before);
+        assert!(!data.join(SHARED_AGENT_HOST_DIRECTORY).exists());
+        if corruption != 0 {
+            assert!(
+                result.is_err(),
+                "must refuse candidate {corruption} before stage publication"
+            );
+            continue;
+        }
+        let inspection = result.unwrap();
+        let retained = inspect_released_system_startup(
+            &data,
+            LocalAgentStorage::Image,
+            None,
+            &operator,
+            [0x5a; 32],
+            &daemon,
+        )
+        .unwrap();
+        assert_eq!(retained, inspection);
+        let gated = preflight_released_system_startup(
+            &data,
+            LocalAgentStorage::Image,
+            Some(&prepared),
+            &operator,
+            [0x5a; 32],
+            &daemon,
+        )
+        .unwrap_err();
+        assert!(gated.to_string().contains("pending release qualification"));
+        assert_eq!(journal_files(&data), before);
+        assert!(CleanSystemAgentFileStores::read_client_bootstrap(&control).is_err());
+        let stores = CleanSystemAgentFileStores::open_or_create(&control).unwrap();
+        assert!(stores.matches_startup_inspection(&inspection).unwrap());
+        let (mut pins, mut bootstrap, mut issuer, mut genesis) = stores.into_production_parts();
+        assert_eq!(
+            pins.load(MAX_CLEAN_SYSTEM_AGENT_PINS_BYTES)
+                .unwrap()
+                .as_deref(),
+            Some(pins_bytes.as_slice())
+        );
+        assert_eq!(
+            bootstrap
+                .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
+                .unwrap()
+                .as_deref(),
+            Some(record_bytes.as_slice())
+        );
+        assert!(issuer.load().unwrap().is_none());
+        assert_eq!(
+            genesis.load().unwrap().as_deref(),
+            Some(genesis_bytes.as_slice())
+        );
+        assert!(CleanSystemAgentFileStores::read_client_bootstrap(&control).is_ok());
+    }
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+#[test]
+fn system_startup_empty_and_exact_pins_only_initialization_require_supplied_certificate() {
+    use crate::commands::space::clean_store::ensure_private_directory;
+    use crate::commands::space::local_config::LocalAgentStorage;
+    let scratch = Scratch::new();
+    let operator = Keypair::ed25519_from_bytes([0x68; 32]).unwrap();
+    let daemon = Keypair::ed25519_from_bytes([0x5b; 32]).unwrap();
+    let (prepared, _, _) = prepared_startup_stage_fixture(&scratch, &operator, &daemon);
+    let (pins_bytes, _) = startup_record_fixture(&prepared, None);
+    for pins_only in [false, true] {
+        let data = scratch.0.join(format!("initialization-{pins_only}"));
+        drop(ensure_private_directory(&data).unwrap());
+        let control = data.join(SYSTEM_AGENT_CONTROL_DIRECTORY);
+        drop(ensure_private_directory(&control).unwrap());
+        if pins_only {
+            let (mut pins, bootstrap, issuer, genesis) =
+                CleanSystemAgentFileStores::open_or_create(&control)
+                    .unwrap()
+                    .into_production_parts();
+            pins.commit(&pins_bytes).unwrap();
+            drop((pins, bootstrap, issuer, genesis));
+        }
+        let before = journal_files(&data);
+        assert!(
+            inspect_released_system_startup(
+                &data,
+                LocalAgentStorage::Image,
+                None,
+                &operator,
+                [0x5a; 32],
+                &daemon
+            )
+            .is_err()
+        );
+        let inspection = inspect_released_system_startup(
+            &data,
+            LocalAgentStorage::Image,
+            Some(&prepared),
+            &operator,
+            [0x5a; 32],
+            &daemon,
+        )
+        .unwrap();
+        assert_eq!(journal_files(&data), before);
+        let stores = CleanSystemAgentFileStores::open_or_create(&control).unwrap();
+        assert!(stores.matches_startup_inspection(&inspection).unwrap());
+        let (mut pins, mut bootstrap, issuer, genesis) = stores.into_production_parts();
+        let pins = pins.load(MAX_CLEAN_SYSTEM_AGENT_PINS_BYTES).unwrap();
+        let record = bootstrap
+            .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
+            .unwrap();
+        assert_eq!(pins.as_deref(), pins_only.then_some(pins_bytes.as_slice()));
+        assert!(record.is_none());
+        let target = prepared.plan().pins().descriptor();
+        let archive = CleanSystemAgentGenesisArchive::new(
+            genesis,
+            HostSpaceId(target.identity.space.0),
+            HostAgentId(target.identity.agent.0),
+            HostNodeId(prepared.plan().pins().node().0),
+            HostHash(target.authority.commitment().0),
+            operator.clone(),
+        )
+        .unwrap();
+        import_certified_system_bootstrap(
+            pins.as_deref(),
+            None,
+            &archive,
+            &prepared,
+            &data.join(SHARED_AGENT_HOST_DIRECTORY),
+        )
+        .unwrap();
+        let published = journal_files(&data);
+        import_certified_system_bootstrap(
+            pins.as_deref(),
+            None,
+            &archive,
+            &prepared,
+            &data.join(SHARED_AGENT_HOST_DIRECTORY),
+        )
+        .unwrap();
+        assert_eq!(journal_files(&data), published);
+        assert!(
+            import_certified_system_bootstrap(
+                Some(b"substituted pins"),
+                None,
+                &archive,
+                &prepared,
+                &data.join(SHARED_AGENT_HOST_DIRECTORY)
+            )
+            .is_err()
+        );
+        assert_eq!(journal_files(&data), published);
+        drop(ensure_private_directory(&data.join(SHARED_AGENT_HOST_DIRECTORY)).unwrap());
+        let residue = journal_files(&data);
+        assert!(
+            import_certified_system_bootstrap(
+                pins.as_deref(),
+                None,
+                &archive,
+                &prepared,
+                &data.join(SHARED_AGENT_HOST_DIRECTORY)
+            )
+            .is_err()
+        );
+        assert_eq!(journal_files(&data), residue);
+        drop((bootstrap, issuer, archive));
+    }
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+#[test]
+fn retained_system_startup_target_keeps_the_complete_roster_and_exact_signed_closure() {
+    let scratch = Scratch::new();
+    let before = journal_files(&scratch.0);
+    let operator = Keypair::ed25519_from_bytes([0x60; 32]).unwrap();
+    let public = raw_public_key(&operator).unwrap();
+    let runtime = crate::bundled::root_signed_system_agent_runtime_package(&operator).unwrap();
+    let authority = crate::bundled::root_signed_actor_package(
+        crate::bundled::system_authority_package_template(),
+        SYSTEM_AUTHORITY_NAME,
+        &operator,
+    )
+    .unwrap();
+    let materials = fixed_three_materials_for_packaged_preflight(&operator, runtime, authority);
+    let descriptor = materials.descriptor.clone();
+    let check = |descriptor: &AgentDescriptor,
+                 runtime: &vos::agent::package_admission::AdmittedRuntimePackage| {
+        system_startup_target_from_descriptor(
+            descriptor,
+            descriptor.identity.space,
+            public,
+            runtime,
+            &materials.authority_package,
+            &materials.catalog_package,
+        )
+    };
+    let ManagementRequest::Install(install) = &materials.authority_request else {
+        unreachable!()
+    };
+    let configuration =
+        SystemAuthorityConfiguration::decode(&install.installation_data.as_ref().unwrap().bytes)
+            .unwrap();
+    assert!(configuration.matches_system_descriptor(&descriptor));
+    assert_eq!(descriptor.replicas.len(), 3);
+    assert_eq!(
+        check(&descriptor, &materials.runtime).unwrap(),
+        materials.authority_target(),
+        "each reopening voter uses the same founding descriptor, not a new singleton"
+    );
+    assert_eq!(materials.descriptor, descriptor);
+    assert_eq!(configuration.bootstrap_additional_nodes.unwrap().len(), 2);
+
+    let local = crate::bundled::root_signed_agent_runtime_package(&operator).unwrap();
+    assert!(check(&descriptor, &local).is_err());
+    let mut wrong_program = descriptor.clone();
+    wrong_program.identity.runtime_program.0[0] ^= 1;
+    assert!(check(&wrong_program, &materials.runtime).is_err());
+    let mut wrong_package = descriptor.clone();
+    wrong_package.runtime_package.hash.0[0] ^= 1;
+    assert!(check(&wrong_package, &materials.runtime).is_err());
+    let mut wrong_authority = descriptor;
+    wrong_authority.authority.policy.0[0] ^= 1;
+    assert!(check(&wrong_authority, &materials.runtime).is_err());
+    assert_eq!(journal_files(&scratch.0), before);
+    assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+}
+
+#[cfg(feature = "experimental-state-blocks")]
 #[test]
 fn packaged_system_prewrite_binding_refuses_same_sac7_other_runtime_and_authority_closures() {
     use vos::agent::package_admission::{admit_actor_package, admit_runtime_package};
@@ -529,6 +951,8 @@ fn packaged_system_prewrite_binding_refuses_same_sac7_other_runtime_and_authorit
             materials.runtime.exact_bytes(),
             materials.authority_package.exact_bytes(),
             &materials.authority_request,
+            materials.catalog_package.exact_bytes(),
+            &materials.catalog_request,
             &operator,
         )
     };
@@ -624,12 +1048,133 @@ fn packaged_system_prewrite_binding_refuses_same_sac7_other_runtime_and_authorit
             canonical.runtime.exact_bytes(),
             canonical.authority_package.exact_bytes(),
             &changed_request,
+            canonical.catalog_package.exact_bytes(),
+            &canonical.catalog_request,
             &operator,
         )
         .unwrap_err()
         .to_string()
         .contains("descriptor differs from its exact packaged runtime and Authority closure")
     );
+    assert_eq!(journal_files(&scratch.0), before);
+    assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+#[test]
+fn packaged_system_prewrite_binding_refuses_other_catalog_closure_and_configuration_without_writes()
+{
+    use vos::agent::package_admission::admit_actor_package;
+    use vos::agent::sdk::package::{PackageEnvelope, PackageManifest};
+    use vos_pvm_compiler::assembler::{Assembler, Reg};
+
+    let scratch = Scratch::new();
+    let before = journal_files(&scratch.0);
+    let operator = Keypair::ed25519_from_bytes([0x60; 32]).unwrap();
+    let runtime = crate::bundled::root_signed_system_agent_runtime_package(&operator).unwrap();
+    let authority = crate::bundled::root_signed_actor_package(
+        crate::bundled::system_authority_package_template(),
+        SYSTEM_AUTHORITY_NAME,
+        &operator,
+    )
+    .unwrap();
+    let materials = fixed_three_materials_for_packaged_preflight(&operator, runtime, authority);
+    let check = |package: &[u8], request: &ManagementRequest| {
+        validate_packaged_system_observation_bootstrap_materials(
+            &materials.descriptor,
+            materials.runtime.exact_bytes(),
+            materials.authority_package.exact_bytes(),
+            &materials.authority_request,
+            package,
+            request,
+            &operator,
+        )
+    };
+    check(
+        materials.catalog_package.exact_bytes(),
+        &materials.catalog_request,
+    )
+    .unwrap();
+
+    // An admitted, correctly root-signed alternate Catalog still cannot be
+    // imported as the released closure, even with a coherent SCC1 request.
+    let replacement_program = Assembler::new()
+        .load_imm_64(Reg::A0, 0x61)
+        .trap()
+        .build_standard();
+    assert_ne!(
+        replacement_program,
+        materials.catalog_package.program_bytes()
+    );
+    let mut envelope = PackageEnvelope::decode(materials.catalog_package.exact_bytes()).unwrap();
+    let PackageManifest::Actor(manifest) = &mut envelope.manifest else {
+        unreachable!()
+    };
+    let previous = manifest.program.clone();
+    let replacement = BlobRef::of_bytes(&replacement_program);
+    manifest.program = replacement.clone();
+    let artifact = envelope
+        .artifacts
+        .iter_mut()
+        .find(|artifact| artifact.identity == previous)
+        .unwrap();
+    artifact.identity = replacement;
+    artifact.bytes = replacement_program;
+    envelope
+        .artifacts
+        .sort_unstable_by(|left, right| left.identity.cmp(&right.identity));
+    envelope.manifest.signing_mut().signature = operator
+        .sign(&envelope.signing_bytes().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let other = admit_actor_package(&envelope.encode().unwrap()).unwrap();
+    other
+        .require_runtime(AgentProfile::Shared, &materials.runtime)
+        .unwrap();
+    let other_request = install_request(
+        materials.descriptor.identity.agent,
+        &other,
+        system_catalog_configuration(&materials.descriptor, &other)
+            .unwrap()
+            .encode(),
+        b"catalog",
+    )
+    .unwrap();
+    assert!(
+        check(other.exact_bytes(), &other_request)
+            .unwrap_err()
+            .to_string()
+            .contains("Catalog differs from the exact packaged Catalog template")
+    );
+
+    let mut wrong_configuration = materials.catalog_request.clone();
+    let ManagementRequest::Install(install) = &mut wrong_configuration else {
+        unreachable!()
+    };
+    let mut configuration =
+        SystemCatalogConfiguration::decode(&install.installation_data.as_ref().unwrap().bytes)
+            .unwrap();
+    configuration.system_runtime_deployment[0] ^= 1;
+    assert!(configuration.is_valid());
+    let bytes = configuration.encode();
+    let reference = BlobRef::of_bytes(&bytes);
+    install.entry.installation_data = Some(reference.clone());
+    install.installation_data = Some(InstallationData { reference, bytes });
+
+    let mut wrong_reservation = materials.catalog_request.clone();
+    let ManagementRequest::Install(install) = &mut wrong_reservation else {
+        unreachable!()
+    };
+    install.registry_reservation.0[0] ^= 1;
+    for request in [&wrong_configuration, &wrong_reservation] {
+        assert!(
+            check(materials.catalog_package.exact_bytes(), request)
+                .unwrap_err()
+                .to_string()
+                .contains("Catalog installation differs from its exact packaged program, package and descriptor closure")
+        );
+    }
     assert_eq!(journal_files(&scratch.0), before);
     assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
 }
@@ -642,6 +1187,7 @@ fn assert_released_system_plan_refused(error: &anyhow::Error) {
             "System observation runtime release artifact is not yet qualified and pinned",
             "System runtime differs from the exact packaged System observation role",
             "Authority differs from the exact packaged Authority template",
+            "Catalog differs from the exact packaged Catalog template",
             "pending release qualification",
         ]
         .iter()
@@ -910,29 +1456,29 @@ fn candidate_public_shared_member_handoff_retries_and_reopens_production_owners(
 
 #[cfg(feature = "experimental-state-blocks")]
 #[test]
-#[ignore = "requires fresh Authority/System IMAGE/external runtime/CLERK_AGENT_PACKAGE and loopback; real public nonleader Install, lost result and all-owner reopen"]
-fn candidate_public_shared_clerk_nonleader_install_lost_result_and_reopen() {
+#[ignore = "requires exact pinned System/Authority/Shared runtime roles, CLERK_AGENT_PACKAGE and loopback; real public nonleader Install, lost result and all-owner reopen"]
+fn packaged_public_shared_clerk_nonleader_install_lost_result_and_reopen() {
     check_fixed_roster_preparation(FixedRosterStage::PublicWorkflow);
 }
 
 #[cfg(feature = "experimental-state-blocks")]
 #[test]
-#[ignore = "requires fresh candidate Authority/System IMAGE/external/Clerk guests and loopback; 257 real public Root-authorized actor Invoke/ACKs, exact archived issuance and locked restart"]
-fn candidate_public_shared_clerk_native_authorization_exceeds_256_and_reopens() {
+#[ignore = "requires exact pinned System/Authority/Shared runtime roles, CLERK_AGENT_PACKAGE and loopback; 257 real public Root-authorized actor Invoke/ACKs, exact archived issuance and locked restart"]
+fn packaged_public_shared_clerk_native_authorization_exceeds_256_and_reopens() {
     check_fixed_roster_preparation(FixedRosterStage::OperationCapacity);
 }
 
 #[cfg(feature = "experimental-state-blocks")]
 #[test]
-#[ignore = "requires fresh candidate Authority/System IMAGE/external/Clerk guests and loopback; pending Install all-owner locked startup with whole30s recovery"]
-fn candidate_pending_shared_install_all_cold_public_startup() {
+#[ignore = "requires exact pinned System/Authority/Shared runtime roles, CLERK_AGENT_PACKAGE and loopback; pending Install receipt-stage fault and all-owner locked startup with whole30s recovery"]
+fn packaged_pending_shared_install_all_cold_public_startup() {
     check_fixed_roster_preparation(FixedRosterStage::ColdInstallAll);
 }
 
 #[cfg(feature = "experimental-state-blocks")]
 #[test]
-#[ignore = "requires fresh candidate Authority/System IMAGE/external/Clerk guests and loopback; pending Install returning-Follower locked startup with whole30s recovery"]
-fn candidate_pending_shared_install_returning_follower_public_startup() {
+#[ignore = "requires exact pinned System/Authority/Shared runtime roles, CLERK_AGENT_PACKAGE and loopback; pending Install receipt-stage fault and returning-Follower locked startup with whole30s recovery"]
+fn packaged_pending_shared_install_returning_follower_public_startup() {
     check_fixed_roster_preparation(FixedRosterStage::ColdInstallReturning);
 }
 
@@ -962,6 +1508,7 @@ fn candidate_production_roster_gate_preserves_fresh_root_without_singleton_fallb
 }
 
 fn check_fixed_roster_preparation(stage: FixedRosterStage) {
+    use crate::commands::space::local_config::LocalAgentStorage;
     if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -990,15 +1537,35 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
             .unwrap()
         })
         .collect();
+    #[cfg(feature = "experimental-state-blocks")]
+    let packaged = matches!(
+        stage,
+        FixedRosterStage::PublicWorkflow
+            | FixedRosterStage::OperationCapacity
+            | FixedRosterStage::ColdInstallAll
+            | FixedRosterStage::ColdInstallReturning
+    );
+    #[cfg(not(feature = "experimental-state-blocks"))]
+    let packaged = false;
+    #[cfg(feature = "experimental-state-blocks")]
+    let inputs = if packaged {
+        // Mandatory integration selectors use the released roles unchanged;
+        // candidate overrides remain confined to the separate candidate selectors.
+        expiry_startup_inputs(&operator)
+    } else {
+        StartupTestInputs {
+            runtime: member_handoff::fresh_system_runtime(&operator),
+            ..candidate_authority_inputs(
+                &operator,
+                &PathBuf::from(std::env::var("AUTHORITY_CANDIDATE_ELF").unwrap()),
+            )
+        }
+    };
+    #[cfg(not(feature = "experimental-state-blocks"))]
     let inputs = candidate_authority_inputs(
         &operator,
         &PathBuf::from(std::env::var("AUTHORITY_CANDIDATE_ELF").unwrap()),
     );
-    #[cfg(feature = "experimental-state-blocks")]
-    let inputs = StartupTestInputs {
-        runtime: member_handoff::fresh_system_runtime(&operator),
-        ..inputs
-    };
     let make_materials = || {
         SystemBootstrapMaterials::new(
             space,
@@ -1071,6 +1638,64 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
     let published = journal_files(&certificate_path);
     let bundle = scratch.0.join("common.bundle");
     std::fs::write(&bundle, prepared.encode_import().unwrap()).unwrap();
+    #[cfg(feature = "experimental-state-blocks")]
+    if packaged {
+        // Even a valid exact packaged certificate cannot import over an
+        // orphaned Shared host and initialize a new System/control root.
+        let data = scratch.0.join("shared-residue-refusal");
+        drop(crate::commands::space::clean_store::ensure_private_directory(&data).unwrap());
+        let untouched = journal_files(&data);
+        for (configured_space, daemon, reason) in [
+            (
+                [0xff; 32],
+                &daemons[0],
+                "bootstrap plan belongs to another Space or node",
+            ),
+            (
+                space.0,
+                &daemons[1],
+                "retained bootstrap plan belongs to another local node",
+            ),
+        ] {
+            let error = preflight_released_system_startup(
+                &data,
+                crate::commands::space::local_config::LocalAgentStorage::Image,
+                Some(&prepared),
+                &operator,
+                configured_space,
+                daemon,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(reason), "{error:#}");
+            assert_eq!(journal_files(&data), untouched);
+            assert!(!data.join(SYSTEM_AGENT_CONTROL_DIRECTORY).exists());
+            assert!(!data.join(SHARED_AGENT_HOST_DIRECTORY).exists());
+            assert!(!data.join(LOCAL_AGENT_HOST_DIRECTORY).exists());
+            assert!(!data.join(LOCAL_LIFECYCLE_DIRECTORY).exists());
+        }
+        let shared = data.join(SHARED_AGENT_HOST_DIRECTORY);
+        drop(crate::commands::space::clean_store::ensure_private_directory(&shared).unwrap());
+        std::fs::write(shared.join("retained-marker"), b"preserve Shared residue").unwrap();
+        let before = journal_files(&data);
+        let error = preflight_released_system_startup(
+            &data,
+            crate::commands::space::local_config::LocalAgentStorage::Image,
+            Some(&prepared),
+            &operator,
+            space.0,
+            &daemons[0],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Shared deployment residue lacks its retained System bootstrap plan")
+        );
+        assert_eq!(journal_files(&data), before);
+        assert!(!data.join(SYSTEM_AGENT_CONTROL_DIRECTORY).exists());
+        assert!(!data.join(LOCAL_AGENT_HOST_DIRECTORY).exists());
+        assert!(!data.join(LOCAL_LIFECYCLE_DIRECTORY).exists());
+    }
     if stage == FixedRosterStage::ProductionGate {
         let data = scratch.0.join("rejected-import");
         drop(crate::commands::space::clean_store::ensure_private_directory(&data).unwrap());
@@ -1206,6 +1831,61 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
                 path
             })
             .collect();
+        #[cfg(feature = "experimental-state-blocks")]
+        let interrupted_inputs: Vec<_> = if stage == FixedRosterStage::PublicWorkflow {
+            daemons
+                .iter()
+                .map(|daemon| {
+                    read_certified_bootstrap_bundle(&bundle, space.0, &operator, daemon).unwrap()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        #[cfg(feature = "experimental-state-blocks")]
+        for (index, local) in interrupted_inputs.iter().take(2).enumerate() {
+            // Real initialization publishes genesis and pins before the first
+            // CSB5 Intent. Lose this process at each side of that record write:
+            // voter0 has no record; voter1 retains its first pre-rename stage.
+            let control = data[index].join(SYSTEM_AGENT_CONTROL_DIRECTORY);
+            let (pins_bytes, intent_bytes) = startup_record_fixture(local, None);
+            let archive = open_archive(&control, enrollments[index].node.0);
+            archive
+                .import_certified(local.provision(), local.catalog())
+                .unwrap();
+            drop(archive);
+            let (mut pins, bootstrap, issuer, genesis) =
+                CleanSystemAgentFileStores::open_or_create(&control)
+                    .unwrap()
+                    .into_production_parts();
+            pins.commit(&pins_bytes).unwrap();
+            drop((pins, bootstrap, issuer, genesis));
+            if index == 1 {
+                crate::commands::space::clean_store::tests::stage_startup_images(
+                    &control,
+                    [None, Some(intent_bytes.as_slice()), None, None],
+                );
+            }
+            let before = journal_files(&data[index]);
+            let inspected = inspect_released_system_startup(
+                &data[index],
+                LocalAgentStorage::Image,
+                Some(local),
+                &operator,
+                space.0,
+                &daemons[index],
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(inspected.bootstrap.selected_payload().is_some(), index == 1);
+            assert!(CleanSystemAgentFileStores::read_client_bootstrap(&control).is_err());
+            assert_eq!(journal_files(&data[index]), before);
+            assert!(!data[index].join(SHARED_AGENT_HOST_DIRECTORY).exists());
+        }
+        #[cfg(feature = "experimental-state-blocks")]
+        if !interrupted_inputs.is_empty() {
+            assert!(!data[2].join(SYSTEM_AGENT_CONTROL_DIRECTORY).exists());
+        }
         // Drop every lifecycle/file owner, then recover solely from persisted
         // plans. The networking processes stay alive; this is not a daemon
         // crash or public-route qualification.
@@ -1244,15 +1924,16 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
                                 read_certified_bootstrap_bundle(bundle, space.0, operator, daemon)
                                     .unwrap()
                             });
-                            open_clean_system_lifecycle_with_inputs(
+                            open_clean_system_lifecycle_with_roster_policy(
                                 network,
                                 data,
                                 space.0,
                                 operator,
                                 daemon,
-                                crate::commands::space::local_config::LocalAgentStorage::Image,
+                                LocalAgentStorage::Image,
                                 &data.join("host.lock"),
                                 certified.as_ref(),
+                                !packaged,
                                 match stage {
                                     #[cfg(feature = "experimental-state-blocks")]
                                     FixedRosterStage::WarmMembers
@@ -1278,6 +1959,45 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
             });
             for (index, (node, _)) in owners.iter().enumerate() {
                 assert_eq!(*node, enrollments[index].node);
+            }
+            #[cfg(feature = "experimental-state-blocks")]
+            for (index, local) in interrupted_inputs.iter().enumerate() {
+                let control = data[index].join(SYSTEM_AGENT_CONTROL_DIRECTORY);
+                let published = CleanSystemAgentFileStores::read_client_bootstrap(&control)
+                    .unwrap()
+                    .unwrap();
+                let plan =
+                    CleanSystemAgentBootstrapRecord::validated_startup_plan(&published.bootstrap)
+                        .unwrap();
+                assert_eq!(plan.commitment(), local.plan().commitment());
+                assert_eq!(
+                    Hash::digest(b"vos/clean-system-agent-pins/v2", &[&published.pins]),
+                    local.plan().pins().commitment()
+                );
+                assert_eq!(
+                    published.bootstrap[37],
+                    vos::agent::clean_bootstrap::CleanSystemAgentBootstrapPhase::Complete as u8
+                );
+                let (provision, catalog) =
+                    super::super::clean_genesis_archive::client_archive_parts(&published.genesis)
+                        .unwrap();
+                assert_eq!(&provision, local.provision());
+                assert_eq!(catalog.as_slice(), local.catalog());
+                let images = CleanSystemAgentFileStores::read_startup_bootstrap(&control)
+                    .unwrap()
+                    .unwrap();
+                let issuer =
+                    vos::agent::clean_authority_issuer::DurableCleanManagementIssuer::open(
+                        ReadonlyStartupIssuer(images.issuer.selected_payload().unwrap()),
+                        target.binding,
+                        space,
+                        target.system_agent,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    (issuer.sequence_high_water(), issuer.acknowledged_through()),
+                    (3, 3)
+                );
             }
             #[cfg(feature = "experimental-state-blocks")]
             let warm = matches!(
@@ -1405,6 +2125,7 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
                                     space,
                                     target,
                                     &inputs,
+                                    packaged,
                                     restart,
                                     &mut handoff,
                                 );
@@ -1491,10 +2212,65 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
             } else {
                 drop(owners);
             }
-            // At the restart boundary, production must reject the stored
-            // roster without importing or initializing another owner.
+            // At the restart boundary, supported packaged plans receive
+            // readonly normal admission; unsupported candidates still refuse.
             for (index, data) in data.iter().enumerate() {
                 let before = journal_files(data);
+                #[cfg(feature = "experimental-state-blocks")]
+                if packaged {
+                    // The exact retained certificate must stay bound to this
+                    // configured Space and this voter before a writer opens.
+                    for (configured_space, daemon, reason) in [
+                        (
+                            [0xff; 32],
+                            &daemons[index],
+                            "bootstrap plan belongs to another Space or node",
+                        ),
+                        (
+                            space.0,
+                            &daemons[(index + 1) % daemons.len()],
+                            "retained bootstrap plan belongs to another local node",
+                        ),
+                    ] {
+                        let error = preflight_released_system_startup(
+                            data,
+                            crate::commands::space::local_config::LocalAgentStorage::Image,
+                            None,
+                            &operator,
+                            configured_space,
+                            daemon,
+                        )
+                        .unwrap_err();
+                        assert!(error.to_string().contains(reason), "{error:#}");
+                        assert_eq!(journal_files(data), before);
+                    }
+                    let retained = preflight_released_system_startup(
+                        data,
+                        LocalAgentStorage::Image,
+                        None,
+                        &operator,
+                        space.0,
+                        &daemons[index],
+                    )
+                    .unwrap()
+                    .unwrap();
+                    let plan = CleanSystemAgentBootstrapRecord::validated_startup_plan(
+                        retained.bootstrap.selected_payload().unwrap(),
+                    )
+                    .unwrap();
+                    let expected = prepared.plan().for_node(enrollments[index].node).unwrap();
+                    assert_eq!(plan.commitment(), expected.commitment());
+                    let (provision, catalog) =
+                        super::super::clean_genesis_archive::client_archive_parts(
+                            retained.genesis.selected_payload().unwrap(),
+                        )
+                        .unwrap();
+                    assert_eq!(provision.root(), prepared.provision().root());
+                    assert_eq!(provision.evidence(), prepared.provision().evidence());
+                    assert_eq!(catalog.as_slice(), prepared.catalog());
+                    assert_eq!(journal_files(data), before);
+                    continue;
+                }
                 let error = open_clean_system_lifecycle_with_roster_policy(
                     networks[index].clone(),
                     data,

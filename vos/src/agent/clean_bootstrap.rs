@@ -1414,6 +1414,20 @@ impl CleanSystemAgentBootstrapRecord {
         Ok(plan)
     }
 
+    /// Validate retained startup inputs and every present signed phase receipt
+    /// without opening a writer or granting permission to serve the record.
+    #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+    pub fn validated_startup_plan(
+        bytes: &[u8],
+    ) -> Result<AuthorizedCleanSystemAgentBootstrap, CleanSystemAgentBootstrapError> {
+        let record = Self::decode(bytes)
+            .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidRecord))?;
+        let plan = AuthorizedCleanSystemAgentBootstrap::decode(&record.plan)
+            .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidRecord))?;
+        validate_record_against_plan(&record, &plan)?;
+        Ok(plan)
+    }
+
     pub const fn phase(&self) -> CleanSystemAgentBootstrapPhase {
         self.phase
     }
@@ -1932,7 +1946,6 @@ where
     }
     match (loaded_pins.as_deref(), loaded_record.as_deref()) {
         (None, Some(_)) => Err(rejected(CleanSystemAgentBootstrapRejection::MissingPins)),
-        (Some(_), None) => Err(rejected(CleanSystemAgentBootstrapRejection::MissingRecord)),
         (Some(pins), Some(record)) => {
             let pins = CleanSystemAgentPins::decode(pins)
                 .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidPins))?;
@@ -1950,7 +1963,7 @@ where
             }
             Ok(plan)
         }
-        (None, None) => {
+        (pins, None) => {
             if lifecycle.is_some_and(|admission| !admission.is_empty()) {
                 return Err(rejected(CleanSystemAgentBootstrapRejection::InvalidRecord));
             }
@@ -1959,7 +1972,15 @@ where
                     CleanSystemAgentBootstrapRejection::PreexistingHost,
                 ));
             }
-            fresh_plan()
+            let pins = pins
+                .map(CleanSystemAgentPins::decode)
+                .transpose()
+                .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidPins))?;
+            let plan = fresh_plan()?;
+            if pins.as_ref().is_some_and(|pins| plan.pins() != pins) {
+                return Err(rejected(CleanSystemAgentBootstrapRejection::DivergentPins));
+            }
+            Ok(plan)
         }
     }
 }
@@ -3884,6 +3905,14 @@ where
         B: CleanManagementIssuerStore,
         J: CleanManagementIssuerStore,
     {
+        let refused = |phase: &str, error: SharedAgentHostError| {
+            #[cfg(test)]
+            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                tracing::debug!(phase, ?error, "Management terminal retirement refused");
+            }
+            let _ = phase;
+            error
+        };
         let target = self.authority_target();
         let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
         intent
@@ -3941,9 +3970,11 @@ where
             return Ok(false);
         }
         self._network_host
-            .ensure_reattached(crate::service::AgentId(self.pins.agent.0))?;
+            .ensure_reattached(crate::service::AgentId(self.pins.agent.0))
+            .map_err(|error| refused("reattach", error))?;
         let mut material =
-            self.supervisor_invocation_material(self.pins.agent, target.binding.issuer.actor)?;
+            self.supervisor_invocation_material(self.pins.agent, target.binding.issuer.actor)
+                .map_err(|error| refused("material", error))?;
         material.root_provenance = false;
         let identity = super::supervisor_adapters::physical_material_identity(&material)
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
@@ -3974,7 +4005,8 @@ where
         let mut changed = false;
         let agent = crate::service::AgentId(self.pins.agent.0);
         self._network_host
-            .reserve_management_retirement(agent, [authorization_work, finalization_work])?;
+            .reserve_management_retirement(agent, [authorization_work, finalization_work])
+            .map_err(|error| refused("reserve", error))?;
         for envelope in [authorization_work, finalization_work] {
             let RuntimeWork::Invoke {
                 invocation,
@@ -3988,7 +4020,8 @@ where
                 .host
                 .lock()
                 .map_err(|_| SharedAgentHostError::Unavailable)?
-                .retained_positive_clean_acknowledgement(agent, invocation, authorization)?
+                .retained_positive_clean_acknowledgement(agent, invocation, authorization)
+                .map_err(|error| refused("retained_ack", error))?
             {
                 continue;
             }
@@ -3998,7 +4031,8 @@ where
                     identity,
                     (**invocation).clone(),
                     (**authorization).clone(),
-                )?;
+                )
+                .map_err(|error| refused("submit_ack", error))?;
             let super::sdk::RuntimeOutcome::Acknowledged(Ok(retired)) = outcome else {
                 return Err(SharedAgentHostError::Unavailable);
             };
@@ -4602,6 +4636,58 @@ where
         S: CleanManagementReceiptSigner,
         Archive: super::genesis_archive::AgentGenesisArchiveStore,
     {
+        if recovery.authority != self.authority_target() || !recovery.admission_valid {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let intent = recovery
+            .intent
+            .intent()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        if recovery
+            .issuer
+            .recover_finalized_application(
+                recovery.authority,
+                intent.call().managed,
+                intent.request(),
+                intent.call(),
+                &RawCredentialVerifier,
+            )
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+            .is_some()
+        {
+            // An interrupted retirement may already have handed the original
+            // envelope to the exact retirement pair. It is no longer pending
+            // dispatch permission: finish from the durable finalized terminal
+            // and a fresh Authority decision, never reauthorize the Create.
+            let record = archive
+                .load_record(recovery.locator())
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            if record.provision().replicas() != replicas {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            self.verify_finalized_shared_genesis(recovery, &record, receipt_signer)?;
+            if !recovery
+                .intent
+                .retirement_complete()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            {
+                return Err(SharedAgentHostError::Conflict);
+            }
+            for (anchor, envelope) in recovery.pending.iter().skip(1).take(1) {
+                self._network_host.finish_pending_management_result(
+                    crate::service::AgentId(self.pins.agent.0),
+                    anchor,
+                    envelope,
+                    true,
+                    || Ok(()),
+                )?;
+            }
+            recovery.retired = true;
+            recovery.pending.clear();
+            recovery.admission_valid = true;
+            return Ok(record);
+        }
         let (candidate, committee) =
             self.resume_shared_genesis_preparation(recovery, replicas, receipt_signer)?;
         recovery.admission_valid = false;
@@ -5041,21 +5127,28 @@ where
                 }
                 proof
             };
-            // Startup restores every retained phase. Successful proof replay
-            // above checked publication and its positive ACK. Drain only its
-            // reservation; finalization remains for exact root completion.
-            // The network boundary independently rechecks durable positive ACK
-            // evidence before removing each pending member.
+            self.finish_shared_genesis_application(recovery, receipt_signer, Some(&proof))?;
+            if !recovery
+                .intent
+                .retirement_complete()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            {
+                return Err(SharedAgentHostError::Conflict);
+            }
+            // Keep the acknowledged publication protected until exact parent
+            // finalization and retirement complete. An ambiguous finalization
+            // must not make the next publication retry lose its reservation.
+            // CMR2 and the exact finalized terminal now permit cleanup even if
+            // another voter already pruned the released publication evidence.
             for (anchor, envelope) in recovery.pending.iter().skip(1).take(1) {
                 self._network_host.finish_pending_management_result(
                     crate::service::AgentId(self.pins.agent.0),
                     anchor,
                     envelope,
-                    false,
+                    true,
                     || Ok(()),
                 )?;
             }
-            self.finish_shared_genesis_application(recovery, receipt_signer, Some(&proof))?;
             proofs.push(proof);
         }
         #[cfg(feature = "experimental-state-blocks")]
@@ -5172,10 +5265,30 @@ where
         recovery: &mut NativeSharedGenesisRecovery<B, J, Q, ReplyStore, W, PubReply>,
         record: &super::genesis::AgentGenesisArchiveRecord,
         signer: &mut S,
-        predecessor: Option<&(
+        _predecessor: Option<&(
             super::clean_management_intent::ManagementJournalAnchor,
             RuntimeWork,
         )>,
+    ) -> Result<ReplayVerifiedAgentGenesisFinality, SharedAgentHostError>
+    where
+        B: CleanManagementIssuerStore,
+        J: CleanManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+    {
+        if !recovery.retired || !recovery.pending.is_empty() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self.verify_finalized_shared_genesis(recovery, record, signer)
+    }
+
+    /// The same exact terminal proof is also used after an interrupted live
+    /// retirement, when the original work has left pending admission but CMR2
+    /// or its quorum release may still need to finish.
+    fn verify_finalized_shared_genesis<B, J, Q, ReplyStore, W, PubReply, S>(
+        &mut self,
+        recovery: &mut NativeSharedGenesisRecovery<B, J, Q, ReplyStore, W, PubReply>,
+        record: &super::genesis::AgentGenesisArchiveRecord,
+        signer: &mut S,
     ) -> Result<ReplayVerifiedAgentGenesisFinality, SharedAgentHostError>
     where
         B: CleanManagementIssuerStore,
@@ -5197,11 +5310,7 @@ where
         else {
             return Err(SharedAgentHostError::ScopeMismatch);
         };
-        if !recovery.retired
-            || !recovery.pending.is_empty()
-            || intent.request() != request
-            || recovery.issued.as_ref() != Some(receipt)
-        {
+        if intent.request() != request || recovery.issued.as_ref() != Some(receipt) {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         let (_, acknowledgement) = recovery
@@ -5215,22 +5324,11 @@ where
             )
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?
             .ok_or(SharedAgentHostError::ScopeMismatch)?;
-        // CMR2 may have committed before its quorum release timed out. The
-        // original envelopes remain in the verified intent: retry only their
-        // terminal release before obtaining the mandatory fresh decision.
-        // This does not substitute issuer history for current genesis finality.
-        self.finish_management_intent_retirement(
-            &mut recovery.intent,
-            intent.call().managed,
-            &acknowledgement,
-            &recovery.issuer,
-        )?;
         let position = self
             .host
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?
             .journal_position(crate::service::AgentId(self.pins.agent.0))?;
-        let authority = self.authority_target();
         let agent = intent.call().managed.agent;
         let nonce = Hash::digest(
             b"vos/shared-genesis/recovery-read/v1",
@@ -5249,10 +5347,34 @@ where
         // A fresh signed observation is independent of management reservation
         // ordering. It proves current decision state without retaining a child.
         let query = self.signed_genesis_decision_query(agent, nonce, signer)?;
-        let response = self.invoke_authority_observation(query)?;
-        if response != record.provision().decision().encode() {
+        let response = self.invoke_authority_observation(query).map_err(|error| {
+            #[cfg(test)]
+            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                tracing::debug!(?error, "Finalized genesis fresh decision refused");
+            }
+            error
+        })?;
+        let expected = record.provision().decision().encode();
+        #[cfg(test)]
+        if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+            tracing::debug!(
+                response_bytes = response.len(),
+                matches = response == expected,
+                "Finalized genesis fresh decision completed"
+            );
+        }
+        if response != expected {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
+        // Authenticate the complete archived decision before any unfinished
+        // retirement writes. CMR2 or its quorum release may have timed out;
+        // retry only the exact original pair after this fresh proof succeeds.
+        self.finish_live_management_intent(
+            &mut recovery.intent,
+            intent.call().managed,
+            &acknowledgement,
+            &recovery.issuer,
+        )?;
         Ok(ReplayVerifiedAgentGenesisFinality(
             record.provision().clone(),
         ))
@@ -5401,16 +5523,25 @@ where
                     &proof,
                 )?;
             }
+            self.finish_shared_genesis_application(recovery, signer, Some(&proof))?;
+            if !recovery
+                .intent
+                .retirement_complete()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            {
+                return Err(SharedAgentHostError::Conflict);
+            }
+            // Publication stays reserved through ambiguous parent finalization;
+            // CMR2 then permits cleanup after released evidence was pruned.
             for (anchor, envelope) in recovery.pending.iter().skip(1).take(1) {
                 self._network_host.finish_pending_management_result(
                     crate::service::AgentId(self.pins.agent.0),
                     anchor,
                     envelope,
-                    false,
+                    true,
                     || Ok(()),
                 )?;
             }
-            self.finish_shared_genesis_application(recovery, signer, Some(&proof))?;
         }
         let intent = recovery
             .intent
@@ -7737,6 +7868,14 @@ where
         terminal: ManagementTerminalRef<'_>,
         issuer: &DurableCleanManagementIssuer<J>,
     ) -> Result<(), SharedAgentHostError> {
+        let refused = |phase: &str, error: SharedAgentHostError| {
+            #[cfg(test)]
+            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                tracing::debug!(phase, ?error, "Management terminal completion refused");
+            }
+            let _ = phase;
+            error
+        };
         if slot
             .retirement_complete()
             .map_err(|_| SharedAgentHostError::Unavailable)?
@@ -7754,13 +7893,23 @@ where
             .finalization_work()
             .map_err(|_| SharedAgentHostError::Unavailable)?
             .ok_or(SharedAgentHostError::ScopeMismatch)?;
-        self.handoff_recovered_management(&[[authorization, finalization]])?;
+        #[cfg(test)]
+        if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+            tracing::debug!("Management terminal completion handoff start");
+        }
+        self.handoff_recovered_management(&[[authorization, finalization]])
+            .map_err(|error| refused("handoff", error))?;
+        #[cfg(test)]
+        if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+            tracing::debug!("Management terminal completion handoff complete");
+        }
         #[cfg(test)]
         if self.finalization_failure_once == Some(7) {
             self.finalization_failure_once = None;
             return Err(SharedAgentHostError::Unavailable);
         }
-        self.finish_management_terminal_retirement(slot, managed, terminal, issuer)?;
+        self.finish_management_terminal_retirement(slot, managed, terminal, issuer)
+            .map_err(|error| refused("retirement", error))?;
         Ok(())
     }
 
@@ -7913,9 +8062,32 @@ where
                 crate::service::AgentId(self.pins.agent.0),
                 query.commitment(),
                 |host| {
-                    host.observe_system_authority(crate::service::AgentId(self.pins.agent.0), &work)
+                    let result = host.observe_system_authority(
+                        crate::service::AgentId(self.pins.agent.0), &work,
+                    );
+                    #[cfg(test)]
+                    if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                        match &result {
+                            Ok(super::sdk::RuntimeOutcome::Completed(Ok(reply))) => {
+                                tracing::debug!(status = ?reply.status, reply_bytes = reply.reply.len(),
+                                    "Authority observation guest completed");
+                            }
+                            Ok(super::sdk::RuntimeOutcome::Completed(Err(error))) => {
+                                tracing::debug!(?error, "Authority observation guest refused");
+                            }
+                            Ok(_) => tracing::debug!("Authority observation guest non-completed outcome"),
+                            Err(error) => tracing::debug!(?error, "Authority observation host refused"),
+                        }
+                    }
+                    result
                 },
-            )?;
+            ).map_err(|error| {
+                #[cfg(test)]
+                if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                    tracing::debug!(?error, "Authority observation freshness or callback refused");
+                }
+                error
+            })?;
             let super::sdk::RuntimeOutcome::Completed(Ok(reply)) = outcome else {
                 return Err(SharedAgentHostError::Unavailable);
             };
@@ -12059,7 +12231,7 @@ mod tests {
                     IssuerMemoryStore::default(),
                 );
                 let genesis = Arc::new(MemoryProvider::new(fixture.provision.clone()));
-                // Only the receiver-origin exercise needs ordinary EXTERNAL
+                // Only ordinary Shared exercises need EXTERNAL
                 // alongside this same actual IMAGE System owner. Use the
                 // existing external opener's selection, not a serving flag or
                 // a second host. Every pre-existing exercise keeps ImageOnly.
@@ -12067,7 +12239,10 @@ mod tests {
                 #[cfg(feature = "experimental-state-blocks")]
                 let selection = if matches!(
                     common_checkpoint,
-                    Some(common_checkpoint::Exercise::ForwardedInstallOrigin)
+                    Some(
+                        common_checkpoint::Exercise::ForwardedInstallOrigin
+                            | common_checkpoint::Exercise::GenesisPublicationRetry
+                    )
                 ) {
                     SharedExecutionSelection::ExternalLinearCandidates
                 } else {
@@ -31503,6 +31678,104 @@ mod tests {
         }
 
         #[test]
+        fn factory_recovers_only_exact_pins_before_record_without_writes() {
+            let fixture = physical_fixture();
+            let directory = TestDirectory::new("factory-pins-before-record");
+            let mut pins = BootstrapMemoryStore::default();
+            pins.commit(&fixture.plan.pins.encode()).unwrap();
+            let mut record = BootstrapMemoryStore::default();
+            let factory_calls = Cell::new(0_usize);
+            let recovered = load_or_prepare_bootstrap_plan(
+                &mut pins,
+                &mut record,
+                || {
+                    factory_calls.set(factory_calls.get() + 1);
+                    Ok(fixture.plan.clone())
+                },
+                &directory.host(),
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(recovered.canonical_bytes(), fixture.plan.canonical_bytes());
+            assert_eq!(factory_calls.get(), 1);
+            assert_eq!(pins.commits(), 1);
+            assert_eq!(record.commits(), 0);
+            assert!(record.image().is_none());
+            assert!(!directory.host().exists());
+
+            let mut divergent = fixture.plan.pins.clone();
+            divergent.observed_slot += 1;
+            let divergent_bytes = divergent.encode();
+            CleanSystemAgentPins::decode(&divergent_bytes).unwrap();
+            let mut divergent_pins = BootstrapMemoryStore::default();
+            divergent_pins.commit(&divergent_bytes).unwrap();
+            assert!(matches!(
+                load_or_prepare_bootstrap_plan(
+                    &mut divergent_pins,
+                    &mut record,
+                    || {
+                        factory_calls.set(factory_calls.get() + 1);
+                        Ok(fixture.plan.clone())
+                    },
+                    &directory.host(),
+                    None,
+                    None,
+                ),
+                Err(CleanSystemAgentBootstrapError::Rejected(
+                    CleanSystemAgentBootstrapRejection::DivergentPins
+                ))
+            ));
+            assert_eq!(factory_calls.get(), 2);
+            assert_eq!(divergent_pins.image(), Some(divergent_bytes));
+            assert_eq!(divergent_pins.commits(), 1);
+
+            std::fs::create_dir(directory.host()).unwrap();
+            let marker = directory.host().join("preserve");
+            std::fs::write(&marker, b"untouched").unwrap();
+            assert!(matches!(
+                load_or_prepare_bootstrap_plan(
+                    &mut pins,
+                    &mut record,
+                    || panic!("Shared residue must refuse before the factory"),
+                    &directory.host(),
+                    None,
+                    None,
+                ),
+                Err(CleanSystemAgentBootstrapError::Rejected(
+                    CleanSystemAgentBootstrapRejection::PreexistingHost
+                ))
+            ));
+            let mut operations = OperationTestJournal(directory.0.clone());
+            let mut admission = NativeAuthorityOperationStartupAdmission::load(
+                &mut operations,
+                fixture.plan.authority_target(),
+                &[],
+            )
+            .unwrap();
+            admission.has_history = true;
+            assert!(matches!(
+                load_or_prepare_bootstrap_plan(
+                    &mut pins,
+                    &mut record,
+                    || panic!("operation history must refuse before the factory"),
+                    &directory.host(),
+                    None,
+                    Some(&admission),
+                ),
+                Err(CleanSystemAgentBootstrapError::Rejected(
+                    CleanSystemAgentBootstrapRejection::InvalidRecord
+                ))
+            ));
+            assert_eq!(std::fs::read(&marker).unwrap(), b"untouched");
+            assert_eq!(pins.image(), Some(fixture.plan.pins.encode()));
+            assert_eq!(pins.commits(), 1);
+            assert!(record.image().is_none());
+            assert_eq!(record.commits(), 0);
+            assert_eq!(factory_calls.get(), 2);
+        }
+
+        #[test]
         fn factory_rejects_partial_preexisting_and_tampered_state_without_fresh_material() {
             let fixture = physical_fixture();
             let provider = Arc::new(MemoryProvider::new(fixture.provision.clone()));
@@ -31511,9 +31784,11 @@ mod tests {
             let factory_calls = Cell::new(0_usize);
 
             let only_pins = BootstrapMemoryStore::default();
+            let mut invalid_pins = fixture.plan.pins.encode();
+            invalid_pins[0] ^= 1;
             only_pins
                 .clone()
-                .commit(&fixture.plan.pins.encode())
+                .commit(&invalid_pins)
                 .unwrap();
             let directory = TestDirectory::new("factory-partial-pins");
             assert!(matches!(
@@ -31532,7 +31807,7 @@ mod tests {
                     Arc::clone(&network),
                 ),
                 Err(CleanSystemAgentBootstrapError::Rejected(
-                    CleanSystemAgentBootstrapRejection::MissingRecord
+                    CleanSystemAgentBootstrapRejection::InvalidPins
                 ))
             ));
 
