@@ -102,24 +102,44 @@ Current O3 component evidence (logs under the native worktree's `target`):
 
 ### Current integration delta and blocking result
 
-Current reviewed source `b20faacd` adds journal/family qualification tests to
-production host correction `f9c61863`; its portable main/harness and public rerun
-remain **open**. Previous clean `5c2bf99c` portable
-main/harness pass **191.197s / 252.859s**, empty RUSTFLAGS and encoded/target
-overrides unset, exact frozen hashes and strict six-file verification **0.101s**.
-Authority, Catalog, both runtime roles and coherent component pins are unchanged.
-Typed retained-client context regressions pass **0.41s / 0.88s / 0.04s**;
-adjacent Local frontend checks include the permitted exact transport rerun after
-sandbox bind EPERM. Zero-selection filters and component passes do not close M1.
+Latest portable/public evidence is frozen at
+`3b72eab63ad4b55ede139a0819168d62758f67dd`, with
+production host correction `f9c61863` and its qualified journal/family tests.
+Portable main/harness **pass 391.301s / 453.172s** with empty RUSTFLAGS and
+encoded/target overrides unset; current main strict six-file verification
+**passes 0.101s**. Exact frozen hashes, clean source before/after, commands and
+owned-group completion are in
+`task-tmp/r41-cli-build-3b72eab6/provenance.json`. Authority, Catalog, both runtime
+roles and coherent guest component pins are unchanged. Typed retained-client
+context regressions remain qualified; zero-selection filters or component
+passes do not close M1.
 
-Previous quiet/scoped public runs **fail 379.809s / 426.664s** at the unchanged
-**120s** bootstrap issuance cap on preparation HTTP 503, after verified nonleader
-Install **113.317s / 116.573s**. Neither reaches bootstrap Issued, mutation/lost
-response, positive ACK or whole locked-owner reopen; the other four packaged
-gates remain unexecuted. Initial origin registration timeout **1.806s** and later
-peer completion **4.188s** correlate displayed truncated digests, without full
-original-byte proof. Absent test-only observation outcome blocks in the
-CLI-linked core do not establish the guest result.
+Current quiet/scoped public runs **fail 377.199s / 450.086s** at the unchanged
+**120s** bootstrap issuance correctness cap on **`/__agents/authorize` HTTP 503**,
+after verified nonleader Install **113.752s / 113.020s**. They progressed beyond
+the previous preparation failure to synchronized AOQ1 publication and exact
+retained authorization delivery. No decoded bootstrap Issued, mutation/lost
+response, Clerk positive ACK or whole locked-owner reopen is reached. Both are one
+executed failing test with owned group gone; the other four selectors and
+current ordinary CLI acceptance remain unexecuted.
+
+Scoped aggregates show preparation **Unavailable 1 / ScopeMismatch 7**, then
+authorization **Unavailable 5**. They do not distinguish policy, issuer, ACK or
+terminal release, and aggregate interleaved custody events do not prove episode
+identity. Absent CLI-linked test-only guest outcome blocks do not establish the
+guest result. The fixture asserts unchanged ATQ1 on failed attempts; ordinary
+client code synchronizes AOQ1 before authorize and loads the same bytes on retry
+without discovery, preparation or replacement signing. This source witness is
+not archived client-state inspection: `Scratch::drop` deletes the runtime tree
+on unwind. Private logs/results/provenance and the safe aggregate summary remain
+under `task-tmp/r41-packaged-five-3b72eab6` and
+`task-tmp/r41-public-scoped-3b72eab6`. Review narrow existing-stage/outcome
+attribution before any next fix; HTTP 503 alone establishes neither guest failure
+nor a performance-only cause. Temporary native-operation phase/outcome diagnostics
+are applied under the existing flag, source-reviewed and syntax-checked only,
+**unbuilt and unexecuted**. They provide attribution rather than quiet/SLA evidence
+and must be removed after the cause is established. No future source checkpoint
+or success is claimed. M1/M2/M3 remain open.
 
 Supported THREE-node BEFORE evidence now establishes the recovery-admission
 defect on this supported cut. Clean `61530b52` core builds **45.045s** after a preserved **20.727s**
@@ -141,7 +161,7 @@ remains journal-first; exact existing NOD1 preparation replays independently of
 an unrelated pending proof, which only matching retention confirmation clears.
 No changed authorization, format, limit or deadline.
 
-Current `b20faacd` debug core builds **55.558s**. The first extended timeout
+Component qualification on `b20faacd` uses a debug core build of **55.558s**. The first extended timeout
 run **fails 70.579s** in the existing **60s leader-bootstrap** setup with
 HostUnavailable, before any cut phase. Keep this unattributed failure; it proves
 neither recovery behavior nor service qualification. The identical isolated rerun
@@ -158,7 +178,7 @@ normal same-store cold refusal **passes 32.735s total / 7.392s whole30**, new-ow
 proof absent and exact call refused without custody adoption, Invoke or ACK.
 Every pass is one executed test with owned group gone and unchanged whole30,
 including checked shutdown. The demonstrated defect is component-qualified;
-current portable/public integration remains open.
+current portable packaging passes while public authorization/issuance remains open.
 
 These use real physical System images and non-clone fsync operation test stores,
 not hardened CSF1 lifecycle lease qualification. Family candidates are detached
@@ -169,8 +189,14 @@ failure remains unexplained; no deadline increase or tuning pass was consumed.
 Existing supported Admin registration-timeout compatibility on production
 `f9c61863` **passes 30.933s total / 8.385s whole30** through exact terminal retry
 and release, verifying preserved default Admin component semantics. The live
-plan owns exact evidence paths; rebuild current portable hosts and rerun the
-quiet public gate before the four remaining selectors and actual CLI acceptance.
+plan owns exact evidence paths and dependency order. Attribute the current
+authorization substage, fix only a demonstrated remaining cause, and rerun quiet
+public acceptance on rebuilt hosts if changed before the four remaining
+selectors and actual CLI acceptance. Recorded build durations are high-confidence
+facts; a predictive **3–8 minutes per portable main/harness binary** range has moderate confidence from
+cache/source variation and is not an aggregate ETA. Earlier source/elapsed
+forecasts remain unreliable.
+No service-tuning pass was consumed.
 
 The earlier corrected role-source boundary `2e19cd17` freezes these changes,
 which close demonstrated M1 defects without changing authorization, wire bounds

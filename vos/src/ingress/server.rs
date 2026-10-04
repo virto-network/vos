@@ -683,6 +683,13 @@ fn handle_operation_authorization(
     request: &super::types::Request,
     handle: &IngressHandle,
 ) -> super::types::Response {
+    let diagnostics = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some();
+    let trace = |phase: &'static str, outcome: &'static str| {
+        if diagnostics {
+            tracing::debug!(phase, outcome, "native_operation_phase");
+        }
+    };
+    trace("http_authorization", "start");
     use super::types::{text, with_content_type};
     use crate::agent::local_lifecycle::{AuthorityOperationSubmission, LocalLifecycleIngressError};
     use crate::agent::sdk::wire::CanonicalWire as _;
@@ -719,13 +726,21 @@ fn handle_operation_authorization(
             "HTTP operation authorization does not accept transport-node claims",
         );
     }
+    trace("http_enqueue", "start");
     let reply = match handle.submit_clean_agent_operation(submission.clone()) {
-        Ok(reply) => reply,
+        Ok(reply) => {
+            trace("http_enqueue", "accepted");
+            reply
+        },
         Err(LocalLifecycleIngressError::Invalid) => {
             return text(400, "invalid operation submission");
         }
-        Err(LocalLifecycleIngressError::Busy) => return text(503, "Local lifecycle queue is full"),
+        Err(LocalLifecycleIngressError::Busy) => {
+            trace("http_enqueue", "busy");
+            return text(503, "Local lifecycle queue is full");
+        },
         Err(LocalLifecycleIngressError::Unavailable) => {
+            trace("http_enqueue", "unavailable");
             return text(503, "operation authorization unavailable");
         }
     };
@@ -733,20 +748,27 @@ fn handle_operation_authorization(
         Ok(Ok(decision)) => match submission.encode_response(&decision) {
             // Both verified policy outcomes are completed decisions; callers
             // distinguish issuance/denial from the authenticated AOR1 payload.
-            Ok(bytes) => with_content_type(200, "application/octet-stream", bytes),
+            Ok(bytes) => {
+                trace("http_native_reply", "complete");
+                with_content_type(200, "application/octet-stream", bytes)
+            },
             Err(_) => text(500, "invalid operation response binding"),
         },
         Ok(Err(error)) => {
+            trace("http_native_reply", "error");
             tracing::warn!(?error, "native operation authorization incomplete");
             text(
                 503,
                 "operation authorization incomplete; retry identical AOQ1",
             )
         }
-        Err(_) => text(
-            504,
-            "operation authorization outcome unknown; retry identical AOQ1",
-        ),
+        Err(_) => {
+            trace("http_native_reply", "timeout_or_disconnected");
+            text(
+                504,
+                "operation authorization outcome unknown; retry identical AOQ1",
+            )
+        },
     }
 }
 

@@ -1629,9 +1629,21 @@ where
         envelope: &RuntimeWork,
         anchor: &super::super::clean_management_intent::ManagementJournalAnchor,
     ) -> Result<AuthorityOperationActorResult, SharedAgentHostError> {
+        let diagnostics = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some();
+        let method = match request.method {
+            AuthorityOperationActorMethod::AuthorizeOperation => "authorization",
+            AuthorityOperationActorMethod::AcknowledgeIssuance => "issuance_ack",
+        };
+        let trace = |phase: &'static str, outcome: &'static str| {
+            if diagnostics {
+                tracing::debug!(phase, outcome, method, "native_operation_phase");
+            }
+        };
+        trace("native_dispatch", "start");
         if request.target != self.authority_target()
             || !matches_operation_envelope(request, envelope)
         {
+            trace("native_refusal", "request_scope");
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         let RuntimeWork::Invoke {
@@ -1641,15 +1653,26 @@ where
             ..
         } = envelope
         else {
+            trace("native_refusal", "envelope_kind");
             return Err(SharedAgentHostError::ScopeMismatch);
         };
-        let mut material = self.supervisor_invocation_material(self.pins.agent, work.actor)?;
+        trace("native_material", "start");
+        let mut material = self.supervisor_invocation_material(self.pins.agent, work.actor)
+            .map_err(|error| {
+                trace("native_material", "error");
+                error
+            })?;
+        trace("native_material", "complete");
         material.root_provenance = false;
         if material.producer != request.target.binding.issuer.producer {
+            trace("native_refusal", "producer");
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         let identity = super::super::supervisor_adapters::physical_material_identity(&material)
-            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            .map_err(|_| {
+                trace("native_refusal", "identity_scope");
+                SharedAgentHostError::ScopeMismatch
+            })?;
         if !super::super::supervisor_adapters::physical_material_authorizes_reserved_work(
             &material,
             identity,
@@ -1658,14 +1681,32 @@ where
             authorization,
             *observed_slot,
         ) {
+            trace("native_refusal", "physical_authorization");
             return Err(SharedAgentHostError::ScopeMismatch);
         }
+        trace("native_invoke", "start");
         let outcome = self.supervisor_invoke_persisted_management(
             identity,
             (**work).clone(),
             (**authorization).clone(),
             anchor,
-        )?;
+        ).map_err(|error| {
+            trace("native_invoke", "error");
+            error
+        })?;
+        if diagnostics {
+            let outcome = match &outcome {
+                super::super::sdk::RuntimeOutcome::Completed(Ok(reply)) => match reply.status {
+                    super::super::sdk::InvocationStatus::Done => "completed_done",
+                    super::super::sdk::InvocationStatus::Forbidden => "completed_forbidden",
+                    super::super::sdk::InvocationStatus::Panicked => "completed_panicked",
+                    super::super::sdk::InvocationStatus::OutOfGas => "completed_out_of_gas",
+                },
+                super::super::sdk::RuntimeOutcome::Completed(Err(_)) => "completed_error",
+                _ => "noncompleted",
+            };
+            trace("native_outcome", outcome);
+        }
         let super::super::sdk::RuntimeOutcome::Completed(Ok(reply)) = outcome else {
             return Err(SharedAgentHostError::Unavailable);
         };
@@ -1676,8 +1717,10 @@ where
             || reply.mode != work.mode
             || reply.status != super::super::sdk::InvocationStatus::Done
         {
+            trace("native_refusal", "reply_scope");
             return Err(SharedAgentHostError::ScopeMismatch);
         }
+        trace("native_dispatch", "complete");
         Ok(AuthorityOperationActorResult {
             target: request.target,
             method: request.method,

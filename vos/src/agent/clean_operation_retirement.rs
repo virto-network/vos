@@ -197,6 +197,12 @@ where
         S: NativeAuthorityOperationRetirementSigner,
         F: FnOnce(&[u8]) -> Result<(), SharedAgentHostError>,
     {
+        let diagnostics = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some();
+        let trace = |phase: &'static str, outcome: &'static str| {
+            if diagnostics {
+                tracing::debug!(phase, outcome, "native_operation_phase");
+            }
+        };
         let target = self.authority_target();
         if retained.completion.target != target || signer.public_key() != target.binding.public_key
         {
@@ -234,10 +240,15 @@ where
         let retired = result.ok_or(SharedAgentHostError::Unavailable)?;
         // NRT1 is synchronized before releasing its exact root retention.
         // A quorum timeout leaves the certificate available for exact retry.
+        trace("terminal_release", "start");
         self._network_host.release_management_retention(
             crate::service::AgentId(self.pins.agent.0),
             retained.completion.authorization.envelope(),
-        )?;
+        ).map_err(|error| {
+            trace("terminal_release", "error");
+            error
+        })?;
+        trace("terminal_release", "complete");
         Ok(retired)
     }
 

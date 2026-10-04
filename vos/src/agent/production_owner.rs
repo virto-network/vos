@@ -1562,24 +1562,44 @@ impl AgentProductionOwner {
         super::clean_bootstrap::NativeAuthorityOperationDecision,
         super::shared_host::SharedAgentHostError,
     > {
+        let diagnostics = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some();
+        let trace = |phase: &'static str, outcome: &'static str| {
+            if diagnostics {
+                tracing::debug!(phase, outcome, "native_operation_phase");
+            }
+        };
+        trace("admission", "start");
         if !self.is_running() {
+            trace("admission", "stopped");
             return Err(super::shared_host::SharedAgentHostError::Unavailable);
         }
-        if !self.is_ready()
+        let ready = self.is_ready();
+        trace("admission", if ready { "ready" } else { "retained_only" });
+        if !ready
             && !self
                 .lifecycle
                 .as_mut()
                 .ok_or(super::shared_host::SharedAgentHostError::Unavailable)?
                 .0
-                .retains_operation(call, Some(&context))?
+                .retains_operation(call, Some(&context))
+                .map_err(|error| {
+                    trace("admission_retained", "error");
+                    error
+                })?
         {
+            trace("admission_retained", "absent");
             return Err(super::shared_host::SharedAgentHostError::ScopeMismatch);
         }
+        trace("admission", "complete");
         self.lifecycle
             .as_mut()
             .ok_or(super::shared_host::SharedAgentHostError::Unavailable)?
             .0
             .authorize_operation(call, context, issued_at)
+            .map_err(|error| {
+                trace("authorization", "error");
+                error
+            })
     }
 
     pub(crate) fn install_local_host(

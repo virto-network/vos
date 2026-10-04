@@ -516,6 +516,13 @@ where
         IssuedAuthorityOperation,
         AuthorityOperationCoordinatorError<C::Error, I::Error, D::Error, S::Error>,
     > {
+        let diagnostics = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some();
+        let trace = |phase: &'static str, outcome: &'static str| {
+            if diagnostics {
+                tracing::debug!(phase, outcome, "native_operation_phase");
+            }
+        };
+        trace("coordinator", "start");
         self.ensure_live()?;
         let verifier = RawEd25519Verifier;
         if !operation_call_has_valid_ingress_envelope(call, &verifier) {
@@ -613,6 +620,7 @@ where
                     AuthorityOperationCoordinatorRejection::WrongSigner,
                 ));
             }
+            trace("authorization_retain", "start");
             self.dispatcher
                 .retain_authorization(&AuthorityOperationActorDispatch {
                     target: self.authority,
@@ -620,7 +628,11 @@ where
                     context: authorization_context,
                     request: call_bytes.clone(),
                 })
-                .map_err(AuthorityOperationCoordinatorError::Dispatch)?;
+                .map_err(|error| {
+                    trace("authorization_retain", "error");
+                    AuthorityOperationCoordinatorError::Dispatch(error)
+                })?;
+            trace("authorization_retain", "complete");
             let mut pledged = self.image.clone();
             pledged.authorization_slot_high_water = Some(authorization_context.observed_slot);
             pledged.issuance_slot_high_water = Some(issued_at);
@@ -630,7 +642,12 @@ where
                 issued_at,
                 consumed_issuance_ack: None,
             });
-            self.commit_candidate::<S::Error>(pledged)?;
+            trace("coordinator_pledge_save", "start");
+            self.commit_candidate::<S::Error>(pledged).map_err(|error| {
+                trace("coordinator_pledge_save", "error");
+                error
+            })?;
+            trace("coordinator_pledge_save", "complete");
             self.image.records.len() - 1
         };
 
@@ -687,14 +704,20 @@ where
             }
         };
 
+        trace("issuer_save", "start");
         let issued = self
             .issuer
             .issue(call, &approval, issued_at, signer)
-            .map_err(AuthorityOperationCoordinatorError::Issuer)?;
+            .map_err(|error| {
+                trace("issuer_save", "error");
+                AuthorityOperationCoordinatorError::Issuer(error)
+            })?;
+        trace("issuer_save", "complete");
         if self.image.records[record_index]
             .consumed_issuance_ack
             .is_some()
         {
+            trace("issuance_ack_retained", "complete");
             return Ok(issued);
         }
 
@@ -715,14 +738,22 @@ where
             context: acknowledgement_context,
             request: acknowledgement_bytes,
         };
-        match self.dispatch_exact::<S::Error>(&request)? {
-            crate::value::Value::Bool(true) => {}
+        trace("issuance_ack_dispatch", "start");
+        match self.dispatch_exact::<S::Error>(&request).map_err(|error| {
+            trace("issuance_ack_dispatch", "error");
+            error
+        })? {
+            crate::value::Value::Bool(true) => {
+                trace("issuance_ack_dispatch", "accepted");
+            }
             crate::value::Value::Bool(false) => {
+                trace("issuance_ack_dispatch", "rejected");
                 return Err(AuthorityOperationCoordinatorError::Rejected(
                     AuthorityOperationCoordinatorRejection::AcknowledgementRejected,
                 ));
             }
             _ => {
+                trace("issuance_ack_dispatch", "invalid_reply");
                 return Err(AuthorityOperationCoordinatorError::Rejected(
                     AuthorityOperationCoordinatorRejection::InvalidDispatchResult,
                 ));
@@ -731,7 +762,12 @@ where
         let mut completed = self.image.clone();
         completed.records[record_index].consumed_issuance_ack =
             Some(issued.issuance_ack.commitment());
-        self.commit_candidate::<S::Error>(completed)?;
+        trace("issuance_ack_save", "start");
+        self.commit_candidate::<S::Error>(completed).map_err(|error| {
+            trace("issuance_ack_save", "error");
+            error
+        })?;
+        trace("issuance_ack_save", "complete");
         Ok(issued)
     }
 
@@ -744,24 +780,37 @@ where
         AuthorityOperationApproval,
         AuthorityOperationCoordinatorError<C::Error, I::Error, D::Error, SignerError>,
     > {
+        let diagnostics = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some();
+        let trace = |phase: &'static str, outcome: &'static str| {
+            if diagnostics {
+                tracing::debug!(phase, outcome, "native_operation_phase");
+            }
+        };
+        trace("policy_dispatch", "start");
         let request = AuthorityOperationActorDispatch {
             target: self.authority,
             method: AuthorityOperationActorMethod::AuthorizeOperation,
             context,
             request: call_bytes.to_vec(),
         };
-        let reply = self.dispatch_exact::<SignerError>(&request)?;
+        let reply = self.dispatch_exact::<SignerError>(&request).map_err(|error| {
+            trace("policy_dispatch", "error");
+            error
+        })?;
         let crate::value::Value::Bytes(approval_bytes) = reply else {
+            trace("policy_reply", "invalid_type");
             return Err(AuthorityOperationCoordinatorError::Rejected(
                 AuthorityOperationCoordinatorRejection::InvalidDispatchResult,
             ));
         };
         if approval_bytes.is_empty() {
+            trace("policy_reply", "denied");
             return Err(AuthorityOperationCoordinatorError::Rejected(
                 AuthorityOperationCoordinatorRejection::AuthorizationDenied,
             ));
         }
         let approval = AuthorityOperationApproval::decode(&approval_bytes).map_err(|_| {
+            trace("policy_reply", "invalid_approval");
             AuthorityOperationCoordinatorError::Rejected(
                 AuthorityOperationCoordinatorRejection::InvalidApproval,
             )
@@ -771,10 +820,12 @@ where
             || approval.authority != self.authority
             || !approval.matches_call(call)
         {
+            trace("policy_reply", "scope_mismatch");
             return Err(AuthorityOperationCoordinatorError::Rejected(
                 AuthorityOperationCoordinatorRejection::InvalidApproval,
             ));
         }
+        trace("policy_reply", "approved");
         Ok(approval)
     }
 

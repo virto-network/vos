@@ -741,6 +741,13 @@ where
             + NativeAuthorityOperationRetirementSigner
             + NativeAuthorityOperationDenialSigner,
     {
+        let diagnostics = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some();
+        let trace = |phase: &'static str, outcome: &'static str| {
+            if diagnostics {
+                tracing::debug!(phase, outcome, "native_operation_phase");
+            }
+        };
+        trace("controller_checks", "start");
         if owner.authority_target() != self.authority
             || call.authority != self.authority
             || AuthorityOperationEvidenceSigner::public_key(signer)
@@ -756,13 +763,20 @@ where
             || issued_at < call.requested_valid_from
             || issued_at > call.requested_expires_at
         {
+            trace("controller_checks", "scope_mismatch");
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         self.validate()
-            .map_err(|_| SharedAgentHostError::Unavailable)?;
+            .map_err(|_| {
+                trace("controller_validate", "error");
+                SharedAgentHostError::Unavailable
+            })?;
+        trace("controller_checks", "complete");
         if let Some((_, issued)) = self.retired_for_call(call, Some(&context), Some(issued_at))? {
+            trace("retained_terminal", "issued");
             return Ok(NativeAuthorityOperationDecision::Issued(issued));
         }
+        trace("denial_recovery", "start");
         for certificate in self
             .denials
             .load()
@@ -787,7 +801,9 @@ where
             self.denials
                 .retain(&certificate)
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
+            trace("denial_retained_release", "start");
             owner.release_native_operation_denial(&retained)?;
+            trace("denial_retained_release", "complete");
             return Ok(NativeAuthorityOperationDecision::Denied {
                 certificate,
                 dispatch: record
@@ -818,6 +834,7 @@ where
                 .is_none()
             {
                 if let Some(proof) = owner.verify_native_operation_denial(&record, &mut issuer)? {
+                    trace("denial_completion", "start");
                     owner.acknowledge_native_operation_denial(&proof)?;
                     let mut certificate = None;
                     owner.finish_native_operation_denial(&proof, signer, |bytes| {
@@ -827,6 +844,7 @@ where
                         certificate = Some(bytes.to_vec());
                         Ok(())
                     })?;
+                    trace("denial_completion", "complete");
                     return certificate
                         .map(|certificate| NativeAuthorityOperationDecision::Denied {
                             certificate,
@@ -836,14 +854,19 @@ where
                 }
             }
         }
+        trace("coordinate", "start");
         match self.coordinate(owner, call, context.clone(), issued_at, signer) {
-            Ok(issued) => self.retire_issued(owner, call, issued, signer)
-                .map(NativeAuthorityOperationDecision::Issued),
+            Ok(issued) => {
+                trace("coordinate", "complete");
+                self.retire_issued(owner, call, issued, signer)
+                    .map(NativeAuthorityOperationDecision::Issued)
+            },
             Err(NativeAuthorityOperationControllerError::Coordinate(
                 AuthorityOperationCoordinatorError::Rejected(
                     crate::agent::authority_operation_coordinator::AuthorityOperationCoordinatorRejection::AuthorizationDenied,
                 ),
             )) => {
+                trace("coordinate", "denied");
                 let record = self.denial_source(call, &context)?;
                 let mut issuer = DurableAuthorityOperationIssuer::open(BorrowedIssuer(&mut self.issuer), self.authority)
                     .map_err(|_| SharedAgentHostError::Unavailable)?;
@@ -860,7 +883,29 @@ where
                     dispatch: record.encode().expect("verified native denial source") })
                     .ok_or(SharedAgentHostError::Unavailable)
             }
-            Err(_) => Err(SharedAgentHostError::Unavailable),
+            Err(error) => {
+                let category = match &error {
+                    NativeAuthorityOperationControllerError::WrongAuthority => "wrong_authority",
+                    NativeAuthorityOperationControllerError::Completion(_) => "completion",
+                    NativeAuthorityOperationControllerError::OpenIssuer(_) => "issuer_open",
+                    NativeAuthorityOperationControllerError::OpenCoordinator(_) => "coordinator_open",
+                    NativeAuthorityOperationControllerError::Coordinate(error) => match error {
+                        AuthorityOperationCoordinatorError::Storage(_) => "coordinate_storage",
+                        AuthorityOperationCoordinatorError::Issuer(_) => "coordinate_issuer",
+                        AuthorityOperationCoordinatorError::Dispatch(error) => match error {
+                            SharedAgentHostError::Unavailable => "dispatch_unavailable",
+                            SharedAgentHostError::ScopeMismatch => "dispatch_scope_mismatch",
+                            SharedAgentHostError::Conflict => "dispatch_conflict",
+                            SharedAgentHostError::CapacityExhausted => "dispatch_capacity",
+                            _ => "dispatch_other",
+                        },
+                        AuthorityOperationCoordinatorError::InvalidState => "coordinate_invalid_state",
+                        AuthorityOperationCoordinatorError::Rejected(_) => "coordinate_rejected",
+                    },
+                };
+                trace(category, "error");
+                Err(SharedAgentHostError::Unavailable)
+            },
         }
     }
 
@@ -921,6 +966,13 @@ where
         I: CleanManagementIssuerStore,
         S: NativeAuthorityOperationCompletionSigner,
     {
+        let diagnostics = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some();
+        let trace = |phase: &'static str, outcome: &'static str| {
+            if diagnostics {
+                tracing::debug!(phase, outcome, "native_operation_phase");
+            }
+        };
+        trace("completion", "start");
         let ids = [
             authorization,
             issued.issuance_ack.acknowledgement_invocation,
@@ -957,6 +1009,7 @@ where
             }
         }
         let retained = if let Some(certificate) = saved {
+            trace("completion_retained", "start");
             let retained = owner.restore_native_operation_completion(
                 &records[0],
                 &records[1],
@@ -967,17 +1020,35 @@ where
             self.completions
                 .retain(&certificate)
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
+            trace("completion_retained", "complete");
             retained
         } else {
+            trace("completion_verify", "start");
             let verified =
-                owner.verify_native_operation_completion(&records[0], &records[1], &issued)?;
+                owner.verify_native_operation_completion(&records[0], &records[1], &issued)
+                    .map_err(|error| {
+                        trace("completion_verify", "error");
+                        error
+                    })?;
+            trace("completion_verify", "complete");
+            trace("completion_save", "start");
             owner.retain_native_operation_completion(&verified, signer, |certificate| {
                 self.completions
                     .retain(certificate)
-                    .map_err(|_| SharedAgentHostError::Unavailable)
+                    .map_err(|_| {
+                        trace("completion_save", "error");
+                        SharedAgentHostError::Unavailable
+                    })
             })?
         };
-        owner.acknowledge_native_operation_completion(&retained)?;
+        trace("completion", "complete");
+        trace("actor_ack_pair", "start");
+        owner.acknowledge_native_operation_completion(&retained)
+            .map_err(|error| {
+                trace("actor_ack_pair", "error");
+                error
+            })?;
+        trace("actor_ack_pair", "complete");
         Ok(retained)
     }
 
@@ -1033,6 +1104,13 @@ where
         I: CleanManagementIssuerStore,
         S: NativeAuthorityOperationCompletionSigner + NativeAuthorityOperationRetirementSigner,
     {
+        let diagnostics = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some();
+        let trace = |phase: &'static str, outcome: &'static str| {
+            if diagnostics {
+                tracing::debug!(phase, outcome, "native_operation_phase");
+            }
+        };
+        trace("retirement", "start");
         let ids = [
             call.invocation,
             issued.issuance_ack.acknowledgement_invocation,
@@ -1064,6 +1142,7 @@ where
             )
             .ok_or(SharedAgentHostError::ScopeMismatch)?;
             if terminal_ids == ids {
+                trace("retirement_retained", "start");
                 let retired = owner.restore_native_operation_retirement(
                     &authorization,
                     &acknowledgement,
@@ -1072,7 +1151,13 @@ where
                 self.retirements
                     .retain(&certificate)
                     .map_err(|_| SharedAgentHostError::Unavailable)?;
-                owner.release_native_operation_retirement(&retired)?;
+                trace("terminal_release", "start");
+                owner.release_native_operation_retirement(&retired)
+                    .map_err(|error| {
+                        trace("terminal_release", "error");
+                        error
+                    })?;
+                trace("terminal_release", "complete");
                 return Ok(issued);
             }
             if terminal_ids.iter().any(|id| ids.contains(id)) {
@@ -1080,11 +1165,22 @@ where
             }
         }
         let retained = self.acknowledge_issued(owner, call.invocation, &issued, signer)?;
+        trace("retirement_finish", "start");
         owner.finish_native_operation_retirement(&retained, signer, |bytes| {
+            trace("retirement_save", "start");
             self.retirements
                 .retain(bytes)
-                .map_err(|_| SharedAgentHostError::Unavailable)
+                .map_err(|_| {
+                    trace("retirement_save", "error");
+                    SharedAgentHostError::Unavailable
+                })?;
+            trace("retirement_save", "complete");
+            Ok(())
+        }).map_err(|error| {
+            trace("retirement_finish", "error");
+            error
         })?;
+        trace("retirement_finish", "complete");
         Ok(issued)
     }
 
