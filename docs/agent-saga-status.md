@@ -28,7 +28,8 @@ Review branch: `e6f2bb45` on `saga/agents`. Original replacement source `8128e67
 and its role bundle `7085c220` precede the decoder/integration correction.
 Corrected source is frozen at `2e19cd17` on `wip/ch08-runtime-directory`;
 two independent builds match both runtime roles, Authority, Catalog and signed
-Clerk bytes. The coherent pin update is active in that worktree. These
+Clerk bytes. The coherent pin update is frozen at `da86c686`, with verifier
+provenance at `39f1f6bb`. These
 checkpoints are not a release promotion.
 Verify actual heads/cleanliness before assuming promotion.
 `master` remains `d2378274`. No push, master change, artifact pin promotion or
@@ -41,7 +42,7 @@ deployment is automatic.
 | Internal Authority observations | O1/O2 and O3 removal are implemented: no read custody/transport/apply/expiry lifecycle. Management retention and public Invoke/ACK remain. | Current physical observation **passes 67.75s**, including exactly one caught-up audit and existing freshness/no-write/cancellation/reopen cases. Optimized management/replay/owner/supervisor/protocol/observation checks **241/241** pass (10 ignored, 7.09s). SDK **259 + 256 passed**, each 1 ignored. Paired signed-role/purity probes **pass 4.64s** with explicit, unmeasured limits. Packaged closure/startup/retry checks **40 passed**, 2 ignored. No released workflow or SLA pass. |
 | External storage/restore | Incremental executor, immutable closure, ACX1 publication and exact marker retirement exist. | Historical optimized reopen/crash-cut slices pass; the released workflow must requalify. |
 | System management recovery | Parent retention, immutable MRQ2 first-owner binding, exact mutation evidence, signed terminal release and recovery remain. | Isolated optimized offline-pruning test **passes 419.04s**: restore, exact Create/Install, checkpoint/pruning, ACK and custody release. Install finalization **21.588s** meets unchanged 30s. Earlier contended 32.979s failure remains recorded, not waived or tuned away. Returning/all-cold Shared pending-Install remain unqualified. |
-| Member/public management | Packaged PublicWorkflow selects exact bundled roles and ordinary CLI Create. Ambiguous publication re-admits the original leased stores before exact retry. Finalization retains publication protection and verifies fresh decision state before exact terminal cleanup. Packaged reopen helpers explicitly use normal startup admission. Provision components use the existing boxed decoder, whose direct decode removes an extra by-value scratch frame without changing wire, validation or limits. | Native genesis checks **15 passed, 0.19s**; uninstrumented Authority build **passes 31.96s**. Expanded physical exact-finalization retry **passes 81.37s** (`release-observation-o3-enrolled-finalization-physical-r38h.log`); post-handoff retry **8.846s**, unchanged 30s bound. Isolated quiet confirmation **passes 91.91s** (`release-observation-o3-enrolled-finalization-quiet-r38i.log`). The fixture enrolls its API observation credential through ordinary signed Admin Invoke/ACK and tests refusal before enrollment. This uses candidate Authority plus the prior System runtime, not a coherent released bundle. Artifact reproduction, Install/lost-result/reopen, packaged cold recovery and actual three-process acceptance remain open. |
+| Member/public management | Packaged PublicWorkflow selects exact bundled roles and ordinary CLI Create. Ambiguous publication re-admits the original leased stores before exact retry. Finalization retains publication protection and verifies fresh decision state before exact terminal cleanup. Packaged reopen helpers explicitly use normal startup admission. Provision components use the existing boxed decoder, whose direct decode removes an extra by-value scratch frame without changing wire, validation or limits. | Native genesis checks **15 passed, 0.19s**. Expanded exact-finalization retry on independently reproduced coherent components **passes 96.21s** (`release-observation-o3-coherent-finalization-physical-r38n.log`), with unchanged 30s phase bounds. The fixture uses ordinary signed Admin Invoke/ACK to enroll its API observation credential and verifies refusal before enrollment. Source and six-file bundle reproduction pass. Install/lost-result/reopen, packaged cold recovery and actual three-process acceptance remain open. |
 | Service/operations | Offline signed corpus generator and read-only hardware collector exist. | Public retained loading, backup/restore, overload, soak, artifacts and hardware qualification remain open. |
 
 R36y is the frozen, superseded legacy-read diagnostic boundary, not qualification
@@ -51,15 +52,18 @@ management Busy, change signed mutation windows/deadlines, or clear old spaces.
 
 Bundled role materialization and strict six-file release verification are
 implemented. Independent builds from corrected `2e19cd17` match byte-for-byte for
-both roles, Authority, Catalog and signed Clerk. Exact signed role pins are staged; ordinary
-fixed-three startup remains closed pending packaged-plan checks and recovery
-qualification. Exact Catalog closure and retained-plan target selection are
+both roles, Authority, Catalog and signed Clerk. Exact signed role pins are committed;
+normal fixed-three startup was deliberately opened after coherent reproduction,
+prewrite/refusal checks and isolated finalization. Packaged recovery qualification
+remains open. Exact Catalog closure and retained-plan target selection are
 implemented and their focused refusal tests pass. CLI defaults select existing
 external-state components for Shared, without changing image Local. R38j
 reproduction evidence is `release-observation-o3-coherent-role-reproduction-r38j.log`
 and `target/agent-release-reproduction/run.1JsTwa` under the native worktree.
 The artifact-bearing builder checkpoint is `da86c686`; strict six-file
-verification is pending. The old `7085c220` full bundle check cannot qualify it.
+verification passes (`release-observation-o3-coherent-full-pinned-reproduction-r38k.log`,
+evidence `target/agent-release-reproduction/run.ykT3eh` under the native worktree).
+The old `7085c220` full bundle check cannot qualify later source.
 The existing enrollment/common-genesis and Shared Create/admit/Install/call/resume
 CLI are reused; no new CLI/signing framework is needed. A direct three-process
 CLI acceptance script is prepared but not yet run; it does not claim load,
@@ -81,6 +85,21 @@ The active diff closes demonstrated M1 defects, not new capabilities:
   supplied plan and no Shared residue or lifecycle/operation history. Strict
   client reading and old-format refusal are unchanged. Packaged interruption/
   cold-open and normal reopen helpers are prepared, not qualified.
+- Current coherent source passes **3 startup inspection**, **2 exact package
+  prewrite**, **87 store checks** (including both strict client readers), and
+  **3 core factory** tests. The store suite's one loopback sandbox refusal passes
+  its exact permitted rerun; it is not a waived failure. Logs:
+  `release-observation-o3-coherent-{startup,package,store}-prewrite-r38l.log`,
+  `release-observation-o3-coherent-store-loopback-r38m.log` and
+  `release-observation-o3-coherent-core-factory-r38m.log`. The separate client
+  filter selected zero tests and is not evidence. Isolated finalization on the
+  coherent components **passes 96.21s** (`release-observation-o3-coherent-finalization-physical-r38n.log`).
+  The two startup bails are deliberately removed: preflight returns the actual
+  inspected snapshot, and its leased comparison remains before reconciliation.
+  The staged-admission regression now asserts exact returned snapshot equality.
+  Current debug CLI unit suite **passes 381 tests**, 52 ignored, **314.36s**
+  (`release-observation-o3-open-startup-cli-unit-r38o.log`). Packaged recovery
+  qualification follows this opening; the ignored fixtures are not passes.
 - Exact backend replay and ELF mapping identify nested genesis decoder stack use.
   Four boxed provision calls were insufficient; direct decode in the existing
   boxed helper removes the overlapping helper scratch frame. The uninstrumented
@@ -254,27 +273,31 @@ micro-optimization iterations; it is not work added alongside them.
 Use the existing **one focused engineering week go/no-go cap** to assess whether
 the replacement is converging; do not quietly roll the cap forward.
 
-Prerequisites and remaining release work, in dependency order:
+Completed prerequisites: corrected source `2e19cd17`, independent role builds
+R38j, coherent pins/builder `da86c686`, strict six-file verification R38k,
+current prewrite/factory checks and isolated coherent finalization R38n.
+Both startup bails were deliberately opened after these checks; actual inspected
+snapshot return and leased comparison remain mandatory.
 
-1. Corrected exact Create/finalization retry is confirmed: R38h and isolated
-   quiet R38i pass the expanded component regression and original retirement
-   checks. Requalify this on the coherent released bundle below.
-2. Freeze the coherent corrected source, independently reproduce signed System/
-   Authority/Shared/Catalog closure and exact release pins, then qualify normal
-   fixed-three startup. Preserve the validated full staged snapshot and actual
-   owner fence before writes; exercise Pins-before-record, first Intent stage,
-   fresh initialization and locked reopen without a test-policy bypass. Both
-   qualification bails stay closed until that deliberate promotion.
-3. Requalify original-owner forwarded Install refusals (complete wrong-shadow
+Remaining release work, in dependency order:
+
+1. Qualify the packaged public lost-result/reopen workflow and returning/all-cold
+   pending Install. Exercise Pins-before-record, first Intent stage, fresh
+   initialization and locked reopen through normal startup, with unchanged whole
+   **<=30s** recovery and no test-policy bypass.
+2. Requalify original-owner forwarded Install refusals (complete wrong-shadow
    upload and absent System root), positive completion/exact retry and genuine
    cumulative >256 public authorizations with unchanged checkpoint/recovery.
    Preserve signed owner/parent evidence, package limits and whole **<=30s**
    recovery. Automatic startup must pass; manual recovery loops are not proof.
-4. Run M1 through ordinary packaged three-process CLI/HTTP: system actors ready,
+3. Freeze the startup correction, build the current portable main and run M1
+   through ordinary packaged three-process CLI/HTTP: system actors ready,
    image Local and external Shared Clerk, genuinely lost initial mutation
    response, exact retry and restart/failover. Record demonstrated small workload
-   and a public steady-state phase/queue/VM/persistence probe. Then progress
-   through unchanged M2 retained-data/backup and M3 load/failure/hardware gates.
+   and a public steady-state phase/queue/VM/persistence probe.
+4. Progress through unchanged M2 retained-data/parity/resource/recovery/Agent
+   backup gates, then locally possible M3 tooling and qualification. Hardware
+   qualification remains explicitly open.
 
 Separate forecasts and unknowns:
 
@@ -282,7 +305,8 @@ Separate forecasts and unknowns:
   241 selected regression tests pass. Role materialization, verification and
   caller selection exist; independent paired-role builds match. Exact packaged
   Catalog prewrite binding, certified-plan startup selection and typed retained
-  transport-error fixes pass focused tests; released startup remains closed.
+  transport-error fixes pass focused tests; normal startup is admitted, with
+  packaged workflow qualification still pending.
   Exact SAC7 constructor/directory binding and the scoped nested-decoder fix are
   necessary correctness dependencies, not relaxed matching or larger limits.
   O1–O3's original source band remains above, not as a remaining-work estimate.
@@ -313,9 +337,9 @@ Separate forecasts and unknowns:
   excluding reproduction and packaged qualification. R38h now passes; the next
   uncertainty is coherent packaged recovery. No service-tuning pass was consumed.
 - **Packaging after correctness:** paired-role tooling/reproduction is
-  implemented within the previous **4–8 source-hour** band. The corrected
-  Authority needs renewed frozen-source/builder reproduction and packaged
-  acceptance. Signed resource ceilings are
+  implemented within the previous **4–8 source-hour** band. Corrected-source
+  independent builds and strict frozen-builder bundle verification pass;
+  packaged acceptance remains open. Signed resource ceilings are
   explicit but unmeasured; M2 must qualify them against retained data.
 - **M1 overall:** no defensible combined ETA. M2 loading at 1,000 accounts/
   100,000 retained transfers, measured capacity/recovery, six-map parity and

@@ -700,7 +700,7 @@ fn system_startup_stage_admission_validates_every_candidate_before_locked_recove
         )
         .unwrap();
         assert_eq!(retained, inspection);
-        let gated = preflight_released_system_startup(
+        let admitted = preflight_released_system_startup(
             &data,
             LocalAgentStorage::Image,
             Some(&prepared),
@@ -708,8 +708,11 @@ fn system_startup_stage_admission_validates_every_candidate_before_locked_recove
             [0x5a; 32],
             &daemon,
         )
-        .unwrap_err();
-        assert!(gated.to_string().contains("pending release qualification"));
+        .unwrap();
+        assert_eq!(
+            admitted, inspection,
+            "preflight preserves the exact inspected snapshot"
+        );
         assert_eq!(journal_files(&data), before);
         assert!(CleanSystemAgentFileStores::read_client_bootstrap(&control).is_err());
         let stores = CleanSystemAgentFileStores::open_or_create(&control).unwrap();
@@ -1188,7 +1191,6 @@ fn assert_released_system_plan_refused(error: &anyhow::Error) {
             "System runtime differs from the exact packaged System observation role",
             "Authority differs from the exact packaged Authority template",
             "Catalog differs from the exact packaged Catalog template",
-            "pending release qualification",
         ]
         .iter()
         .any(|reason| message.contains(reason)),

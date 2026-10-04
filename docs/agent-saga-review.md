@@ -26,7 +26,8 @@ correctness gate. Review a frozen source/artifact boundary plus its acceptance
 evidence and delta; internal passing suites are not a milestone exit.
 
 Production Local remains image-based. Exact paired-role artifact pins are
-staged; fixed-three startup stays closed pending packaged recovery qualification.
+committed; normal fixed-three startup is admitted after the prerequisite checks.
+Packaged recovery qualification remains open.
 Test signers, candidate guests and fixture resource policies are not release proof.
 The replacement release requires fresh v1 System/control and Shared roots;
 existing experimental spaces remain untouched and unsupported by the new binary.
@@ -120,8 +121,7 @@ M1 defects without changing authorization, wire bounds or deadlines:
   pass **4 / 2 / 2 / 3 tests**. Strict clients and old-format refusal remain
   unchanged. Exact Pins-before-record requires the verified supplied plan and
   no Shared residue/lifecycle/history. Packaged interruption/cold-open and owner
-  reopen now select normal admission, but are not qualified while both bails
-  remain closed.
+  reopen now select normal admission; packaged qualification remains open.
 
 Exact Create finalization/recovery was the current component blocker.
 `release-observation-o3-finalization-exact-retry-physical-debug-r37d.log`
@@ -177,8 +177,23 @@ builds from corrected `2e19cd17`: System/Shared runtime ELFs and programs, all f
 signed templates and signed Clerk bytes match. Detailed evidence is
 `target/agent-release-reproduction/run.1JsTwa` under the native worktree. The coherent
 repin preserves Local's canonical image runtime. The artifact-bearing builder
-checkpoint is `da86c686`; strict six-file verification and packaged recovery still precede
-normal startup admission; reproduction alone does not close M1.
+checkpoint is `da86c686`, with verifier provenance at `39f1f6bb`.
+`release-observation-o3-coherent-full-pinned-reproduction-r38k.log` passes strict
+six-file verification; detailed evidence is `target/agent-release-reproduction/run.ykT3eh`
+under the native worktree. Current source also passes **3 startup inspection**,
+**2 package prewrite**, **87 store** and **3 core factory** checks. Store evidence
+includes both strict client readers and the exact permitted rerun of one
+loopback sandbox refusal; the separate client filter selected zero tests and
+is not evidence. Logs are the R38l prewrite and R38m store-loopback/core-factory
+files referenced by the live checklist. Isolated coherent-artifact finalization
+R38n **passes 96.21s** on the coherent components. The two startup bails are now
+deliberately removed after these checks. Preflight directly returns the actual
+inspection; the full leased snapshot comparison still precedes reconciliation.
+The staged-admission regression asserts exact returned snapshot equality.
+Current debug CLI unit suite **passes 381 tests**, 52 ignored, **314.36s**
+(`release-observation-o3-open-startup-cli-unit-r38o.log`). Packaged recovery
+checks follow this opening; the ignored fixtures are not passes. M1 remains
+open; reproduction and component passes do not close it.
 
 The portable full CLI suite previously **passes 375 tests**, 52 ignored, 39.53s
 (`release-observation-o3-cli-unit-release-r37a.log`); that boundary predates the
@@ -196,11 +211,12 @@ current checks; generic execution was structurally audited.
 
 No packaged workflow/SLA, blanket filesystem-write trace, hard wall-clock bound
 under stalled locks/disk, live-root replacement or mid-guest term/config-change
-qualification is claimed. Artifact repins are staged, not release-qualified;
-no release gate or review branch has been promoted. Packaged startup binds exact
+qualification is claimed. Artifact repins are committed and the two startup
+bails deliberately removed after the prerequisite checks; packaged pilot and
+service qualification remain open. The review branch is unchanged. Startup binds exact
 System/Authority/Catalog closure before writes: SAC7 alone cannot identify O3's
 management-only RMF4 lineage. The full reproducer passes with artifact-bearing
-builder `7085c220`. The direct CLI acceptance script is unrun.
+builder `da86c686`. The direct CLI acceptance script is unrun.
 
 ### Implemented contract; integrated qualification remains open
 

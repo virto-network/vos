@@ -795,10 +795,7 @@ fn validate_production_bootstrap_roster(
     if allow_candidate_roster {
         return Ok(());
     }
-    validate_system_observation_bootstrap_plan(plan)?;
-    anyhow::bail!(
-        "fixed-three SAC7 System observation startup is pending release qualification; no bootstrap or deployment roots were created"
-    );
+    validate_system_observation_bootstrap_plan(plan)
 }
 
 /// Exact v1 placement/configuration, not artifact or workflow qualification.
@@ -951,7 +948,7 @@ fn validate_packaged_system_observation_bootstrap_materials(
     Ok(())
 }
 
-/// Pending release gate runs before taking a writer lease, reconciling stages,
+/// Exact released admission runs before taking a writer lease, reconciling stages,
 /// importing a certificate, or creating System/control/Shared/Local roots.
 fn preflight_released_system_startup(
     data_dir: &Path,
@@ -968,10 +965,7 @@ fn preflight_released_system_startup(
         operator,
         space,
         daemon,
-    )?;
-    anyhow::bail!(
-        "fixed-three SAC7 System observation startup is pending release qualification; no bootstrap or deployment roots were created"
-    );
+    )
 }
 
 /// Readonly admission, not release qualification or permission to serve. Keep
