@@ -102,8 +102,9 @@ Current O3 component evidence (logs under the native worktree's `target`):
 
 ### Current integration delta and blocking result
 
-Current host correction `f9c61863` has debug component evidence; its portable
-main/harness and public rerun remain **open**. Previous clean `5c2bf99c` portable
+Current reviewed source `b20faacd` adds journal/family qualification tests to
+production host correction `f9c61863`; its portable main/harness and public rerun
+remain **open**. Previous clean `5c2bf99c` portable
 main/harness pass **191.197s / 252.859s**, empty RUSTFLAGS and encoded/target
 overrides unset, exact frozen hashes and strict six-file verification **0.101s**.
 Authority, Catalog, both runtime roles and coherent component pins are unchanged.
@@ -140,21 +141,36 @@ remains journal-first; exact existing NOD1 preparation replays independently of
 an unrelated pending proof, which only matching retention confirmation clears.
 No changed authorization, format, limit or deadline.
 
-Current `f9c61863` debug core builds **83.591s**. Live exact retry **passes
-32.636s total / 4.147s whole30**, including checked shutdown and byte-identical
-NOD1/context/whole work/anchor; normal cold refusal **passes 35.640s total /
-8.230s whole30**, with proof absent on the new owner and no adoption. Owned groups
-exit. The fixture uses real physical System images and non-clone fsync operation
-test stores, not hardened CSF1 lifecycle lease qualification. It prepares only:
-no operation guest policy, issuance/operation-evidence signing, follower-forwarding
-timing, public workflow
-or SLA claim. Journal prewrite/ambiguous-write and full-family negative extension
-qualification remains pending. No performance-only diagnosis or tuning pass is
-justified. The existing supported Admin registration-timeout compatibility cut
-on this source **passes 30.933s total / 8.385s whole30** through exact terminal
-retry and release; this verifies unchanged default Admin component semantics,
-not CLI or Local recovery. The live plan owns exact evidence paths and remaining
-dependencies; current portable/public integration must rerun before later M1 gates.
+Current `b20faacd` debug core builds **55.558s**. The first extended timeout
+run **fails 70.579s** in the existing **60s leader-bootstrap** setup with
+HostUnavailable, before any cut phase. Keep this unattributed failure; it proves
+neither recovery behavior nor service qualification. The identical isolated rerun
+**passes 29.132s total / 4.076s whole30**, preserving exact NOD1/context/work/anchor
+through late registration and checking map-absent substitutions plus detached
+signed shadow/extended-family/wrong-origin refusals.
+
+Real journal prewrite **passes 28.032s total / 2.527s whole30**, with journal retain
+attempt count one, absent NOD1 and original held map/proof. Actual fsync write-then-error
+**passes 27.430s total / 2.028s whole30**; bytes-present native confirmation
+synchronizes the exact NOD1 and clears its matching proof at **1.625s**. Both
+journal cuts exercise guarded map-present gas/clock/anchor refusal. Extended
+normal same-store cold refusal **passes 32.735s total / 7.392s whole30**, new-owner
+proof absent and exact call refused without custody adoption, Invoke or ACK.
+Every pass is one executed test with owned group gone and unchanged whole30,
+including checked shutdown. The demonstrated defect is component-qualified;
+current portable/public integration remains open.
+
+These use real physical System images and non-clone fsync operation test stores,
+not hardened CSF1 lifecycle lease qualification. Family candidates are detached
+authenticated copies, with no live retirement/application claim. No operation
+guest policy, receipt/issuance, operation-evidence signing, follower-forwarding
+timing, public workflow or SLA qualification is established. The preserved setup
+failure remains unexplained; no deadline increase or tuning pass was consumed.
+Existing supported Admin registration-timeout compatibility on production
+`f9c61863` **passes 30.933s total / 8.385s whole30** through exact terminal retry
+and release, verifying preserved default Admin component semantics. The live
+plan owns exact evidence paths; rebuild current portable hosts and rerun the
+quiet public gate before the four remaining selectors and actual CLI acceptance.
 
 The earlier corrected role-source boundary `2e19cd17` freezes these changes,
 which close demonstrated M1 defects without changing authorization, wire bounds

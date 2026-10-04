@@ -37,8 +37,9 @@ deployment is automatic.
 
 ## Current position
 
-Current host correction is frozen at `f9c61863`; portable main/harness from
-this source have **not yet been rebuilt or exercised**. The previous clean
+Current reviewed source is `b20faacd`; production host correction remains
+`f9c61863`, with the journal/family test extension applied. Portable main/harness
+from this corrected host have **not yet been rebuilt or exercised**. The previous clean
 `5c2bf99c` portable main/harness pass **191.197s / 252.859s**, with empty
 RUSTFLAGS, encoded/target overrides unset, exact frozen hashes and strict
 six-file verification **0.101s**. The Authority, Catalog, both runtime roles
@@ -80,26 +81,46 @@ already-held map. Authorization remains journal-backed. Exact NOD1 replay takes
 precedence over an unrelated live attempt, and proof clears only after matching
 retention is confirmed. No authorization, wire, limit or deadline changes.
 
-Current debug core `f9c61863` builds **83.591s**. Original-owner live exact retry
-**passes 32.636s total / 4.147s whole recovery**, including checked shutdown,
-byte-identical NOD1/context/whole work/anchor and repeated exact preparation.
-Normal cold reopen **passes 35.640s total / 8.230s whole recovery**, with the new
-owner's proof absent and exact call refused. Both remain below the unchanged
-**30s** recovery bound; owned command groups exit. These use genuine physical
-System images and existing non-clone fsync operation test stores, **not hardened
-CSF1 filesystem lifecycle lease qualification**. They prepare only: no operation guest
-policy, receipt/issuance or operation-evidence signing, follower-forwarding timing, public
-workflow or SLA claim. Extra journal prewrite/ambiguous-write and complete-family
-negative qualification remains pending. No performance-only conclusion,
-deadline increase or service-tuning pass is warranted. The existing supported
-Admin registration-timeout compatibility cut on this source also **passes
-30.933s total / 8.385s whole30** through exact terminal retry and release,
-qualifying preserved default Admin component semantics, not CLI or Local recovery.
+Current debug core `b20faacd` builds **55.558s**. The first extended timeout
+run **fails 70.579s** during the existing **60s leader-bootstrap** setup with
+HostUnavailable, before any operation cut phase. Preserve this unattributed
+setup failure; it neither tests the correction nor qualifies service behavior.
+The identical isolated rerun **passes 29.132s total / 4.076s whole recovery**,
+proving exact original NOD1/context/work/anchor retry after late registration,
+map-absent guarded substitutions and signed detached complete-family refusals.
+
+The real journal prewrite cut **passes 28.032s total / 2.527s whole recovery**:
+journal retain attempt count is one, NOD1 is absent, the exact original map/proof remains,
+and normal recovery preserves the whole input. The actual fsync write-then-error
+cut **passes 27.430s total / 2.028s whole recovery**; a bytes-present native retry
+confirms exact retained NOD1 and clears only its matching proof at **1.625s**.
+Both journal cuts exercise strict map-present gas/clock/anchor refusal. Extended
+normal same-store cold reopening **passes 32.735s total / 7.392s whole recovery**,
+with the new owner's proof absent, exact preparation refused and no replicated
+custody adoption, Invoke or ACK. All four successful cuts finish with one executed
+test and owned groups gone, under the unchanged **30s** whole-recovery bound.
+
+The demonstrated preparation recovery defect is **component-qualified** across
+late metadata commit, journal prewrite/ambiguous write and normal cold refusal.
+These use genuine physical System images and non-clone fsync operation test
+stores, **not hardened CSF1 filesystem lifecycle lease qualification**. Signed
+shadow/extended-family candidates are authenticated detached copies; no live
+retirement or application permission is inferred from them. The cuts prepare
+only: no operation guest policy, receipt/issuance or operation-evidence signing,
+follower-forwarding timing, public workflow or SLA claim. The preserved setup
+failure remains unexplained. No deadline increase or service-tuning pass was
+consumed. Existing Admin registration-timeout compatibility on production
+`f9c61863` also **passes 30.933s total / 8.385s whole30** through exact terminal
+retry/release, qualifying preserved default Admin component semantics.
+Current portable/public integration and later M1 gates remain open.
 
 Current component evidence under the native worktree's target is
-`task-tmp/r41-operation-prepare-{before-build-61530b52,before-61530b52,cold-before-61530b52,after-build-f9c61863,after-f9c61863,cold-after-f9c61863}`
+`task-tmp/r41-operation-prepare-journal-build-b20faacd` and
+`task-tmp/r41-operation-{family-timeout-b20faacd,family-timeout-b20faacd-rerun,journal-prewrite-b20faacd,journal-write-error-b20faacd,family-cold-b20faacd}`
 (build provenance or `summary.json`, private stdout/stderr and exact result
-records). Admin compatibility evidence is
+records). Original BEFORE/initial correction evidence remains
+`task-tmp/r41-operation-prepare-{before-build-61530b52,before-61530b52,cold-before-61530b52,after-build-f9c61863,after-f9c61863,cold-after-f9c61863}`.
+Admin compatibility evidence is
 `task-tmp/r41-admin-registration-related-f9c61863/{physical.result.json,physical.stdout,physical.stderr}`.
 Previous portable/public evidence remains
 `task-tmp/r40-cli-build-5c2bf99c/provenance.json`,
@@ -113,7 +134,7 @@ unrelated zero-selection filters are not evidence.
 | --- | --- | --- |
 | Internal Authority observations | O1/O2 and O3 removal are implemented: no read custody/transport/apply/expiry lifecycle. Management retention and public Invoke/ACK remain. | Current physical observation **passes 67.75s**, including exactly one caught-up audit and existing freshness/no-write/cancellation/reopen cases. Optimized management/replay/owner/supervisor/protocol/observation checks **241/241** pass (10 ignored, 7.09s). SDK **259 + 256 passed**, each 1 ignored. Paired signed-role/purity probes **pass 4.64s** with explicit, unmeasured limits. Packaged closure/startup/retry checks **40 passed**, 2 ignored. No released workflow or SLA pass. |
 | External storage/restore | Incremental executor, immutable closure, ACX1 publication and exact marker retirement exist. | Historical optimized reopen/crash-cut slices pass; the released workflow must requalify. |
-| System management recovery | Parent retention, immutable MRQ2 first-owner binding, exact mutation evidence, signed terminal release and recovery remain. | Isolated optimized offline-pruning test **passes 419.04s**: restore, exact Create/Install, checkpoint/pruning, ACK and custody release. Install finalization **21.588s** meets unchanged 30s. Earlier contended 32.979s failure remains recorded, not waived or tuned away. Same-open native operation preparation now passes live exact NOD1/context retry **4.147s whole30** and normal cold refusal **8.230s whole30**; these are preparation-only fsync test-store component evidence. Journal/family extension, current portable public workflow and returning/all-cold Shared pending-Install remain unqualified. |
+| System management recovery | Parent retention, immutable MRQ2 first-owner binding, exact mutation evidence, signed terminal release and recovery remain. | Isolated optimized offline-pruning test **passes 419.04s**: restore, exact Create/Install, checkpoint/pruning, ACK and custody release. Install finalization **21.588s** meets unchanged 30s. Earlier contended 32.979s failure remains recorded, not waived or tuned away. Same-open native operation preparation, complete-family refusals, journal prewrite/ambiguous-write exact retention and normal cold refusal are component-qualified under whole30 on `b20faacd`; preparation-only fsync test-store limits apply. Current portable public workflow and returning/all-cold Shared pending-Install remain unqualified. |
 | Member/public management | Packaged PublicWorkflow selects exact bundled roles and ordinary CLI Create. Ambiguous publication re-admits the original leased stores before exact retry. Finalization retains publication protection and verifies fresh decision state before exact terminal cleanup. Packaged reopen helpers explicitly use normal startup admission. Provision components use the existing boxed decoder, whose direct decode removes an extra by-value scratch frame without changing wire, validation or limits. | Native genesis checks **15 passed, 0.19s**. Expanded exact-finalization retry on independently reproduced coherent components **passes 96.21s** (`release-observation-o3-coherent-finalization-physical-r38n.log`), with unchanged 30s phase bounds. The fixture uses ordinary signed Admin Invoke/ACK to enroll its API observation credential and verifies refusal before enrollment. Source and six-file bundle reproduction pass. Install/lost-result/reopen, packaged cold recovery and actual three-process acceptance remain open. |
 | Service/operations | Offline signed corpus generator, bounded public corpus loader and read-only hardware collector exist. Loader resumes exact private ATQ1 through existing CLI/ASR1 verification and independently replays accepted seeds/order for all six maps. | Loader tooling tests **7 passed, 0.10s**; it has not executed public data. M1 setup and pre-granted signed Clerk Operator/Member roles are prerequisites. Public retained loading, resources/recovery, backup/restore, overload, soak and hardware qualification remain open. |
 
@@ -710,10 +731,11 @@ snapshot return and leased comparison remain mandatory.
 
 Remaining release work, in dependency order:
 
-1. Finish focused journal/complete-family qualification of the demonstrated
-   native preparation recovery correction; supported live exact retry and normal
-   cold refusal already pass under whole30 on `f9c61863`. Freeze and rebuild the
-   current portable hosts, then rerun the same quiet packaged public gate before
+1. Freeze and rebuild the current portable hosts with the component-qualified
+   native preparation recovery correction. Supported late registration,
+   journal prewrite/ambiguous write, complete-family refusals and normal cold
+   refusal now pass under whole30 on `b20faacd`; this is preparation-only fsync
+   test-store evidence. Rerun the same quiet packaged public gate before
    the remaining four selectors. Previous `5c2bf99c` portable/strict bundle passes
    cannot qualify the later host correction. Preserve exact original work/clock/
    anchor, journal-backed authorization, the existing 120s correctness retry and
@@ -837,9 +859,13 @@ Separate forecasts and unknowns:
   on preparation HTTP 503. The supported THREE-node BEFORE regression now proves
   exact signed registration committed after timeout while NOD1/map remain absent,
   followed by normal unready admission refusal. Same-open recovery preserves the
-  original whole work/clock/anchor; live retry and genuine cold refusal pass below
-  whole30, with journal/family extension qualification and portable integration
-  pending. Preparing the supported cut is mandatory recovery work, not native
+  original whole work/clock/anchor. Extended late-registration, journal prewrite/
+  ambiguous-write and family refusal cuts now pass below whole30, as does genuine
+  normal cold refusal; current portable/public integration remains pending. One
+  extended run failed during existing leader-bootstrap setup before any cut; the
+  identical isolated rerun passed, without changing limits. Its cause remains
+  unattributed and is not a service pass. Preparing the supported cut is mandatory
+  recovery work, not native
   policy/issuance or follower-forwarding evidence. The prior **1–4 source-hour**
   and **2–6 elapsed-hour** bands remain unreliable. No engineering ETA or reliable
   aggregate qualification range exists; no tuning pass was consumed.
