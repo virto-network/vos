@@ -1665,6 +1665,10 @@ where
     // publication. This is not a WAL or new custody; cold opens never restore
     // it. Keep its whole work until matching NAD2 retention is confirmed.
     unpublished_admin_attempt: Option<(NativeAuthorityAdminSubmission, RuntimeWork)>,
+    // Exact live image Local Install handoff, physically validated before
+    // metadata I/O. Cold opens and generic helpers cannot mint this proof.
+    unpublished_local_install_attempt:
+        Option<(super::clean_management_intent::CleanManagementIntent, RuntimeWork)>,
     shared_lifecycle_recovery_pending: bool,
     // Process-only exact proofs minted by this owner. Cold startup must obtain
     // them again from Authority replay; no archive bytes can repopulate this set.
@@ -2773,6 +2777,7 @@ where
             authority_install: install_request(plan.authority_request())?.clone(),
             invocation_gas: plan.invocation_gas,
             unpublished_admin_attempt: None,
+            unpublished_local_install_attempt: None,
             shared_lifecycle_recovery_pending: false,
             shared_genesis_finality: ReplayVerifiedAgentGenesisFinalitySet::default(),
             #[cfg(test)]
@@ -3251,6 +3256,25 @@ where
         J: CleanManagementIssuerStore,
         S: CleanManagementReceiptSigner,
     {
+        self.issue_management_intent_with_local_install_attempt(
+            slot, managed, issuer, signer, capture, false,
+        )
+    }
+
+    fn issue_management_intent_with_local_install_attempt<B, J, S>(
+        &mut self,
+        slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
+        managed: ManagedAgentTarget,
+        issuer: &mut DurableCleanManagementIssuer<J>,
+        signer: &mut S,
+        capture: bool,
+        fresh_local_install: bool,
+    ) -> Result<AuthorityReceipt, SharedAgentHostError>
+    where
+        B: CleanManagementIssuerStore,
+        J: CleanManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+    {
         use crate::actors::codec::Decode as _;
 
         let target = self.authority_target();
@@ -3260,6 +3284,54 @@ where
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
         self._network_host
             .ensure_reattached(crate::service::AgentId(self.pins.agent.0))?;
+        if capture
+            && self.pins.replicas.members().len() == 3
+            && managed.profile == AgentProfile::Local
+            && matches!(
+                slot.intent().map(|intent| intent.request()),
+                Some(ManagementRequest::Install(_))
+            )
+            && slot
+                .authorization_work()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .is_none()
+        {
+            let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
+            if let Some((anchor, work)) = self.pending_local_install_authorization(intent)? {
+                if !self.retained_local_install_family(slot)? {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                // Admission only restores existing exclusion. Complete its
+                // original CMI pledge before sampling replacement material.
+                slot.pledge_authorization_work(work, anchor)
+                    .map_err(|_| SharedAgentHostError::Unavailable)?;
+                self.confirm_local_install_authorization(slot);
+            } else if let Some((previous, expected_work)) = &self.unpublished_local_install_attempt
+                && previous == intent
+            {
+                // A failure before append may leave no registered member.
+                // Normal ready retries recapture only the physically validated
+                // original envelope under the existing quiescent barrier.
+                // Recovery-only admission remains closed until its exact root
+                // is applied; it does not take this fresh-capture path.
+                let proposed = expected_work.clone();
+                self._network_host
+                    .capture_management_pending_with_checkpoint(
+                        crate::service::AgentId(self.pins.agent.0),
+                        &proposed,
+                        &self.pins.replicas,
+                        self.snapshot_signer.as_ref(),
+                        |(anchor, work)| {
+                            if work != &proposed {
+                                return Err(SharedAgentHostError::ScopeMismatch);
+                            }
+                            slot.pledge_authorization_work(work.clone(), anchor.clone())
+                                .map_err(|_| SharedAgentHostError::Unavailable)
+                        },
+                    )?;
+                self.confirm_local_install_authorization(slot);
+            }
+        }
         let diagnostic_started = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS")
             .is_some()
             .then(std::time::Instant::now);
@@ -3346,6 +3418,27 @@ where
                 authorization: Box::new(authorization),
                 observed_slot: material.observed_slot,
             };
+            if fresh_local_install {
+                let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
+                if !capture
+                    || self.pins.replicas.members().len() != 3
+                    || managed.profile != AgentProfile::Local
+                    || !matches!(intent.request(), ManagementRequest::Install(_))
+                {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                if let Some((previous, work)) = &self.unpublished_local_install_attempt {
+                    if previous != intent || work != &envelope {
+                        return Err(SharedAgentHostError::Conflict);
+                    }
+                } else {
+                    // Only the successful signed live handoff selects this
+                    // branch. Package admission and physical work validation
+                    // precede this proof and every metadata/callback write.
+                    self.unpublished_local_install_attempt =
+                        Some((intent.clone(), envelope.clone()));
+                }
+            }
             trace("capture_start", None);
             if capture {
                 self._network_host
@@ -3355,6 +3448,9 @@ where
                         &self.pins.replicas,
                         self.snapshot_signer.as_ref(),
                         |(anchor, work)| {
+                            if fresh_local_install && work != &envelope {
+                                return Err(SharedAgentHostError::ScopeMismatch);
+                            }
                             slot.pledge_authorization_work(work.clone(), anchor.clone())
                                 .map_err(|_| SharedAgentHostError::Unavailable)
                         },
@@ -3396,6 +3492,7 @@ where
                     error
                 })?;
         }
+        self.confirm_local_install_authorization(slot);
         trace("capture_complete", None);
         let Some(RuntimeWork::Invoke {
             invocation: work,
@@ -6372,6 +6469,25 @@ where
         J: CleanManagementIssuerStore,
         S: CleanManagementReceiptSigner,
     {
+        self.install_local_from_management_intent_with_attempt(
+            slot, local, package, issuer, signer, false,
+        )
+    }
+
+    fn install_local_from_management_intent_with_attempt<B, J, S>(
+        &mut self,
+        slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
+        local: &mut super::local_sdk_host::LocalAgentHost,
+        package: &AdmittedActorPackage,
+        issuer: &mut DurableCleanManagementIssuer<J>,
+        signer: &mut S,
+        fresh_local_install: bool,
+    ) -> Result<ManagementApplicationAck, SharedAgentHostError>
+    where
+        B: super::clean_authority_issuer::CleanManagementActorStore,
+        J: CleanManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+    {
         let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
         let request = intent.request().clone();
         if !matches!(request, ManagementRequest::Install(_))
@@ -6405,8 +6521,9 @@ where
             .load_actor()
             .map_err(|_| SharedAgentHostError::Unavailable)?
             .ok_or(SharedAgentHostError::Unavailable)?;
-        let receipt =
-            self.issue_management_intent_with_admission(slot, managed, issuer, signer, true)?;
+        let receipt = self.issue_management_intent_with_local_install_attempt(
+            slot, managed, issuer, signer, true, fresh_local_install,
+        )?;
         local
             .manage(
                 managed.agent,
@@ -6460,11 +6577,11 @@ where
         .map_err(|_| SharedAgentHostError::ScopeMismatch)
     }
 
-    /// Check only the complete original-owner family of this retained image
-    /// Install. A bare intent needs this open owner's existing pending member;
-    /// it cannot adopt an applied manifest or reconstruct a missing envelope.
+    /// Check the complete original-owner family of this retained image
+    /// Install. Missing volatile exclusion needs this same open owner's
+    /// physically validated live attempt; cold bare intents stay closed.
     pub(crate) fn retained_local_install_family<B: CleanManagementIssuerStore>(
-        &self,
+        &mut self,
         slot: &super::clean_management_intent::CleanManagementIntentSlot<B>,
     ) -> Result<bool, SharedAgentHostError> {
         let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
@@ -6500,16 +6617,20 @@ where
                 work.clone(),
             ),
             None => {
-                let Some((anchor, work)) = self
-                    ._network_host
-                    .current_management_pending(agent, intent.call().invocation)?
-                else {
-                    return Ok(false);
+                let Some(found) = self.pending_local_install_authorization(intent)? else {
+                    return if self
+                        .unpublished_local_install_attempt
+                        .as_ref()
+                        .is_some_and(|(previous, _)| previous == intent)
+                    {
+                        // The original append may still be unapplied. This
+                        // guard permits no new capture during quarantine.
+                        Err(SharedAgentHostError::Unavailable)
+                    } else {
+                        Ok(false)
+                    };
                 };
-                if !intent.validates_unpledged_authorization(&work, &anchor) {
-                    return Err(SharedAgentHostError::ScopeMismatch);
-                }
-                (anchor, work)
+                found
             }
         };
         let manifest = self._network_host.management_recovery_manifest(agent)?;
@@ -6558,6 +6679,128 @@ where
         Ok(true)
     }
 
+    /// Pure validation under the existing lifecycle, proposal and host guards.
+    /// The caller supplied the already verified exact image intent/package;
+    /// the expected whole work was physically validated by this same owner.
+    fn validate_live_local_install_member(
+        intent: &super::clean_management_intent::CleanManagementIntent,
+        expected_work: &RuntimeWork,
+        node: crate::service::NodeId,
+        slot: &super::shared_recovery::management::SharedManagementRecoverySlot,
+        pending: &[(
+            super::clean_management_intent::ManagementJournalAnchor,
+            RuntimeWork,
+        )],
+        retiring: &[[RuntimeWork; 2]],
+    ) -> Result<(), SharedAgentHostError> {
+        if !pending.is_empty() || !retiring.is_empty() {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        if slot.owner() != node
+            || slot.origin_owner() != node
+            || slot.is_released()
+            || slot.members().len() != 1
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let root = slot
+            .members()
+            .first()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        if root.parent().is_some()
+            || root.work().invocation != intent.call().invocation
+            || root.envelope() != expected_work
+            || !intent.validates_unpledged_authorization(root.envelope(), root.anchor())
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        Ok(())
+    }
+
+    fn pending_local_install_authorization(
+        &mut self,
+        intent: &super::clean_management_intent::CleanManagementIntent,
+    ) -> Result<
+        Option<(
+            super::clean_management_intent::ManagementJournalAnchor,
+            RuntimeWork,
+        )>,
+        SharedAgentHostError,
+    > {
+        if intent.call().authority != self.authority_target()
+            || intent.call().managed.profile != AgentProfile::Local
+            || !matches!(intent.request(), ManagementRequest::Install(_))
+            || intent
+                .call()
+                .authenticated_node
+                .is_some_and(|node| node != self.pins.node)
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let agent = crate::service::AgentId(self.pins.agent.0);
+        if let Some((anchor, work)) = self
+            ._network_host
+            .current_management_pending(agent, intent.call().invocation)?
+        {
+            if !intent.validates_unpledged_authorization(&work, &anchor)
+                || self
+                    .unpublished_local_install_attempt
+                    .as_ref()
+                    .is_some_and(|(previous, expected)| previous == intent && expected != &work)
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            return Ok(Some((anchor, work)));
+        }
+        let Some((previous, expected_work)) = &self.unpublished_local_install_attempt else {
+            return Ok(None);
+        };
+        if previous != intent {
+            return Ok(None);
+        }
+        let node = crate::service::NodeId(self.pins.node.0);
+        let found = self
+            ._network_host
+            .retained_management_pending_with_validation(
+                agent,
+                intent.call().invocation,
+                |slot, pending, retiring| {
+                    Self::validate_live_local_install_member(
+                        intent,
+                        expected_work,
+                        node,
+                        slot,
+                        pending,
+                        retiring,
+                    )
+                },
+            )?;
+        // Absence does not clear the proof. The recovery-only guard refuses
+        // it; a normal ready retry can recapture the original whole work.
+        Ok(found)
+    }
+
+    /// A successful pledge or an exact bytes-present retry confirms retention.
+    /// An unrelated save never clears this open owner's ambiguous attempt.
+    fn confirm_local_install_authorization<B: CleanManagementIssuerStore>(
+        &mut self,
+        slot: &super::clean_management_intent::CleanManagementIntentSlot<B>,
+    ) {
+        if self
+            .unpublished_local_install_attempt
+            .as_ref()
+            .is_some_and(|(previous, work)| {
+                slot.intent().is_some_and(|intent| {
+                    previous.request() == intent.request()
+                        && previous.call() == intent.call()
+                        && intent.authorization_work() == Some(work)
+                })
+            })
+        {
+            self.unpublished_local_install_attempt = None;
+        }
+    }
+
     /// Complete a native Local Install while preserving the caller's store
     /// leases. Route publication is still owned by the production supervisor.
     pub(crate) fn install_local_actor<B, J, S>(
@@ -6592,6 +6835,7 @@ where
             .intent()
             .ok_or(SharedAgentHostError::ScopeMismatch)?
             .clone();
+        let mut fresh_local_install = false;
         if previous.call() != next.call() || previous.request() != next.request() {
             if !slot
                 .retirement_complete()
@@ -6630,6 +6874,9 @@ where
             self.finish_live_management_intent(&mut slot, managed, &ack, &issuer)?;
             slot.handoff_retired(&previous, next, &RawCredentialVerifier)
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
+            // The exact signed retired predecessor and its physical image
+            // were checked above. Generic/cold helper calls cannot select it.
+            fresh_local_install = self.pins.replicas.members().len() == 3;
         }
         slot.retain_actor(package)
             .map_err(|_| SharedAgentHostError::Unavailable)?;
@@ -6670,12 +6917,13 @@ where
             self.finish_live_management_intent(&mut slot, managed, &ack, &issuer)?;
             return Ok(ack);
         }
-        let ack = self.install_local_from_management_intent(
+        let ack = self.install_local_from_management_intent_with_attempt(
             &mut slot,
             local,
             package,
             &mut issuer,
             signer,
+            fresh_local_install,
         )?;
         self.finalize_management_intent_with_admission(
             &mut slot,

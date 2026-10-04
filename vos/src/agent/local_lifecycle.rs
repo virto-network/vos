@@ -5195,7 +5195,7 @@ where
             ))]
             LocalBacking::External { .. } => return Err(SharedAgentHostError::Unavailable),
         };
-        let system = self
+        let mut system = self
             .system
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?;

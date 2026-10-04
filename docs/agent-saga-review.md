@@ -465,6 +465,19 @@ first-owner family, queue restriction across readiness, normal finality and
 route completion unchanged. Closed owners and bare absent-map requests remain
 refused; compilation and complete recovery are pending. It alone cannot complete
 the reproduced missing-map case and must not be reported as qualification.
+Conservative R40a builds **1m26s**, queue/HTTP checks **2 pass, 0.30s**, but the
+same cut **fails 43.06s** at ProjectionNotReady (late registration **6.776s**,
+no-Invoke negatives **7.210s**). The live plan references its logs/provenance.
+Review the applied same-open correction: physically validated original whole
+work before metadata, fresh signed image handoff eligibility only, complete
+original-owner single-root validation under existing guards before restoration,
+original pair pledge before new material and matching-confirmed CMI clear.
+Ready pre-append retries recapture the same envelope; quarantined and cold
+requests cannot create proof. Memento-backed callbacks require whole-envelope
+equality before pledge. A prewrite regression reuses the unchanged whole 30s.
+Compilation, A/B/cold/family and public/main qualification remain open. Compound
+handoff-store-write ambiguity is a separate open cut, not waived by this patch;
+the first original CLI interruption remains unattributed.
 
 The final >256 locked-owner reopen now includes all constructors/attachments,
 readiness and exact archived native-result verification under one unchanged

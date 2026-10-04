@@ -13,6 +13,20 @@ use crate::agent::clean_management_intent::CleanManagementIntent;
 pub(super) struct Fault {
     load_once: bool,
     commit_then_error_at: Option<usize>,
+    install_authorization_prewrite_once: bool,
+    install_authorization_prewrite_failures: usize,
+}
+
+impl Fault {
+    pub(super) fn refuse_install_authorization_before_write_once(&mut self) {
+        assert!(!self.install_authorization_prewrite_once);
+        assert_eq!(self.install_authorization_prewrite_failures, 0);
+        self.install_authorization_prewrite_once = true;
+    }
+
+    pub(super) fn install_authorization_prewrite_failures(&self) -> usize {
+        self.install_authorization_prewrite_failures
+    }
 }
 
 /// Non-clone owner used to observe that borrowed reload never releases or
@@ -49,6 +63,30 @@ impl CleanManagementIssuerStore for LeaseStore {
         self.inner.load()
     }
     fn commit(&mut self, bytes: &[u8]) -> Result<(), MemoryError> {
+        {
+            let mut fault = self.fault.lock().unwrap();
+            if fault.install_authorization_prewrite_once {
+                if let Ok(next) = CleanManagementIntent::decode(bytes) {
+                    if matches!(next.request(), ManagementRequest::Install(_))
+                        && next.authorization_work().is_some()
+                        && next.finalization_work().is_none()
+                    {
+                        let current = CleanManagementIntent::decode(
+                            &self.inner.load()?.expect("prewrite cut requires retained bare CMI"),
+                        )
+                        .unwrap();
+                        assert!(current.request() == next.request());
+                        assert!(current.call() == next.call());
+                        assert!(current.authorization_work().is_none());
+                        assert!(current.finalization_work().is_none());
+                        current.call().verify_with(&RawCredentialVerifier).unwrap();
+                        fault.install_authorization_prewrite_once = false;
+                        fault.install_authorization_prewrite_failures += 1;
+                        return Err(MemoryError);
+                    }
+                }
+            }
+        }
         self.inner.commit(bytes)?;
         let mut fault = self.fault.lock().unwrap();
         if let Some(remaining) = fault.commit_then_error_at.as_mut() {

@@ -335,6 +335,24 @@ The active diff closes demonstrated M1 defects, not new capabilities:
   readiness changes. Closed owners and missing-map bare intents remain refused.
   Compilation and whole recovery remain open; this conservative correction
   alone cannot complete the reproduced missing-map case.
+  Conservative core R40a **passes 1m26s**; queue/readiness and HTTP quarantine
+  checks **2 pass, 0.30s**. The same real cut **fails 43.06s** at normal
+  ProjectionNotReady after late registration (**6.776s**) and no-Invoke negatives
+  (**7.210s**), demonstrating the remaining missing-map seam. Evidence is
+  `release-observation-o3-local-install-admission-core-{build,provenance}-r40a.*`,
+  `release-observation-o3-local-install-admission-unit-r40a.log` and
+  `release-observation-o3-local-install-registration-admission-only-r40a.log`.
+  The independently reviewed same-open correction is applied: mint original
+  full work only after validated fresh image Install handoff, before metadata;
+  restore only the exact complete local single-root family under existing
+  guards; pledge the original pair before fresh material; clear only confirmed
+  matching CMI retention. Generic/cold helpers cannot mint proof. Ready retries
+  before append recapture the same whole work; quarantine stays closed without
+  applied custody. A separate pre-authorization-write regression shares the
+  fixture and original whole 30s. Compilation, A/B completion, cold/family
+  negatives and current public/main integration remain open. A compound
+  ambiguous handoff-store-write cut is separately open; original R39w first
+  interruption remains unattributed.
 - The >256 fixture's final locked-owner reopen now measures from before all
   constructors through production attachment/readiness, retained handoff and
   exact archived native-result verification using one unchanged **30s** bound.

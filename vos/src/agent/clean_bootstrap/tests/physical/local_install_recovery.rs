@@ -21,6 +21,12 @@ use crate::service::wire::ServiceWire as _;
 use ed25519_dalek::Signer as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Cut {
+    AuthorizationPrewrite,
+    RegistrationTimeout,
+}
+
 struct Stores {
     space: SpaceId,
     agent: AgentId,
@@ -28,6 +34,7 @@ struct Stores {
     issuer: IssuerMemoryStore,
     opens: Arc<AtomicUsize>,
     live: Arc<AtomicUsize>,
+    intent_fault: Arc<Mutex<Fault>>,
 }
 impl LocalLifecycleStoreFactory for Stores {
     type Intent = LeaseStore;
@@ -42,7 +49,7 @@ impl LocalLifecycleStoreFactory for Stores {
         Ok((
             LeaseStore::new(
                 self.intent.clone(),
-                Arc::new(Mutex::new(Fault::default())),
+                Arc::clone(&self.intent_fault),
                 Arc::clone(&self.live),
             ),
             LeaseStore::new(
@@ -188,12 +195,40 @@ fn submit(
     owner.install_local_actor(install.clone(), call.clone(), package.clone(), true)
 }
 
+fn wait_original_registration(
+    deadline: std::time::Instant,
+    controller: &Controller,
+    agent: HostAgentId,
+    node: NodeId,
+    invocation: InvocationId,
+    expected: Option<&crate::agent::shared_recovery::SharedManagementRecoveryRegistration>,
+) -> crate::agent::shared_recovery::SharedManagementRecoverySlot {
+    retry_until(deadline, "Local committed original registration", || {
+        let original = controller.system_for_test();
+        let manifest = original._network_host.management_recovery_manifest(agent)?;
+        let Some(slot) = manifest.management_slot(HostNodeId(node.0)).filter(|slot| {
+            !slot.is_released()
+                && slot
+                    .members()
+                    .first()
+                    .is_some_and(|member| member.work().invocation == invocation)
+        }) else {
+            return Err(SharedAgentHostError::Unavailable);
+        };
+        if let Some(expected) = expected {
+            assert!(slot.registration() == expected);
+        }
+        Ok(slot.clone())
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 pub(super) fn exercise(
     origin: usize,
     owners: &mut [Option<MemoryBootstrapOwner>],
     fixtures: &[PhysicalFixture],
     directories: &[TestDirectory],
+    cut: Cut,
 ) {
     assert_eq!(owners.len(), 3);
     let agent = HostAgentId(fixtures[origin].plan.pins.agent.0);
@@ -303,6 +338,7 @@ pub(super) fn exercise(
     let issuer_store = IssuerMemoryStore::default();
     let opens = Arc::new(AtomicUsize::new(0));
     let live = Arc::new(AtomicUsize::new(0));
+    let intent_fault = Arc::new(Mutex::new(Fault::default()));
     let stores = Stores {
         space: descriptor.identity.space,
         agent: descriptor.identity.agent,
@@ -310,6 +346,7 @@ pub(super) fn exercise(
         issuer: issuer_store.clone(),
         opens: Arc::clone(&opens),
         live: Arc::clone(&live),
+        intent_fault: Arc::clone(&intent_fault),
     };
     let mut controller = LocalLifecycleController::new(
         owners[origin].take().unwrap(),
@@ -464,86 +501,113 @@ pub(super) fn exercise(
         .last_index();
     let recovery_started = std::time::Instant::now();
     let deadline = recovery_started + std::time::Duration::from_secs(30);
-    let mut restore = RestoreIsolationOnDrop {
-        original: &mut controller,
-        owners,
-        agent,
-        armed: true,
+    let retained = match cut {
+        Cut::AuthorizationPrewrite => {
+            intent_fault
+                .lock()
+                .unwrap()
+                .refuse_install_authorization_before_write_once();
+            retry_until(deadline, "Local authorization prewrite cut", || {
+                let result = controller.install(install.clone(), call.clone(), package.clone());
+                if intent_fault
+                    .lock()
+                    .unwrap()
+                    .install_authorization_prewrite_failures()
+                    == 1
+                {
+                    assert!(matches!(result, Err(SharedAgentHostError::Unavailable)));
+                    Ok(())
+                } else {
+                    result.map(|_| panic!("prewrite cut must precede authorization persistence"))
+                }
+            });
+            assert_eq!(
+                intent_fault
+                    .lock()
+                    .unwrap()
+                    .install_authorization_prewrite_failures(),
+                1
+            );
+            wait_original_registration(deadline, &controller, agent, node, call.invocation, None)
+        }
+        Cut::RegistrationTimeout => {
+            let mut restore = RestoreIsolationOnDrop {
+                original: &mut controller,
+                owners,
+                agent,
+                armed: true,
+            };
+            restore
+                .original
+                .system_for_test()
+                ._network_host
+                .set_raft_isolated_for_test(agent, true)
+                .unwrap();
+            for owner in owners.iter().flatten() {
+                owner
+                    ._network_host
+                    .set_raft_isolated_for_test(agent, true)
+                    .unwrap();
+            }
+            let cut_started = std::time::Instant::now();
+            let cut = restore
+                .original
+                .install(install.clone(), call.clone(), package.clone());
+            let cut_elapsed = cut_started.elapsed();
+            let observed = (|| {
+                let meta = crate::raft::RaftMeta::load(&database)?;
+                let log = crate::raft::RaftLog::open(Arc::clone(&database))?;
+                let last = log.last_index();
+                let entries = log.entries(last, last)?;
+                Ok::<_, crate::commit::CommitError>((meta, last, entries))
+            })();
+            // A quorum must include the original longer-log owner until its exact
+            // append commits; the two shorter logs may legitimately discard it.
+            restore
+                .original
+                .system_for_test()
+                ._network_host
+                .set_raft_isolated_for_test(agent, false)
+                .unwrap();
+            owners[(origin + 1) % 3]
+                .as_ref()
+                .unwrap()
+                ._network_host
+                .set_raft_isolated_for_test(agent, false)
+                .unwrap();
+            let (meta_after, last_after, entries) = observed.unwrap();
+            assert!(matches!(cut, Err(SharedAgentHostError::Unavailable)));
+            assert!(cut_elapsed >= std::time::Duration::from_millis(1_800));
+            assert!(std::time::Instant::now() < deadline);
+            assert_eq!(meta_after.commit_index, meta_before.commit_index);
+            assert_eq!(last_after, last_before + 1);
+            assert_eq!(entries.len(), 1);
+            let vos_raft::EntryKind::Data { payload } =
+                crate::agent::shared_raft::decode_agent_raft_entry_kind(&entries[0].payload)
+                    .unwrap()
+            else {
+                panic!("Local cut must append actual signed metadata");
+            };
+            let crate::agent::shared_raft::AgentRaftCommand::RegisterManagementRecovery {
+                registration,
+                ..
+            } = crate::agent::shared_raft::AgentRaftCommand::decode(&payload).unwrap()
+            else {
+                panic!("Local cut must append RegisterManagementRecovery");
+            };
+            let retained = wait_original_registration(
+                deadline,
+                restore.original,
+                agent,
+                node,
+                call.invocation,
+                Some(&registration),
+            );
+            restore.restore_checked().unwrap();
+            drop(restore);
+            retained
+        }
     };
-    restore
-        .original
-        .system_for_test()
-        ._network_host
-        .set_raft_isolated_for_test(agent, true)
-        .unwrap();
-    for owner in owners.iter().flatten() {
-        owner
-            ._network_host
-            .set_raft_isolated_for_test(agent, true)
-            .unwrap();
-    }
-    let cut_started = std::time::Instant::now();
-    let cut = restore
-        .original
-        .install(install.clone(), call.clone(), package.clone());
-    let cut_elapsed = cut_started.elapsed();
-    let observed = (|| {
-        let meta = crate::raft::RaftMeta::load(&database)?;
-        let log = crate::raft::RaftLog::open(Arc::clone(&database))?;
-        let last = log.last_index();
-        let entries = log.entries(last, last)?;
-        Ok::<_, crate::commit::CommitError>((meta, last, entries))
-    })();
-    // A quorum must include the original longer-log owner until its exact
-    // append commits; the two shorter logs may legitimately discard it.
-    restore
-        .original
-        .system_for_test()
-        ._network_host
-        .set_raft_isolated_for_test(agent, false)
-        .unwrap();
-    owners[(origin + 1) % 3]
-        .as_ref()
-        .unwrap()
-        ._network_host
-        .set_raft_isolated_for_test(agent, false)
-        .unwrap();
-    let (meta_after, last_after, entries) = observed.unwrap();
-    assert!(matches!(cut, Err(SharedAgentHostError::Unavailable)));
-    assert!(cut_elapsed >= std::time::Duration::from_millis(1_800));
-    assert!(std::time::Instant::now() < deadline);
-    assert_eq!(meta_after.commit_index, meta_before.commit_index);
-    assert_eq!(last_after, last_before + 1);
-    assert_eq!(entries.len(), 1);
-    let vos_raft::EntryKind::Data { payload } =
-        crate::agent::shared_raft::decode_agent_raft_entry_kind(&entries[0].payload).unwrap()
-    else {
-        panic!("Local cut must append actual signed metadata");
-    };
-    let crate::agent::shared_raft::AgentRaftCommand::RegisterManagementRecovery {
-        registration,
-        ..
-    } = crate::agent::shared_raft::AgentRaftCommand::decode(&payload).unwrap()
-    else {
-        panic!("Local cut must append RegisterManagementRecovery");
-    };
-    let retained = retry_until(deadline, "Local committed original registration", || {
-        let original = restore.original.system_for_test();
-        let manifest = original._network_host.management_recovery_manifest(agent)?;
-        let Some(slot) = manifest.management_slot(HostNodeId(node.0)).filter(|slot| {
-            !slot.is_released()
-                && slot
-                    .members()
-                    .first()
-                    .is_some_and(|member| member.work().invocation == call.invocation)
-        }) else {
-            return Err(SharedAgentHostError::Unavailable);
-        };
-        assert!(slot.registration() == &registration);
-        Ok(slot.clone())
-    });
-    restore.restore_checked().unwrap();
-    drop(restore);
     assert!(std::time::Instant::now() <= deadline);
     assert_eq!(retained.owner(), HostNodeId(node.0));
     assert_eq!(retained.origin_owner(), retained.owner());
@@ -557,21 +621,30 @@ pub(super) fn exercise(
     {
         let original = controller.system_for_test();
         assert!(original.management_admission_held().unwrap());
-        assert!(
-            original
-                ._network_host
-                .current_management_pending(agent, call.invocation)
-                .unwrap()
-                .is_none()
-        );
-        assert!(matches!(
-            original._network_host.ensure_management_pending_member(
-                agent,
-                &saved_anchor,
-                &saved_work
-            ),
-            Err(SharedAgentHostError::Conflict)
-        ));
+        let current_pending = original
+            ._network_host
+            .current_management_pending(agent, call.invocation)
+            .unwrap();
+        match cut {
+            Cut::AuthorizationPrewrite => {
+                assert!(current_pending == Some((saved_anchor.clone(), saved_work.clone())));
+                original
+                    ._network_host
+                    .ensure_management_pending_member(agent, &saved_anchor, &saved_work)
+                    .unwrap();
+            }
+            Cut::RegistrationTimeout => {
+                assert!(current_pending.is_none());
+                assert!(matches!(
+                    original._network_host.ensure_management_pending_member(
+                        agent,
+                        &saved_anchor,
+                        &saved_work
+                    ),
+                    Err(SharedAgentHostError::Conflict)
+                ));
+            }
+        }
         let mut hosted = original.host.lock().unwrap();
         let mut wrong_anchor = saved_anchor.clone();
         wrong_anchor.ordered.index += 1;
@@ -609,7 +682,8 @@ pub(super) fn exercise(
     assert_eq!(opens.load(Ordering::Acquire), 1);
     assert_eq!(live.load(Ordering::Acquire), 2);
     eprintln!(
-        "fixed_three_local_install phase=late_registration bare_intent=true current_pending=false elapsed_ms={}",
+        "fixed_three_local_install phase=captured_bare_intent cut={cut:?} current_pending={} elapsed_ms={}",
+        cut == Cut::AuthorizationPrewrite,
         recovery_started.elapsed().as_millis()
     );
     let calls = Arc::new(AtomicUsize::new(0));
@@ -701,9 +775,9 @@ pub(super) fn exercise(
         "fixed_three_local_install phase=normal_guard_negatives no_invoke=true elapsed_ms={}",
         recovery_started.elapsed().as_millis()
     );
-    // The baseline guard currently refuses here. A conservative same-open map
-    // predicate alone also cannot complete this genuine map-absent late commit.
-    // Keep the positive expectation so neither refusal is called qualification.
+    // The baseline guard refuses both exact cuts. A conservative same-open
+    // map predicate may admit the prewrite cut, but cannot complete the genuine
+    // map-absent late commit. Keep the positive expectation for both cuts.
     let acknowledgement = loop {
         assert!(
             std::time::Instant::now() < deadline,
@@ -806,7 +880,7 @@ pub(super) fn exercise(
     assert_eq!(live.load(Ordering::Acquire), 2);
     assert!(recovery_started.elapsed() <= std::time::Duration::from_secs(30));
     eprintln!(
-        "fixed_three_local_install phase=terminal_exact_retry released=true elapsed_ms={}",
+        "fixed_three_local_install phase=terminal_exact_retry cut={cut:?} released=true elapsed_ms={}",
         recovery_started.elapsed().as_millis()
     );
     production.shutdown_and_join().unwrap();
