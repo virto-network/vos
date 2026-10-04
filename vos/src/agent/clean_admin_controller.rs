@@ -31,16 +31,8 @@ impl<J: NativeAuthorityAdminJournalStore, T: NativeAuthorityAdminTerminalStore>
             .load(call.invocation)
             .map_err(|_| SharedAgentHostError::Unavailable)?
         else {
-            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
-                tracing::debug!(phase = "retained_admission_record", dispatch_record_present = false,
-                    "Authority admin lifecycle diagnostic");
-            }
             return Ok(false);
         };
-        if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
-            tracing::debug!(phase = "retained_admission_record", dispatch_record_present = true,
-                "Authority admin lifecycle diagnostic");
-        }
         let record = admin_dispatch::RetainedAuthorityAdminDispatch::decode(&bytes)
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
         if record.call != *call || record.preparation != *preparation {
@@ -138,10 +130,6 @@ impl<J: NativeAuthorityAdminJournalStore, T: NativeAuthorityAdminTerminalStore>
                 return Err(SharedAgentHostError::ScopeMismatch);
             }
         } else {
-            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
-                tracing::debug!(phase = "submit_record", dispatch_record_present = false,
-                    "Authority admin lifecycle diagnostic");
-            }
             owner.retain_authority_admin(call, preparation, &mut self.journal)?;
         }
         self.coordinate_and_retire(owner, call, signer)
@@ -210,6 +198,7 @@ impl<J: NativeAuthorityAdminJournalStore, T: NativeAuthorityAdminTerminalStore>
             self.journal
                 .retain(call.invocation, &bytes)
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
+            owner.confirm_authority_admin_retention(&record);
             record
         } else {
             return Err(SharedAgentHostError::Unavailable);

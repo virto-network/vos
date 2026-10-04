@@ -15,6 +15,9 @@ mod forwarded_install_origin;
 #[cfg(feature = "experimental-state-blocks")]
 #[path = "genesis_publication_retry.rs"]
 mod genesis_publication_retry;
+#[cfg(feature = "experimental-state-blocks")]
+#[path = "admin_pending_validation.rs"]
+mod admin_pending_validation;
 #[path = "management_retention.rs"]
 mod management_retention;
 use crate::agent::shared_commit::SharedAgentCommonSnapshotClaim;
@@ -46,6 +49,8 @@ pub(super) enum Exercise {
     AdminJournalPrewrite,
     #[cfg(feature = "experimental-state-blocks")]
     AdminRegistrationTimeout,
+    #[cfg(feature = "experimental-state-blocks")]
+    AdminRegistrationTimeoutCold,
 }
 
 #[cfg(feature = "experimental-state-blocks")]
@@ -79,6 +84,19 @@ fn candidate_admin_registration_timeout_exact_retry_passes_production_recovery_a
     assert!(std::env::var_os("VOS_AGENT_RUNTIME_COST_CANDIDATE").is_some());
     assert!(std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some());
     check_fixed_system_pending_cluster_with_checkpoint(true, Some(Exercise::AdminRegistrationTimeout));
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+#[test]
+#[ignore = "requires coherent Authority/System IMAGE components and three authenticated loopback transports"]
+fn candidate_admin_registration_timeout_cold_missing_journal_refuses_adoption() {
+    assert!(std::env::var_os("AUTHORITY_CANDIDATE_ELF").is_some());
+    assert!(std::env::var_os("VOS_AGENT_RUNTIME_COST_CANDIDATE").is_some());
+    assert!(std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some());
+    check_fixed_system_pending_cluster_with_checkpoint(
+        true,
+        Some(Exercise::AdminRegistrationTimeoutCold),
+    );
 }
 
 #[cfg(feature = "experimental-state-blocks")]
@@ -320,13 +338,23 @@ pub(super) fn exercise(
         return;
     }
     #[cfg(feature = "experimental-state-blocks")]
-    if matches!(exercise, Exercise::AdminJournalPrewrite | Exercise::AdminRegistrationTimeout) {
+    if matches!(
+        exercise,
+        Exercise::AdminJournalPrewrite
+            | Exercise::AdminRegistrationTimeout
+            | Exercise::AdminRegistrationTimeoutCold
+    ) {
         exercise_admin_missing_journal(
             leader,
             owners,
             fixtures,
             directories,
-            matches!(exercise, Exercise::AdminRegistrationTimeout),
+            stores,
+            providers,
+            networks,
+            signer,
+            !matches!(exercise, Exercise::AdminJournalPrewrite),
+            matches!(exercise, Exercise::AdminRegistrationTimeoutCold),
         );
         return;
     }
@@ -358,7 +386,9 @@ pub(super) fn exercise(
         #[cfg(feature = "experimental-state-blocks")]
         Exercise::GenesisPublicationRetry => unreachable!(),
         #[cfg(feature = "experimental-state-blocks")]
-        Exercise::AdminJournalPrewrite | Exercise::AdminRegistrationTimeout => unreachable!(),
+        Exercise::AdminJournalPrewrite
+        | Exercise::AdminRegistrationTimeout
+        | Exercise::AdminRegistrationTimeoutCold => unreachable!(),
     };
     let agent = HostAgentId(fixtures[leader].plan.pins.agent.0);
     let lagger = (leader + 1) % 3;
@@ -977,15 +1007,22 @@ pub(super) fn exercise(
 }
 
 
-/// Both cuts retain the real original owner. This proves live retry admission,
-/// not cold missing-WAL adoption or released-bundle CLI qualification.
+/// Live cuts retain the real original owner; the separate cold cut naturally
+/// drops it and proves missing-journal refusal through normal startup/admission.
+/// These component regressions do not qualify the released-bundle CLI workflow.
 #[cfg(feature = "experimental-state-blocks")]
+#[allow(clippy::too_many_arguments)]
 fn exercise_admin_missing_journal(
     origin: usize,
     owners: &mut [Option<MemoryBootstrapOwner>],
     fixtures: &[PhysicalFixture],
     directories: &[TestDirectory],
+    stores: &[(BootstrapMemoryStore, BootstrapMemoryStore, IssuerMemoryStore)],
+    providers: &[Arc<MemoryProvider>],
+    networks: &[Arc<Network>],
+    signer: &mut CountingSigner,
     registration_timeout: bool,
+    cold_reopen: bool,
 ) {
     use crate::actors::codec::Decode as _;
     use crate::agent::clean_bootstrap::admin_dispatch::RetainedAuthorityAdminDispatch;
@@ -1121,6 +1158,45 @@ fn exercise_admin_missing_journal(
         }
     }
 
+    // This guard only restores the existing test transport cut. Every later
+    // assertion or panic must leave all three authenticated peers connected.
+    struct RestoreIsolationOnDrop<'a> {
+        owners: &'a [Option<MemoryBootstrapOwner>],
+        agent: HostAgentId,
+        armed: bool,
+    }
+    impl RestoreIsolationOnDrop<'_> {
+        fn restore_checked(&mut self) -> Result<(), SharedAgentHostError> {
+            let mut failed = None;
+            for owner in self.owners.iter().filter_map(Option::as_ref) {
+                if let Err(error) = owner
+                    ._network_host
+                    .set_raft_isolated_for_test(self.agent, false)
+                {
+                    if failed.is_none() {
+                        failed = Some(error);
+                    }
+                }
+            }
+            if let Some(error) = failed {
+                return Err(error);
+            }
+            self.armed = false;
+            Ok(())
+        }
+    }
+    impl Drop for RestoreIsolationOnDrop<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                for owner in self.owners.iter().filter_map(Option::as_ref) {
+                    let _ = owner
+                        ._network_host
+                        .set_raft_isolated_for_test(self.agent, false);
+                }
+            }
+        }
+    }
+
     assert_eq!(owners.len(), 3);
     let agent = HostAgentId(fixtures[origin].plan.pins.agent.0);
     for owner in owners.iter().map(|owner| owner.as_ref().unwrap()) {
@@ -1252,7 +1328,7 @@ fn exercise_admin_missing_journal(
         .unwrap();
     let recovery_started = std::time::Instant::now();
     let deadline = recovery_started + std::time::Duration::from_secs(30);
-    let delayed_registration = if registration_timeout {
+    let (delayed_registration, mut isolation_restore) = if registration_timeout {
         let database = owners[origin]
             .as_ref()
             .unwrap()
@@ -1279,8 +1355,13 @@ fn exercise_admin_missing_journal(
             &mut journal,
         );
         let cut_elapsed = cut_started.elapsed();
-        // Always restore the existing transport cut before inspecting/asserting
-        // the result. A reply loss alone would not hold the local commit cursor.
+        let isolation_restore = RestoreIsolationOnDrop {
+            owners,
+            agent,
+            armed: true,
+        };
+        // Inspect the actual isolated append before allowing replication.
+        // A reply loss alone would not hold the local commit cursor.
         let observed = (|| {
             let meta = crate::raft::RaftMeta::load(&database)?;
             let raw = crate::raft::RaftLog::open(Arc::clone(&database))?;
@@ -1288,8 +1369,13 @@ fn exercise_admin_missing_journal(
             let entries = raw.entries(last, last)?;
             Ok::<_, crate::commit::CommitError>((meta, last, entries))
         })();
-        for owner in owners.iter().map(|owner| owner.as_ref().unwrap()) {
-            owner
+        // Reconnect a quorum containing the original longer-log owner. The
+        // two shorter-log peers must not elect each other and legitimately
+        // discard this uncommitted registration before the cut is exercised.
+        for index in [origin, (origin + 1) % 3] {
+            owners[index]
+                .as_ref()
+                .unwrap()
                 ._network_host
                 .set_raft_isolated_for_test(agent, false)
                 .unwrap();
@@ -1315,7 +1401,7 @@ fn exercise_admin_missing_journal(
         else {
             panic!("admin timeout must append RegisterManagementRecovery");
         };
-        Some(registration)
+        (Some(registration), Some(isolation_restore))
     } else {
         retry_until(deadline, "admin journal prewrite cut", || {
             let result = owners[origin].as_mut().unwrap().retain_authority_admin(
@@ -1332,7 +1418,7 @@ fn exercise_admin_missing_journal(
             }
         });
         assert!(journal.load(call.invocation).unwrap().is_none());
-        None
+        (None, None)
     };
     let owner = owners[origin].as_ref().unwrap();
     let retained = retry_until(deadline, "admin committed original registration", || {
@@ -1354,6 +1440,14 @@ fn exercise_admin_missing_journal(
         }
         Ok(slot.clone())
     });
+    // The exact signed registration has now committed on its original owner.
+    // Restore the third peer immediately and release the borrowed cut guard
+    // before any later mutable original-owner retry.
+    if let Some(restore) = isolation_restore.as_mut() {
+        restore.restore_checked().unwrap();
+    }
+    drop(isolation_restore);
+    assert!(std::time::Instant::now() <= deadline);
     assert_eq!(retained.owner(), HostNodeId(owner.pins.node.0));
     assert_eq!(retained.origin_owner(), retained.owner());
     assert!(!retained.is_released());
@@ -1434,7 +1528,263 @@ fn exercise_admin_missing_journal(
         ..expected_record.clone()
     };
     assert!(missing_family.encode().is_err());
+    // Exercise the actual retain path with a different valid signed attempt.
+    // Its refusal must preserve the first ambiguous attempt for exact recovery.
+    assert!(matches!(
+        owners[origin].as_mut().unwrap().retain_authority_admin(
+            &absent_call,
+            &absent_preparation,
+            &mut journal,
+        ),
+        Err(SharedAgentHostError::Conflict)
+    ));
+    assert!(journal.load(call.invocation).unwrap().is_none());
+    assert!(journal.load(absent_call.invocation).unwrap().is_none());
+    let owner = owners[origin].as_ref().unwrap();
+    assert_eq!(
+        owner._network_host.management_recovery_manifest(agent).unwrap()
+            .management_slot(retained.owner()),
+        Some(&retained)
+    );
+    let protected_after_refusal = owner._network_host.ensure_management_pending_member(
+        agent,
+        &expected_record.anchor,
+        &expected_record.envelope,
+    );
+    if registration_timeout {
+        assert!(matches!(protected_after_refusal, Err(SharedAgentHostError::Conflict)));
+        assert_eq!(writes.load(Ordering::Acquire), 0);
+    } else {
+        protected_after_refusal.unwrap();
+        assert_eq!(writes.load(Ordering::Acquire), 1);
+    }
+    let retained_submission = admin_pending_validation::pending(
+        owners[origin].as_mut().unwrap(),
+        &retained,
+        &expected_record,
+        &NativeAuthorityAdminSubmission::new(absent_call.clone(), absent_preparation.clone()).unwrap(),
+        &mut journal,
+    );
+    let owner = owners[origin].as_ref().unwrap();
     let before = native_owner_physical_state(owner);
+    if cold_reopen {
+        assert!(registration_timeout);
+        assert_eq!(writes.load(Ordering::Acquire), 0);
+        let bootstrap_bytes = || {
+            (
+                stores[origin].0.image(),
+                stores[origin].0.commits(),
+                stores[origin].1.image(),
+                stores[origin].1.commits(),
+                stores[origin].2.image.lock().unwrap().clone(),
+            )
+        };
+        let durable_before = bootstrap_bytes();
+        let record_before = owner.record.encode();
+        // Revoke the actual transport, then relinquish every old-owner host
+        // reference and lease. A new owner must not inherit its live marker.
+        owners[origin]
+            .as_mut()
+            .unwrap()
+            ._network_host
+            .retire_attachment_for_test(agent)
+            .unwrap();
+        drop(owners[origin].take().unwrap());
+        assert!(std::time::Instant::now() <= deadline);
+        let assert_no_cold_adoption = || {
+            assert_eq!(bootstrap_bytes(), durable_before);
+            assert_eq!(writes.load(Ordering::Acquire), 0);
+            let mut view = OperationTestJournal(journal_path.clone());
+            for id in [call.invocation, absent_call.invocation] {
+                assert!(
+                    NativeAuthorityOperationJournalStore::load(&mut view, id)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            for surviving in owners.iter().filter_map(Option::as_ref) {
+                let manifest = retry_until(deadline, "cold admin survivor manifest", || {
+                    surviving._network_host.management_recovery_manifest(agent)
+                });
+                assert_eq!(manifest.management_slot(retained.owner()), Some(&retained));
+                assert_eq!(
+                    surviving
+                        .host
+                        .lock()
+                        .unwrap()
+                        .clean_state_commitment(agent)
+                        .unwrap(),
+                    before.1
+                );
+            }
+        };
+        assert!(std::time::Instant::now() < deadline);
+        let reopened = PendingCleanSystemAgentBootstrap::open_with_operation_admission(
+            stores[origin].0.clone(),
+            stores[origin].1.clone(),
+            stores[origin].2.clone(),
+            signer,
+            || panic!("cold admin reopen must retain its durable bootstrap plan"),
+            directories[origin].host(),
+            directories[origin].lock(),
+            fixtures[origin].plan.pins.space,
+            fixtures[origin].plan.pins.node,
+            fixtures[origin].trust.clone(),
+            fixtures[origin].merge.clone(),
+            fixtures[origin].finality.clone(),
+            providers[origin].clone(),
+            networks[origin].clone(),
+            None,
+            None,
+        );
+        assert!(std::time::Instant::now() <= deadline);
+        let mut pending = match reopened {
+            Ok(pending) => pending,
+            Err(CleanSystemAgentBootstrapError::Host(SharedAgentHostError::ScopeMismatch)) => {
+                assert_no_cold_adoption();
+                assert!(recovery_started.elapsed() <= std::time::Duration::from_secs(30));
+                eprintln!(
+                    "fixed_three_admin_recovery phase=cold_startup_refusal elapsed_ms={}",
+                    recovery_started.elapsed().as_millis()
+                );
+                return;
+            }
+            Err(error) => panic!("cold admin normal reopen failed before admission: {error:?}"),
+        };
+        let reopened = loop {
+            assert!(std::time::Instant::now() < deadline);
+            let result = pending.try_complete(signer);
+            assert!(std::time::Instant::now() <= deadline);
+            match result {
+                Ok(Some(owner)) => break owner,
+                Ok(None) => panic!("cold admin pending owner disappeared before completion"),
+                Err(CleanSystemAgentBootstrapError::Host(SharedAgentHostError::Unavailable)) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(CleanSystemAgentBootstrapError::Host(SharedAgentHostError::ScopeMismatch)) => {
+                    drop(pending);
+                    assert_no_cold_adoption();
+                    assert!(recovery_started.elapsed() <= std::time::Duration::from_secs(30));
+                    eprintln!(
+                        "fixed_three_admin_recovery phase=cold_startup_refusal elapsed_ms={}",
+                        recovery_started.elapsed().as_millis()
+                    );
+                    return;
+                }
+                Err(error) => panic!("cold admin normal completion failed: {error:?}"),
+            }
+        };
+        drop(pending);
+        assert_eq!(reopened.record.encode(), record_before);
+        assert!(reopened.management_admission_held().unwrap());
+        assert!(matches!(
+            reopened._network_host.ensure_management_pending_member(
+                agent,
+                &expected_record.anchor,
+                &expected_record.envelope,
+            ),
+            Err(SharedAgentHostError::Conflict)
+        ));
+        let cold_before = native_owner_physical_state(&reopened);
+        assert_eq!(cold_before.1, before.1);
+        assert_eq!(
+            reopened
+                ._network_host
+                .management_recovery_manifest(agent)
+                .unwrap()
+                .management_slot(retained.owner()),
+            Some(&retained)
+        );
+        let cold_host = Arc::clone(&reopened.host);
+        let local = crate::agent::local_sdk_host::LocalAgentHost::create(
+            directories[origin].0.join("admin-cold-recovery-local-host"),
+            target.space,
+            fixtures[origin].plan.pins.node,
+            fixtures[origin].trust.clone(),
+        )
+        .unwrap();
+        let lifecycle = LocalLifecycleController::new(
+            reopened,
+            local,
+            NoLifecycleStores,
+            CountingSigner::new(),
+        )
+        .unwrap()
+        .with_admins(
+            NativeAuthorityAdminController::new(
+                target,
+                journal,
+                AdminTerminals(OperationTestJournal(journal_path.clone())),
+            ),
+            AdminSigner,
+        )
+        .unwrap();
+        let observation_calls = Arc::new(AtomicUsize::new(0));
+        let mut production = AgentProductionOwner::start_local(
+            fixtures[origin].plan.pins.node,
+            crate::agent::supervisor::AgentSupervisorLimits::default(),
+            Box::new(lifecycle),
+            4,
+            Box::new(NeverProjectionAuthenticator(Arc::clone(&observation_calls))),
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(std::time::Instant::now() <= deadline);
+        assert!(production.is_running());
+        assert!(!production.is_ready());
+        assert!(matches!(
+            production.ingress(),
+            Err(AgentProductionOwnerError::ProjectionNotReady)
+        ));
+        assert!(matches!(
+            production.prepare_admin(&draft),
+            Err(SharedAgentHostError::Unavailable)
+        ));
+        for (refused_call, refused_preparation) in [
+            (&call, &preparation),
+            (&absent_call, &absent_preparation),
+            (&changed_call, &preparation),
+            (&call, &bad_proof),
+            (&call, &absent_preparation),
+            (&other_call, &other_preparation),
+        ] {
+            assert!(matches!(
+                production.submit_admin(refused_call, refused_preparation),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
+            assert!(std::time::Instant::now() <= deadline);
+        }
+        assert_no_cold_adoption();
+        {
+            let mut hosted = cold_host.lock().unwrap();
+            // Current-term no-op progress from a genuine election may advance
+            // metadata. Exact refusal must preserve actor state and the whole
+            // signed family without Invoke, ACK, or release evidence.
+            assert_eq!(hosted.clean_state_commitment(agent).unwrap(), cold_before.1);
+            assert_eq!(
+                hosted
+                    .recovery_manifest(agent)
+                    .unwrap()
+                    .management_slot(retained.owner()),
+                Some(&retained)
+            );
+        }
+        assert_eq!(observation_calls.load(Ordering::Acquire), 0);
+        assert!(!production.is_ready());
+        assert!(matches!(
+            production.ingress(),
+            Err(AgentProductionOwnerError::ProjectionNotReady)
+        ));
+        production.shutdown_and_join().unwrap();
+        drop(cold_host);
+        assert_no_cold_adoption();
+        assert!(recovery_started.elapsed() <= std::time::Duration::from_secs(30));
+        eprintln!(
+            "fixed_three_admin_recovery phase=cold_exact_retry_refusal elapsed_ms={}",
+            recovery_started.elapsed().as_millis()
+        );
+        return;
+    }
     let host = Arc::clone(&owner.host);
     let controller = NativeAuthorityAdminController::new(
         target,
@@ -1539,6 +1889,12 @@ fn exercise_admin_missing_journal(
     assert_eq!(final_slot.members_evidence().len(), 1);
     assert!(final_slot.members_evidence()[0].invoke().is_some());
     assert!(final_slot.members_evidence()[0].acknowledgement().is_some());
+    admin_pending_validation::released(
+        &retained_submission,
+        &expected_record.envelope,
+        retained.owner(),
+        final_slot,
+    );
     let completed_position = host.lock().unwrap().journal_position(agent).unwrap();
     let completed_state = host.lock().unwrap().clean_state_commitment(agent).unwrap();
     let retry = retry_until(deadline, "normal terminal admin exact retry", || {

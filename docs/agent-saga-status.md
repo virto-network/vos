@@ -230,6 +230,46 @@ The active diff closes demonstrated M1 defects, not new capabilities:
   preserve this boundary. The narrow same-open exact-attempt correction is
   under review; cold missing-journal admission remains closed. No correction
   or complete public workflow pass is claimed.
+- The narrow same-open admin correction is applied after independent source
+  review. One fully validated signed submission and complete original work are
+  kept in memory before metadata I/O; only matching original-owner, single-root
+  applied custody can restore exclusion, after full validation under the same
+  guards. Confirmed exact NAD2 retention clears it, including bytes-present
+  controller retries. Cold opens initialize no proof; unmatched attempts cannot
+  replace it. Temporary admin diagnostics are removed. Core R39t builds
+  **1m16s**. Journal-prewrite recovery **passes 28.00s**, with whole recovery
+  **5.799s**; diagnostic registration-timeout recovery R39u **passes 30.42s**,
+  with whole recovery **7.897s**, including actual guest Invoke/ACK, signed
+  terminal release and identical terminal retry. The first quiet timeout run
+  **fails 51.92s** before retry admission, waiting for exact registration commit
+  under the unchanged whole 30s bound. Its cause is not established by that
+  quiet log. Reconnecting both shorter-log peers can legitimately lose an
+  uncommitted proposal; the fixture will reconnect the original plus one peer
+  until exact commit, then restore the third, with checked cleanup and no bound
+  change. Cold missing-journal and complete-family negatives remain pending.
+  These are component passes, not M1 or released-workflow qualification. Logs:
+  `release-observation-o3-admin-live-attempt-core-{build,provenance}-r39t.*`,
+  `release-observation-o3-admin-{registration,prewrite}-after-r39t.log`, and
+  `release-observation-o3-admin-registration-after-diagnostics-r39u.log`.
+- Final corrected component source R39v builds **1m29s**; nine related
+  management recovery/protocol checks **pass 0.66s**. Both live three-node cuts
+  pass with authenticated family negatives and exact terminal retry: timeout
+  **30.70s overall / 8.352s whole recovery**, prewrite **28.98s / 6.488s**.
+  The real cold same-store reopen **passes 29.97s / 7.695s**, reaching a normal
+  recovery owner whose exact original signed submission is refused while NAD2
+  remains absent, actor state unchanged and custody unreleased without Invoke
+  or ACK. It inherits no live marker. Valid signed shadow/extended families,
+  original-owner and same-ID gas/anchor substitutions, exclusion conflicts,
+  failed validation before actual map restoration and genuine released slots
+  are covered. Detached candidate/exclusion checks do not claim extra live
+  fault coverage. The reconnect guard restores every peer on failure and the
+  third immediately after original-plus-one-peer commit. All recovery phases
+  retain the whole **30s** bound; bootstrap setup is outside and unclaimed.
+  Logs are `release-observation-o3-admin-family-core-{build,provenance}-r39v.*`,
+  `release-observation-o3-admin-related-core-r39v.log`,
+  `release-observation-o3-admin-{registration,prewrite}-family-after-r39v.log`
+  and `release-observation-o3-admin-cold-missing-journal-r39v.log`.
+  The current portable public workflow and M1 remain unqualified.
 - The >256 fixture's final locked-owner reopen now measures from before all
   constructors through production attachment/readiness, retained handoff and
   exact archived native-result verification using one unchanged **30s** bound.

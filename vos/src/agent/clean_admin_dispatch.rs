@@ -39,6 +39,48 @@ pub(crate) struct RetainedAuthorityAdminDispatch {
     pub(super) preparation: NativeAuthorityAdminPreparation,
 }
 
+impl RetainedAuthorityAdminDispatch {
+    /// Pure validation of the complete authenticated slot against this open
+    /// owner's already validated exact attempt. Call under the existing host
+    /// and proposal guards, before restoring any volatile reservation.
+    pub(crate) fn from_live_pending_slot(
+        submission: &NativeAuthorityAdminSubmission,
+        expected_work: &RuntimeWork,
+        node: crate::service::NodeId,
+        slot: &crate::agent::shared_recovery::management::SharedManagementRecoverySlot,
+        pending: &[(ManagementJournalAnchor, RuntimeWork)],
+        retiring: &[[RuntimeWork; 2]],
+    ) -> Result<Self, SharedAgentHostError> {
+        if !pending.is_empty() || !retiring.is_empty() {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        if slot.owner() != node
+            || slot.origin_owner() != node
+            || slot.is_released()
+            || slot.members().len() != 1
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let root = &slot.members()[0];
+        if root.parent().is_some()
+            || root.work().invocation != submission.call().invocation
+            || root.envelope() != expected_work
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let retained = Self {
+            call: submission.call().clone(),
+            envelope: root.envelope().clone(),
+            anchor: root.anchor().clone(),
+            preparation: submission.preparation().clone(),
+        };
+        retained
+            .validate_wire()
+            .then_some(retained)
+            .ok_or(SharedAgentHostError::ScopeMismatch)
+    }
+}
+
 fn message(call: &AuthorityAdminCall) -> Vec<u8> {
     dynamic_message(
         "administer",
@@ -168,6 +210,106 @@ where
     R: CleanSystemAgentBootstrapStore,
     I: CleanManagementIssuerStore,
 {
+    /// Admit only exact pending work, including an ambiguous metadata append
+    /// attempted by this same open owner. Restoring its existing exclusion
+    /// does not retain a result or permit a fresh admin request during recovery.
+    pub(crate) fn retains_authority_admin_pending(
+        &mut self,
+        call: &AuthorityAdminCall,
+        preparation: &NativeAuthorityAdminPreparation,
+    ) -> Result<bool, SharedAgentHostError> {
+        if self.pending_authority_admin_dispatch(call, preparation)?.is_some() {
+            return Ok(true);
+        }
+        if self.unpublished_admin_attempt.as_ref().is_some_and(|(submission, _)| {
+            submission.call() == call && submission.preparation() == preparation
+        }) {
+            // The original metadata append may still be unapplied. Absence is
+            // not permission to replace it or a permanent signed-call refusal.
+            return Err(SharedAgentHostError::Unavailable);
+        }
+        Ok(false)
+    }
+
+    /// Clear only after the caller confirms exact NAD2 retention. Bytes-present
+    /// retries confirm in the controller too, after an ambiguous prior write.
+    pub(crate) fn confirm_authority_admin_retention(
+        &mut self,
+        retained: &RetainedAuthorityAdminDispatch,
+    ) {
+        if self.unpublished_admin_attempt.as_ref().is_some_and(|(submission, work)| {
+            submission.call() == &retained.call
+                && submission.preparation() == &retained.preparation
+                && work == &retained.envelope
+        }) {
+            self.unpublished_admin_attempt = None;
+        }
+    }
+
+    fn pending_authority_admin_dispatch(
+        &mut self,
+        call: &AuthorityAdminCall,
+        preparation: &NativeAuthorityAdminPreparation,
+    ) -> Result<Option<RetainedAuthorityAdminDispatch>, SharedAgentHostError> {
+        if !preparation.matches_call(call)
+            || call.authority != self.authority_target()
+            || call.authenticated_node != self.pins.node
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let make_retained = |anchor: ManagementJournalAnchor, envelope: RuntimeWork| {
+            let retained = RetainedAuthorityAdminDispatch {
+                call: call.clone(),
+                envelope,
+                anchor,
+                preparation: preparation.clone(),
+            };
+            retained
+                .validate_wire()
+                .then_some(retained)
+                .ok_or(SharedAgentHostError::ScopeMismatch)
+        };
+        let agent = crate::service::AgentId(self.pins.agent.0);
+        if let Some((anchor, envelope)) = self
+            ._network_host
+            .current_management_pending(agent, call.invocation)?
+        {
+            if self.unpublished_admin_attempt.as_ref().is_some_and(|(submission, work)| {
+                submission.call() == call
+                    && submission.preparation() == preparation
+                    && work != &envelope
+            }) {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            return make_retained(anchor, envelope).map(Some);
+        }
+        let Some((submission, expected_work)) = &self.unpublished_admin_attempt else {
+            return Ok(None);
+        };
+        if submission.call() != call || submission.preparation() != preparation {
+            return Ok(None);
+        }
+        let node = crate::service::NodeId(self.pins.node.0);
+        let found = self._network_host.retained_management_pending_with_validation(
+            agent,
+            call.invocation,
+            |slot, pending, retiring| {
+                RetainedAuthorityAdminDispatch::from_live_pending_slot(
+                    submission,
+                    expected_work,
+                    node,
+                    slot,
+                    pending,
+                    retiring,
+                )
+                .map(|_| ())
+            },
+        )?;
+        found
+            .map(|(anchor, envelope)| make_retained(anchor, envelope))
+            .transpose()
+    }
+
     /// Retry uses the whole retained envelope, never newly selected material
     /// or a newly sampled clock. A failed publication leaves admission held.
     pub(crate) fn retain_authority_admin<J: NativeAuthorityAdminJournalStore>(
@@ -200,33 +342,23 @@ where
             journal
                 .retain(call.invocation, &bytes)
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
+            self.confirm_authority_admin_retention(&retained);
             return Ok(retained);
         }
-        if let Some((anchor, envelope)) = self._network_host.retained_management_pending(
-            crate::service::AgentId(self.pins.agent.0),
-            call.invocation,
-        )? {
-            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
-                tracing::debug!(phase = "retained_pending_lookup", dispatch_record_present = false,
-                    current_pending_present = true, "Authority admin lifecycle diagnostic");
-            }
-            let retained = RetainedAuthorityAdminDispatch {
-                call: call.clone(),
-                envelope,
-                anchor,
-                preparation: preparation.clone(),
-            };
+        if self.unpublished_admin_attempt.as_ref().is_some_and(|(submission, _)| {
+            submission.call() != call || submission.preparation() != preparation
+        }) {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        if let Some(retained) = self.pending_authority_admin_dispatch(call, preparation)? {
             let bytes = retained
                 .encode()
                 .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
             journal
                 .retain(call.invocation, &bytes)
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
+            self.confirm_authority_admin_retention(&retained);
             return Ok(retained);
-        }
-        if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
-            tracing::debug!(phase = "retained_pending_lookup", dispatch_record_present = false,
-                current_pending_present = false, "Authority admin lifecycle diagnostic");
         }
         let mut material = self
             .supervisor_invocation_material(self.pins.agent, call.authority.binding.issuer.actor)?;
@@ -293,8 +425,16 @@ where
             authorization: Box::new(authorization),
             observed_slot: call.observed_slot,
         };
-        if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
-            tracing::debug!(phase = "capture_start", "Authority admin lifecycle diagnostic");
+        let submission = NativeAuthorityAdminSubmission::new(call.clone(), preparation.clone())
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if let Some((previous, work)) = &self.unpublished_admin_attempt {
+            if previous != &submission || work != &proposed {
+                return Err(SharedAgentHostError::Conflict);
+            }
+        } else {
+            // All signed and physical work checks above precede metadata I/O.
+            // Preserve this exact attempt across either metadata or WAL loss.
+            self.unpublished_admin_attempt = Some((submission, proposed.clone()));
         }
         let result = self._network_host
             .capture_management_pending_with_checkpoint(
@@ -303,10 +443,6 @@ where
                 &self.pins.replicas,
                 self.snapshot_signer.as_ref(),
                 |(anchor, envelope)| {
-                    if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
-                        tracing::debug!(phase = "capture_callback", dispatch_record_present = false,
-                            current_pending_present = true, "Authority admin lifecycle diagnostic");
-                    }
                     let retained = RetainedAuthorityAdminDispatch {
                         call: call.clone(),
                         envelope: envelope.clone(),
@@ -322,9 +458,8 @@ where
                     Ok(retained)
                 },
             );
-        if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
-            tracing::debug!(phase = "capture_complete", error = ?result.as_ref().err(),
-                "Authority admin lifecycle diagnostic");
+        if let Ok(retained) = &result {
+            self.confirm_authority_admin_retention(retained);
         }
         result
     }

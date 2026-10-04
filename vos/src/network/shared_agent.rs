@@ -4603,11 +4603,10 @@ impl SharedAgentNetworkHost {
         attached.coordinator.release_management_retention(root)
     }
 
-    /// Recover a failed publication, including registration committed before
-    /// the origin wrote its independent WAL. Only the actual owner's verified
-    /// exact member may restore volatile exclusion; absence is not completion.
-    pub(crate) fn retained_management_pending(
-        &mut self,
+    /// Inspect this open attachment's already held exact member without
+    /// adopting registrations or restoring volatile exclusion.
+    pub(crate) fn current_management_pending(
+        &self,
         agent: crate::service::AgentId,
         invocation: crate::agent_sdk::InvocationId,
     ) -> Result<Option<PendingManagement>, SharedAgentHostError> {
@@ -4623,7 +4622,39 @@ impl SharedAgentNetworkHost {
             .cloned();
         if let Some((anchor, envelope)) = &found {
             self.ensure_management_pending_member(agent, anchor, envelope)?;
-            return Ok(found);
+        }
+        Ok(found)
+    }
+
+    /// Recover a failed publication, including registration committed before
+    /// the origin wrote its independent WAL. Only the actual owner's verified
+    /// exact member may restore volatile exclusion; absence is not completion.
+    pub(crate) fn retained_management_pending(
+        &mut self,
+        agent: crate::service::AgentId,
+        invocation: crate::agent_sdk::InvocationId,
+    ) -> Result<Option<PendingManagement>, SharedAgentHostError> {
+        self.retained_management_pending_with_validation(agent, invocation, |_, _, _| Ok(()))
+    }
+
+    /// Validate the complete applied family under the existing lifecycle,
+    /// proposal and host guards before restoring its volatile reservation.
+    /// The validator is pure and must not re-enter the host or coordinator.
+    pub(crate) fn retained_management_pending_with_validation<F>(
+        &mut self,
+        agent: crate::service::AgentId,
+        invocation: crate::agent_sdk::InvocationId,
+        validate: F,
+    ) -> Result<Option<PendingManagement>, SharedAgentHostError>
+    where
+        F: FnOnce(
+            &crate::agent::shared_recovery::management::SharedManagementRecoverySlot,
+            &[PendingManagement],
+            &[[crate::agent_sdk::RuntimeWork; 2]],
+        ) -> Result<(), SharedAgentHostError>,
+    {
+        if let Some(found) = self.current_management_pending(agent, invocation)? {
+            return Ok(Some(found));
         }
         if !self.system_agents.contains(&agent) {
             return Ok(None);
@@ -4662,14 +4693,16 @@ impl SharedAgentNetworkHost {
             return Ok(None);
         }
         let manifest = host.recovery_manifest(agent)?;
-        let Some(member) = manifest
+        let Some(slot) = manifest
             .management_slot(crate::service::NodeId(self.network.agent_node_id().0))
             .filter(|slot| !slot.is_released())
-            .and_then(|slot| {
-                slot.members()
-                    .iter()
-                    .find(|member| member.work().invocation == invocation)
-            })
+        else {
+            return Ok(None);
+        };
+        let Some(member) = slot
+            .members()
+            .iter()
+            .find(|member| member.work().invocation == invocation)
         else {
             return Ok(None);
         };
@@ -4689,6 +4722,14 @@ impl SharedAgentNetworkHost {
         {
             return Err(SharedAgentHostError::Conflict);
         }
+        validate(
+            slot,
+            &previous,
+            self.management_retirements
+                .get(&agent)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        )?;
         let found = (member.anchor().clone(), member.envelope().clone());
         let mut pending = previous;
         pending.push(found.clone());

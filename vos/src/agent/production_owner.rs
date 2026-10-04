@@ -1501,42 +1501,22 @@ impl AgentProductionOwner {
         if !self.is_running() {
             return Err(super::shared_host::SharedAgentHostError::Unavailable);
         }
-        let ready = self.is_ready();
-        if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
-            tracing::debug!(phase = "submit_start", ready, "Authority admin lifecycle diagnostic");
-        }
-        if !ready {
+        if !self.is_ready() {
             let retained = self
                 .lifecycle
                 .as_mut()
                 .ok_or(super::shared_host::SharedAgentHostError::Unavailable)?
                 .0
-                .retains_admin(call, preparation)
-                .map_err(|error| {
-                    if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
-                        tracing::debug!(phase = "retained_admission_error", ready, ?error,
-                            "Authority admin lifecycle diagnostic");
-                    }
-                    error
-                })?;
-            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
-                tracing::debug!(phase = "retained_admission", ready, retained,
-                    "Authority admin lifecycle diagnostic");
-            }
+                .retains_admin(call, preparation)?;
             if !retained {
                 return Err(super::shared_host::SharedAgentHostError::ScopeMismatch);
             }
         }
-        let result = self.lifecycle
+        self.lifecycle
             .as_mut()
             .ok_or(super::shared_host::SharedAgentHostError::Unavailable)?
             .0
-            .submit_admin(call, preparation);
-        if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
-            tracing::debug!(phase = "submit_complete", ready, error = ?result.as_ref().err(),
-                "Authority admin lifecycle diagnostic");
-        }
-        result
+            .submit_admin(call, preparation)
     }
 
     pub(crate) fn prepare_operation(

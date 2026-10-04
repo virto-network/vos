@@ -2540,10 +2540,19 @@ where
         call: &super::sdk::authority::AuthorityAdminCall,
         preparation: &super::clean_bootstrap::NativeAuthorityAdminPreparation,
     ) -> Result<bool, SharedAgentHostError> {
-        self.admins
+        if self
+            .admins
             .as_mut()
             .ok_or(SharedAgentHostError::Unavailable)?
-            .retains(call, preparation)
+            .retains(call, preparation)?
+        {
+            return Ok(true);
+        }
+        let mut system = self
+            .system
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        system.retains_authority_admin_pending(call, preparation)
     }
     fn authorize_operation(
         &mut self,

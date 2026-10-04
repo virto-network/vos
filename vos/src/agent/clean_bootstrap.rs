@@ -1661,6 +1661,10 @@ where
     // Authority inventory row or by whatever happens to be installed now.
     authority_install: super::sdk::InstallActor,
     invocation_gas: u64,
+    // One exact admin attempt validated by this open owner before metadata
+    // publication. This is not a WAL or new custody; cold opens never restore
+    // it. Keep its whole work until matching NAD2 retention is confirmed.
+    unpublished_admin_attempt: Option<(NativeAuthorityAdminSubmission, RuntimeWork)>,
     shared_lifecycle_recovery_pending: bool,
     // Process-only exact proofs minted by this owner. Cold startup must obtain
     // them again from Authority replay; no archive bytes can repopulate this set.
@@ -2768,6 +2772,7 @@ where
             root_lineage,
             authority_install: install_request(plan.authority_request())?.clone(),
             invocation_gas: plan.invocation_gas,
+            unpublished_admin_attempt: None,
             shared_lifecycle_recovery_pending: false,
             shared_genesis_finality: ReplayVerifiedAgentGenesisFinalitySet::default(),
             #[cfg(test)]
