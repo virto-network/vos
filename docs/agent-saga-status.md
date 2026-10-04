@@ -37,6 +37,40 @@ deployment is automatic.
 
 ## Current position
 
+Latest host boundary: portable main and harness from clean `a1000b15` **pass
+389.592s / 454.561s**, with empty RUSTFLAGS, encoded/target overrides unset,
+exact frozen binary hashes and current strict six-file verification **0.101s**.
+Three adjacent Local frontend checks pass; the transport check first refuses
+sandbox loopback bind (**EPERM, 0.031s**) and passes its permitted exact rerun
+(**0.19s**). The other two pass **0.384s / 0.111s**. These are component and
+packaging checks, not an integrated milestone.
+
+The first serial packaged public gate **fails 310.133s**. Its last verified
+marker is nonleader Install at cumulative **109.011s**; bootstrap issuance,
+Clerk mutation/lost response, exact result/ACK and locked reopen are unreached.
+This uses the saved recompiler/refinement fixture environment, not ordinary
+production-default or hardware qualification.
+The failing `/__agents/prepare-authorization` HTTP 503 loses its typed cause
+when `operation_authorization::prepare_retained` converts the error to a new
+string-only diagnostic. The existing retry helper therefore treats the transient
+response as nonretryable instead of retrying the retained AOC5. This establishes a
+client classification defect, not the backend reason for HTTP 503 or a guest,
+freshness, finalization or performance-only failure.
+
+The existing preparation regression **fails before, 0.22s**. Adjacent retained
+authorization-submit and ordinary Invoke regressions independently reproduce
+the same type loss (**0.28s / 0.01s**); the public run attributes only preparation.
+Identical narrow diagnostic-context corrections preserve original typed errors
+and requests. Final three exact regressions **pass 0.41s / 0.88s / 0.04s**,
+including genuinely lost transport replies, invalid/wrong/old response refusal,
+exact bytes, exclusive ownership and cached reopen. Unrelated zero-selection
+integration filters are not evidence. Current portable rebuild/public execution
+remain open; no server-503 cause or service-tuning pass is established.
+Evidence under the native worktree's target:
+`task-tmp/r40-cli-build-a1000b15/{provenance.json,local-install-related.log,local-install-transport-loopback-rerun.log}`,
+`task-tmp/r40-packaged-five-a1000b15/public.{stdout,stderr,result.json}` and
+`release-observation-o3-{preparation,authorization,invocation}-typed-error-{before,final}-r40f.log`.
+
 | Mandatory gate | Implementation | Integration / qualification |
 | --- | --- | --- |
 | Internal Authority observations | O1/O2 and O3 removal are implemented: no read custody/transport/apply/expiry lifecycle. Management retention and public Invoke/ACK remain. | Current physical observation **passes 67.75s**, including exactly one caught-up audit and existing freshness/no-write/cancellation/reopen cases. Optimized management/replay/owner/supervisor/protocol/observation checks **241/241** pass (10 ignored, 7.09s). SDK **259 + 256 passed**, each 1 ignored. Paired signed-role/purity probes **pass 4.64s** with explicit, unmeasured limits. Packaged closure/startup/retry checks **40 passed**, 2 ignored. No released workflow or SLA pass. |
@@ -408,7 +442,8 @@ The active diff closes demonstrated M1 defects, not new capabilities:
   `release-observation-o3-local-install-optimized-{cuts-summary,related}-r40e.*`.
   The exact before-fix binary is preserved at
   `release-observation-o3-local-install-before-handoff-test-binary-r40d`.
-  Current public/main integration remains unqualified.
+  Current portable packaging passes at the boundary above; public workflow
+  integration remains unqualified.
   Lifecycle stores in these cuts are memory-backed; this is not filesystem
   lifecycle durability or all-cold cluster evidence. Original R39w first
   interruption remains unattributed. No service-tuning pass is consumed.
@@ -638,7 +673,11 @@ snapshot return and leased comparison remain mandatory.
 Remaining release work, in dependency order:
 
 1. Integrate the qualified same-open Admin and image Local corrections into
-   current portable main/harness builds and the packaged public workflow.
+   the packaged public workflow. The `a1000b15` portable builds and strict bundle
+   verify pass, but public execution stops before bootstrap issuance. Freeze the
+   reviewed retained-client typed-cause corrections, rebuild current portable
+   host binaries with exact provenance, then rerun the same public gate before later
+   selectors. Preserve its existing 120s correctness retry and whole30 recovery.
    Supported fixed-three Local late-registration, prewrite, compound handoff
    and normal cold-refusal cuts pass R40e under original whole30. They do not
    retrospectively attribute the first R39w CLI interruption or prove filesystem
@@ -714,9 +753,10 @@ Separate forecasts and unknowns:
   excluding reproduction and packaged qualification. Coherent finalization
   and reproduction now pass, but public qualification exposed the delayed
   registration succession race and single-attempt fixture/script assumptions.
-  The focused remaining correction/review band is **1–4 source hours**,
-  medium-low confidence, plus **2–6 elapsed hours** of isolated M1 execution if
-  no further defect appears. This is not a combined M1/M2/M3 forecast.
+  The earlier focused **1–4 source hours** plus **2–6 elapsed hours** of
+  isolated M1 execution was conditional on no further defect. Subsequent
+  integration failures make it unreliable as a remaining forecast; it never
+  covered combined M1/M2/M3 delivery.
   R39b/R39c exposed a retained-Install quarantine admission gap; its narrow
   correction passes focused checks and R39g reaches verified nonleader Install.
   R39f/R39g next exposed lost typed transport causes and one-shot role-grant
@@ -741,18 +781,22 @@ Separate forecasts and unknowns:
   resulting correction is qualified.
   The **2–6 elapsed-hour**
   execution band remains conditional and is not a reliable remaining estimate
-  while the remaining recovery gates are open. The current portable main builds
-  in **6m32s**; recent optimized main/harness builds span about **6–8 minutes**
-  each. These measured build costs are not an aggregate milestone estimate.
+  while the remaining recovery gates are open. Current `a1000b15` portable
+  main/harness builds take **389.592s / 454.561s**; recent optimized builds span
+  about **6–8 minutes** each. These measured build costs are not an aggregate
+  milestone estimate.
   Current optimized core R40d takes **13m05s**; three Local component cuts
   pass, while real compound handoff ambiguity exposes a separate normal
   admission defect. The reviewed correction builds **13m01s** and all four
   quiet cuts pass under original whole30; current CLI integration remains open.
   Its correction remains within the same exact-retry gate;
   no new authority or service-tuning pass is warranted.
-  Admin component terminal completion is verified; Local Install and public
-  workflow completion still need verification. Evidence
-  does not establish a new guest execution defect or performance-only cause.
+  Admin and supported image Local component terminal completion are verified;
+  filesystem lifecycle and public workflow completion remain open. The next
+  public run verifies nonleader Install but stops before bootstrap issuance on
+  lost typed preparation-error classification. The three client component fixes do
+  not attribute the backend HTTP 503 or establish a new guest execution defect
+  or performance-only cause. No reliable aggregate qualification range exists.
   Optimized R38r main and harness builds each take about seven minutes;
   R38s/R38t and first CLI failure establish the current variance. Cold recovery,
   actual leader-loss coverage, cumulative pruning and cleanup may expose more
@@ -878,7 +922,14 @@ leave hardware/load/soak qualification explicitly open.
   lifecycle ownership and qualified with measured external counts/bytes.
 - [ ] Bounded public-API load tooling using existing ATQ1/AOC5/AOQ1/ASQ1 paths.
   Execution stays gated on supported startup/lifecycle/retention. Do not multiply
-  Root credentials/queues or revive the retired acceptance API.
+  Root credentials/queues or revive the retired acceptance API. Source audit
+  finds the M2 loader's final fresh per-member Ordered Queries cannot succeed
+  at a stable follower through the current HTTP supervisor path; ordinary
+  follower submission returns Unavailable, while forwarding is management-only.
+  Close exact retained delivery to a serving leader and separately authenticate
+  all-owner application/parity. A cached ASR1 or repeated leader response does
+  not prove each owner's six maps, local freshness or catch-up. No public corpus
+  or full-data parity pass is claimed.
 - [ ] Exact-release phase measurements: preparation, outer/inner VM, persistence,
   queue and quorum. Recompiler selection is implemented, not service qualification.
   At most two measured tuning passes; stop for direction after two failed passes.
@@ -888,7 +939,11 @@ leave hardware/load/soak qualification explicitly open.
   Current public backup is registry-only and rejects live Agent roots; external
   streaming export is test-only and restore remains internal. Integrate those
   existing authenticated mechanisms rather than wrapping registry backup or
-  describing it as an Agent backup.
+  describing it as an Agent backup. Production-owner maintenance orchestration
+  for certified System state, detached Shared AXJ1/ACX1, opaque image Local
+  closure and exact lifecycle/client retries remains absent. Existing detached
+  catch-up applies to an already finalized same-identity replica; it does not
+  authorize replacing permanent freshness/lock domains after their loss.
 - [ ] Release-binary overload, partitions/minority refusal, catch-up, full restart,
   interrupted lifecycle and restore; unchanged load, failover and soak targets.
   `scripts/collect-agent-release-node.sh` prepares read-only per-node binary-hash,

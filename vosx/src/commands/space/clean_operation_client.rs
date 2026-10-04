@@ -221,6 +221,10 @@ mod tests {
         );
         drop(store);
         for (status, body, minimum, success) in [
+            (503, Vec::new(), 20, false),
+            (0, Vec::new(), 20, false), // Lost response after receiving the exact call.
+            (409, Vec::new(), 20, false),
+            (401, Vec::new(), 20, false),
             (504, Vec::new(), 20, false),
             (200, submission(2).encode().unwrap(), 20, false),
             (200, response.clone(), 21, false),
@@ -250,6 +254,9 @@ mod tests {
                     CleanOperationClientFile::open_authorization_preparation(root),
                     Err(CleanFileStoreError::Busy)
                 ));
+                if status == 0 {
+                    return;
+                }
                 write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
                 let _ = stream.write_all(&body);
             });
@@ -258,6 +265,22 @@ mod tests {
             let result = prepare_retained(&mut store, address, minimum);
             assert_eq!(result.is_ok(), success, "{result:?}");
             server.join().unwrap();
+            if let Err(error) = &result {
+                match (status, error.downcast_ref::<ureq::Error>()) {
+                    (0, Some(ureq::Error::Transport(_))) => {}
+                    (200, None) => {} // Invalid or stale AOQ1 remains a nonretryable validation error.
+                    (expected, Some(ureq::Error::Status(actual, _))) => {
+                        assert_eq!(*actual, expected);
+                    }
+                    _ => panic!("preparation lost its typed HTTP/transport cause"),
+                }
+                if let Some(cause) = error.downcast_ref::<ureq::Error>() {
+                    assert_eq!(
+                        error.to_string(),
+                        format!("{cause}; exact preparation call retained; retry identical AOC5")
+                    );
+                }
+            }
             assert_eq!(store.load_request().unwrap().unwrap(), call);
             assert_eq!(store.load_response().unwrap().is_some(), success);
         }
@@ -696,6 +719,7 @@ mod tests {
         super::super::tests::write_private(&input, &bytes);
         let mut last_address = None;
         for (status, content_type, body, succeeds) in [
+            (0, "application/octet-stream", Vec::new(), false),
             (503, "application/octet-stream", Vec::new(), false),
             (504, "application/octet-stream", Vec::new(), false),
             (302, "application/octet-stream", response.clone(), false),
@@ -742,6 +766,9 @@ mod tests {
                     CleanOperationClientFile::open_or_create(root),
                     Err(CleanFileStoreError::Busy)
                 ));
+                if status == 0 {
+                    return;
+                }
                 write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
                 stream.write_all(&body).unwrap();
             });
@@ -752,6 +779,24 @@ mod tests {
             );
             server.join().unwrap();
             assert_eq!(result.is_ok(), succeeds, "{result:?}");
+            if status == 0 || status == 503 || status == 504 {
+                let error = result.as_ref().unwrap_err();
+                let cause = error.downcast_ref::<ureq::Error>();
+                match (status, cause) {
+                    (0, Some(ureq::Error::Transport(_))) => {}
+                    (expected, Some(ureq::Error::Status(actual, _))) => {
+                        assert_eq!(*actual, expected);
+                    }
+                    _ => panic!("authorization delivery lost its typed HTTP/transport cause"),
+                }
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "{}; exact authorization request retained, outcome may be unknown",
+                        cause.unwrap()
+                    )
+                );
+            }
             let mut store = CleanOperationClientFile::open_or_create(&fixture.root).unwrap();
             assert_eq!(store.load_request().unwrap(), Some(bytes.clone()));
             assert_eq!(

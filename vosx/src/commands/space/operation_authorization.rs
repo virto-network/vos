@@ -31,7 +31,9 @@ pub(crate) fn prepare_retained(
             AuthorityOperationSubmission::MAX_ENCODED_BYTES,
         )
         .map_err(|error| {
-            anyhow::anyhow!("{error}; exact preparation call retained; retry identical AOC5")
+            let diagnostic =
+                format!("{error}; exact preparation call retained; retry identical AOC5");
+            error.context(diagnostic)
         })?,
     };
     let submission = AuthorityOperationSubmission::decode(&response)
@@ -101,7 +103,9 @@ pub(crate) fn submit(
         Ok(response)
     })()
     .map_err(|error: anyhow::Error| {
-        anyhow::anyhow!("{error}; exact authorization request retained, outcome may be unknown")
+        let diagnostic =
+            format!("{error}; exact authorization request retained, outcome may be unknown");
+        error.context(diagnostic)
     })
 }
 

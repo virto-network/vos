@@ -222,7 +222,9 @@ pub(crate) fn submit(
         Ok(response)
     })();
     result.map_err(|error: anyhow::Error| {
-        anyhow::anyhow!("{error}; exact invocation retained, execution outcome may be unknown")
+        let diagnostic =
+            format!("{error}; exact invocation retained, execution outcome may be unknown");
+        error.context(diagnostic)
     })
 }
 
@@ -803,6 +805,7 @@ pub(crate) mod tests {
         let input = root.join("initial.asq1");
         std::fs::write(&input, &request).unwrap();
         for (status, content_type, body, succeeds) in [
+            (0, "application/octet-stream", Vec::new(), false),
             (503, "application/octet-stream", Vec::new(), false),
             (302, "application/octet-stream", response.clone(), false),
             (200, "application/json", response.clone(), false),
@@ -840,11 +843,34 @@ pub(crate) mod tests {
                 stream.read_exact(&mut bytes[header_end..]).unwrap();
                 assert_eq!(&bytes[header_end..], expected);
                 assert!(CleanInvocationFile::open_or_create(&leased).is_err());
+                if status == 0 {
+                    return;
+                }
                 write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
                 stream.write_all(&body).unwrap();
             });
-            assert_eq!(submit(&path, Some(&input), address).is_ok(), succeeds);
+            let result = submit(&path, Some(&input), address);
+            assert_eq!(result.is_ok(), succeeds);
             server.join().unwrap();
+            if status == 0 || status == 503 {
+                let error = result.as_ref().unwrap_err();
+                let cause = error.downcast_ref::<ureq::Error>();
+                assert!(
+                    matches!(
+                        (status, cause),
+                        (0, Some(ureq::Error::Transport(_)))
+                            | (503, Some(ureq::Error::Status(503, _)))
+                    ),
+                    "invocation delivery lost its typed HTTP/transport cause"
+                );
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "{}; exact invocation retained, execution outcome may be unknown",
+                        cause.unwrap()
+                    )
+                );
+            }
             if input.exists() {
                 std::fs::remove_file(&input).unwrap();
             }

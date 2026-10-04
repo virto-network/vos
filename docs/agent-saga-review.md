@@ -5,8 +5,9 @@ owns scope, dependency order, forecasts, open gates and acceptance targets.
 Review read-only and return findings for the implementation branch, not competing
 fixes on the review branch.
 Start with [the observation replacement](#active-priority-r37-observation-replacement)
-and its current scoped R38 decoder correction. Older evidence is explicitly
-frozen and cannot qualify later source.
+and [the current integrated result](#current-integration-delta-and-blocking-result).
+Older decoder/component evidence is explicitly frozen and cannot qualify later
+host source or the released workflow.
 
 ## Boundary and release claim
 
@@ -101,8 +102,36 @@ Current O3 component evidence (logs under the native worktree's `target`):
 
 ### Current integration delta and blocking result
 
-Corrected source `2e19cd17` freezes these changes, which close demonstrated
-M1 defects without changing authorization, wire bounds or deadlines:
+Current portable host boundary `a1000b15` builds main/harness **389.592s /
+454.561s**, empty RUSTFLAGS with encoded/target overrides unset; frozen hashes
+and strict six-file verification **0.101s** are recorded. Three adjacent Local
+frontend checks pass: two **0.384s / 0.111s**, plus the transport check's exact
+permitted rerun **0.19s** after sandbox bind EPERM (**0.031s**). No bound is
+waived. Review the exact selected Clerk/release and private provenance referenced
+by the live plan; packaging/frontend passes do not close M1.
+
+The first serial public gate **fails 310.133s**, last verified nonleader Install
+at cumulative **109.011s**. It does not reach bootstrap Issued authorization,
+Clerk execution/lost response, positive ACK or whole locked-owner reopen.
+The saved recompiler/refinement fixture environment does not qualify ordinary
+production-default or hardware behavior.
+`/__agents/prepare-authorization` returns HTTP 503; the diagnostic wrapper in
+`operation_authorization::prepare_retained` discards the typed cause, so the
+existing exact retry helper mistakes a transient refusal for a nonretryable error.
+Review the narrow context-preserving correction and real retained-client
+regressions. Preparation **fails before 0.22s**; adjacent authorization-submit
+and ordinary Invoke independently reproduce type loss (**0.28s / 0.01s**).
+Their final exact regressions **pass 0.41s / 0.88s / 0.04s**, including genuinely
+lost replies, fatal malformed/substituted response refusal, original request
+bytes/writer ownership and cached reopen. Unrelated zero-selection filters are
+not passes. Public attribution remains preparation only. Current portable
+rebuild/public execution stay open; these component fixes do not establish the
+backend HTTP 503 cause, guest outcome or timing qualification. No tuning pass
+is consumed. The live plan owns exact evidence paths and remaining dependencies.
+
+The earlier corrected role-source boundary `2e19cd17` freezes these changes,
+which close demonstrated M1 defects without changing authorization, wire bounds
+or deadlines:
 
 - Ambiguous publication exact retry re-admits the original leased stores.
   `release-observation-o3-publication-exact-retry-physical-debug-r37b.log`
@@ -513,9 +542,10 @@ full work/family, finality, complete signed ACK/release and terminal no-write re
 Five current owner/queue/HTTP checks pass **0.27s**. This closes the demonstrated
 component defect; memory lifecycle stores do not prove filesystem server
 durability or actual main/CLI integration. The live plan references logs,
-provenance and preserved exact before-fix binary. Current portable CLI builds
-and packaged gates are next; original R39w first interruption remains unattributed.
-No tuning pass used.
+provenance and preserved exact before-fix binary. Current portable packaging
+passes at the boundary above; public qualification stops before bootstrap
+issuance. Original R39w first interruption remains unattributed. No tuning pass
+is consumed.
 
 The final >256 locked-owner reopen now includes all constructors/attachments,
 readiness and exact archived native-result verification under one unchanged
@@ -544,8 +574,8 @@ bails deliberately removed after the prerequisite checks; packaged pilot and
 service qualification remain open. The review branch is unchanged. Startup binds exact
 System/Authority/Catalog closure before writes: SAC7 alone cannot identify O3's
 management-only RMF4 lineage. The full reproducer passes with artifact-bearing
-builder `da86c686`. The direct CLI acceptance script has run once with the
-unresolved result above; no three-process acceptance pass is claimed.
+builder `da86c686`. The direct CLI acceptance attempts remain unresolved;
+no three-process acceptance pass is claimed.
 
 ### Implemented contract; integrated qualification remains open
 
@@ -697,6 +727,17 @@ Private parent/output 0700, files 0600; business keys/openings must not be expos
 Peak memory is unmeasured. This closes offline corpus only, not public loading,
 capacity, service or hardware. Public parity requires actual accepted batch seed
 timestamps and execution order, not synthetic offline roots or client reply order.
+Source audit finds a separate unexecuted M2 integration gap: the loader's fresh
+final Queries on all three HTTP endpoints take the ordinary Ordered path, whose
+stable followers return Unavailable. Existing exact retained transport selection
+can target a serving leader; cached result verification or repeated leader
+responses do not establish all-owner six-map application/freshness. Review that
+gate separately from accepted-context reference replay. Maintenance backup also
+lacks production-owner integration of certified System state, detached Shared
+AXJ1/ACX1, opaque image Local closure and exact retry state; public backup remains
+registry-only. Same-identity detached catch-up does not recover authority lost
+with permanent freshness/lock domains. These remain the existing M2 gates,
+not additional profiles or a new backup framework.
 
 ## Reproduction and working rules
 
