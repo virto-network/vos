@@ -13,7 +13,7 @@ host_toolchain = "nightly-2025-05-09"
 # Public, non-authoritative signed templates. Space creation re-signs these
 # packages with its actual root; this signer is never an operator credential.
 system_templates_source_revision = "2e19cd17b7c037fa54a06bff159db1d56b997b6a"
-system_templates_builder_revision = "7085c2204ec81fceb6a90b22c62906c3c874809e"
+system_templates_builder_revision = "da86c686d880806b50debff09f44632a3fa6404d"
 system_templates_public_signing_seed_hex = "5454545454545454545454545454545454545454545454545454545454545454"
 system_authority_package_blake2b_256 = "5b9b07fd479f7f021e4b4932a86bf4f6633a667cd38384c6aa5661b9f00b6cdf"
 system_catalog_package_blake2b_256 = "5b91c5054c8316f947e13634cbab1e3e395c31236a01efa89a648f0e7e60683f"

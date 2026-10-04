@@ -58,8 +58,8 @@ implemented and their focused refusal tests pass. CLI defaults select existing
 external-state components for Shared, without changing image Local. R38j
 reproduction evidence is `release-observation-o3-coherent-role-reproduction-r38j.log`
 and `target/agent-release-reproduction/run.1JsTwa` under the native worktree.
-The artifact-bearing builder checkpoint and strict six-file verification must
-follow the coherent repin; the old `7085c220` full bundle check cannot qualify it.
+The artifact-bearing builder checkpoint is `da86c686`; strict six-file
+verification is pending. The old `7085c220` full bundle check cannot qualify it.
 The existing enrollment/common-genesis and Shared Create/admit/Install/call/resume
 CLI are reused; no new CLI/signing framework is needed. A direct three-process
 CLI acceptance script is prepared but not yet run; it does not claim load,

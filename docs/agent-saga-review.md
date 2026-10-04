@@ -177,7 +177,7 @@ builds from corrected `2e19cd17`: System/Shared runtime ELFs and programs, all f
 signed templates and signed Clerk bytes match. Detailed evidence is
 `target/agent-release-reproduction/run.1JsTwa` under the native worktree. The coherent
 repin preserves Local's canonical image runtime. The artifact-bearing builder
-checkpoint, strict six-file verification and packaged recovery still precede
+checkpoint is `da86c686`; strict six-file verification and packaged recovery still precede
 normal startup admission; reproduction alone does not close M1.
 
 The portable full CLI suite previously **passes 375 tests**, 52 ignored, 39.53s
