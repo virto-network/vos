@@ -500,14 +500,21 @@ lifetime correction separately: eligibility before store I/O only after exact
 signed predecessor/issuer ACK/physical image validation; full work before
 metadata only after existing physical validation, with no eligibility-only
 recovery or cold/family bypass. The same bounded field holds optional whole work;
-an unconditional exact-intent Conflict fence precedes store reads/native writes,
+an unconditional exact-intent Conflict fence precedes intent/issuer loads and native writes,
 including another Agent's already-bare intent. Independent review caught the
 first draft's branch-only fence; it was corrected before application. Compound
 signed negatives verify eligibility-only no-admission/no-write/no-clear, then
 exact full work after capture. Different-Agent coverage is source proof only.
-Corrected optimized compilation and all four cuts remain open. The live plan
-references evidence. Compound and
-public/main remain open; first original CLI interruption remains unattributed.
+Corrected portable core R40e builds **781.50s** from clean `eeec1d49`, empty
+RUSTFLAGS with encoded/target overrides unset. Quiet B **passes 52.96s / 26.955s
+whole30**, A **51.89s / 23.621s**, normal cold refusal **41.95s / 14.656s** and
+compound **54.04s / 26.365s**. Compound proves both proof stages, exact original
+full work/family, finality, complete signed ACK/release and terminal no-write retry.
+Five current owner/queue/HTTP checks pass **0.27s**. This closes the demonstrated
+component defect; memory lifecycle stores do not prove filesystem server
+durability or actual main/CLI integration. The live plan references logs,
+provenance and preserved exact before-fix binary. Current portable CLI builds
+and packaged gates are next; original R39w first interruption remains unattributed.
 No tuning pass used.
 
 The final >256 locked-owner reopen now includes all constructors/attachments,

@@ -384,16 +384,31 @@ The active diff closes demonstrated M1 defects, not new capabilities:
   and complete original-owner guarded family admission. The same bounded
   memento now carries optional full work; cold constructors remain empty and
   exact pledge confirmation alone clears it. An unconditional exact-intent
-  Conflict fence precedes native store reads/writes, including another Agent's
+  Conflict fence precedes intent/issuer loads and native writes, including another Agent's
   already-bare intent. Signed compound negatives preserve eligibility with no
   whole work or mutation, then require the original full work after capture.
   Different-Agent reachability is source-reviewed, not a new physical claim.
-  Current corrected optimized compilation and all-four-cut execution are open.
+  Corrected portable core R40e from clean `eeec1d49` **builds 781.50s**, empty
+  RUSTFLAGS and encoded/target overrides unset. All quiet cuts pass: B
+  **52.96s / 26.955s whole30**, A **51.89s / 23.621s**, normal cold refusal
+  **41.95s / 14.656s**, and compound **54.04s / 26.365s**. Compound proves
+  eligibility-only refusal/no-write/no-clear after the real handoff error, then
+  exact original full work, signed family negatives, issuer finality, complete
+  two-member ACK/release, Local route and terminal no-write retry. Five current
+  owner/queue/HTTP checks **pass 0.27s**. This qualifies the demonstrated
+  same-open Local correction at the stated component/test-profile boundary;
+  actual CLI and filesystem server lifecycle durability remain open.
   Logs/provenance:
   `release-observation-o3-local-install-qualified-cuts-core-{build,provenance}-r40d.*`,
   `release-observation-o3-local-install-{registration,prewrite,cold-refusal,compound-handoff}-optimized-r40d.log`,
   `release-observation-o3-local-install-optimized-{cuts-summary,related}-r40d.*`.
-  Compound correction and current public/main integration remain unqualified.
+  Corrected evidence is the corresponding
+  `release-observation-o3-local-install-handoff-eligibility-core-{build,provenance}-r40e.*`
+  and `release-observation-o3-local-install-{registration,prewrite,cold-refusal,compound-handoff}-optimized-r40e.log`;
+  `release-observation-o3-local-install-optimized-{cuts-summary,related}-r40e.*`.
+  The exact before-fix binary is preserved at
+  `release-observation-o3-local-install-before-handoff-test-binary-r40d`.
+  Current public/main integration remains unqualified.
   Lifecycle stores in these cuts are memory-backed; this is not filesystem
   lifecycle durability or all-cold cluster evidence. Original R39w first
   interruption remains unattributed. No service-tuning pass is consumed.
@@ -622,13 +637,14 @@ snapshot return and leased comparison remain mandatory.
 
 Remaining release work, in dependency order:
 
-1. Attribute the first image Local Install interruption in actual CLI R39w,
-   using existing scoped diagnostics and a supported fixed-three cut. Fix only
-   demonstrated recovery defects; its later unready rejection must admit only
-   exact retained image requests through the existing leased owner. The admin
-   same-open correction passes supported component recovery/release and cold
-   refusal, but must now integrate into the current packaged public workflow.
-   Compile the test-only whole locked-owner reopen deadline correction, then
+1. Integrate the qualified same-open Admin and image Local corrections into
+   current portable main/harness builds and the packaged public workflow.
+   Supported fixed-three Local late-registration, prewrite, compound handoff
+   and normal cold-refusal cuts pass R40e under original whole30. They do not
+   retrospectively attribute the first R39w CLI interruption or prove filesystem
+   lifecycle durability. Use scoped diagnostics if the fresh ordinary CLI
+   exposes another failure; fix only a demonstrated cause. Compile the test-only
+   whole locked-owner reopen and exact bootstrap-Authorize retry corrections, then
    qualify public lost-result/reopen and returning/all-cold
    pending Install. Exercise Pins-before-record, first Intent stage, fresh
    initialization and locked reopen through normal startup, with unchanged whole
@@ -730,7 +746,9 @@ Separate forecasts and unknowns:
   each. These measured build costs are not an aggregate milestone estimate.
   Current optimized core R40d takes **13m05s**; three Local component cuts
   pass, while real compound handoff ambiguity exposes a separate normal
-  admission defect. Its correction remains within the same exact-retry gate;
+  admission defect. The reviewed correction builds **13m01s** and all four
+  quiet cuts pass under original whole30; current CLI integration remains open.
+  Its correction remains within the same exact-retry gate;
   no new authority or service-tuning pass is warranted.
   Admin component terminal completion is verified; Local Install and public
   workflow completion still need verification. Evidence
