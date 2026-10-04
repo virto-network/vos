@@ -37,49 +37,82 @@ deployment is automatic.
 
 ## Current position
 
-Latest portable/public evidence is frozen at
-`3b72eab63ad4b55ede139a0819168d62758f67dd`;
-production host correction remains `f9c61863`, with the qualified journal/family
-tests. Current portable main/harness **pass 391.301s / 453.172s**, with empty
-RUSTFLAGS, encoded/target overrides unset and exact frozen binary hashes.
-Current main strict six-file verification **passes 0.101s**. Provenance records
-the same clean source before/after, exact commands, copied executable SHA-256
-and owned groups gone. Authority, Catalog, both runtime roles and coherent guest
-component pins remain unchanged. Typed retained-client context corrections
-remain component-qualified; their three exact regressions pass
-**0.41s / 0.88s / 0.04s**, preserving signed bytes and deadlines. Adjacent Local
-frontend checks include the permitted exact loopback rerun after sandbox EPERM.
-Component and packaging checks do not close M1.
+Latest measured portable/diagnostic source is frozen at
+`5750f0c222880b01be7e9caae697403af85e810f`; production recovery correction
+remains `f9c61863`, with the qualified journal/family tests and temporary
+existing-flag native phase/outcome diagnostics. Portable main/harness **pass
+391.697s / 453.055s**; current main strict six-file verification **passes 0.101s**.
+Empty RUSTFLAGS, unset encoded/target overrides, exact copied binary hashes,
+clean source before/after and owned-group completion are recorded. Authority,
+Catalog, both runtime roles and coherent guest pins remain unchanged. Typed
+retained-client regressions remain component-qualified; component and packaging
+passes do not close M1.
 
-The current quiet public gate **fails 377.199s**, and the isolated scoped rerun
-**fails 450.086s**, at the unchanged **120s** bootstrap issuance correctness
-retry cap on **`/__agents/authorize` HTTP 503**. Last verified nonleader Install
-is **113.752s / 113.020s** respectively. This is later than the previous
-`5c2bf99c` preparation failure: current native preparation progressed enough to
-publish AOQ1, then exact authorization delivery failed. Neither current run
-reaches decoded bootstrap Issued, Clerk mutation/lost response, Clerk positive ACK or
-whole locked-owner reopen. Each executes exactly one failing test and leaves its
-owned process group gone. The remaining four packaged gates are unexecuted;
-current ordinary three-process CLI acceptance and M1/M2/M3 remain open.
+Current quiet/scoped public runs **fail 412.139s / 366.996s** at the unchanged
+**120s** bootstrap issuance correctness cap on **`/__agents/authorize` HTTP 503**,
+after verified nonleader Install **105.444s / 109.102s** respectively. Each
+executes one failing test and leaves its owned group gone; later gates are not
+run. The initial diagnostic run on this source **fails 429.670s** at
+**`/__agents/credential`**, before any native-operation phase; preserve that
+unattributed failure. Previous `3b72eab6` authorize failures remain frozen
+evidence, not current qualification.
 
-Scoped aggregates report preparation **Unavailable 1 / ScopeMismatch 7** before
-progression, then authorization **Unavailable 5**. Existing traces do not identify
-whether policy execution, issuer coordination, ACK or terminal release is the
-failing authorization substage; interleaved aggregate custody events cannot prove
-identity. CLI-linked core omits the test-only observation outcome blocks, so their
-absence does not establish a guest result. The fixture asserts exact ATQ1 on every
-failed attempt, and the ordinary client publishes AOQ1 before authorize delivery;
-subsequent retries load that same AOQ1 without discovery, preparation or signing.
-These are source-supported retention witnesses. `Scratch::drop` deletes the
-runtime tree on unwind, so client ATQ/AOC/AOQ/AOR states are **not archived** beside
-the preserved logs. No surviving-state or successful issuance claim follows.
-The next prerequisite is narrow existing-stage/outcome attribution before any
-correction; HTTP 503 alone proves neither a guest defect nor a performance cause.
-Temporary native-operation phase/outcome diagnostics are now applied under the
-existing diagnostic flag after source review and syntax-only checks. They are
-**unbuilt and unexecuted**; they change no semantics or limits. Run them only for
-attribution, not quiet/SLA qualification, and remove them after the cause is
-established. No future source checkpoint or successful outcome is implied.
+The scoped extractor accepts **216 fixed native records / 0 unknown**. It reports
+four dispatch Unavailable errors, two actor-ACK-pair errors, six authorization
+**CompletedDone** outcomes and two AOI1 **CompletedDone** outcomes. Aggregate
+counts alone cannot match interleaved episodes. The single serial bootstrap
+source and privately reviewed trace order establish that authorization attempt
+seven completes the actor ACK pair and NRT1 `retirement_save`, then its forwarded
+`ReleaseManagementRecovery` reaches **local_custody_timeout at 1.873882s** under the unchanged **1.8s local
+confirmation bound**, separate from the outer 120s correctness cap.
+The fixed-order safe artifact records this sequence; the quiet run has no native
+phase records. This establishes the scoped failure boundary after the saved
+retirement witness, without identifying the release-ambiguity cause, resolving
+every earlier failure or supporting a guest-failure/performance-only verdict.
+
+The next action is exact terminal-release ambiguity/recovery attribution using
+the existing NRT1, retained family and publication mechanisms. **No native terminal-release source
+correction is established yet.** Preserve original work/clock/anchor,
+journal-backed authorization, complete original-owner retention, exact release
+and unchanged bounds. Source review of last-completed-row compaction protection
+and unreleased-root fences preserves the latest hot NRT1 exact-retry path; no
+archive-removal defect is demonstrated. This is source evidence only: **full
+supported fixed-three native NRT1 exact retry/reopen remains open**.
+The diagnostics are now compiled and exercised under the
+existing flag with unchanged fixture backend/profile/stack settings. They affect
+timing, provide attribution only, and must be removed after the cause is
+established; they are not quiet, ordinary-default or SLA qualification.
+
+The fixture fences exact ATQ1 and retained AOQ1 on retries; ordinary client code
+publishes AOQ1 before authorize and reuses it without discovery, preparation or
+replacement signing. These are source-path retention witnesses.
+Packaged-fixture `Scratch::drop` removes its runtime tree on unwind, so ATQ/AOC/AOQ/AOR and
+native retirement states are **not archived** beside the preserved logs.
+No surviving-state or client-decoded bootstrap Issued claim follows. Neither
+Clerk mutation/lost response, Clerk positive ACK nor whole locked-owner reopen
+is reached. The remaining four packaged gates, current ordinary three-process
+CLI acceptance and M1/M2/M3 remain open.
+
+Actual ordinary three-process CLI on recorded `5750f0c2` **fails 101.711s**
+at the script's empty Local Query result-shape assertion. All three reach the
+first-ready stage **10.274s**; Local Create/Install complete **13.839s / 27.630s**.
+Local Query itself **passes 46.307s**, exit 0, with verified issued,
+delivery-retired, Done and direct value `"0x"`. The script wrongly expected
+`{"Ok":"0x"}`: Clerk `journal_id` returns `Vec<u8>`, and `local_call` exposes
+decoded Bytes as direct hex. Shared is not reached. Graceful cleanup **passes
+0.941s**, three recorded launches/zero matching survivors, with source/artifact
+fences passing. These are Local happy-path stage costs, not whole-recovery/SLA
+or full workflow qualification; ordinary-run private evidence is preserved.
+
+The one-line script predicate is corrected to `.result.value == "0x"`, retaining
+issued/retired/Done checks. Shell syntax, the corrected check against archived
+Query JSON and diff checks pass; the correction is **source-only, not rerun**.
+No Query retry/endpoint proposal is applied. Recorded `5750f0c2` main/original
+script evidence cannot qualify the corrected run. Freeze the reviewed correction,
+rebuild portable hosts with current clean provenance, review the runner's
+`SCRIPT_SHA`, then rerun ordinary CLI with fresh roots/identities. Earlier R39w
+is source-frozen historical evidence. Shared/reopen, later packaged gates and
+M1/M2/M3 remain open.
 
 A supported signed THREE-node regression now **proves the missing-NOD1
 recovery-admission defect on this supported cut**. Before correction, clean `61530b52` debug core
@@ -145,12 +178,22 @@ records). Original BEFORE/initial correction evidence remains
 Admin compatibility evidence is
 `task-tmp/r41-admin-registration-related-f9c61863/{physical.result.json,physical.stdout,physical.stderr}`.
 Current portable/public evidence is
-`task-tmp/r41-cli-build-3b72eab6/provenance.json`,
+`task-tmp/r41-cli-build-5750f0c2/provenance.json`,
+`task-tmp/r41-public-stage-outcomes-5750f0c2{,-rerun}/{public.stdout,public.stderr,public.result.json,safe-summary.json}`
+and `task-tmp/r42-public-quiet-5750f0c2/{public.stdout,public.stderr,public.result.json,safe-summary.json}`.
+Ordinary CLI evidence is `task-tmp/r42-current-actual-cli-5750f0c2`, with
+`ordinary-cli.result.json`, `before.json`, `after.json`, `run/timings.tsv`
+and `run/logs/local-query.stdout`; private identities/request stores stay private.
+The scoped `task-tmp/r41-public-stage-outcomes-5750f0c2-rerun/native-phase-order-safe.json`
+(SHA-256 `1101184e6260c8b05978247e6a58672ff4aa145057cfdc68ac26721e2b46c6ac`)
+exports fixed-enum order only. The v2 summary exports allowlisted
+phase/outcome/method counts and existing safe timing/status fields; raw logs
+remain private, and order/count artifacts are not archived native/client state.
+Previous quiet/scoped authorize failures remain
 `task-tmp/r41-packaged-five-3b72eab6/public.{stdout,stderr,result.json}` and
-`task-tmp/r41-public-scoped-3b72eab6/{public.stdout,public.stderr,public.result.json,safe-summary.json}`.
-The scoped summary exports only phase/status/count/timing fields; raw diagnostic
-logs remain private. Previous preparation-blocked portable evidence is frozen
-under the corresponding `task-tmp/r40-*-5c2bf99c` directories.
+`task-tmp/r41-public-scoped-3b72eab6/{public.stdout,public.stderr,public.result.json,safe-summary.json}`,
+with their portable provenance under `task-tmp/r41-cli-build-3b72eab6`.
+Preparation-blocked evidence stays under `task-tmp/r40-*-5c2bf99c`.
 Typed-client component logs remain
 `release-observation-o3-{preparation,authorization,invocation}-typed-error-{before,final}-r40f.log`;
 unrelated zero-selection filters are not evidence.
@@ -159,8 +202,8 @@ unrelated zero-selection filters are not evidence.
 | --- | --- | --- |
 | Internal Authority observations | O1/O2 and O3 removal are implemented: no read custody/transport/apply/expiry lifecycle. Management retention and public Invoke/ACK remain. | Current physical observation **passes 67.75s**, including exactly one caught-up audit and existing freshness/no-write/cancellation/reopen cases. Optimized management/replay/owner/supervisor/protocol/observation checks **241/241** pass (10 ignored, 7.09s). SDK **259 + 256 passed**, each 1 ignored. Paired signed-role/purity probes **pass 4.64s** with explicit, unmeasured limits. Packaged closure/startup/retry checks **40 passed**, 2 ignored. No released workflow or SLA pass. |
 | External storage/restore | Incremental executor, immutable closure, ACX1 publication and exact marker retirement exist. | Historical optimized reopen/crash-cut slices pass; the released workflow must requalify. |
-| System management recovery | Parent retention, immutable MRQ2 first-owner binding, exact mutation evidence, signed terminal release and recovery remain. | Isolated optimized offline-pruning test **passes 419.04s**: restore, exact Create/Install, checkpoint/pruning, ACK and custody release. Install finalization **21.588s** meets unchanged 30s. Earlier contended 32.979s failure remains recorded, not waived or tuned away. Same-open native operation preparation, complete-family refusals, journal prewrite/ambiguous-write exact retention and normal cold refusal are component-qualified under whole30 on `b20faacd`; preparation-only fsync test-store limits apply. Current portable public authorization still exceeds its unchanged correctness cap; returning/all-cold Shared pending-Install remain unqualified. |
-| Member/public management | Packaged PublicWorkflow selects exact bundled roles and ordinary CLI Create. Ambiguous publication re-admits the original leased stores before exact retry. Finalization retains publication protection and verifies fresh decision state before exact terminal cleanup. Packaged reopen helpers explicitly use normal startup admission. Provision components use the existing boxed decoder, whose direct decode removes an extra by-value scratch frame without changing wire, validation or limits. | Native genesis checks **15 passed, 0.19s**. Expanded exact-finalization retry on independently reproduced coherent components **passes 96.21s** (`release-observation-o3-coherent-finalization-physical-r38n.log`), with unchanged 30s phase bounds. The fixture uses ordinary signed Admin Invoke/ACK to enroll its API observation credential and verifies refusal before enrollment. Source and six-file bundle reproduction pass. Current portable public reaches verified nonleader Install, then fails before Issued. Lost-result/reopen, packaged cold recovery and actual three-process acceptance remain open. |
+| System management recovery | Parent retention, immutable MRQ2 first-owner binding, exact mutation evidence, signed terminal release and recovery remain. | Isolated optimized offline-pruning test **passes 419.04s**: restore, exact Create/Install, checkpoint/pruning, ACK and custody release. Install finalization **21.588s** meets unchanged 30s. Earlier contended 32.979s failure remains recorded, not waived or tuned away. Same-open native operation preparation, complete-family refusals, journal prewrite/ambiguous-write exact retention and normal cold refusal are component-qualified under whole30 on `b20faacd`; preparation-only fsync test-store limits apply. Latest scoped public authorization reaches saved NRT1 then times out during forwarded terminal release; this is attribution, not quiet qualification. Returning/all-cold Shared pending-Install remain unqualified. |
+| Member/public management | Packaged PublicWorkflow selects exact bundled roles and ordinary CLI Create. Ambiguous publication re-admits the original leased stores before exact retry. Finalization retains publication protection and verifies fresh decision state before exact terminal cleanup. Packaged reopen helpers explicitly use normal startup admission. Provision components use the existing boxed decoder, whose direct decode removes an extra by-value scratch frame without changing wire, validation or limits. | Native genesis checks **15 passed, 0.19s**. Expanded exact-finalization retry on independently reproduced coherent components **passes 96.21s** (`release-observation-o3-coherent-finalization-physical-r38n.log`), with unchanged 30s phase bounds. The fixture uses ordinary signed Admin Invoke/ACK to enroll its API observation credential and verifies refusal before enrollment. Source and six-file bundle reproduction pass. Latest scoped public reaches verified nonleader Install, actor ACK and retirement retention, then fails before client-decoded Issued. Actual CLI completes image Local Create/Install/Query/ACK but its script asserts the wrong empty-result shape; the one-line source correction is not rerun and Shared is not reached. Lost-result/reopen, packaged cold recovery and complete three-process acceptance remain open. |
 | Service/operations | Offline signed corpus generator, bounded public corpus loader and read-only hardware collector exist. Loader resumes exact private ATQ1 through existing CLI/ASR1 verification and independently replays accepted seeds/order for all six maps. | Loader tooling tests **7 passed, 0.10s**; it has not executed public data. M1 setup and pre-granted signed Clerk Operator/Member roles are prerequisites. Public retained loading, resources/recovery, backup/restore, overload, soak and hardware qualification remain open. |
 
 R36y is the frozen, superseded legacy-read diagnostic boundary, not qualification
@@ -756,40 +799,43 @@ snapshot return and leased comparison remain mandatory.
 
 Remaining release work, in dependency order:
 
-1. Attribute the current packaged authorization failure to its actual stage and
-   outcome using narrow scoped diagnostics before fixing it. Clean `3b72eab6`
-   portable main/harness and strict six-file verification pass; quiet/scoped
-   public runs progress through native preparation and exact AOQ1 publication,
-   then exhaust the unchanged 120s correctness retry cap on authorize HTTP 503.
-   Preserve exact original work/clock/anchor, journal-backed authorization,
-   retained AOQ1, original-owner complete-family restrictions and whole30 recovery.
-   The same-open preparation correction is component-qualified across late
-   registration, journal prewrite/ambiguous write and normal cold refusal;
-   these preparation-only fsync test-store passes do not qualify policy/issuance
-   or public bootstrap. Supported image Local cuts likewise do not prove
-   filesystem lifecycle durability or attribute the first R39w interruption.
-   Fix only a demonstrated remaining cause, rebuild current portable hosts if
-   host source changes, and rerun the quiet public gate before the remaining
-   four selectors. Qualify public lost-result/whole locked-owner reopen,
-   returning/all-cold pending Install and actual Shared leader loss through normal
-   startup. Pins-before-record, first Intent stage, fresh initialization and
-   locked reopen retain the unchanged whole **<=30s** recovery bound, actual
-   inspected-snapshot return and writer-lease comparison; no test-policy bypass.
+1. Attribute exact terminal-release ambiguity/recovery after the demonstrated
+   saved NRT1 and actor ACK pair, using existing retained-family/publication
+   mechanisms. Clean `5750f0c2` portable main/harness and strict six-file
+   verification pass; scoped evidence reaches forwarded
+   `ReleaseManagementRecovery` timeout under the unchanged 1.8s local confirmation
+   bound, and the current quiet run still exhausts the outer 120s correctness cap.
+   Source protection of the latest hot NRT1 is not execution/reopen proof.
+   Full supported fixed-three native NRT1 exact retry/reopen remains a mandatory
+   open gate; no native release correction or archive-removal defect is established.
+   Preserve original work/clock/anchor,
+   journal-backed authorization, exact AOQ1/NRT1 retry, complete original-owner
+   retention and whole30 recovery. Remove temporary diagnostics after attribution,
+   fix only a demonstrated remaining cause, and freeze/rebuild current portable
+   hosts before the quiet public gate and remaining four selectors.
+   Preparation-only fsync component passes and supported image Local cuts do
+   not prove filesystem lifecycle durability or retrospectively attribute R39w.
+   Qualify public lost-result/whole locked-owner reopen, returning/all-cold pending
+   Install and actual Shared leader loss through normal startup. Pins-before-record,
+   first Intent stage, fresh initialization and locked reopen retain unchanged
+   whole **<=30s** recovery, actual inspected-snapshot return and writer-lease
+   comparison; no test-policy bypass.
 2. Requalify original-owner forwarded Install refusals (complete wrong-shadow
    upload and absent System root), positive completion/exact retry and genuine
    cumulative >256 public authorizations with unchanged checkpoint/recovery.
    Preserve signed owner/parent evidence, package limits and whole **<=30s**
    recovery. Automatic startup must pass; manual recovery loops are not proof.
-3. Freeze the resulting host corrections, rebuild the portable main with exact
-   provenance, and run M1
-   through ordinary packaged three-process CLI/HTTP: system actors ready,
-   image Local and external Shared Clerk, genuinely lost initial mutation
-   response, exact retry and restart/failover. Record demonstrated small workload
-   and a public steady-state phase/queue/VM/persistence probe. R39w verifies
-   current ordinary startup, exact Local Create resume and graceful cleanup,
-   but fails at Local Install before Shared workflow. Guest source remains
-   unchanged since the coherent reproduction; guest changes would require
-   renewed independent builds and coherent pins.
+3. Freeze the reviewed one-line ordinary CLI assertion correction, rebuild portable
+   main/harness with current clean provenance, review the wrapper `SCRIPT_SHA` and
+   rerun fresh ordinary three-process CLI/HTTP. Recorded `5750f0c2` reaches all three
+   ready and verified image Local Create/Install/Query/ACK, then stops at the
+   script's wrong empty-result shape; Shared/reopen remain unexecuted there.
+   Shell/archived-JSON/diff checks are not a rerun. Preserve authenticated Create/
+   Install/Invoke/read/denial, genuinely lost initial mutation response, exact
+   retry and restart/failover, and record the demonstrated small workload plus
+   public steady-state phase/queue/VM/persistence evidence. R39w remains frozen
+   historical evidence, not current acceptance. Guest source/pins remain unchanged;
+   guest changes require renewed independent builds and coherent pins.
 4. Progress through unchanged M2 retained-data/parity/resource/recovery/Agent
    backup gates, then locally possible M3 tooling and qualification. Hardware
    qualification remains explicitly open.
@@ -849,19 +895,24 @@ Separate forecasts and unknowns:
   its identical isolated rerun passed without changing limits. Its cause remains
   unattributed. These are preparation-only fsync test-store results, not native
   policy/issuance or follower-forwarding qualification.
-  Current `3b72eab6` portable main/harness take **391.301s / 453.172s**; recent
-  portable main/harness builds span about **3–8 minutes** each. Recorded durations are
-  high-confidence measurements at their source/toolchain boundaries; a predictive
-  **3–8 minutes per portable main/harness binary** range has moderate confidence because cache and source
-  deltas vary. Neither is an aggregate milestone estimate. Quiet/scoped public runs now reach exact
-  AOQ1 delivery and fail on authorize HTTP 503 after verified nonleader Install.
-  Scoped enum counts cannot yet attribute policy, issuer, ACK or terminal release,
-  and runtime client states were removed on fixture unwind. The preparation
-  component fix has progressed integration, but authorization/issuance remains
-  a blocking defect or qualification failure requiring stage/outcome evidence
-  before correction. No performance-only conclusion, engineering ETA or reliable
-  aggregate qualification range is established. Remaining cold recovery,
-  leader loss, cumulative pruning and ordinary CLI delivery may expose more work.
+  Current `5750f0c2` portable main/harness take **391.697s / 453.055s**.
+  Recorded durations are high-confidence measurements at their source/toolchain
+  boundaries; a predictive **3–8 minutes per portable main/harness binary** range
+  has moderate confidence because cache/source deltas vary. Neither is an
+  aggregate milestone estimate. Current quiet/scoped public runs still fail.
+  Scoped fixed-order evidence identifies forwarded terminal release timing out
+  after actor ACK and saved NRT1; earlier dispatch/ACK and initial credential-stage
+  failures remain preserved. Exact release ambiguity/recovery needs attribution,
+  and full fixed-three native NRT1 retry/reopen remains unqualified. Static latest-row/
+  root-fence protection does not justify an archive fix or prove execution.
+  The ordinary CLI run independently demonstrates Local happy-path completion
+  and a wrong script assertion; its source-only correction needs fresh execution,
+  current provenance and a reviewed runner hash. No Query retry proposal was used.
+  Counts alone do not bind episodes, and packaged-fixture client/native states
+  were removed on unwind. No guest-failure/performance-only conclusion, engineering
+  ETA or reliable aggregate qualification range is established. Remaining cold
+  recovery, leader loss, cumulative pruning and ordinary CLI delivery may expose
+  more work.
   No service-tuning pass was consumed.
 - **Packaging after correctness:** paired-role tooling/reproduction is
   implemented within the previous **4–8 source-hour** band. Corrected-source

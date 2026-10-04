@@ -102,44 +102,77 @@ Current O3 component evidence (logs under the native worktree's `target`):
 
 ### Current integration delta and blocking result
 
-Latest portable/public evidence is frozen at
-`3b72eab63ad4b55ede139a0819168d62758f67dd`, with
-production host correction `f9c61863` and its qualified journal/family tests.
-Portable main/harness **pass 391.301s / 453.172s** with empty RUSTFLAGS and
+Latest measured portable/diagnostic source is frozen at
+`5750f0c222880b01be7e9caae697403af85e810f`, with production recovery correction
+`f9c61863`, qualified journal/family tests and temporary existing-flag diagnostics.
+Portable main/harness **pass 391.697s / 453.055s** with empty RUSTFLAGS and
 encoded/target overrides unset; current main strict six-file verification
-**passes 0.101s**. Exact frozen hashes, clean source before/after, commands and
-owned-group completion are in
-`task-tmp/r41-cli-build-3b72eab6/provenance.json`. Authority, Catalog, both runtime
-roles and coherent guest component pins are unchanged. Typed retained-client
-context regressions remain qualified; zero-selection filters or component
-passes do not close M1.
+**passes 0.101s**. Exact copied hashes, clean source before/after, commands and
+owned-group completion are in `task-tmp/r41-cli-build-5750f0c2/provenance.json`.
+Authority, Catalog, both runtime roles and coherent guest pins are unchanged.
+Component/packaging passes do not close M1.
 
-Current quiet/scoped public runs **fail 377.199s / 450.086s** at the unchanged
+Current quiet/scoped public runs **fail 412.139s / 366.996s** at the unchanged
 **120s** bootstrap issuance correctness cap on **`/__agents/authorize` HTTP 503**,
-after verified nonleader Install **113.752s / 113.020s**. They progressed beyond
-the previous preparation failure to synchronized AOQ1 publication and exact
-retained authorization delivery. No decoded bootstrap Issued, mutation/lost
-response, Clerk positive ACK or whole locked-owner reopen is reached. Both are one
-executed failing test with owned group gone; the other four selectors and
-current ordinary CLI acceptance remain unexecuted.
+after verified nonleader Install **105.444s / 109.102s** respectively. Both are one
+executed failing test with owned group gone; later gates are not run. The initial
+same-source diagnostic **fails 429.670s** on **`/__agents/credential`** before
+native phases; keep that unattributed failure. Earlier `3b72eab6` failures stay
+frozen without any intervening public qualification pass.
 
-Scoped aggregates show preparation **Unavailable 1 / ScopeMismatch 7**, then
-authorization **Unavailable 5**. They do not distinguish policy, issuer, ACK or
-terminal release, and aggregate interleaved custody events do not prove episode
-identity. Absent CLI-linked test-only guest outcome blocks do not establish the
-guest result. The fixture asserts unchanged ATQ1 on failed attempts; ordinary
-client code synchronizes AOQ1 before authorize and loads the same bytes on retry
-without discovery, preparation or replacement signing. This source witness is
-not archived client-state inspection: `Scratch::drop` deletes the runtime tree
-on unwind. Private logs/results/provenance and the safe aggregate summary remain
-under `task-tmp/r41-packaged-five-3b72eab6` and
-`task-tmp/r41-public-scoped-3b72eab6`. Review narrow existing-stage/outcome
-attribution before any next fix; HTTP 503 alone establishes neither guest failure
-nor a performance-only cause. Temporary native-operation phase/outcome diagnostics
-are applied under the existing flag, source-reviewed and syntax-checked only,
-**unbuilt and unexecuted**. They provide attribution rather than quiet/SLA evidence
-and must be removed after the cause is established. No future source checkpoint
-or success is claimed. M1/M2/M3 remain open.
+The scoped v2 extractor accepts **216 native records / 0 unknown**: four dispatch
+Unavailable errors, two actor-ACK-pair errors, six authorization **CompletedDone**
+and two AOI1 **CompletedDone** outcomes. Counts alone cannot associate interleaved
+episodes. Single serial bootstrap source plus privately reviewed trace order
+establish attempt seven's actor ACK completion and NRT1 `retirement_save`
+completion before its forwarded `ReleaseManagementRecovery` ends in
+**local_custody_timeout at 1.873882s** under the unchanged **1.8s local
+confirmation bound**, separate from the outer 120s correctness cap. Fixed-order
+safe evidence supports that scoped sequence; the quiet run has no native phase
+records. This identifies the release-stage boundary without establishing its
+cause, a verdict on every earlier guest attempt or a performance-only diagnosis.
+Exact release ambiguity/recovery attribution using existing retained-family/
+NRT1/publication mechanisms is next; **no native terminal-release source correction is established yet**.
+Source audit of last-completed-row compaction protection and unreleased-root
+fences preserves the latest hot NRT1 exact-retry path; no archive-removal defect
+is demonstrated. This does not qualify **full supported fixed-three native NRT1
+exact retry/reopen**, which remains open.
+
+Source and fixture fences preserve ATQ1/AOQ1 retry without replacement discovery
+or signing. Packaged-fixture `Scratch::drop` removes client/native states on unwind;
+logs are not archived request or NRT1 inspection. No client-decoded bootstrap
+Issued, Clerk mutation/lost response, Clerk positive ACK or whole locked-owner
+reopen is reached. Evidence is
+`task-tmp/r41-public-stage-outcomes-5750f0c2{,-rerun}`, with safe summaries and
+private raw logs; current quiet evidence is under
+`task-tmp/r42-public-quiet-5750f0c2`. The scoped fixed-order artifact is
+`task-tmp/r41-public-stage-outcomes-5750f0c2-rerun/native-phase-order-safe.json`,
+SHA-256 `1101184e6260c8b05978247e6a58672ff4aa145057cfdc68ac26721e2b46c6ac`.
+It exports fixed-enum order, not archived native/client state. Earlier evidence
+remains under `task-tmp/r41-packaged-five-3b72eab6` and
+`task-tmp/r41-public-scoped-3b72eab6`.
+Diagnostics are compiled/exercised under the existing flag and unchanged fixture
+backend/profile/stack settings; timing is diagnostic only, not quiet,
+ordinary-default or SLA evidence. Remove them after attribution.
+The other four selectors, ordinary CLI acceptance and M1/M2/M3 remain open.
+
+Actual ordinary three-process CLI on recorded `5750f0c2` **fails 101.711s** at a
+script assertion after successful Local Query. First-ready stage **10.274s**,
+Local Create **13.839s**, Install **27.630s**, Query **46.307s**/exit 0: verified
+issued, delivery-retired, Done and direct value `"0x"`. Clerk `journal_id`
+returns `Vec<u8>`; `local_call` decodes Bytes to direct hex, while the script
+expected `{"Ok":"0x"}`. Shared is not reached. Cleanup **passes 0.941s** with three
+launch records, zero matching survivors and all source/artifact fences passing.
+Private ordinary-run evidence remains at `task-tmp/r42-current-actual-cli-5750f0c2`.
+Stage costs do not qualify whole recovery, SLA or the complete workflow.
+
+The applied one-line predicate `.result.value == "0x"` preserves issued/
+retired/Done checks. Shell syntax, archived actual JSON and diff checks pass;
+this is **source-only, not rerun**. No Query retry/endpoint proposal is applied.
+The recorded `5750f0c2` binary/original script demonstrate only the preceding Local slice.
+Freeze the correction, rebuild current portable provenance, review the runner
+`SCRIPT_SHA` and rerun fresh ordinary identities/roots. Earlier R39w stays
+source-frozen historical evidence; Shared/reopen and full acceptance remain open.
 
 Supported THREE-node BEFORE evidence now establishes the recovery-admission
 defect on this supported cut. Clean `61530b52` core builds **45.045s** after a preserved **20.727s**
@@ -189,12 +222,17 @@ failure remains unexplained; no deadline increase or tuning pass was consumed.
 Existing supported Admin registration-timeout compatibility on production
 `f9c61863` **passes 30.933s total / 8.385s whole30** through exact terminal retry
 and release, verifying preserved default Admin component semantics. The live
-plan owns exact evidence paths and dependency order. Attribute the current
-authorization substage, fix only a demonstrated remaining cause, and rerun quiet
-public acceptance on rebuilt hosts if changed before the four remaining
-selectors and actual CLI acceptance. Recorded build durations are high-confidence
-facts; a predictive **3–8 minutes per portable main/harness binary** range has moderate confidence from
-cache/source variation and is not an aggregate ETA. Earlier source/elapsed
+plan owns exact evidence paths and dependency order. Attribute exact terminal
+release ambiguity/recovery after the saved NRT1 witness and qualify full supported
+fixed-three native NRT1 exact retry/reopen. Latest-row/root-fence source protection
+is not execution proof and supplies no demonstrated archive fix. Current quiet
+acceptance still fails; fix only a demonstrated native cause and remove diagnostics.
+Separately freeze the demonstrated script assertion correction, rebuild current
+provenance/review runner hash, and rerun fresh ordinary CLI before crediting that
+slice. The source-only predicate change does not close the native gate. Recorded
+portable costs **391.697s / 453.055s** are high-confidence facts; a predictive
+**3–8 minutes per portable main/harness binary** range has moderate confidence
+from cache/source variation and is not an aggregate ETA. Earlier source/elapsed
 forecasts remain unreliable.
 No service-tuning pass was consumed.
 

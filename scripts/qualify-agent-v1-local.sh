@@ -351,7 +351,7 @@ start_all() {
 query() {
     local step=$1 persona=$2 agent=$3 port=$4
     run "$step" "$persona" space call-agent-actor "$name" "$agent" clerk-ledger journal_id --package "$clerk" --args '{}' --http "127.0.0.1:$port"
-    jq -e '.decision == "issued" and .delivery_retired == true and .result.status == "Done" and .result.value == {"Ok":"0x"}' "$evidence/logs/$step.stdout" >/dev/null || fail "$step did not complete the actual empty Clerk query/ACK"
+    jq -e '.decision == "issued" and .delivery_retired == true and .result.status == "Done" and .result.value == "0x"' "$evidence/logs/$step.stdout" >/dev/null || fail "$step did not complete the actual empty Clerk query/ACK"
 }
 start_all first
 run_lifecycle local-create a space create-local-agent "$name" --http "127.0.0.1:$((base_port+3))"
