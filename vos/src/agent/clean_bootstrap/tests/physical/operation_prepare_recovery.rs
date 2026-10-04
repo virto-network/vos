@@ -490,7 +490,7 @@ pub(super) fn exercise(
         assert_eq!(writes.load(Ordering::Acquire), 0);
         assert!(!coordinator_path.exists());
         assert!(!issuer_path.exists());
-        let hosted = host.lock().unwrap();
+        let mut hosted = host.lock().unwrap();
         // Genuine cold reopen can apply current-term metadata no-ops. Exact
         // family/opaque state and absent Invoke/ACK remain the cold boundary.
         if !cold_reopen { assert!(hosted.journal_position(agent).unwrap() == position_before); }
