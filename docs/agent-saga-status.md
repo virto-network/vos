@@ -100,6 +100,15 @@ The active diff closes demonstrated M1 defects, not new capabilities:
   Current debug CLI unit suite **passes 381 tests**, 52 ignored, **314.36s**
   (`release-observation-o3-open-startup-cli-unit-r38o.log`). Packaged recovery
   qualification follows this opening; the ignored fixtures are not passes.
+- Packaged public debug run R38p **fails 143.94s** during ordinary CLI Shared
+  Create: repeated HTTP 503 exhausts the existing 120s correctness retry cap;
+  Install/lost-response/reopen are not reached. R38q diagnostics show ready
+  dispatch and successful authorization/candidate/committee preparation, then
+  forwarded custody timeouts while the leader later commits publication and
+  finalization. Repeated guarded validation contributes measurable delay.
+  This is debug-host evidence, not an established release performance defect.
+  Run the isolated portable optimized fixture before changing code. Preserve
+  the existing forwarding and recovery bounds; no tuning pass is consumed.
 - Exact backend replay and ELF mapping identify nested genesis decoder stack use.
   Four boxed provision calls were insufficient; direct decode in the existing
   boxed helper removes the overlapping helper scratch frame. The uninstrumented

@@ -195,6 +195,17 @@ Current debug CLI unit suite **passes 381 tests**, 52 ignored, **314.36s**
 checks follow this opening; the ignored fixtures are not passes. M1 remains
 open; reproduction and component passes do not close it.
 
+The first opened-startup packaged public debug run
+`release-observation-o3-packaged-public-open-startup-r38p.log` **fails 143.94s**
+at ordinary CLI Shared Create: repeated HTTP 503 exhausts the existing 120s
+correctness retry cap, before Install or the lost-response seam. R38q existing
+diagnostics establish `retained_only=false`, successful authorization/candidate/
+committee/receipt recovery, then origin custody timeouts and eventual leader
+publication/finalization commits. Repeated guarded validation is a measured
+contributor; no guest failure is established by these HTTP errors. This debug
+host run requires isolated portable optimized confirmation before a release
+performance correction. All checks/deadlines remain; no tuning pass is consumed.
+
 The portable full CLI suite previously **passes 375 tests**, 52 ignored, 39.53s
 (`release-observation-o3-cli-unit-release-r37a.log`); that boundary predates the
 latest startup/decoder edits. Prior packaged failure timelines remain in
