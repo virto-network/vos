@@ -172,6 +172,20 @@ The active diff closes demonstrated M1 defects, not new capabilities:
   possible pre-NAD2 admin retention seam is a source hypothesis, not yet the
   established R39j cause. No observation bypass, authorization change, deadline
   increase or service-tuning pass is introduced.
+- Optimized harness R39l builds from clean `a1780e83` in **7m02s**, with empty
+  RUSTFLAGS and recorded provenance. Scoped public R39m **fails 457.34s**:
+  verified nonleader Install at cumulative **135506ms**, then the Clerk Operator
+  role grant exceeds its unchanged 120s correctness bound. All **88** visible
+  observation guests return `Done`; no guest refusal, non-completed outcome or
+  host refusal is recorded. Of **23** outer Unavailable refusals, eight follow
+  guest completion and fifteen have no adjacent completion. Associated guest
+  calls take **0.186–0.371s**; total coordination/apply/guard time is not yet
+  attributed. Custody timeout followed by later commit does not establish admin
+  finalization or terminal release. Lost mutation response/reopen remain
+  unreached. Temporary scoped guard diagnostics will distinguish the actual
+  freshness refusal without changing guard order, ownership or the **1.8s**
+  observation bound; remove them after attribution. Log:
+  `release-observation-o3-packaged-public-outcomes-r39m.log`.
 - The >256 fixture's final locked-owner reopen now measures from before all
   constructors through production attachment/readiness, retained handoff and
   exact archived native-result verification using one unchanged **30s** bound.
@@ -397,8 +411,10 @@ snapshot return and leased comparison remain mandatory.
 
 Remaining release work, in dependency order:
 
-1. Review and verify typed CLI transport causes and exact admin-claim retry
-   selection, then qualify the packaged public lost-result/reopen workflow and returning/all-cold
+1. Attribute the R39m observation/admin recovery refusal and fix only the
+   demonstrated cause. Typed CLI transport causes and exact admin-claim retry
+   selection pass focused checks; they do not resolve this later gate. Then
+   qualify the packaged public lost-result/reopen workflow and returning/all-cold
    pending Install. Exercise Pins-before-record, first Intent stage, fresh
    initialization and locked reopen through normal startup, with unchanged whole
    **<=30s** recovery and no test-policy bypass.
@@ -469,7 +485,9 @@ Separate forecasts and unknowns:
   correction passes focused checks and R39g reaches verified nonleader Install.
   R39f/R39g next exposed lost typed transport causes and one-shot role-grant
   fixture handling; their correction passes focused checks. R39j/R39k still
-  exceed existing public retry caps at admin/Install. The **2–6 elapsed-hour**
+  exceed existing public retry caps at admin/Install. R39m verifies nonleader
+  Install and visible guest completion but still exceeds the role-grant bound;
+  outer freshness and terminal recovery attribution remain open. The **2–6 elapsed-hour**
   execution band remains conditional and is not a reliable remaining estimate
   while failure attribution is open. Scoped diagnostics must distinguish guest,
   freshness and terminal completion before further source work; current evidence

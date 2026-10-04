@@ -178,6 +178,18 @@ impl SharedAgentNetworkHost {
         }
         let started = Instant::now();
         let deadline = started + ORDERED_REPLY_WAIT;
+        // TEMPORARY attribution only: remove after identifying this refusal.
+        // No request, credential, route identity or guest bytes are logged.
+        let diagnostics = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some();
+        let refused = |phase: &'static str, error: SharedAgentHostError| {
+            if diagnostics {
+                tracing::debug!(
+                    phase, ?error, elapsed_us = started.elapsed().as_micros(),
+                    "Authority observation guard refused"
+                );
+            }
+            error
+        };
         let attached = self
             .generations
             .get(&agent)
@@ -197,17 +209,19 @@ impl SharedAgentNetworkHost {
             .as_ref()
             .ok_or(SharedAgentHostError::TransportNotAttached)?;
         let initial = futures_executor::block_on(worker.snapshot())
-            .ok_or(SharedAgentHostError::Unavailable)?;
-        observation_configuration(&initial, &attached.fingerprint)?;
+            .ok_or_else(|| refused("pre_guest_initial_snapshot", SharedAgentHostError::Unavailable))?;
+        observation_configuration(&initial, &attached.fingerprint)
+            .map_err(|error| refused("pre_guest_initial_configuration", error))?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(SharedAgentHostError::Unavailable);
+            return Err(refused("pre_guest_barrier_deadline", SharedAgentHostError::Unavailable));
         }
         let input = AuthorityReadBarrierRequest { request };
         let barrier = if initial.role == vos_raft::Role::Leader {
             attached
                 .coordinator
-                .authority_read_barrier(input, local, remaining)?
+                .authority_read_barrier(input, local, remaining)
+                .map_err(|error| refused("pre_guest_local_barrier", error))?
         } else {
             let leader = initial
                 .leader_hint
@@ -222,16 +236,16 @@ impl SharedAgentNetworkHost {
                     input,
                 )
                 .recv_timeout(remaining)
-                .map_err(|_| SharedAgentHostError::Unavailable)?
-                .map_err(|_| SharedAgentHostError::Unavailable)?
-                .ok_or(SharedAgentHostError::Unavailable)?
+                .map_err(|_| refused("pre_guest_remote_delivery", SharedAgentHostError::Unavailable))?
+                .map_err(|_| refused("pre_guest_remote_response", SharedAgentHostError::Unavailable))?
+                .ok_or_else(|| refused("pre_guest_remote_missing", SharedAgentHostError::Unavailable))?
         };
         if barrier.request != request {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         loop {
             if Instant::now() >= deadline || attached.stale.load(Ordering::Acquire) {
-                return Err(SharedAgentHostError::Unavailable);
+                return Err(refused("pre_guest_freshness_wait", SharedAgentHostError::Unavailable));
             }
             // No host/proposal mutex crosses this worker mailbox operation.
             let snapshot = futures_executor::block_on(worker.snapshot())
@@ -298,23 +312,66 @@ impl SharedAgentNetworkHost {
             )?;
             let current = worker
                 .cached_snapshot()
-                .ok_or(SharedAgentHostError::Unavailable)?;
-            observation_term_matches(&current, &attached.fingerprint, local, barrier)?;
+                .ok_or_else(|| refused("pre_guest_snapshot", SharedAgentHostError::Unavailable))?;
+            observation_term_matches(&current, &attached.fingerprint, local, barrier)
+                .map_err(|error| refused("pre_guest_term_configuration", error))?;
             if Instant::now() >= deadline {
-                return Err(SharedAgentHostError::Unavailable);
+                return Err(refused("pre_guest_deadline", SharedAgentHostError::Unavailable));
             }
-            host.validate_observation_owner(agent)?;
-            let outcome = observe(&host)?;
+            host.validate_observation_owner(agent)
+                .map_err(|error| refused("pre_guest_owner", error))?;
+            if diagnostics {
+                tracing::debug!(
+                    phase = "callback_start", elapsed_us = started.elapsed().as_micros(),
+                    "Authority observation guard phase"
+                );
+            }
+            let outcome = observe(&host).map_err(|error| refused("callback", error))?;
             // Guest execution is bounded separately. A changed leader or
             // configuration during it discards this observation; no durable
             // query/result has been created and no cleanup proof is needed.
             let current = worker
                 .cached_snapshot()
-                .ok_or(SharedAgentHostError::Unavailable)?;
-            observation_term_matches(&current, &attached.fingerprint, local, barrier)?;
-            host.validate_observation_owner(agent)?;
-            if attached.stale.load(Ordering::Acquire) || Instant::now() >= deadline {
-                return Err(SharedAgentHostError::Unavailable);
+                .ok_or_else(|| refused("post_guest_snapshot", SharedAgentHostError::Unavailable))?;
+            observation_term_matches(&current, &attached.fingerprint, local, barrier)
+                .map_err(|error| {
+                    if diagnostics {
+                        let leader = match current.role {
+                            vos_raft::Role::Leader => Some(local),
+                            vos_raft::Role::Follower => current.leader_hint,
+                            _ => None,
+                        };
+                        tracing::debug!(
+                            phase = "post_guest_term_configuration", ?error,
+                            elapsed_us = started.elapsed().as_micros(),
+                            term_matches = current.current_term == barrier.raft_term,
+                            configuration_matches = current.active_config_index
+                                == Some(barrier.configuration_index),
+                            configuration_committed = current.active_config_index
+                                .is_some_and(|index| index <= current.commit_index),
+                            members_match = current.members == attached.fingerprint.voters,
+                            joint = current.joint_old.is_some(),
+                            retiring = current.retirement_final_index.is_some(),
+                            leader_matches = leader == Some(barrier.leader),
+                            "Authority observation guard refused"
+                        );
+                    }
+                    error
+                })?;
+            host.validate_observation_owner(agent)
+                .map_err(|error| refused("post_guest_owner", error))?;
+            // Preserve the original stale-first short circuit: one atomic
+            // read, then the existing deadline read only if not stale.
+            let stale = attached.stale.load(Ordering::Acquire);
+            if stale || Instant::now() >= deadline {
+                let phase = if stale { "post_guest_stale" } else { "post_guest_deadline" };
+                return Err(refused(phase, SharedAgentHostError::Unavailable));
+            }
+            if diagnostics {
+                tracing::debug!(
+                    phase = "complete", elapsed_us = started.elapsed().as_micros(),
+                    "Authority observation guard phase"
+                );
             }
             return Ok(outcome);
         }

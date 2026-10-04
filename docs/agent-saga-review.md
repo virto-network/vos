@@ -315,6 +315,21 @@ attribution. A pre-NAD2 admin retention seam remains a source hypothesis. No
 observation admission bypass, authorization, deadline or service-tuning change
 is introduced.
 
+Optimized harness R39l builds from clean `a1780e83` **pass 7m02s**, with empty
+RUSTFLAGS and recorded provenance. Scoped R39m **fails 457.34s**: verified
+nonleader Install at cumulative **135506ms**, then the Clerk Operator role grant
+exceeds the unchanged 120s correctness bound. All **88** visible observation
+guests return `Done`; no guest refusal, non-completed outcome or host refusal
+appears. Of **23** outer Unavailable refusals, eight follow guest completion and
+fifteen have no adjacent completion. Associated guest calls take
+**0.186–0.371s**, but total coordination/apply/guard time remains unattributed.
+Custody timeout followed by later commit does not establish admin finalization
+or terminal release. Lost mutation response/reopen are not reached. Review the
+temporary scoped guard labels and remove them after attribution; guard order,
+ownership and the **1.8s** observation bound remain unchanged. Evidence:
+`release-observation-o3-observation-outcome-cli-{build,provenance}-r39l.*` and
+`release-observation-o3-packaged-public-outcomes-r39m.log` under the shared target.
+
 The final >256 locked-owner reopen now includes all constructors/attachments,
 readiness and exact archived native-result verification under one unchanged
 30s deadline, including both HTTP retries and post-call elapsed checks. Source
