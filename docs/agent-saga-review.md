@@ -10,10 +10,11 @@ frozen and cannot qualify later source.
 
 ## Boundary and release claim
 
-The review branch remains `e6f2bb45` on `saga/agents`. Immutable replacement
-source is `8128e677` on `wip/ch08-runtime-directory`, with the reproduced role
-bundle at `7085c220`; inspect the subsequent packaged integration diff as well.
-These commits are not a release promotion.
+The review branch remains `e6f2bb45` on `saga/agents`. Original replacement
+source `8128e677` and its role bundle `7085c220` precede the corrected integration
+source frozen at `2e19cd17` on `wip/ch08-runtime-directory`. Inspect the coherent
+artifact repin and subsequent qualification delta as well. These checkpoints
+are not a release promotion.
 Verify actual heads and cleanliness before assuming fast-forward promotion.
 `master` remains `d2378274`. No released fixed-three workflow or service capacity
 is qualified by this diff yet.
@@ -39,8 +40,8 @@ approved **fresh v1 spaces**, including System/control and Shared roots.
 Old experimental spaces remain untouched and unsupported by the new binary;
 migration, reset and mixed-generation Local rebinding are not authorized.
 
-O1/O2 and O3 removal are implemented; the current integration diff is not yet a
-frozen qualified checkpoint. Explicit signed image opt-in, Observe tag 5,
+O1/O2 and O3 removal are implemented; corrected integration source is frozen,
+with released workflow qualification still open. Explicit signed image opt-in, Observe tag 5,
 non-retaining guest execution/no-effects policy, opaque host purity validation,
 authenticated ReadIndex/apply-through and exact SAC7 System contract binding
 exist. Complete consumer cutover and read-lifecycle deletion are present;
@@ -99,7 +100,7 @@ Current O3 component evidence (logs under the native worktree's `target`):
 
 ### Current integration delta and blocking result
 
-The active diff is not a frozen checkpoint. These changes close demonstrated
+Corrected source `2e19cd17` freezes these changes, which close demonstrated
 M1 defects without changing authorization, wire bounds or deadlines:
 
 - Ambiguous publication exact retry re-admits the original leased stores.
@@ -170,6 +171,14 @@ plus prior System runtime component evidence. Isolated quiet confirmation
 Coherent signed-artifact reproduction precedes cutover. Packaged recovery and M1
 remain open. Temporary guest/host probes and private-input capture helpers have
 been removed; regression coverage and disk evidence remain.
+
+`release-observation-o3-coherent-role-reproduction-r38j.log` passes two independent
+builds from corrected `2e19cd17`: System/Shared runtime ELFs and programs, all four
+signed templates and signed Clerk bytes match. Detailed evidence is
+`target/agent-release-reproduction/run.1JsTwa` under the native worktree. The coherent
+repin preserves Local's canonical image runtime. The artifact-bearing builder
+checkpoint, strict six-file verification and packaged recovery still precede
+normal startup admission; reproduction alone does not close M1.
 
 The portable full CLI suite previously **passes 375 tests**, 52 ignored, 39.53s
 (`release-observation-o3-cli-unit-release-r37a.log`); that boundary predates the

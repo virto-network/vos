@@ -24,10 +24,12 @@ Acceptance uses packaged artifacts and ordinary authenticated identities, not
 test signers, environment-only guests, fake quorum or hand-edited journals.
 A small vertical slice proves integration only, not capacity or service targets.
 
-Review branch: `e6f2bb45` on `saga/agents`. The immutable replacement source is
-`8128e677` on `wip/ch08-runtime-directory`; its independently reproduced role
-bundle is frozen at `7085c220`. Packaged integration edits are active in that
-worktree. Neither commit is a release promotion.
+Review branch: `e6f2bb45` on `saga/agents`. Original replacement source `8128e677`
+and its role bundle `7085c220` precede the decoder/integration correction.
+Corrected source is frozen at `2e19cd17` on `wip/ch08-runtime-directory`;
+two independent builds match both runtime roles, Authority, Catalog and signed
+Clerk bytes. The coherent pin update is active in that worktree. These
+checkpoints are not a release promotion.
 Verify actual heads/cleanliness before assuming promotion.
 `master` remains `d2378274`. No push, master change, artifact pin promotion or
 deployment is automatic.
@@ -48,16 +50,17 @@ is no legacy-read fallback or further expiry/finality extension. Do not add
 management Busy, change signed mutation windows/deadlines, or clear old spaces.
 
 Bundled role materialization and strict six-file release verification are
-implemented. Independent builds from `8128e677` match byte-for-byte for both
-roles, Authority and Catalog. Exact signed role pins are staged; ordinary
+implemented. Independent builds from corrected `2e19cd17` match byte-for-byte for
+both roles, Authority, Catalog and signed Clerk. Exact signed role pins are staged; ordinary
 fixed-three startup remains closed pending packaged-plan checks and recovery
 qualification. Exact Catalog closure and retained-plan target selection are
 implemented and their focused refusal tests pass. CLI defaults select existing
-external-state components for Shared, without changing image Local. Reproduction's frozen builder revision
-now points to artifact-bearing `7085c220`; the full frozen bundle check passes.
-That reproduction predates the current decoder correction; the rebuilt Authority
-guest has component evidence only and needs coherent signed artifacts and renewed
-reproduction before cutover. The existing enrollment/common-genesis and Shared Create/admit/Install/call/resume
+external-state components for Shared, without changing image Local. R38j
+reproduction evidence is `release-observation-o3-coherent-role-reproduction-r38j.log`
+and `target/agent-release-reproduction/run.1JsTwa` under the native worktree.
+The artifact-bearing builder checkpoint and strict six-file verification must
+follow the coherent repin; the old `7085c220` full bundle check cannot qualify it.
+The existing enrollment/common-genesis and Shared Create/admit/Install/call/resume
 CLI are reused; no new CLI/signing framework is needed. A direct three-process
 CLI acceptance script is prepared but not yet run; it does not claim load,
 hardware, mutation-loss or non-root qualification.
@@ -93,7 +96,7 @@ The active diff closes demonstrated M1 defects, not new capabilities:
 The portable full CLI suite previously passed **375 tests**, 52 ignored, 39.53s;
 that boundary predates the latest startup/decode changes and cannot qualify them.
 No new authorization, deadline, memory limit, fallback or release promotion is
-approved. Current source is not a new frozen checkpoint.
+approved. Corrected source is frozen; its released workflow is not qualified.
 
 ## Approved replacement: contract and acceptance
 
