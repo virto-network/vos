@@ -244,3 +244,8 @@ hkdf = "0.12"
 aes-gcm = { version = "0.10", features = ["aes", "alloc"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 trybuild = "1"
+
+[[example]]
+name = "clerk_corpus_public"
+# Normal JSON CLI replies use the existing host ingress dependency surface.
+required-features = ["std", "http-ingress"]

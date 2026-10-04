@@ -3,6 +3,166 @@
 
 use super::*;
 use crate::agent::shared_journal_driver::CleanInvocationReplayRequest;
+use crate::agent::shared_recovery::management::SharedManagementRecoverySlot;
+
+fn management_operation_wait_member<'a>(
+    slot: Option<&'a SharedManagementRecoverySlot>,
+    retained: &ManagementRecoveryOperationRequest,
+) -> Result<(&'a SharedManagementRecoverySlot, usize), SharedAgentHostError> {
+    let slot = slot.ok_or(SharedAgentHostError::ScopeMismatch)?;
+    let index = slot
+        .members()
+        .iter()
+        .position(|member| member.commitment().0 == retained.member.0)
+        .ok_or(SharedAgentHostError::ScopeMismatch)?;
+    if slot.registration().commitment().0 != retained.registration.0 {
+        // A delayed signed extension can replace the owner's registration
+        // while this exact member waits on peer I/O. Do not authorize the old
+        // digest against its successor: retry from a fresh local manifest.
+        // Missing or substituted members remain permanent scope refusals.
+        return Err(SharedAgentHostError::Conflict);
+    }
+    Ok((slot, index))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::clean_management_intent::ManagementJournalAnchor;
+    use crate::agent::journal::OrderedBase;
+    use crate::agent::shared_commit::ReplicaCommitSignature;
+    use crate::agent::shared_recovery::{
+        management_node_for_test, management_observation_for_test,
+        management_recovery_fixture_for_test,
+    };
+    use ed25519_dalek::{Signer as _, SigningKey};
+
+    #[test]
+    fn delayed_registration_extension_retries_exact_member_without_accepting_old_scope() {
+        let root = management_recovery_fixture_for_test(1, 9);
+        let observed = management_observation_for_test(&root, 2, false);
+        let anchor = ManagementJournalAnchor {
+            genesis: root.generation().genesis(),
+            admission: root.generation().admission(),
+            runtime: observed.observation().input().runtime.commitment(),
+            ordered: OrderedBase::post_genesis(),
+        };
+        let member =
+            SharedManagementRecoveryMember::new(None, anchor.clone(), root.envelope().clone())
+                .unwrap();
+        let sign = |request: SharedManagementRecoveryRegistrationRequest| {
+            let signature = ReplicaCommitSignature::new(
+                root.owner(),
+                SigningKey::from_bytes(&[1; 32])
+                    .sign(&request.signing_message().0)
+                    .to_bytes(),
+            )
+            .unwrap();
+            SharedManagementRecoveryRegistration::new(request, signature).unwrap()
+        };
+        let first = sign(
+            SharedManagementRecoveryRegistrationRequest::new(
+                root.generation(),
+                root.committee(),
+                root.owner(),
+                root.owner(),
+                1,
+                None,
+                vec![member.clone()],
+            )
+            .unwrap(),
+        );
+        let mut manifest = crate::agent::shared_recovery::management_manifest_for_test();
+        manifest.apply_management_registration(&first, 1, 3).unwrap();
+        manifest.observe(&observed).unwrap();
+        let in_flight = ManagementRecoveryOperationRequest {
+            registration: Hash(first.commitment().0),
+            member: Hash(member.commitment().0),
+            operation: ManagementRecoveryOperation::Invoke,
+        };
+        let before = manifest.management_slot(root.owner()).unwrap();
+        assert_eq!(
+            management_operation_wait_member(Some(before), &in_flight)
+                .unwrap()
+                .1,
+            0,
+        );
+        let original_evidence = before.members_evidence()[0].invoke().unwrap().clone();
+        let child = management_recovery_fixture_for_test(1, 10);
+        let child_member = SharedManagementRecoveryMember::new(
+            Some(member.commitment()),
+            anchor.clone(),
+            child.envelope().clone(),
+        )
+        .unwrap();
+        let extension = sign(
+            SharedManagementRecoveryRegistrationRequest::new(
+                root.generation(),
+                root.committee(),
+                root.owner(),
+                root.owner(),
+                2,
+                Some(before.commitment()),
+                vec![member.clone(), child_member],
+            )
+            .unwrap(),
+        );
+        // Apply the genuine signed prefix extension after the origin selected
+        // its request, just as a timed-out metadata delivery can finish later.
+        manifest
+            .apply_management_registration(&extension, 3, 3)
+            .unwrap();
+        let current = manifest.management_slot(root.owner()).unwrap();
+        assert_eq!(current.origin_owner(), root.owner());
+        assert_eq!(
+            management_operation_wait_member(Some(current), &in_flight).unwrap_err(),
+            SharedAgentHostError::Conflict,
+        );
+        let fresh = ManagementRecoveryOperationRequest {
+            registration: Hash(extension.commitment().0),
+            ..in_flight.clone()
+        };
+        let (slot, index) = management_operation_wait_member(Some(current), &fresh).unwrap();
+        assert_eq!(slot.members()[index].envelope(), root.envelope());
+        assert_eq!(
+            slot.members_evidence()[index].invoke(),
+            Some(&original_evidence),
+        );
+        assert_eq!(
+            original_evidence.input_id(),
+            observed.observation().input_id(),
+        );
+        assert_eq!(
+            original_evidence.outcome(),
+            observed.observation().outcome(),
+        );
+
+        assert_eq!(
+            management_operation_wait_member(
+                manifest.management_slot(management_node_for_test(2)),
+                &fresh,
+            )
+            .unwrap_err(),
+            SharedAgentHostError::ScopeMismatch,
+        );
+        let mut wrong_anchor = anchor;
+        wrong_anchor.runtime = crate::service::Hash([0xf1; 32]);
+        let substituted =
+            SharedManagementRecoveryMember::new(None, wrong_anchor, root.envelope().clone())
+                .unwrap();
+        for wrong_member in [Hash::ZERO, Hash(substituted.commitment().0)] {
+            let wrong = ManagementRecoveryOperationRequest {
+                // Changed registration cannot hide a missing or changed member.
+                member: wrong_member,
+                ..in_flight.clone()
+            };
+            assert_eq!(
+                management_operation_wait_member(Some(current), &wrong).unwrap_err(),
+                SharedAgentHostError::ScopeMismatch,
+            );
+        }
+    }
+}
 
 impl SharedRouteHandler {
     pub(super) fn management_leader(
@@ -661,25 +821,20 @@ impl SharedRouteHandler {
             let manifest = host
                 .recovery_manifest(self.agent)
                 .map_err(|error| refused("wait_manifest_error", error))?;
-            let slot = manifest
-                .management_slot(crate::service::NodeId(self.network.agent_node_id().0))
-                .filter(|slot| slot.registration().commitment().0 == retained.registration.0)
-                .ok_or_else(|| {
-                    refused(
-                        "wait_registration_scope_error",
-                        SharedAgentHostError::ScopeMismatch,
-                    )
-                })?;
-            let index = slot
-                .members()
-                .iter()
-                .position(|member| member.commitment().0 == retained.member.0)
-                .ok_or_else(|| {
-                    refused(
-                        "wait_member_scope_error",
-                        SharedAgentHostError::ScopeMismatch,
-                    )
-                })?;
+            let (slot, index) = management_operation_wait_member(
+                manifest.management_slot(crate::service::NodeId(self.network.agent_node_id().0)),
+                &retained,
+            )
+            .map_err(|error| {
+                refused(
+                    if error == SharedAgentHostError::Conflict {
+                        "wait_registration_changed"
+                    } else {
+                        "wait_member_scope_error"
+                    },
+                    error,
+                )
+            })?;
             let evidence = match operation {
                 ManagementRecoveryOperation::Invoke => slot.members_evidence()[index].invoke(),
                 ManagementRecoveryOperation::Acknowledge => {

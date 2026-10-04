@@ -43,7 +43,7 @@ deployment is automatic.
 | External storage/restore | Incremental executor, immutable closure, ACX1 publication and exact marker retirement exist. | Historical optimized reopen/crash-cut slices pass; the released workflow must requalify. |
 | System management recovery | Parent retention, immutable MRQ2 first-owner binding, exact mutation evidence, signed terminal release and recovery remain. | Isolated optimized offline-pruning test **passes 419.04s**: restore, exact Create/Install, checkpoint/pruning, ACK and custody release. Install finalization **21.588s** meets unchanged 30s. Earlier contended 32.979s failure remains recorded, not waived or tuned away. Returning/all-cold Shared pending-Install remain unqualified. |
 | Member/public management | Packaged PublicWorkflow selects exact bundled roles and ordinary CLI Create. Ambiguous publication re-admits the original leased stores before exact retry. Finalization retains publication protection and verifies fresh decision state before exact terminal cleanup. Packaged reopen helpers explicitly use normal startup admission. Provision components use the existing boxed decoder, whose direct decode removes an extra by-value scratch frame without changing wire, validation or limits. | Native genesis checks **15 passed, 0.19s**. Expanded exact-finalization retry on independently reproduced coherent components **passes 96.21s** (`release-observation-o3-coherent-finalization-physical-r38n.log`), with unchanged 30s phase bounds. The fixture uses ordinary signed Admin Invoke/ACK to enroll its API observation credential and verifies refusal before enrollment. Source and six-file bundle reproduction pass. Install/lost-result/reopen, packaged cold recovery and actual three-process acceptance remain open. |
-| Service/operations | Offline signed corpus generator and read-only hardware collector exist. | Public retained loading, backup/restore, overload, soak, artifacts and hardware qualification remain open. |
+| Service/operations | Offline signed corpus generator, bounded public corpus loader and read-only hardware collector exist. Loader resumes exact private ATQ1 through existing CLI/ASR1 verification and independently replays accepted seeds/order for all six maps. | Loader tooling tests **7 passed, 0.10s**; it has not executed public data. M1 setup and pre-granted signed Clerk Operator/Member roles are prerequisites. Public retained loading, resources/recovery, backup/restore, overload, soak and hardware qualification remain open. |
 
 R36y is the frozen, superseded legacy-read diagnostic boundary, not qualification
 of this replacement. The review guide points to its archived evidence; there
@@ -65,9 +65,9 @@ verification passes (`release-observation-o3-coherent-full-pinned-reproduction-r
 evidence `target/agent-release-reproduction/run.ykT3eh` under the native worktree).
 The old `7085c220` full bundle check cannot qualify later source.
 The existing enrollment/common-genesis and Shared Create/admit/Install/call/resume
-CLI are reused; no new CLI/signing framework is needed. A direct three-process
-CLI acceptance script is prepared but not yet run; it does not claim load,
-hardware, mutation-loss or non-root qualification.
+CLI are reused; no new CLI/signing framework is needed. The direct three-process
+CLI acceptance script's first run R38u is unresolved as recorded below; it does
+not claim load, hardware, mutation-loss or non-root qualification.
 
 The active diff closes demonstrated M1 defects, not new capabilities:
 
@@ -107,8 +107,39 @@ The active diff closes demonstrated M1 defects, not new capabilities:
   forwarded custody timeouts while the leader later commits publication and
   finalization. Repeated guarded validation contributes measurable delay.
   This is debug-host evidence, not an established release performance defect.
-  Run the isolated portable optimized fixture before changing code. Preserve
-  the existing forwarding and recovery bounds; no tuning pass is consumed.
+  Portable current main and test harness R38r each build in about seven minutes
+  with empty RUSTFLAGS. Optimized R38s completes Create but **fails 212.17s** at
+  the first nonleader Install HTTP 503. It had not resumed the retained SIQ1.
+  Optimized scoped diagnostics R38t **fail 53.18s** earlier: a delayed signed
+  registration extension replaces the owner slot while an exact root retry is
+  in flight, producing a permanent registration ScopeMismatch. This is a
+  demonstrated retry race, not proof of guest failure or a solved timing gate.
+  The narrow origin correction authenticates the current same-owner exact
+  member, then returns Conflict before reading evidence if registration changed;
+  the receiver still refuses the stale digest. A signed-manifest regression
+  passes, including exact retained result and wrong owner/member/anchor refusals.
+  The packaged Install fixture now resumes the normal CLI operation and asserts
+  its unchanged retained root/SIQ1 within the existing 120s correctness cap.
+  The corrected portable integrated workflow remains unqualified. Preserve
+  forwarding/recovery bounds; no service-tuning pass is consumed.
+- First actual three-process CLI run R38u uses the provenance-recorded portable
+  binary and exact six-file bundle. Readiness passes **9.744s**, then initial
+  Local Create returns an ambiguous HTTP 503 after **10.776s**. The script exits
+  without normal --resume, so this is not evidence of a persistent Local defect.
+  All owned processes exited; one worker reports InvalidConfiguration during
+  simultaneous shutdown, after peers begin stopping. Exact CLI resume and
+  cleanup qualification remain open; private evidence is preserved.
+- The script now fences the fresh operation and every retained client file
+  before normal --resume; all attempts share its existing whole 180s command
+  budget. Signed denials and invalid inputs fail. Shell/Python syntax checks
+  pass; actual corrected-script delivery and cleanup remain unqualified.
+- `vos/examples/clerk_corpus_public.rs` prepares M2's public retained loader via
+  existing invoke/submit CLI commands, with stable intents, exact result checks,
+  durable verification identities and six-map accepted-context reference replay.
+  Its host-only opt-in uses existing std/http-ingress features. Independent
+  source review and seven focused tests pass (`release-observation-o3-public-corpus-tool-tests-r38v.log`);
+  the interrupted cold debug build is not evidence. No corpus has been publicly
+  loaded; signed resource, backup/recovery and full-data qualification remain open.
 - Exact backend replay and ELF mapping identify nested genesis decoder stack use.
   Four boxed provision calls were insufficient; direct decode in the existing
   boxed helper removes the overlapping helper scratch frame. The uninstrumented
@@ -343,8 +374,16 @@ Separate forecasts and unknowns:
   deeper scratch-frame overlap; fixing it exposed a missing fixture credential,
   which was enrolled through the existing signed Admin path. The immediate
   diagnostic/fix/retest forecast was **2–6 engineering hours**, low confidence,
-  excluding reproduction and packaged qualification. R38h now passes; the next
-  uncertainty is coherent packaged recovery. No service-tuning pass was consumed.
+  excluding reproduction and packaged qualification. Coherent finalization
+  and reproduction now pass, but public qualification exposed the delayed
+  registration succession race and single-attempt fixture/script assumptions.
+  The focused remaining correction/review band is **1–4 source hours**,
+  medium-low confidence, plus **2–6 elapsed hours** of isolated M1 execution if
+  no further defect appears. This is not a combined M1/M2/M3 forecast.
+  Optimized R38r main and harness builds each take about seven minutes;
+  R38s/R38t and first CLI failure establish the current variance. Cold recovery,
+  actual leader-loss coverage, cumulative pruning and cleanup may expose more
+  work. No service-tuning pass was consumed.
 - **Packaging after correctness:** paired-role tooling/reproduction is
   implemented within the previous **4–8 source-hour** band. Corrected-source
   independent builds and strict frozen-builder bundle verification pass;

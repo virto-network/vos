@@ -123,7 +123,7 @@ pub(super) fn exercise(
         .unwrap();
     returned_follower(networks, enrollments, record, leader);
     let address = listen(&mut nodes[0], "public-clerk-origin-follower");
-    let args = commands::shared_operation::InstallSharedArgs {
+    let mut args = commands::shared_operation::InstallSharedArgs {
         space: "explicit-public-workflow".into(),
         agent: hex::encode(agent.0),
         package: Some(package_path),
@@ -132,16 +132,37 @@ pub(super) fn exercise(
         http: None,
         resume: false,
     };
-    let disposition = commands::shared_operation::install_shared_for_test(
-        &data[0],
-        address,
-        operator,
-        space,
-        node_public,
-        agent,
-        &args,
-    )
-    .expect("real CLI nonleader Shared Install");
+    let mut retained_install = None;
+    let disposition = super::member_handoff::retry_exact("real CLI nonleader Shared Install", || {
+        let result = commands::shared_operation::install_shared_for_test(
+            &data[0],
+            address,
+            operator,
+            space,
+            node_public,
+            agent,
+            &args,
+        );
+        // An unavailable reply leaves the ordinary CLI reservation pending.
+        // Resume that operation, retaining its nonce and every signed SIQ1
+        // byte, rather than requiring the first transport attempt to succeed.
+        args.resume = true;
+        let root = current_operation(&data[0], space, &identity);
+        let mut request = commands::clean_store::CleanSharedInstallFile::open_or_create(
+            root.join("request"),
+        )
+        .unwrap();
+        if let Some(bytes) = request.load_request().unwrap() {
+            match &retained_install {
+                Some((previous_root, previous_bytes)) => {
+                    assert_eq!(&root, previous_root);
+                    assert_eq!(&bytes, previous_bytes);
+                }
+                None => retained_install = Some((root, bytes)),
+            }
+        }
+        result
+    });
     let SharedInstallDisposition::Applied(ack) = disposition else {
         panic!("real public Clerk Install did not apply: {disposition:?}")
     };

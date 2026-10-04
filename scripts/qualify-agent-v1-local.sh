@@ -8,7 +8,7 @@ set -euo pipefail
 umask 077
 fail() { echo "qualification refused: $*" >&2; exit 1; }
 (( $# == 6 )) || fail "expected VOSX SHA256 RELEASE_DIR CLERK_PACKAGE FRESH_EVIDENCE_DIR BASE_PORT"
-for tool in realpath stat id sha256sum install mkdir jq curl ss timeout date awk sed env dirname ls wc sleep; do
+for tool in realpath stat id sha256sum install mkdir jq curl ss timeout date awk sed env dirname ls wc sleep python3; do
     command -v "$tool" >/dev/null || fail "missing $tool"
 done
 while IFS= read -r variable; do
@@ -81,18 +81,169 @@ owned_live() {
     state=${identity#* }
     [[ ${identity%% *} == "$2" && $state != Z && $state != X && $state != x ]]
 }
-cli() {
-    local persona=$1; shift
-    timeout --signal=TERM --kill-after=10s 180s env XDG_DATA_HOME="$evidence/$persona/data" XDG_CONFIG_HOME="$evidence/$persona/config" \
+cli_bounded() {
+    local persona=$1 duration=$2; shift 2
+    timeout --signal=TERM --kill-after=10s "$duration" env XDG_DATA_HOME="$evidence/$persona/data" XDG_CONFIG_HOME="$evidence/$persona/config" \
         XDG_CACHE_HOME="$evidence/$persona/cache" TMPDIR="$evidence/tmp" VOSX_DISABLE_MDNS=1 \
         RUST_LOG=info "$binary" --format json "$@"
 }
+cli() { local persona=$1; shift; cli_bounded "$persona" 180s "$@"; }
 run() {
     local step=$1 persona=$2 started code=0; shift 2
     started=$(date +%s%3N)
     cli "$persona" "$@" > "$evidence/logs/$step.stdout" 2> "$evidence/logs/$step.stderr" || code=$?
     printf '%s\t%s\t%s\t%s\n' "$step" "$started" "$(( $(date +%s%3N) - started ))" "$code" >> "$evidence/timings.tsv"
     (( code == 0 )) || fail "$step failed ($code); inspect retained logs"
+}
+monotonic_ms() { python3 -c 'import time; print(time.monotonic_ns() // 1_000_000)'; }
+lifecycle_fence() {
+    # These private hashes are a delivery fence, not a wire/authentication
+    # decoder. The ordinary CLI still validates Space, credential, nonce and
+    # signed request. This fresh persona has one serialized client operation.
+    python3 - "$1" "$evidence/$2/space/agent-client" "$space_id" "$evidence/logs/$3.binding.json" "$3.request" <<'PY'
+import hashlib, json, re, sys
+from pathlib import Path
+
+mode, client_path, space, state_path, request_name = sys.argv[1:]
+client, state_file = Path(client_path), Path(state_path)
+
+def refuse():
+    raise SystemExit("qualification refused: lifecycle operation binding changed; inspect private evidence")
+
+def entries(directory):
+    if not directory.exists():
+        return []
+    if directory.is_symlink() or not directory.is_dir():
+        refuse()
+    values = list(directory.iterdir())
+    if any(value.is_symlink() for value in values):
+        refuse()
+    return values
+
+def digest(path):
+    if path.is_symlink() or not path.is_file():
+        refuse()
+    value = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            value.update(chunk)
+    return value.hexdigest()
+
+def files(directory):
+    result = {}
+    for path in entries(directory):
+        if path.name == "lock":
+            continue
+        if path.is_dir():
+            for name, value in files(path).items():
+                result[f"{path.name}/{name}"] = value
+        else:
+            result[path.name] = digest(path)
+    return result
+
+operations = entries(client / "operations")
+if any(not path.is_dir() or not re.fullmatch(r"[0-9a-f]{64}-[0-9a-f]{64}", path.name) for path in operations):
+    refuse()
+names = sorted(path.name for path in operations)
+claims = entries(client / "credentials")
+if len(claims) > 1 or any(not path.is_dir() or not re.fullmatch(space + r"-[0-9a-f]{64}", path.name) for path in claims):
+    refuse()
+if mode == "begin":
+    state = {"before": names, "operation": None, "claim": None, "claim_files": {}, "files": {}}
+else:
+    state = json.loads(state_file.read_text())
+    if state["operation"] is None:
+        added = set(names) - set(state["before"])
+        if mode != "bind" or len(added) != 1 or set(state["before"]) - set(names):
+            refuse()
+        state["operation"] = added.pop()
+        credential = state["operation"].split("-")[0]
+        if len(claims) != 1 or claims[0].name != f"{space}-{credential}":
+            refuse()
+        state["claim"] = claims[0].name
+        state["claim_files"] = files(claims[0])
+        if not state["claim_files"] or not any(name.startswith("credential.reservation") for name in state["claim_files"]):
+            refuse()
+    if names != sorted(state["before"] + [state["operation"]]) or len(claims) != 1 or claims[0].name != state["claim"]:
+        refuse()
+    claim_files = files(claims[0])
+    if mode != "success" and claim_files != state["claim_files"]:
+        refuse()
+    current = files(client / "operations" / state["operation"])
+    if any(current.get(name) != value for name, value in state["files"].items()):
+        refuse()
+    other_requests = {"local-create.request", "local-install.request", "shared-create.request", "shared-install.request"} - {request_name}
+    if any(Path(name).name in other_requests for name in current):
+        refuse()
+    if f"request/{request_name}" not in current and "query/credential.query" not in current:
+        refuse()
+    state["files"] = current
+    if mode == "success":
+        state["claim_files"] = claim_files
+state_file.write_text(json.dumps(state, sort_keys=True) + "\n")
+PY
+}
+lifecycle_retryable() {
+    python3 - "$1" <<'PY'
+import json, re, sys
+from pathlib import Path
+try:
+    error = json.loads(Path(sys.argv[1]).read_text().splitlines()[-1])
+    if not isinstance(error, dict):
+        raise TypeError()
+    message = error["error"]
+except (OSError, IndexError, KeyError, ValueError, TypeError):
+    raise SystemExit(1)
+if error.get("code") != 1 or not isinstance(message, str):
+    raise SystemExit(1)
+if re.search(r"signed denial|verified terminal|denied;|invalid |malformed|corrupt|oversized", message, re.I):
+    raise SystemExit(1)
+status = re.search(r"\bstatus code (\d{3})\b", message)
+if status:
+    raise SystemExit(0 if status[1] in {"409", "429", "503", "504"} else 1)
+transport = re.search(r"network error|connection failed|connection refused|connection reset|timed out|timeout|unexpected end of file|broken pipe", message, re.I)
+retained = re.search(r"request retained|retry the identical retained credential query", message, re.I)
+loopback = re.search(r"http://127\.0\.0\.1:\d+(?:/|:)", message)
+raise SystemExit(0 if transport and (retained or loopback) else 1)
+PY
+}
+run_lifecycle() {
+    local step=$1 persona=$2 started clock_start deadline now attempt=0 code=0 duration attempt_started attempt_clock remaining
+    local -a resume=()
+    shift 2
+    clock_start=$(monotonic_ms); started=$(date +%s%3N); deadline=$((clock_start + 180000))
+    lifecycle_fence begin "$persona" "$step"
+    while true; do
+        now=$(monotonic_ms); remaining=$((deadline - now))
+        # Keep the existing ten-second CLI termination grace inside the whole
+        # step bound. Every attempt uses only the remaining budget.
+        (( remaining > 10000 )) || fail "$step has no CLI budget left within its existing 180s command bound; inspect retained attempts"
+        if (( attempt > 0 )); then lifecycle_fence verify "$persona" "$step"; fi
+        now=$(monotonic_ms); remaining=$((deadline - now - 10000))
+        (( remaining > 0 )) || fail "$step has no CLI budget left within its existing 180s command bound; inspect retained attempts"
+        printf -v duration '%d.%03ds' "$((remaining / 1000))" "$((remaining % 1000))"
+        ((attempt+=1)); code=0; attempt_started=$(date +%s%3N); attempt_clock=$(monotonic_ms)
+        cli_bounded "$persona" "$duration" "$@" "${resume[@]}" > "$evidence/logs/$step.attempt-$attempt.stdout" 2> "$evidence/logs/$step.attempt-$attempt.stderr" || code=$?
+        now=$(monotonic_ms)
+        printf '%s.attempt-%s\t%s\t%s\t%s\n' "$step" "$attempt" "$attempt_started" "$((now - attempt_clock))" "$code" >> "$evidence/timings.tsv"
+        install -m 0600 -- "$evidence/logs/$step.attempt-$attempt.stdout" "$evidence/logs/$step.stdout"
+        install -m 0600 -- "$evidence/logs/$step.attempt-$attempt.stderr" "$evidence/logs/$step.stderr"
+        (( now < deadline )) || fail "$step exceeded its existing 180s command bound; inspect retained attempts"
+        if (( code == 0 )); then
+            if (( attempt > 1 )); then lifecycle_fence success "$persona" "$step"; fi
+            now=$(monotonic_ms)
+            printf '%s\t%s\t%s\t0\n' "$step" "$started" "$((now - clock_start))" >> "$evidence/timings.tsv"
+            (( now < deadline )) || fail "$step completed after its existing 180s command bound"
+            return
+        fi
+        if (( code != 1 )) || ! lifecycle_retryable "$evidence/logs/$step.stderr"; then
+            printf '%s\t%s\t%s\t%s\n' "$step" "$started" "$((now - clock_start))" "$code" >> "$evidence/timings.tsv"
+            fail "$step failed ($code) without a retryable retained transport outcome; inspect retained logs"
+        fi
+        lifecycle_fence bind "$persona" "$step"
+        resume=(--resume)
+        sleep 0.1
+    done
 }
 stop_all() {
     local pid index deadline code=0 status started
@@ -203,11 +354,11 @@ query() {
     jq -e '.decision == "issued" and .delivery_retired == true and .result.status == "Done" and .result.value == {"Ok":"0x"}' "$evidence/logs/$step.stdout" >/dev/null || fail "$step did not complete the actual empty Clerk query/ACK"
 }
 start_all first
-run local-create a space create-local-agent "$name" --http "127.0.0.1:$((base_port+3))"
+run_lifecycle local-create a space create-local-agent "$name" --http "127.0.0.1:$((base_port+3))"
 local_agent=$(jq -er '.agent | select(test("^[0-9a-f]{64}$"))' "$evidence/logs/local-create.stdout")
-run local-install a space install-local-actor "$name" "$local_agent" "$clerk" --http "127.0.0.1:$((base_port+3))"
+run_lifecycle local-install a space install-local-actor "$name" "$local_agent" "$clerk" --http "127.0.0.1:$((base_port+3))"
 query local-query a "$local_agent" "$((base_port+3))"
-run shared-create a space create-shared-agent "$name" --runtime "$evidence/release/shared-external-runtime.vos" \
+run_lifecycle shared-create a space create-shared-agent "$name" --runtime "$evidence/release/shared-external-runtime.vos" \
     --enrollment "$evidence/enrollments/a.nen" --enrollment "$evidence/enrollments/b.nen" --enrollment "$evidence/enrollments/c.nen" \
     --archive-out "$evidence/shared.ogar" --http "127.0.0.1:$((base_port+3))"
 jq -e '.phase == "applied" and .ready == false and .management_completed == true and .response_retained == true' "$evidence/logs/shared-create.stdout" >/dev/null || fail "Shared Create did not retain Applied"
@@ -217,7 +368,7 @@ for persona in a b c; do
     run "admit-$persona" "$persona" space admit-shared "$name" --archive "$evidence/shared.ogar" --http "127.0.0.1:$((base_port+3+index))"
     ((index+=1))
 done
-run shared-install a space install-shared-actor "$name" "$shared_agent" "$clerk" --http "127.0.0.1:$((base_port+3))"
+run_lifecycle shared-install a space install-shared-actor "$name" "$shared_agent" "$clerk" --http "127.0.0.1:$((base_port+3))"
 jq -e '.decision == "applied" and .management_completed == true and .response_retained == true' "$evidence/logs/shared-install.stdout" >/dev/null || fail "Shared Install did not retain Applied"
 for phase in before-reopen after-reopen; do
     if [[ $phase == after-reopen ]]; then stop_all; start_all reopened; query reopened-local a "$local_agent" "$((base_port+3))"; fi

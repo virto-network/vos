@@ -203,8 +203,45 @@ diagnostics establish `retained_only=false`, successful authorization/candidate/
 committee/receipt recovery, then origin custody timeouts and eventual leader
 publication/finalization commits. Repeated guarded validation is a measured
 contributor; no guest failure is established by these HTTP errors. This debug
-host run requires isolated portable optimized confirmation before a release
-performance correction. All checks/deadlines remain; no tuning pass is consumed.
+host result is superseded by the following current portable evidence, without
+waiving its failure.
+
+R38r builds the portable main and optimized CLI harness from `63a2d2f0`, with
+empty RUSTFLAGS; each takes about seven minutes. Main SHA-256 is
+`e1cdb183c6ef3dd3f083335456806e59760eb3db4392d8b92b7023ad2d0fa4a6`.
+Optimized public R38s **fails 212.17s**: Create completes, then the initial
+nonleader Install returns HTTP 503; the fixture did not resume its retained
+SIQ1. Scoped optimized R38t **fails 53.18s** during Create: a delayed signed
+registration extension replaces the owner slot while the same root retry waits
+on peer I/O. The stale registration digest produces ScopeMismatch despite
+preserved exact member/result evidence. Review the narrow origin-only correction
+in `network/shared_agent/management_recovery.rs`: current owner and exact member
+are checked first, then a changed registration returns Conflict before reading
+evidence. Receiver exact registration checks remain unchanged. The deterministic
+signed-manifest regression and **14 Shared route unit checks** pass; integrated
+portable retry remains unqualified. The Install fixture now uses normal resume
+and asserts unchanged operation root/SIQ1 under the existing 120s cap.
+
+Actual three-process CLI R38u passes readiness **9.744s**, then the initial
+Local Create returns ambiguous HTTP 503 after **10.776s**. The script did not
+resume; this does not prove a persistent Local Create defect. All owned processes
+exited. One worker reports InvalidConfiguration during simultaneous cleanup
+after peers begin stopping. Exact CLI resume and graceful cleanup remain open.
+Logs are `release-observation-o3-portable-*-r38r.log`,
+`release-observation-o3-packaged-public-portable{-diagnostics-r38t,-r38s}.log`,
+`release-observation-o3-registration-*-r38v.log` and
+`release-observation-o3-actual-three-process-cli-r38u.log` under the shared target.
+All checks/deadlines remain; no service-tuning pass is consumed.
+
+The corrected CLI script fences the fresh operation and immutable retained
+client bytes before each normal --resume. Its attempts share the existing whole
+180s command bound; shell/Python syntax checks pass, actual corrected delivery
+and cleanup remain unqualified. The opt-in host example
+`vos/examples/clerk_corpus_public.rs` prepares the M2 public loader using existing
+CLI/retained ASR1 verification, stable intents and independently replayed accepted
+business seeds/order for all six maps. Source review and **7 tooling tests,
+0.10s** pass; no public corpus run, resource/recovery or backup qualification is
+claimed. It requires passing M1 setup and existing signed Operator/Member roles.
 
 The portable full CLI suite previously **passes 375 tests**, 52 ignored, 39.53s
 (`release-observation-o3-cli-unit-release-r37a.log`); that boundary predates the
@@ -227,7 +264,8 @@ bails deliberately removed after the prerequisite checks; packaged pilot and
 service qualification remain open. The review branch is unchanged. Startup binds exact
 System/Authority/Catalog closure before writes: SAC7 alone cannot identify O3's
 management-only RMF4 lineage. The full reproducer passes with artifact-bearing
-builder `da86c686`. The direct CLI acceptance script is unrun.
+builder `da86c686`. The direct CLI acceptance script has run once with the
+unresolved result above; no three-process acceptance pass is claimed.
 
 ### Implemented contract; integrated qualification remains open
 
