@@ -671,6 +671,8 @@ pub(crate) enum PendingLocalLifecycle {
     },
     Install {
         submission: LocalInstallSubmission,
+        // Preserve recovery-only admission if readiness changes before dispatch.
+        retained_only: bool,
         reply: mpsc::SyncSender<LocalInstallResult>,
     },
     #[cfg(all(
@@ -941,6 +943,7 @@ impl LocalLifecycleQueue {
     pub(crate) fn submit_install(
         &self,
         submission: LocalInstallSubmission,
+        retained_only: bool,
     ) -> Result<mpsc::Receiver<LocalInstallResult>, LocalLifecycleIngressError> {
         let channel = self
             .channel
@@ -951,7 +954,7 @@ impl LocalLifecycleQueue {
             .ok_or(LocalLifecycleIngressError::Unavailable)?;
         let (reply, receiver) = mpsc::sync_channel(1);
         sender
-            .try_send(PendingLocalLifecycle::Install { submission, reply })
+            .try_send(PendingLocalLifecycle::Install { submission, retained_only, reply })
             .map_err(|error| match error {
                 mpsc::TrySendError::Full(_) => LocalLifecycleIngressError::Busy,
                 mpsc::TrySendError::Disconnected(_) => LocalLifecycleIngressError::Unavailable,
@@ -2468,6 +2471,14 @@ pub(crate) trait NativeLocalLifecycle: Send {
     ) -> Result<(AgentId, ManagementApplicationAck), SharedAgentHostError> {
         Err(SharedAgentHostError::Unavailable)
     }
+    fn retains_local_install(
+        &mut self,
+        _install: &super::sdk::InstallActor,
+        _call: &AuthorityCredentialCall,
+        _package: &super::package_admission::AdmittedActorPackage,
+    ) -> Result<bool, SharedAgentHostError> {
+        Err(SharedAgentHostError::Unavailable)
+    }
     fn install(
         &mut self,
         _install: super::sdk::InstallActor,
@@ -2793,6 +2804,15 @@ where
             submission,
             &mut super::sdk::state_blocks::ReadBudget::new(1_000_000, 1_000_000_000),
         )
+    }
+
+    fn retains_local_install(
+        &mut self,
+        install: &super::sdk::InstallActor,
+        call: &AuthorityCredentialCall,
+        package: &super::package_admission::AdmittedActorPackage,
+    ) -> Result<bool, SharedAgentHostError> {
+        LocalLifecycleController::retains_local_install(self, install, call, package)
     }
 
     fn install(
@@ -5151,6 +5171,111 @@ where
                 Err(SharedAgentHostError::Conflict)
             }
         }
+    }
+
+    /// Select only an exact retained image Install through already-held leases.
+    /// Existing leased reads may reconcile staged sidecars; this does not open
+    /// lifecycle paths, hand off an intent, pledge work or publish routes.
+    pub(crate) fn retains_local_install(
+        &mut self,
+        install: &super::sdk::InstallActor,
+        call: &AuthorityCredentialCall,
+        package: &super::package_admission::AdmittedActorPackage,
+    ) -> Result<bool, SharedAgentHostError> {
+        use super::clean_authority_issuer::DurableCleanManagementIssuer;
+        use super::clean_bootstrap::RawCredentialVerifier;
+        use super::clean_management_intent::CleanManagementIntentSlot;
+
+        let local = match &self.local {
+            LocalBacking::Image(local) => local,
+            #[cfg(all(
+                target_os = "linux",
+                feature = "storage",
+                feature = "experimental-state-blocks"
+            ))]
+            LocalBacking::External { .. } => return Err(SharedAgentHostError::Unavailable),
+        };
+        let system = self
+            .system
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let local = local
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let request = ManagementRequest::Install(Box::new(install.clone()));
+        let signed = system.local_install_intent(&local, &request, call, package)?;
+        let descriptor = local
+            .show(call.managed.agent)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if descriptor.replicas.len() != 1
+            || descriptor.replicas[0].node != system.pins().node()
+            || descriptor.replicas[0].role != super::sdk::ReplicaRole::Voter
+            || call
+                .authenticated_node
+                .is_some_and(|node| node != system.pins().node())
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let Some((intent_store, issuer_store)) = self.retained_stores.get_mut(&call.managed.agent)
+        else {
+            return Ok(false);
+        };
+        let mut slot = CleanManagementIntentSlot::open(intent_store)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let Some(current) = slot.intent().cloned() else {
+            return Ok(false);
+        };
+        current
+            .verify(
+                system.authority_target(),
+                call.managed,
+                &RawCredentialVerifier,
+            )
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if current.request() != signed.request() || current.call() != signed.call() {
+            return Ok(false);
+        }
+        if slot
+            .denial_complete()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        {
+            return Ok(false);
+        }
+        let Some(saved) = slot
+            .load_actor()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        else {
+            return Ok(false);
+        };
+        if saved.exact_bytes() != package.exact_bytes() {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        if slot
+            .retirement_complete()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        {
+            let issuer = DurableCleanManagementIssuer::open(
+                issuer_store,
+                system.authority_target().binding,
+                call.managed.space,
+                call.managed.agent,
+            )
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+            if issuer
+                .recover_finalized_application(
+                    system.authority_target(),
+                    call.managed,
+                    &request,
+                    call,
+                    &RawCredentialVerifier,
+                )
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+                .is_none()
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+        }
+        system.retained_local_install_family(&slot)
     }
 
     /// Install into an existing Local Agent, retaining the same exclusive

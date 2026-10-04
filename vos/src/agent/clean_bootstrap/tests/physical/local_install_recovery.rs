@@ -178,15 +178,14 @@ fn retry_until<T>(
     }
 }
 
-// Keep this normal production call in one place when the ingress patch adds
-// the recovery-only flag. The baseline deliberately exercises today's guard.
+// Preserve recovery-only admission throughout the normal production call.
 fn submit(
     owner: &mut AgentProductionOwner,
     install: &crate::agent_sdk::InstallActor,
     call: &AuthorityCredentialCall,
     package: &AdmittedActorPackage,
 ) -> Result<ManagementApplicationAck, AgentProductionOwnerError> {
-    owner.install_local_actor(install.clone(), call.clone(), package.clone())
+    owner.install_local_actor(install.clone(), call.clone(), package.clone(), true)
 }
 
 #[allow(clippy::too_many_lines)]

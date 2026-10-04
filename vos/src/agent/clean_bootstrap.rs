@@ -6460,6 +6460,104 @@ where
         .map_err(|_| SharedAgentHostError::ScopeMismatch)
     }
 
+    /// Check only the complete original-owner family of this retained image
+    /// Install. A bare intent needs this open owner's existing pending member;
+    /// it cannot adopt an applied manifest or reconstruct a missing envelope.
+    pub(crate) fn retained_local_install_family<B: CleanManagementIssuerStore>(
+        &self,
+        slot: &super::clean_management_intent::CleanManagementIntentSlot<B>,
+    ) -> Result<bool, SharedAgentHostError> {
+        let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
+        if self.pins.replicas.members().len() != 3
+            || intent.call().authority != self.authority_target()
+            || intent.call().managed.profile != AgentProfile::Local
+            || !matches!(intent.request(), ManagementRequest::Install(_))
+            || intent
+                .call()
+                .authenticated_node
+                .is_some_and(|node| node != self.pins.node)
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if slot
+            .retirement_complete()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        {
+            // The caller independently verifies exact signed issuer finality.
+            // A later family may have replaced this already-released scope.
+            return Ok(true);
+        }
+        let agent = crate::service::AgentId(self.pins.agent.0);
+        let (anchor, work) = match slot
+            .authorization_work()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        {
+            Some(work) => (
+                slot.authorization_anchor()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?
+                    .clone(),
+                work.clone(),
+            ),
+            None => {
+                let Some((anchor, work)) = self
+                    ._network_host
+                    .current_management_pending(agent, intent.call().invocation)?
+                else {
+                    return Ok(false);
+                };
+                if !intent.validates_unpledged_authorization(&work, &anchor) {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                (anchor, work)
+            }
+        };
+        let manifest = self._network_host.management_recovery_manifest(agent)?;
+        if manifest.committee() != &self.pins.replicas
+            || manifest.generation().space().0 != self.pins.space.0
+            || manifest.generation().agent().0 != self.pins.agent.0
+            || manifest.generation().genesis() != anchor.genesis
+            || manifest.generation().admission() != anchor.admission
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let Some(retained) = manifest
+            .management_slot(crate::service::NodeId(self.pins.node.0))
+            .filter(|retained| !retained.is_released())
+        else {
+            return Err(SharedAgentHostError::Unavailable);
+        };
+        let finalization = slot
+            .finalization_work()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let expected_members = 1 + usize::from(finalization.is_some());
+        let root = retained
+            .members()
+            .first()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        if retained.origin_owner().0 != self.pins.node.0
+            || retained.members().len() != expected_members
+            || root.parent().is_some()
+            || root.anchor() != &anchor
+            || root.envelope() != &work
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if let Some(finalization) = finalization {
+            let child = &retained.members()[1];
+            if child.parent() != Some(root.commitment())
+                || slot
+                    .finalization_anchor()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?
+                    != Some(child.anchor())
+                || child.envelope() != finalization
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+        }
+        Ok(true)
+    }
+
     /// Complete a native Local Install while preserving the caller's store
     /// leases. Route publication is still owned by the production supervisor.
     pub(crate) fn install_local_actor<B, J, S>(
@@ -25052,24 +25150,25 @@ mod tests {
             assert!(LocalInstallSubmission::new(wrong, call.clone(), package.clone()).is_err());
             let queue = LocalLifecycleQueue::default();
             assert!(matches!(
-                queue.submit_install(submission()),
+                queue.submit_install(submission(), false),
                 Err(LocalLifecycleIngressError::Unavailable)
             ));
             queue.open().unwrap();
             assert_eq!(queue.open(), Err(LocalLifecycleIngressError::Busy));
             let mut replies = Vec::new();
             for _ in 0..LOCAL_LIFECYCLE_QUEUE_CAPACITY {
-                replies.push(queue.submit_install(submission()).unwrap());
+                replies.push(queue.submit_install(submission(), false).unwrap());
             }
             assert!(matches!(
-                queue.submit_install(submission()),
+                queue.submit_install(submission(), false),
                 Err(LocalLifecycleIngressError::Busy)
             ));
             let pending = queue.pop().unwrap().unwrap();
-            let PendingLocalLifecycle::Install { submission, reply } = pending else {
+            let PendingLocalLifecycle::Install { submission, retained_only, reply } = pending else {
                 panic!("wrong operation");
             };
             assert_eq!(submission.encode(), bytes);
+            assert!(!retained_only);
             let error =
                 crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration;
             reply.try_send(Err(error)).unwrap();
@@ -25081,7 +25180,7 @@ mod tests {
             assert!(queue.pop().unwrap().is_none());
             queue.open().unwrap();
             let reply = queue
-                .submit_install(LocalInstallSubmission::decode(&bytes).unwrap())
+                .submit_install(LocalInstallSubmission::decode(&bytes).unwrap(), false)
                 .unwrap();
             drop(reply);
             queue.pop().unwrap().unwrap().reject();

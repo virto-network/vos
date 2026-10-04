@@ -298,6 +298,7 @@ async fn handle_request(
                 | "/__agents/authorize"
                 | "/__agents/prepare-authorization"
                 | "/__agents/admin"
+                | "/__agents/local/install"
         ) || (cfg!(feature = "experimental-state-blocks")
             && matches!(
                 path.as_str(),
@@ -2236,7 +2237,7 @@ mod tests {
                 "/__agents/invoke",
                 "/__agents/prepare",
                 "/__agents/local",
-                "/__agents/local/install",
+                "/__agents/local/install/",
                 "/__agents/authorize/",
                 "/__agents/admin/prepare",
                 "/__agents/admin/",
@@ -2251,6 +2252,7 @@ mod tests {
                 "/__agents/authorize",
                 "/__agents/prepare-authorization",
                 "/__agents/admin",
+                "/__agents/local/install",
             ] {
                 let response = request(port, path);
                 assert!(response.starts_with("HTTP/1.1 405"), "{path}: {response}");

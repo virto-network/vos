@@ -286,6 +286,22 @@ impl CleanManagementIntent {
         self.finalization_work.as_ref()
     }
 
+    /// Validate a same-open pending authorization without pledging it or
+    /// deriving replacement work. The current signed intent is immutable.
+    pub(crate) fn validates_unpledged_authorization(
+        &self,
+        work: &RuntimeWork,
+        anchor: &ManagementJournalAnchor,
+    ) -> bool {
+        if self.authorization_work.is_some() || self.finalization_work.is_some() {
+            return false;
+        }
+        let mut candidate = self.clone();
+        candidate.authorization_work = Some(work.clone());
+        candidate.authorization_anchor = Some(anchor.clone());
+        candidate.validate().is_ok()
+    }
+
     pub(crate) fn authorization_message(&self) -> Vec<u8> {
         use crate::actors::codec::Encode as _;
         let mut bytes = vec![crate::actors::value::TAG_DYNAMIC];

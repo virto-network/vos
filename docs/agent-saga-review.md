@@ -455,6 +455,16 @@ substitutions before normal owner completion. Its whole 30s starts before the
 cut. Run it against the unchanged guard first; no cut or completion pass is
 claimed before execution. Memory lifecycle wrappers do not qualify filesystem
 durability or cold recovery. No speculative missing-envelope restore is applied.
+Core R39z from clean `e9d9832f` **passes 38.12s**; real Local cut **fails
+42.66s** at the intended normal InvalidConfiguration guard after committed
+original registration/bare intent/absent map (**6.756s**) and strict no-Invoke
+substitutions (**7.142s**). The live checklist references build/source provenance
+and before-fix execution. Review the applied conservative admission separately:
+image-only already-held stores, exact signed intent/package and complete local
+first-owner family, queue restriction across readiness, normal finality and
+route completion unchanged. Closed owners and bare absent-map requests remain
+refused; compilation and complete recovery are pending. It alone cannot complete
+the reproduced missing-map case and must not be reported as qualification.
 
 The final >256 locked-owner reopen now includes all constructors/attachments,
 readiness and exact archived native-result verification under one unchanged

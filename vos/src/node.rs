@@ -2416,7 +2416,8 @@ impl IngressHandle {
         if self.shutdown.load(Ordering::Acquire) {
             return Err(crate::agent::local_lifecycle::LocalLifecycleIngressError::Unavailable);
         }
-        self.clean_local_lifecycle_queue.submit_install(submission)
+        self.clean_local_lifecycle_queue
+            .submit_install(submission, self.clean_agent_recovering())
     }
 
     /// Queue exact signed external Shared Create. The application result is

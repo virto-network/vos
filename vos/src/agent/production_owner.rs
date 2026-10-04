@@ -1405,9 +1405,19 @@ impl AgentProductionOwner {
         install: super::sdk::InstallActor,
         call: super::sdk::authority::AuthorityCredentialCall,
         package: super::package_admission::AdmittedActorPackage,
+        retained_only: bool,
     ) -> Result<super::sdk::authority::ManagementApplicationAck, AgentProductionOwnerError> {
-        if !self.is_ready() {
+        if !self.is_running() {
             return Err(AgentProductionOwnerError::InvalidConfiguration);
+        }
+        if retained_only || !self.is_ready() {
+            let (lifecycle, _) = self.lifecycle.as_mut()
+                .ok_or(AgentProductionOwnerError::InvalidConfiguration)?;
+            if !lifecycle.retains_local_install(&install, &call, &package)
+                .map_err(AgentProductionOwnerError::Lifecycle)?
+            {
+                return Err(AgentProductionOwnerError::ProjectionNotReady);
+            }
         }
         self.completed_local_publication = None;
         let previous = self.completed_local_install.take();
@@ -4814,6 +4824,203 @@ mod tests {
         assert!(owner.is_ready());
         owner.request_shutdown();
         assert_eq!(owner.install_shared_disposition(submission, true), Err(AgentProductionOwnerError::ShutdownRequested));
+        queue.close();
+        owner.shutdown_and_join().unwrap();
+    }
+
+    #[test]
+    #[cfg(all(
+        target_os = "linux",
+        feature = "storage",
+        feature = "experimental-state-blocks"
+    ))]
+    fn queued_image_local_install_keeps_exact_recovery_admission_across_readiness() {
+        use crate::agent::local_lifecycle::{
+            LocalInstallSubmission, LocalLifecycleQueue, NativeLocalLifecycle,
+            PendingLocalLifecycle,
+        };
+        use crate::agent::shared_host::SharedAgentHostError;
+        use ed25519_dalek::{Signer as _, SigningKey};
+
+        // Control ordering only. The real fixed-three image fixture verifies
+        // retained stores, original ownership and terminal completion.
+        struct Retained {
+            submission: LocalInstallSubmission,
+            calls: Arc<Mutex<Vec<&'static str>>>,
+        }
+        impl NativeLocalLifecycle for Retained {
+            fn node(&self) -> Result<NodeId, SharedAgentHostError> {
+                unreachable!()
+            }
+            fn system_attachment(
+                &self,
+                _: usize,
+            ) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError> {
+                unreachable!()
+            }
+            fn local_attachment(
+                &self,
+                _: usize,
+            ) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError> {
+                unreachable!()
+            }
+            fn create(
+                &mut self,
+                _: AgentDescriptor,
+                _: crate::agent_sdk::authority::AuthorityCredentialCall,
+                _: crate::agent::package_admission::AdmittedRuntimePackage,
+            ) -> Result<
+                (
+                    AgentId,
+                    crate::agent_sdk::authority::ManagementApplicationAck,
+                ),
+                SharedAgentHostError,
+            > {
+                unreachable!()
+            }
+            fn retains_local_install(
+                &mut self,
+                install: &crate::agent_sdk::InstallActor,
+                call: &crate::agent_sdk::authority::AuthorityCredentialCall,
+                package: &crate::agent::package_admission::AdmittedActorPackage,
+            ) -> Result<bool, SharedAgentHostError> {
+                self.calls.lock().unwrap().push("lookup");
+                if call.managed.agent != self.submission.call().managed.agent {
+                    return Ok(false);
+                }
+                if install != self.submission.install()
+                    || call != self.submission.call()
+                    || package.exact_bytes() != self.submission.package().exact_bytes()
+                {
+                    return Err(SharedAgentHostError::Conflict);
+                }
+                Ok(true)
+            }
+            fn install(
+                &mut self,
+                _: crate::agent_sdk::InstallActor,
+                _: crate::agent_sdk::authority::AuthorityCredentialCall,
+                _: crate::agent::package_admission::AdmittedActorPackage,
+            ) -> Result<crate::agent_sdk::authority::ManagementApplicationAck, SharedAgentHostError>
+            {
+                self.calls.lock().unwrap().push("complete");
+                Err(SharedAgentHostError::CapacityExhausted)
+            }
+        }
+        let (_, shared) = crate::agent::local_lifecycle::shared_submissions_for_test(false);
+        let install = shared.install().clone();
+        let package = shared.package().clone();
+        let key = SigningKey::from_bytes(&[0x81; 32]);
+        let resign = |call: &mut crate::agent_sdk::authority::AuthorityCredentialCall| {
+            call.invocation = call.expected_invocation();
+            call.signature = key.sign(&call.signing_bytes()).to_bytes();
+        };
+        let mut call = shared.call().clone();
+        call.managed.profile = AgentProfile::Local;
+        resign(&mut call);
+        let submission =
+            || LocalInstallSubmission::new(install.clone(), call.clone(), package.clone()).unwrap();
+        let exact = submission().encode();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (mut owner, _, _) = held_inventory_owner();
+        owner.lifecycle = Some((
+            Box::new(Retained {
+                submission: submission(),
+                calls: calls.clone(),
+            }),
+            1,
+        ));
+        owner.accepted_head = Some(head(1));
+        owner.routes_verified = true;
+        let accepted = owner.accepted_head;
+        let queue = LocalLifecycleQueue::default();
+        queue.open().unwrap();
+        let reply = queue.submit_install(submission(), false).unwrap();
+        owner.source = Box::new(FailedInventory(AgentProductionOwnerError::ProjectionBusy));
+        assert_eq!(
+            owner.reconcile(),
+            Err(AgentProductionOwnerError::ProjectionBusy)
+        );
+        owner.quarantine_routes().unwrap();
+        assert!(!owner.is_ready());
+        let PendingLocalLifecycle::Install {
+            submission: queued,
+            retained_only,
+            reply: sender,
+        } = queue.pop().unwrap().unwrap()
+        else {
+            panic!("wrong lifecycle variant");
+        };
+        assert!(!retained_only);
+        assert_eq!(queued.encode(), exact);
+        let (install, call, package) = queued.into_parts();
+        sender
+            .try_send(owner.install_local_actor(install, call, package, retained_only))
+            .unwrap();
+        assert_eq!(
+            reply.recv().unwrap(),
+            Err(AgentProductionOwnerError::Lifecycle(
+                SharedAgentHostError::CapacityExhausted
+            ))
+        );
+        assert_eq!(*calls.lock().unwrap(), ["lookup", "complete"]);
+        assert_eq!(owner.accepted_head, accepted);
+        assert!(!owner.is_ready());
+        let reply = queue.submit_install(submission(), true).unwrap();
+        owner.routes_verified = true;
+        assert!(owner.is_ready());
+        let PendingLocalLifecycle::Install {
+            submission: queued,
+            retained_only,
+            reply: sender,
+        } = queue.pop().unwrap().unwrap()
+        else {
+            panic!("wrong lifecycle variant");
+        };
+        assert!(retained_only);
+        assert_eq!(queued.encode(), exact);
+        let (install, call, package) = queued.into_parts();
+        sender
+            .try_send(owner.install_local_actor(install, call, package, retained_only))
+            .unwrap();
+        assert_eq!(
+            reply.recv().unwrap(),
+            Err(AgentProductionOwnerError::Lifecycle(
+                SharedAgentHostError::CapacityExhausted
+            ))
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["lookup", "complete", "lookup", "complete"]
+        );
+        let mut absent = shared.call().clone();
+        absent.managed.profile = AgentProfile::Local;
+        absent.managed.agent = AgentId([0xf1; 32]);
+        resign(&mut absent);
+        let absent =
+            LocalInstallSubmission::new(shared.install().clone(), absent, shared.package().clone())
+                .unwrap();
+        let (install, call, package) = absent.into_parts();
+        assert_eq!(
+            owner.install_local_actor(install, call, package, true),
+            Err(AgentProductionOwnerError::ProjectionNotReady)
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["lookup", "complete", "lookup", "complete", "lookup"]
+        );
+        owner.request_shutdown();
+        let (install, call, package) = submission().into_parts();
+        assert_eq!(
+            owner.install_local_actor(install, call, package, true),
+            Err(AgentProductionOwnerError::InvalidConfiguration)
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["lookup", "complete", "lookup", "complete", "lookup"]
+        );
+        assert_eq!(submission().encode(), exact);
+        assert_eq!(owner.accepted_head, accepted);
         queue.close();
         owner.shutdown_and_join().unwrap();
     }

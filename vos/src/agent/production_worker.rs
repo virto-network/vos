@@ -398,9 +398,9 @@ fn dispatch(owner: &mut AgentProductionOwner, request: PendingLocalLifecycle) {
         PendingLocalLifecycle::CreateExternal { submission, reply } => {
             let _ = reply.try_send(owner.create_external_local_disposition(submission));
         }
-        PendingLocalLifecycle::Install { submission, reply } => {
+        PendingLocalLifecycle::Install { submission, retained_only, reply } => {
             let (install, call, package) = submission.into_parts();
-            let _ = reply.try_send(owner.install_local_actor(install, call, package));
+            let _ = reply.try_send(owner.install_local_actor(install, call, package, retained_only));
         }
         #[cfg(all(
             target_os = "linux",

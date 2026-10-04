@@ -323,6 +323,18 @@ The active diff closes demonstrated M1 defects, not new capabilities:
   intent/issuer use owned non-clone memory store wrappers. It does not qualify
   filesystem lifecycle durability or cold recovery. Compilation and intended
   cut reproduction remain open; no speculative original-work restore is applied.
+  Core R39z compiles from clean `e9d9832f` **passes 38.12s**. The real cut
+  **fails 42.66s** at the intended normal owner InvalidConfiguration guard,
+  after locally committed original registration/bare intent/absent map
+  (**6.756s**) and strict no-Invoke substitutions (**7.142s**). Logs:
+  `release-observation-o3-local-install-before-core-{build,provenance}-r39z.*`
+  and `release-observation-o3-local-install-registration-before-r39z.log`.
+  Exact retained image-only admission is now applied after independent review:
+  already-held stores, signed current intent, identical package and complete
+  original-owner family; a captured queue bit preserves the restriction across
+  readiness changes. Closed owners and missing-map bare intents remain refused.
+  Compilation and whole recovery remain open; this conservative correction
+  alone cannot complete the reproduced missing-map case.
 - The >256 fixture's final locked-owner reopen now measures from before all
   constructors through production attachment/readiness, retained handoff and
   exact archived native-result verification using one unchanged **30s** bound.
