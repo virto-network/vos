@@ -37,57 +37,83 @@ deployment is automatic.
 
 ## Current position
 
-Latest host boundary: portable main and harness from clean `5c2bf99c` **pass
-191.197s / 252.859s**, with empty RUSTFLAGS, encoded/target overrides unset,
-exact frozen binary hashes and strict six-file verification **0.101s**. The
-reviewed retained-client diagnostic-context corrections preserve typed transport
-causes without changing signed bytes or deadlines. Their three exact component
-regressions pass **0.41s / 0.88s / 0.04s**; adjacent Local frontend checks remain
-qualified, including the exact permitted loopback rerun after sandbox EPERM.
-Component and packaging passes do not close M1.
+Current host correction is frozen at `f9c61863`; portable main/harness from
+this source have **not yet been rebuilt or exercised**. The previous clean
+`5c2bf99c` portable main/harness pass **191.197s / 252.859s**, with empty
+RUSTFLAGS, encoded/target overrides unset, exact frozen hashes and strict
+six-file verification **0.101s**. The Authority, Catalog, both runtime roles
+and exact coherent component pins remain unchanged. Typed retained-client
+context corrections remain component-qualified; their three exact regressions
+pass **0.41s / 0.88s / 0.04s**, preserving signed bytes and deadlines. Adjacent
+Local frontend checks include the permitted exact loopback rerun after sandbox
+EPERM. Component and packaging checks do not close M1.
 
-The first serial packaged public gate **fails 379.809s** at the unchanged
-**120s** bootstrap issuance retry cap. Its last verified marker is nonleader
-Install at cumulative **113.317s**. The isolated scoped rerun **fails 426.664s**
-at the same preparation endpoint/cap after nonleader Install **116.573s**.
-Neither reaches bootstrap Issued authorization, Clerk mutation/lost response,
-exact result/ACK or whole locked-owner reopen. The remaining four serial gates
-are unexecuted. This is saved recompiler/refinement fixture evidence, not
-ordinary production-default or hardware qualification; owned groups exit.
+The prior portable public gate **fails 379.809s**, and the isolated scoped
+rerun **fails 426.664s**, at the unchanged **120s** bootstrap issuance cap on
+`/__agents/prepare-authorization` HTTP 503. Last verified nonleader Install is
+**113.317s / 116.573s** respectively. Neither reaches bootstrap Issued,
+Clerk mutation/lost response, positive ACK or whole locked-owner reopen. The
+remaining four packaged gates are unexecuted. Scoped evidence showed initial
+registration custody timeout **1.806s**, later peer completion **4.188s**, then
+repeated preparation ScopeMismatch. Truncated displayed digests correlated
+phases without proving the full original custody input; absent test-only guest
+outcome blocks in the CLI-linked core establish no guest outcome.
 
-The corrected client now retries retained AOC5 after
-`/__agents/prepare-authorization` HTTP 503. Scoped evidence establishes one
-initial native preparation **Unavailable**, then **175 ScopeMismatch** results.
-That first call takes **7.205s**: origin registration custody times out at
-**1.806s**, then a peer completes a matching displayed registration at
-**4.188s** in its own commit episode. The displayed digests are truncated;
-this is phase correlation, not independent full-byte identity proof. Subsequent
-503s continue; after that delayed episode, existing scoped diagnostics have no
-subsequent metadata/custody trace. Source shows the timeout
-precedes the NOD1 callback and current pending-map insertion, while retained
-operation admission requires NOD1. Actual missing-NOD1/map state and the precise
-normal readiness refusal are **not yet proven**; a supported fixed-three signed
-regression must establish the cause before a correction. Current packaged
-observation guest outcome blocks are test-only in the linked core dependency,
-so their absence establishes no guest outcome. No performance-only conclusion,
-deadline increase or service-tuning pass is warranted.
+A supported signed THREE-node regression now **proves the missing-NOD1
+recovery-admission defect on this supported cut**. Before correction, clean `61530b52` debug core
+builds **45.045s** after one preserved **20.727s** test-only mutable host-guard
+compile failure (no execution evidence). The exact physical BEFORE run **fails
+28.831s** at the intended normal production ScopeMismatch guard: genuine
+registration timeout is followed by the exact signed committed original-owner
+Root, whole physical work and anchor at **2.809s**, with both NOD1 and the
+origin's pending map absent; normal unready guard is reached at **3.057s**.
+There is no bound failure or fabricated pending state. The separate normal
+same-store cold reopen **passes 33.136s total / 7.452s whole recovery**, refusing
+exact preparation without journal-independent adoption, Invoke or ACK.
 
-The earlier typed-error defect and before/after component evidence remain in
-the R40f logs; unrelated zero-selection integration filters are not evidence.
-Current provenance and public evidence under the native worktree's target:
+The reviewed correction keeps one same-open signed preparation, original whole
+physical envelope/clock and anchor, minted under the existing final barrier and
+lifecycle/proposal/host guards immediately before fresh metadata I/O. It refuses
+cold adoption and validates the complete original-owner, unreleased, one-member
+parentless Root before reservation restoration or NOD1 retention, including an
+already-held map. Authorization remains journal-backed. Exact NOD1 replay takes
+precedence over an unrelated live attempt, and proof clears only after matching
+retention is confirmed. No authorization, wire, limit or deadline changes.
+
+Current debug core `f9c61863` builds **83.591s**. Original-owner live exact retry
+**passes 32.636s total / 4.147s whole recovery**, including checked shutdown,
+byte-identical NOD1/context/whole work/anchor and repeated exact preparation.
+Normal cold reopen **passes 35.640s total / 8.230s whole recovery**, with the new
+owner's proof absent and exact call refused. Both remain below the unchanged
+**30s** recovery bound; owned command groups exit. These use genuine physical
+System images and existing non-clone fsync operation test stores, **not hardened
+CSF1 filesystem lifecycle lease qualification**. They prepare only: no operation guest
+policy, receipt/issuance or operation-evidence signing, follower-forwarding timing, public
+workflow or SLA claim. Extra journal prewrite/ambiguous-write and complete-family
+negative qualification remains pending. No performance-only conclusion,
+deadline increase or service-tuning pass is warranted. The existing supported
+Admin registration-timeout compatibility cut on this source also **passes
+30.933s total / 8.385s whole30** through exact terminal retry and release,
+qualifying preserved default Admin component semantics, not CLI or Local recovery.
+
+Current component evidence under the native worktree's target is
+`task-tmp/r41-operation-prepare-{before-build-61530b52,before-61530b52,cold-before-61530b52,after-build-f9c61863,after-f9c61863,cold-after-f9c61863}`
+(build provenance or `summary.json`, private stdout/stderr and exact result
+records). Admin compatibility evidence is
+`task-tmp/r41-admin-registration-related-f9c61863/{physical.result.json,physical.stdout,physical.stderr}`.
+Previous portable/public evidence remains
 `task-tmp/r40-cli-build-5c2bf99c/provenance.json`,
 `task-tmp/r40-packaged-five-5c2bf99c/public.{stdout,stderr,result.json}` and
 `task-tmp/r40-public-scoped-diagnostics-5c2bf99c/public.{stdout,stderr,result.json}`.
-Earlier frontend evidence is
-`task-tmp/r40-cli-build-a1000b15/{local-install-related.log,local-install-transport-loopback-rerun.log}`;
-client component logs are
-`release-observation-o3-{preparation,authorization,invocation}-typed-error-{before,final}-r40f.log`.
+Typed-client component logs remain
+`release-observation-o3-{preparation,authorization,invocation}-typed-error-{before,final}-r40f.log`;
+unrelated zero-selection filters are not evidence.
 
 | Mandatory gate | Implementation | Integration / qualification |
 | --- | --- | --- |
 | Internal Authority observations | O1/O2 and O3 removal are implemented: no read custody/transport/apply/expiry lifecycle. Management retention and public Invoke/ACK remain. | Current physical observation **passes 67.75s**, including exactly one caught-up audit and existing freshness/no-write/cancellation/reopen cases. Optimized management/replay/owner/supervisor/protocol/observation checks **241/241** pass (10 ignored, 7.09s). SDK **259 + 256 passed**, each 1 ignored. Paired signed-role/purity probes **pass 4.64s** with explicit, unmeasured limits. Packaged closure/startup/retry checks **40 passed**, 2 ignored. No released workflow or SLA pass. |
 | External storage/restore | Incremental executor, immutable closure, ACX1 publication and exact marker retirement exist. | Historical optimized reopen/crash-cut slices pass; the released workflow must requalify. |
-| System management recovery | Parent retention, immutable MRQ2 first-owner binding, exact mutation evidence, signed terminal release and recovery remain. | Isolated optimized offline-pruning test **passes 419.04s**: restore, exact Create/Install, checkpoint/pruning, ACK and custody release. Install finalization **21.588s** meets unchanged 30s. Earlier contended 32.979s failure remains recorded, not waived or tuned away. Returning/all-cold Shared pending-Install remain unqualified. |
+| System management recovery | Parent retention, immutable MRQ2 first-owner binding, exact mutation evidence, signed terminal release and recovery remain. | Isolated optimized offline-pruning test **passes 419.04s**: restore, exact Create/Install, checkpoint/pruning, ACK and custody release. Install finalization **21.588s** meets unchanged 30s. Earlier contended 32.979s failure remains recorded, not waived or tuned away. Same-open native operation preparation now passes live exact NOD1/context retry **4.147s whole30** and normal cold refusal **8.230s whole30**; these are preparation-only fsync test-store component evidence. Journal/family extension, current portable public workflow and returning/all-cold Shared pending-Install remain unqualified. |
 | Member/public management | Packaged PublicWorkflow selects exact bundled roles and ordinary CLI Create. Ambiguous publication re-admits the original leased stores before exact retry. Finalization retains publication protection and verifies fresh decision state before exact terminal cleanup. Packaged reopen helpers explicitly use normal startup admission. Provision components use the existing boxed decoder, whose direct decode removes an extra by-value scratch frame without changing wire, validation or limits. | Native genesis checks **15 passed, 0.19s**. Expanded exact-finalization retry on independently reproduced coherent components **passes 96.21s** (`release-observation-o3-coherent-finalization-physical-r38n.log`), with unchanged 30s phase bounds. The fixture uses ordinary signed Admin Invoke/ACK to enroll its API observation credential and verifies refusal before enrollment. Source and six-file bundle reproduction pass. Install/lost-result/reopen, packaged cold recovery and actual three-process acceptance remain open. |
 | Service/operations | Offline signed corpus generator, bounded public corpus loader and read-only hardware collector exist. Loader resumes exact private ATQ1 through existing CLI/ASR1 verification and independently replays accepted seeds/order for all six maps. | Loader tooling tests **7 passed, 0.10s**; it has not executed public data. M1 setup and pre-granted signed Clerk Operator/Member roles are prerequisites. Public retained loading, resources/recovery, backup/restore, overload, soak and hardware qualification remain open. |
 
@@ -684,14 +710,14 @@ snapshot return and leased comparison remain mandatory.
 
 Remaining release work, in dependency order:
 
-1. Resolve native operation preparation after ambiguous registration in the
-   packaged public workflow. Current `5c2bf99c` portable builds/strict bundle pass;
-   the typed-cause correction is integrated, but quiet/scoped public runs still
-   stop at preparation before bootstrap issuance. Prove the missing-NOD1/readiness
-   seam with real signed fixed-three registration and normal production admission,
-   fix only the demonstrated defect, then freeze/rebuild current portable hosts
-   and rerun the same public gate before later selectors. Preserve the existing
-   120s correctness retry and whole30 recovery.
+1. Finish focused journal/complete-family qualification of the demonstrated
+   native preparation recovery correction; supported live exact retry and normal
+   cold refusal already pass under whole30 on `f9c61863`. Freeze and rebuild the
+   current portable hosts, then rerun the same quiet packaged public gate before
+   the remaining four selectors. Previous `5c2bf99c` portable/strict bundle passes
+   cannot qualify the later host correction. Preserve exact original work/clock/
+   anchor, journal-backed authorization, the existing 120s correctness retry and
+   whole30 recovery; a component pass is not public bootstrap issuance.
    Supported fixed-three Local late-registration, prewrite, compound handoff
    and normal cold-refusal cuts pass R40e under original whole30. They do not
    retrospectively attribute the first R39w CLI interruption or prove filesystem
@@ -806,13 +832,17 @@ Separate forecasts and unknowns:
   Its correction remains within the same exact-retry gate;
   no new authority or service-tuning pass is warranted.
   Admin and supported image Local component terminal completion are verified;
-  filesystem lifecycle and public workflow completion remain open. The next
-  quiet/scoped public runs verify nonleader Install, then exhaust the existing
-  bootstrap issuance retry cap on preparation HTTP 503. The initial registration
-  timeout and later matching displayed custody completion narrow the source
-  hypothesis to pre-NOD1 recovery admission, but actual journal/map/guard state
-  remains unproven. The client fixes do not establish a guest execution defect
-  or performance-only cause. No reliable aggregate qualification range exists.
+  filesystem lifecycle and public workflow completion remain open. Quiet/scoped
+  public runs verify nonleader Install, then exhaust the bootstrap issuance cap
+  on preparation HTTP 503. The supported THREE-node BEFORE regression now proves
+  exact signed registration committed after timeout while NOD1/map remain absent,
+  followed by normal unready admission refusal. Same-open recovery preserves the
+  original whole work/clock/anchor; live retry and genuine cold refusal pass below
+  whole30, with journal/family extension qualification and portable integration
+  pending. Preparing the supported cut is mandatory recovery work, not native
+  policy/issuance or follower-forwarding evidence. The prior **1–4 source-hour**
+  and **2–6 elapsed-hour** bands remain unreliable. No engineering ETA or reliable
+  aggregate qualification range exists; no tuning pass was consumed.
   Optimized R38r main and harness builds each take about seven minutes;
   R38s/R38t and first CLI failure establish the current variance. Cold recovery,
   actual leader-loss coverage, cumulative pruning and cleanup may expose more
