@@ -19,6 +19,7 @@ use crate::agent::authority_operation_coordinator::{
     AuthorityOperationActorMethod, AuthorityOperationActorResult,
 };
 use crate::agent::clean_management_intent::ManagementJournalAnchor;
+use crate::agent::sdk::InvocationContext;
 use crate::agent::sdk::authority_operation::{
     AuthorityOperationApproval, AuthorityOperationCall, AuthorityOperationIssuanceAck,
     MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES, MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES,
@@ -636,6 +637,12 @@ where
             {
                 return Err(SharedAgentHostError::ScopeMismatch);
             }
+            if self.owner.unpublished_operation_attempt.as_ref().is_some_and(|expected| {
+                expected.request.context.invocation == record.request.context.invocation
+                    && expected != &record
+            }) {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
             self.journal
                 .retain(
                     call.invocation,
@@ -644,7 +651,17 @@ where
                         .map_err(|_| SharedAgentHostError::ScopeMismatch)?,
                 )
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
+            self.owner.confirm_authority_operation_retention(&record);
             return Ok(record.request.context);
+        }
+        // Existing exact journal rows replay independently of an unrelated
+        // live attempt. Only unmatched fresh preparation is excluded here.
+        if self.owner.unpublished_operation_attempt.as_ref().is_some_and(|expected| {
+            expected.request.target != call.authority
+                || expected.request.method != AuthorityOperationActorMethod::AuthorizeOperation
+                || expected.request.request != bytes
+        }) {
+            return Err(SharedAgentHostError::Conflict);
         }
         let journal = &mut self.journal;
         let record = self
@@ -684,11 +701,21 @@ where
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         if let Some(retained) = self.retained(request.context.invocation)? {
-            return if retained.request == *request {
-                Ok(())
-            } else {
-                Err(SharedAgentHostError::ScopeMismatch)
-            };
+            if retained.request != *request {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            if self.owner.unpublished_operation_attempt.as_ref() == Some(&retained) {
+                // A prior failed retain may already have written these bytes.
+                // Confirm their durable publication before clearing live proof.
+                self.journal
+                    .retain(
+                        request.context.invocation,
+                        &retained.encode().map_err(|_| SharedAgentHostError::ScopeMismatch)?,
+                    )
+                    .map_err(|_| SharedAgentHostError::Unavailable)?;
+                self.owner.confirm_authority_operation_retention(&retained);
+            }
+            return Ok(());
         }
         let journal = &mut self.journal;
         let captured = self
@@ -811,6 +838,79 @@ pub(crate) struct VerifiedNativeOperationCompletion {
 }
 
 impl RetainedAuthorityOperationDispatch {
+    /// Pure validation of this open owner's complete original preparation
+    /// under the host's lifecycle/proposal guards, before restoring exclusion.
+    pub(crate) fn from_live_pending_slot(
+        expected: &Self,
+        node: crate::service::NodeId,
+        slot: &crate::agent::shared_recovery::management::SharedManagementRecoverySlot,
+        pending: &[(ManagementJournalAnchor, RuntimeWork)],
+        retiring: &[[RuntimeWork; 2]],
+    ) -> Result<Self, SharedAgentHostError> {
+        if !retiring.is_empty() || pending.len() > 1 {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        if slot.owner() != node
+            || slot.origin_owner() != node
+            || slot.is_released()
+            || slot.members().len() != 1
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let root = slot.members().first().ok_or(SharedAgentHostError::ScopeMismatch)?;
+        if root.parent().is_some()
+            || root.work().invocation != expected.request.context.invocation
+            || root.anchor() != &expected.anchor
+            || root.envelope() != &expected.envelope
+            || expected.request.method != AuthorityOperationActorMethod::AuthorizeOperation
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let retained = Self::new(
+            expected.request.clone(),
+            root.envelope().clone(),
+            root.anchor().clone(),
+        )?;
+        if pending.first().is_some_and(|(anchor, envelope)| {
+            anchor != &retained.anchor || envelope != &retained.envelope
+        }) {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        Ok(retained)
+    }
+
+    fn validate_live_candidate(
+        expected: &Self,
+        node: crate::service::NodeId,
+        candidate: &(ManagementJournalAnchor, RuntimeWork),
+        slot: Option<&crate::agent::shared_recovery::management::SharedManagementRecoverySlot>,
+        pending: &[(ManagementJournalAnchor, RuntimeWork)],
+        retiring: &[[RuntimeWork; 2]],
+        fixed_three: bool,
+    ) -> Result<(), SharedAgentHostError> {
+        if candidate.0 != expected.anchor
+            || candidate.1 != expected.envelope
+            || !expected.validate_wire()
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if let Some(slot) = slot {
+            return Self::from_live_pending_slot(expected, node, slot, pending, retiring).map(|_| ());
+        }
+        // An exact pre-append retry has no applied root yet. A fixed-three
+        // local map without that root cannot be promoted into new custody.
+        if !retiring.is_empty()
+            || pending.len() > 1
+            || (fixed_three && !pending.is_empty())
+            || pending.first().is_some_and(|(anchor, work)| {
+                anchor != &expected.anchor || work != &expected.envelope
+            })
+        {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        Ok(())
+    }
+
     fn new(
         request: AuthorityOperationActorDispatch,
         envelope: RuntimeWork,
@@ -1133,6 +1233,81 @@ where
         Ok(changed)
     }
 
+    /// Recovery admission is restricted to the exact signed preparation this
+    /// same open owner validated before metadata publication. Cold owners have
+    /// no marker and cannot adopt a journal-independent replicated root.
+    pub(crate) fn retains_authority_operation_pending(
+        &mut self,
+        call: &AuthorityOperationCall,
+    ) -> Result<bool, SharedAgentHostError> {
+        if self.pending_authority_operation_dispatch(call, None)?.is_some() {
+            return Ok(true);
+        }
+        if self.unpublished_operation_attempt.as_ref().is_some_and(|retained| {
+            retained.request.target == call.authority
+                && retained.request.method == AuthorityOperationActorMethod::AuthorizeOperation
+                && call.encode().ok().as_ref() == Some(&retained.request.request)
+        }) {
+            // The original append may still be unapplied. Its absence cannot
+            // admit replacement work or turn an ambiguous attempt terminal.
+            return Err(SharedAgentHostError::Unavailable);
+        }
+        Ok(false)
+    }
+
+    /// Clear only after exact NOD1 retention succeeds, including a bytes-present
+    /// retry following an ambiguous independent journal write.
+    pub(crate) fn confirm_authority_operation_retention(
+        &mut self,
+        retained: &RetainedAuthorityOperationDispatch,
+    ) {
+        if self.unpublished_operation_attempt.as_ref() == Some(retained) {
+            self.unpublished_operation_attempt = None;
+        }
+    }
+
+    fn pending_authority_operation_dispatch(
+        &mut self,
+        call: &AuthorityOperationCall,
+        context: Option<&InvocationContext>,
+    ) -> Result<Option<RetainedAuthorityOperationDispatch>, SharedAgentHostError> {
+        if call.authority != self.authority_target() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let bytes = call.encode().map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let Some(expected) = &self.unpublished_operation_attempt else {
+            return Ok(None);
+        };
+        let request = &expected.request;
+        if request.target != call.authority
+            || request.method != AuthorityOperationActorMethod::AuthorizeOperation
+            || request.request != bytes
+            || context.is_some_and(|context| context != &request.context)
+        {
+            return Ok(None);
+        }
+        if !expected.validate_wire() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let node = crate::service::NodeId(self.pins.node.0);
+        let found = self._network_host.retained_management_pending_with_validation(
+            crate::service::AgentId(self.pins.agent.0),
+            call.invocation,
+            |slot, pending, retiring| {
+                RetainedAuthorityOperationDispatch::from_live_pending_slot(
+                    expected,
+                    node,
+                    slot,
+                    pending,
+                    retiring,
+                ).map(|_| ())
+            },
+        )?;
+        found.map(|(anchor, envelope)| {
+            RetainedAuthorityOperationDispatch::new(request.clone(), envelope, anchor)
+        }).transpose()
+    }
+
     /// Reserve and durably retain the first exact operation invocation before
     /// it is given to the coordinator. The callback runs under admission and
     /// must sync the record without re-entering this owner. A callback error
@@ -1150,6 +1325,16 @@ where
         if request.method != AuthorityOperationActorMethod::AuthorizeOperation {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
+        if let Some(expected) = self.unpublished_operation_attempt.clone() {
+            if expected.request != *request {
+                return Err(SharedAgentHostError::Conflict);
+            }
+            let call = AuthorityOperationCall::decode(&request.request)
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            self.pending_authority_operation_dispatch(&call, Some(&request.context))?;
+            // A pre-append failure still belongs to this exact original work.
+            return self.capture_prepared_authority_operation(request, &expected.envelope, false, persist);
+        }
         let proposed = self.prepare_authority_operation_dispatch(request)?;
         self.capture_prepared_authority_operation(request, &proposed, false, persist)
     }
@@ -1158,38 +1343,84 @@ where
         &mut self,
         request: &AuthorityOperationActorDispatch,
         proposed: &RuntimeWork,
-        reuse_reserved_clock: bool,
+        fresh_attempt: bool,
         persist: F,
     ) -> Result<RetainedAuthorityOperationDispatch, SharedAgentHostError>
     where
         F: FnOnce(&RetainedAuthorityOperationDispatch) -> Result<(), SharedAgentHostError>,
     {
-        self._network_host
-            .capture_management_pending_with_checkpoint(
+        let expected = self.unpublished_operation_attempt.clone();
+        if fresh_attempt && expected.is_some() {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let exact_attempt = if let Some(saved) = &expected {
+            if &saved.request != request || &saved.envelope != proposed {
+                return Err(SharedAgentHostError::Conflict);
+            }
+            true
+        } else {
+            false
+        };
+        let retain = |(anchor, envelope): &(ManagementJournalAnchor, RuntimeWork)| {
+            if (exact_attempt || fresh_attempt) && envelope != proposed {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            let retained = RetainedAuthorityOperationDispatch::new(
+                request.clone(),
+                envelope.clone(),
+                anchor.clone(),
+            )?;
+            if expected.as_ref().is_some_and(|saved| saved != &retained) {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            persist(&retained)?;
+            Ok(retained)
+        };
+        let result = if fresh_attempt {
+            let marker = &mut self.unpublished_operation_attempt;
+            self._network_host.capture_fresh_management_pending_with_checkpoint(
                 crate::service::AgentId(self.pins.agent.0),
                 proposed,
                 &self.pins.replicas,
                 self.snapshot_signer.as_ref(),
-                |(anchor, envelope)| {
-                    let mut request = request.clone();
-                    if reuse_reserved_clock {
-                        // A failed journal callback may have retained a native
-                        // reservation. The host supplies its original envelope;
-                        // bind that clock, never the retry's newer observation.
-                        let RuntimeWork::Invoke { observed_slot, .. } = envelope else {
-                            return Err(SharedAgentHostError::ScopeMismatch);
-                        };
-                        request.context.observed_slot = *observed_slot;
+                |(anchor, envelope), _, _, _, _| {
+                    if marker.is_some() || envelope != proposed {
+                        return Err(SharedAgentHostError::ScopeMismatch);
                     }
-                    let retained = RetainedAuthorityOperationDispatch::new(
-                        request,
-                        envelope.clone(),
-                        anchor.clone(),
-                    )?;
-                    persist(&retained)?;
-                    Ok(retained)
+                    // Signed and physical validation preceded this guarded
+                    // fresh-only check. Mint immediately before metadata I/O.
+                    *marker = Some(RetainedAuthorityOperationDispatch::new(
+                        request.clone(), envelope.clone(), anchor.clone(),
+                    )?);
+                    Ok(())
                 },
+                retain,
             )
+        } else if let Some(expected) = &expected {
+            let node = crate::service::NodeId(self.pins.node.0);
+            self._network_host.recapture_management_pending(
+                crate::service::AgentId(self.pins.agent.0),
+                proposed,
+                |candidate, slot, pending, retiring, fixed_three| {
+                    RetainedAuthorityOperationDispatch::validate_live_candidate(
+                        expected, node, candidate, slot, pending, retiring, fixed_three,
+                    )
+                },
+                retain,
+            )
+        } else {
+            self._network_host.capture_management_pending_with_checkpoint(
+                crate::service::AgentId(self.pins.agent.0),
+                proposed,
+                &self.pins.replicas,
+                self.snapshot_signer.as_ref(),
+                retain,
+            )
+        };
+        if let Ok(retained) = &result {
+            self.confirm_authority_operation_retention(retained);
+        }
+        result
     }
 
     /// Select context from the same physical material used to build the native
@@ -1204,6 +1435,20 @@ where
     {
         if call.authority != self.authority_target() {
             return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let bytes = call.encode().map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if let Some(expected) = self.unpublished_operation_attempt.clone() {
+            let request = &expected.request;
+            if request.target != call.authority
+                || request.method != AuthorityOperationActorMethod::AuthorizeOperation
+                || request.request != bytes
+            {
+                return Err(SharedAgentHostError::Conflict);
+            }
+            self.pending_authority_operation_dispatch(call, None)?;
+            // Re-enter existing admission with the original full input after a
+            // pre-append interruption. Never resample its material or clock.
+            return self.capture_prepared_authority_operation(request, &expected.envelope, false, persist);
         }
         let material = self
             .supervisor_invocation_material(self.pins.agent, call.authority.binding.issuer.actor)?;
@@ -1228,11 +1473,11 @@ where
                 roles: super::super::sdk::InvocationRoleClaims::none(),
                 observed_slot,
             },
-            request: call
-                .encode()
-                .map_err(|_| SharedAgentHostError::ScopeMismatch)?,
+            request: bytes,
         };
         let proposed = self.prepare_operation_from_material(&request, material)?;
+        // The existing physical validation above precedes a guarded fresh-only
+        // check. That check mints per-open proof immediately before metadata I/O.
         self.capture_prepared_authority_operation(&request, &proposed, true, persist)
     }
 

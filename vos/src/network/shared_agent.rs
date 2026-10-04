@@ -943,6 +943,13 @@ type PendingManagement = (
     crate::agent::clean_management_intent::ManagementJournalAnchor,
     crate::agent_sdk::RuntimeWork,
 );
+type ManagementPublicationGuard<'a> = dyn FnMut(
+    &PendingManagement,
+    Option<&crate::agent::shared_recovery::management::SharedManagementRecoverySlot>,
+    &[PendingManagement],
+    &[[crate::agent_sdk::RuntimeWork; 2]],
+    bool,
+) -> Result<(), SharedAgentHostError> + 'a;
 type PendingManagementKey = (
     ManagementInvocationKey,
     crate::agent::clean_management_intent::ManagementJournalAnchor,
@@ -1900,6 +1907,8 @@ impl SharedRouteHandler {
         retiring: &[[crate::agent_sdk::RuntimeWork; 2]],
         predecessor: Option<&PendingManagement>,
         retain_management: bool,
+        fresh_only: bool,
+        mut before_publication: Option<&mut ManagementPublicationGuard<'_>>,
         proposed: &crate::agent_sdk::RuntimeWork,
         record: F,
     ) -> Result<T, SharedAgentHostError>
@@ -1907,6 +1916,9 @@ impl SharedRouteHandler {
         F: FnOnce(&PendingManagement) -> Result<T, SharedAgentHostError>,
     {
         let key = management_envelope_key(self.agent, proposed)?;
+        if fresh_only && (!retain_management || predecessor.is_some() || !pending.is_empty() || !retiring.is_empty()) {
+            return Err(SharedAgentHostError::Conflict);
+        }
         let mut proposal = self
             .proposal
             .lock()
@@ -2020,7 +2032,15 @@ impl SharedRouteHandler {
             return Err(SharedAgentHostError::Unavailable);
         }
         let retained_member = if fixed_three_retention {
-            host.recovery_manifest(self.agent)?
+            let manifest = host.recovery_manifest(self.agent)?;
+            if fresh_only && manifest.management_slots().iter().any(|slot| {
+                slot.members().iter().any(|member| member.work().invocation == key.invocation)
+            }) {
+                // A released or forwarded copy of this same call is still old
+                // custody. Unrelated released slots remain ordinary predecessors.
+                return Err(SharedAgentHostError::Conflict);
+            }
+            manifest
                 .management_slot(crate::service::NodeId(self.network.agent_node_id().0))
                 .filter(|slot| !slot.is_released())
                 .and_then(|slot| {
@@ -2032,6 +2052,9 @@ impl SharedRouteHandler {
         } else {
             None
         };
+        if fresh_only && retained_member.is_some() {
+            return Err(SharedAgentHostError::Conflict);
+        }
         if let Some(member) = &retained_member {
             let crate::agent_sdk::RuntimeWork::Invoke { invocation, .. } = proposed else {
                 return Err(SharedAgentHostError::ScopeMismatch);
@@ -2102,6 +2125,7 @@ impl SharedRouteHandler {
             );
             return Err(SharedAgentHostError::CapacityExhausted);
         }
+        let mut publication_checked = false;
         if retain_management {
             let status = host
                 .supervisor_attachment_status(self.agent)?
@@ -2171,6 +2195,9 @@ impl SharedRouteHandler {
                     let origin_owner = manifest
                         .management_origin_for_root(owner, root)
                         .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                    if fresh_only && origin_owner != owner {
+                        return Err(SharedAgentHostError::ScopeMismatch);
+                    }
                     let request = SharedManagementRecoveryRegistrationRequest::new(
                         status.route.generation(),
                         status.route.committee(),
@@ -2203,10 +2230,10 @@ impl SharedRouteHandler {
                     if remaining_slots < joint_required as u64 + joint_metadata as u64 {
                         return Err(SharedAgentHostError::CapacityExhausted);
                     }
-                    let (candidate, signature) =
+                    let (registration_candidate, signature) =
                         host.prepare_signed_management_recovery_registration(self.agent, &request)?;
                     let registration = SharedManagementRecoveryRegistration::new(
-                        candidate.request().clone(),
+                        registration_candidate.request().clone(),
                         signature,
                     )
                     .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
@@ -2239,12 +2266,31 @@ impl SharedRouteHandler {
                             }
                             error
                         })?;
+                    if let Some(validate) = before_publication.as_mut() {
+                        // No retained family or volatile pair was adopted.
+                        // Mint only this open owner's fresh publication proof
+                        // under the same guards, immediately before metadata I/O.
+                        validate(&candidate, retained, pending, retiring, true)?;
+                        publication_checked = true;
+                    }
                     drop(host);
                     // No intent or dispatch is published on an ambiguous
                     // append. A retry first proves the entire tail committed,
                     // then recovers the original member from the manifest.
                     self.commit_management_metadata(worker, &current, &fingerprint, &command)?;
+                } else if let Some(validate) = before_publication.as_mut() {
+                    // Existing exact roots still require the marked complete
+                    // family and original pair before the independent WAL write.
+                    validate(&candidate, retained, pending, retiring, true)?;
+                    publication_checked = true;
                 }
+            }
+        }
+        if !publication_checked {
+            // The historical singleton lane has no registration metadata.
+            // Preserve its callback recovery without adopting an old pair.
+            if let Some(validate) = before_publication {
+                validate(&candidate, None, pending, retiring, false)?;
             }
         }
         proposal.management_pending = Some(keys);
@@ -4450,6 +4496,8 @@ impl SharedAgentNetworkHost {
                 .unwrap_or(&[]),
             Some(predecessor),
             self.system_agents.contains(&agent),
+            false,
+            None,
             proposed,
             record,
         )
@@ -4501,6 +4549,20 @@ impl SharedAgentNetworkHost {
     where
         F: FnOnce(&PendingManagement) -> Result<T, SharedAgentHostError>,
     {
+        self.capture_management_pending_guarded(agent, proposed, false, None, record)
+    }
+
+    fn capture_management_pending_guarded<F, T>(
+        &mut self,
+        agent: crate::service::AgentId,
+        proposed: &crate::agent_sdk::RuntimeWork,
+        fresh_only: bool,
+        before_publication: Option<&mut ManagementPublicationGuard<'_>>,
+        record: F,
+    ) -> Result<T, SharedAgentHostError>
+    where
+        F: FnOnce(&PendingManagement) -> Result<T, SharedAgentHostError>,
+    {
         let attached = self
             .generations
             .get(&agent)
@@ -4521,6 +4583,8 @@ impl SharedAgentNetworkHost {
                 .unwrap_or(&[]),
             None,
             self.system_agents.contains(&agent),
+            fresh_only,
+            before_publication,
             proposed,
             record,
         );
@@ -4546,13 +4610,77 @@ impl SharedAgentNetworkHost {
     where
         F: FnOnce(&PendingManagement) -> Result<T, SharedAgentHostError>,
     {
+        self.capture_management_pending_with_checkpoint_guarded(
+            agent, proposed, expected_committee, signer, false, |_, _, _, _, _| Ok(()), record,
+        )
+    }
+
+    /// A native preparation may establish same-open proof only while this
+    /// guarded capture is about to publish a genuinely fresh original root.
+    /// Existing capture/extension callers keep their unchanged retry behavior.
+    pub(crate) fn capture_fresh_management_pending_with_checkpoint<F, V, T>(
+        &mut self,
+        agent: crate::service::AgentId,
+        proposed: &crate::agent_sdk::RuntimeWork,
+        expected_committee: &AgentReplicaCommittee,
+        signer: &dyn LocalMergeAuthenticator,
+        before_publication: V,
+        record: F,
+    ) -> Result<T, SharedAgentHostError>
+    where
+        F: FnOnce(&PendingManagement) -> Result<T, SharedAgentHostError>,
+        V: FnMut(&PendingManagement, Option<&crate::agent::shared_recovery::management::SharedManagementRecoverySlot>, &[PendingManagement], &[[crate::agent_sdk::RuntimeWork; 2]], bool) -> Result<(), SharedAgentHostError>,
+    {
+        self.capture_management_pending_with_checkpoint_guarded(
+            agent, proposed, expected_committee, signer, true, before_publication, record,
+        )
+    }
+
+    /// A marked retry keeps its original anchor and validates the complete
+    /// current family under the same guards before any metadata or WAL write.
+    /// Capacity repair is no longer permitted after first publication proof.
+    pub(crate) fn recapture_management_pending<F, V, T>(
+        &mut self,
+        agent: crate::service::AgentId,
+        proposed: &crate::agent_sdk::RuntimeWork,
+        mut before_publication: V,
+        record: F,
+    ) -> Result<T, SharedAgentHostError>
+    where
+        F: FnOnce(&PendingManagement) -> Result<T, SharedAgentHostError>,
+        V: FnMut(&PendingManagement, Option<&crate::agent::shared_recovery::management::SharedManagementRecoverySlot>, &[PendingManagement], &[[crate::agent_sdk::RuntimeWork; 2]], bool) -> Result<(), SharedAgentHostError>,
+    {
+        self.ensure_reattached(agent)?;
+        self.capture_management_pending_guarded(agent, proposed, false, Some(&mut before_publication), record)
+    }
+
+    fn capture_management_pending_with_checkpoint_guarded<F, V, T>(
+        &mut self,
+        agent: crate::service::AgentId,
+        proposed: &crate::agent_sdk::RuntimeWork,
+        expected_committee: &AgentReplicaCommittee,
+        signer: &dyn LocalMergeAuthenticator,
+        fresh_only: bool,
+        mut before_publication: V,
+        record: F,
+    ) -> Result<T, SharedAgentHostError>
+    where
+        F: FnOnce(&PendingManagement) -> Result<T, SharedAgentHostError>,
+        V: FnMut(&PendingManagement, Option<&crate::agent::shared_recovery::management::SharedManagementRecoverySlot>, &[PendingManagement], &[[crate::agent_sdk::RuntimeWork; 2]], bool) -> Result<(), SharedAgentHostError>,
+    {
         self.ensure_reattached(agent)?;
         let mut record = Some(record);
-        let result = self.capture_management_pending(agent, proposed, |pending| {
+        let publication_attempted = core::cell::Cell::new(false);
+        let mut publication_guard = |pending: &PendingManagement, slot: Option<&crate::agent::shared_recovery::management::SharedManagementRecoverySlot>, previous: &[PendingManagement], retiring: &[[crate::agent_sdk::RuntimeWork; 2]], fixed_three| {
+            publication_attempted.set(true);
+            before_publication(pending, slot, previous, retiring, fixed_three)
+        };
+        let result = self.capture_management_pending_guarded(agent, proposed, fresh_only, if fresh_only { Some(&mut publication_guard) } else { None }, |pending| {
             record.take().expect("capture callback runs once")(pending)
         });
         if !matches!(result, Err(SharedAgentHostError::CapacityExhausted))
             || record.is_none()
+            || publication_attempted.get()
             || self.management_pending.contains_key(&agent)
             || self.management_retirements.contains_key(&agent)
         {
@@ -4575,7 +4703,9 @@ impl SharedAgentNetworkHost {
             expected_committee,
             signer,
         )?;
-        self.capture_management_pending(agent, proposed, record.expect("unpublished callback"))
+        self.capture_management_pending_guarded(
+            agent, proposed, fresh_only, if fresh_only { Some(&mut publication_guard) } else { None }, record.expect("unpublished callback"),
+        )
     }
 
     /// Native terminal bridge only. The caller pledges successful durable
@@ -4634,6 +4764,9 @@ impl SharedAgentNetworkHost {
         agent: crate::service::AgentId,
         invocation: crate::agent_sdk::InvocationId,
     ) -> Result<Option<PendingManagement>, SharedAgentHostError> {
+        if let Some(found) = self.current_management_pending(agent, invocation)? {
+            return Ok(Some(found));
+        }
         self.retained_management_pending_with_validation(agent, invocation, |_, _, _| Ok(()))
     }
 
@@ -4653,9 +4786,6 @@ impl SharedAgentNetworkHost {
             &[[crate::agent_sdk::RuntimeWork; 2]],
         ) -> Result<(), SharedAgentHostError>,
     {
-        if let Some(found) = self.current_management_pending(agent, invocation)? {
-            return Ok(Some(found));
-        }
         if !self.system_agents.contains(&agent) {
             return Ok(None);
         }
@@ -4689,20 +4819,12 @@ impl SharedAgentNetworkHost {
             == 1
         {
             // No replicated registration exists on the historical singleton
-            // lane. Its existing volatile/WAL member lookup above is unchanged.
+            // lane. The default wrapper preserves its existing volatile lookup.
             return Ok(None);
         }
         let manifest = host.recovery_manifest(agent)?;
         let Some(slot) = manifest
             .management_slot(crate::service::NodeId(self.network.agent_node_id().0))
-            .filter(|slot| !slot.is_released())
-        else {
-            return Ok(None);
-        };
-        let Some(member) = slot
-            .members()
-            .iter()
-            .find(|member| member.work().invocation == invocation)
         else {
             return Ok(None);
         };
@@ -4730,7 +4852,26 @@ impl SharedAgentNetworkHost {
                 .map(Vec::as_slice)
                 .unwrap_or(&[]),
         )?;
+        if slot.is_released() {
+            return Ok(None);
+        }
+        let Some(member) = slot
+            .members()
+            .iter()
+            .find(|member| member.work().invocation == invocation)
+        else {
+            return Ok(None);
+        };
         let found = (member.anchor().clone(), member.envelope().clone());
+        if let Some(existing) = previous.iter().find(|(_, envelope)| {
+            matches!(envelope, crate::agent_sdk::RuntimeWork::Invoke { invocation: work, .. }
+                if work.invocation == invocation)
+        }) {
+            if existing != &found {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            return Ok(Some(found));
+        }
         let mut pending = previous;
         pending.push(found.clone());
         proposal.management_pending = Some(pending_management_keys(agent, &pending)?);

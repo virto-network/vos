@@ -2585,10 +2585,23 @@ where
         call: &super::sdk::authority_operation::AuthorityOperationCall,
         context: Option<&super::sdk::InvocationContext>,
     ) -> Result<bool, SharedAgentHostError> {
-        self.operations
+        if self.operations
             .as_mut()
             .ok_or(SharedAgentHostError::Unavailable)?
-            .retains_call(call, context)
+            .retains_call(call, context)?
+        {
+            return Ok(true);
+        }
+        if context.is_some() {
+            // Authorization remains journal-backed. A client receives its
+            // context only after the preparation's exact NOD1 is retained.
+            return Ok(false);
+        }
+        let mut system = self
+            .system
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        system.retains_authority_operation_pending(call)
     }
     fn management_admission_held(&self) -> Result<bool, SharedAgentHostError> {
         self.system

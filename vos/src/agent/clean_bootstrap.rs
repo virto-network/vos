@@ -1665,6 +1665,10 @@ where
     // publication. This is not a WAL or new custody; cold opens never restore
     // it. Keep its whole work until matching NAD2 retention is confirmed.
     unpublished_admin_attempt: Option<(NativeAuthorityAdminSubmission, RuntimeWork)>,
+    // One signed preparation, whole physical input and original anchor checked
+    // by this open owner immediately before fresh metadata I/O. It confers no
+    // cold admission and is kept until exact NOD1 retention is confirmed.
+    unpublished_operation_attempt: Option<operation_dispatch::RetainedAuthorityOperationDispatch>,
     // Exact signed live image Local Install eligibility, verified before
     // handoff I/O. Its whole work is attached after physical validation and
     // before metadata I/O; eligibility alone grants no recovery admission.
@@ -2781,6 +2785,7 @@ where
             authority_install: install_request(plan.authority_request())?.clone(),
             invocation_gas: plan.invocation_gas,
             unpublished_admin_attempt: None,
+            unpublished_operation_attempt: None,
             unpublished_local_install_attempt: None,
             shared_lifecycle_recovery_pending: false,
             shared_genesis_finality: ReplayVerifiedAgentGenesisFinalitySet::default(),
