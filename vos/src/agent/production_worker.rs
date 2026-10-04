@@ -353,6 +353,11 @@ fn drive(owner: &mut AgentProductionOwner, guard: &ExitGuard) -> Result<(), Erro
             result => result?,
         }
         if !owner.is_running() {
+            // Explicit stop publishes this flag before closing the supervisor,
+            // including while reconciliation is in peer I/O. Keep checked retirement.
+            if control.shutdown.load(Ordering::Acquire) {
+                break;
+            }
             return Err(Error::InvalidConfiguration);
         }
     }
@@ -458,6 +463,34 @@ fn dispatch(owner: &mut AgentProductionOwner, request: PendingLocalLifecycle) {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn explicit_shutdown_during_inventory_peer_failure_keeps_checked_join_successful() {
+        let (owner, entered, release) =
+            super::super::production_owner::shutdown_raced_inventory_owner_for_test();
+        let supervisor = owner.handle();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker = AgentProductionWorker::start(
+            owner,
+            shutdown.clone(),
+            Arc::new(RwLock::new(None)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(LocalLifecycleQueue::default()),
+        )
+        .unwrap();
+        entered.recv_timeout(Duration::from_secs(1)).unwrap();
+        // The observation was already in flight when TERM-equivalent local
+        // cancellation hid routes and closed the supervisor. Its peer failure
+        // returns NotReady before the projection client's post-I/O flag check.
+        worker.request_shutdown();
+        assert!(shutdown.load(Ordering::Acquire));
+        assert!(!supervisor.is_running());
+        release.send(()).unwrap();
+        worker
+            .shutdown_and_join()
+            .expect("explicit shutdown must not turn a closed supervisor into invalid configuration");
+        assert!(!supervisor.is_running());
+    }
 
     #[test]
     fn empty_polls_do_not_reset_the_idle_clock_but_completed_work_does() {

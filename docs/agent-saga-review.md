@@ -243,6 +243,26 @@ business seeds/order for all six maps. Source review and **7 tooling tests,
 0.10s** pass; no public corpus run, resource/recovery or backup qualification is
 claimed. It requires passing M1 setup and existing signed Operator/Member roles.
 
+Normal-shutdown correction adds one Acquire cancellation check inside the final
+failed owner-liveness branch. A held-inventory regression reproduces unchanged
+production InvalidConfiguration (**0.05s**); **7 final focused checks pass**,
+including fatal inventory and panic propagation. Checked retirement remains
+unconditional. R38w before/after logs preserve evidence; the interrupted portable
+build is not qualification. Actual three-process cleanup remains open.
+
+Review the separate test-only packaged Shared-leader-loss selector: actual Shared
+leader loss before first dispatch and after committed/pre-ACK result, online
+original issuer, exact request/result on survivors and normally reopened owners,
+and three healthy owners restored before either cut. Fault and returning-owner
+phases retain whole 30s bounds including stop/open and verification. Setup alone
+uses the existing 120s correctness cap. It does not prove accepted in-flight
+precommit crash or public System mutation failover. Independent review corrected
+the retry fixture's premature Completed assertion; failed attempts can inspect
+the canonical retained operation, while success requires completion. Same SIQ1
+bytes remain mandatory. Final CLI debug harness compilation passes **4.08s**
+(`release-observation-o3-leader-loss-cli-test-final-r38x.log`); portable build and
+actual execution remain pending.
+
 The portable full CLI suite previously **passes 375 tests**, 52 ignored, 39.53s
 (`release-observation-o3-cli-unit-release-r37a.log`); that boundary predates the
 latest startup/decoder edits. Prior packaged failure timelines remain in

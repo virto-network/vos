@@ -1,6 +1,6 @@
-//! Candidate public Clerk vertical slice through real locked startup, HTTP,
-//! signed Authority decisions and retained CLI delivery. This is not load,
-//! release-artifact, or the end-to-end recovery-deadline qualification.
+//! Public Clerk slices through real locked startup, HTTP, signed Authority
+//! decisions and retained CLI delivery. The separate Shared leader-loss slice
+//! measures bounded exact recovery; neither slice is load qualification.
 
 use super::*;
 use crate::commands::space as commands;
@@ -46,6 +46,7 @@ pub(super) fn exercise(
     inputs: &StartupTestInputs,
     record: &AgentGenesisArchiveRecord,
     restart: bool,
+    leader_loss: bool,
     retained: &mut Option<RetainedWorkflow>,
 ) {
     let started = std::time::Instant::now();
@@ -147,7 +148,7 @@ pub(super) fn exercise(
         // Resume that operation, retaining its nonce and every signed SIQ1
         // byte, rather than requiring the first transport attempt to succeed.
         args.resume = true;
-        let root = current_operation(&data[0], space, &identity);
+        let root = retained_operation(&data[0], space, &identity, result.is_ok());
         let mut request = commands::clean_store::CleanSharedInstallFile::open_or_create(
             root.join("request"),
         )
@@ -265,15 +266,34 @@ pub(super) fn exercise(
         request.authorization(),
         vos::agent::sdk::InvocationAuthorization::AuthorityReceipt(_)
     ));
-    let first_response = super::member_handoff::retry_exact("public Clerk bootstrap", || {
-        commands::local_create::post_binary(
+    let first_response = if leader_loss {
+        exercise_leader_loss(
+            nodes,
+            networks,
+            data,
+            operator,
+            daemons,
+            enrollments,
+            space,
+            inputs,
+            record,
             address,
-            "/__agents/invoke",
-            200,
+            actor,
+            &package,
+            &application_root,
             &invocation_request,
-            commands::local_invocation::MAX_RESPONSE_BYTES,
         )
-    });
+    } else {
+        super::member_handoff::retry_exact("public Clerk bootstrap", || {
+            commands::local_create::post_binary(
+                address,
+                "/__agents/invoke",
+                200,
+                &invocation_request,
+                commands::local_invocation::MAX_RESPONSE_BYTES,
+            )
+        })
+    };
     assert_reply(
         &invocation_request,
         &first_response,
@@ -322,6 +342,259 @@ pub(super) fn listen(node: &mut VosNode, name: &str) -> SocketAddr {
     })
     .unwrap();
     address
+}
+
+fn stop_member(nodes: &mut [VosNode], index: usize) {
+    let previous = std::mem::replace(&mut nodes[index], VosNode::new());
+    previous.shutdown();
+    previous
+        .collect_checked()
+        .expect("checked ordinary Shared member retirement");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reopen_member(
+    nodes: &mut [VosNode],
+    networks: &[Arc<Network>],
+    data: &[PathBuf],
+    operator: &Keypair,
+    daemons: &[Keypair],
+    members: &[vos::agent::sdk::private::NodeEncryptionEnrollment],
+    space: SpaceId,
+    inputs: &StartupTestInputs,
+    index: usize,
+) -> SocketAddr {
+    let (node, lifecycle) = open_clean_system_lifecycle_with_roster_policy(
+        networks[index].clone(),
+        &data[index],
+        space.0,
+        operator,
+        &daemons[index],
+        commands::local_config::LocalAgentStorage::Image,
+        &data[index].join("host.lock"),
+        None,
+        false,
+        Some(inputs),
+    )
+    .expect("normal locked startup of the retired Shared member");
+    assert_eq!(node, members[index].node);
+    nodes[index]
+        .start_clean_local_agent_production(
+            node,
+            lifecycle,
+            Box::new(OperatorAuthorityProjectionAuthenticator::new(operator.clone()).unwrap()),
+            AgentSupervisorLimits::default(),
+            PROJECTION_ROUTE_QUEUE_CAPACITY,
+            PROJECTION_RECONCILE_INTERVAL,
+        )
+        .expect("real production attachment of the returning Shared member");
+    listen(&mut nodes[index], "public-clerk-returned-leader")
+}
+
+fn shared_leader(
+    networks: &[Arc<Network>],
+    members: &[vos::agent::sdk::private::NodeEncryptionEnrollment],
+    record: &AgentGenesisArchiveRecord,
+    live_indices: &[usize],
+    deadline: std::time::Instant,
+) -> usize {
+    assert!(live_indices.len() >= 2);
+    let bytes = record.encode();
+    loop {
+        let mut statuses = Vec::new();
+        for &target in live_indices {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "actual Shared leader observation exceeded its existing phase bound"
+            );
+            let source = *live_indices.iter().find(|&&index| index != target).unwrap();
+            if let Ok(Some(status)) = networks[source]
+                .shared_member_raft_status_fixture(&bytes, members[target].node)
+            {
+                statuses.push((target, status));
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "actual Shared leader observation completed after its existing phase bound"
+        );
+        let leaders: Vec<_> = statuses
+            .iter()
+            .filter(|(_, (_, leader, _))| *leader)
+            .map(|(index, _)| *index)
+            .collect();
+        if statuses.len() == live_indices.len() && leaders.len() == 1 {
+            let leader = leaders[0];
+            if statuses.iter().all(|(_, (follower, actual_leader, hint))| {
+                (*follower || *actual_leader) && *hint == Some(members[leader].node)
+            }) {
+                return leader;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wait_shared_routes(
+    nodes: &[VosNode],
+    live_indices: &[usize],
+    space: SpaceId,
+    agent: AgentId,
+    actor: ActorId,
+    package: &AdmittedActorPackage,
+    deadline: std::time::Instant,
+) {
+    let route = AgentRouteKey::new(space, agent, actor).unwrap();
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "live Shared actor routes did not recover within their existing phase bound"
+        );
+        assert!(live_indices.iter().all(|&index| !nodes[index]
+            .shutdown_handle()
+            .load(Ordering::Acquire)));
+        let ready = live_indices.iter().all(|&index| {
+            nodes[index]
+                .clean_agent_supervisor()
+                .and_then(|supervisor| supervisor.snapshot(route).ok())
+                .is_some_and(|snapshot| {
+                    snapshot.profile() == vos::agent::sdk::AgentProfile::Shared
+                        && snapshot.actor_program() == package.program()
+                        && snapshot.actor_deployment() == package.deployment()
+                })
+        });
+        if ready {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exercise_leader_loss(
+    nodes: &mut [VosNode],
+    networks: &[Arc<Network>],
+    data: &[PathBuf],
+    operator: &Keypair,
+    daemons: &[Keypair],
+    members: &[vos::agent::sdk::private::NodeEncryptionEnrollment],
+    space: SpaceId,
+    inputs: &StartupTestInputs,
+    record: &AgentGenesisArchiveRecord,
+    mut address: SocketAddr,
+    actor: ActorId,
+    package: &AdmittedActorPackage,
+    application_root: &Path,
+    request: &[u8],
+) -> Vec<u8> {
+    let all = [0, 1, 2];
+    let agent = AgentId(record.provision().proposal().locator().agent.0);
+    let mut first_response = None;
+    for (cut, phase) in ["before_first_invoke", "after_commit_before_ack"]
+        .into_iter()
+        .enumerate()
+    {
+        // Establish three live, independently published actor routes before
+        // each fault. If the issuer became Shared leader, ordinary retirement
+        // and normal reopen move it behind an actually elected peer first.
+        let setup_deadline = std::time::Instant::now() + Duration::from_secs(120);
+        wait_shared_routes(nodes, &all, space, agent, actor, package, setup_deadline);
+        let mut leader = shared_leader(networks, members, record, &all, setup_deadline);
+        if leader == 0 {
+            stop_member(nodes, 0);
+            shared_leader(networks, members, record, &[1, 2], setup_deadline);
+            address = reopen_member(
+                nodes, networks, data, operator, daemons, members, space, inputs, 0,
+            );
+            wait_shared_routes(nodes, &all, space, agent, actor, package, setup_deadline);
+            leader = shared_leader(networks, members, record, &all, setup_deadline);
+        }
+        assert_ne!(
+            leader, 0,
+            "original management issuer must stay online during the fault"
+        );
+        assert_pending_application(application_root, request);
+        assert_eq!(first_response.is_some(), cut == 1);
+        let live: Vec<_> = all.into_iter().filter(|&index| index != leader).collect();
+        let loss_started = std::time::Instant::now();
+        let deadline = loss_started + Duration::from_secs(30);
+        stop_member(nodes, leader);
+        // Observe this ordinary Shared generation only. Its election is
+        // independent of the System leader used by Authority observations.
+        shared_leader(networks, members, record, &live, deadline);
+        let response = super::member_handoff::retry_exact_until(phase, deadline, || {
+            commands::local_create::post_binary(
+                address,
+                "/__agents/invoke",
+                200,
+                request,
+                commands::local_invocation::MAX_RESPONSE_BYTES,
+            )
+        });
+        assert_reply(request, &response, vos::value::Value::Bytes(vec![0]));
+        if let Some(first) = &first_response {
+            assert!(
+                &response == first,
+                "leader loss changed the exact committed pre-ACK result"
+            );
+        } else {
+            first_response = Some(response);
+        }
+        assert!(loss_started.elapsed() <= Duration::from_secs(30));
+        eprintln!(
+            "public_shared_leader_loss phase={phase} recovery_ms={}",
+            loss_started.elapsed().as_millis(),
+        );
+        assert!(!nodes[0].shutdown_handle().load(Ordering::Acquire));
+
+        // Return this one owner before any next fault. Include its real locked
+        // constructor and attachment in the separately recorded reopen phase;
+        // it must independently return the unchanged body/result before ACK.
+        let reopen_started = std::time::Instant::now();
+        let reopen_deadline = reopen_started + Duration::from_secs(30);
+        let returned = reopen_member(
+            nodes, networks, data, operator, daemons, members, space, inputs, leader,
+        );
+        wait_shared_routes(nodes, &all, space, agent, actor, package, reopen_deadline);
+        shared_leader(networks, members, record, &all, reopen_deadline);
+        let repeated = super::member_handoff::retry_exact_until(
+            "returning Shared leader exact pre-ACK result",
+            reopen_deadline,
+            || {
+                commands::local_create::post_binary(
+                    returned,
+                    "/__agents/invoke",
+                    200,
+                    request,
+                    commands::local_invocation::MAX_RESPONSE_BYTES,
+                )
+            },
+        );
+        assert!(
+            &repeated == first_response.as_ref().unwrap(),
+            "returning Shared owner changed the original request's exact result"
+        );
+        assert_reply(request, &repeated, vos::value::Value::Bytes(vec![0]));
+        assert_pending_application(application_root, request);
+        assert!(reopen_started.elapsed() <= Duration::from_secs(30));
+        eprintln!(
+            "public_shared_leader_loss phase=returning_owner_exact_result cut={cut} reopen_ms={}",
+            reopen_started.elapsed().as_millis(),
+        );
+    }
+    first_response.unwrap()
+}
+
+fn assert_pending_application(application_root: &Path, request: &[u8]) {
+    let mut application =
+        commands::clean_store::CleanInvocationFile::open_or_create(application_root).unwrap();
+    assert!(
+        application.load_request().unwrap().as_deref() == Some(request),
+        "leader arrangement changed the retained client request"
+    );
+    assert!(application.load_response().unwrap().is_none());
+    assert!(application.load_progress().unwrap().is_none());
 }
 
 pub(super) fn peer_leader(
@@ -376,6 +649,15 @@ pub(super) fn current_operation(
     space: SpaceId,
     identity: &commands::clean_identity::CleanOperatorIdentitySigner<'_>,
 ) -> PathBuf {
+    retained_operation(data, space, identity, true)
+}
+
+fn retained_operation(
+    data: &Path,
+    space: SpaceId,
+    identity: &commands::clean_identity::CleanOperatorIdentitySigner<'_>,
+    require_completed: bool,
+) -> PathBuf {
     let mut reservation = commands::clean_store::CleanCredentialReservation::open_or_create(
         &data.join("agent-client/credentials"),
         space,
@@ -383,10 +665,12 @@ pub(super) fn current_operation(
     )
     .unwrap();
     let (nonce, status) = reservation.current().unwrap().unwrap();
-    assert_eq!(
-        status,
-        commands::clean_store::CredentialReservationStatus::Completed
-    );
+    if require_completed {
+        assert_eq!(
+            status,
+            commands::clean_store::CredentialReservationStatus::Completed
+        );
+    }
     data.join("agent-client/operations").join(format!(
         "{}-{}",
         hex::encode(identity.credential().0),

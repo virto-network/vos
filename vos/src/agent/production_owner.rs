@@ -2344,11 +2344,21 @@ fn accept_head(
 }
 
 #[cfg(test)]
+pub(crate) fn shutdown_raced_inventory_owner_for_test() -> (
+    AgentProductionOwner,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::SyncSender<()>,
+) {
+    tests::held_inventory_owner_with_shutdown_error(AgentProductionOwnerError::ProjectionNotReady)
+}
+
+#[cfg(test)]
 mod tests {
     struct HeldInventory {
         entered: std::sync::mpsc::SyncSender<()>,
         release: std::sync::mpsc::Receiver<()>,
         shutdown: Option<Arc<AtomicBool>>,
+        shutdown_error: Option<AgentProductionOwnerError>,
     }
 
     impl AuthorityInventorySource for HeldInventory {
@@ -2364,7 +2374,9 @@ mod tests {
                 .as_ref()
                 .is_some_and(|signal| signal.load(Ordering::Acquire))
             {
-                Err(AgentProductionOwnerError::ShutdownRequested)
+                Err(self
+                    .shutdown_error
+                    .unwrap_or(AgentProductionOwnerError::ShutdownRequested))
             } else {
                 Err(AgentProductionOwnerError::InvalidProjection)
             }
@@ -2372,6 +2384,26 @@ mod tests {
     }
 
     fn held_inventory_owner() -> (
+        AgentProductionOwner,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        held_inventory_owner_with_error(None)
+    }
+
+    pub(super) fn held_inventory_owner_with_shutdown_error(
+        error: AgentProductionOwnerError,
+    ) -> (
+        AgentProductionOwner,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        held_inventory_owner_with_error(Some(error))
+    }
+
+    fn held_inventory_owner_with_error(
+        shutdown_error: Option<AgentProductionOwnerError>,
+    ) -> (
         AgentProductionOwner,
         std::sync::mpsc::Receiver<()>,
         std::sync::mpsc::SyncSender<()>,
@@ -2393,6 +2425,7 @@ mod tests {
                 entered,
                 release: wait,
                 shutdown: None,
+                shutdown_error,
             }),
             accepted_head: None,
             routes_verified: false,

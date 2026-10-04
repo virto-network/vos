@@ -442,7 +442,7 @@ pub(super) fn retry_exact<T>(phase: &str, mut operation: impl FnMut() -> anyhow:
     retry_exact_until(phase, deadline, &mut operation)
 }
 
-fn retry_exact_until<T>(
+pub(super) fn retry_exact_until<T>(
     phase: &str,
     deadline: std::time::Instant,
     mut operation: impl FnMut() -> anyhow::Result<T>,

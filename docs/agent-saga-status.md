@@ -133,6 +133,26 @@ The active diff closes demonstrated M1 defects, not new capabilities:
   before normal --resume; all attempts share its existing whole 180s command
   budget. Signed denials and invalid inputs fail. Shell/Python syntax checks
   pass; actual corrected-script delivery and cleanup remain unqualified.
+- Normal-shutdown InvalidConfiguration is reproduced by holding inventory I/O,
+  requesting explicit cancellation, then returning ProjectionNotReady. Unchanged
+  production fails **0.05s**. A single Acquire shutdown recheck inside the final
+  failed owner-liveness branch preserves all earlier fatal errors and checked
+  retirement; **7 focused checks pass**, including fatal inventory/panic controls.
+  Logs are `release-observation-o3-r38w-shutdown-regression-{before,after}.log`.
+  Actual three-process cleanup still requires qualification. The interrupted
+  R38w portable build is not evidence.
+- A separate packaged Shared-leader-loss selector is prepared. It stops the
+  actual Shared leader before public mutation dispatch and after commit/pre-ACK,
+  verifies exact result recovery at the online original issuer, then normally
+  reopens each stopped owner before the next cut. Both fault and returning-owner
+  phases have whole 30s bounds, including stop/open and verified completion.
+  Exactly one owner is offline during either fault. It does not claim an accepted
+  in-flight precommit crash or System mutation failover. Independent review
+  caught and corrected the retry fixture's premature Completed assertion;
+  success still requires completion and every retry retains identical SIQ1.
+  Current CLI debug harness compiles **4.08s** after the final correction
+  (`release-observation-o3-leader-loss-cli-test-final-r38x.log`). Portable build
+  and actual execution remain pending.
 - `vos/examples/clerk_corpus_public.rs` prepares M2's public retained loader via
   existing invoke/submit CLI commands, with stable intents, exact result checks,
   durable verification identities and six-map accepted-context reference replay.

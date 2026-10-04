@@ -1465,6 +1465,13 @@ fn packaged_public_shared_clerk_nonleader_install_lost_result_and_reopen() {
 
 #[cfg(feature = "experimental-state-blocks")]
 #[test]
+#[ignore = "requires exact pinned System/Authority/Shared runtime roles, CLERK_AGENT_PACKAGE and loopback; actual Shared leader loss before first Invoke and after commit/pre-ACK, exact30s retry and normal locked reopen"]
+fn packaged_public_shared_clerk_leader_loss_exact_retry_and_reopen() {
+    check_fixed_roster_preparation(FixedRosterStage::PublicLeaderLoss);
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+#[test]
 #[ignore = "requires exact pinned System/Authority/Shared runtime roles, CLERK_AGENT_PACKAGE and loopback; 257 real public Root-authorized actor Invoke/ACKs, exact archived issuance and locked restart"]
 fn packaged_public_shared_clerk_native_authorization_exceeds_256_and_reopens() {
     check_fixed_roster_preparation(FixedRosterStage::OperationCapacity);
@@ -1494,6 +1501,8 @@ enum FixedRosterStage {
     WarmMembers,
     #[cfg(feature = "experimental-state-blocks")]
     PublicWorkflow,
+    #[cfg(feature = "experimental-state-blocks")]
+    PublicLeaderLoss,
     #[cfg(feature = "experimental-state-blocks")]
     OperationCapacity,
     #[cfg(feature = "experimental-state-blocks")]
@@ -1543,6 +1552,7 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
     let packaged = matches!(
         stage,
         FixedRosterStage::PublicWorkflow
+            | FixedRosterStage::PublicLeaderLoss
             | FixedRosterStage::OperationCapacity
             | FixedRosterStage::ColdInstallAll
             | FixedRosterStage::ColdInstallReturning
@@ -1834,7 +1844,10 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
             })
             .collect();
         #[cfg(feature = "experimental-state-blocks")]
-        let interrupted_inputs: Vec<_> = if stage == FixedRosterStage::PublicWorkflow {
+        let interrupted_inputs: Vec<_> = if matches!(
+            stage,
+            FixedRosterStage::PublicWorkflow | FixedRosterStage::PublicLeaderLoss
+        ) {
             daemons
                 .iter()
                 .map(|daemon| {
@@ -1940,6 +1953,7 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
                                     #[cfg(feature = "experimental-state-blocks")]
                                     FixedRosterStage::WarmMembers
                                     | FixedRosterStage::PublicWorkflow
+                                    | FixedRosterStage::PublicLeaderLoss
                                     | FixedRosterStage::OperationCapacity
                                     | FixedRosterStage::ColdInstallAll
                                     | FixedRosterStage::ColdInstallReturning => Some(inputs),
@@ -2006,6 +2020,7 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
                 stage,
                 FixedRosterStage::WarmMembers
                     | FixedRosterStage::PublicWorkflow
+                    | FixedRosterStage::PublicLeaderLoss
                     | FixedRosterStage::OperationCapacity
                     | FixedRosterStage::ColdInstallAll
                     | FixedRosterStage::ColdInstallReturning
@@ -2132,8 +2147,10 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
                                     &mut handoff,
                                 );
                             }
-                            if stage == FixedRosterStage::PublicWorkflow
-                                || (stage == FixedRosterStage::OperationCapacity
+                            if matches!(
+                                stage,
+                                FixedRosterStage::PublicWorkflow | FixedRosterStage::PublicLeaderLoss
+                            ) || (stage == FixedRosterStage::OperationCapacity
                                     && operation_capacity.is_none())
                             {
                                 member_workflow::exercise(
@@ -2148,6 +2165,7 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
                                     &inputs,
                                     &handoff.as_ref().unwrap().1,
                                     restart,
+                                    stage == FixedRosterStage::PublicLeaderLoss,
                                     &mut workflow,
                                 );
                             }
