@@ -21,6 +21,9 @@ mod admin_pending_validation;
 #[cfg(feature = "experimental-state-blocks")]
 #[path = "local_install_recovery.rs"]
 mod local_install_recovery;
+#[cfg(feature = "experimental-state-blocks")]
+#[path = "operation_prepare_recovery.rs"]
+mod operation_prepare_recovery;
 #[path = "management_retention.rs"]
 mod management_retention;
 use crate::agent::shared_commit::SharedAgentCommonSnapshotClaim;
@@ -49,6 +52,10 @@ pub(super) enum Exercise {
     #[cfg(feature = "experimental-state-blocks")]
     GenesisPublicationRetry,
     #[cfg(feature = "experimental-state-blocks")]
+    OperationPrepareRegistrationTimeout,
+    #[cfg(feature = "experimental-state-blocks")]
+    OperationPrepareRegistrationTimeoutCold,
+    #[cfg(feature = "experimental-state-blocks")]
     AdminJournalPrewrite,
     #[cfg(feature = "experimental-state-blocks")]
     AdminRegistrationTimeout,
@@ -74,6 +81,30 @@ fn candidate_shared_publication_exact_retry_readmits_original_leased_stores() {
     check_fixed_system_pending_cluster_with_checkpoint(
         true,
         Some(Exercise::GenesisPublicationRetry),
+    );
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+#[test]
+#[ignore = "requires coherent Authority/System IMAGE components and three authenticated loopback transports"]
+fn candidate_operation_prepare_registration_timeout_exact_retry_passes_production_recovery_admission() {
+    assert!(std::env::var_os("AUTHORITY_CANDIDATE_ELF").is_some());
+    assert!(std::env::var_os("VOS_AGENT_RUNTIME_COST_CANDIDATE").is_some());
+    assert!(std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some());
+    check_fixed_system_pending_cluster_with_checkpoint(
+        true, Some(Exercise::OperationPrepareRegistrationTimeout),
+    );
+}
+
+#[cfg(feature = "experimental-state-blocks")]
+#[test]
+#[ignore = "requires coherent Authority/System IMAGE components and three authenticated loopback transports"]
+fn candidate_operation_prepare_registration_timeout_cold_missing_journal_refuses_adoption() {
+    assert!(std::env::var_os("AUTHORITY_CANDIDATE_ELF").is_some());
+    assert!(std::env::var_os("VOS_AGENT_RUNTIME_COST_CANDIDATE").is_some());
+    assert!(std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some());
+    check_fixed_system_pending_cluster_with_checkpoint(
+        true, Some(Exercise::OperationPrepareRegistrationTimeoutCold),
     );
 }
 
@@ -414,6 +445,14 @@ pub(super) fn exercise(
         return;
     }
     #[cfg(feature = "experimental-state-blocks")]
+    if matches!(exercise, Exercise::OperationPrepareRegistrationTimeout | Exercise::OperationPrepareRegistrationTimeoutCold) {
+        operation_prepare_recovery::exercise(
+            leader, owners, fixtures, directories, stores, providers, networks.as_slice(), signer,
+            matches!(exercise, Exercise::OperationPrepareRegistrationTimeoutCold),
+        );
+        return;
+    }
+    #[cfg(feature = "experimental-state-blocks")]
     if matches!(
         exercise,
         Exercise::AdminJournalPrewrite
@@ -461,6 +500,8 @@ pub(super) fn exercise(
         Exercise::ForwardedInstallOrigin => unreachable!(),
         #[cfg(feature = "experimental-state-blocks")]
         Exercise::GenesisPublicationRetry => unreachable!(),
+        #[cfg(feature = "experimental-state-blocks")]
+        Exercise::OperationPrepareRegistrationTimeout | Exercise::OperationPrepareRegistrationTimeoutCold => unreachable!(),
         #[cfg(feature = "experimental-state-blocks")]
         Exercise::AdminJournalPrewrite
         | Exercise::AdminRegistrationTimeout
