@@ -47,6 +47,7 @@ pub(super) fn exercise(
     record: &AgentGenesisArchiveRecord,
     restart: bool,
     leader_loss: bool,
+    owner_recovery_started: Option<std::time::Instant>,
     retained: &mut Option<RetainedWorkflow>,
 ) {
     let started = std::time::Instant::now();
@@ -60,6 +61,7 @@ pub(super) fn exercise(
             .expect("initial public workflow completed its loss seam");
         let address = listen(&mut nodes[0], "public-clerk-reopened");
         resume_after_reopen(
+            nodes,
             &data[0],
             address,
             operator,
@@ -67,6 +69,7 @@ pub(super) fn exercise(
             node_public,
             agent,
             previous,
+            owner_recovery_started.expect("reopen timer starts before locked constructors"),
         );
         return;
     }
@@ -980,6 +983,7 @@ pub(super) fn assert_reply(request: &[u8], bytes: &[u8], expected: vos::value::V
 
 #[allow(clippy::too_many_arguments)]
 fn resume_after_reopen(
+    nodes: &[VosNode],
     data: &Path,
     address: SocketAddr,
     operator: &Keypair,
@@ -987,10 +991,13 @@ fn resume_after_reopen(
     node_public: [u8; 32],
     agent: AgentId,
     previous: &RetainedWorkflow,
+    started: std::time::Instant,
 ) {
-    let started = std::time::Instant::now();
+    // This measures locked-owner reopen with the existing transports alive.
+    // The caller starts it before every constructor and production attachment.
+    let deadline = started + Duration::from_secs(30);
     let (_, install_response) =
-        super::member_handoff::retry_exact("reopened public Install exact retry", || {
+        super::member_handoff::retry_exact_until("reopened public Install exact retry", deadline, || {
             commands::local_create::post_shared_install_response(address, &previous.install_request)
         });
     assert_eq!(install_response, previous.install_response);
@@ -1019,22 +1026,28 @@ fn resume_after_reopen(
     );
     assert!(application.load_response().unwrap().is_none());
     drop(application);
-    let repeated = super::member_handoff::retry_exact("reopened lost bootstrap response", || {
-        commands::local_create::post_binary(
-            address,
-            "/__agents/invoke",
-            200,
-            &previous.invocation_request,
-            commands::local_invocation::MAX_RESPONSE_BYTES,
-        )
-    });
+    let repeated = super::member_handoff::retry_exact_until(
+        "reopened lost bootstrap response",
+        deadline,
+        || {
+            commands::local_create::post_binary(
+                address,
+                "/__agents/invoke",
+                200,
+                &previous.invocation_request,
+                commands::local_invocation::MAX_RESPONSE_BYTES,
+            )
+        },
+    );
     assert_eq!(repeated, previous.first_response);
     assert_reply(
         &previous.invocation_request,
         &repeated,
         vos::value::Value::Bytes(vec![0]),
     );
+    assert!(std::time::Instant::now() < deadline);
     commands::local_invocation::submit(&previous.application_root, None, address).unwrap();
+    assert!(std::time::Instant::now() <= deadline);
     let (authorization_root, _) = commands::local_operation::authorize_with_application(
         data,
         address,
@@ -1045,6 +1058,7 @@ fn resume_after_reopen(
         true,
     )
     .expect("real CLI exact bootstrap application and ACK resume");
+    assert!(std::time::Instant::now() <= deadline);
     assert_eq!(authorization_root, previous.authorization_root);
     let mut application =
         commands::clean_store::CleanInvocationFile::open_or_create(&previous.application_root)
@@ -1062,16 +1076,29 @@ fn resume_after_reopen(
         .is_retired(&previous.invocation_request, &response)
         .unwrap()
     );
-    eprintln!(
-        "public_clerk_workflow phase=exact_reopen_result_and_ack elapsed_ms={}",
-        started.elapsed().as_millis()
-    );
-    drop(application);
-    let identity = commands::clean_identity::CleanOperatorIdentitySigner::new(operator).unwrap();
     let package_path = PathBuf::from(std::env::var_os("CLERK_AGENT_PACKAGE").unwrap());
     let package =
         vos::agent::package_admission::admit_actor_package(&std::fs::read(package_path).unwrap())
             .unwrap();
+    wait_shared_routes(
+        nodes,
+        &[0, 1, 2],
+        space,
+        agent,
+        previous.actor,
+        &package,
+        deadline,
+    );
+    assert!(
+        started.elapsed() <= Duration::from_secs(30),
+        "whole locked-owner constructor/attachment/handoff/exact result, ACK and required route recovery exceeded 30s"
+    );
+    let recovery_ms = started.elapsed().as_millis();
+    eprintln!(
+        "public_clerk_workflow phase=exact_reopen_result_and_ack scope=locked_owner_reopen recovery_ms={recovery_ms}"
+    );
+    drop(application);
+    let identity = commands::clean_identity::CleanOperatorIdentitySigner::new(operator).unwrap();
     let mut message = vec![vos::value::TAG_DYNAMIC];
     message.extend(vos::value::Msg::new("journal_id").encode());
     let query = intent(
@@ -1105,7 +1132,7 @@ fn resume_after_reopen(
         vos::value::Value::Bytes(previous.journal.to_vec()),
     );
     eprintln!(
-        "public_clerk_workflow phase=persisted_journal_read elapsed_ms={}",
+        "public_clerk_workflow phase=persisted_journal_read scope=locked_owner_reopen recovery_ms={recovery_ms} probe_inclusive_ms={}",
         started.elapsed().as_millis()
     );
 }

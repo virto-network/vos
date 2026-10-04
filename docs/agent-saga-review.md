@@ -409,6 +409,28 @@ the original whole 30s bound, excluding bootstrap setup. R39v logs/provenance
 are referenced by the live checklist. These passes close this component defect,
 not the current portable public workflow or M1 exit.
 
+R39w portable main builds from clean `290e2563` **pass 6m32s**, empty RUSTFLAGS
+with recorded SHA/source provenance. Actual ordinary three-process CLI checks
+the exact six-file bundle and reaches readiness **9.333s**. Image Local Create
+recovers its ambiguous first error through normal exact resume (**24.292s**
+total). Local Install exhausts its unchanged 180s command budget with **163**
+exact attempts at `/__agents/local/install`: first server error
+`Lifecycle(Unavailable)`, then `InvalidConfiguration`. The unready production
+guard explains the later source path; info logs do not attribute the first
+interruption to guest/freshness/application/terminal. All matching owned PIDs
+exit and graceful cleanup **passes 0.317s**. Shared workflow/reopen remain
+unreached; no actual CLI acceptance pass is claimed. Private evidence and
+R39w logs/provenance are referenced by the live checklist.
+
+The packaged public fixture previously timed reopen after construction and
+reset correctness retries. Review its test-only whole 30s correction: original
+pre-constructor start covers every locked constructor, attachment/readiness,
+retained Create/member handoff, exact Install/invocation result, normal positive
+ACK/durable progress and all three Shared actor routes. It uses normal admission
+and rejects late completion; initial 120s setup is unchanged. Existing transports
+stay live, so its scope is locked-owner reopen. The later fresh serving query is
+separate. Optimized harness compilation and actual qualification remain open.
+
 The final >256 locked-owner reopen now includes all constructors/attachments,
 readiness and exact archived native-result verification under one unchanged
 30s deadline, including both HTTP retries and post-call elapsed checks. Source

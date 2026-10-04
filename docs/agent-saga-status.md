@@ -270,6 +270,30 @@ The active diff closes demonstrated M1 defects, not new capabilities:
   `release-observation-o3-admin-{registration,prewrite}-family-after-r39v.log`
   and `release-observation-o3-admin-cold-missing-journal-r39v.log`.
   The current portable public workflow and M1 remain unqualified.
+- Portable main R39w builds from clean `290e2563` **passes 6m32s**, with empty
+  RUSTFLAGS and recorded SHA/source provenance. Actual ordinary three-process
+  CLI acceptance verifies the exact six-file bundle and reaches readiness
+  **9.333s**. Image Local Create initially fails ambiguously (**10.442s**),
+  then normal exact resume succeeds (**13.510s**, **24.292s** total), preserving
+  the script's retained-file fences. Local Install then exhausts its existing
+  **180s** command budget after **163** exact attempts at the actual
+  `/__agents/local/install` endpoint. The first server error is
+  `Lifecycle(Unavailable)`; later attempts return `InvalidConfiguration`.
+  Info-level evidence cannot distinguish the first interruption's guest,
+  observation, image application or terminal stage. The unconditional unready
+  Local Install guard is the source seam for later rejections, not proof of that
+  first cause. All three matching owned PIDs exit; graceful cleanup **passes
+  0.317s**. Shared workflow and all-owner reopen are unreached. Preserve private
+  evidence through `target/task-tmp/r39w-cli-acceptance-path` under the native
+  worktree and `release-observation-o3-actual-three-process-cli-r39w.log`.
+  No actual CLI acceptance pass or Local runtime defect is claimed.
+  Source review also found the packaged public fixture's reopen timer excluded
+  constructors/handoff. Its test-only correction now shares one **30s** window
+  from before all locked constructors through attachment/readiness, retained
+  handoff, exact Install/invocation result and positive ACK, and all three Shared
+  actor routes. Normal admission and initial 120s setup remain unchanged; fresh
+  serving query is separate. This is locked-owner reopen with live transports,
+  not process-outage coverage. The patched optimized harness/run remain pending.
 - The >256 fixture's final locked-owner reopen now measures from before all
   constructors through production attachment/readiness, retained handoff and
   exact archived native-result verification using one unchanged **30s** bound.
@@ -495,11 +519,14 @@ snapshot return and leased comparison remain mandatory.
 
 Remaining release work, in dependency order:
 
-1. Attribute the admin recovery refusal after the enforced observation deadlines
-   in R39o, using the supported three-node fixture, and fix only the
-   demonstrated cause. Typed CLI transport causes and exact admin-claim retry
-   selection pass focused checks; they do not resolve this later gate. Then
-   qualify the packaged public lost-result/reopen workflow and returning/all-cold
+1. Attribute the first image Local Install interruption in actual CLI R39w,
+   using existing scoped diagnostics and a supported fixed-three cut. Fix only
+   demonstrated recovery defects; its later unready rejection must admit only
+   exact retained image requests through the existing leased owner. The admin
+   same-open correction passes supported component recovery/release and cold
+   refusal, but must now integrate into the current packaged public workflow.
+   Compile the test-only whole locked-owner reopen deadline correction, then
+   qualify public lost-result/reopen and returning/all-cold
    pending Install. Exercise Pins-before-record, first Intent stage, fresh
    initialization and locked reopen through normal startup, with unchanged whole
    **<=30s** recovery and no test-policy bypass.
@@ -508,11 +535,16 @@ Remaining release work, in dependency order:
    cumulative >256 public authorizations with unchanged checkpoint/recovery.
    Preserve signed owner/parent evidence, package limits and whole **<=30s**
    recovery. Automatic startup must pass; manual recovery loops are not proof.
-3. Freeze the startup correction, build the current portable main and run M1
+3. Freeze the resulting host corrections, rebuild the portable main with exact
+   provenance, and run M1
    through ordinary packaged three-process CLI/HTTP: system actors ready,
    image Local and external Shared Clerk, genuinely lost initial mutation
    response, exact retry and restart/failover. Record demonstrated small workload
-   and a public steady-state phase/queue/VM/persistence probe.
+   and a public steady-state phase/queue/VM/persistence probe. R39w verifies
+   current ordinary startup, exact Local Create resume and graceful cleanup,
+   but fails at Local Install before Shared workflow. Guest source remains
+   unchanged since the coherent reproduction; guest changes would require
+   renewed independent builds and coherent pins.
 4. Progress through unchanged M2 retained-data/parity/resource/recovery/Agent
    backup gates, then locally possible M3 tooling and qualification. Hardware
    qualification remains explicitly open.
@@ -577,13 +609,24 @@ Separate forecasts and unknowns:
   later leader commit and subsequent admission rejection. R39s reproduces both
   cuts through supported fixed-three custody and the normal production guard.
   Replacing the unsupported singleton fixture added preparation within the
-  same mandatory recovery gate; the same-open correction remains unqualified.
-  The earlier **1–4 source-hour** band now has low confidence and is not a
-  reliable remaining estimate until correction and terminal release pass.
+  same mandatory recovery gate. R39v now qualifies that component correction's
+  whole recovery, exact terminal release, signed family negatives and genuine
+  cold refusal; the public workflow still needs to integrate it. Actual CLI
+  R39w next exposes image Local Install: a first Unavailable before persisted
+  authorization work, then unready admission refusal. Bare exact intent/package
+  evidence does not attribute the first interruption or permit cold adoption.
+  This additional supported recovery gate explains the variance; it does not
+  justify new authority, a fallback, larger limits or longer deadlines.
+  The earlier **1–4 source-hour** band has low confidence and is not a
+  reliable remaining estimate until this interruption is attributed and the
+  resulting correction is qualified.
   The **2–6 elapsed-hour**
   execution band remains conditional and is not a reliable remaining estimate
-  while the remaining recovery gates are open. Scoped attribution has identified
-  the admission defect; terminal completion still needs verification. Evidence
+  while the remaining recovery gates are open. The current portable main builds
+  in **6m32s**; recent optimized main/harness builds span about **6–8 minutes**
+  each. These measured build costs are not an aggregate milestone estimate.
+  Admin component terminal completion is verified; Local Install and public
+  workflow completion still need verification. Evidence
   does not establish a new guest execution defect or performance-only cause.
   Optimized R38r main and harness builds each take about seven minutes;
   R38s/R38t and first CLI failure establish the current variance. Cold recovery,

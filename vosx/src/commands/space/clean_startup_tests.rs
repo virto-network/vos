@@ -1925,6 +1925,16 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
             // the pending-recovery measurement, not just the later HTTP retry.
             #[cfg(feature = "experimental-state-blocks")]
             let recovery_started = std::time::Instant::now();
+            #[cfg(feature = "experimental-state-blocks")]
+            let owner_recovery_deadline = (packaged
+                && restart
+                && matches!(
+                    stage,
+                    FixedRosterStage::PublicWorkflow
+                        | FixedRosterStage::PublicLeaderLoss
+                        | FixedRosterStage::OperationCapacity
+                ))
+            .then_some(recovery_started + Duration::from_secs(30));
             let owners = std::thread::scope(|scope| {
                 let handles: Vec<_> = (0..3)
                     .map(|index| {
@@ -1973,6 +1983,13 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
                     })
                     .collect::<Vec<_>>()
             });
+            #[cfg(feature = "experimental-state-blocks")]
+            if let Some(deadline) = owner_recovery_deadline {
+                assert!(
+                    std::time::Instant::now() <= deadline,
+                    "whole locked-owner reopen exceeded 30s during constructors"
+                );
+            }
             for (index, (node, _)) in owners.iter().enumerate() {
                 assert_eq!(*node, enrollments[index].node);
             }
@@ -2087,8 +2104,11 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
                 // Initial construction may retain all owners unpublished while
                 // their workers complete the exact read custody. Observe actual
                 // fresh publication; never drive recovery or set readiness here.
-                // This bounded phase wait is not whole-startup latency evidence.
+                // Packaged workflow reopen shares the original constructor-to-
+                // result deadline; other setup waits remain separate evidence.
                 let readiness_deadline = std::time::Instant::now() + Duration::from_secs(30);
+                #[cfg(feature = "experimental-state-blocks")]
+                let readiness_deadline = owner_recovery_deadline.unwrap_or(readiness_deadline);
                 loop {
                     assert!(
                         nodes.iter().all(|(node, _)| !node
@@ -2144,6 +2164,7 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
                                     &inputs,
                                     packaged,
                                     restart,
+                                    owner_recovery_deadline,
                                     &mut handoff,
                                 );
                             }
@@ -2166,6 +2187,7 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
                                     &handoff.as_ref().unwrap().1,
                                     restart,
                                     stage == FixedRosterStage::PublicLeaderLoss,
+                                    restart.then_some(recovery_started),
                                     &mut workflow,
                                 );
                             }

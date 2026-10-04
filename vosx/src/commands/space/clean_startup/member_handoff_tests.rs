@@ -82,8 +82,13 @@ pub(super) fn public_handoff(
     inputs: &StartupTestInputs,
     packaged: bool,
     restart: bool,
+    recovery_deadline: Option<std::time::Instant>,
     retained: &mut Option<(SharedCreateSubmission, AgentGenesisArchiveRecord)>,
 ) {
+    if let Some(deadline) = recovery_deadline {
+        assert!(packaged && restart);
+        assert!(std::time::Instant::now() < deadline);
+    }
     let addresses: Vec<_> = nodes
         .iter_mut()
         .enumerate()
@@ -185,7 +190,7 @@ pub(super) fn public_handoff(
             call.signature = sign_exact(operator, &call.signing_bytes()).unwrap();
             let submission =
                 SharedCreateSubmission::new(descriptor, call, runtime, committee).unwrap();
-            let archive = create_public(addresses[0], &submission);
+            let archive = create_public(addresses[0], &submission, None);
             (submission, archive)
         };
         *retained = Some((submission, archive));
@@ -195,7 +200,7 @@ pub(super) fn public_handoff(
     let bytes = record.encode();
 
     if restart {
-        assert_eq!(create_public(addresses[0], submission), *record);
+        assert_eq!(create_public(addresses[0], submission, recovery_deadline), *record);
     }
     for index in 1..3 {
         let archive_path = data[index].join("public-member.ogar");
@@ -235,8 +240,16 @@ pub(super) fn public_handoff(
                 &archive_path,
             )
         };
-        assert_eq!(retry_exact("member handoff", admit), locator);
-        assert_eq!(retry_exact("already attached member", admit), locator);
+        let retry_deadline = || {
+            recovery_deadline.unwrap_or_else(|| {
+                std::time::Instant::now() + Duration::from_secs(120)
+            })
+        };
+        assert_eq!(retry_exact_until("member handoff", retry_deadline(), admit), locator);
+        assert_eq!(
+            retry_exact_until("already attached member", retry_deadline(), admit),
+            locator
+        );
         assert_eq!(std::fs::read(&archive_path).unwrap(), bytes);
         assert!(
             super::super::super::shared_operation::admit_shared_archive(
@@ -256,6 +269,12 @@ pub(super) fn public_handoff(
             !node
                 .shutdown_handle()
                 .load(std::sync::atomic::Ordering::Acquire)
+        );
+    }
+    if let Some(deadline) = recovery_deadline {
+        assert!(
+            std::time::Instant::now() <= deadline,
+            "whole locked-owner reopen exceeded 30s during retained handoff"
         );
     }
 }
@@ -413,9 +432,12 @@ fn lose_successful_admission_response(
 fn create_public(
     address: SocketAddr,
     submission: &SharedCreateSubmission,
+    recovery_deadline: Option<std::time::Instant>,
 ) -> AgentGenesisArchiveRecord {
     let request = submission.encode();
-    retry_exact("public Shared Create", || {
+    let deadline = recovery_deadline
+        .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(120));
+    retry_exact_until("public Shared Create", deadline, || {
         let (status, bytes) = super::super::super::local_create::post_binary_response(
             address,
             "/_vos/agents/shared/create",
