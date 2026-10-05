@@ -5268,7 +5268,7 @@ where
             .map_err(|_| SharedAgentHostError::Unavailable)?
         {
             let issuer = DurableCleanManagementIssuer::open(
-                issuer_store,
+                &mut *issuer_store,
                 system.authority_target().binding,
                 call.managed.space,
                 call.managed.agent,
@@ -5288,7 +5288,46 @@ where
                 return Err(SharedAgentHostError::ScopeMismatch);
             }
         }
-        system.retained_local_install_family(&slot)
+        let target = system.authority_target();
+        system.retained_local_install_family_with_application(
+            &slot,
+            Some(|candidate: &ManagementApplicationAck| {
+                use super::sdk::wire::CanonicalWire as _;
+                let issuer = DurableCleanManagementIssuer::open(
+                    &mut *issuer_store,
+                    target.binding,
+                    call.managed.space,
+                    call.managed.agent,
+                )
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+                let (receipt, saved) = issuer
+                    .recover_observed_application(
+                        target,
+                        call.managed,
+                        &request,
+                        call,
+                        &RawCredentialVerifier,
+                    )
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                if saved.encode().map_err(|_| SharedAgentHostError::ScopeMismatch)?
+                    != candidate.encode().map_err(|_| SharedAgentHostError::ScopeMismatch)?
+                {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                let observed = local
+                    .observe_management_application(call.managed.agent, &request, &receipt)
+                    .map_err(|_| SharedAgentHostError::Unavailable)?;
+                if observed.receipt() != &receipt
+                    || observed.result().as_ref().ok() != Some(&saved.application)
+                    || observed.reopened_state() != saved.reopened_state
+                    || observed.applied_at() != saved.applied_at
+                {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                Ok(())
+            }),
+        )
     }
 
     /// Install into an existing Local Agent, retaining the same exclusive

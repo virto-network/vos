@@ -38,14 +38,59 @@ deployment is automatic.
 ## Current position
 
 Latest measured portable source is frozen at
-`19e8d0515d5ab949d1f3ee2aca88f96c2afe4807`; it includes the provisional
-Shared recovery transport refresh and temporary Local family, transfer and
-observation/finalization diagnostics. Portable main/harness **pass 391.198s /
-449.955s**; main strict six-file verification **passes 0.101s**. Main is
-`3a9fcab0`; harness is `8637e90c`. Empty RUSTFLAGS, unset encoded/target
-overrides, exact copied hashes, clean source before/after and owned-group
-completion are recorded in `task-tmp/r44-cli-build-19e8d051/provenance.json`.
-Authority, Catalog, both runtime roles and coherent guest pins remain unchanged.
+`3b2d9b7420a6a4eba54a9ed66b011a54c48f9d8e`, including guarded ACK manifest
+reuse and full Local child correlation diagnostics. Portable main/harness
+**pass 393.998s / 459.572s**; strict six-file verification **passes 0.101s**.
+Main is `fe9d8599`; harness is `c38b732d`. Empty RUSTFLAGS, unset
+encoded/target overrides, exact copied hashes, clean source before/after and
+exhausted owned groups are recorded in
+`task-tmp/r45-cli-build-3b2d9b74/provenance.json`. Authority, Catalog, both
+runtime roles and coherent guest pins remain unchanged. Earlier `19e8d051`
+portable measurements remain frozen evidence, not current workflow qualification.
+
+The first measured ACK tuning candidate remains **UNQUALIFIED**. Current
+quiet/scoped all-cold runs **fail 239.765s / 242.958s**, one executed test each,
+owned groups gone and source/artifact fences passing. Cold durable and issuer
+observations complete. Extension twice returns Unavailable, then succeeds;
+the subsequent forwarded finalization Invoke times out waiting for local
+custody after **1.903902s** under the unchanged **1.8s** bound. Leader custody
+validation occurs after origin failure; later ordered-result availability also
+returns Unavailable. No cold guest outcome, issuer save, handoff, recovery,
+fresh Query or whole30 pass follows. The cold episode never reaches the ACK
+branch being optimized. No tuning benefit or performance-only/guest-failure
+verdict is established. This consumes **tuning pass one**, leaving one measured
+pass; a diagnostic rerun of this same candidate is not another tuning change.
+Evidence: `task-tmp/r45-pending-all-cold{,-scoped}-3b2d9b74`. The fixed
+forward/custody artifact has **114 records / zero unknown**, SHA-256
+`383ad432ae68d43d2bae6020af118e487b6291f92dc30890c938b98ce8b3f637`.
+
+Fresh owned Local diagnostic **fails 206.129s** before Query or Shared, with
+127 Install attempts and 123 two-member/root-only-CMI refusals. All source,
+artifact and process fences pass; three recorded launches, zero survivors.
+Full private correlation now **proves** that every refused child carries the
+original journal-verified signed ACK and the earlier proposed envelope, with
+all signature/request/message/whole-work/clock/parent/anchor/canonical checks
+true: **248 fixed events / zero unknown**. Only validation/equality booleans
+are exported. Evidence is `task-tmp/r45-local-child-correlation-3b2d9b74`;
+safe artifact SHA-256
+`a9c77026debe47eec3c9611e68b73fcacf5fb3134e691350b5fcb86bdff670ee`.
+Current physical-image equality is still unproved.
+
+The reviewed exact Local recovery correction is **APPLIED, UNBUILT,
+UNQUALIFIED**. Only the same-held production image Local controller may prove
+this exact original-owner two-member, authorization-present/finalization-absent
+family. All original child bindings are checked before normal issuer recovery
+and physical observation; complete canonical ACK bytes and physical receipt,
+application, whole state and applied clock must match. A fresh authenticated
+generation/committee/complete-slot comparison follows before admission.
+Default/bare/cold restrictions remain strict, with no signer, new custody,
+restoration or cached proof. Normal issuer open/physical observation can
+reconcile staged records/catalog state; this is real new recovery-path I/O,
+not a pure-read claim. Patch SHA-256
+`940585cdcfdfa6c939d5f08f74b2811899dbf0a93b7a2d0b60ebaa19de6395d9`.
+Meaningful callback negatives, exact retry, current portable builds and ordinary
+CLI/M1 qualification remain prerequisites. Existing component tests do not
+qualify the newly allowed branch.
 Three focused exact-retention units on preceding `f4a3dc90` each execute one test and **pass
 0.101s / 0.101s / 0.601s** (credential query, reservation and exact Install),
 with owned groups gone. These and the earlier typed retained-client regressions
@@ -163,7 +208,7 @@ worker checks attach only independently verified namespaces; public projection
 export stays closed while recovery is pending. No election, authorization,
 observation, protocol, resource or deadline change.
 
-Latest quiet/scoped all-cold runs on clean `19e8d051` **fail 243.961s /
+Earlier quiet/scoped all-cold runs on clean `19e8d051` **fail 243.961s /
 201.317s**, each one executed failing test, owned group gone and frozen
 source/artifact/provenance fences passing. Both fail constructor Shared recovery
 before routes with Unavailable. The scoped cold episode reaches exact retained
@@ -245,8 +290,10 @@ the earlier `941b3d3c` count-only run; neither fresh run retrospectively
 attributes `fcac175a`. The large copied-state proposal stays held/unqualified
 and opened no original stores.
 
-Next close exact Local child proof/admission and review cold ACK confirmation
-using the approved same-guard immutable-manifest reuse seam. Preserve every
+Next qualify the proved Local child-admission correction and investigate the
+current forwarded finalization Invoke custody delay. Any second tuning
+candidate must reuse only the same-guard immutable manifest while preserving
+the Invoke-specific original-clock, anchored-input and fresh absence checks. Preserve every
 fresh settled-prefix, physical availability/corruption and post-peer check.
 Fix only demonstrated causes, freeze current host provenance, then rerun quiet
 cold/returning and ordinary CLI under unchanged bounds. Native NRT1 terminal
@@ -263,8 +310,9 @@ dropped before guard release, peer availability or publication; ordinary,
 Invoke, persisted and local-owner retirement paths retain fresh behavior.
 Reviewed patch SHA-256
 `6d94a2f1dd66f588a2162f3e30ed8e4b821ea60c0fb4b4f29a128fa89d856866`.
-Portable CLI compilation and timing/recovery benefit remain open. Its next measured
-qualification counts as **service-tuning pass one**; none is measured yet.
+Current portable CLI compilation passes. Timing/recovery benefit remains open:
+first measured quiet/scoped qualification fails as recorded above before the
+cold ACK branch; **service-tuning pass one** is consumed without benefit credit.
 First core build on `7aa46a57` **fails 16.617s** before execution: the new
 network match omitted the existing fully qualified replay-request enum path.
 That one reference is corrected; the failed build and exhausted owned group
@@ -1062,8 +1110,10 @@ Remaining release work, in dependency order:
    The fresh existing-flag diagnostic on `19e8d051` fails **208.124s**, with
    123 exact-root two-member/root-only-CMI refusals. Command/order evidence
    proves registration confirmation timeout before the CMI pledge, followed
-   by the family admission gap. Actual full child/issuer binding remains open.
-   Pure private-commitment comparison is CORE BUILT, CLI UNBUILT/UNEXECUTED:
+   by the family admission gap. Current full child/issuer binding is proved by
+   the `3b2d9b74` correlation above; the reviewed recovery correction is applied
+   and needs meaningful callback qualification before integrated credit.
+   Pure private-commitment comparison is BUILT and EXECUTED on `3b2d9b74`:
    normal already-verified ACK/envelope versus the authenticated refused child,
    with fixed signature/work/clock/parent/anchor checks. It adds diagnostic CPU
    only and preserves ScopeMismatch; no store/guest/state/cache/admission change.
@@ -1137,7 +1187,7 @@ Separate forecasts and unknowns:
   its identical isolated rerun passed without changing limits. Its cause remains
   unattributed. These are preparation-only fsync test-store results, not native
   policy/issuance or follower-forwarding qualification.
-  Current `19e8d051` portable main/harness take **391.198s / 449.955s**; both
+  Earlier `19e8d051` portable main/harness take **391.198s / 449.955s**; both
   include temporary diagnostics and provisional transport refresh. This is
   **14.0 minutes** combined; preceding `941b3d3c` took **14.2 minutes**, while
   the preceding fixture-only build took **7.4 minutes**. Cache/source build
@@ -1178,7 +1228,7 @@ Separate forecasts and unknowns:
   ETA or reliable aggregate qualification range is established. Remaining cold
   recovery, leader loss, cumulative pruning and ordinary CLI delivery may expose
   more work.
-  No service-tuning pass was consumed.
+  First measured ACK tuning pass is consumed; no benefit is credited. One remains.
 - **Packaging after correctness:** paired-role tooling/reproduction is
   implemented within the previous **4–8 source-hour** band. Corrected-source
   independent builds and strict frozen-builder bundle verification pass;
@@ -1189,16 +1239,19 @@ Separate forecasts and unknowns:
   Agent backup/restore remain open. M3 additionally requires external hardware
   and prescribed 30-minute load/24-hour soak elapsed time.
 
-Measured cold ACK confirmation failure warrants the narrow immutable-manifest
-reuse delta above, awaiting compilation and first measured tuning pass. The
+The narrow ACK immutable-manifest reuse delta above is compiled; its first
+measured cold runs fail before the optimized ACK branch. Current cold evidence
+instead identifies forwarded finalization Invoke custody confirmation delay.
+A second candidate requires independently reviewed same-guard reuse preserving
+every Invoke preparation, fresh absence and physical availability check. The
 separate retained-result availability seam and full audited-view reuse remain
 deferred: raw Raft movement requires the fresh settled-prefix/absence checks.
 Existing retained-registration early return already works. Never cache permits
 across host-lock release/peer I/O or remove fresh physical corruption checks.
 
 No completion percentage, deployment date, release promotion or master change is
-established. At most two measured service-tuning passes remain authorized; none
-has been consumed. Architectural replacement and correctness diagnosis are not
+established. One of the two authorized measured service-tuning passes is consumed
+without benefit credit; one remains. Architectural replacement and correctness diagnosis are not
 service-tuning passes. Hardware is unavailable; prepare tooling locally and
 leave hardware/load/soak qualification explicitly open.
 

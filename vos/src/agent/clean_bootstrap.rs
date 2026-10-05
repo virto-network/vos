@@ -6729,6 +6729,24 @@ where
         &mut self,
         slot: &super::clean_management_intent::CleanManagementIntentSlot<B>,
     ) -> Result<bool, SharedAgentHostError> {
+        self.retained_local_install_family_with_application(
+            slot,
+            None::<fn(&ManagementApplicationAck) -> Result<(), SharedAgentHostError>>,
+        )
+    }
+
+    /// Only the production Local controller may supply an exact issuer and
+    /// physical-application check for an already registered finalization child.
+    /// Default callers and bare intents keep their strict admission behavior.
+    pub(crate) fn retained_local_install_family_with_application<B, F>(
+        &mut self,
+        slot: &super::clean_management_intent::CleanManagementIntentSlot<B>,
+        verify_application: Option<F>,
+    ) -> Result<bool, SharedAgentHostError>
+    where
+        B: CleanManagementIssuerStore,
+        F: FnOnce(&ManagementApplicationAck) -> Result<(), SharedAgentHostError>,
+    {
         let diagnostics = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some();
         let refused = |phase: &'static str, error: SharedAgentHostError| {
             if diagnostics {
@@ -6821,6 +6839,88 @@ where
             .members()
             .first()
             .ok_or_else(|| refused("root_missing", SharedAgentHostError::ScopeMismatch))?;
+        if verify_application.is_some()
+            && intent.authorization_work().is_some()
+            && finalization.is_none()
+            && retained.owner().0 == self.pins.node.0
+            && retained.origin_owner().0 == self.pins.node.0
+            && retained.members().len() == 2
+            && root.parent().is_none()
+            && root.anchor() == &anchor
+            && root.envelope() == &work
+        {
+            use crate::actors::codec::Decode as _;
+            use super::clean_management_intent::CleanManagementIntent;
+            let child = &retained.members()[1];
+            let ack = child.work().message.get(1..)
+                .and_then(crate::actors::value::Msg::try_decode)
+                .and_then(|message| match message.args.get("ack") {
+                    Some(crate::actors::value::Value::Bytes(bytes)) => {
+                        ManagementApplicationAck::decode(bytes).ok()
+                    }
+                    _ => None,
+                })
+                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            let (
+                RuntimeWork::Invoke {
+                    invocation: original, observed_slot: original_slot, ..
+                },
+                RuntimeWork::Invoke {
+                    context, state, invocation, authorization, observed_slot,
+                },
+            ) = (root.envelope(), child.envelope()) else {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            };
+            let message = CleanManagementIntent::finalization_message(&ack);
+            let mut expected = (**original).clone();
+            expected.invocation = ack.acknowledgement_invocation;
+            expected.origin = super::sdk::InvocationOrigin::anonymous();
+            expected.message = message.clone();
+            if ack.verify_with(&RawCredentialVerifier).is_err()
+                || ack.authority != intent.call().authority
+                || ack.managed != intent.call().managed
+                || ack.authorization_invocation != intent.call().invocation
+                || ack.acknowledgement_invocation
+                    != ManagementApproval::derive_acknowledgement_invocation(intent.call())
+                || ack.credential_call != intent.call().commitment()
+                || ack.request != intent.request().commitment()
+                || invocation.message != message
+                || invocation.as_ref() != &expected
+                || *context != RuntimeExecutionContext::Direct
+                || *state != RuntimeState::default()
+                || **authorization != InvocationAuthorization::PublicPreflight(
+                    super::sdk::PublicPreflight::for_work(invocation, *observed_slot),
+                )
+                || *original_slot > ack.applied_at
+                || ack.applied_at > *observed_slot
+                || child.parent() != Some(root.commitment())
+                || child.anchor().genesis != anchor.genesis
+                || child.anchor().admission != anchor.admission
+                || child.anchor().runtime != anchor.runtime
+                || child.anchor().ordered.index < anchor.ordered.index
+                || (child.anchor().ordered.index == anchor.ordered.index
+                    && child.anchor().ordered.head != anchor.ordered.head)
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            // Reconcile and observe only after complete original-family proof.
+            // This callback must not re-enter this System owner or coordinator.
+            verify_application.ok_or(SharedAgentHostError::ScopeMismatch)?(&ack)?;
+            // Blocking issuer/Local observation released the network snapshot's
+            // guards. Re-inspect before admission; changed custody is retryable.
+            let fresh = self._network_host.management_recovery_manifest(agent)?;
+            if fresh.generation() != manifest.generation()
+                || fresh.committee() != manifest.committee()
+                || fresh.management_slot(crate::service::NodeId(self.pins.node.0))
+                    != Some(retained)
+            {
+                return Err(SharedAgentHostError::Unavailable);
+            }
+            if diagnostics {
+                tracing::debug!(phase = "complete", "Local image Install retained family admitted");
+            }
+            return Ok(true);
+        }
         if retained.origin_owner().0 != self.pins.node.0
             || retained.members().len() != expected_members
             || root.parent().is_some()

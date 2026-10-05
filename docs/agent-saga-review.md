@@ -103,14 +103,59 @@ Current O3 component evidence (logs under the native worktree's `target`):
 ### Current integration delta and blocking result
 
 Latest measured portable source is frozen at
-`19e8d0515d5ab949d1f3ee2aca88f96c2afe4807`; it includes the provisional
-Shared recovery transport refresh and temporary Local family, transfer and
-observation/finalization diagnostics. Portable main/harness **pass 391.198s /
-449.955s**; main strict six-file verification **passes 0.101s**. Main is
-`3a9fcab0`; harness is `8637e90c`. Empty RUSTFLAGS, unset encoded/target
-overrides, exact copied hashes, clean source before/after and owned-group
-completion are recorded in `task-tmp/r44-cli-build-19e8d051/provenance.json`.
-Authority, Catalog, both runtime roles and coherent guest pins remain unchanged.
+`3b2d9b7420a6a4eba54a9ed66b011a54c48f9d8e`, including guarded ACK manifest
+reuse and full Local child correlation diagnostics. Portable main/harness
+**pass 393.998s / 459.572s**; strict six-file verification **passes 0.101s**.
+Main is `fe9d8599`; harness is `c38b732d`. Empty RUSTFLAGS, unset
+encoded/target overrides, exact copied hashes, clean source before/after and
+exhausted owned groups are recorded in
+`task-tmp/r45-cli-build-3b2d9b74/provenance.json`. Authority, Catalog, both
+runtime roles and coherent guest pins remain unchanged. Earlier `19e8d051`
+portable measurements remain frozen evidence, not current workflow qualification.
+
+The first measured ACK tuning candidate remains **UNQUALIFIED**. Current
+quiet/scoped all-cold runs **fail 239.765s / 242.958s**, one executed test each,
+owned groups gone and source/artifact fences passing. Cold durable and issuer
+observations complete. Extension twice returns Unavailable, then succeeds;
+the subsequent forwarded finalization Invoke times out waiting for local
+custody after **1.903902s** under the unchanged **1.8s** bound. Leader custody
+validation occurs after origin failure; later ordered-result availability also
+returns Unavailable. No cold guest outcome, issuer save, handoff, recovery,
+fresh Query or whole30 pass follows. The cold episode never reaches the ACK
+branch being optimized. No tuning benefit or performance-only/guest-failure
+verdict is established. This consumes **tuning pass one**, leaving one measured
+pass; a diagnostic rerun of this same candidate is not another tuning change.
+Evidence: `task-tmp/r45-pending-all-cold{,-scoped}-3b2d9b74`. The fixed
+forward/custody artifact has **114 records / zero unknown**, SHA-256
+`383ad432ae68d43d2bae6020af118e487b6291f92dc30890c938b98ce8b3f637`.
+
+Fresh owned Local diagnostic **fails 206.129s** before Query or Shared, with
+127 Install attempts and 123 two-member/root-only-CMI refusals. All source,
+artifact and process fences pass; three recorded launches, zero survivors.
+Full private correlation now **proves** that every refused child carries the
+original journal-verified signed ACK and the earlier proposed envelope, with
+all signature/request/message/whole-work/clock/parent/anchor/canonical checks
+true: **248 fixed events / zero unknown**. Only validation/equality booleans
+are exported. Evidence is `task-tmp/r45-local-child-correlation-3b2d9b74`;
+safe artifact SHA-256
+`a9c77026debe47eec3c9611e68b73fcacf5fb3134e691350b5fcb86bdff670ee`.
+Current physical-image equality is still unproved.
+
+The reviewed exact Local recovery correction is **APPLIED, UNBUILT,
+UNQUALIFIED**. Only the same-held production image Local controller may prove
+this exact original-owner two-member, authorization-present/finalization-absent
+family. All original child bindings are checked before normal issuer recovery
+and physical observation; complete canonical ACK bytes and physical receipt,
+application, whole state and applied clock must match. A fresh authenticated
+generation/committee/complete-slot comparison follows before admission.
+Default/bare/cold restrictions remain strict, with no signer, new custody,
+restoration or cached proof. Normal issuer open/physical observation can
+reconcile staged records/catalog state; this is real new recovery-path I/O,
+not a pure-read claim. Patch SHA-256
+`940585cdcfdfa6c939d5f08f74b2811899dbf0a93b7a2d0b60ebaa19de6395d9`.
+Meaningful callback negatives, exact retry, current portable builds and ordinary
+CLI/M1 qualification remain prerequisites. Existing component tests do not
+qualify the newly allowed branch.
 Three focused exact-retention units on preceding `f4a3dc90` each execute one test and **pass
 0.101s / 0.101s / 0.601s** (credential query, reservation and exact Install),
 with owned groups gone. These and the earlier typed retained-client regressions
@@ -230,7 +275,7 @@ worker checks attach only independently verified namespaces; public projection
 export stays closed while recovery is pending. No election, authorization,
 observation, protocol, resource or deadline change.
 
-Latest quiet/scoped all-cold runs on clean `19e8d051` **fail 243.961s /
+Earlier quiet/scoped all-cold runs on clean `19e8d051` **fail 243.961s /
 201.317s**, each one executed failing test, owned group gone and frozen
 source/artifact/provenance fences passing. Both fail constructor Shared recovery
 before routes with Unavailable. The scoped cold episode reaches exact retained
@@ -328,8 +373,9 @@ closure, capacity, worker barriers and exact custody checks remain. The view
 is dropped before unlock/peer availability/publication; other paths stay fresh.
 Reviewed patch SHA-256
 `6d94a2f1dd66f588a2162f3e30ed8e4b821ea60c0fb4b4f29a128fa89d856866`.
-Portable CLI compilation and runtime benefit are open; its next measured qualification
-counts as **service-tuning pass one**, with none measured yet.
+Current portable CLI compilation passes. First measured quiet/scoped cold
+qualification fails before the optimized ACK branch; **service-tuning pass one**
+is consumed without timing or recovery benefit credit.
 First core build on `7aa46a57` **fails 16.617s** before execution at the new
 network match's missing qualified enum path. That reference is corrected;
 the failed build/exhausted owned group are retained, without test/tuning credit.
@@ -426,15 +472,16 @@ acceptance still fails; fix only a demonstrated native cause and remove diagnost
 Fresh Local diagnostic `19e8d051` isolates 123 root-family count refusals:
 two retained members, root-only CMI, matching original root/owner/anchor/work.
 Ordered command evidence proves registration confirmation timeout before CMI
-pledge, followed by the family admission gap. Full child/issuer binding remains
-unproved. Pure correlation is CORE BUILT, CLI UNBUILT/UNEXECUTED:
+pledge, followed by the family admission gap. Full child/issuer binding was
+unproved on that source; current `3b2d9b74` correlation proves it as above.
+Pure correlation is BUILT and EXECUTED:
 compare normal already-verified durable ACK/proposed envelope with the refused
 authenticated child, and fixed signature/work/clock/parent/anchor checks.
 This adds diagnostic CPU only; no store/guest/state/cache/admission change, and
 ScopeMismatch remains. Reader outputs equality/validation booleans only.
 Current physical-image equality remains unproved. Preserve complete-family and
 cold bare-intent refusal. The corrected ordinary Query predicate is unreached.
-Current quiet/scoped cold runs **fail 243.961s / 201.317s**. Scoped observation,
+Earlier `19e8d051` quiet/scoped cold runs **fail 243.961s / 201.317s**. Scoped observation,
 guest finalization, issuer save and handoff succeed before retirement ACK
 confirmation times out. Peer reaches preparation start; no completion/late
 commit or whole30/fresh Query pass follows. Review only the approved same-guard
@@ -447,7 +494,7 @@ The quiet failed-gate costs are observations, not a successful recovery range. A
 **3–8 minutes per portable main/harness binary** range has moderate confidence
 from cache/source variation and is not an aggregate ETA. Earlier source/elapsed
 forecasts remain unreliable.
-No service-tuning pass was consumed.
+First measured ACK tuning pass is consumed; no benefit is credited. One remains.
 
 The earlier corrected role-source boundary `2e19cd17` freezes these changes,
 which close demonstrated M1 defects without changing authorization, wire bounds
