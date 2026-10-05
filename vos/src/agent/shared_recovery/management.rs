@@ -1093,6 +1093,29 @@ pub(crate) fn apply_management_registration(
     raft_term: u64,
 ) -> Result<bool, SharedRecoveryError> {
     validate_management_registration_request(slots, generation, committee, registration.request())?;
+    apply_management_registration_after_request_validation(
+        slots,
+        generation,
+        committee,
+        registration,
+        raft_index,
+        raft_term,
+    )
+}
+
+// Only for this same call's unchanged slots and exact request after the checked
+// request validation above. The manifest caller clones those immutable slots
+// before entering this body. This proof does not validate the incoming signed
+// registration: verify it before even an exact-retry return. Changed candidates
+// still receive complete slot/signature/evidence validation before assignment.
+pub(super) fn apply_management_registration_after_request_validation(
+    slots: &mut Vec<SharedManagementRecoverySlot>,
+    generation: AgentGenerationRouteKey,
+    committee: &AgentReplicaCommittee,
+    registration: &SharedManagementRecoveryRegistration,
+    raft_index: u64,
+    raft_term: u64,
+) -> Result<bool, SharedRecoveryError> {
     registration.verify(generation, committee)?;
     let existing =
         slots.binary_search_by_key(&registration.owner(), SharedManagementRecoverySlot::owner);
@@ -2422,6 +2445,265 @@ mod tests {
             .apply_management_registration(&registration, 1, 3)
             .unwrap();
         manifest
+    }
+
+    // Reference the original manifest path: both checked request passes and
+    // complete candidate.validate_at remain independent of the optimized path.
+    fn checked_manifest_registration(
+        manifest: &mut SharedRecoveryManifest,
+        registration: &SharedManagementRecoveryRegistration,
+        index: u64,
+        term: u64,
+    ) -> Result<bool, SharedRecoveryError> {
+        manifest.validate_management_registration_request(registration.request())?;
+        let mut candidate = manifest.clone();
+        let changed = apply_management_registration(
+            &mut candidate.management,
+            manifest.generation(),
+            manifest.committee(),
+            registration,
+            index,
+            term,
+        )?;
+        if changed {
+            let previous = manifest.last_position();
+            if index <= previous.0 || term < previous.1 {
+                return Err(SharedRecoveryError::InvalidObservation);
+            }
+            candidate.validate_at(index)?;
+            *manifest = candidate;
+        }
+        Ok(changed)
+    }
+
+    fn assert_registration_paths(
+        manifest: &mut SharedRecoveryManifest,
+        registration: &SharedManagementRecoveryRegistration,
+        index: u64,
+        term: u64,
+        expected: Result<bool, SharedRecoveryError>,
+    ) {
+        let before = manifest.clone();
+        let mut checked = before.clone();
+        assert_eq!(
+            checked_manifest_registration(&mut checked, registration, index, term),
+            expected,
+        );
+        assert_eq!(
+            manifest.apply_management_registration(registration, index, term),
+            expected,
+        );
+        assert_eq!(*manifest, checked);
+        if expected == Ok(true) {
+            manifest.validate_at(index).unwrap();
+        } else {
+            assert_eq!(
+                *manifest, before,
+                "retry/refusal must not publish a candidate"
+            );
+        }
+    }
+
+    #[test]
+    fn management_registration_manifest_matches_checked_wrapper_and_keeps_first_capsules() {
+        let root = member(44, None);
+        let registration = sign_registration(1, 1, None, alloc::vec![root.clone()]);
+        let mut manifest = scope();
+        assert_registration_paths(&mut manifest, &registration, 1, 3, Ok(true));
+        // Exact retries are verified but do not impose a new publication position.
+        assert_registration_paths(&mut manifest, &registration, 0, 0, Ok(false));
+        manifest.observe(&observe(&root, 2, false)).unwrap();
+        manifest.observe(&observe(&root, 3, true)).unwrap();
+        let first = manifest.management[0].members_evidence[0].clone();
+        let extension = sign_registration(
+            1,
+            2,
+            Some(manifest.management[0].commitment()),
+            alloc::vec![root.clone(), member(45, Some(root.commitment()))],
+        );
+        assert_registration_paths(&mut manifest, &extension, 4, 3, Ok(true));
+        assert_eq!(manifest.management[0].members_evidence[0], first);
+        assert!(manifest.management[0].members_evidence[1].invoke.is_none());
+        assert!(
+            manifest.management[0].members_evidence[1]
+                .acknowledgement
+                .is_none()
+        );
+
+        let shadow = sign_registration_from(2, node(1), 1, None, alloc::vec![root.clone()]);
+        assert_registration_paths(&mut manifest, &shadow, 5, 3, Ok(true));
+        let shadow_slot = manifest.management_slot(node(2)).unwrap();
+        assert_eq!(shadow_slot.origin_owner(), node(1));
+        assert_eq!(shadow_slot.members_evidence[0], first);
+        assert_registration_paths(&mut manifest, &extension, 0, 0, Ok(false));
+        assert_registration_paths(&mut manifest, &shadow, 1, 1, Ok(false));
+
+        // Later physical retries retain the inherited first Invoke/ACK capsules.
+        assert!(!manifest.observe(&observe(&root, 6, false)).unwrap());
+        assert!(!manifest.observe(&observe(&root, 7, true)).unwrap());
+        for owner in [node(1), node(2)] {
+            assert_eq!(
+                manifest.management_slot(owner).unwrap().members_evidence[0],
+                first,
+            );
+        }
+        manifest.validate_at(5).unwrap();
+    }
+
+    #[test]
+    fn management_registration_manifest_refuses_invalid_signed_input_without_change() {
+        let root = member(46, None);
+        let registration = sign_registration(1, 1, None, alloc::vec![root.clone()]);
+        let mut manifest = scope();
+        assert_registration_paths(&mut manifest, &registration, 1, 3, Ok(true));
+        manifest.observe(&observe(&root, 2, false)).unwrap();
+        manifest.observe(&observe(&root, 3, true)).unwrap();
+        let previous = manifest.management[0].commitment();
+        let members = alloc::vec![root.clone(), member(47, Some(root.commitment()))];
+        let extension = sign_registration(1, 2, Some(previous), members.clone());
+        for (index, term) in [(0, 3), (3, 3), (4, 0), (4, 2)] {
+            assert_registration_paths(
+                &mut manifest,
+                &extension,
+                index,
+                term,
+                Err(SharedRecoveryError::InvalidObservation),
+            );
+        }
+        for stale in [
+            sign_registration(1, 3, Some(previous), members.clone()),
+            sign_registration(1, 2, Some(Hash([0x9e; 32])), members.clone()),
+        ] {
+            assert_registration_paths(
+                &mut manifest,
+                &stale,
+                4,
+                3,
+                Err(SharedRecoveryError::Sequence),
+            );
+        }
+        let changed_origin = sign_registration_from(1, node(2), 2, Some(previous), members);
+        assert_registration_paths(
+            &mut manifest,
+            &changed_origin,
+            4,
+            3,
+            Err(SharedRecoveryError::Conflict),
+        );
+        let outside = sign_registration(4, 1, None, alloc::vec![member(48, None)]);
+        assert_registration_paths(
+            &mut manifest,
+            &outside,
+            4,
+            3,
+            Err(SharedRecoveryError::ScopeMismatch),
+        );
+
+        // A valid newly signed envelope cannot substitute the original retained
+        // work/authorization, even under another admitted holder's signature.
+        let mut changed_root = root.clone();
+        let RuntimeWork::Invoke {
+            invocation,
+            authorization,
+            ..
+        } = &mut changed_root.envelope
+        else {
+            unreachable!()
+        };
+        invocation.gas -= 1;
+        **authorization = InvocationAuthorization::PublicPreflight(
+            sdk::PublicPreflight::for_work(invocation, 10),
+        );
+        let changed_authorization =
+            sign_registration_from(2, node(1), 1, None, alloc::vec![changed_root]);
+        assert_registration_paths(
+            &mut manifest,
+            &changed_authorization,
+            4,
+            3,
+            Err(SharedRecoveryError::Conflict),
+        );
+
+        let mut bad_authorization = registration.clone();
+        let RuntimeWork::Invoke { invocation, .. } =
+            &mut bad_authorization.request.members[0].envelope
+        else {
+            unreachable!()
+        };
+        invocation.gas -= 1;
+        bad_authorization.signature = ReplicaCommitSignature::new(
+            node(1),
+            key(1)
+                .sign(&bad_authorization.request.signing_message().0)
+                .to_bytes(),
+        )
+        .unwrap();
+        assert_registration_paths(
+            &mut manifest,
+            &bad_authorization,
+            0,
+            0,
+            Err(SharedRecoveryError::InvalidEnvelope),
+        );
+
+        let mut too_many_members = registration.clone();
+        too_many_members.request.members.resize(
+            MAX_SHARED_MANAGEMENT_RECOVERY_MEMBERS + 1,
+            root,
+        );
+        too_many_members.signature = ReplicaCommitSignature::new(
+            node(1),
+            key(1)
+                .sign(&too_many_members.request.signing_message().0)
+                .to_bytes(),
+        )
+        .unwrap();
+        assert_registration_paths(
+            &mut manifest,
+            &too_many_members,
+            0,
+            0,
+            Err(SharedRecoveryError::LimitExceeded),
+        );
+
+        // The exact request proof is insufficient for either signature failure;
+        // incoming registration.verify must precede its otherwise exact retry.
+        let mut bad_signature = registration.clone();
+        bad_signature.signature = ReplicaCommitSignature::new(
+            node(1),
+            key(2).sign(&registration.request.signing_message().0).to_bytes(),
+        )
+        .unwrap();
+        assert_registration_paths(
+            &mut manifest,
+            &bad_signature,
+            0,
+            0,
+            Err(SharedRecoveryError::InvalidSignature),
+        );
+        let mut wrong_signer = registration;
+        wrong_signer.signature = ReplicaCommitSignature::new(
+            node(2),
+            key(2).sign(&wrong_signer.request.signing_message().0).to_bytes(),
+        )
+        .unwrap();
+        assert_registration_paths(
+            &mut manifest,
+            &wrong_signer,
+            0,
+            0,
+            Err(SharedRecoveryError::InvalidSignature),
+        );
+
+        let mut corrupted = manifest;
+        corrupted.management[0].registration.signature = bad_signature.signature;
+        assert_registration_paths(
+            &mut corrupted,
+            &extension,
+            4,
+            3,
+            Err(SharedRecoveryError::InvalidSignature),
+        );
     }
 
     #[test]

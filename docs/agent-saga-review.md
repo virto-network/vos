@@ -11,6 +11,16 @@ host source or the released workflow.
 
 ## Boundary and release claim
 
+R52 is now explicitly authorized: the user replied **"keep going"** to one
+bounded measured registration-validation helper pass. The live plan owns its
+source/test/provenance sequence and unchanged cap. It preserves the checked
+entry point, incoming signature verification, complete candidate validation,
+manifest bounds/positions and fresh independent audits. Source implementation
+and independent review are complete; compilation and exact-candidate measurement
+are pending. No benefit or recovery claim is
+established. This permission does not automatically authorize another candidate,
+redesign, promotion or deadline increase.
+
 The latest user direction continues investigation and prioritizes demonstrated
 smaller defects before broader simplifications. R51 adds only narrow audit and
 attachment timings on the R50 failure path. It is complete on clean `26c6023b`:

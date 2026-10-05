@@ -37,6 +37,48 @@ deployment is automatic.
 
 ## Current position
 
+### R52 authorized bounded registration-validation pass
+
+The user replied **"keep going"** to the concrete request for one bounded
+measured validation-helper pass after R51. This explicitly authorizes this
+additional candidate; the engineering-week cap and all phase/resource limits
+remain unchanged. It does not authorize another candidate, a redesign or a
+release promotion. Start from clean documentation checkpoint
+`3190343a82c63aa10188fe4fef425ea28935c0bd`, whose code is R51 `26c6023b`.
+
+Implement only same-call registration validation reuse in
+`shared_recovery.rs` and `shared_recovery/management.rs`. Retain the general
+checked entry point; the optimized manifest path must establish identical
+immutable current slots/request before calling the private body. Retain
+incoming signature verification before exact-retry return, complete candidate
+checks, explicit manifest scope/byte/position bounds and assignment only after
+success. No audit is reused across a mutation, read transaction, released guard
+or peer I/O. Physical/live-manifest freshness/corruption checks and all signed
+ownership/retention/retry restrictions remain authoritative.
+
+Independently review code and a signed differential against the original
+checked manifest path, run meaningful registration/recovery preservation units,
+then freeze clean source. Reuse the original owned portable main/harness build,
+strict six-file provenance and isolated quiet all-cold measurement; a scoped
+attempt on the same candidate attributes success/failure without counting as
+another tuning change. Admit all completed evidence through unchanged exact
+source/artifact/environment/binary/one-test/owned-group/input fences before
+documentation changes. Guest artifacts/pins stay unchanged. The final
+availability leaf from R51 remains unknown; a lower fold time cannot establish
+that its failure is only performance. No recovery or performance result is
+established for R52 yet. M1 remains the next integrated milestone.
+
+The candidate source and two signed differential tests now exist. Production
+code removes only the two repeated validation passes; its explicit manifest
+scope and actual whole-byte bound remain. The differential reference follows
+the original checked wrapper plus full `validate_at`, comparing exact results
+and unchanged state on refusals. Existing component bounds make an isolated
+otherwise-valid whole-manifest overflow unconstructible; do not manufacture a
+large malformed fixture or relax limits to test it. Source review must verify
+the retained whole-manifest bound, alongside signed-input/bounds regressions.
+Independent source and differential-test review passed. Compilation, unit
+execution and packaged measurement remain pending.
+
 ### Architecture review and authorized causal diagnostics
 
 Latest direction (2026-10-05): continue causal investigation as needed and tackle

@@ -414,7 +414,7 @@ impl SharedRecoveryManifest {
     ) -> Result<bool, SharedRecoveryError> {
         self.validate_management_registration_request(registration.request())?;
         let mut candidate = self.clone();
-        let changed = management::apply_management_registration(
+        let changed = management::apply_management_registration_after_request_validation(
             &mut candidate.management,
             self.generation,
             &self.committee,
@@ -427,7 +427,13 @@ impl SharedRecoveryManifest {
             if index <= previous.0 || term < previous.1 {
                 return Err(SharedRecoveryError::InvalidObservation);
             }
-            candidate.validate_at(index)?;
+            // The same-call helper fully validated these candidate slots,
+            // including signatures and all inherited evidence, against this
+            // unchanged generation/committee. Keep the remaining manifest
+            // scope, whole encoded bound and positions before publication.
+            validate_scope(candidate.generation, &candidate.committee)?;
+            bound(&candidate, MAX_SHARED_RECOVERY_MANIFEST_BYTES)?;
+            candidate.validate_positions_after_validation(index)?;
             *self = candidate;
         }
         Ok(changed)
