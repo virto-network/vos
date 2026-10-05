@@ -459,7 +459,12 @@ impl SharedRecoveryManifest {
             if index <= previous.0 || term < previous.1 {
                 return Err(SharedRecoveryError::InvalidObservation);
             }
-            candidate.validate_at(index)?;
+            // The checked release application already fully validated these
+            // exact changed slots. Keep the remaining manifest-level checks
+            // before assignment; this proof stays within this one call.
+            validate_scope(candidate.generation, &candidate.committee)?;
+            bound(&candidate, MAX_SHARED_RECOVERY_MANIFEST_BYTES)?;
+            candidate.validate_positions_after_validation(index)?;
             *self = candidate;
         }
         Ok(changed)

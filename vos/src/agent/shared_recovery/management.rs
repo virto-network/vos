@@ -2706,6 +2706,217 @@ mod tests {
         );
     }
 
+    // Preserve the original release manifest path as the differential reference:
+    // checked signed application followed by complete candidate.validate_at.
+    fn checked_manifest_release(
+        manifest: &mut SharedRecoveryManifest,
+        release: &SharedManagementRecoveryRelease,
+        index: u64,
+        term: u64,
+    ) -> Result<bool, SharedRecoveryError> {
+        let mut candidate = manifest.clone();
+        let changed = apply_management_release(
+            &mut candidate.management,
+            manifest.generation(),
+            manifest.committee(),
+            release,
+            index,
+            term,
+        )?;
+        if changed {
+            let previous = manifest.last_position();
+            if index <= previous.0 || term < previous.1 {
+                return Err(SharedRecoveryError::InvalidObservation);
+            }
+            candidate.validate_at(index)?;
+            *manifest = candidate;
+        }
+        Ok(changed)
+    }
+
+    fn assert_release_paths(
+        manifest: &mut SharedRecoveryManifest,
+        release: &SharedManagementRecoveryRelease,
+        index: u64,
+        term: u64,
+        expected: Result<bool, SharedRecoveryError>,
+    ) {
+        let before = manifest.clone();
+        let mut checked = before.clone();
+        assert_eq!(
+            checked_manifest_release(&mut checked, release, index, term),
+            expected,
+        );
+        assert_eq!(manifest.apply_management_release(release, index, term), expected);
+        assert_eq!(*manifest, checked);
+        if expected == Ok(true) {
+            manifest.validate_at(index).unwrap();
+        } else {
+            assert_eq!(*manifest, before, "retry/refusal must not publish a candidate");
+        }
+    }
+
+    #[test]
+    fn management_release_manifest_matches_checked_wrapper_and_keeps_first_capsules() {
+        let root = member(49, None);
+        let child = member(50, Some(root.commitment()));
+        let mut manifest = candidate_manifest(&root);
+        manifest.observe(&observe(&root, 2, false)).unwrap();
+        manifest.observe(&observe(&root, 3, true)).unwrap();
+        let first_root = manifest.management_slot(node(1)).unwrap().members_evidence[0].clone();
+        let extension = sign_registration(
+            1,
+            2,
+            Some(manifest.management_slot(node(1)).unwrap().commitment()),
+            alloc::vec![root.clone(), child.clone()],
+        );
+        manifest.apply_management_registration(&extension, 4, 3).unwrap();
+        manifest.observe(&observe(&child, 5, false)).unwrap();
+        manifest.observe(&observe(&child, 6, true)).unwrap();
+        let first = manifest.management_slot(node(1)).unwrap().members_evidence.clone();
+        assert_eq!(first[0], first_root);
+        let shadow = sign_registration_from(2, node(1), 1, None, alloc::vec![root.clone()]);
+        manifest.apply_management_registration(&shadow, 7, 3).unwrap();
+        let owner_release = sign_release(manifest.management_slot(node(1)).unwrap(), 1);
+        let shadow_release = sign_release(manifest.management_slot(node(2)).unwrap(), 2);
+
+        assert_release_paths(&mut manifest, &owner_release, 8, 3, Ok(true));
+        assert!(manifest.management_slot(node(1)).unwrap().is_released());
+        assert!(!manifest.management_slot(node(2)).unwrap().is_released());
+        assert_eq!(manifest.management_slot(node(1)).unwrap().members_evidence, first);
+        assert_eq!(manifest.management_slot(node(2)).unwrap().members_evidence[0], first_root);
+        assert_release_paths(&mut manifest, &shadow_release, 9, 3, Ok(true));
+        assert_eq!(manifest.management_slot(node(2)).unwrap().origin_owner(), node(1));
+        assert_release_paths(&mut manifest, &owner_release, 0, 0, Ok(false));
+        assert_release_paths(&mut manifest, &shadow_release, 1, 1, Ok(false));
+
+        for (member, index, acknowledgement) in [
+            (&root, 10, false), (&root, 11, true), (&child, 12, false), (&child, 13, true),
+        ] {
+            assert!(!manifest.observe(&observe(member, index, acknowledgement)).unwrap());
+        }
+        assert_eq!(manifest.management_slot(node(1)).unwrap().members_evidence, first);
+        assert_eq!(manifest.management_slot(node(2)).unwrap().members_evidence[0], first_root);
+        manifest.validate_at(9).unwrap();
+    }
+
+    #[test]
+    fn management_release_manifest_refuses_invalid_signed_input_without_change() {
+        let root = member(51, None);
+        let mut manifest = candidate_manifest(&root);
+        manifest.observe(&observe(&root, 2, false)).unwrap();
+        manifest.observe(&observe(&root, 3, true)).unwrap();
+        let terminal = sign_release(manifest.management_slot(node(1)).unwrap(), 1);
+        for (index, term) in [(0, 3), (3, 3), (4, 0), (4, 2)] {
+            assert_release_paths(
+                &mut manifest, &terminal, index, term,
+                Err(SharedRecoveryError::InvalidObservation),
+            );
+        }
+        let signed = |request: SharedManagementRecoveryReleaseRequest, owner: u8| {
+            let signature = ReplicaCommitSignature::new(
+                node(owner), key(owner).sign(&request.signing_message().0).to_bytes(),
+            ).unwrap();
+            SharedManagementRecoveryRelease::new(request, signature).unwrap()
+        };
+        let mut wrong_generation = terminal.request.clone();
+        let generation = manifest.generation();
+        wrong_generation.generation = AgentGenerationRouteKey::new(
+            generation.space(), generation.agent(), generation.genesis(),
+            super::super::super::genesis::AgentGenesisAdmissionId::from_bytes([0xa7; 32]),
+        ).unwrap();
+        let mut wrong_committee = terminal.request.clone();
+        wrong_committee.committee = AgentReplicaCommitteeId::from_bytes([0xa8; 32]);
+        let mut outside_owner = terminal.request.clone();
+        outside_owner.owner = node(4);
+        let mut stale_scope = terminal.request.clone();
+        stale_scope.scope = Hash([0xa9; 32]);
+        let mut stale_sequence = terminal.request.clone();
+        stale_sequence.sequence += 1;
+        for (request, owner, error) in [
+            (wrong_generation, 1, SharedRecoveryError::ScopeMismatch),
+            (wrong_committee, 1, SharedRecoveryError::ScopeMismatch),
+            (outside_owner, 4, SharedRecoveryError::ScopeMismatch),
+            (stale_scope, 1, SharedRecoveryError::Conflict),
+            (stale_sequence, 1, SharedRecoveryError::Conflict),
+        ] {
+            assert_release_paths(&mut manifest, &signed(request, owner), 4, 3, Err(error));
+        }
+
+        let mut bad_signature = terminal.clone();
+        bad_signature.signature = ReplicaCommitSignature::new(
+            node(1), key(2).sign(&terminal.request.signing_message().0).to_bytes(),
+        ).unwrap();
+        let mut wrong_signer = terminal.clone();
+        wrong_signer.signature = ReplicaCommitSignature::new(
+            node(2), key(2).sign(&terminal.request.signing_message().0).to_bytes(),
+        ).unwrap();
+        for invalid in [&bad_signature, &wrong_signer] {
+            assert_release_paths(
+                &mut manifest, invalid, 0, 0, Err(SharedRecoveryError::InvalidSignature),
+            );
+        }
+        let mut invalid_request = terminal.clone();
+        invalid_request.request.sequence = 0;
+        invalid_request.signature = ReplicaCommitSignature::new(
+            node(1), key(1).sign(&invalid_request.request.signing_message().0).to_bytes(),
+        ).unwrap();
+        assert_release_paths(
+            &mut manifest, &invalid_request, 4, 3, Err(SharedRecoveryError::InvalidEnvelope),
+        );
+
+        // A root's ACK does not discharge an additional retained member.
+        let mut unacknowledged = manifest.clone();
+        let child = member(52, Some(root.commitment()));
+        let extension = sign_registration(
+            1, 2, Some(unacknowledged.management_slot(node(1)).unwrap().commitment()),
+            alloc::vec![root, child],
+        );
+        unacknowledged.apply_management_registration(&extension, 4, 3).unwrap();
+        let slot = unacknowledged.management_slot(node(1)).unwrap();
+        let mut incomplete = terminal.request.clone();
+        incomplete.sequence = slot.sequence();
+        incomplete.scope = slot.commitment();
+        assert_release_paths(
+            &mut unacknowledged, &signed(incomplete, 1), 5, 3,
+            Err(SharedRecoveryError::NotAcknowledged),
+        );
+
+        let mut corrupted = manifest.clone();
+        let stored = &mut corrupted.management[0].registration;
+        stored.signature = ReplicaCommitSignature::new(
+            node(1), key(2).sign(&stored.request.signing_message().0).to_bytes(),
+        ).unwrap();
+        assert_release_paths(
+            &mut corrupted, &terminal, 4, 3, Err(SharedRecoveryError::InvalidSignature),
+        );
+        let mut nonvoter = manifest.clone();
+        let members = manifest.committee().members().iter().map(|member| {
+            if member.replica().node != node(1) { return member.clone(); }
+            let mut replica = member.replica();
+            replica.role = ReplicaRole::Observer;
+            super::super::super::genesis::AgentReplicaMember::new(
+                replica, member.peer_id().to_vec(), *member.ed25519_public_key(), None,
+            ).unwrap()
+        }).collect();
+        nonvoter.committee = AgentReplicaCommittee::new(
+            generation.space(), generation.agent(), AgentProfile::Shared, members,
+        ).unwrap();
+        assert_release_paths(
+            &mut nonvoter, &terminal, 4, 3, Err(SharedRecoveryError::ScopeMismatch),
+        );
+
+        assert_release_paths(&mut manifest, &terminal, 4, 3, Ok(true));
+        // The incoming signed release is checked even for an otherwise exact retry.
+        assert_release_paths(
+            &mut manifest, &bad_signature, 0, 0, Err(SharedRecoveryError::InvalidSignature),
+        );
+        manifest.management[0].release.as_mut().unwrap().release.signature = bad_signature.signature;
+        assert_release_paths(
+            &mut manifest, &terminal, 0, 0, Err(SharedRecoveryError::InvalidSignature),
+        );
+    }
+
     #[test]
     fn management_candidate_fold_matches_checked_wrapper_and_keeps_first_capsules() {
         let member = member(40, None);

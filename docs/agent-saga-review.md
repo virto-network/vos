@@ -11,6 +11,15 @@ host source or the released workflow.
 
 ## Boundary and release claim
 
+R54 is now authorized by the user's 2026-10-06 direction to keep going until
+the issue is resolved, answering the concrete fifth-pass proposal. It removes
+only repeated same-call release candidate-slot validation while retaining all
+checked request/signature/member/owner restrictions, whole-manifest bounds,
+positions and fresh physical audits. Signed differential, preservation checks,
+clean current portable provenance and isolated quiet/scoped measurements remain
+required. The live plan owns this sequence and unchanged cap; no benefit,
+recovery pass, material redesign or promotion is implied by approval.
+
 R52's explicitly authorized bounded registration-validation pass is complete
 on clean `92702a09`: independent source reviews and ten preservation/differential
 units pass; portable main/harness and strict six-file verification pass.
@@ -30,8 +39,9 @@ release wait expires before proposal, then the leader confirms the exact release
 late. Signed-ledger validation and capacity dominate admission; worker snapshot
 is small in the measured calls. Later confirmation waits over two seconds for
 the host lock, whose holder is unidentified. No behavior remedy is applied.
-The live plan holds a reviewed, unapplied release-fold proposal and the explicit
-go/no-go requirement before any fifth tuning candidate; no cap extension follows.
+The live plan records the subsequently authorized R54 release-fold candidate;
+no cap extension follows. Its reviewed proposal precedes implementation and
+supplies no measured benefit.
 
 The latest user direction continues investigation and prioritizes demonstrated
 smaller defects before broader simplifications. R51 adds only narrow audit and
@@ -175,10 +185,12 @@ No fifth tuning candidate or week-cap extension is automatic.
 The reviewed proposal removes only repeated changed-candidate slot validation
 from historical release folding. It retains incoming signature-before-retry,
 complete checked request/candidate restrictions, explicit manifest scope/byte/
-position checks and assignment last. The patch lives only in the target evidence
-directory; it is not applied, compiled or measured. Signed differential and
+position checks and assignment last. At the R53 evidence boundary the patch lived
+only in the target evidence directory, unapplied, uncompiled and unmeasured.
+R54 now authorizes its implementation; no current measurement exists yet.
+Signed differential and
 preservation regressions plus exact portable quiet/scoped evidence are required
-if that further pass is approved. No measured sufficient benefit is promised.
+for that approved pass. No measured sufficient benefit is promised.
 
 Historical [R52](agent-saga-status.md#completed-r52-registration-validation-pass-retention-release-remains-blocked)
 records lower matching-composition fold medians with distinct signed datasets

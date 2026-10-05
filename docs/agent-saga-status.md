@@ -37,6 +37,37 @@ deployment is automatic.
 
 ## Current position
 
+### R54 authorized release-fold validation pass
+
+On 2026-10-06 the user answered the concrete fifth-pass proposal with
+"let's keep going all the way through until we nail this down". Proceed with
+the reviewed release-fold patch from clean `12d65abd`, and continue causal
+investigation toward integrated recovery. This does not increase the
+engineering-week cap, phase/resource limits or deadlines, or authorize a material
+redesign, new authority, fallback, promotion or deployment.
+
+R54 removes only the outer repeat of complete changed-candidate slot validation
+after the inner checked release fold has already validated those exact slots
+in the same call. Keep original checked request/old-slot validation, incoming
+release signature before exact retry, complete owner/sequence/scope/member ACK
+restrictions, full candidate signatures/cross-holder checks, explicit whole
+manifest scope/byte/position bounds, previous index/term and assignment last.
+No proof crosses mutation, ledger transaction/guard release or peer I/O; all
+fresh physical-prefix/availability/corruption checks remain mandatory.
+
+Add signed differentials against the original checked manifest release path
+for successful release, exact retry, refusal and unchanged state. Independently
+review source/tests and preservation selectors, freeze clean source, run core
+preservation checks, then build current portable main/harness and strictly verify
+the unchanged coherent six-file bundle. Reuse original owned tooling and isolate
+quiet/scoped all-cold measurements. Admit completed evidence through all original
+exact source/artifact/environment/binary/input/owned-group fences before doc
+updates. Continue mandatory gates after a demonstrated pass; tests/checkpoints
+alone are not completion. R53's audit and later host-lock pressure are measured,
+but the repeated pure release check's removable cost and sufficiency remain
+unknown. Host-holder source review can proceed in parallel without another
+behavior change. M1 is still the next integrated milestone.
+
 ### Completed R53 exact terminal-release diagnostics
 
 **Implementation:** diagnostic-only source is frozen at clean
@@ -131,8 +162,9 @@ would require a signed differential against the original checked release path,
 existing release/reopen/corruption preservation regressions, clean portable
 provenance and isolated quiet/scoped measurements. Do not add a provenance-loan
 optimization or combine fresh transactions without separate review/authority.
-Obtain explicit go/no-go direction before a fifth tuning candidate under the
-unchanged engineering-week cap. Broader nonblocking simplifications remain later.
+The fifth candidate was pending explicit direction at this evidence boundary;
+R54 above records the subsequent authorization under the unchanged cap.
+Broader nonblocking simplifications remain later.
 Implementation/remedy hours and total M1/M2/M3 effort remain unknown; observed
 paired-build **14–35min** and failed-attempt **2.3–6.1min** ranges are only
 medium-confidence attempt-cost guidance. The different failure/progress stages
@@ -2044,8 +2076,8 @@ Remaining release work, in dependency order:
    worker snapshots are small in those samples. The host holder and internal
    preflight contention/body cost remain unknown. Independent fresh physical-prefix audits
    remain mandatory; host/proposal guards alone do not prevent raw Raft progress.
-   Obtain explicit go/no-go direction before a fifth tuning candidate or material
-   redesign; no week-cap extension follows.
+   R54 records the explicit fifth-pass go/no-go authorization. Keep its patch
+   and measurements bounded; no material redesign or week-cap extension follows.
    Source review rules out a missing caller retry: existing same-held recovery
    already retries Unavailable within the original scheduling window. Preserve
    exact retained continuation, fresh absence/settled-prefix, physical
@@ -2232,7 +2264,8 @@ across host-lock release/peer I/O or remove fresh physical corruption checks.
 No completion percentage, deployment date, release promotion or master change is
 established. Both original measured service-tuning passes are consumed without
 qualification or benefit credit. The renewed bounded R48 and R52 candidates have
-also failed to qualify recovery; a fifth tuning candidate requires direction.
+also failed to qualify recovery; the fifth candidate is explicitly authorized
+as R54 above, with its benefit and recovery result still unestablished.
 Do not extend the engineering-
 week go/no-go cap automatically.
 Architectural replacement and correctness diagnosis are not service-tuning passes.
