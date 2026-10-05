@@ -102,11 +102,19 @@ Current O3 component evidence (logs under the native worktree's `target`):
 
 ### Current integration delta and blocking result
 
-The user renewed go-ahead after the two failed measured candidates. This
-authorizes one bounded, source-justified corrective candidate and isolated
-measurement, not an automatic engineering-week cap extension, deadline increase,
-architecture change or readiness claim. The previous two-pass boundary remains
-frozen failed evidence; a further measured candidate will be counted explicitly.
+The user-authorized bounded R48 candidate is **measured and failed** on clean
+source `89b40ba6e34b87d94a323b3fe54a08fea614afa5`. This is the **third measured
+candidate**, explicitly authorized after the original two failed passes; it
+supplies no recovery, performance benefit or M1 exit. The engineering-week
+go/no-go cap has not been extended. Another tuning change requires direction.
+
+A subsequent seven-line preservation repair restores the original post-worker-
+snapshot live lease/Agent check before selecting any retained custody capsule.
+Two independent source reviews pass. It uses the existing verified-manifest
+selector, without another audit, changed admission rule or cross-guard cache.
+This repair is pending a fresh core build and two existing ownership regression
+checks; the measured R48 portable binaries precede it. It is a correctness
+preservation repair, not another service-tuning candidate.
 
 R48 reads the completed R47 logs without rerunning a fixture. Its independently
 reviewed finite reader reports **689 events / eight temporal intervals / zero
@@ -138,16 +146,67 @@ manifest through the existing driver evidence verifier. Fresh ledger preflights,
 each unseen member's settled-prefix/absence proof, signatures, first-owner and
 complete-family checks, actual successful-terminal guest preview, full capacity
 audit, corruption/availability and worker barriers all remain. No manifest crosses
-application progress, host-guard release, publication or peer I/O. This candidate
-is **in implementation, unbuilt and unmeasured**; no benefit or M1 exit is claimed.
+application progress, host-guard release, publication or peer I/O.
 
-Implementation effort remains uncertain until review/checks close the exact
-reuse seams; no defensible aggregate source-hour estimate is established.
-Integration attempt costs have high-confidence measurements: recent portable
-main+harness rebuilds take **14–16 minutes**, failed all-cold runs approximately
-**3–5 minutes**. These are attempt costs, not successful recovery or remaining
-qualification forecasts. M1 qualification, M2 and local M3 gates remain below;
-external hardware qualification stays open.
+On `89b40ba6`, the core build **passes 76.885s** and six existing preservation
+units pass. The first unit runner's wrong module executes zero tests and is
+rejected; only the independently reviewed corrected exact selectors count.
+Portable main/harness **pass 410.140s / 476.407s**, strict six-file verification
+**passes 0.101s**. Provenance:
+`task-tmp/r48-cli-build-89b40ba6/provenance.json`, SHA-256
+`116ab1c0ec90e453c010d26b80e00b728c302fe11397456eb826f1dfefdabed5`.
+Empty RUSTFLAGS, unset overrides, exact frozen source/binaries/guest inputs and
+exhausted owned groups are checked; guest bytes and pins are unchanged.
+
+Quiet all-cold **fails 266.697s**, one executed test, with Shared startup
+Unavailable before public routes at `clean_startup_tests.rs:1981`. Safe artifact:
+`task-tmp/r48-pending-all-cold-89b40ba6/quiet-safe-summary.json`, SHA-256
+`85a50ba47bd6b0b4d8c4a0fd0d9d48279df7dbba55dab28b7715a5c487650812`.
+Its independently reviewed finite reader checks the exact exit/result/count
+tuple; the unexecuted predecessor remains preserved.
+
+The same-candidate scoped run **fails 266.397s**, one executed test and owned
+group gone. Preparation succeeds once, so preparation retry is not exercised.
+Cold durable and issuer observations complete; extension refuses twice, then
+completes, and finalization Invoke returns Unavailable. The admitted timeline
+contains **705 fixed events / eight temporal intervals / zero unknown**:
+origin registration confirmation times out at **1.840002s**, while temporally
+overlapping leader validation reaches clock preview at **3.612922s** and
+commit/local confirmation at **6.607590s**. Later origin Invoke confirmation
+times out during leader admission. A leader ordered-result waiter completes
+after origin startup has failed; its outcome category is not exported, and the
+subsequent availability refusal may be affected by teardown. No exact-request
+or node association, full cold guest verdict, result-loss defect or controlled
+speedup is established by these timestamps. Observation guard labels separately
+record six whole-observation post-execution refusals at **1.886070–1.993513s**
+against unchanged **1.8s**; they do not establish finalization causality.
+Scoped evidence: `task-tmp/r48-pending-all-cold-scoped-89b40ba6`.
+Timeline reader V3 SHA-256:
+`82659ae547bb3eca116b64d2a154749d643a4295d857244473f381019a4b9e06`;
+`cold-finalization-attribution-safe.json` SHA-256:
+`cb7aa873e539fa54fc3a2342d73c4356f8658afd8b5723a680f4c511c010a901`.
+Original source/artifact/binary/count/owned-process fences remain exact.
+No raw memory or private input collection was used; both loopback executions
+passed normal automatic approval. The previously errored standalone regression
+and decoder agent remain untouched.
+
+Source review also confirms that startup **already** retries only Unavailable,
+using the same held controller, System owner, signer, leases and original
+signed request/package. `recover_shared_before_publication` in
+`vos/src/agent/local_lifecycle/shared_recovery_retry.rs` limits scheduling
+between attempts to the existing 30s window; a blocking recovery attempt may
+consume that window. The packaged whole-recovery bound remains authoritative.
+A missing caller retry is not demonstrated; adding another loop, Busy protocol
+or reset deadline would not close this gate.
+
+**Implementation:** replacement/removal and reviewed preservation repair exist;
+remaining integrated recovery defects are unresolved. No defensible remaining
+source-hour range is established. **Integration:** measured portable build
+attempts take **14–16 minutes** and failed all-cold runs **3–5 minutes**, high
+confidence as attempt costs only. **Qualification:** M1 is still open; remaining
+packaged gates, M2 and local M3 have no defensible aggregate effort range.
+External hardware qualification remains open. No completion percentage, date,
+performance credit or cap rollover follows these internal passes.
 
 ### Frozen preceding diagnostic boundary
 
@@ -693,8 +752,9 @@ The quiet failed-gate costs are observations, not a successful recovery range. A
 from cache/source variation and is not an aggregate ETA. Earlier source/elapsed
 forecasts remain unreliable.
 Both original measured tuning passes are consumed and failed to qualify recovery.
-The renewed bounded direction and R48 candidate are recorded at the current
-integration delta; no benefit or automatic cap extension is credited.
+The explicitly renewed third candidate also fails, as recorded at the current
+integration delta. No benefit or automatic cap extension is credited; another
+tuning change requires direction.
 
 The earlier corrected role-source boundary `2e19cd17` freezes these changes,
 which close demonstrated M1 defects without changing authorization, wire bounds

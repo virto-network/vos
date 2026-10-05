@@ -455,7 +455,14 @@ impl SharedRouteHandler {
         // capacity's manifest, after the driver's full evidence verification.
         // Fresh absence, budget and applied-availability checks remain below.
         let manifest = match verified_manifest {
-            Some(manifest) => manifest,
+            Some(manifest) => {
+                // Preserve the original lookup's live lease/Agent fence after
+                // the worker snapshot, including the retained-capsule path.
+                // This existing selector rechecks ownership without rereading
+                // or reauditing the same immutable manifest.
+                host.management_custody_has_pending_with_manifest(self.agent, &manifest)?;
+                manifest
+            }
             None => host.recovery_manifest(self.agent)?,
         };
         let slot = manifest
