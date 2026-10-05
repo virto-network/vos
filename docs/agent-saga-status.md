@@ -74,8 +74,8 @@ flowchart LR
     Q -. authenticated answer .-> O
 ```
 
-Source-established pressure points; their contribution to the failures is not
-yet causally measured:
+Source-established pressure points identified before R50; the measured subset
+and remaining attribution gaps are recorded in the completed investigation below:
 
 | Area | Structure and concern | Discriminating evidence |
 | --- | --- | --- |
@@ -106,19 +106,20 @@ waits for, derives and confirms progress, followed by avoidable opaque-image
 copy/preparation work. No current evidence establishes that durable authority,
 quorum or runtime ABI must be redesigned.
 
-R50 is in progress from clean architecture checkpoint `96f07bb8`. Temporary
-host-only markers cover exact retained-family correlation, confirmation polls,
-observation/runtime boundaries and affirmative fixture stages. They preserve
-all existing reads, guards, validations, results and deadlines. No new guest,
-wire field, durable trace record, tuning candidate or redesign is authorized.
-Instrumentation independently passes source review; the finite reader is still
-under review. Freeze clean host source before the portable main/harness build,
-then finish reader review before fixture execution. No R50 build or fixture
-result exists yet. VM outcome markers report status after execution; use the
-separate context/run/output phases for duration. Retained frontier equality is
-diagnostic only and never equality of manifest/state bytes or reused proof.
+R50 is complete on clean diagnostic source
+`d58af26f536f4a193a773ff2ad575716935c35af`, following architecture checkpoint
+`96f07bb8`. Independently reviewed temporary host-only markers correlate the
+exact retained family, confirmation polls, observation/runtime boundaries and
+affirmative fixture stages. All reads, guards, validations, results and deadlines
+remain. Guest bytes, wire/ABI, artifact pins and durable records are unchanged.
+This is causal investigation, not a new tuning candidate or redesign. Preview
+outcome timers measure status bookkeeping after execution; Observe execution
+and purity timers retain their separate boundaries. Context/run/output phases
+measure their own durations. Retained frontier equality is diagnostic only, never
+equality of manifest/state bytes or a reused proof. The latest user direction
+reserves the fix or simplification decision until after these findings.
 
-The authorized session has this sequence:
+The completed session followed this authorized sequence:
 
 1. Follow one **exact original public Shared Create family** through the existing
    packaged all-cold selector. Preserve its ordinary CLI request and every
@@ -166,10 +167,97 @@ Fix classification after that verdict:
 | Bounded internal simplification | Repeated waiting/proof reconstruction dominates despite unchanged relevant state. Consider existing apply notifications as wake hints followed by fresh proof, clearer derived phase ownership from existing records, or a call-scoped verified context. No new journal, authority, cross-guard proof cache or public Busy expansion. |
 | Major design decision | A witnessed progress cycle, unavoidable broad serialization, or whole-image work that defeats existing bounds after local causes are excluded. Assess narrower ownership or runtime representation changes separately with explicit scope, trust/crash proof, artifact reproduction and qualification costs. No quorum redesign, merged durable authorities, native Authority oracle or remote-answer trust shortcut. |
 
-M1 remains blocked. Implementation remediation effort is unknown until the
-culprit is established. Recent portable rebuilds cost 14–16 minutes and failed
-selector attempts 2.3–5.7 minutes; these are historical attempt costs, not a new
-diagnostic-session or milestone ETA. M2/M3 and external hardware gates stay open.
+M1 remains blocked. Remediation effort is unknown until the internal audit and
+confirmation cause is discriminated or a bounded remedy is selected. Observed
+portable main/harness rebuilds now span 14–35 minutes; failed selector attempts
+span 2.3–5.7 minutes. These are measured attempt costs, not remaining source hours
+or a successful qualification range. M2/M3 and external hardware gates stay open.
+
+### Completed R50 exact-family causal investigation
+
+**Implementation:** temporary diagnostics and independently reviewed finite
+readers are complete. **Integration:** the exact public Shared Create family
+still fails. **Qualification:** neither the pending-Install cut/cold restart nor
+M1 is established; no performance benefit, fourth tuning pass or cap extension
+is credited. No fix was applied during this investigation.
+
+Portable main/harness pass **1414.511s / 678.723s**; strict six-file verification
+passes **0.201s**. The 34.9-minute build pair exceeds the previous 14–16-minute
+band; its build-time cause is unmeasured. No compiler failure or reported file
+lock wait explains it. Provenance is
+`task-tmp/r50-cli-build-d58af26f/provenance.json`, SHA-256
+`8c4390126ef33dc6b3571c936a038001677ec203ff43f3cbb394c046b67d6a3a`.
+Original portable flags, source/binary/artifact/environment/input before/after
+fences, exactly one executed test and exhausted noninterrupted owned groups
+admit both sequential attempts. No heavy build or fixture ran concurrently.
+
+The quiet all-cold selector **fails 144.379s**. A source-bound fixed phase label
+affirmatively identifies the ordinary packaged Shared Create retry deadline
+at `member_handoff_tests.rs:504`, not the earlier R49 startup-wrapper failure.
+Safe stage summary:
+`task-tmp/r50-pending-all-cold-d58af26f/quiet-stage-safe-summary.json`, SHA-256
+`ecc371a740083e6bfaa55f101d7437880b47c160debfbcfa22249859c3c6b01d`.
+This does not attribute its inner cause retrospectively from the scoped run.
+
+The one focused attempt **fails 145.283s**. The first strict reader refused two
+records; a separately reviewed count-only adapter preserved that refusal and
+identified two source-defined forwarding phases omitted from its whitelist.
+A new reader adds only `wait_registration_changed` / `wait_member_scope_error`
+and a distinct output basename. It admits **3726 records, 305 explicit binding
+edges, zero unknown records**. Original reader/refusal evidence remains intact;
+no fixture rerun or relaxed admission fence was used. Safe exact-family artifact:
+`task-tmp/r50-pending-all-cold-scoped-d58af26f/exact-family-causal-safe-v2.json`,
+SHA-256 `26aade1fe6d771a6315068a563cd400263038c8b62adf99ff648b7edf442d1fa`;
+reader SHA-256
+`db965b37650e0c509c7d04d40b7b887d47df1991fd95e72de076afbb86dc88c9`.
+Only aliases, closed phases/statuses and scalar measurements are exported.
+
+All **13** validated public retries retain root `id24` / invocation `id25`;
+responses are **12 Unavailable, one Conflict**. Explicit bindings establish the
+original authorization member, publication child and finalization child. A fresh
+publication candidate has another authorization alias, but capture/forwarding
+retain the original member authorization; it is not a changed admitted mutation.
+
+| Exact family boundary | Demonstrated evidence and implication |
+| --- | --- |
+| First authorization confirmation | Registration is locally confirmed at events 1667–1668. Invoke polls 21 times with evidence absent at frontier (33,1); origin times out at 1813 before leader proposal 1830. Leader preparation includes a 913.672ms VM run that halts/completes successfully. Confirmation expired before proposal; this execution did not crash. |
+| Repeated confirmation work | First Invoke manifest verification costs 42.569–57.588ms per poll; publication Invoke 178.957–224.096ms, its ACK 249.565–330.691ms, finalization registration 247.512–336.524ms. These polls observe unchanged retained frontiers, not proven unchanged whole state. Origin host waits/drains are small for these particular attempts. |
+| Publication and finalization progress | Publication Invoke has local evidence and availability completion at 2665–2673. Its recorded ACK times out at 2761, while the leader later completes it at 2810. Finalization extension fails at 3079 after exact registration timeout 3078; the leader later confirms that registration at 3174–3176. Both finalization previews halt/completed_done, but previews do not prove finalization Invoke acceptance. |
+| Late fresh observation prerequisite | Root-bound committee request `id35` enters 13 times: six complete, four refuse before callback at 1.892–2.431s, three after callback at 1.932–2.081s. Nine executed callbacks return completed_done with purity ok. All 264 recorded VM runs halt; this sample does not establish general stack-failure resolution. |
+| Observation pressure point | Initial capacity audit 199–1679ms; receiver host-lock waits report 0µs, callback 341–515ms, VM run 301–463ms. Fresh barrier roundtrip 140–821ms versus leader ReadIndex 1.7–6.1ms. Host construction/encoding/context/purity are small in this sample. These clocks overlap and are not summed. |
+
+The witnessed wait chain is owner local-custody confirmation awaiting leader
+admission/preview/proposal/application, followed on later retries by fresh
+ReadIndex, authenticated capacity audit, guest callback and deadline checks.
+Registration sequences 1→2→3 and later physical evidence establish progress.
+The stale-registration Conflict is source-required refusal followed by a fresh
+exact-registration retry; it is not evidence of changed authorization. No
+reverse dependency proving cyclic deadlock is recorded.
+
+Source `shared_raft.rs:8557` shows capacity taking the ledger write guard and
+database read, then performing the full authenticated recovery audit: retained
+rows/physical Raft commands, configuration/meta/committee/snapshot, recovery
+and committee folds, live manifest and reservations. Thus the capacity-audit
+boundary is demonstrated on the failing observation path, but its internal
+lock, database, decode, signature and fold costs remain unsplit. History growth
+is plausible from the algorithm, not established as the cause of longer samples.
+Barrier transport/route waiting and later long host waits are also unsplit;
+one leader confirmation reports a 2.895s host wait. Small measured host codec
+costs do not exclude guest decoding inside aggregate VM execution.
+
+No affirmative Create-applied, pending-Install-cut or cold-restart marker is
+present. Finalization Invoke, terminal persistence, retirement and exact release
+remain unestablished; absence alone does not prove nonexecution. The explicit
+extension error proves that call stopped before its following finalization
+Invoke/completion stages. Three independent analyses of the admitted alias
+artifact agree. Investigation identifies the proof/confirmation path as the
+next decision boundary, without establishing a performance-only root cause,
+an unnecessary security check, or a required quorum/runtime/authority redesign.
+Keep the approved replacement and exact mutation invariants; choose the next
+bounded diagnostic or remedy deliberately before further implementation.
+Confidence is high in these observed call boundaries and exact-family bindings,
+low in the unresolved internal cause and remediation effort. No defensible
+aggregate remaining source-hour or M1 qualification forecast follows yet.
 
 ### Completed R49 bounded admission-cost investigation
 
@@ -1566,11 +1654,15 @@ snapshot return and leased comparison remain mandatory.
 
 Remaining release work, in dependency order:
 
-1. Use the newly requested architecture review and planned exact-family causal
-   diagnostics to establish the culprit before deciding a local fix or a larger
-   design change. Read-only review is complete on `6a6b9297`; the diagnostic
-   execution plan is above. Obtain explicit go/no-go direction before another
-   tuning candidate or material redesign. The bounded R49 cost investigation
+1. Use the completed R50 exact-family investigation to choose the next bounded
+   diagnostic or remedy. It establishes confirmation expiry before leader
+   proposal and late fresh-observation deadline failures on the path through the
+   authenticated capacity audit. Internal ledger-lock/database/proof costs and barrier
+   delay outside ReadIndex remain unsplit; no deadlock, performance-only cause
+   or necessary major redesign is proved. The latest user direction reserves
+   implementation until this subsequent decision. Obtain explicit go/no-go
+   direction before another tuning candidate or material redesign. R50 grants
+   no cap extension. The bounded R49 cost investigation
    is complete on frozen `40a7e553`; portable
    binaries include the ownership repair, but the quiet selector fails Shared
    startup recovery and the scoped run fails public Create before the cut.
@@ -1656,7 +1748,10 @@ Separate forecasts and unknowns:
   all-four-store and empty-initialization cases enlarged the test diff; this
   remained within O3's existing restart gate, not a format/migration project.
   Integrated packaged crash/restart evidence is still pending.
-- **Qualification:** normal optimized rebuilds historically take **14–15 min**.
+- **Qualification:** paired portable rebuilds span **14–35 min** in the recorded
+  attempts; R50 main/harness take **1414.511s / 678.723s**. The slower build cause
+  is unmeasured. Its quiet/scoped attempts fail **144.379s / 145.283s** before any
+  pending-Install/cold qualification. These are attempt costs, not success bounds.
   Full physical runs are sequential; new guest/ABI artifacts require reproduction
   and new evidence. ReadIndex smoke is not System guest or released workflow
   qualification. No reliable aggregate qualification range exists yet.

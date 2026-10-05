@@ -12,10 +12,13 @@ host source or the released workflow.
 ## Boundary and release claim
 
 R50 is the user-authorized bounded causal investigation of one exact public
-Create family through the existing all-cold selector. Its instrumentation and
-finite reader are under review; no new execution or fix verdict exists yet.
-Keep the previous R49 outcomes separate. The live plan owns this session's
-scope, source freeze, evidence fences and subsequent fix decision.
+Create family through the existing all-cold selector. It is complete on clean
+diagnostic source `d58af26f`: quiet/scoped attempts fail **144.379s / 145.283s**.
+The admitted alias trace establishes confirmation timeouts before leader
+proposal and later fresh-observation deadline failures after the capacity audit
+or callback. No fix, performance benefit, deadlock or necessary redesign is proved.
+Keep R49 outcomes separate. The live plan owns the exact evidence, remaining
+internal attribution gaps and subsequent user decision.
 
 The review branch remains `e6f2bb45` on `saga/agents`. Original replacement
 source `8128e677` and its role bundle `7085c220` precede the corrected integration
@@ -108,21 +111,39 @@ Current O3 component evidence (logs under the native worktree's `target`):
 
 ### Current integration delta and blocking result
 
-The latest user direction requests an architectural review and a deeper causal
-diagnostic plan before choosing a local fix or major design change. Three
-independent read-only source audits completed on clean `6a6b9297`; its code is
-unchanged from measured R49 `40a7e553`. No new build, fixture, tuning candidate
-or redesign was executed. Read the
-[architecture review and diagnostic plan](agent-saga-status.md#architecture-review-and-planned-causal-diagnostics)
-in the single live checklist. Source supports repeated proof work in confirmation
-loops, host-instance serialization, hidden directory-inspection/whole-image
-runtime work, and ambiguous inner failure/completion reporting. Their causal
-contribution is unmeasured; no current deadlock or necessary major redesign is
-established. Internal generation attachment precedes public routes, and the old
+The latest user direction authorized investigation before choosing a fix or
+simplification. Three read-only source audits preceded independently reviewed
+host-only instrumentation and finite readers on clean
+`d58af26f536f4a193a773ff2ad575716935c35af`. Portable main/harness pass
+**1414.511s / 678.723s**; strict six-file verification passes **0.201s**.
+Quiet/scoped attempts fail **144.379s / 145.283s**, each one executed test and
+exhausted noninterrupted owned group, with unchanged guest bytes/pins/deadlines.
+Read the [completed R50 causal investigation](agent-saga-status.md#completed-r50-exact-family-causal-investigation)
+in the single live checklist for hashes, exact aliases/event boundaries and
+limits. The original reader's two-record refusal is preserved; a reviewed new
+copy adds only two omitted source-defined forwarding labels and admits all
+3726 records with zero unknowns. No physical rerun or relaxed fence was used.
+
+Exact retained retries make replication progress, but confirmation can expire
+before leader proposal. The late committee observation has six completions and
+seven deadline refusals in 13 entries. All nine executed callbacks complete with
+purity ok; all 264 recorded VM runs halt. Initial capacity audit takes
+**199–1679ms**, callback **341–515ms**, with receiver host-lock waits **0µs**.
+The audit includes its internal ledger guard, database read and full authenticated
+recovery validation. Its internal cost, history-size causality and barrier delay
+outside ReadIndex remain unsplit. Small measured host codec/copy costs do not
+justify starting with a runtime representation redesign. This sample neither
+qualifies general guest-stack resolution nor establishes a performance-only
+root cause. No affirmative pending-Install cut/cold restart or exact terminal
+release is established. No cyclic wait-for dependency is proved.
+
+The architecture review remains [context for the decision](agent-saga-status.md#architecture-review-and-authorized-causal-diagnostics).
+Internal generation attachment precedes public routes, and the older
 unfinished-Create/retired-generation observation cycle has an ordering fix.
 
-Review the exact-family phase/wait graph and fixed refusal taxonomy before any
-fix proposal. Preserve distinct intent, physical application, runtime ACK,
+Use the measured proof/confirmation boundaries for the next bounded diagnostic
+or remedy decision; R50 authorizes no fix, fourth tuning pass or cap extension.
+Preserve distinct intent, physical application, runtime ACK,
 owner terminal, certified publication and quorum-release authorities. Existing
 notifications may only be wake hints; freshness/corruption checks cannot become
 cross-guard cached permissions. A runtime ABI or ownership redesign requires a
