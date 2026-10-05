@@ -319,7 +319,7 @@ Fix only demonstrated causes, freeze current host provenance, then rerun quiet
 cold/returning and ordinary CLI under unchanged bounds. Native NRT1 terminal
 release remains separate and open.
 
-The measured ACK audit-reuse delta is **APPLIED, UNBUILT and UNEXECUTED**: a
+The measured ACK audit-reuse delta is **CORE BUILT, UNQUALIFIED**: a
 Current forwarded ManagementCustody ACK lends only its post-drain verified
 immutable manifest within uninterrupted host/proposal guards to existing
 budget/pending/early-preparation selectors. Four repeated source validations
@@ -328,11 +328,20 @@ closure, capacity, worker barriers and exact custody checks remain. The view
 is dropped before unlock/peer availability/publication; other paths stay fresh.
 Reviewed patch SHA-256
 `6d94a2f1dd66f588a2162f3e30ed8e4b821ea60c0fb4b4f29a128fa89d856866`.
-Compilation and runtime benefit are open; its next measured qualification
+Portable CLI compilation and runtime benefit are open; its next measured qualification
 counts as **service-tuning pass one**, with none measured yet.
 First core build on `7aa46a57` **fails 16.617s** before execution at the new
 network match's missing qualified enum path. That reference is corrected;
 the failed build/exhausted owned group are retained, without test/tuning credit.
+Corrected `09c18fd7` core builds **79.285s**. Existing exact early-ACK,
+archived whole-view/capsule and fresh-corruption/common-baseline tests **pass
+0.101s / 0.101s / 4.505s**, one test each and all fences/groups passing.
+Existing returning-owner retention **fails 171.383s** at
+`management_retention.rs:1495`: finalization returned Unavailable without a
+saved CMI child, so the intended before-Invoke cut was not established.
+Inner cause remains unattributed; no recovery or tuning benefit is credited.
+Evidence is `task-tmp/r45-{core-build,ack-preservation-units,management-retention}-09c18fd7`;
+preserve the earlier `r45-core-build-7aa46a57` compile failure. This batch is closed.
 
 The fixture-only preparation correction is **BUILT and EXECUTED, UNQUALIFIED**.
 Normal credential/descriptor discovery retries the exact persisted credential
@@ -418,7 +427,7 @@ Fresh Local diagnostic `19e8d051` isolates 123 root-family count refusals:
 two retained members, root-only CMI, matching original root/owner/anchor/work.
 Ordered command evidence proves registration confirmation timeout before CMI
 pledge, followed by the family admission gap. Full child/issuer binding remains
-unproved. Pure private-commitment correlation is APPLIED, UNBUILT and UNEXECUTED:
+unproved. Pure correlation is CORE BUILT, CLI UNBUILT/UNEXECUTED:
 compare normal already-verified durable ACK/proposed envelope with the refused
 authenticated child, and fixed signature/work/clock/parent/anchor checks.
 This adds diagnostic CPU only; no store/guest/state/cache/admission change, and

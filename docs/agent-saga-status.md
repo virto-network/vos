@@ -252,7 +252,7 @@ Fix only demonstrated causes, freeze current host provenance, then rerun quiet
 cold/returning and ordinary CLI under unchanged bounds. Native NRT1 terminal
 release remains separate and open.
 
-The approved measured ACK audit-reuse delta is **APPLIED, UNBUILT and UNEXECUTED**:
+The approved measured ACK audit-reuse delta is **CORE BUILT, UNQUALIFIED**:
 only a Current forwarded ManagementCustody ACK borrows its freshly verified
 manifest within the uninterrupted post-drain host/proposal guards. Aggregate
 budget outer/inner selectors, pending-family exclusion and early preparation
@@ -263,12 +263,24 @@ dropped before guard release, peer availability or publication; ordinary,
 Invoke, persisted and local-owner retirement paths retain fresh behavior.
 Reviewed patch SHA-256
 `6d94a2f1dd66f588a2162f3e30ed8e4b821ea60c0fb4b4f29a128fa89d856866`.
-Type checking and timing/recovery benefit remain open. Its next measured
+Portable CLI compilation and timing/recovery benefit remain open. Its next measured
 qualification counts as **service-tuning pass one**; none is measured yet.
 First core build on `7aa46a57` **fails 16.617s** before execution: the new
 network match omitted the existing fully qualified replay-request enum path.
 That one reference is corrected; the failed build and exhausted owned group
 are preserved. This is a build correction, not qualification or tuning evidence.
+Corrected clean `09c18fd7` core builds **79.285s**. Three existing exact
+preservation tests **pass 0.101s / 0.101s / 4.505s**: early ACK/no-publication,
+archived whole-live-view/capsule and fresh-corruption/common-baseline checks.
+Each executes one test; source/artifact/binary fences and owned groups pass.
+The existing supported returning-owner retention regression **fails 171.383s**
+at `management_retention.rs:1495`: after finalization returns Unavailable,
+CMI has no saved child, so the intended before-Invoke cut is not established.
+The inner cause remains unattributed; no custody/recovery or tuning benefit
+is credited. Evidence: `task-tmp/r45-core-build-09c18fd7`,
+`task-tmp/r45-ack-preservation-units-09c18fd7` and
+`task-tmp/r45-management-retention-09c18fd7`. Original failed build remains at
+`task-tmp/r45-core-build-7aa46a57`. No owned build/test remains from this batch.
 
 The fixture-only preparation correction is **BUILT and EXECUTED, UNQUALIFIED**.
 Normal credential/descriptor discovery retries the exact persisted credential
@@ -1051,7 +1063,7 @@ Remaining release work, in dependency order:
    123 exact-root two-member/root-only-CMI refusals. Command/order evidence
    proves registration confirmation timeout before the CMI pledge, followed
    by the family admission gap. Actual full child/issuer binding remains open.
-   A pure private-commitment comparison is APPLIED, UNBUILT and UNEXECUTED:
+   Pure private-commitment comparison is CORE BUILT, CLI UNBUILT/UNEXECUTED:
    normal already-verified ACK/envelope versus the authenticated refused child,
    with fixed signature/work/clock/parent/anchor checks. It adds diagnostic CPU
    only and preserves ScopeMismatch; no store/guest/state/cache/admission change.
