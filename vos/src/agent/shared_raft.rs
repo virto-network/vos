@@ -4522,6 +4522,16 @@ mod application_ledger_v2 {
 
     use super::*;
 
+    fn causal_capacity_started() -> Option<std::time::Instant> {
+        std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS")
+            .is_some()
+            .then(std::time::Instant::now)
+    }
+
+    fn causal_capacity_elapsed(started: Option<std::time::Instant>) -> u64 {
+        started.map_or(0, |started| started.elapsed().as_micros() as u64)
+    }
+
     const APPLICATION_SCHEMA_VERSION: u32 = 2;
     const CONFIG_RECORD_MAX_BYTES: usize =
         MAX_AGENT_REPLICA_COMMITTEE_BYTES + MAX_COMMITTEE_AUTHORITY_BINDING_BYTES + 1024;
@@ -8550,6 +8560,22 @@ mod application_ledger_v2 {
             self.capacity_and_recovery_manifest().map(|(capacity, _)| capacity)
         }
 
+        fn report_causal_capacity(
+            &self,
+            started: Option<std::time::Instant>,
+            phase: &'static str,
+            status: &'static str,
+        ) {
+            if let Some(started) = started {
+                let elapsed_us = started.elapsed().as_micros() as u64;
+                tracing::debug!(node = ?self.local_node.0, agent = ?self.generation.agent().0,
+                    space = ?self.generation.space().0, generation = ?self.generation.replication_id(),
+                    thread = ?std::thread::current().id(), phase, status,
+                    elapsed_us, count = 1u64,
+                    "VOS causal capacity");
+            }
+        }
+
         /// Return the immutable manifest already decoded by this capacity
         /// audit. The driver must still authenticate its runtime and replayed
         /// outcomes before lending it under uninterrupted admission guards.
@@ -8558,14 +8584,20 @@ mod application_ledger_v2 {
             &self,
         ) -> Result<((u64, u64, bool), Option<SharedRecoveryManifest>), AgentRaftApplicationErrorV2>
         {
-            let _guard = self
+            let causal_lock_started = causal_capacity_started();
+            let guard = self
                 .writes
                 .lock()
-                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger);
+            self.report_causal_capacity(causal_lock_started, "ledger_wait", if guard.is_ok() { "ok" } else { "error" });
+            let _guard = guard?;
             #[cfg(test)]
             self.capacity_audits
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            let transaction = self.database.begin_read()?;
+            let causal_read_started = causal_capacity_started();
+            let transaction = self.database.begin_read();
+            self.report_causal_capacity(causal_read_started, "read_begin", if transaction.is_ok() { "ok" } else { "error" });
+            let transaction = transaction?;
             let audited = self.audit_recovery_in_read(&transaction)?;
             Ok((audited.capacity(), audited.recovery))
         }
@@ -8617,6 +8649,7 @@ mod application_ledger_v2 {
             collect_replay_evidence: bool,
         ) -> Result<AuditedRecoveryView, AgentRaftApplicationErrorV2> {
             let started = std::time::Instant::now();
+            let causal_started = causal_capacity_started();
             let key = generation_storage_key(self.generation);
             ensure_v2_config_in_read(
                 &transaction,
@@ -8658,6 +8691,8 @@ mod application_ledger_v2 {
                 state
             };
             let raft = crate::raft::RaftMeta::load_from_read_transaction(&transaction)?;
+            let header_us = causal_capacity_elapsed(causal_started);
+            let causal_snapshot_started = causal_started.map(|_| std::time::Instant::now());
             let snapshot = read_snapshot_in_read(&transaction, key.as_slice())?;
             let (mut replayed_committee_state, snapshot_claim) = match snapshot.as_ref() {
                 Some(snapshot) => {
@@ -8704,6 +8739,19 @@ mod application_ledger_v2 {
                 return Err(AgentRaftApplicationErrorV2::CorruptLedger);
             }
 
+            let snapshot_us = causal_capacity_elapsed(causal_snapshot_started);
+            // Diagnostic subphase sums are nested in the complete row pass,
+            // which also covers table setup and iteration. Signatures stay
+            // inside decode/fold work; early errors emit no complete body.
+            let causal_rows_started = causal_started.map(|_| std::time::Instant::now());
+            let mut row_decode_us = 0u64;
+            let mut physical_row_us = 0u64;
+            let mut recovery_fold_us = 0u64;
+            let mut committee_fold_us = 0u64;
+            let mut registered_rows = 0u64;
+            let mut released_rows = 0u64;
+            let mut ordered_rows = 0u64;
+
             let table = transaction.open_table(APPLY_AUDIT_TABLE_V2)?;
             let observation_table = transaction.open_table(RECOVERY_OBSERVATION_TABLE_V2)?;
             let mut replayed_recovery = snapshot
@@ -8724,6 +8772,7 @@ mod application_ledger_v2 {
             let mut last_record = None;
             let mut retained = 0_usize;
             for row in table.range(key.as_slice()..)? {
+                let causal_row_started = causal_started.map(|_| std::time::Instant::now());
                 let (stored_key, value) = row?;
                 if !stored_key.value().starts_with(key.as_slice()) {
                     break;
@@ -8745,7 +8794,15 @@ mod application_ledger_v2 {
                 {
                     return Err(AgentRaftApplicationErrorV2::CorruptLedger);
                 }
+                if causal_row_started.is_some() {
+                    row_decode_us = row_decode_us.saturating_add(causal_capacity_elapsed(causal_row_started));
+                }
+                let causal_physical_started = causal_started.map(|_| std::time::Instant::now());
                 let physical = verify_audited_physical_row_in_read(&transaction, &raft, &record)?;
+                if causal_physical_started.is_some() {
+                    physical_row_us = physical_row_us.saturating_add(causal_capacity_elapsed(causal_physical_started));
+                }
+                let causal_recovery_started = causal_started.map(|_| std::time::Instant::now());
                 let observation =
                     read_recovery_observation(&observation_table, stored_key.value())?;
                 match (&record.disposition, physical.command.as_ref()) {
@@ -8756,6 +8813,9 @@ mod application_ledger_v2 {
                         },
                         Some(AgentRaftCommand::RegisterManagementRecovery { registration, .. }),
                     ) => {
+                        if causal_started.is_some() {
+                            registered_rows = registered_rows.saturating_add(1);
+                        }
                         if observation.is_some() || registration.commitment() != *expected {
                             return Err(AgentRaftApplicationErrorV2::CorruptLedger);
                         }
@@ -8790,6 +8850,9 @@ mod application_ledger_v2 {
                         },
                         Some(AgentRaftCommand::ReleaseManagementRecovery { release, .. }),
                     ) => {
+                        if causal_started.is_some() {
+                            released_rows = released_rows.saturating_add(1);
+                        }
                         if observation.is_some() || release.commitment() != *expected {
                             return Err(AgentRaftApplicationErrorV2::CorruptLedger);
                         }
@@ -8809,6 +8872,9 @@ mod application_ledger_v2 {
                         ),
                         Some(AgentRaftCommand::Ordered { entry, .. }),
                     ) => {
+                        if causal_started.is_some() {
+                            ordered_rows = ordered_rows.saturating_add(1);
+                        }
                         management_runtime = Some(entry.input.runtime.commitment());
                         ordered = OrderedBase {
                             index: entry.index,
@@ -8862,22 +8928,33 @@ mod application_ledger_v2 {
                     }
                     _ => {}
                 }
+                if causal_recovery_started.is_some() {
+                    recovery_fold_us = recovery_fold_us.saturating_add(causal_capacity_elapsed(causal_recovery_started));
+                }
+                let causal_committee_started = causal_started.map(|_| std::time::Instant::now());
                 replay_committee_disposition(
                     &mut replayed_committee_state,
                     self.authority,
                     &record,
                     physical,
                 )?;
+                if causal_committee_started.is_some() {
+                    committee_fold_us = committee_fold_us.saturating_add(causal_capacity_elapsed(causal_committee_started));
+                }
                 previous_term = record.term;
                 expected_index = expected_index.saturating_add(1);
                 last_record = Some(record);
             }
+            let row_total_us = causal_capacity_elapsed(causal_rows_started);
+            let causal_live_started = causal_started.map(|_| std::time::Instant::now());
             let live_recovery = read_recovery_manifest(
                 &transaction.open_table(RECOVERY_MANIFEST_TABLE_V2)?,
                 &key,
                 self.generation,
                 &self.initial_committee,
             )?;
+            let live_manifest_us = causal_capacity_elapsed(causal_live_started);
+            let causal_boundary_started = causal_started.map(|_| std::time::Instant::now());
             if replayed_recovery.as_ref().filter(|value| !value.is_empty())
                 != live_recovery.as_ref()
                 || observed_recovery_rows != exact_audit_row_count(&observation_table, &key)?
@@ -8921,6 +8998,8 @@ mod application_ledger_v2 {
             if replayed_committee_state != stored_committee_state {
                 return Err(AgentRaftApplicationErrorV2::CorruptLedger);
             }
+            let boundary_us = causal_capacity_elapsed(causal_boundary_started);
+            let causal_reservation_started = causal_started.map(|_| std::time::Instant::now());
             let reservation = {
                 let table = transaction.open_table(COMMAND_RESERVATION_TABLE_V2)?;
                 table
@@ -8954,11 +9033,22 @@ mod application_ledger_v2 {
                 }
                 verify_reservation_physical_row_in_read(&transaction, &raft, &reservation)?;
             }
+            let reservation_us = causal_capacity_elapsed(causal_reservation_started);
             tracing::debug!(
                 elapsed_us = started.elapsed().as_micros() as u64,
                 rows = retained,
                 "Shared recovery audit complete"
             );
+            if let Some(causal_started) = causal_started {
+                let elapsed_us = causal_started.elapsed().as_micros() as u64;
+                tracing::debug!(node = ?self.local_node.0, agent = ?self.generation.agent().0,
+                    space = ?self.generation.space().0, generation = ?self.generation.replication_id(),
+                    thread = ?std::thread::current().id(), phase = "complete", status = "ok",
+                    elapsed_us, rows = retained as u64, header_us, snapshot_us, row_total_us,
+                    row_decode_us, physical_row_us, recovery_fold_us, committee_fold_us,
+                    live_manifest_us, boundary_us, reservation_us,
+                    registered_rows, released_rows, ordered_rows, "VOS causal recovery audit");
+            }
             Ok(AuditedRecoveryView {
                 meta,
                 committee: stored_committee_state,

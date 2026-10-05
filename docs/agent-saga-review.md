@@ -11,6 +11,12 @@ host source or the released workflow.
 
 ## Boundary and release claim
 
+The latest user direction continues investigation and prioritizes demonstrated
+smaller defects before broader simplifications. R51 adds only narrow audit and
+attachment timings on the R50 failure path. Its source/reader review, clean
+portable freeze and one isolated focused attempt are in progress; no R51 result
+or remedy exists yet. The live plan owns its exact scope and unchanged fences.
+
 R50 is the user-authorized bounded causal investigation of one exact public
 Create family through the existing all-cold selector. It is complete on clean
 diagnostic source `d58af26f`: quiet/scoped attempts fail **144.379s / 145.283s**.

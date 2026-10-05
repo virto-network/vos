@@ -39,8 +39,42 @@ deployment is automatic.
 
 ### Architecture review and authorized causal diagnostics
 
-The latest user direction authorizes the bounded causal investigation below;
-the fix or simplification decision follows its demonstrated culprits. Three
+Latest direction (2026-10-05): continue causal investigation as needed and tackle
+demonstrated smaller defects before broader architectural simplifications. R51
+is a bounded diagnostic follow-up to completed R50, not a new tuning candidate.
+It splits the capacity helper's ledger wait/database opening and successful
+audit body's header/snapshot, row decode/physical proof/recovery/committee fold,
+live manifest/boundary/reservation costs. Existing exact observation requests
+scope only the actual capacity call; one per-body aggregate keeps its phase
+measurements together without a new wire/durable trace identity. An attachment
+timer measures the separate repeated committee projection candidate. Leader
+timings also split the barrier's pre/post host, attachment and worker snapshot
+waits outside its already measured ReadIndex. Early body
+errors without an aggregate remain explicit gaps; crypto remains inside the
+decode/fold categories. No reads/checks/guards/errors/artifacts/deadlines change.
+
+Review source and finite reader independently, freeze clean host source, then
+reuse unchanged portable build/strict six-file provenance and owned scoped
+all-cold tooling. One isolated focused attempt is initially authorized by this
+continuation; retain all original source/binary/artifact/environment/one-test/
+owned-group and before/after input fences. The completed d58 run cannot be
+re-read with its unchanged exact-current-source guard at the later docs HEAD;
+no exception, relabel, reset or helper override is allowed. Fresh instrumentation
+requires a fresh build/run. Recorded build pairs cost 14–35min and failed attempts
+2.3–5.7min, plus source/review work; these are medium-confidence attempt-cost
+ranges and low-confidence guidance for remaining effort, not a milestone ETA.
+Choose any bounded remedy from the demonstrated leaf cost; no automatic fourth
+tuning pass, cap extension or material redesign follows. Broader nonblocking
+simplifications stay later. M1 remains the next integrated milestone; M2/M3 open.
+Source candidates retained for later decision: pure apply-wrapper validation of
+identical slots/request before mutation (already noted in R49), and triple
+committee-state reads for one attachment projection. Neither has measured
+benefit. Whole preflight/capacity audits across released ledger guards remain
+fresh obligations even while the outer host/proposal guard stays held; source
+review found no missing required notification to repair.
+
+The preceding architecture review and R50 authorized investigation follow below;
+their measured outcomes are kept separate from R51. Three
 independent read-only source audits completed on clean
 `6a6b929765638c7fcca12cac4718da1d4cb7a536`. That checkpoint differs from measured
 R49 source `40a7e553` only in the two live documents. No new build, fixture,
@@ -117,7 +151,8 @@ outcome timers measure status bookkeeping after execution; Observe execution
 and purity timers retain their separate boundaries. Context/run/output phases
 measure their own durations. Retained frontier equality is diagnostic only, never
 equality of manifest/state bytes or a reused proof. The latest user direction
-reserves the fix or simplification decision until after these findings.
+reserved the fix or simplification decision until after these findings. The
+continued investigation now authorized is scoped above.
 
 The completed session followed this authorized sequence:
 
@@ -1659,8 +1694,9 @@ Remaining release work, in dependency order:
    proposal and late fresh-observation deadline failures on the path through the
    authenticated capacity audit. Internal ledger-lock/database/proof costs and barrier
    delay outside ReadIndex remain unsplit; no deadlock, performance-only cause
-   or necessary major redesign is proved. The latest user direction reserves
-   implementation until this subsequent decision. Obtain explicit go/no-go
+   or necessary major redesign is proved. The latest user direction continues
+   the bounded leaf investigation and prioritizes smaller defects before broader
+   simplification; R51's exact source/measurement scope is above. Obtain explicit go/no-go
    direction before another tuning candidate or material redesign. R50 grants
    no cap extension. The bounded R49 cost investigation
    is complete on frozen `40a7e553`; portable

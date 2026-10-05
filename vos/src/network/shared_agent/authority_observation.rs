@@ -146,18 +146,28 @@ impl SharedRouteHandler {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         let local = self.network.agent_node_id();
+        let causal_barrier_started = causal_observation_started();
+        let causal_event = |started, phase| {
+            report_causal_observation(started, request.request, self.agent, Some(local.0),
+                phase, "ok", 0);
+        };
         let fingerprint = {
+            let causal_host_started = causal_observation_started();
             let host = self
                 .host
                 .lock()
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
+            causal_event(causal_host_started, "leader_host_wait_before");
+            let causal_attachment_started = causal_observation_started();
             let status = host
                 .supervisor_attachment_status(self.agent)?
                 .ok_or(SharedAgentHostError::AgentNotFound)?;
             if status.transport != SharedAgentTransportState::Attached {
                 return Err(SharedAgentHostError::TransportNotAttached);
             }
-            AttachmentFingerprint::from_attachment_status(&status)?
+            let fingerprint = AttachmentFingerprint::from_attachment_status(&status)?;
+            causal_event(causal_attachment_started, "leader_attachment_before");
+            fingerprint
         };
         fixed_observation_scope(&fingerprint, local)?;
         if fingerprint.protocol_route != self.route
@@ -169,8 +179,10 @@ impl SharedRouteHandler {
             .worker
             .as_ref()
             .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        let causal_snapshot_started = causal_observation_started();
         let before = futures_executor::block_on(worker.snapshot())
             .ok_or(SharedAgentHostError::Unavailable)?;
+        causal_event(causal_snapshot_started, "leader_snapshot_before");
         let configuration_index = observation_configuration(&before, &fingerprint)?;
         if before.role != vos_raft::Role::Leader {
             return Err(SharedAgentHostError::Unavailable);
@@ -184,8 +196,10 @@ impl SharedRouteHandler {
         report_causal_observation(causal_read_started, request.request, self.agent, Some(local.0),
             "leader_read_index", read_index.as_ref().map_or_else(causal_observation_status, |_| "ok"), 0);
         let read_index = read_index?;
+        let causal_snapshot_started = causal_observation_started();
         let after = futures_executor::block_on(worker.snapshot())
             .ok_or(SharedAgentHostError::Unavailable)?;
+        causal_event(causal_snapshot_started, "leader_snapshot_after");
         let barrier = AuthorityReadBarrier {
             request: request.request,
             leader: local,
@@ -197,10 +211,13 @@ impl SharedRouteHandler {
         if after.role != vos_raft::Role::Leader || after.commit_index < read_index {
             return Err(SharedAgentHostError::Unavailable);
         }
+        let causal_host_started = causal_observation_started();
         let host = self
             .host
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
+        causal_event(causal_host_started, "leader_host_wait_after");
+        let causal_attachment_started = causal_observation_started();
         let status = host
             .supervisor_attachment_status(self.agent)?
             .ok_or(SharedAgentHostError::AgentNotFound)?;
@@ -209,6 +226,8 @@ impl SharedRouteHandler {
         {
             return Err(SharedAgentHostError::Unavailable);
         }
+        causal_event(causal_attachment_started, "leader_attachment_after");
+        causal_event(causal_barrier_started, "leader_barrier_complete");
         Ok(barrier)
     }
 }
@@ -329,6 +348,7 @@ impl SharedAgentNetworkHost {
                 .lock()
                 .map_err(|_| causal_refused("host_wait", SharedAgentHostError::Unavailable))?;
             causal_event(causal_host_started, "host_wait", "ok", 0);
+            let causal_attachment_started = causal_observation_started();
             let status = host
                 .supervisor_attachment_status(agent)
                 .map_err(|error| causal_refused("attachment", error))?
@@ -339,13 +359,19 @@ impl SharedAgentNetworkHost {
             {
                 return Err(causal_refused("attachment", SharedAgentHostError::Unavailable));
             }
+            causal_event(causal_attachment_started, "attachment", "ok", 0);
             // Apply only through the needed committed frontier, not an
             // unbounded drain chasing unrelated concurrent future proposals.
             // Keep this call-local audited cursor under the uninterrupted
             // host guard. Re-audit only after actual application progress;
             // collecting volatile replies cannot advance this cursor.
             let causal_audit_started = causal_observation_started();
-            let mut applied = host.capacity(agent)
+            let mut applied = {
+                let span = causal_started.map(|_| tracing::debug_span!(
+                    "vos_causal_observation_audit", request = ?request.0));
+                let _span_guard = span.as_ref().map(|span| span.enter());
+                host.capacity(agent)
+            }
                 .map_err(|error| causal_refused("initial_audit", error))?.0;
             causal_event(causal_audit_started, "initial_audit", "ok", 0);
             while applied < barrier.read_index {
@@ -365,7 +391,12 @@ impl SharedAgentNetworkHost {
                         causal_event(causal_apply_started, "apply_step", causal_apply_status, 1);
                         let causal_audit_started = causal_observation_started();
                         let previous_applied = applied;
-                        applied = host.capacity(agent)
+                        applied = {
+                            let span = causal_started.map(|_| tracing::debug_span!(
+                                "vos_causal_observation_audit", request = ?request.0));
+                            let _span_guard = span.as_ref().map(|span| span.enter());
+                            host.capacity(agent)
+                        }
                             .map_err(|error| causal_refused("apply_audit", error))?.0;
                         causal_event(causal_audit_started, "apply_audit",
                             if applied > previous_applied { "advanced" } else { "unchanged" },
