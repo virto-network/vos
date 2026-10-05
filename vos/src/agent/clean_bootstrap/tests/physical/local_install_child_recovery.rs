@@ -39,7 +39,7 @@ pub(super) fn exercise(
             result.map(|_| panic!("finalization cut must precede independent CMI pledge"))
         }
     });
-    let slot = CleanManagementIntentSlot::open(intent_store.clone()).unwrap();
+    let mut slot = CleanManagementIntentSlot::open(intent_store.clone()).unwrap();
     let intent = slot.intent().unwrap();
     assert!(intent.request() == request && intent.call() == call);
     let root_anchor = slot.authorization_anchor().unwrap().unwrap().clone();

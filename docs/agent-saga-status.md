@@ -118,6 +118,12 @@ intervening fresh-family progression negatives remain explicitly open.
 Reviewed patch SHA-256
 `fefec4149bd87f8dbeccd66ca6ec804efe8285d9fc54338234898f347dda0ac2`.
 
+Combined core build on `324f7e6c` **fails 24.031s** before execution:
+the new fixture's `load_actor` needs a mutable slot binding (`E0596`). Only
+that first binding is corrected; independent source review passes. The failed
+build/owned-group completion remain at `task-tmp/r46-core-build-324f7e6c`.
+This is a test compile correction, with no runtime or tuning credit.
+
 The **second/final tuning candidate is APPLIED, UNBUILT, UNQUALIFIED**.
 Direct persisted ManagementCustody Invoke now may borrow only its own
 post-drain/capacity/barrier-verified manifest under uninterrupted admission
