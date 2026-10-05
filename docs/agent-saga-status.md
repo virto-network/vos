@@ -74,7 +74,8 @@ true: **248 fixed events / zero unknown**. Only validation/equality booleans
 are exported. Evidence is `task-tmp/r45-local-child-correlation-3b2d9b74`;
 safe artifact SHA-256
 `a9c77026debe47eec3c9611e68b73fcacf5fb3134e691350b5fcb86bdff670ee`.
-Current physical-image equality is still unproved.
+That correlation does not establish physical-image equality; the current
+component test below exercises the production physical observer.
 
 The reviewed exact Local recovery correction is **CORE BUILT,
 UNQUALIFIED** on `4ce0f46b` (36.439s). Only the same-held production image Local controller may prove
@@ -88,9 +89,9 @@ restoration or cached proof. Normal issuer open/physical observation can
 reconcile staged records/catalog state; this is real new recovery-path I/O,
 not a pure-read claim. Patch SHA-256
 `940585cdcfdfa6c939d5f08f74b2811899dbf0a93b7a2d0b60ebaa19de6395d9`.
-Meaningful callback negatives, exact retry, current portable builds and ordinary
-CLI/M1 qualification remain prerequisites. Existing component tests do not
-qualify the newly allowed branch.
+The component run below exercises admission and three callback refusals, but
+whole30, additional typed/fresh-family negatives, current portable builds and
+ordinary CLI/M1 qualification remain prerequisites.
 
 Existing strict Local cold-adoption refusal **passes 54.460s**. Existing
 registration-timeout exact retry **fails 65.472s** at
@@ -104,18 +105,24 @@ and source/artifact fences pass. Evidence is
 The initial shortened-selector wrapper refusal launched no test and is not
 execution evidence.
 
-The genuine Local child-before-pledge regression is now **APPLIED, UNBUILT,
-UNEXECUTED**. It extends the existing fixed-three fixture with an exact CMI
-finalization-prewrite refusal after real child registration. It checks strict
-default refusal, held-controller admission, missing observed ACK, a different
-validly signed issuer ACK against the unchanged child, and actual physical
-image corruption; original child envelope/anchor, terminal retry, normal signer
-count and original whole30 remain mandatory. It uses non-clone memory lifecycle
-leases and physical images, not public HTTP or filesystem lifecycle custody.
-Full outer System/transport shutdown is outside that helper's whole30; lease
-release/owner extraction is inside. Typed observation-field mismatch and
-intervening fresh-family progression negatives remain explicitly open.
-Reviewed patch SHA-256
+The genuine Local child-before-pledge regression is **BUILT AND EXECUTED,
+UNQUALIFIED** on `70ce586a`: **fails 65.873s**, one executed test, exhausted
+owned group and source/artifact fences passing. After actual child registration
+and an exact CMI finalization-prewrite refusal, the fixed marker at **14.744s**
+confirms strict default refusal, held-controller admission and three negatives:
+missing observed ACK, a different validly signed issuer ACK against the unchanged
+child, and actual physical-image corruption. The normal original retry then
+matches the ACK and original child envelope/anchor and releases the complete
+Invoke/ACK family. The second terminal retry call returns, but whole30 fails at
+`local_install_recovery.rs:185` before its result is accepted. Its success,
+final ACK equality, signer-count and owner-extraction assertions are unvalidated.
+This proves component admission/refusal and the first retry/release, not the
+complete test, whole30, ordinary CLI or M1. Non-clone memory lifecycle leases
+and physical images do not qualify filesystem lifecycle custody/public HTTP.
+Outer System/transport shutdown is outside the helper's whole30; lease release
+and owner extraction are inside. Typed observation-field mismatch and fresh
+family progression between callback and recheck remain open. Evidence:
+`task-tmp/r46-local-child-callback-70ce586a/summary.json`. Reviewed patch SHA-256
 `fefec4149bd87f8dbeccd66ca6ec804efe8285d9fc54338234898f347dda0ac2`.
 
 Combined core build on `324f7e6c` **fails 24.031s** before execution:
@@ -123,8 +130,26 @@ the new fixture's `load_actor` needs a mutable slot binding (`E0596`). Only
 that first binding is corrected; independent source review passes. The failed
 build/owned-group completion remain at `task-tmp/r46-core-build-324f7e6c`.
 This is a test compile correction, with no runtime or tuning credit.
+Corrected clean `70ce586a` debug core **passes 43.049s**, with exact binary,
+source/artifact fences and exhausted owned group recorded in
+`task-tmp/r46-core-build-70ce586a/provenance.json`. This compiles the Local
+correction, genuine child regression and Invoke candidate together; it is not
+a portable build or integrated qualification.
 
-The **second/final tuning candidate is APPLIED, UNBUILT, UNQUALIFIED**.
+Eight existing preservation units on that core **pass**, each exactly once:
+clock ordering/finalization, exact capsule/whole envelope, aggregate retention
+and ACK exclusion, committed/uncommitted recovery tails, settled committee
+barrier, archived whole-live-view/capsule and fresh corruption/common baseline.
+Timings are **0.101 / 0.101 / 0.101 / 0.101 / 0.301 / 0.201 / 0.101 / 4.205s**.
+All owned groups are gone and source/artifact/binary fences pass. Evidence:
+`task-tmp/r46-invoke-preservation-units-v2-70ce586a/summary.json`.
+The original wrapper refused an incorrect inferred module alias at listing,
+before any unit execution; V2 corrects only `evidence_ledger` to the compiled
+`application_ledger_v2` path. The failed listing is preserved separately.
+These existing units do not qualify the new borrowed Invoke path, Local
+callback, physical recovery bounds or M1; they consume no tuning measurement.
+
+The **second/final tuning candidate is CORE BUILT, UNQUALIFIED**.
 Direct persisted ManagementCustody Invoke now may borrow only its own
 post-drain/capacity/barrier-verified manifest under uninterrupted admission
 guards, alongside the existing Current ACK path. Only immutable applied
@@ -134,7 +159,8 @@ preview, exact anchored-input agreement, every fresh absence/raw settled-prefix
 check, physical/common closure and availability remain. Defaults stay fresh;
 explicit disposal precedes publication, drain, unlock or peer I/O.
 No full audited view, result, absence or availability proof is cached.
-Independent source review passes, but no compiler/runtime benefit is claimed.
+Independent source review and debug core compilation pass; runtime benefit
+and current portable qualification remain unproved.
 Reviewed patch SHA-256
 `73550005e9d5ec39d3b5962fd83927164ef70bfaf425aa1d81b70d9ac2e197c3`.
 The second measured pass is not consumed until isolated measurement.
@@ -210,8 +236,8 @@ failure remains frozen evidence of successful Local Query **46.307s**, issued/
 delivery-retired/Done/direct `"0x"`, before the old wrong shape assertion.
 The one-line `.result.value == "0x"` change preserves those checks; no Query
 retry/endpoint proposal is applied. Neither run reaches Shared or reopen.
-Ordinary CLI integration needs attribution of the current exact Local Install
-refusal and a frozen-provenance rerun; no new source correction is established.
+Ordinary CLI integration needs a current frozen-provenance rerun of the Local
+correction above. This older ordinary failure did not establish its inner cause.
 Stage timings are not whole-recovery/SLA or complete workflow qualification.
 
 Earlier quiet returning/all-cold pending-Install runs on clean `f4a3dc90`
@@ -1108,73 +1134,44 @@ snapshot return and leased comparison remain mandatory.
 
 Remaining release work, in dependency order:
 
-1. Attribute exact terminal-release ambiguity/recovery after the demonstrated
-   saved NRT1 and actor ACK pair, using existing retained-family/publication
-   mechanisms. Clean `19e8d051` portable main/harness and strict six-file
-   verification pass; current host diagnostic main and fixture harness have
-   current recorded provenance; latest completed `5750f0c2`
-   public scoped evidence reaches forwarded
-   `ReleaseManagementRecovery` timeout under the unchanged 1.8s local confirmation
-   bound, and the latest completed quiet run still exhausts the outer 120s
-   correctness cap.
-   Source protection of the latest hot NRT1 is not execution/reopen proof.
-   Full supported fixed-three native NRT1 exact retry/reopen remains a mandatory
-   open gate; no native release correction or archive-removal defect is established.
-   Preserve original work/clock/anchor,
-   journal-backed authorization, exact AOQ1/NRT1 retry, complete original-owner
-   retention and whole30 recovery. Remove temporary diagnostics after attribution,
-   fix only a demonstrated remaining cause, and freeze/rebuild current portable
-   hosts before the quiet public gate and remaining four selectors.
-   Preparation-only fsync component passes and supported image Local cuts do
-   not prove filesystem lifecycle durability or retrospectively attribute R39w.
-   Qualify public lost-result/whole locked-owner reopen, returning/all-cold pending
-   Install and actual Shared leader loss through normal startup. The fixture-only
-   preparation correction is built/exercised but unqualified: current returning
-   startup fails with cut occurrence unestablished, while all-cold proves its
-   receipt cut and all-owner reopen entry before replica 0 startup fails Unavailable.
-   Latest quiet/scoped all-cold fails **243.961s / 201.317s**. Scoped exact
-   retry completes durable/issuer observation, guest finalization and handoff,
-   then retirement ACK confirmation fails. Peer reaches preparation start;
-   completion/late commit and exact failed-member identity remain unknown.
-   Review the approved same-guard immutable-manifest reuse seam, retaining
-   fresh absence, physical availability/corruption and worker barriers.
-   Qualify cold and returning under unchanged bounds before later gates.
-   Public projection remains closed during recovery.
-   Fresh Query
-   after timed recovery remains a distinct native-issuance probe. Pins-before-record,
-   first Intent stage, fresh initialization and locked reopen retain unchanged
-   whole **<=30s** recovery, actual inspected-snapshot return and writer-lease
-   comparison; no test-policy bypass.
-2. Requalify original-owner forwarded Install refusals (complete wrong-shadow
-   upload and absent System root), positive completion/exact retry and genuine
-   cumulative >256 public authorizations with unchanged checkpoint/recovery.
-   Preserve signed owner/parent evidence, package limits and whole **<=30s**
-   recovery. Automatic startup must pass; manual recovery loops are not proof.
-3. Attribute the current ordinary exact Local Install refusal using existing
-   mechanisms and preserved signed requests/stores. Clean `fcac175a` all-three
-   readiness and exact Local Create resume pass; repeated HTTP 503 with production
-   ScopeMismatch stops the corrected script before Query, Shared or reopen.
-   The fresh existing-flag diagnostic on `19e8d051` fails **208.124s**, with
-   123 exact-root two-member/root-only-CMI refusals. Command/order evidence
-   proves registration confirmation timeout before the CMI pledge, followed
-   by the family admission gap. Current full child/issuer binding is proved by
-   the `3b2d9b74` correlation above; the reviewed recovery correction is applied
-   and needs meaningful callback qualification before integrated credit.
-   Pure private-commitment comparison is BUILT and EXECUTED on `3b2d9b74`:
-   normal already-verified ACK/envelope versus the authenticated refused child,
-   with fixed signature/work/clock/parent/anchor checks. It adds diagnostic CPU
-   only and preserves ScopeMismatch; no store/guest/state/cache/admission change.
-   The reader must export equality/validation booleans only. Current physical
-   image equality remains unproved. Keep complete-family/cold-adoption
-   restrictions and grant no ordinary-default acceptance credit.
-   Freeze/rebuild and review the unchanged ordinary wrapper/script hashes before
-   a fresh ordinary three-process CLI/HTTP rerun.
-   Prior `5750f0c2` Local Query/ACK is frozen evidence, not this run's result.
-   Preserve authenticated Create/Install/Invoke/read/denial, genuinely lost
-   initial mutation response, exact retry and restart/failover. Stage costs are
-   not whole30 or SLA evidence. R39w remains frozen historical evidence.
-   Guest source/pins remain unchanged; guest changes require renewed independent
-   builds and coherent pins.
+1. Freeze the reviewed Local correction and guarded Invoke candidate, then
+   build portable main and harness with empty RUSTFLAGS and strict six-file
+   verification. Debug core `70ce586a` passes 43.049s and eight preservation
+   units pass; current portable workflow qualification is still pending.
+   Quiet all-cold on that exact provenance is the **second/final measured tuning
+   pass**. First-pass quiet/scoped runs fail **239.765s / 242.958s**; forwarded
+   finalization Invoke confirmation times out at 1.903902s under unchanged 1.8s,
+   with no cold guest outcome. Preserve every fresh absence/settled-prefix,
+   physical availability/corruption, worker and post-peer check. An attribution
+   rerun of the same candidate is not a third tuning change. Two failed passes
+   require direction; do not roll the cap forward.
+2. Qualify Local callback recovery under unchanged whole30 and current ordinary
+   three-process CLI/HTTP. The genuine child test proves admission, three
+   refusals and original retry/release, then exceeds whole30 at a second
+   terminal retry; its result/equality/signer assertions and typed/fresh-family
+   negatives remain open. `3b2d9b74` correlation proves its original child/issuer
+   binding, not ordinary acceptance or retrospective attribution of `fcac175a`.
+   Preserve complete-family/cold-adoption restrictions and original requests.
+   Attribute the separate public NRT1 terminal-release ambiguity using existing
+   retained-family/publication mechanisms. `5750f0c2` reaches saved NRT1/actor ACK,
+   then release confirmation times out under 1.8s; quiet public exhausts its
+   unchanged 120s issuance cap. No native release correction or archive-removal
+   defect is established. Hot-row/root-fence protection is not full fixed-three
+   NRT1 retry/reopen proof. Remove diagnostics after attribution no longer needs them.
+3. Complete public lost-result/exact retry/whole locked-owner reopen,
+   returning/all-cold pending Install, leader loss and actual ordinary CLI
+   acceptance on current provenance. Fresh Query after recovery separately probes
+   native issuance. Pins-before-record, first Intent and startup/reopen retain
+   actual inspected-snapshot return and writer-lease comparison before writes;
+   routes remain closed during recovery and no test-policy bypass is allowed.
+   Requalify complete wrong-shadow/absent-origin forwarding refusals,
+   observation freshness/cancellation, mutation negatives and cumulative >256
+   public authorizations/pruning. Preserve original work/clock/anchor,
+   journal-backed authorization, complete retained families, exact AOQ1/NRT1
+   retry/release, package limits and whole **<=30s** recovery.
+   Component/fixture passes and manual loops do not qualify automatic startup
+   or M1. Guest bytes/pins remain unchanged; a guest change requires renewed
+   independent reproduction and coherent pins.
 4. Progress through unchanged M2 retained-data/parity/resource/recovery/Agent
    backup gates, then locally possible M3 tooling and qualification. Hardware
    qualification remains explicitly open.
@@ -1250,10 +1247,12 @@ Separate forecasts and unknowns:
   failures remain preserved. Exact release ambiguity/recovery needs attribution,
   and full fixed-three native NRT1 retry/reopen remains unqualified. Static latest-row/
   root-fence protection does not justify an archive fix or prove execution.
-  The current ordinary CLI run demonstrates exact Local Create resume but repeats
-  Local Install HTTP 503. Fresh diagnostic evidence isolates the root-family
-  count check after registration confirmation timeout before the CMI pledge;
-  the actual child's full signed issuer/envelope binding remains unknown.
+  The latest ordinary CLI run demonstrates exact Local Create resume but repeats
+  Local Install HTTP 503. Separate `3b2d9b74` diagnostics prove full signed
+  issuer/child envelope binding after the registration-before-pledge gap.
+  The reviewed Local correction is core built; its genuine callback test proves
+  admission/three refusals and original retry/release, then exceeds whole30 at
+  a second terminal retry. That partial result does not qualify current CLI.
   The corrected Query assertion is unreached, while the prior successful
   Local Query slice remains frozen. Existing native terminal-release and ordinary
   Local integration causes both need attribution. Earlier quiet pending-Install
@@ -1261,12 +1260,11 @@ Separate forecasts and unknowns:
   occurrence is unestablished; all-cold proves the receipt cut and all-owner
   reopen entry, without a recovery or Query pass. These durations are measured
   failed gate costs, not a successful recovery range or aggregate forecast. The
-  current quiet/scoped all-cold fails **243.961s / 201.317s**. Scoped cold
-  finalization and handoff succeed before retirement ACK confirmation failure.
-  The Local diagnostic fails **208.124s**, proving the registration-before-pledge
-  gap without proving the child's complete binding. These measured failed-gate
-  costs are not recovery or remaining engineering ranges. New pure Local
-  correlation visibility needs a frozen build and exact attribution. No whole
+  latest quiet/scoped all-cold fails **239.765s / 242.958s**. Forwarded finalization
+  Invoke confirmation fails before any cold guest outcome, so the first ACK
+  tuning pass has no measured benefit. Earlier `19e8d051` finalization/handoff
+  and count-only Local evidence remain frozen, without retrospective attribution.
+  These failed-gate costs are not recovery or remaining engineering ranges. No whole
   recovery, global guest-stack or performance-only verdict is established.
   Cold/returning qualification remains; fresh Query separately probes issuance.
   No Query retry proposal was used.
@@ -1289,8 +1287,9 @@ Separate forecasts and unknowns:
 The narrow ACK immutable-manifest reuse delta above is compiled; its first
 measured cold runs fail before the optimized ACK branch. Current cold evidence
 instead identifies forwarded finalization Invoke custody confirmation delay.
-A second candidate requires independently reviewed same-guard reuse preserving
-every Invoke preparation, fresh absence and physical availability check. The
+A second/final candidate is independently reviewed and core built; its isolated
+packaged measurement is pending. Every Invoke preparation, fresh absence and
+physical availability check remains mandatory. The
 separate retained-result availability seam and full audited-view reuse remain
 deferred: raw Raft movement requires the fresh settled-prefix/absence checks.
 Existing retained-registration early return already works. Never cache permits

@@ -139,7 +139,8 @@ true: **248 fixed events / zero unknown**. Only validation/equality booleans
 are exported. Evidence is `task-tmp/r45-local-child-correlation-3b2d9b74`;
 safe artifact SHA-256
 `a9c77026debe47eec3c9611e68b73fcacf5fb3134e691350b5fcb86bdff670ee`.
-Current physical-image equality is still unproved.
+That correlation does not establish physical-image equality; the current
+component test below exercises the production physical observer.
 
 The reviewed exact Local recovery correction is **CORE BUILT,
 UNQUALIFIED** on `4ce0f46b` (36.439s). Only the same-held production image Local controller may prove
@@ -153,9 +154,9 @@ restoration or cached proof. Normal issuer open/physical observation can
 reconcile staged records/catalog state; this is real new recovery-path I/O,
 not a pure-read claim. Patch SHA-256
 `940585cdcfdfa6c939d5f08f74b2811899dbf0a93b7a2d0b60ebaa19de6395d9`.
-Meaningful callback negatives, exact retry, current portable builds and ordinary
-CLI/M1 qualification remain prerequisites. Existing component tests do not
-qualify the newly allowed branch.
+The component run below exercises admission and three callback refusals, but
+whole30, additional typed/fresh-family negatives, current portable builds and
+ordinary CLI/M1 qualification remain prerequisites.
 
 Existing strict Local cold-adoption refusal **passes 54.460s**. Existing
 registration-timeout exact retry **fails 65.472s** at
@@ -169,18 +170,24 @@ and source/artifact fences pass. Evidence is
 The initial shortened-selector wrapper refusal launched no test and is not
 execution evidence.
 
-The genuine Local child-before-pledge regression is now **APPLIED, UNBUILT,
-UNEXECUTED**. It extends the existing fixed-three fixture with an exact CMI
-finalization-prewrite refusal after real child registration. It checks strict
-default refusal, held-controller admission, missing observed ACK, a different
-validly signed issuer ACK against the unchanged child, and actual physical
-image corruption; original child envelope/anchor, terminal retry, normal signer
-count and original whole30 remain mandatory. It uses non-clone memory lifecycle
-leases and physical images, not public HTTP or filesystem lifecycle custody.
-Full outer System/transport shutdown is outside that helper's whole30; lease
-release/owner extraction is inside. Typed observation-field mismatch and
-intervening fresh-family progression negatives remain explicitly open.
-Reviewed patch SHA-256
+The genuine Local child-before-pledge regression is **BUILT AND EXECUTED,
+UNQUALIFIED** on `70ce586a`: **fails 65.873s**, one executed test, exhausted
+owned group and source/artifact fences passing. After actual child registration
+and an exact CMI finalization-prewrite refusal, the fixed marker at **14.744s**
+confirms strict default refusal, held-controller admission and three negatives:
+missing observed ACK, a different validly signed issuer ACK against the unchanged
+child, and actual physical-image corruption. The normal original retry then
+matches the ACK and original child envelope/anchor and releases the complete
+Invoke/ACK family. The second terminal retry call returns, but whole30 fails at
+`local_install_recovery.rs:185` before its result is accepted. Its success,
+final ACK equality, signer-count and owner-extraction assertions are unvalidated.
+This proves component admission/refusal and the first retry/release, not the
+complete test, whole30, ordinary CLI or M1. Non-clone memory lifecycle leases
+and physical images do not qualify filesystem lifecycle custody/public HTTP.
+Outer System/transport shutdown is outside the helper's whole30; lease release
+and owner extraction are inside. Typed observation-field mismatch and fresh
+family progression between callback and recheck remain open. Evidence:
+`task-tmp/r46-local-child-callback-70ce586a/summary.json`. Reviewed patch SHA-256
 `fefec4149bd87f8dbeccd66ca6ec804efe8285d9fc54338234898f347dda0ac2`.
 
 Combined core build on `324f7e6c` **fails 24.031s** before execution:
@@ -188,8 +195,26 @@ the new fixture's `load_actor` needs a mutable slot binding (`E0596`). Only
 that first binding is corrected; independent source review passes. The failed
 build/owned-group completion remain at `task-tmp/r46-core-build-324f7e6c`.
 This is a test compile correction, with no runtime or tuning credit.
+Corrected clean `70ce586a` debug core **passes 43.049s**, with exact binary,
+source/artifact fences and exhausted owned group recorded in
+`task-tmp/r46-core-build-70ce586a/provenance.json`. This compiles the Local
+correction, genuine child regression and Invoke candidate together; it is not
+a portable build or integrated qualification.
 
-The **second/final tuning candidate is APPLIED, UNBUILT, UNQUALIFIED**.
+Eight existing preservation units on that core **pass**, each exactly once:
+clock ordering/finalization, exact capsule/whole envelope, aggregate retention
+and ACK exclusion, committed/uncommitted recovery tails, settled committee
+barrier, archived whole-live-view/capsule and fresh corruption/common baseline.
+Timings are **0.101 / 0.101 / 0.101 / 0.101 / 0.301 / 0.201 / 0.101 / 4.205s**.
+All owned groups are gone and source/artifact/binary fences pass. Evidence:
+`task-tmp/r46-invoke-preservation-units-v2-70ce586a/summary.json`.
+The original wrapper refused an incorrect inferred module alias at listing,
+before any unit execution; V2 corrects only `evidence_ledger` to the compiled
+`application_ledger_v2` path. The failed listing is preserved separately.
+These existing units do not qualify the new borrowed Invoke path, Local
+callback, physical recovery bounds or M1; they consume no tuning measurement.
+
+The **second/final tuning candidate is CORE BUILT, UNQUALIFIED**.
 Direct persisted ManagementCustody Invoke now may borrow only its own
 post-drain/capacity/barrier-verified manifest under uninterrupted admission
 guards, alongside the existing Current ACK path. Only immutable applied
@@ -199,7 +224,8 @@ preview, exact anchored-input agreement, every fresh absence/raw settled-prefix
 check, physical/common closure and availability remain. Defaults stay fresh;
 explicit disposal precedes publication, drain, unlock or peer I/O.
 No full audited view, result, absence or availability proof is cached.
-Independent source review passes, but no compiler/runtime benefit is claimed.
+Independent source review and debug core compilation pass; runtime benefit
+and current portable qualification remain unproved.
 Reviewed patch SHA-256
 `73550005e9d5ec39d3b5962fd83927164ef70bfaf425aa1d81b70d9ac2e197c3`.
 The second measured pass is not consumed until isolated measurement.
@@ -277,8 +303,8 @@ failure remains frozen evidence of successful Local Query **46.307s**, issued/
 delivery-retired/Done/direct `"0x"`, before the old wrong shape assertion.
 The one-line `.result.value == "0x"` change preserves those checks; no Query
 retry/endpoint proposal is applied. Neither run reaches Shared or reopen.
-Ordinary CLI integration needs attribution of the current exact Local Install
-refusal and a frozen-provenance rerun; no new source correction is established.
+Ordinary CLI integration needs a current frozen-provenance rerun of the Local
+correction above. This older ordinary failure did not establish its inner cause.
 Stage timings are not whole-recovery/SLA or complete workflow qualification.
 
 Earlier quiet returning/all-cold pending-Install runs on clean `f4a3dc90`
@@ -404,8 +430,8 @@ the earlier `941b3d3c` count-only run; neither fresh run retrospectively
 attributes `fcac175a`. The large copied-state proposal stays held/unqualified
 and opened no original stores.
 
-Next close exact Local child proof/admission and review cold ACK confirmation
-using the approved same-guard immutable-manifest reuse seam. Preserve every
+Current Local proof/admission and partial component results are above. The live
+plan orders the portable build, final Invoke measurement and ordinary CLI. Preserve every
 fresh settled-prefix, physical availability/corruption and post-peer check.
 Fix only demonstrated causes, freeze current host provenance, then rerun quiet
 cold/returning and ordinary CLI under unchanged bounds. Native NRT1 terminal
@@ -526,8 +552,9 @@ compare normal already-verified durable ACK/proposed envelope with the refused
 authenticated child, and fixed signature/work/clock/parent/anchor checks.
 This adds diagnostic CPU only; no store/guest/state/cache/admission change, and
 ScopeMismatch remains. Reader outputs equality/validation booleans only.
-Current physical-image equality remains unproved. Preserve complete-family and
-cold bare-intent refusal. The corrected ordinary Query predicate is unreached.
+Pure correlation does not establish physical-image equality; the current
+production-observer component result is above. Preserve complete-family and cold
+bare-intent refusal. The corrected ordinary Query predicate remains unreached.
 Earlier `19e8d051` quiet/scoped cold runs **fail 243.961s / 201.317s**. Scoped observation,
 guest finalization, issuer save and handoff succeed before retirement ACK
 confirmation times out. Peer reaches preparation start; no completion/late
