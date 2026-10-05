@@ -1739,6 +1739,10 @@ where
             self.generations_recovered = true;
         }
         drop(entries);
+        // Every voter must attach its independently verified generations before
+        // an original owner can recover an Install through their Raft quorum.
+        // Keep completed physical recovery across a fallible attachment retry.
+        owner._network_host.refresh()?;
         for (entry, _) in &mut self.entries {
             let Some(slot) = entry.management_intent.as_mut() else {
                 continue;

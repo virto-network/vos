@@ -38,11 +38,11 @@ deployment is automatic.
 ## Current position
 
 Latest measured portable source is frozen at
-`be0844c3dacaa16b22d231741b356e560af17f44`; production recovery correction
+`5c45f4a8a861b8923eb1a56c9eea9111ffba120d`; production recovery correction
 remains `f9c61863`. Existing flag-gated host observation/terminal diagnostics
-are now visible to the packaged host, compiled and exercised. Portable
-main/harness **pass 393.101s / 458.972s**; main strict six-file verification
-**passes 0.101s**. Main is `28053e01`; harness is `d8737a32`. Empty
+and Shared transfer phases are compiled and exercised. Portable
+main/harness **pass 392.608s / 452.265s**; main strict six-file verification
+**passes 0.101s**. Main is `0e1d6400`; harness is `6b8ac2e1`. Empty
 RUSTFLAGS, unset encoded/target overrides, exact copied hashes, clean source
 before/after and owned-group completion are recorded.
 Authority, Catalog, both runtime roles and coherent guest pins remain unchanged.
@@ -135,50 +135,61 @@ Query**. Neither failure identifies the inner guest, observation, storage or
 release cause, or supports a performance-only verdict. Existing whole **30s**
 recovery remains mandatory; no recovery or Query pass is credited.
 
-Latest scoped all-cold diagnostic on clean `be0844c3` **fails 262.079s**,
+Latest scoped all-cold diagnostic on clean `5c45f4a8` **fails 194.815s**,
 one executed failing test, owned group gone and source/artifact/provenance
-fences passing. It reaches **replica 0 restart=true / Shared recovery before
-routes Unavailable** after the intended signed receipt cut and all-owner reopen
-entry. The eight existing host outcome hooks are now compiled and exercised.
-Across interleaved setup/recovery there are **63 observation guest Done**,
-**ten freshness Unavailable**, **seven matching finalized GenesisDecision** and
-**one GenesisDecision Unavailable**. Counts alone do not bind failure episodes
-or prove every guest path stack-safe.
+fences passing. Seven constructor material records partition initial setup,
+pre-cut open and the cold cluster. All **seven Shared Install origin_forwarded**
+attempts occur in that cold cluster: **six leader-selection Unavailable**,
+then **one apply-barrier Unavailable**, before any package Progress send.
+There are no Progress/peer/Finish/local-evidence events. The aggregate host
+reports **56 observation guest Done**, **four freshness Unavailable**, **three
+matching finalized GenesisDecision**, and one completed terminal handoff pair.
+Aggregate outcomes do not identify every episode or prove all guest paths.
 
-Fixed-order source review separates three initial constructors, a raw pre-cut
-open and the three cold constructors. All **three completion-retirement** and
-**two terminal submit-ACK Unavailable** records occur during initial Shared
-Create setup, before the cut; they cannot explain the cold constructor.
-After the cold cluster, six observations report Done, two freshness checks
-refuse Unavailable, and one fresh GenesisDecision refuses before a later
-matching decision. **Eleven System authorization/forward/receipt sequences
-complete**, including leader retained availability and original-owner local
-evidence. Five actual **Shared Install origin_forwarded** attempts follow,
-without origin_retained or observed cold completion/ACK/retirement. These
-establish failure inside Shared Install forwarding before successful owner
-return, without distinguishing preflight, package
-progress/chunk/Finish, local replay or availability. No cause correction,
-successful recovery/fresh Query, global stack-resolution or performance-only
-verdict follows.
+Source review establishes a missing transport attachment step: exact fresh
+genesis proofs reopen the deferred Shared namespaces, but member-only recovery
+never refreshes their Raft workers. The fixture joins every constructor before
+starting production; only the retained issuer's later authorization refresh
+attaches its Shared worker. That dependency cycle explains the demonstrated
+leader-selection boundary. Ordinary CLI uses the same constructor but starts
+each completed daemon independently; **no ordinary CLI deadlock is claimed**.
+The individual worker role/leader-hint clause was not logged.
+
+The narrow correction is **APPLIED, UNBUILT and UNEXECUTED**: existing network
+`refresh()` after `generations_recovered = true` and the borrowed entry drop,
+before handoff/Install recovery. A partial attachment retries refresh without
+reopening the already-cleared deferred set. Only fully verified host namespaces
+are attached through existing lease/role/fingerprint/worker checks; public
+projection export stays closed while recovery is pending. No election, authorization,
+observation, protocol, resource or deadline change. Freeze/rebuild portable
+provenance, rerun isolated cold recovery and returning recovery with unchanged
+whole **30s**, then resume remaining M1 gates. The correction is provisional,
+not a recovery/fresh-Query or M1 pass.
 
 Current private logs and fixed safe evidence are under
-`task-tmp/r42-pending-all-cold-outcomes-be0844c3`:
+`task-tmp/r43-pending-all-cold-transfer-5c45f4a8`:
 `safe-summary.json` SHA-256
-`25b1b30e50d71deb3da6301983898a52ef6d05989135fe49ba72075f32c254af`;
-`pending-authorization-forward-order-safe.json` SHA-256
-`12e30c573cd60937960f48f70552d11adc11378dbf2a4c6bf92dbee68e3f963d`;
-`pending-shared-install-provenance-safe-v2.json` SHA-256
-`9a79d11342e29a47f5280f286b9b1bf32c96c56f4a76ec31dd92545be51d9c69`.
-Earlier `f4a3dc90` scoped failure **248.167s**, lacking CLI-linked core outcome
-visibility, stays frozen under `task-tmp/r42-pending-all-cold-scoped-f4a3dc90`.
-A narrow existing-flag Shared transfer diagnostic is **APPLIED, UNBUILT and
-UNEXECUTED**. Fixed pre-progress/progress/chunk/Finish/local-evidence/error
-stages and one peer-refusal category preserve existing read/send/guard order,
-checks, errors and the unchanged 1.8s transfer bound. Freeze/rebuild portable
-provenance, then run one isolated diagnostic to identify the remaining substage
-before any behavior correction. Guest bytes/pins,
-protocols, checks and bounds remain unchanged. Diagnostic timing is not quiet
-recovery/SLA qualification; remove temporary diagnostics after attribution.
+`4fde20ee450c2266dedd62bb96df3dc4579361c7259d10bd821ee1dd52c8839f`;
+`shared-install-transfer-fixed-order-safe.json` SHA-256
+`ef5ed3798d017e579d128824bece6095a8b453461f01e7e652681e651313f231`.
+Its reviewed extractor V2 is exercised: **110 fixed events / zero unknown**.
+Earlier `be0844c3` scoped failure **262.079s** stays frozen under
+`task-tmp/r42-pending-all-cold-outcomes-be0844c3`; its ordered review separates
+initial terminal errors from cold recovery and proves System authorization/
+receipt success before Shared forwarding. Earlier `f4a3dc90` scoped failure
+**248.167s**, without core outcome visibility, remains at its frozen evidence
+boundary. Transfer/outcome diagnostics are compiled and exercised for attribution
+only; remove them when no longer needed. Guest bytes/pins remain unchanged.
+No global stack-resolution or performance-only verdict follows.
+
+The separate temporary image Local family diagnostic is **APPLIED, UNBUILT and
+UNEXECUTED**. It emits fixed stages/errors and refused-branch member counts/
+comparison booleans under the existing flag and System/Local guards, adding no
+I/O/audit or behavior change. The reviewed target-only diagnostic CLI copy and
+extractor are held/unexecuted; the tracked ordinary acceptance script remains
+unchanged. Diagnostic execution cannot qualify ordinary-default acceptance or
+retrospectively establish the original Local refusal. The large copied-state
+proposal stays held/unqualified; no original stores were opened by it.
 
 The fixture-only preparation correction is **BUILT and EXECUTED, UNQUALIFIED**.
 Normal credential/descriptor discovery retries the exact persisted credential
@@ -270,10 +281,11 @@ records). Original BEFORE/initial correction evidence remains
 `task-tmp/r41-operation-prepare-{before-build-61530b52,before-61530b52,cold-before-61530b52,after-build-f9c61863,after-f9c61863,cold-after-f9c61863}`.
 Admin compatibility evidence is
 `task-tmp/r41-admin-registration-related-f9c61863/{physical.result.json,physical.stdout,physical.stderr}`.
-Current portable evidence is `task-tmp/r42-cli-build-be0844c3/provenance.json`;
+Current portable evidence is `task-tmp/r43-cli-build-5c45f4a8/provenance.json`;
 focused exact-retention units are under
 `task-tmp/r42-pending-install-retention-units-f4a3dc90`. Earlier portable builds
-remain `task-tmp/r42-cli-build-f4a3dc90/provenance.json`,
+remain `task-tmp/r42-cli-build-be0844c3/provenance.json`,
+`task-tmp/r42-cli-build-f4a3dc90/provenance.json`,
 `task-tmp/r42-cli-build-fcac175a/provenance.json` and
 `task-tmp/r41-cli-build-5750f0c2/provenance.json`.
 Latest completed public evidence is
@@ -912,7 +924,7 @@ Remaining release work, in dependency order:
 
 1. Attribute exact terminal-release ambiguity/recovery after the demonstrated
    saved NRT1 and actor ACK pair, using existing retained-family/publication
-   mechanisms. Clean `be0844c3` portable main/harness and strict six-file
+   mechanisms. Clean `5c45f4a8` portable main/harness and strict six-file
    verification pass; current host diagnostic main and fixture harness have
    current recorded provenance; latest completed `5750f0c2`
    public scoped evidence reaches forwarded
@@ -934,13 +946,13 @@ Remaining release work, in dependency order:
    preparation correction is built/exercised but unqualified: current returning
    startup fails with cut occurrence unestablished, while all-cold proves its
    receipt cut and all-owner reopen entry before replica 0 startup fails Unavailable.
-   The current scoped all-cold run fails **262.079s** at that boundary.
-   Ordered evidence proves successful cold System authorization/receipt and
-   entry into Shared Install forwarding, without observed local retained
-   application evidence.
-   Initial terminal errors predate the cut. Attribute the remaining transfer/
-   replay substage using narrow existing-flag diagnostics in isolation,
-   fix only a demonstrated cause and rerun both with unchanged bounds. Fresh Query
+   Current scoped all-cold fails **194.815s** with six leader-selection refusals
+   and one barrier refusal before Progress. The source-proved member-only
+   transport attachment gap has a reviewed provisional one-call correction
+   after the completed generation stage. Freeze/build, qualify cold and returning
+   recovery with unchanged bounds, then continue native terminal-release and
+   later integrated gates. Public projection remains closed during recovery.
+   Fresh Query
    after timed recovery remains a distinct native-issuance probe. Pins-before-record,
    first Intent stage, fresh initialization and locked reopen retain unchanged
    whole **<=30s** recovery, actual inspected-snapshot return and writer-lease
@@ -954,9 +966,12 @@ Remaining release work, in dependency order:
    mechanisms and preserved signed requests/stores. Clean `fcac175a` all-three
    readiness and exact Local Create resume pass; repeated HTTP 503 with production
    ScopeMismatch stops the corrected script before Query, Shared or reopen.
-   The substage/cause remains open; fix only a demonstrated defect. Freeze any
-   resulting correction, rebuild current portable provenance and review the
-   wrapper hash before a fresh ordinary three-process CLI/HTTP rerun.
+   The substage/cause remains open. The narrow existing-flag family diagnostic is
+   applied/unbuilt/unexecuted; reviewed target-only diagnostic script/wrapper/
+   extractor are held. Attribute on new private evidence without granting
+   ordinary-default acceptance credit, then fix only a demonstrated defect.
+   Freeze/rebuild and review the unchanged ordinary wrapper/script hashes before
+   a fresh ordinary three-process CLI/HTTP rerun.
    Prior `5750f0c2` Local Query/ACK is frozen evidence, not this run's result.
    Preserve authenticated Create/Install/Invoke/read/denial, genuinely lost
    initial mutation response, exact retry and restart/failover. Stage costs are
@@ -1022,9 +1037,9 @@ Separate forecasts and unknowns:
   its identical isolated rerun passed without changing limits. Its cause remains
   unattributed. These are preparation-only fsync test-store results, not native
   policy/issuance or follower-forwarding qualification.
-  Current `be0844c3` portable main/harness take **393.101s / 458.972s**; both
-  include the existing host diagnostic visibility correction. The core-changing
-  rebuild takes **14.2 minutes** combined versus **7.4 minutes** for the preceding
+  Current `5c45f4a8` portable main/harness take **392.608s / 452.265s**; both
+  include the existing host diagnostic visibility and transfer phases. The
+  core-changing rebuild takes **14.1 minutes** combined versus **7.4 minutes** for the preceding
   fixture-only rebuild; this is measured build variance, not expanded scope.
   Focused exact-retention units on `f4a3dc90` pass **0.101s / 0.101s /
   0.601s**, without qualifying integrated recovery.
@@ -1046,14 +1061,14 @@ Separate forecasts and unknowns:
   occurrence is unestablished; all-cold proves the receipt cut and all-owner
   reopen entry, without a recovery or Query pass. These durations are measured
   failed gate costs, not a successful recovery range or aggregate forecast. The
-  current scoped all-cold diagnostic fails **262.079s** at the same constructor
-  context. Compiled host outcomes plus fixed-order source review establish
-  successful cold System authorization/receipt and actual Shared Install
-  forwarding entry, without observed local retained application evidence.
-  Initial terminal errors
-  predate the cut; aggregate Done does not prove all guest paths. Their reviewed
-  fixture-only correction is built/executed but unqualified. Isolated transfer/
-  replay attribution and both quiet reruns remain. No Query retry proposal was used.
+  current scoped all-cold diagnostic fails **194.815s** before Progress:
+  six leader-selection refusals and one barrier refusal. Source review proves
+  the member-only transport attachment gap; its one-call correction and the
+  separate Local family diagnostic are applied/unbuilt/unexecuted. No individual
+  worker role/hint, corrected recovery, global guest-stack or performance-only
+  verdict is established. Freeze/rebuild and both cold/returning qualification
+  runs remain; the later fresh Query separately probes native issuance.
+  No Query retry proposal was used.
   Counts alone do not bind episodes, and packaged-fixture client/native states
   were removed on unwind. No guest-failure/performance-only conclusion, engineering
   ETA or reliable aggregate qualification range is established. Remaining cold

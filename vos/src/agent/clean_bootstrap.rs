@@ -6592,7 +6592,19 @@ where
         &mut self,
         slot: &super::clean_management_intent::CleanManagementIntentSlot<B>,
     ) -> Result<bool, SharedAgentHostError> {
-        let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let diagnostics = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some();
+        let refused = |phase: &'static str, error: SharedAgentHostError| {
+            if diagnostics {
+                tracing::debug!(phase, ?error, "Local image Install retained family refused");
+            }
+            error
+        };
+        if diagnostics {
+            tracing::debug!(phase = "start", "Local image Install retained family guard");
+        }
+        let intent = slot.intent().ok_or_else(|| {
+            refused("intent", SharedAgentHostError::ScopeMismatch)
+        })?;
         if self.pins.replicas.members().len() != 3
             || intent.call().authority != self.authority_target()
             || intent.call().managed.profile != AgentProfile::Local
@@ -6602,30 +6614,34 @@ where
                 .authenticated_node
                 .is_some_and(|node| node != self.pins.node)
         {
-            return Err(SharedAgentHostError::ScopeMismatch);
+            return Err(refused("request_scope", SharedAgentHostError::ScopeMismatch));
         }
         if slot
             .retirement_complete()
-            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .map_err(|_| refused("retirement_record", SharedAgentHostError::Unavailable))?
         {
             // The caller independently verifies exact signed issuer finality.
             // A later family may have replaced this already-released scope.
+            if diagnostics {
+                tracing::debug!(phase = "terminal", "Local image Install retained family admitted");
+            }
             return Ok(true);
         }
         let agent = crate::service::AgentId(self.pins.agent.0);
         let (anchor, work) = match slot
             .authorization_work()
-            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .map_err(|_| refused("authorization_record", SharedAgentHostError::Unavailable))?
         {
             Some(work) => (
                 slot.authorization_anchor()
-                    .map_err(|_| SharedAgentHostError::Unavailable)?
-                    .ok_or(SharedAgentHostError::ScopeMismatch)?
+                    .map_err(|_| refused("authorization_anchor_read", SharedAgentHostError::Unavailable))?
+                    .ok_or_else(|| refused("authorization_anchor", SharedAgentHostError::ScopeMismatch))?
                     .clone(),
                 work.clone(),
             ),
             None => {
-                let Some(found) = self.pending_local_install_authorization(intent)? else {
+                let Some(found) = self.pending_local_install_authorization(intent)
+                    .map_err(|error| refused("pending_authorization", error))? else {
                     return if self
                         .unpublished_local_install_attempt
                         .as_ref()
@@ -6633,56 +6649,75 @@ where
                     {
                         // The original append may still be unapplied. This
                         // guard permits no new capture during quarantine.
-                        Err(SharedAgentHostError::Unavailable)
+                        Err(refused("pending_unapplied", SharedAgentHostError::Unavailable))
                     } else {
+                        if diagnostics {
+                            tracing::debug!(phase = "pending_absent", "Local image Install retained family not admitted");
+                        }
                         Ok(false)
                     };
                 };
                 found
             }
         };
-        let manifest = self._network_host.management_recovery_manifest(agent)?;
+        let manifest = self._network_host.management_recovery_manifest(agent)
+            .map_err(|error| refused("manifest", error))?;
         if manifest.committee() != &self.pins.replicas
             || manifest.generation().space().0 != self.pins.space.0
             || manifest.generation().agent().0 != self.pins.agent.0
             || manifest.generation().genesis() != anchor.genesis
             || manifest.generation().admission() != anchor.admission
         {
-            return Err(SharedAgentHostError::ScopeMismatch);
+            return Err(refused("manifest_scope", SharedAgentHostError::ScopeMismatch));
         }
         let Some(retained) = manifest
             .management_slot(crate::service::NodeId(self.pins.node.0))
             .filter(|retained| !retained.is_released())
         else {
-            return Err(SharedAgentHostError::Unavailable);
+            return Err(refused("owner_slot", SharedAgentHostError::Unavailable));
         };
         let finalization = slot
             .finalization_work()
-            .map_err(|_| SharedAgentHostError::Unavailable)?;
+            .map_err(|_| refused("finalization_record", SharedAgentHostError::Unavailable))?;
         let expected_members = 1 + usize::from(finalization.is_some());
         let root = retained
             .members()
             .first()
-            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            .ok_or_else(|| refused("root_missing", SharedAgentHostError::ScopeMismatch))?;
         if retained.origin_owner().0 != self.pins.node.0
             || retained.members().len() != expected_members
             || root.parent().is_some()
             || root.anchor() != &anchor
             || root.envelope() != &work
         {
-            return Err(SharedAgentHostError::ScopeMismatch);
+            if diagnostics {
+                tracing::debug!(
+                    phase = "root_family",
+                    member_count = retained.members().len(), expected_members,
+                    finalization_present = finalization.is_some(),
+                    origin_matches = retained.origin_owner().0 == self.pins.node.0,
+                    root_parentless = root.parent().is_none(),
+                    anchor_matches = root.anchor() == &anchor,
+                    work_matches = root.envelope() == &work,
+                    "Local image Install retained root family refused"
+                );
+            }
+            return Err(refused("root_family", SharedAgentHostError::ScopeMismatch));
         }
         if let Some(finalization) = finalization {
             let child = &retained.members()[1];
             if child.parent() != Some(root.commitment())
                 || slot
                     .finalization_anchor()
-                    .map_err(|_| SharedAgentHostError::Unavailable)?
+                    .map_err(|_| refused("finalization_anchor_read", SharedAgentHostError::Unavailable))?
                     != Some(child.anchor())
                 || child.envelope() != finalization
             {
-                return Err(SharedAgentHostError::ScopeMismatch);
+                return Err(refused("child_family", SharedAgentHostError::ScopeMismatch));
             }
+        }
+        if diagnostics {
+            tracing::debug!(phase = "complete", "Local image Install retained family admitted");
         }
         Ok(true)
     }
