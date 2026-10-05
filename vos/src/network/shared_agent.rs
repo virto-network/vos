@@ -3632,7 +3632,17 @@ impl AgentRouteHandler for SharedRouteHandler {
             #[cfg(target_os = "linux")]
             AgentMessage::ForwardedSharedInstallRequest(request) => {
                 let correlation = request.correlation();
-                let next_offset = self.handle_forwarded_shared_install(sender, &request).ok();
+                let next_offset = self.handle_forwarded_shared_install(sender, &request).map_err(|error| {
+                    if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                        let operation = match &request.operation {
+                            super::agent_protocol::ForwardedSharedInstallOperation::Progress => "progress",
+                            super::agent_protocol::ForwardedSharedInstallOperation::Chunk(_) => "chunk",
+                            super::agent_protocol::ForwardedSharedInstallOperation::Finish => "finish",
+                        };
+                        tracing::debug!(operation, ?error, "Shared Install transfer peer refused");
+                    }
+                    error
+                }).ok();
                 Ok(AgentMessage::ForwardedSharedInstallReply {
                     request: correlation,
                     next_offset,

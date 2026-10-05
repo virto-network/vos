@@ -105,11 +105,20 @@ impl SharedRouteHandler {
         authority: crate::agent_sdk::authority::AuthorityReceipt,
         package: &AdmittedActorPackage,
     ) -> Result<CleanManagementSubmission, SharedAgentHostError> {
+        // Temporary payload-free attribution under the existing diagnostic flag.
+        let diagnostic = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some();
+        let trace = |phase: &'static str| {
+            if diagnostic { tracing::debug!(phase, "Shared Install transfer phase"); }
+        };
+        let refused = |phase: &'static str, error: SharedAgentHostError| {
+            if diagnostic { tracing::debug!(phase, ?error, "Shared Install transfer refused"); }
+            error
+        };
         let crate::agent_sdk::ManagementRequest::Install(install) = &request else {
-            return Err(SharedAgentHostError::ScopeMismatch);
+            return Err(refused("request", SharedAgentHostError::ScopeMismatch));
         };
         if package.package_ref() != &install.package {
-            return Err(SharedAgentHostError::InvalidCatalog);
+            return Err(refused("package", SharedAgentHostError::InvalidCatalog));
         }
         let mut transfer = ForwardedSharedInstallRequest {
             owner,
@@ -118,23 +127,26 @@ impl SharedRouteHandler {
             operation: ForwardedSharedInstallOperation::Progress,
         };
         if !transfer.is_valid(self.route) {
-            return Err(SharedAgentHostError::ScopeMismatch);
+            return Err(refused("transfer", SharedAgentHostError::ScopeMismatch));
         }
         let worker = self
             .worker
             .as_ref()
-            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+            .ok_or_else(|| refused("worker", SharedAgentHostError::TransportNotAttached))?;
         let before = futures_executor::block_on(worker.snapshot())
-            .ok_or(SharedAgentHostError::Unavailable)?;
+            .ok_or_else(|| refused("snapshot", SharedAgentHostError::Unavailable))?;
         let (route, retained) = {
             let mut host = self
                 .host
                 .lock()
-                .map_err(|_| SharedAgentHostError::Unavailable)?;
-            drain_committed(&mut host, self.agent, &self.ordered_replies)?;
-            let (route, _) = self.forwarded_install_fingerprint(&host)?;
+                .map_err(|_| refused("host_lock", SharedAgentHostError::Unavailable))?;
+            drain_committed(&mut host, self.agent, &self.ordered_replies)
+                .map_err(|error| refused("drain", error))?;
+            let (route, _) = self.forwarded_install_fingerprint(&host)
+                .map_err(|error| refused("fingerprint", error))?;
             let retained =
-                host.retained_forwarded_shared_install(self.agent, &request, &authority)?;
+                host.retained_forwarded_shared_install(self.agent, &request, &authority)
+                    .map_err(|error| refused("retained", error))?;
             if retained.is_none() {
                 host.validate_forwarded_shared_install_owner(
                     owner.system,
@@ -143,18 +155,21 @@ impl SharedRouteHandler {
                     owner.member,
                     &request,
                     &authority,
-                )?;
+                ).map_err(|error| refused("owner", error))?;
                 let current = futures_executor::block_on(worker.snapshot())
-                    .ok_or(SharedAgentHostError::Unavailable)?;
+                    .ok_or_else(|| refused("barrier_snapshot", SharedAgentHostError::Unavailable))?;
                 CommittedProposalBarrier::from(&before).validate_applied(
                     CommittedProposalBarrier::from(&current),
-                    host.capacity(self.agent)?.0,
-                )?;
+                    host.capacity(self.agent).map_err(|error| refused("capacity", error))?.0,
+                ).map_err(|error| refused("barrier", error))?;
             }
             (route, retained)
         };
         if let Some((input, outcome, observed_slot)) = retained {
-            self.require_ordered_availability(input)?;
+            trace("retained_evidence");
+            self.require_ordered_availability(input)
+                .map_err(|error| refused("availability", error))?;
+            trace("availability_complete");
             tracing::debug!(
                 phase = "origin_retained",
                 node = ?self.network.agent_node_id(),
@@ -172,7 +187,7 @@ impl SharedRouteHandler {
                 new_slot: false,
             });
         }
-        let leader = self.management_leader(&before)?;
+        let leader = self.management_leader(&before).map_err(|error| refused("leader", error))?;
         let manifest = shared_raft::ArtifactBatchManifest::new(
             route,
             vec![crate::service::BlobRef {
@@ -180,7 +195,7 @@ impl SharedRouteHandler {
                 len: install.package.len,
             }],
         )
-        .map_err(|_| SharedAgentHostError::InvalidCatalog)?;
+        .map_err(|_| refused("manifest", SharedAgentHostError::InvalidCatalog))?;
         let deadline = Instant::now() + ORDERED_REPLY_WAIT;
         let receive =
             |request: ForwardedSharedInstallRequest| -> Result<u64, SharedAgentHostError> {
@@ -194,7 +209,9 @@ impl SharedRouteHandler {
                     .map_err(|_| SharedAgentHostError::Unavailable)?
                     .ok_or(SharedAgentHostError::Unavailable)
             };
-        let mut offset = receive(transfer.clone())?;
+        trace("progress_start");
+        let mut offset = receive(transfer.clone()).map_err(|error| refused("progress", error))?;
+        trace("progress_complete");
         while offset < install.package.len {
             if !transfer.admits_progress(offset) {
                 return Err(SharedAgentHostError::ScopeMismatch);
@@ -213,11 +230,11 @@ impl SharedRouteHandler {
                 shared_raft::ArtifactChunk::new(manifest.clone(), 0, offset, bytes.to_vec())
                     .map_err(|_| SharedAgentHostError::InvalidCatalog)?;
             transfer.operation = ForwardedSharedInstallOperation::Chunk(chunk);
-            let next = receive(transfer.clone())?;
+            let next = receive(transfer.clone()).map_err(|error| refused("chunk", error))?;
             // A restarted peer may advertise an earlier bounded offset. End
             // this turn; exact retry resumes from a freshly queried progress.
             if next <= offset {
-                return Err(SharedAgentHostError::Unavailable);
+                return Err(refused("chunk_progress", SharedAgentHostError::Unavailable));
             }
             offset = next;
         }
@@ -228,18 +245,25 @@ impl SharedRouteHandler {
         let _finish_hint = self
             .network
             .send_agent_forwarded_shared_install(leader, self.route, transfer);
+        trace("finish_sent");
         loop {
             let retained = {
                 let mut host = self
                     .host
                     .lock()
-                    .map_err(|_| SharedAgentHostError::Unavailable)?;
-                drain_committed(&mut host, self.agent, &self.ordered_replies)?;
-                self.forwarded_install_fingerprint(&host)?;
-                host.retained_forwarded_shared_install(self.agent, &request, &authority)?
+                    .map_err(|_| refused("local_host_lock", SharedAgentHostError::Unavailable))?;
+                drain_committed(&mut host, self.agent, &self.ordered_replies)
+                    .map_err(|error| refused("local_drain", error))?;
+                self.forwarded_install_fingerprint(&host)
+                    .map_err(|error| refused("local_fingerprint", error))?;
+                host.retained_forwarded_shared_install(self.agent, &request, &authority)
+                    .map_err(|error| refused("local_retained", error))?
             };
             if let Some((input, outcome, observed_slot)) = retained {
-                self.require_ordered_availability(input)?;
+                trace("local_evidence");
+                self.require_ordered_availability(input)
+                    .map_err(|error| refused("local_availability", error))?;
+                trace("local_availability_complete");
                 tracing::debug!(
                     phase = "origin_retained",
                     node = ?self.network.agent_node_id(),
@@ -258,7 +282,7 @@ impl SharedRouteHandler {
                 });
             }
             if Instant::now() >= deadline {
-                return Err(SharedAgentHostError::Unavailable);
+                return Err(refused("local_timeout", SharedAgentHostError::Unavailable));
             }
             std::thread::sleep(Duration::from_millis(10));
         }

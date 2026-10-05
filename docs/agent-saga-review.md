@@ -103,17 +103,16 @@ Current O3 component evidence (logs under the native worktree's `target`):
 ### Current integration delta and blocking result
 
 Latest measured portable source is frozen at
-`f4a3dc90849ea34d706269c016ebb35e8314e048`; production recovery correction
-remains `f9c61863`. The fixture-only pending-Install preparation correction is
-now compiled and exercised, with recovery qualification still open. Portable
-main/harness **pass 191.597s / 249.354s**; main strict six-file verification
-**passes 0.101s**. Main remains `005faa69`, identical to the measured `5750f0c2`
-and `fcac175a` binary; the corrected fixture harness is `667395e9`. Empty
+`be0844c3dacaa16b22d231741b356e560af17f44`; production recovery correction
+remains `f9c61863`. Existing flag-gated host observation/terminal diagnostics
+are now visible to the packaged host, compiled and exercised. Portable
+main/harness **pass 393.101s / 458.972s**; main strict six-file verification
+**passes 0.101s**. Main is `28053e01`; harness is `d8737a32`. Empty
 RUSTFLAGS, unset encoded/target overrides, exact copied hashes, clean source
 before/after and owned-group completion are recorded in
-`task-tmp/r42-cli-build-f4a3dc90/provenance.json`.
+`task-tmp/r42-cli-build-be0844c3/provenance.json`.
 Authority, Catalog, both runtime roles and coherent guest pins remain unchanged.
-Three focused exact-retention units each execute one test and **pass
+Three focused exact-retention units on preceding `f4a3dc90` each execute one test and **pass
 0.101s / 0.101s / 0.601s** (credential query, reservation and exact Install),
 with owned groups gone. These and the earlier typed retained-client regressions
 are component evidence, not integrated recovery or M1 qualification.
@@ -204,28 +203,50 @@ Query**. Neither failure identifies the inner guest, observation, storage or
 release cause, or supports a performance-only verdict. Existing whole **30s**
 recovery remains mandatory; no recovery or Query pass is credited.
 
-The same-source scoped all-cold diagnostic also **fails 248.167s**, one
-executed failing test, owned group gone and current fences passing. It reaches
-the same **replica 0 restart=true / Shared recovery before routes Unavailable**
-boundary. Aggregate startup phase counts are **seven** each through `local_host`
-and **six** each for `shared_lifecycle_recovery` and `lifecycle_controller`;
-these interleaved counts do not bind a registration/release episode to the failed
-constructor. There are **zero native-operation phase records**. Existing
-observation/fresh-Genesis/management-terminal outcome traces are unavailable to
-the CLI-linked core because their hooks are `cfg(test)`; missing traces therefore
-establish no guest result or inner cause. Evidence is
-`task-tmp/r42-pending-all-cold-scoped-f4a3dc90`, with `safe-summary.json` SHA-256
-`e0c6d84a43ff4709a45a2281159423c1493d18022a4a8705a1015fcddd6e5a8a`.
-A minimal host diagnostic visibility correction is **APPLIED, UNBUILT and
-UNEXECUTED**: eight test-compilation gates were removed immediately before
-existing `VOS_TEST_BOOTSTRAP_DIAGNOSTICS`-gated observation/fresh-Genesis/
-management-terminal logs. Only fixed phase/status/error enums, booleans and
-lengths become visible to the CLI-linked host; fault gates, execution/guard order
-and original checks remain. Freeze/build current portable provenance, then run
-one isolated diagnostic before a cause correction. No cause correction is
-established; diagnostic timing is not quiet recovery/SLA qualification. Guest
-bytes/pins, protocols and bounds remain unchanged. Remove the temporary
-diagnostics after attribution.
+Latest scoped all-cold diagnostic on clean `be0844c3` **fails 262.079s**,
+one executed failing test, owned group gone and source/artifact/provenance
+fences passing. It reaches **replica 0 restart=true / Shared recovery before
+routes Unavailable** after the intended signed receipt cut and all-owner reopen
+entry. The eight existing host outcome hooks are now compiled and exercised.
+Across interleaved setup/recovery there are **63 observation guest Done**,
+**ten freshness Unavailable**, **seven matching finalized GenesisDecision** and
+**one GenesisDecision Unavailable**. Counts alone do not bind failure episodes
+or prove every guest path stack-safe.
+
+Fixed-order source review separates three initial constructors, a raw pre-cut
+open and the three cold constructors. All **three completion-retirement** and
+**two terminal submit-ACK Unavailable** records occur during initial Shared
+Create setup, before the cut; they cannot explain the cold constructor.
+After the cold cluster, six observations report Done, two freshness checks
+refuse Unavailable, and one fresh GenesisDecision refuses before a later
+matching decision. **Eleven System authorization/forward/receipt sequences
+complete**, including leader retained availability and original-owner local
+evidence. Five actual **Shared Install origin_forwarded** attempts follow,
+without origin_retained or observed cold completion/ACK/retirement. These
+establish failure inside Shared Install forwarding before successful owner
+return, without distinguishing preflight, package
+progress/chunk/Finish, local replay or availability. No cause correction,
+successful recovery/fresh Query, global stack-resolution or performance-only
+verdict follows.
+
+Current private logs and fixed safe evidence are under
+`task-tmp/r42-pending-all-cold-outcomes-be0844c3`:
+`safe-summary.json` SHA-256
+`25b1b30e50d71deb3da6301983898a52ef6d05989135fe49ba72075f32c254af`;
+`pending-authorization-forward-order-safe.json` SHA-256
+`12e30c573cd60937960f48f70552d11adc11378dbf2a4c6bf92dbee68e3f963d`;
+`pending-shared-install-provenance-safe-v2.json` SHA-256
+`9a79d11342e29a47f5280f286b9b1bf32c96c56f4a76ec31dd92545be51d9c69`.
+Earlier `f4a3dc90` scoped failure **248.167s**, lacking CLI-linked core outcome
+visibility, stays frozen under `task-tmp/r42-pending-all-cold-scoped-f4a3dc90`.
+A narrow existing-flag Shared transfer diagnostic is **APPLIED, UNBUILT and
+UNEXECUTED**. Fixed pre-progress/progress/chunk/Finish/local-evidence/error
+stages and one peer-refusal category preserve existing read/send/guard order,
+checks, errors and the unchanged 1.8s transfer bound. Freeze/rebuild portable
+provenance, then run one isolated diagnostic to identify the remaining substage
+before any behavior correction. Guest bytes/pins,
+protocols, checks and bounds remain unchanged. Diagnostic timing is not quiet
+recovery/SLA qualification; remove temporary diagnostics after attribution.
 
 The fixture-only preparation correction is **BUILT and EXECUTED, UNQUALIFIED**.
 Normal credential/descriptor discovery retries the exact persisted credential
@@ -314,16 +335,21 @@ Current quiet pending-Install runs **fail 186.302s / 244.666s** during normal
 startup: returning cut occurrence is unestablished, while all-cold proves the
 receipt cut and all-owner reopen entry before replica 0 fails Unavailable.
 Neither supplies recovery or fresh-Query proof. The fixture-only preparation
-correction is built/executed but unqualified; the scoped all-cold diagnostic
-**fails 248.167s** at the same constructor context without usable inner outcome
-traces. Reviewed host-only visibility is applied but unbuilt/unexecuted; freeze
-current source/build provenance, then attribute in isolation before a cause
-correction and both reruns. Interleaved metadata
-counts supply no cause proof. Preserve the earlier `fcac175a` pre-cut setup
+correction is built/executed but unqualified. Current `be0844c3` scoped
+all-cold **fails 262.079s** at that constructor; compiled host outcomes and
+fixed-order source review establish successful cold System authorization/
+receipt and Shared Install forwarding entry, without observed local retained
+application evidence.
+Initial terminal errors predate the cut; aggregate Done does not prove all guest
+paths. Attribute the remaining transfer/replay substage before a cause correction
+and both quiet reruns. Preserve earlier `fcac175a` pre-cut setup
 failures by reference.
 Freeze any demonstrated correction/current portable provenance and rerun fresh
-ordinary CLI. Recorded portable costs **191.597s / 249.354s** are high-confidence
-facts at clean `f4a3dc90`; main is unchanged, corrected harness provenance differs.
+ordinary CLI. Recorded portable costs **393.101s / 458.972s** are high-confidence
+facts at clean `be0844c3`; main and harness include existing host diagnostic
+visibility. Its core-changing rebuild takes **14.2 minutes** combined versus
+**7.4 minutes** for the preceding fixture-only build, measured variance without
+scope expansion.
 The quiet failed-gate costs are observations, not a successful recovery range. A predictive
 **3–8 minutes per portable main/harness binary** range has moderate confidence
 from cache/source variation and is not an aggregate ETA. Earlier source/elapsed
