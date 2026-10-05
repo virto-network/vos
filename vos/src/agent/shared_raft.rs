@@ -5961,9 +5961,18 @@ mod application_ledger_v2 {
                 audited.ordered,
                 audited.management_runtime,
             )?;
-            manifest
-                .validate_management_registration_request(request)
-                .map_err(|_| AgentRaftApplicationErrorV2::InvalidCommandDisposition)?;
+            // The mandatory preflight strictly decoded and fully validated
+            // these exact owned slots, then authenticated their physical fold.
+            // The anchor check above does not mutate them. Reuse that same
+            // validation only for the remaining exact request check; keep the
+            // fresh settled-prefix preflight and all request/family bounds.
+            super::super::shared_recovery::management::validate_management_registration_request_after_slots_validation(
+                manifest.management_slots(),
+                self.generation,
+                &self.initial_committee,
+                request,
+            )
+            .map_err(|_| AgentRaftApplicationErrorV2::InvalidCommandDisposition)?;
             Ok(())
         }
 
@@ -8500,6 +8509,17 @@ mod application_ledger_v2 {
         /// Capacity facts from the same fully authenticated recovery pass.
         /// No projection of the already validated command suffix is needed.
         pub(crate) fn capacity(&self) -> Result<(u64, u64, bool), AgentRaftApplicationErrorV2> {
+            self.capacity_and_recovery_manifest().map(|(capacity, _)| capacity)
+        }
+
+        /// Return the immutable manifest already decoded by this capacity
+        /// audit. The driver must still authenticate its runtime and replayed
+        /// outcomes before lending it under uninterrupted admission guards.
+        /// This does not confer a fresh settled-prefix or availability proof.
+        pub(crate) fn capacity_and_recovery_manifest(
+            &self,
+        ) -> Result<((u64, u64, bool), Option<SharedRecoveryManifest>), AgentRaftApplicationErrorV2>
+        {
             let _guard = self
                 .writes
                 .lock()
@@ -8507,7 +8527,9 @@ mod application_ledger_v2 {
             #[cfg(test)]
             self.capacity_audits
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            self.audit_recovery_capacity()
+            let transaction = self.database.begin_read()?;
+            let audited = self.audit_recovery_in_read(&transaction)?;
+            Ok((audited.capacity(), audited.recovery))
         }
 
         #[cfg(test)]
@@ -15383,7 +15405,7 @@ mod tests {
             Err(AgentRaftApplicationErrorV2::MissingCommittedSlot)
         ));
         assert!(matches!(
-            missing_ledger.capacity(),
+            missing_ledger.capacity_and_recovery_manifest(),
             Err(AgentRaftApplicationErrorV2::MissingCommittedSlot)
         ));
 
@@ -15405,8 +15427,10 @@ mod tests {
             .unwrap();
         let slot = corrupt_ledger.next_committed_slot().unwrap().unwrap();
         corrupt_ledger.apply_foundation_slot(&slot).unwrap();
-        let admitted_capacity = corrupt_ledger.capacity().unwrap();
+        let (admitted_capacity, admitted_manifest) =
+            corrupt_ledger.capacity_and_recovery_manifest().unwrap();
         assert_eq!(admitted_capacity.0, 1);
+        assert!(admitted_manifest.is_none());
         let capacity_audits = corrupt_ledger.capacity_audits_for_test();
         {
             const AUDIT_TABLE: TableDefinition<&[u8], &[u8]> =

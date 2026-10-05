@@ -322,13 +322,18 @@ impl SharedRouteHandler {
                         SharedAgentHostError::Conflict,
                     ));
                 }
-                host.validate_management_recovery_registration(self.agent, registration)
-                    .map_err(|error| refused("registration_validation_error", error))?;
+                host.validate_management_recovery_registration_with_manifest(
+                    self.agent,
+                    registration,
+                    &manifest,
+                )
+                .map_err(|error| refused("registration_validation_error", error))?;
                 trace("signed_registration_verified");
                 let required = host
-                    .management_retention_admission_requirement(
+                    .management_retention_admission_requirement_with_manifest(
                         self.agent,
                         Some(registration.request()),
+                        &manifest,
                     )
                     .map_err(|error| refused("joint_budget_error", error))?
                     .ok_or_else(|| {
@@ -364,8 +369,12 @@ impl SharedRouteHandler {
                 // The origin's preview is not authority. Recheck this new
                 // exact member against the actual leader state before custody.
                 trace("clock_preview_start");
-                host.validate_new_management_invocation_clock(self.agent, registration.request())
-                    .map_err(|error| refused("clock_preview_error", error))?;
+                host.validate_new_management_invocation_clock_with_manifest(
+                    self.agent,
+                    registration.request(),
+                    &manifest,
+                )
+                .map_err(|error| refused("clock_preview_error", error))?;
                 trace("clock_preview_verified");
                 Some(capacity)
             }
@@ -418,6 +427,7 @@ impl SharedRouteHandler {
             capacity_audits_before + 1,
             "metadata admission must perform one actual capacity audit under its uninterrupted guards"
         );
+        drop(manifest);
         drop(host);
         trace("commit_start");
         self.commit_management_metadata(worker, &current, &fingerprint, command)
@@ -435,12 +445,19 @@ impl SharedRouteHandler {
         request: &CleanInvocationReplayRequest,
         clock: InvocationClock<'_>,
         audited_remaining: u64,
+        verified_manifest: Option<SharedRecoveryManifest>,
     ) -> Result<(Option<CleanOrderedSubmission>, SharedRecoveryManifest), SharedAgentHostError> {
         let (_, fingerprint) = self.management_fingerprint(host)?;
         if fingerprint.voters.binary_search(&owner).is_err() {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        let manifest = host.recovery_manifest(self.agent)?;
+        // Only the same uninterrupted post-drain host/proposal guard may lend
+        // capacity's manifest, after the driver's full evidence verification.
+        // Fresh absence, budget and applied-availability checks remain below.
+        let manifest = match verified_manifest {
+            Some(manifest) => manifest,
+            None => host.recovery_manifest(self.agent)?,
+        };
         let slot = manifest
             .management_slot(crate::service::NodeId(owner.0))
             .filter(|slot| slot.registration().commitment().0 == registration.0)

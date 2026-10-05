@@ -930,6 +930,22 @@ pub(crate) fn validate_management_registration_request(
     request: &SharedManagementRecoveryRegistrationRequest,
 ) -> Result<(), SharedRecoveryError> {
     validate_management_slots(slots, generation, committee)?;
+    validate_management_registration_request_after_slots_validation(
+        slots, generation, committee, request,
+    )
+}
+
+// Only for this same call's immutable slots after full validation, including
+// their registration/release signatures. This is the remaining exact request
+// check, not custody provenance, signing authority, or permission to skip a
+// fresh physical-prefix preflight. The checked wrapper above remains mandatory
+// for callers without that dominating validation.
+pub(in crate::agent) fn validate_management_registration_request_after_slots_validation(
+    slots: &[SharedManagementRecoverySlot],
+    generation: AgentGenerationRouteKey,
+    committee: &AgentReplicaCommittee,
+    request: &SharedManagementRecoveryRegistrationRequest,
+) -> Result<(), SharedRecoveryError> {
     request.validate()?;
     validate_request_owner(
         generation,
@@ -1570,6 +1586,13 @@ mod tests {
             &extension,
         )
         .unwrap();
+        validate_management_registration_request_after_slots_validation(
+            &slots,
+            scope.generation(),
+            scope.committee(),
+            &extension,
+        )
+        .unwrap();
         let mut wrong_previous = extension.clone();
         wrong_previous.previous = Some(Hash([0x9e; 32]));
         assert_eq!(
@@ -1581,6 +1604,48 @@ mod tests {
             ),
             Err(SharedRecoveryError::Sequence)
         );
+        assert_eq!(
+            validate_management_registration_request_after_slots_validation(
+                &slots,
+                scope.generation(),
+                scope.committee(),
+                &wrong_previous,
+            ),
+            Err(SharedRecoveryError::Sequence)
+        );
+        let mut missing_child = extension.clone();
+        missing_child.members.pop();
+        let mut wrong_origin = extension.clone();
+        wrong_origin.origin_owner = node(2);
+        let mut too_many_members = extension.clone();
+        too_many_members.members.resize(
+            MAX_SHARED_MANAGEMENT_RECOVERY_MEMBERS + 1,
+            extension.members()[1].clone(),
+        );
+        for (request, expected) in [
+            (&missing_child, SharedRecoveryError::Conflict),
+            (&wrong_origin, SharedRecoveryError::Conflict),
+            (&too_many_members, SharedRecoveryError::LimitExceeded),
+        ] {
+            assert_eq!(
+                validate_management_registration_request(
+                    &slots,
+                    scope.generation(),
+                    scope.committee(),
+                    request,
+                ),
+                Err(expected)
+            );
+            assert_eq!(
+                validate_management_registration_request_after_slots_validation(
+                    &slots,
+                    scope.generation(),
+                    scope.committee(),
+                    request,
+                ),
+                Err(expected)
+            );
+        }
         let mut wrong_scope = release;
         wrong_scope.scope = Hash([0x9e; 32]);
         assert_eq!(

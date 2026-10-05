@@ -2441,6 +2441,25 @@ impl SharedAgentHost {
             .map_err(map_driver_error)
     }
 
+    /// One actual capacity audit plus this same call's verified immutable
+    /// recovery manifest. The caller retains host/proposal exclusion and a
+    /// fresh worker barrier; no product may survive publication or guard release.
+    pub(crate) fn capacity_and_recovery_manifest(
+        &mut self,
+        agent: AgentId,
+    ) -> Result<
+        ((u64, u64, bool), super::shared_recovery::SharedRecoveryManifest),
+        SharedAgentHostError,
+    > {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .capacity_and_recovery_manifest()
+            .map_err(map_driver_error)
+    }
+
     #[cfg(test)]
     pub(crate) fn capacity_audits_for_test(
         &self,
@@ -3280,6 +3299,31 @@ impl SharedAgentHost {
             &super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest,
         >,
     ) -> Result<Option<usize>, SharedAgentHostError> {
+        self.management_retention_admission_requirement_with_policy(agent, incoming, None)
+    }
+
+    /// Lend only a freshly verified immutable manifest under the caller's same
+    /// uninterrupted host/proposal guards. Fresh request and absence admission
+    /// remain in the driver; this is not a physical availability certificate.
+    pub(crate) fn management_retention_admission_requirement_with_manifest(
+        &mut self,
+        agent: AgentId,
+        incoming: Option<
+            &super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest,
+        >,
+        manifest: &super::shared_recovery::SharedRecoveryManifest,
+    ) -> Result<Option<usize>, SharedAgentHostError> {
+        self.management_retention_admission_requirement_with_policy(agent, incoming, Some(manifest))
+    }
+
+    fn management_retention_admission_requirement_with_policy(
+        &mut self,
+        agent: AgentId,
+        incoming: Option<
+            &super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest,
+        >,
+        verified_manifest: Option<&super::shared_recovery::SharedRecoveryManifest>,
+    ) -> Result<Option<usize>, SharedAgentHostError> {
         self.lease.validate_live().map_err(map_outer_lease_error)?;
         let hosted = self
             .agents
@@ -3291,10 +3335,13 @@ impl SharedAgentHost {
         ) {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        hosted
-            .driver
-            .management_retention_admission_requirement(incoming)
-            .map_err(map_driver_error)
+        match verified_manifest {
+            Some(manifest) => hosted
+                .driver
+                .management_retention_admission_requirement_with_manifest(incoming, manifest),
+            None => hosted.driver.management_retention_admission_requirement(incoming),
+        }
+        .map_err(map_driver_error)
     }
 
     /// Only a Current custody ACK or persisted custody Invoke may borrow this
@@ -3421,29 +3468,27 @@ impl SharedAgentHost {
         agent: AgentId,
         registration: &super::shared_recovery::management::SharedManagementRecoveryRegistration,
     ) -> Result<(), SharedAgentHostError> {
-        self.lease.validate_live().map_err(map_outer_lease_error)?;
-        let hosted = self
-            .agents
-            .get(&agent)
-            .ok_or(SharedAgentHostError::AgentNotFound)?;
-        if !matches!(
-            &hosted.intent.authority,
-            SharedGenesisAuthority::SystemBootstrap { .. }
-        ) {
-            return Err(SharedAgentHostError::ScopeMismatch);
-        }
-        hosted
-            .driver
-            .validate_management_recovery_registration(registration)
-            .map_err(map_driver_error)
+        self.validate_management_recovery_registration_with_policy(agent, registration, None)
     }
 
-    /// Caller retains settled proposal/host exclusion. This is only a
-    /// nonpublishing admission check, never a signing or replay exception.
-    pub(crate) fn validate_new_management_invocation_clock(
+    pub(crate) fn validate_management_recovery_registration_with_manifest(
         &mut self,
         agent: AgentId,
-        request: &super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest,
+        registration: &super::shared_recovery::management::SharedManagementRecoveryRegistration,
+        manifest: &super::shared_recovery::SharedRecoveryManifest,
+    ) -> Result<(), SharedAgentHostError> {
+        self.validate_management_recovery_registration_with_policy(
+            agent,
+            registration,
+            Some(manifest),
+        )
+    }
+
+    fn validate_management_recovery_registration_with_policy(
+        &mut self,
+        agent: AgentId,
+        registration: &super::shared_recovery::management::SharedManagementRecoveryRegistration,
+        verified_manifest: Option<&super::shared_recovery::SharedRecoveryManifest>,
     ) -> Result<(), SharedAgentHostError> {
         self.lease.validate_live().map_err(map_outer_lease_error)?;
         let hosted = self
@@ -3456,10 +3501,58 @@ impl SharedAgentHost {
         ) {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        hosted
-            .driver
-            .validate_new_management_invocation_clock(request)
-            .map_err(map_driver_error)
+        match verified_manifest {
+            Some(manifest) => hosted
+                .driver
+                .validate_management_recovery_registration_with_manifest(registration, manifest),
+            None => hosted.driver.validate_management_recovery_registration(registration),
+        }
+        .map_err(map_driver_error)
+    }
+
+    /// Caller retains settled proposal/host exclusion. This is only a
+    /// nonpublishing admission check, never a signing or replay exception.
+    pub(crate) fn validate_new_management_invocation_clock(
+        &mut self,
+        agent: AgentId,
+        request: &super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest,
+    ) -> Result<(), SharedAgentHostError> {
+        self.validate_new_management_invocation_clock_with_policy(agent, request, None)
+    }
+
+    pub(crate) fn validate_new_management_invocation_clock_with_manifest(
+        &mut self,
+        agent: AgentId,
+        request: &super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest,
+        manifest: &super::shared_recovery::SharedRecoveryManifest,
+    ) -> Result<(), SharedAgentHostError> {
+        self.validate_new_management_invocation_clock_with_policy(agent, request, Some(manifest))
+    }
+
+    fn validate_new_management_invocation_clock_with_policy(
+        &mut self,
+        agent: AgentId,
+        request: &super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest,
+        verified_manifest: Option<&super::shared_recovery::SharedRecoveryManifest>,
+    ) -> Result<(), SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        let hosted = self
+            .agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        if !matches!(
+            &hosted.intent.authority,
+            SharedGenesisAuthority::SystemBootstrap { .. }
+        ) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        match verified_manifest {
+            Some(manifest) => hosted
+                .driver
+                .validate_new_management_invocation_clock_with_manifest(request, manifest),
+            None => hosted.driver.validate_new_management_invocation_clock(request),
+        }
+        .map_err(map_driver_error)
     }
 
     pub(crate) fn validate_management_recovery_release(
@@ -3498,6 +3591,40 @@ impl SharedAgentHost {
         ),
         SharedAgentHostError,
     > {
+        self.prepare_signed_management_recovery_registration_with_policy(agent, request, None)
+    }
+
+    pub(crate) fn prepare_signed_management_recovery_registration_with_manifest(
+        &mut self,
+        agent: AgentId,
+        request: &super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest,
+        manifest: &super::shared_recovery::SharedRecoveryManifest,
+    ) -> Result<
+        (
+            VerifiedSharedManagementRecoveryRegistrationCandidate,
+            ReplicaCommitSignature,
+        ),
+        SharedAgentHostError,
+    > {
+        self.prepare_signed_management_recovery_registration_with_policy(
+            agent,
+            request,
+            Some(manifest),
+        )
+    }
+
+    fn prepare_signed_management_recovery_registration_with_policy(
+        &mut self,
+        agent: AgentId,
+        request: &super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest,
+        verified_manifest: Option<&super::shared_recovery::SharedRecoveryManifest>,
+    ) -> Result<
+        (
+            VerifiedSharedManagementRecoveryRegistrationCandidate,
+            ReplicaCommitSignature,
+        ),
+        SharedAgentHostError,
+    > {
         self.lease.validate_live().map_err(map_outer_lease_error)?;
         let hosted = self
             .agents
@@ -3515,14 +3642,20 @@ impl SharedAgentHost {
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        hosted
-            .driver
-            .validate_management_recovery_registration_request(request)
-            .map_err(map_driver_error)?;
-        hosted
-            .driver
-            .validate_new_management_invocation_clock(request)
-            .map_err(map_driver_error)?;
+        match verified_manifest {
+            Some(manifest) => hosted
+                .driver
+                .validate_management_recovery_registration_request_with_manifest(request, manifest),
+            None => hosted.driver.validate_management_recovery_registration_request(request),
+        }
+        .map_err(map_driver_error)?;
+        match verified_manifest {
+            Some(manifest) => hosted
+                .driver
+                .validate_new_management_invocation_clock_with_manifest(request, manifest),
+            None => hosted.driver.validate_new_management_invocation_clock(request),
+        }
+        .map_err(map_driver_error)?;
         let candidate = VerifiedSharedManagementRecoveryRegistrationCandidate {
             request: request.clone(),
             committee,

@@ -2213,7 +2213,11 @@ impl SharedRouteHandler {
                     )
                     .map_err(|_| SharedAgentHostError::CapacityExhausted)?;
                     let joint_required = host
-                        .management_retention_admission_requirement(self.agent, Some(&request))?
+                        .management_retention_admission_requirement_with_manifest(
+                            self.agent,
+                            Some(&request),
+                            &manifest,
+                        )?
                         .ok_or(SharedAgentHostError::CapacityExhausted)?;
                     let old_metadata = retained
                         .map(|slot| {
@@ -2230,8 +2234,12 @@ impl SharedRouteHandler {
                     if remaining_slots < joint_required as u64 + joint_metadata as u64 {
                         return Err(SharedAgentHostError::CapacityExhausted);
                     }
-                    let (registration_candidate, signature) =
-                        host.prepare_signed_management_recovery_registration(self.agent, &request)?;
+                    let (registration_candidate, signature) = host
+                        .prepare_signed_management_recovery_registration_with_manifest(
+                            self.agent,
+                            &request,
+                            &manifest,
+                        )?;
                     let registration = SharedManagementRecoveryRegistration::new(
                         registration_candidate.request().clone(),
                         signature,
@@ -2273,6 +2281,7 @@ impl SharedRouteHandler {
                         validate(&candidate, retained, pending, retiring, true)?;
                         publication_checked = true;
                     }
+                    drop(manifest);
                     drop(host);
                     // No intent or dispatch is published on an ambiguous
                     // append. A retry first proves the entire tail committed,
@@ -2755,10 +2764,21 @@ impl SharedRouteHandler {
             // snapshot position and reservations cannot change while these
             // host/proposal guards remain held. Reuse only for admission below,
             // never across preparation, publication or another drain.
+            let mut capacity_manifest = None;
             let audited_capacity = if let Some(barrier) = ordered_barrier {
-                let capacity = host
-                    .capacity(self.agent)
-                    .map_err(|error| refused("capacity_error", error))?;
+                let capacity = if matches!(
+                    reservation,
+                    Some(ReservedSubmission::ManagementCustody { .. })
+                ) {
+                    let (capacity, manifest) = host
+                        .capacity_and_recovery_manifest(self.agent)
+                        .map_err(|error| refused("capacity_error", error))?;
+                    capacity_manifest = Some(manifest);
+                    capacity
+                } else {
+                    host.capacity(self.agent)
+                        .map_err(|error| refused("capacity_error", error))?
+                };
                 trace("capacity_audited");
                 let current = futures_executor::block_on(worker.snapshot()).ok_or_else(|| {
                     refused(
@@ -2791,6 +2811,7 @@ impl SharedRouteHandler {
                         audited_capacity
                             .ok_or(SharedAgentHostError::CorruptResidue)?
                             .1,
+                        capacity_manifest.take(),
                     )
                     .map_err(|error| refused("custody_validation_error", error))?;
                 trace("custody_validated");
@@ -6899,7 +6920,9 @@ impl SharedAgentNetworkHost {
                     .position(|saved| saved == &member)
                     .unwrap();
                 let first = slot.members_evidence()[index].invoke().unwrap();
-                let audited_capacity = host.capacity(agent).unwrap();
+                let (audited_capacity, capacity_manifest) =
+                    host.capacity_and_recovery_manifest(agent).unwrap();
+                assert_eq!(capacity_manifest, manifest);
                 let mut substituted = request.clone();
                 let crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Invoke {
                     work,
@@ -6918,6 +6941,7 @@ impl SharedAgentNetworkHost {
                         &substituted,
                         InvocationClock::PersistedManagement(member.anchor()),
                         audited_capacity.1,
+                        Some(capacity_manifest.clone()),
                     ),
                     Err(SharedAgentHostError::ScopeMismatch)
                 ));
@@ -6939,6 +6963,7 @@ impl SharedAgentNetworkHost {
                         &substituted,
                         InvocationClock::PersistedManagement(member.anchor()),
                         audited_capacity.1,
+                        Some(capacity_manifest.clone()),
                     ),
                     Err(SharedAgentHostError::ScopeMismatch)
                 ));
@@ -6953,6 +6978,7 @@ impl SharedAgentNetworkHost {
                         &request,
                         InvocationClock::PersistedManagement(&late_anchor),
                         audited_capacity.1,
+                        Some(capacity_manifest),
                     ),
                     Err(SharedAgentHostError::ScopeMismatch)
                 ));

@@ -102,6 +102,56 @@ Current O3 component evidence (logs under the native worktree's `target`):
 
 ### Current integration delta and blocking result
 
+The user renewed go-ahead after the two failed measured candidates. This
+authorizes one bounded, source-justified corrective candidate and isolated
+measurement, not an automatic engineering-week cap extension, deadline increase,
+architecture change or readiness claim. The previous two-pass boundary remains
+frozen failed evidence; a further measured candidate will be counted explicitly.
+
+R48 reads the completed R47 logs without rerunning a fixture. Its independently
+reviewed finite reader reports **689 events / eight temporal intervals / zero
+unknown**. Archived source admission proves that clean `fa601999` differs from
+measured `e168c39d` only in the two live documents; original binaries, artifacts,
+source, test counts and owned-process fences remain exact. The first cold
+extension's origin custody wait times out while leader registration validation
+continues: leader checks reach clock-preview completion at **4.724s**, and its
+commit/local confirmation completes at **8.768s**. Later Invoke origin custody
+confirmation times out while leader admission still continues. The subsequent
+ordered-result waiter timeout occurs after origin startup failure and may be
+affected by teardown; it is not an independently established result-loss defect.
+Abbreviated Debug IDs do not prove cross-node/exact-request association. These
+are temporal phase facts, not a global performance-only or guest-outcome verdict.
+
+Reader: `task-tmp/r48-cold-finalization-fixed-reader-v2.py`, SHA-256
+`5d970407bb7e3dcd39802d8b4bbb9b54cd46c8822c9cf2fd908c28aad622628a`.
+Safe artifact: `task-tmp/r47-pending-all-cold-scoped-e168c39d/cold-finalization-attribution-safe.json`,
+SHA-256 `576832be538e3bdd59da19d929afa62ad68b734cbeb101fbb94aa8bb1e2a7923`.
+V1 remains unexecuted: independent review corrected overlapping-window pairing
+before V2 extraction. No raw memory or private diagnostic inputs are exported.
+
+The candidate targets the named M1 cold management-admission blocker by removing
+demonstrably repeated immutable validation. Register uses the existing Release
+precedent: request-only checks follow the same call's full physical preflight.
+Registration/budget/clock selectors borrow the existing verified manifest only
+under uninterrupted host/proposal guards. Capacity returns its already-decoded
+manifest through the existing driver evidence verifier. Fresh ledger preflights,
+each unseen member's settled-prefix/absence proof, signatures, first-owner and
+complete-family checks, actual successful-terminal guest preview, full capacity
+audit, corruption/availability and worker barriers all remain. No manifest crosses
+application progress, host-guard release, publication or peer I/O. This candidate
+is **in implementation, unbuilt and unmeasured**; no benefit or M1 exit is claimed.
+
+Implementation effort remains uncertain until review/checks close the exact
+reuse seams; no defensible aggregate source-hour estimate is established.
+Integration attempt costs have high-confidence measurements: recent portable
+main+harness rebuilds take **14–16 minutes**, failed all-cold runs approximately
+**3–5 minutes**. These are attempt costs, not successful recovery or remaining
+qualification forecasts. M1 qualification, M2 and local M3 gates remain below;
+external hardware qualification stays open.
+
+### Frozen preceding diagnostic boundary
+
+
 The one user-authorized bounded diagnostic continuation is **completed, not
 qualified** on clean source `e168c39d7db42997f159b17ff0b691bb2d37b596`.
 Independent source reviews preserve the same held lifecycle, original signed
@@ -642,8 +692,9 @@ The quiet failed-gate costs are observations, not a successful recovery range. A
 **3–8 minutes per portable main/harness binary** range has moderate confidence
 from cache/source variation and is not an aggregate ETA. Earlier source/elapsed
 forecasts remain unreliable.
-Both measured tuning passes are consumed and failed to qualify recovery.
-No benefit is credited; the plan requires go/no-go direction before further tuning.
+Both original measured tuning passes are consumed and failed to qualify recovery.
+The renewed bounded direction and R48 candidate are recorded at the current
+integration delta; no benefit or automatic cap extension is credited.
 
 The earlier corrected role-source boundary `2e19cd17` freezes these changes,
 which close demonstrated M1 defects without changing authorization, wire bounds

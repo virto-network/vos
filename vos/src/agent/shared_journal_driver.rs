@@ -2718,18 +2718,54 @@ where
             &super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest,
         >,
     ) -> Result<Option<usize>, SharedJournalDriverError> {
-        let manifest = self.recovery_manifest()?;
+        self.management_retention_admission_requirement_with_policy(incoming, None)
+    }
+
+    /// Borrow only this call's verified immutable manifest under uninterrupted
+    /// host/proposal guards. Every incoming request and unseen member still
+    /// receives its original fresh physical-prefix admission below.
+    pub(crate) fn management_retention_admission_requirement_with_manifest(
+        &self,
+        incoming: Option<
+            &super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest,
+        >,
+        manifest: &SharedRecoveryManifest,
+    ) -> Result<Option<usize>, SharedJournalDriverError> {
+        self.management_retention_admission_requirement_with_policy(incoming, Some(manifest))
+    }
+
+    fn management_retention_admission_requirement_with_policy(
+        &self,
+        incoming: Option<
+            &super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest,
+        >,
+        verified_manifest: Option<&SharedRecoveryManifest>,
+    ) -> Result<Option<usize>, SharedJournalDriverError> {
+        let fresh_manifest = if verified_manifest.is_none() {
+            Some(self.recovery_manifest()?)
+        } else {
+            None
+        };
+        let manifest = verified_manifest
+            .or(fresh_manifest.as_ref())
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
         if let Some(request) = incoming {
-            self.validate_management_recovery_registration_request(request)?;
+            self.validate_management_recovery_registration_request_with_policy(
+                request,
+                verified_manifest,
+            )?;
         }
         let (pending, future_entries, future_bytes) =
-            management_retention_headroom(self.materialization.heads(), &manifest, incoming)?;
-        self.management_recovery_admission_with_headroom(
+            management_retention_headroom(self.materialization.heads(), manifest, incoming)?;
+        self.management_recovery_admission_with_headroom_and_input(
             &pending,
             &[],
             future_entries,
             future_bytes,
+            false,
+            verified_manifest,
         )
+        .map(|(requirement, _)| requirement)
     }
 
     /// The caller verified this manifest after draining under the same
@@ -5205,6 +5241,20 @@ where
         self.ledger.capacity().map_err(Into::into)
     }
 
+    /// The raw manifest is a product of this actual capacity audit. Reuse only
+    /// its immutable bytes; retain the independent runtime, physical result
+    /// and common-baseline verification before lending it to admission.
+    pub(crate) fn capacity_and_recovery_manifest(
+        &self,
+    ) -> Result<((u64, u64, bool), SharedRecoveryManifest), SharedJournalDriverError> {
+        let (capacity, raw_manifest) = self.ledger.capacity_and_recovery_manifest()?;
+        let manifest = match self.verified_recovery_manifest_from_read(raw_manifest)? {
+            Some(manifest) => manifest,
+            None => self.ledger.recovery_manifest()?,
+        };
+        Ok((capacity, manifest))
+    }
+
     pub(crate) fn recovery_manifest(
         &self,
     ) -> Result<SharedRecoveryManifest, SharedJournalDriverError> {
@@ -5328,8 +5378,28 @@ where
         &self,
         request: &super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest,
     ) -> Result<(), SharedJournalDriverError> {
-        self.verified_recovery_manifest()?;
+        self.validate_management_recovery_registration_request_with_policy(request, None)
+    }
+
+    pub(crate) fn validate_management_recovery_registration_request_with_manifest(
+        &self,
+        request: &super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest,
+        manifest: &SharedRecoveryManifest,
+    ) -> Result<(), SharedJournalDriverError> {
+        self.validate_management_recovery_registration_request_with_policy(request, Some(manifest))
+    }
+
+    fn validate_management_recovery_registration_request_with_policy(
+        &self,
+        request: &super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest,
+        verified_manifest: Option<&SharedRecoveryManifest>,
+    ) -> Result<(), SharedJournalDriverError> {
+        if verified_manifest.is_none() {
+            self.verified_recovery_manifest()?;
+        }
         self.validate_management_registration_runtime(request)?;
+        // This ledger call still audits and verifies the current settled raw
+        // prefix for every request, independently of the borrowed selectors.
         self.ledger
             .validate_management_recovery_registration_request(request)
             .map_err(Into::into)
@@ -5343,13 +5413,34 @@ where
         &self,
         request: &super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest,
     ) -> Result<(), SharedJournalDriverError> {
+        self.validate_new_management_invocation_clock_with_policy(request, None)
+    }
+
+    pub(crate) fn validate_new_management_invocation_clock_with_manifest(
+        &self,
+        request: &super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest,
+        manifest: &SharedRecoveryManifest,
+    ) -> Result<(), SharedJournalDriverError> {
+        self.validate_new_management_invocation_clock_with_policy(request, Some(manifest))
+    }
+
+    fn validate_new_management_invocation_clock_with_policy(
+        &self,
+        request: &super::shared_recovery::management::SharedManagementRecoveryRegistrationRequest,
+        verified_manifest: Option<&SharedRecoveryManifest>,
+    ) -> Result<(), SharedJournalDriverError> {
         self.validate_management_registration_runtime(request)?;
         let member = request
             .members()
             .last()
             .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
-        let manifest = self.verified_recovery_manifest()?;
-        if let Some(manifest) = manifest.as_ref()
+        let fresh_manifest = if verified_manifest.is_none() {
+            self.verified_recovery_manifest()?
+        } else {
+            None
+        };
+        let manifest = verified_manifest.or(fresh_manifest.as_ref());
+        if let Some(manifest) = manifest
             && exact_retained_management_member(manifest, None, member.envelope())?.is_some()
         {
             return Ok(());
@@ -5411,7 +5502,25 @@ where
         &self,
         registration: &super::shared_recovery::SharedManagementRecoveryRegistration,
     ) -> Result<(), SharedJournalDriverError> {
-        self.verified_recovery_manifest()?;
+        self.validate_management_recovery_registration_with_policy(registration, None)
+    }
+
+    pub(crate) fn validate_management_recovery_registration_with_manifest(
+        &self,
+        registration: &super::shared_recovery::SharedManagementRecoveryRegistration,
+        manifest: &SharedRecoveryManifest,
+    ) -> Result<(), SharedJournalDriverError> {
+        self.validate_management_recovery_registration_with_policy(registration, Some(manifest))
+    }
+
+    fn validate_management_recovery_registration_with_policy(
+        &self,
+        registration: &super::shared_recovery::SharedManagementRecoveryRegistration,
+        verified_manifest: Option<&SharedRecoveryManifest>,
+    ) -> Result<(), SharedJournalDriverError> {
+        if verified_manifest.is_none() {
+            self.verified_recovery_manifest()?;
+        }
         self.validate_management_registration_runtime(registration.request())?;
         // The signature-verifying ledger entry point also performs the fresh,
         // complete request preflight. Do not audit that same request twice.
