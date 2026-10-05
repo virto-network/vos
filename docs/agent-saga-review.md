@@ -22,12 +22,16 @@ before leader proposal. The quiet inner cause remains independently unknown.
 M1 stays open. This permission does not authorize a fifth tuning candidate,
 redesign, promotion, cap extension or deadline increase.
 
-R53 continues the user's authorized causal investigation only: split existing
-exact release driver provenance/signed-ledger validation, leader capacity and
-worker snapshot calls with gated scalar timings. Preserve all calls, guard and
-transaction boundaries, fresh audits and errors. No behavior remedy is applied.
-Source/finite-reader review, clean freeze, portable build and isolated exact
-scoped measurement are required before attributing those costs.
+R53 diagnostic-only investigation is complete on clean `e59c702f`: portable
+main/harness and strict six-file verification pass; one scoped all-cold attempt
+fails **267.579s**, admitting **9,237 records / 501 edges / zero unknowns** through
+all original evidence fences. Install finalization/terminal complete, its owner
+release wait expires before proposal, then the leader confirms the exact release
+late. Signed-ledger validation and capacity dominate admission; worker snapshot
+is small in the measured calls. Later confirmation waits over two seconds for
+the host lock, whose holder is unidentified. No behavior remedy is applied.
+The live plan holds a reviewed, unapplied release-fold proposal and the explicit
+go/no-go requirement before any fifth tuning candidate; no cap extension follows.
 
 The latest user direction continues investigation and prioritizes demonstrated
 smaller defects before broader simplifications. R51 adds only narrow audit and
@@ -138,33 +142,48 @@ Current O3 component evidence (logs under the native worktree's `target`):
 
 ### Current integration delta and blocking result
 
-Read [completed R52](agent-saga-status.md#completed-r52-registration-validation-pass-retention-release-remains-blocked)
+Read [completed R53](agent-saga-status.md#completed-r53-exact-terminal-release-diagnostics)
 in the sole live plan for source/binary/reader/artifact hashes and event limits.
-Portable main/harness pass **425.826s / 491.986s**, strict six-file verification
-**0.101s**. The scoped attempt admits **7,619 records / 341 explicit edges /
+Portable main/harness pass **420.717s / 487.505s**, strict six-file verification
+**0.101s**. The scoped attempt admits **9,237 records / 501 explicit edges /
 zero unknowns**, one failed test and exhausted noninterrupted owned group.
 Public Create completes terminal/release and exact Applied replay, then the
 fixture verifies pending Install and enters cold restart. Exact Install
 finalization is delivered and accepted; root-bound issuer save requires actual
 Done, exact reply validation and durable replay equality. Both runtime retirements
 and terminal persistence complete. Current failure is its original owner's
-retention release: twelve absent polls, timeout **1.885s** into confirmation,
-before leader proposal. The leader's later attachment ScopeMismatch follows
-the owner failure and may be teardown; no changed component or causal lifecycle
-defect is proved. No current availability refusal is recorded. R51's precise
-availability subcause remains historical unknown.
+retention release: twelve absent polls, timeout **1.907s** into confirmation,
+before leader proposal. The leader then observes that exact release present and
+completes local custody/commit. There is no tail attachment ScopeMismatch here;
+R52's late attachment refusal remains historical and cannot explain its earlier
+owner timeout. Late leader release is not original-owner completion or readiness.
 
-Same-composition recorded audit/fold medians are lower, but signed datasets,
-physical costs and schedules differ. Exact Create-bound observations complete
-Done/purity; 527 generic VM halts do not qualify general guest-stack resolution.
-The release validator combines driver provenance with a fresh signature-first
-settled-prefix audit; the following interval combines a separate fresh capacity
-audit and worker mailbox wait. Source confirms exact terminal-release retry
-already exists within one unchanged startup scheduling budget. Those independent
-fresh transactions cannot be cached away. Separate existing calls before
-choosing another remedy. Release completion, client recovery, routes, whole30,
+Exact Install release times: driver provenance **106.798ms**, signed-ledger
+validation **942.592ms**, capacity **960.884ms**, worker snapshot **84µs**.
+The validator's driver time is already nested in its enclosing leader interval.
+Its fresh settled-prefix preflight and the separate capacity transaction remain
+mandatory; these durations do not establish their removable fraction or a
+CPU-only cause. The second leader confirmation poll spends **2291.921ms** acquiring
+the host, **131µs** draining and **130.251ms** verifying manifest; the holder and
+its work remain unknown. Source confirms exact terminal-release retry already
+exists within one unchanged startup scheduling budget. Neither that budget's
+monotonic start nor exhaustion is logged. These independent fresh transactions
+cannot be cached away. Original-owner release completion, client recovery, routes, whole30,
 ordinary three-process CLI and M1 remain open. Broader simplifications stay later.
 No fifth tuning candidate or week-cap extension is automatic.
+
+The reviewed proposal removes only repeated changed-candidate slot validation
+from historical release folding. It retains incoming signature-before-retry,
+complete checked request/candidate restrictions, explicit manifest scope/byte/
+position checks and assignment last. The patch lives only in the target evidence
+directory; it is not applied, compiled or measured. Signed differential and
+preservation regressions plus exact portable quiet/scoped evidence are required
+if that further pass is approved. No measured sufficient benefit is promised.
+
+Historical [R52](agent-saga-status.md#completed-r52-registration-validation-pass-retention-release-remains-blocked)
+records lower matching-composition fold medians with distinct signed datasets
+and schedules. It is not a controlled helper-only speedup or recovery pass.
+Generic VM halts and pure observations alone do not qualify general stack safety.
 
 Historical [R51](agent-saga-status.md#completed-r51-audit-and-cold-install-investigation)
 failed after exact local finalization-result handoff at applied availability.
@@ -200,7 +219,7 @@ The architecture review remains [context for the decision](agent-saga-status.md#
 Internal generation attachment precedes public routes, and the older
 unfinished-Create/retired-generation observation cycle has an ordering fix.
 
-Use the completed R52 proof/cost boundaries for the next bounded diagnostic
+Use the completed R53 proof/cost boundaries for the next bounded diagnostic
 or remedy decision. No fifth tuning candidate or cap extension is authorized by
 these measurements.
 Preserve distinct intent, physical application, runtime ACK,

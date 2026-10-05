@@ -37,6 +37,107 @@ deployment is automatic.
 
 ## Current position
 
+### Completed R53 exact terminal-release diagnostics
+
+**Implementation:** diagnostic-only source is frozen at clean
+`e59c702f63560f1d5ecad02f09d3406abbb032b9`. Two independent reviews pass:
+existing driver manifest and signed-ledger calls, capacity, worker snapshot,
+checks, guards, transactions and errors keep their order. Only gated clocks and
+existing release metadata bindings are added. No fifth tuning candidate or
+behavior remedy was applied; guest artifacts/pins and all limits stay unchanged.
+
+**Integration:** portable main/harness pass **420.717s / 487.505s** and strict
+six-file verification **0.101s**. One isolated scoped all-cold attempt fails
+**267.579s**, one test, exhausted noninterrupted owned group. All original
+source/artifact/environment/binary/input/owned-group/before-after fences pass;
+the reviewed finite reader admits **9,237 records / 501 explicit edges / zero
+unknowns**. Its source-defined schema additions and four leader phases pass
+13 accept/31 refusal cases plus privacy/alias checks; independent pure-definition
+review adds 2 accept/7 refusal checks without private execution. Original helpers
+are preserved. No quiet attempt was run on R53; R52's quiet cause remains unknown.
+
+Public Create `id24` recovers an initial release timeout: leader later confirms
+release `id58`, exact owner retry restores the terminal and confirms release
+(e4141/e4148), returning Applied and exact Applied replay (e4158/e4166).
+Pending Install cut and cold entry are verified (e7413/e7434). Install `id147`
+retains invocation/work `id146/id148`, authorization/member `id149/id155`;
+finalization `id171/id172` retains authorization/member `id173/id176`, under
+registration `id174` sequence 5. Root-bound issuer save completes (e8862) after
+exact finalization availability. Source still requires actual Done, exact reply
+validation and durable replay equality; the unkeyed outcome is not assigned by
+adjacency. Both runtime retirements and terminal persistence complete
+(e9127/e9130). Original owner/origin is `id6`, leader `id5`.
+
+Its exact release `id183`, scope `id182`, then times out at the owner after
+12 absent polls at `(49,2)`, **1.906516s** into confirmation (e9210–12), before
+leader proposal (e9221). Unlike R52, the leader later observes that release
+present at `(50,2)` and completes local custody/commit (e9235–37). This confirms
+late leader release, not original-owner completion, routes or client recovery.
+There is no tail attachment ScopeMismatch in this run. No release-authorization
+refusal or missing exact retry loop is demonstrated.
+
+The new exact-metadata-bound timings separate the existing work:
+
+| Release | Driver manifest, ms | Signed ledger validation, ms | Capacity, ms | Worker snapshot, µs |
+| --- | ---: | ---: | ---: | ---: |
+| Create `id58` | 218.882 | 748.481 | 714.546 | 58 |
+| Install `id183` | 106.798 | 942.592 | 960.884 | 84 |
+
+Each metadata identity has one complete leader phase sequence in one exact
+route/node/origin/thread group. Capacity and snapshot brackets use that call's
+source-defined cumulative clock; repeated metadata generally does not identify
+attempts. Driver durations are already inside the enclosing validation interval
+and must not be added to it. Signed-ledger validation and capacity dominate
+admission in these samples; snapshot waits are small. They retain separate fresh
+ledger guards/read transactions; no permission to skip either audit follows.
+Ledger guard acquisition versus internal preflight body remains unsplit here,
+so this is not a CPU-only diagnosis or controlled performance benchmark.
+
+Install's second post-proposal confirmation poll waits **2291.921ms** for the
+host lock (e9232), versus **131µs** drain and **130.251ms** manifest validation
+(e9233–34). It becomes present at cumulative **2587.289ms**. Create shows a similar
+**2242.817ms** host wait. The lock holder and its work remain unidentified;
+unscoped audit rows cannot be assigned by neighboring timestamps or thread.
+Printed wall-clock spacing does not establish the retry wrapper's monotonic
+budget start. No cumulative/subphase clock sums or deadlock claim are made.
+
+Evidence below `target/task-tmp`:
+
+- `r53-cli-build-e59c702f/provenance.json`, SHA
+  `d23c697d011937eb46be2708bb095f3d0658e2e86f908f6eef1fa5595b412d51`.
+  Main/harness SHA
+  `72bfd79b9ffa5b9af6d10d687fda6cb03cab790c60f7c282e9e5693d59301c9c` /
+  `12ce4e2c7200e362edc55c8598934e90e1abf9df7703fb95ef8aee5e33b7ab88`.
+- `r53-pending-all-cold-scoped-e59c702f/exact-release-cost-safe.json`, SHA
+  `903d25f435e935a45ad487355e5a9830a5ddb265d58b27ea5323d47397be5708`.
+  Reviewed reader `r53-exact-release-cost-safe-reader.py`, SHA
+  `030c8fbf13e216ca8a62e4643d4ef95a17d469ada0e75bd40331369e05700c2e`.
+- `r53-release-cost-reader-synthetic-result.json`, SHA
+  `b8f4290ccb21846be203ce07610c0dd1d2824d800c66a00242c6059de7249bdb`.
+
+**Qualification and next decision:** M1 remains blocked at exact original-owner
+terminal-release confirmation and whole30; actual ordinary three-process CLI,
+remaining packaged gates, M2 and local/external M3 remain open. Current evidence
+supports verification and host-ownership pressure, not a required redesign.
+A source-only concrete proposal is retained at
+`task-tmp/r53-release-fold-proposal.patch`, SHA
+`03776b40842b61a0546c09764d9fe2ed4821dd2260fe355347451040b61ad27e`.
+It reuses the inner release fold's just-validated changed candidate slots, keeping
+explicit manifest scope/whole-byte/position checks before assignment. Incoming
+signature-before-retry, old-slot/request/all-member checks and fresh physical
+audits stay untouched. It is not applied, compiled or measured. Its removable
+share and ability to repair either pressure point are unknown. An approved pass
+would require a signed differential against the original checked release path,
+existing release/reopen/corruption preservation regressions, clean portable
+provenance and isolated quiet/scoped measurements. Do not add a provenance-loan
+optimization or combine fresh transactions without separate review/authority.
+Obtain explicit go/no-go direction before a fifth tuning candidate under the
+unchanged engineering-week cap. Broader nonblocking simplifications remain later.
+Implementation/remedy hours and total M1/M2/M3 effort remain unknown; observed
+paired-build **14–35min** and failed-attempt **2.3–6.1min** ranges are only
+medium-confidence attempt-cost guidance. The different failure/progress stages
+explain variance without enlarging scope or promising completion.
+
 ### Completed R52 registration-validation pass; retention release remains blocked
 
 The user replied **"keep going"** to the concrete request for one bounded
@@ -153,7 +254,7 @@ variance; it does not establish a qualified performance benefit.
 
 ### Architecture review and authorized causal diagnostics
 
-R53 is the next diagnostic-only follow-up to R52, within the user's direction
+R53 was the diagnostic-only follow-up to R52, within the user's direction
 to continue investigation before choosing another remedy. Split the already
 existing exact release driver provenance and signed-ledger validation calls,
 and leader release capacity versus worker snapshot. Use only the existing
@@ -162,7 +263,8 @@ add no reads, verification, durable identity, cache or changed guard/transaction
 The current source cannot attribute unscoped audit bodies by proximity. Require
 independent source and finite-reader review, synthetic accept/refuse/privacy
 cases, clean frozen host source, the original portable pair/strict six-file
-provenance, and one isolated scoped all-cold attempt. Admit evidence through all
+provenance, and one isolated scoped all-cold attempt. These checks are complete
+at the source/evidence boundary above. Admit evidence through all
 original exact source/artifact/environment/binary/input/owned-group fences before
 documentation changes. This consumes no new tuning candidate. Source confirms
 saved-terminal release retry already exists on the same held recovery state,
@@ -1929,16 +2031,18 @@ snapshot return and leased comparison remain mandatory.
 
 Remaining release work, in dependency order:
 
-1. Use [completed R52](#completed-r52-registration-validation-pass-retention-release-remains-blocked)
-   and the bounded R53 release diagnostics for the remedy/go-no-go decision.
+1. Use [completed R53](#completed-r53-exact-terminal-release-diagnostics)
+   for the remedy/go-no-go decision, keeping R52's quiet failure separate.
    Public Create and exact replay complete. Cold Install now reaches accepted
    finalization, runtime retirement and terminal persistence; exact retention
-   release times out before leader proposal. Its later attachment refusal is
-   not the cause of the earlier owner timeout. The quiet cause remains unknown.
+   release times out before leader proposal, then the leader confirms the exact
+   release late. Original-owner recovery remains unqualified. R52's later
+   attachment refusal does not explain its earlier owner timeout.
    Registration validation reuse has lower recorded same-composition fold
-   medians, without controlled or sufficient recovery benefit. Split current
-   release provenance/signed-ledger validation and capacity/worker snapshot
-   before selecting another remedy. Independent fresh physical-prefix audits
+   medians, without controlled or sufficient recovery benefit. R53 isolates
+   expensive signed-ledger validation/capacity and later host acquisition;
+   worker snapshots are small in those samples. The host holder and internal
+   preflight contention/body cost remain unknown. Independent fresh physical-prefix audits
    remain mandatory; host/proposal guards alone do not prevent raw Raft progress.
    Obtain explicit go/no-go direction before a fifth tuning candidate or material
    redesign; no week-cap extension follows.
@@ -1952,8 +2056,8 @@ Remaining release work, in dependency order:
    prove exact-request causality or a promised fix. A pass still requires
    cold recovery, routes, fresh Query and whole30;
    build/unit/component passes do not close this gate. Any resumed source change
-   must rebuild portable main/harness with exact provenance. R52 inputs remain
-   bound to clean `92702a09`; later documentation is not execution evidence.
+   must rebuild portable main/harness with exact provenance. R53 inputs remain
+   bound to clean `e59c702f`; later documentation is not execution evidence.
 2. Qualify Local callback recovery under unchanged whole30 and current ordinary
    three-process CLI/HTTP. The genuine child test proves admission, three
    refusals and original retry/release, then exceeds whole30 at a second
@@ -2028,7 +2132,9 @@ Separate forecasts and unknowns:
   restart. R52 main/harness take **425.826s / 491.986s**; quiet/scoped attempts
   fail **262.880s / 209.225s**, with the scoped run reaching terminal persistence
   and then retention-release refusal. The failed-attempt range remains
-  **2.3–6.1min** across different stages,
+  **2.3–6.1min** across different stages. R53 main/harness take
+  **420.717s / 487.505s**; scoped all-cold fails **267.579s** at original-owner
+  release confirmation, with later leader release completion. These are
   not repeated measurements of the same failure or evidence of a benefit.
   These are attempt costs, not success bounds. Source/review time and successful
   cold result, release, routes and whole30 remain unestimated.
