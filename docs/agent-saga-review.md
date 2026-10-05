@@ -102,6 +102,28 @@ Current O3 component evidence (logs under the native worktree's `target`):
 
 ### Current integration delta and blocking result
 
+The latest user direction requests an architectural review and a deeper causal
+diagnostic plan before choosing a local fix or major design change. Three
+independent read-only source audits completed on clean `6a6b9297`; its code is
+unchanged from measured R49 `40a7e553`. No new build, fixture, tuning candidate
+or redesign was executed. Read the
+[architecture review and diagnostic plan](agent-saga-status.md#architecture-review-and-planned-causal-diagnostics)
+in the single live checklist. Source supports repeated proof work in confirmation
+loops, host-instance serialization, hidden directory-inspection/whole-image
+runtime work, and ambiguous inner failure/completion reporting. Their causal
+contribution is unmeasured; no current deadlock or necessary major redesign is
+established. Internal generation attachment precedes public routes, and the old
+unfinished-Create/retired-generation observation cycle has an ordering fix.
+
+Review the exact-family phase/wait graph and fixed refusal taxonomy before any
+fix proposal. Preserve distinct intent, physical application, runtime ACK,
+owner terminal, certified publication and quorum-release authorities. Existing
+notifications may only be wake hints; freshness/corruption checks cannot become
+cross-guard cached permissions. A runtime ABI or ownership redesign requires a
+separate decision and renewed artifact/recovery qualification. Old Local
+management-history inspection remains mandatory; obsolete delegated-read expiry
+wording in its semantic contract has been corrected.
+
 The user-authorized **R49 bounded admission-cost investigation is complete,
 without a recovery pass or performance benefit**. Frozen clean source is
 `40a7e553396e68f6e3eebbea0ed3dc9e2afe0fa2`, including the ownership repair.

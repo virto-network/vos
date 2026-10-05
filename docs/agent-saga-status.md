@@ -37,6 +37,128 @@ deployment is automatic.
 
 ## Current position
 
+### Architecture review and planned causal diagnostics
+
+The latest user direction authorizes a higher-level architectural review and
+planning of deeper diagnostics, followed by a fix decision based on demonstrated
+culprits. Three independent read-only source audits completed on clean
+`6a6b929765638c7fcca12cac4718da1d4cb7a536`. That checkpoint differs from measured
+R49 source `40a7e553` only in the two live documents. No new build, fixture,
+runtime change, tuning candidate or redesign was executed during this review.
+The engineering-week cap, fixed-three scope and all release targets remain.
+
+The main concern is orchestration across distinct sources of durable truth:
+original signed native intent, issuer/controller records, System/Shared Raft
+commands, physically applied runtime results, certified publication, positive
+runtime ACKs, owner terminal records and replicated custody release. They prove
+different facts. A committed command is not an applied guest result; a saved
+terminal is not a confirmed release. Exact retry must finish the missing stage
+without manufacturing a new request or repeating a completed mutation.
+
+Conceptual responsibilities, repeated for several child work items and separate
+System/Shared replication groups, rather than one atomic transaction:
+the owner confirms retention registration before publishing the independent
+native intent. The arrows below show responsibilities, not durable write order.
+
+```mermaid
+flowchart LR
+    C[Original signed client request] --> O[Native owner and exact request]
+    O --> M[Retained signed management work]
+    M --> A[Raft commit and local guest apply]
+    A --> V[Exact result and applied-majority availability]
+    V --> P[Create or Install publication]
+    P --> T[Runtime ACK and durable owner terminal]
+    T --> L[Exact custody release confirmed]
+    L --> R[Confirmed exact client result]
+    O -. current facts .-> Q[ReadIndex and receiver-owned guest observation]
+    Q -. authenticated answer .-> O
+```
+
+Source-established pressure points; their contribution to the failures is not
+yet causally measured:
+
+| Area | Structure and concern | Discriminating evidence |
+| --- | --- | --- |
+| Confirmation waiting | Metadata and forwarded Invoke/ACK loops reacquire the host, drain committed work and verify the full manifest on each poll, followed by a 10ms sleep. The 1.8s window includes that work (`shared_agent.rs:1733`, `management_recovery.rs:840`). | For one exact family: poll count, changed/equal frontier, actual apply count, lock wait, drain and manifest verification durations. |
+| Ownership and scheduling | Routes and per-agent apply threads attached to the same Shared network host share its `Arc<Mutex<SharedAgentHost>>`. Preview and observation callbacks run under host ownership (`shared_agent.rs:865,5836,5867`, `authority_observation.rs:244`). This is host-instance serialization, not a demonstrated global VM lock. | Named host/owner/proposal guard wait and hold times, guard-instance association and worker/apply progress; establish actual sharing in the fixture. |
+| Observation/runtime preparation | Resolving Authority material executes `InspectActors(limit=1)` and authenticates package/schema/policy before the fresh observation starts. Observe executes the runtime and inner actor, returning the unchanged whole opaque image (`shared_journal_driver.rs:2251`, `clean_bootstrap.rs:8715`). | Separate material inspection, image bytes/copies, encoding, context preparation, execution, output decoding and purity checks, including work outside the observation deadline. |
+| Error and completion boundaries | Native controller paths map different validation/coordinator failures to Unavailable. CMR2/NRT1 synchronization precedes confirmed custody release (`clean_operation_controller.rs:1083`, `clean_operation_retirement.rs:190`). | Fixed inner refusal category before the existing mapping; exact last durable/applied phase and release-confirmation state at timeout and later progress. |
+| Startup dependencies | Readonly admission and leased snapshot equality precede System owner, admin, image Local and Shared recovery, then public serving. Shared recovery attaches internal generations before pending Install (`clean_startup.rs:1608`, `clean_genesis_recovery.rs:1742`). | Per-owner internal attachment, awaited phase and whole-attempt duration; require an actual wait-for cycle before claiming architectural deadlock. |
+
+The prior unfinished-Create/fresh retired-generation observation cycle has a
+source correction: finalize and retire unfinished Creates before observing
+retired generations (`clean_bootstrap.rs:5272`). Public routes are not a current
+prerequisite for internal recovery. Neither corrected ordering nor a shared
+mutex proves a new cycle. Runtime code preparation is already cached by exact
+bytes/backend, with the cache guard released before execution; another generic
+code cache is not an evidence-based proposal.
+
+The observation's existing 1.8-second window includes lifecycle/host waits,
+freshness coordination, receiver apply/audit and the entire Observe callback,
+with a deadline check afterward. Directory material inspection precedes that
+window. Both parts count toward the enclosing operation's latency and need
+separate measurements; the internal deadline does not bound work before it.
+
+The replacement analogy is precise: observations never needed mutation custody,
+retained results or ACK, so that lifecycle was deleted. Mutations still need
+those facts. The strongest candidate area for simplification is how the host
+waits for, derives and confirms progress, followed by avoidable opaque-image
+copy/preparation work. No current evidence establishes that durable authority,
+quorum or runtime ABI must be redesigned.
+
+The next diagnostic session is planned, not executed:
+
+1. Follow one **exact original public Shared Create family** through the existing
+   packaged all-cold selector. Preserve its ordinary CLI request and every
+   original signed child/member. First distinguish Create preparation from the
+   later pending-Install cut and cold startup; entry into a selector is not
+   proof that its fault/recovery stage occurred.
+   Label pre-retention discovery/signing separately; do not invent an exact
+   signed-request identity before the first request is actually retained.
+2. Bind events internally with existing full canonical route/generation,
+   request/work/authorization and registration/member commitments. Abbreviated
+   Debug IDs are insufficient. Export only session-local aliases, fixed node
+   roles/phases, attempt ordinals, bounded counts/durations and closed statuses;
+   no underlying identities, credentials, request/state bytes or raw memory.
+   No new wire correlation, durable trace state or diagnostic framework.
+3. Add only missing markers under existing scoped diagnostics. Separate queue
+   and named guard waits, worker snapshot/proposal waits, actual application,
+   fresh audit, manifest decode/signature/evidence work, inspection, preview,
+   commit, local confirmation, applied-majority availability and terminal release.
+   Log a closed refusal cause before existing Unavailable mappings. Distinguish
+   repeated checking without state progress from checking after real progress.
+   Comparisons are diagnostic only; all current checks still execute.
+4. Review the instrumentation and finite reader independently, freeze clean
+   source, then build the portable main/harness with original artifact/binary
+   and six-file provenance. Initial measurement scope is one quiet run and,
+   if needed, one focused run of the same exact selector, sequentially with
+   original owned cleanup, disk-backed evidence and unchanged flags/bounds.
+   No heavy parallel build/fixture, guest alteration or private input capture.
+5. Admit only exact completed-run evidence with source, artifact, binary,
+   one-test, original environment, owned-group and before/after input fences.
+   Correlate causal message/commit identities and per-owner durations; avoid
+   treating interleaved timestamps as one request's latency. A shifted scoped
+   failure stage cannot retrospectively explain the quiet stage. Unknown or
+   missing correlation/status remains explicit and grants no qualification.
+6. Produce an exact-family phase/wait graph and a culprit verdict: deterministic
+   refusal, costly host preparation/execution, polling amplification, delayed
+   local apply/availability, or a proved dependency cycle. If unresolved, report
+   the failed discrimination and remaining unknown before expanding the session.
+   No fourth tuning candidate or cap extension follows automatically.
+
+Fix classification after that verdict:
+
+| Class | Evidence threshold and candidate boundary |
+| --- | --- |
+| Local defect | An exact wrong transition/mapping/notification, unnecessary copy, or immutable check dominated inside one uninterrupted call. Correct that demonstrated defect with existing mechanisms and focused preservation checks. |
+| Bounded internal simplification | Repeated waiting/proof reconstruction dominates despite unchanged relevant state. Consider existing apply notifications as wake hints followed by fresh proof, clearer derived phase ownership from existing records, or a call-scoped verified context. No new journal, authority, cross-guard proof cache or public Busy expansion. |
+| Major design decision | A witnessed progress cycle, unavoidable broad serialization, or whole-image work that defeats existing bounds after local causes are excluded. Assess narrower ownership or runtime representation changes separately with explicit scope, trust/crash proof, artifact reproduction and qualification costs. No quorum redesign, merged durable authorities, native Authority oracle or remote-answer trust shortcut. |
+
+M1 remains blocked. Implementation remediation effort is unknown until the
+culprit is established. Recent portable rebuilds cost 14–16 minutes and failed
+selector attempts 2.3–5.7 minutes; these are historical attempt costs, not a new
+diagnostic-session or milestone ETA. M2/M3 and external hardware gates stay open.
+
 ### Completed R49 bounded admission-cost investigation
 
 The user-authorized investigation is **complete, without a recovery pass or
@@ -1432,8 +1554,12 @@ snapshot return and leased comparison remain mandatory.
 
 Remaining release work, in dependency order:
 
-1. Obtain explicit go/no-go direction before another tuning candidate. The
-   bounded R49 cost investigation is complete on frozen `40a7e553`; portable
+1. Use the newly requested architecture review and planned exact-family causal
+   diagnostics to establish the culprit before deciding a local fix or a larger
+   design change. Read-only review is complete on `6a6b9297`; the diagnostic
+   execution plan is above. Obtain explicit go/no-go direction before another
+   tuning candidate or material redesign. The bounded R49 cost investigation
+   is complete on frozen `40a7e553`; portable
    binaries include the ownership repair, but the quiet selector fails Shared
    startup recovery and the scoped run fails public Create before the cut.
    The eligible immutable duplicate-validation helper is unmeasured and does

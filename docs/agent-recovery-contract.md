@@ -82,6 +82,9 @@ deployable runtime; preserve the independent normal custom runtime as the public
 contract example. Shared replay and broader release acceptance retain their own
 gates and cannot be qualified by this Local recovery contract alone.
 
-Host-side quorum expiry of a delegated read is separate recovery metadata. It
-does not fabricate a guest result or alter this management-history ABI contract;
-its integration and qualification status belong to the live checklist.
+Internal Authority reads now use receiver-owned, non-retaining observations;
+the delegated-read registration and expiry lifecycle is removed on the supported
+fresh-space path. That replacement is separate from the Local management-history
+guest/host recovery comparison described here, which remains mandatory. Ordinary
+public actor Query retains Invoke/ACK semantics. Current integration and release
+qualification belong to the live checklist.
