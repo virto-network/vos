@@ -102,20 +102,52 @@ Current O3 component evidence (logs under the native worktree's `target`):
 
 ### Current integration delta and blocking result
 
-The user authorized one bounded diagnostic continuation after the two-pass
-boundary: identify the pre-cut preparation refusal, preserve the original
-signed Install/call/package and held lifecycle, then run the existing scoped
-all-cold fixture once. Source review locates the observed refusal in fresh
-predecessor Create revalidation, before Install pledge/retention; guest Done
-alone does not select the later refusing guard. The provisional fixture retries
-only native Unavailable under its unchanged 120s absolute setup deadline, with
-pre/post checks. Refusal-only observation diagnostics expose fixed phase and
-elapsed time, without identifiers or payloads. Receipt cut, whole30, production
-guards and coherent guest pins remain unchanged. This is diagnosis, not a third
-tuning candidate or qualification pass; no further tuning or cap extension is
-authorized. A fresh reviewed source/binary boundary is required before the run.
+The one user-authorized bounded diagnostic continuation is **completed, not
+qualified** on clean source `e168c39d7db42997f159b17ff0b691bb2d37b596`.
+Independent source reviews preserve the same held lifecycle, original signed
+Install/call/package, native Unavailable-only setup retry and unchanged 120s
+pre/post deadline. Fixed observation refusal diagnostics add no guard, state,
+cache, deadline or payload change. Portable main/harness **pass 428.434s /
+506.520s**; strict six-file verification **passes 0.101s**. Main is `d83eec90`,
+harness `ead0723c`; provenance is `task-tmp/r47-cli-build-e168c39d/provenance.json`,
+SHA-256 `6b7f9dfd75e7195af75549dc071096e9fef8daf97a656575dd9c405ea0cf83b9`.
+Clean source, empty RUSTFLAGS/unset overrides, exact frozen binaries/artifact
+inputs and exhausted owned groups are checked. Guest bytes/pins are unchanged.
 
-Latest completed portable source is frozen at
+The single scoped all-cold run **fails 294.324s**, with one executed test and
+owned group gone. Preparation succeeds on attempt **one**: this does not
+reproduce the prior pre-cut refusal or exercise retry. Receipt-stage assertions
+are followed by the three cold constructors (seven total startup records).
+Cold durable Install and issuer observations complete. The first recorded
+cold finalization failure is `extend_management_pending -> Unavailable`, before
+Invoke; the next extension also refuses, then a later extension completes and
+finalization Invoke returns Unavailable before an outcome is recorded. This
+locates call boundaries, not their inner causes, node association, a cold guest
+outcome or the earlier quiet failure. Recovery, routes, fresh Query and whole30
+remain unqualified. Existing finalization/transfer readers report **28 / 84
+fixed events**, each **zero unknown**, with all evidence fences preserved.
+
+The supplemental reader reports **nine events / zero unknown**: one ready
+preparation and eight **post-execution deadline** refusals at **1.830756–2.076408s**
+against unchanged **1.8s**. Elapsed time covers the whole observation, not only
+guest execution. Those labels attribute only their own refusals;
+interleaved aggregate events cannot establish cold finalization causality or a
+performance-only cause. The v1 supplemental reader refused its own erroneous
+boolean expectation for r43's exact test-count dictionary. Its independently
+reviewed v2 corrects only that schema comparison, preserving the original file,
+all fences and private finite exports. No fixture rerun follows that correction.
+Evidence is `task-tmp/r47-pending-all-cold-scoped-e168c39d`; safe summary,
+finalization, transfer and guard artifact SHA-256s are respectively
+`83186539b2c70aa93039961f849f9e8ca39fd0efc60c9b6a1da63a308c69c21a`,
+`b6d47e935af6b75a726048af36fa3ed5c09e79f418ec9b6c5ceb9926386c8d0a`,
+`b311a442e7fb4109c859f7129542720fbae33c28209df7cad1c5eb7cbd29bd7d`,
+`0d9704a4a28b27064bc14a172ff895de821844f4f92ff6ff9956fe88330f5286`.
+No raw memory or new private-input collection was used; normal approval review
+accepted this continuation. Debug timing is attribution only. This is not a
+third tuning pass, cap extension, benefit credit or M1 exit. Further tuning
+still requires go/no-go direction after the two failed measured passes.
+
+Previous completed portable source is frozen at
 `76b3f7232e423a666f1240a4611f54a2fd732fef`, including the Local correction and
 guarded custody Invoke/ACK manifest reuse. Portable main/harness **pass
 389.506s / 459.188s**; strict six-file verification **passes 0.101s**.
@@ -1105,6 +1137,19 @@ signed query authentication and pure handlers). Existing ReadIndex is in
 `support/vos-raft/src/worker.rs`; the global ABI/mutation wire is unchanged.
 
 ### Completed deletion inventory to verify in the final diff
+
+The source audit against the reviewer boundary `e6f2bb45` confirms removal of
+13 read-specific production types, nine read transport variants, two Raft
+commands and three live read-record formats. Read coordination now has the
+barrier request/reply pair. Remaining read-error categories, management
+Register/Release and public Invoke/ACK are intentional preserved mechanisms.
+This demonstrates a smaller persistent protocol/recovery surface; the overall
+branch grew with other implementation, integration and tests, and the combined
+`8128e677` checkpoint cannot isolate replacement-only net line reduction.
+The physical observation fixture verifies 40 distinct no-ACK observations leave
+retained state unchanged, and a caught-up observation performs one fresh audit
+instead of two. There is no matched old-read/new-observation latency or
+throughput benchmark, so no end-to-end speedup or service benefit is claimed.
 
 | Boundary | Removed internal-read path | Must remain / implementation trap |
 | --- | --- | --- |
