@@ -112,9 +112,18 @@ A subsequent seven-line preservation repair restores the original post-worker-
 snapshot live lease/Agent check before selecting any retained custody capsule.
 Two independent source reviews pass. It uses the existing verified-manifest
 selector, without another audit, changed admission rule or cross-guard cache.
-This repair is pending a fresh core build and two existing ownership regression
-checks; the measured R48 portable binaries precede it. It is a correctness
-preservation repair, not another service-tuning candidate.
+The repair is frozen at `64c7f528d7463ede73fc5e013e49d28327b610a5`:
+fresh core build **passes 24.827s** and both existing ownership regressions
+**pass 0.101s each**, with clean exact source/binary/artifact fences and exhausted
+owned groups. These tests cover root replacement/quarantine and pinned root
+identity, not combined custody timing. Core provenance:
+`task-tmp/r48-lease-core-build-64c7f528/provenance.json`, SHA-256
+`fd4b570054410d6139cb7cfb466ffb133f448d5639190ebbba65402c5ae8121f`;
+`task-tmp/r48-lease-units-64c7f528/safe-summary.json`, SHA-256
+`c3aecf87da381a86dc61a13df88298f1a2e7dc82e68269c998eff998df186a2d`.
+Measured R48 portable binaries precede the repair; current portable/recovery
+qualification is open. This is a correctness preservation repair, not another
+service-tuning candidate.
 
 R48 reads the completed R47 logs without rerunning a fixture. Its independently
 reviewed finite reader reports **689 events / eight temporal intervals / zero
@@ -291,8 +300,9 @@ Debug timing supplies attribution only, not quiet qualification.
 
 **Both measured tuning passes are consumed and failed to qualify recovery.**
 No benefit, performance-only cause, global guest-stack resolution or M1 exit is
-claimed. The existing two-pass gate requires go/no-go direction before further
-tuning; no third tuning change, deadline increase or cap extension is authorized.
+claimed. At that preceding boundary, the two-pass gate required renewed
+direction: a third change had not yet been authorized. R48's later explicit
+renewal is recorded in the current position; deadlines and cap remain unchanged.
 Current ordinary CLI, remaining packaged gates, full native NRT1 retry/reopen,
 Local whole30/remaining negatives, M2 and M3 remain open.
 
@@ -741,9 +751,9 @@ bare-intent refusal. The corrected ordinary Query predicate remains unreached.
 Earlier `19e8d051` quiet/scoped cold runs **fail 243.961s / 201.317s**. Scoped observation,
 guest finalization, issuer save and handoff succeed before retirement ACK
 confirmation times out. Peer reaches preparation start; no completion/late
-commit or whole30/fresh Query pass follows. Review only the approved same-guard
-immutable-manifest reuse seam, retaining fresh absence/physical/common-closure
-and worker checks. Earlier returning/pre-cut evidence stays frozen.
+commit or whole30/fresh Query pass follows. The resulting candidate reviewed only
+the approved same-guard immutable-manifest reuse seam, retaining fresh
+absence/physical/common-closure and worker checks. Earlier returning/pre-cut evidence stays frozen.
 Recorded portable costs **391.198s / 449.955s** are high-confidence facts at
 clean `19e8d051`: **14.0 minutes** combined, versus preceding `941b3d3c`
 **14.2 minutes** and fixture-only **7.4 minutes**, without scope expansion.

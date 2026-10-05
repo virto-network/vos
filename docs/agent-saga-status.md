@@ -47,9 +47,18 @@ A subsequent seven-line preservation repair restores the original post-worker-
 snapshot live lease/Agent check before selecting any retained custody capsule.
 Two independent source reviews pass. It uses the existing verified-manifest
 selector, without another audit, changed admission rule or cross-guard cache.
-This repair is pending a fresh core build and two existing ownership regression
-checks; the measured R48 portable binaries precede it. It is a correctness
-preservation repair, not another service-tuning candidate.
+The repair is frozen at `64c7f528d7463ede73fc5e013e49d28327b610a5`:
+fresh core build **passes 24.827s** and both existing ownership regressions
+**pass 0.101s each**, with clean exact source/binary/artifact fences and exhausted
+owned groups. These tests cover root replacement/quarantine and pinned root
+identity, not combined custody timing. Core provenance:
+`task-tmp/r48-lease-core-build-64c7f528/provenance.json`, SHA-256
+`fd4b570054410d6139cb7cfb466ffb133f448d5639190ebbba65402c5ae8121f`;
+`task-tmp/r48-lease-units-64c7f528/safe-summary.json`, SHA-256
+`c3aecf87da381a86dc61a13df88298f1a2e7dc82e68269c998eff998df186a2d`.
+Measured R48 portable binaries precede the repair; current portable/recovery
+qualification is open. This is a correctness preservation repair, not another
+service-tuning candidate.
 
 R48 reads the completed R47 logs without rerunning a fixture. Its independently
 reviewed finite reader reports **689 events / eight temporal intervals / zero
@@ -226,8 +235,9 @@ Debug timing supplies attribution only, not quiet qualification.
 
 **Both measured tuning passes are consumed and failed to qualify recovery.**
 No benefit, performance-only cause, global guest-stack resolution or M1 exit is
-claimed. The existing two-pass gate requires go/no-go direction before further
-tuning; no third tuning change, deadline increase or cap extension is authorized.
+claimed. At that preceding boundary, the two-pass gate required renewed
+direction: a third change had not yet been authorized. R48's later explicit
+renewal is recorded in the current position; deadlines and cap remain unchanged.
 Current ordinary CLI, remaining packaged gates, full native NRT1 retry/reopen,
 Local whole30/remaining negatives, M2 and M3 remain open.
 
@@ -861,9 +871,9 @@ The active diff closes demonstrated M1 defects, not new capabilities:
   calls take **0.186–0.371s**; total coordination/apply/guard time is not yet
   attributed. Custody timeout followed by later commit does not establish admin
   finalization or terminal release. Lost mutation response/reopen remain
-  unreached. Temporary scoped guard diagnostics will distinguish the actual
+  unreached. Temporary scoped guard diagnostics were added to distinguish the
   freshness refusal without changing guard order, ownership or the **1.8s**
-  observation bound; remove them after attribution. Log:
+  observation bound; their later removal is recorded below. Log:
   `release-observation-o3-packaged-public-outcomes-r39m.log`.
 - Scoped guard harness R39n builds from clean `32b12b0b` **passes 7m06s**.
   Public R39o **fails 369.77s** at the same Operator role-grant 120s retry cap
@@ -923,8 +933,8 @@ The active diff closes demonstrated M1 defects, not new capabilities:
   **fails 51.92s** before retry admission, waiting for exact registration commit
   under the unchanged whole 30s bound. Its cause is not established by that
   quiet log. Reconnecting both shorter-log peers can legitimately lose an
-  uncommitted proposal; the fixture will reconnect the original plus one peer
-  until exact commit, then restore the third, with checked cleanup and no bound
+  uncommitted proposal; the fixture was corrected to reconnect the original plus
+  one peer until exact commit, then restore the third, with checked cleanup and no bound
   change. Cold missing-journal and complete-family negatives remain pending.
   These are component passes, not M1 or released-workflow qualification. Logs:
   `release-observation-o3-admin-live-attempt-core-{build,provenance}-r39t.*`,
@@ -1317,8 +1327,8 @@ snapshot return and leased comparison remain mandatory.
 
 Remaining release work, in dependency order:
 
-1. Finish fresh core/ownership checks and freeze the reviewed lease restoration.
-   R48's explicitly authorized third measured candidate has failed quiet and
+1. The lease restoration is frozen and passes core/ownership checks; current
+   portable integration remains open. R48's third measured candidate failed quiet and
    scoped all-cold recovery; report that evidence and obtain go/no-go direction
    before another service-tuning change, without an automatic week-cap extension.
    Source review rules out a missing caller retry: existing same-held recovery
@@ -1477,10 +1487,10 @@ Separate forecasts and unknowns:
 
 The narrow ACK immutable-manifest reuse delta above is compiled; its first
 measured cold runs fail before the optimized ACK branch. That first-pass evidence
-identifies forwarded finalization Invoke custody confirmation delay; the latest
-quiet run's inner cold failure remains unknown.
-The second/final candidate is reviewed, portable built and measured; quiet
-all-cold recovery fails and its scoped rerun fails before the receipt cut.
+identifies forwarded finalization Invoke custody confirmation delay; that
+first-pass quiet run's inner cold failure remains unknown.
+The original second candidate was reviewed, portable built and measured; quiet
+all-cold recovery failed and its preceding scoped rerun failed before the receipt cut.
 Every Invoke preparation, fresh absence and physical availability check remains
 mandatory. The
 separate retained-result availability seam and full audited-view reuse remain
