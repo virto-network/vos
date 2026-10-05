@@ -37,6 +37,19 @@ deployment is automatic.
 
 ## Current position
 
+The user authorized one bounded diagnostic continuation after the two-pass
+boundary: identify the pre-cut preparation refusal, preserve the original
+signed Install/call/package and held lifecycle, then run the existing scoped
+all-cold fixture once. Source review locates the observed refusal in fresh
+predecessor Create revalidation, before Install pledge/retention; guest Done
+alone does not select the later refusing guard. The provisional fixture retries
+only native Unavailable under its unchanged 120s absolute setup deadline, with
+pre/post checks. Refusal-only observation diagnostics expose fixed phase and
+elapsed time, without identifiers or payloads. Receipt cut, whole30, production
+guards and coherent guest pins remain unchanged. This is diagnosis, not a third
+tuning candidate or qualification pass; no further tuning or cap extension is
+authorized. A fresh reviewed source/binary boundary is required before the run.
+
 Latest completed portable source is frozen at
 `76b3f7232e423a666f1240a4611f54a2fd732fef`, including the Local correction and
 guarded custody Invoke/ACK manifest reuse. Portable main/harness **pass
@@ -1163,8 +1176,10 @@ snapshot return and leased comparison remain mandatory.
 
 Remaining release work, in dependency order:
 
-1. Obtain the required go/no-go direction at the exhausted two-pass boundary
-   before further tuning or qualification launches. Portable main/harness on
+1. Complete the one user-authorized bounded diagnostic continuation described
+   above, then report its first failing recovery phase or remaining setup
+   blocker. Further tuning still requires go/no-go direction at the exhausted
+   two-pass boundary. Portable main/harness on
    `76b3f723` pass **389.506s / 459.188s**, strict six-file verification
    passes **0.101s**, with clean source, exact artifacts/copies and owned groups gone.
    Final quiet all-cold fails **223.845s** during replica 0 cold Shared recovery

@@ -304,17 +304,29 @@ impl SharedAgentNetworkHost {
                 return Err(SharedAgentHostError::Unavailable);
             }
             host.validate_observation_owner(agent)?;
-            let outcome = observe(&host)?;
+            let refused = |phase: &'static str, error| {
+                if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                    tracing::debug!(phase, elapsed_us = started.elapsed().as_micros(),
+                        "Authority observation terminal guard refused");
+                }
+                error
+            };
+            let outcome = observe(&host).map_err(|error| refused("callback", error))?;
             // Guest execution is bounded separately. A changed leader or
             // configuration during it discards this observation; no durable
             // query/result has been created and no cleanup proof is needed.
             let current = worker
                 .cached_snapshot()
-                .ok_or(SharedAgentHostError::Unavailable)?;
-            observation_term_matches(&current, &attached.fingerprint, local, barrier)?;
-            host.validate_observation_owner(agent)?;
-            if attached.stale.load(Ordering::Acquire) || Instant::now() >= deadline {
-                return Err(SharedAgentHostError::Unavailable);
+                .ok_or_else(|| refused("snapshot", SharedAgentHostError::Unavailable))?;
+            observation_term_matches(&current, &attached.fingerprint, local, barrier)
+                .map_err(|error| refused("term_config", error))?;
+            host.validate_observation_owner(agent)
+                .map_err(|error| refused("owner", error))?;
+            if attached.stale.load(Ordering::Acquire) {
+                return Err(refused("stale", SharedAgentHostError::Unavailable));
+            }
+            if Instant::now() >= deadline {
+                return Err(refused("deadline", SharedAgentHostError::Unavailable));
             }
             return Ok(outcome);
         }

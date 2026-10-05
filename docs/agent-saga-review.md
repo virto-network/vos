@@ -102,6 +102,19 @@ Current O3 component evidence (logs under the native worktree's `target`):
 
 ### Current integration delta and blocking result
 
+The user authorized one bounded diagnostic continuation after the two-pass
+boundary: identify the pre-cut preparation refusal, preserve the original
+signed Install/call/package and held lifecycle, then run the existing scoped
+all-cold fixture once. Source review locates the observed refusal in fresh
+predecessor Create revalidation, before Install pledge/retention; guest Done
+alone does not select the later refusing guard. The provisional fixture retries
+only native Unavailable under its unchanged 120s absolute setup deadline, with
+pre/post checks. Refusal-only observation diagnostics expose fixed phase and
+elapsed time, without identifiers or payloads. Receipt cut, whole30, production
+guards and coherent guest pins remain unchanged. This is diagnosis, not a third
+tuning candidate or qualification pass; no further tuning or cap extension is
+authorized. A fresh reviewed source/binary boundary is required before the run.
+
 Latest completed portable source is frozen at
 `76b3f7232e423a666f1240a4611f54a2fd732fef`, including the Local correction and
 guarded custody Invoke/ACK manifest reuse. Portable main/harness **pass

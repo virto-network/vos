@@ -156,14 +156,37 @@ pub(super) fn exercise(
     // The cut and unchanged journal assertion precede actor Install. Returning
     // role verification follows normal production attachment below; all-cold
     // recovery may elect fresh roles instead of inheriting this warm leader.
-    lifecycle
-        .prepare_shared_install(
+    // Revalidate the predecessor Create through the normal fresh observation.
+    // Retry only its native availability refusal, under the original setup
+    // deadline and the same held owner and immutable signed Install inputs.
+    let diagnostics = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some();
+    let mut prepare_attempt = 0u32;
+    loop {
+        check_setup();
+        prepare_attempt += 1;
+        let result = lifecycle.prepare_shared_install(
             submission.install().clone(),
             submission.call().clone(),
             submission.package(),
-        )
-        .expect("retain the original actual signed Install");
-    check_setup();
+        );
+        check_setup();
+        if diagnostics {
+            let status = match &result {
+                Ok(()) => "ready",
+                Err(SharedAgentHostError::Unavailable) => "unavailable",
+                Err(_) => "fatal",
+            };
+            tracing::debug!(attempt = prepare_attempt, status,
+                "Pending Install exact preparation attempt completed");
+        }
+        match result {
+            Ok(()) => break,
+            Err(SharedAgentHostError::Unavailable) => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            other => other.expect("retain the original actual signed Install"),
+        }
+    }
     let ordinary_root = ctx.data[0]
         .join(SHARED_AGENT_HOST_DIRECTORY)
         .join(format!("{}.agent", hex::encode(agent.0)));
