@@ -803,6 +803,11 @@ pub(super) fn retain_install_for_test(
     node_public: [u8; 32],
     agent: AgentId,
     package: AdmittedActorPackage,
+    discover: impl FnOnce(
+        &Path,
+        SocketAddr,
+        AuthorityActorTarget,
+    ) -> anyhow::Result<(AgentDescriptor, NonZeroU64)>,
 ) -> anyhow::Result<(PathBuf, SharedInstallSubmission)> {
     let identity = CleanOperatorIdentitySigner::new(operator)?;
     let authority = authority(data, operator, space, node_public)?;
@@ -832,14 +837,10 @@ pub(super) fn retain_install_for_test(
         None,
         &package,
     )?;
-    let (credential, sequence) = super::local_create::discover_credential(
-        &operation.join("query"),
-        address,
-        operator,
-        authority,
-    )?;
-    let descriptor =
-        super::local_install::discover_agent(address, operator, authority, credential.head, agent)?;
+    // The fixture may retry only these normal discovery reads while this
+    // original credential reservation, nonce and query path remain held.
+    // Signing and immutable SIQ1 publication below still run exactly once.
+    let (descriptor, sequence) = discover(&operation.join("query"), address, authority)?;
     let (valid_from, expires_at) = window()?;
     let submission = prepare_install(
         operator,

@@ -82,14 +82,24 @@ pub(super) fn exercise(
         return;
     }
     assert!(retained.is_none());
+    let setup_deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let check_setup = || {
+        assert!(
+            std::time::Instant::now() < setup_deadline,
+            "pending Install preparation/receipt cut exceeded its existing 120s setup bound"
+        );
+    };
+    check_setup();
     let package_path =
         PathBuf::from(std::env::var_os("CLERK_AGENT_PACKAGE").expect("real signed Clerk package"));
     let package =
         vos::agent::package_admission::admit_actor_package(&std::fs::read(package_path).unwrap())
             .unwrap();
     assert_eq!(package.manifest().name, "clerk-ledger");
+    check_setup();
     let agent = AgentId(ctx.archive.provision().proposal().locator().agent.0);
     let address = member_workflow::listen(&mut ctx.nodes[0], "cold-install-signing");
+    check_setup();
     let (request_root, submission) = commands::shared_operation::retain_install_for_test(
         &ctx.data[0],
         address,
@@ -98,22 +108,54 @@ pub(super) fn exercise(
         raw_public_key(&ctx.daemons[0]).unwrap(),
         agent,
         package,
+        |query_root, query_address, authority| {
+            Ok(member_handoff::retry_exact_until(
+                "pending Shared Install credential/descriptor discovery",
+                setup_deadline,
+                || {
+                    let (credential, sequence) = commands::local_create::discover_credential(
+                        query_root,
+                        query_address,
+                        ctx.operator,
+                        authority,
+                    )?;
+                    let descriptor = commands::local_install::discover_agent(
+                        query_address,
+                        ctx.operator,
+                        authority,
+                        credential.head,
+                        agent,
+                    )?;
+                    Ok((descriptor, sequence))
+                },
+            ))
+        },
     )
     .expect("actual CLI discovery, signing, reservation and immutable SIQ1 publication");
+    check_setup();
     assert!(submission.call().authenticated_node.is_none());
     assert_eq!(submission.call().authority, ctx.authority);
     let request = submission.encode();
 
     // Fault setup alone calls native completion. After this cut, recovery is
     // exclusively the locked constructor, production attachment and public retry.
+    check_setup();
     let original = std::mem::replace(&mut ctx.nodes[0], VosNode::new());
     original.shutdown();
     original
         .collect_checked()
         .expect("issuer lease retirement before fault setup");
+    check_setup();
     let leader = member_workflow::peer_leader(ctx.networks, ctx.enrollments, ctx.archive);
+    check_setup();
     let (_, mut lifecycle) = ctx.open_origin();
-    member_workflow::returned_follower(ctx.networks, ctx.enrollments, ctx.archive, leader);
+    check_setup();
+    // Physical reopening precedes ordinary Shared protocol attachment. Keep
+    // this raw leased lifecycle only for the real issuer receipt cut; its
+    // normal authorization path refreshes transport before signing a receipt.
+    // The cut and unchanged journal assertion precede actor Install. Returning
+    // role verification follows normal production attachment below; all-cold
+    // recovery may elect fresh roles instead of inheriting this warm leader.
     lifecycle
         .prepare_shared_install(
             submission.install().clone(),
@@ -121,6 +163,7 @@ pub(super) fn exercise(
             submission.package(),
         )
         .expect("retain the original actual signed Install");
+    check_setup();
     let ordinary_root = ctx.data[0]
         .join(SHARED_AGENT_HOST_DIRECTORY)
         .join(format!("{}.agent", hex::encode(agent.0)));
@@ -132,11 +175,14 @@ pub(super) fn exercise(
     let issuer_root = ctx.data[0]
         .join(commands::clean_store::SHARED_LIFECYCLE_DIRECTORY)
         .join(hex::encode(agent.0));
+    check_setup();
     let fault = commands::clean_store::SharedManagementStageFault::issuer(&issuer_root, 2);
-    let setup_deadline = std::time::Instant::now() + Duration::from_secs(120);
+    check_setup();
     loop {
+        check_setup();
         let result =
             lifecycle.complete_shared_install(ctx.archive.provision().proposal().locator());
+        check_setup();
         if fault.fired() {
             assert!(matches!(result, Err(SharedAgentHostError::Unavailable)));
             break;
@@ -145,12 +191,9 @@ pub(super) fn exercise(
             matches!(result, Err(SharedAgentHostError::Unavailable)),
             "pre-cut completion must remain transient, not apply or reinterpret failure: {result:?}",
         );
-        assert!(
-            std::time::Instant::now() < setup_deadline,
-            "real issuer receipt cut not reached"
-        );
         std::thread::sleep(Duration::from_millis(10));
     }
+    check_setup();
     assert!(issuer_root.join("shared-management.issuer.next").is_file());
     assert_eq!(
         journal_files(&ordinary_root),
@@ -164,6 +207,7 @@ pub(super) fn exercise(
     drop(client);
     drop(fault);
     drop(lifecycle);
+    check_setup();
     let mut saved = RetainedColdInstall {
         request_root,
         request,

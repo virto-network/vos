@@ -102,20 +102,25 @@ Current O3 component evidence (logs under the native worktree's `target`):
 
 ### Current integration delta and blocking result
 
-Latest measured portable/diagnostic source is frozen at
-`5750f0c222880b01be7e9caae697403af85e810f`, with production recovery correction
-`f9c61863`, qualified journal/family tests and temporary existing-flag diagnostics.
-Portable main/harness **pass 391.697s / 453.055s** with empty RUSTFLAGS and
-encoded/target overrides unset; current main strict six-file verification
-**passes 0.101s**. Exact copied hashes, clean source before/after, commands and
-owned-group completion are in `task-tmp/r41-cli-build-5750f0c2/provenance.json`.
-Authority, Catalog, both runtime roles and coherent guest pins are unchanged.
-Component/packaging passes do not close M1.
+Latest measured portable source is frozen at
+`fcac175a79d43ab9268f66a008f68ce3fbb44f57`; production recovery correction
+remains `f9c61863`, with qualified journal/family tests, temporary existing-flag
+native diagnostics and the reviewed one-line empty Query assertion correction.
+Portable main/harness **pass 192.698s / 245.354s**; main strict six-file
+verification **passes 0.101s**. Main/harness hashes are identical to the measured
+`5750f0c2` binaries. Empty RUSTFLAGS, unset encoded/target overrides, exact
+copied hashes, clean source before/after and owned-group completion are recorded
+in `task-tmp/r42-cli-build-fcac175a/provenance.json`.
+Authority, Catalog, both runtime roles and coherent guest pins remain unchanged.
+Typed retained-client regressions remain component-qualified.
+Implementation/component and packaging passes do not close integration or M1.
 
-Current quiet/scoped public runs **fail 412.139s / 366.996s** at the unchanged
+Latest completed quiet/scoped public runs on `5750f0c2` **fail
+412.139s / 366.996s** at the unchanged
 **120s** bootstrap issuance correctness cap on **`/__agents/authorize` HTTP 503**,
 after verified nonleader Install **105.444s / 109.102s** respectively. Both are one
-executed failing test with owned group gone; later gates are not run. The initial
+executed failing test with owned group gone; later gates were not run at that
+boundary. The initial
 same-source diagnostic **fails 429.670s** on **`/__agents/credential`** before
 native phases; keep that unattributed failure. Earlier `3b72eab6` failures stay
 frozen without any intervening public qualification pass.
@@ -156,23 +161,65 @@ backend/profile/stack settings; timing is diagnostic only, not quiet,
 ordinary-default or SLA evidence. Remove them after attribution.
 The other four selectors, ordinary CLI acceptance and M1/M2/M3 remain open.
 
-Actual ordinary three-process CLI on recorded `5750f0c2` **fails 101.711s** at a
-script assertion after successful Local Query. First-ready stage **10.274s**,
-Local Create **13.839s**, Install **27.630s**, Query **46.307s**/exit 0: verified
-issued, delivery-retired, Done and direct value `"0x"`. Clerk `journal_id`
-returns `Vec<u8>`; `local_call` decodes Bytes to direct hex, while the script
-expected `{"Ok":"0x"}`. Shared is not reached. Cleanup **passes 0.941s** with three
-launch records, zero matching survivors and all source/artifact fences passing.
-Private ordinary-run evidence remains at `task-tmp/r42-current-actual-cli-5750f0c2`.
-Stage costs do not qualify whole recovery, SLA or the complete workflow.
+Current ordinary three-process CLI on clean `fcac175a` **fails 208.524s**
+before Local Query or Shared. First-ready **passes 9.338s**; Local Create
+**passes 26.178s**, with an initial HTTP 503 and successful second exact retained
+attempt. Local Install makes **125 attempts**, spanning **169.760s** before the
+unchanged **180s** command budget has less than its existing ten-second
+termination grace remaining. All attempts return HTTP 503; the production
+Install warnings classify the first **three Lifecycle(Unavailable)** and next
+**122 Lifecycle(ScopeMismatch)**. The ScopeMismatch substage and underlying
+cause remain unattributed: these statuses establish neither a source defect,
+stack failure nor performance-only cause. Graceful cleanup **passes 0.318s**,
+three recorded launches/zero matching survivors, owned group gone and all
+source/artifact fences passing. Private evidence is preserved at
+`task-tmp/r42-current-actual-cli-fcac175a` with original inputs and
+`safe-summary.json` (SHA-256
+`84b89f0ef599d5a79275e0c3e831936e8475875ea51fb00eb1edb3aafee67673`).
 
-The applied one-line predicate `.result.value == "0x"` preserves issued/
-retired/Done checks. Shell syntax, archived actual JSON and diff checks pass;
-this is **source-only, not rerun**. No Query retry/endpoint proposal is applied.
-The recorded `5750f0c2` binary/original script demonstrate only the preceding Local slice.
-Freeze the correction, rebuild current portable provenance, review the runner
-`SCRIPT_SHA` and rerun fresh ordinary identities/roots. Earlier R39w stays
-source-frozen historical evidence; Shared/reopen and full acceptance remain open.
+The corrected Query predicate is in the launched script but **was not reached**;
+this run does not qualify it. The earlier `5750f0c2` **101.711s** assertion
+failure remains frozen evidence of successful Local Query **46.307s**, issued/
+delivery-retired/Done/direct `"0x"`, before the old wrong shape assertion.
+The one-line `.result.value == "0x"` change preserves those checks; no Query
+retry/endpoint proposal is applied. Neither run reaches Shared or reopen.
+Ordinary CLI integration needs attribution of the current exact Local Install
+refusal and a frozen-provenance rerun; no new source correction is established.
+Stage timings are not whole-recovery/SLA or complete workflow qualification.
+
+The independently run returning/all-cold pending-Install selectors **fail
+148.160s / 290.903s**, each one executed failing test with owned group gone and
+current fences passing. Returning fails at `member_cold_install_tests.rs:102`
+on credential HTTP 503 in `retain_install_for_test`, **before SIQ1 publication,
+receipt cut or recovery timer**. All-cold completes SIQ preparation, original
+shutdown, peer-leader selection and `open_origin`, then fails the pre-cut
+`returned_follower` wait at `member_workflow_tests.rs:721` /
+`member_cold_install_tests.rs:116`, **before `prepare_shared_install`, fault
+construction or recovery timing**. No native/frontphase/whole30 recovery markers
+are recorded. These are setup failures, not pending-Install recovery evidence;
+neither supplies a recovery or fresh-Query pass, and their causes are not
+established. Evidence is `task-tmp/r42-pending-install-fcac175a` and
+`task-tmp/r42-pending-all-cold-fcac175a`, with private logs/results and preserved
+current fences. Preserve both setup failures without crediting recovery.
+
+A fixture-only source correction is **APPLIED, UNBUILT, UNEXECUTED and
+UNQUALIFIED**. Normal credential/descriptor discovery now retries the exact
+persisted credential query while the original reservation/nonce remain held;
+SIQ1 signing/publication still occurs once. The existing **120s** setup deadline
+starts before preparation and is reused through the receipt cut, rejecting late
+results. Only the premature raw-lifecycle pre-cut follower wait is removed:
+normal authorization refreshes authenticated transport before receipt signing,
+and real returning-follower checks remain after normal production attachment.
+Exact SIQ1/no-response/staged-receipt/unchanged ordinary-journal assertions and
+whole **30s** recovery remain. No API/visibility, forced election/readiness or
+public admission is added. Compile and rerun both selectors before crediting
+recovery. This does not resolve ordinary Local ScopeMismatch or native NRT1
+terminal-release causes.
+
+Their source-based independence still allows focused recovery qualification,
+but a fresh Query after timed recovery remains a distinct native-issuance probe
+outside whole30. Native NRT1 release/retry/reopen, remaining packaged gates,
+ordinary CLI and M1/M2/M3 remain open. Older R39w stays source-frozen history.
 
 Supported THREE-node BEFORE evidence now establishes the recovery-admission
 defect on this supported cut. Clean `61530b52` core builds **45.045s** after a preserved **20.727s**
@@ -227,10 +274,15 @@ release ambiguity/recovery after the saved NRT1 witness and qualify full support
 fixed-three native NRT1 exact retry/reopen. Latest-row/root-fence source protection
 is not execution proof and supplies no demonstrated archive fix. Current quiet
 acceptance still fails; fix only a demonstrated native cause and remove diagnostics.
-Separately freeze the demonstrated script assertion correction, rebuild current
-provenance/review runner hash, and rerun fresh ordinary CLI before crediting that
-slice. The source-only predicate change does not close the native gate. Recorded
-portable costs **391.697s / 453.055s** are high-confidence facts; a predictive
+Separately attribute the ordinary exact Local Install refusal; its repeated
+ScopeMismatch is a reported boundary with unknown substage/cause. The corrected
+Query predicate is unreached and does not close either integration gate.
+Independent pending-Install runs also fail during pre-cut setup, supplying no
+recovery proof. The reviewed fixture-only preparation correction is applied but
+unbuilt/unexecuted/unqualified and requires compilation plus both reruns.
+Freeze any demonstrated correction/current portable provenance and rerun fresh
+ordinary CLI. Recorded portable costs **192.698s / 245.354s** are high-confidence
+facts at clean `fcac175a` with unchanged executable hashes; a predictive
 **3–8 minutes per portable main/harness binary** range has moderate confidence
 from cache/source variation and is not an aggregate ETA. Earlier source/elapsed
 forecasts remain unreliable.
