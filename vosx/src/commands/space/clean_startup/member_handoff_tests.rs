@@ -322,7 +322,14 @@ fn create_packaged(
         http: Some(address),
         resume: false,
     };
+    let mut diagnostic_attempt = 0u64;
     let disposition = retry_exact("ordinary packaged CLI Shared Create", || {
+        if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+            diagnostic_attempt += 1;
+            tracing::debug!(target: "vos", phase = "ordinary_create_attempt",
+                status = "start", attempt = diagnostic_attempt,
+                thread = ?std::thread::current().id(), "VOS causal fixture");
+        }
         let result = shared_operation::create_shared_for_test(
             data,
             address,
@@ -340,6 +347,11 @@ fn create_packaged(
     let SharedCreateDisposition::Applied(applied) = disposition else {
         panic!("packaged Root Shared Create did not apply: {disposition:?}")
     };
+    if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+        tracing::debug!(target: "vos", phase = "ordinary_create_complete",
+            status = "applied", attempt = diagnostic_attempt,
+            thread = ?std::thread::current().id(), "VOS causal fixture");
+    }
     let archive = applied.archive().clone();
     super::super::publish_shared_archive(&args.archive_out, &archive.encode()).unwrap();
 

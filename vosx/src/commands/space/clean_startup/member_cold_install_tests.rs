@@ -227,6 +227,11 @@ pub(super) fn exercise(
         commands::clean_store::CleanSharedInstallFile::open_or_create(&request_root).unwrap();
     assert_eq!(client.load_request().unwrap().unwrap(), request);
     assert!(client.load_response().unwrap().is_none());
+    if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+        tracing::debug!(target: "vos", phase = "pending_install_cut",
+            status = "verified", attempt = 0u64,
+            thread = ?std::thread::current().id(), "VOS causal fixture");
+    }
     drop(client);
     drop(fault);
     drop(lifecycle);

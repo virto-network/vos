@@ -11,6 +11,12 @@ host source or the released workflow.
 
 ## Boundary and release claim
 
+R50 is the user-authorized bounded causal investigation of one exact public
+Create family through the existing all-cold selector. Its instrumentation and
+finite reader are under review; no new execution or fix verdict exists yet.
+Keep the previous R49 outcomes separate. The live plan owns this session's
+scope, source freeze, evidence fences and subsequent fix decision.
+
 The review branch remains `e6f2bb45` on `saga/agents`. Original replacement
 source `8128e677` and its role bundle `7085c220` precede the corrected integration
 source frozen at `2e19cd17` on `wip/ch08-runtime-directory`. Inspect the coherent

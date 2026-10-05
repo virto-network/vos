@@ -1082,6 +1082,72 @@ pub(crate) enum LocalReplayExecutorError {
     Store(JournalStoreError),
 }
 
+fn causal_runtime_started() -> Option<std::time::Instant> {
+    std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS")
+        .is_some()
+        .then(std::time::Instant::now)
+}
+
+fn causal_runtime_status(error: &LocalReplayExecutorError) -> &'static str {
+    match error {
+        LocalReplayExecutorError::InvalidState => "invalid_state",
+        LocalReplayExecutorError::InvalidProfile => "invalid_profile",
+        LocalReplayExecutorError::WrongReplica => "wrong_replica",
+        LocalReplayExecutorError::TrustUnavailable => "trust_unavailable",
+        LocalReplayExecutorError::InvalidAuthority => "invalid_authority",
+        LocalReplayExecutorError::InvalidRequest => "invalid_request",
+        LocalReplayExecutorError::ArtifactUnavailable(_) => "artifact_unavailable",
+        LocalReplayExecutorError::InvalidArtifact(_) => "invalid_artifact",
+        LocalReplayExecutorError::Package(_) => "package_error",
+        LocalReplayExecutorError::RuntimeExit { .. } => "runtime_exit",
+        LocalReplayExecutorError::RuntimeOutput => "runtime_output",
+        LocalReplayExecutorError::RuntimeBackend => "runtime_backend",
+        LocalReplayExecutorError::RuntimeStateTooLarge => "runtime_state_too_large",
+        LocalReplayExecutorError::Store(_) => "store_error",
+    }
+}
+
+fn causal_runtime_outcome(outcome: &crate::agent_sdk::RuntimeOutcome) -> &'static str {
+    use crate::agent_sdk::{InvocationStatus, RuntimeOutcome};
+    match outcome {
+        RuntimeOutcome::Completed(Ok(reply)) => match reply.status {
+            InvocationStatus::Done => "completed_done",
+            InvocationStatus::Forbidden => "completed_forbidden",
+            InvocationStatus::Panicked => "completed_panicked",
+            InvocationStatus::OutOfGas => "completed_out_of_gas",
+        },
+        RuntimeOutcome::Completed(Err(_)) => "completed_error",
+        RuntimeOutcome::Yielded(_) => "yielded",
+        RuntimeOutcome::Acknowledged(Ok(_)) => "acknowledged_ok",
+        RuntimeOutcome::Acknowledged(Err(_)) => "acknowledged_error",
+        RuntimeOutcome::Management(Ok(_)) => "management_ok",
+        RuntimeOutcome::Management(Err(_)) => "management_error",
+    }
+}
+
+fn report_causal_runtime(
+    started: Option<std::time::Instant>,
+    phase: &'static str,
+    status: &'static str,
+    bytes: usize,
+    work: Option<&[u8; 32]>,
+) {
+    if let Some(started) = started {
+        let elapsed_us = started.elapsed().as_micros() as u64;
+        if let Some(work) = work {
+            tracing::debug!(phase, status, elapsed_us, bytes, work = ?work,
+                thread = ?std::thread::current().id(), "VOS causal runtime");
+        } else {
+            tracing::debug!(phase, status, elapsed_us, bytes,
+                thread = ?std::thread::current().id(), "VOS causal runtime");
+        }
+    }
+}
+
+fn causal_runtime_span(work: Option<&[u8; 32]>) -> Option<tracing::span::EnteredSpan> {
+    work.map(|work| tracing::debug_span!("vos_causal_work", work = ?work).entered())
+}
+
 impl core::fmt::Display for LocalReplayExecutorError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(formatter, "local replay executor: {self:?}")
@@ -1766,6 +1832,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             authority: Some(Box::new(authority.clone())),
             observed_slot,
         };
+        let causal_work = causal_runtime_started().map(|_| request.replay_commitment().0);
         #[cfg(all(test, feature = "pvm"))]
         let returned: crate::agent_sdk::RuntimeTransition =
             if self.trust.use_native_clean_runtime_for_test() {
@@ -1775,6 +1842,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
                 let encoded = work
                     .encode()
                     .map_err(|_| LocalReplayExecutorError::InvalidRequest)?;
+                let _causal_span = causal_runtime_span(causal_work.as_ref());
                 self.execute_agent_wire(runtime.program_bytes(), self.management_gas, &encoded)?
             };
         #[cfg(any(not(test), all(test, not(feature = "pvm"))))]
@@ -1782,8 +1850,11 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             let encoded = work
                 .encode()
                 .map_err(|_| LocalReplayExecutorError::InvalidRequest)?;
+            let _causal_span = causal_runtime_span(causal_work.as_ref());
             self.execute_agent_wire(runtime.program_bytes(), self.management_gas, &encoded)?
         };
+        report_causal_runtime(causal_runtime_started(), "management_preview_outcome",
+            causal_runtime_outcome(&returned.outcome), 0, causal_work.as_ref());
         if expiry
             && (returned.outcome
                 != crate::agent_sdk::RuntimeOutcome::Management(Err(
@@ -1820,23 +1891,41 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         before: &RuntimeState,
         request: &crate::agent_sdk::ManagementRequest,
     ) -> Result<crate::agent_sdk::RuntimeOutcome, LocalReplayExecutorError> {
+        let causal_prepare_started = causal_runtime_started();
         if !matches!(
             request,
             crate::agent_sdk::ManagementRequest::InspectActors { .. }
                 | crate::agent_sdk::ManagementRequest::InspectResources
                 | crate::agent_sdk::ManagementRequest::InspectManagementHistory
         ) {
+            report_causal_runtime(causal_prepare_started, "inspect_prepare", "invalid_request", 0, None);
             return Err(LocalReplayExecutorError::InvalidRequest);
         }
-        let runtime = self.clean_runtime_package(binding)?;
+        let causal_work = causal_prepare_started.map(|_| request.replay_commitment().0);
+        let runtime = self.clean_runtime_package(binding).map_err(|error| {
+            report_causal_runtime(causal_prepare_started, "inspect_prepare", causal_runtime_status(&error), 0, causal_work.as_ref());
+            error
+        })?;
         let descriptor = Self::current_clean_descriptor(
             self.clean_genesis_descriptor
                 .as_ref()
-                .ok_or(LocalReplayExecutorError::InvalidState)?,
+                .ok_or(LocalReplayExecutorError::InvalidState)
+                .map_err(|error| {
+                    report_causal_runtime(causal_prepare_started, "inspect_prepare", causal_runtime_status(&error), 0, causal_work.as_ref());
+                    error
+                })?,
             binding,
             &runtime,
-        )?;
-        let observed_slot = self.current_logical_slot()?;
+        ).map_err(|error| {
+            report_causal_runtime(causal_prepare_started, "inspect_prepare", causal_runtime_status(&error), 0, causal_work.as_ref());
+            error
+        })?;
+        let observed_slot = self.current_logical_slot().map_err(|error| {
+            report_causal_runtime(causal_prepare_started, "inspect_prepare", causal_runtime_status(&error), 0, causal_work.as_ref());
+            error
+        })?;
+        report_causal_runtime(causal_prepare_started, "inspect_prepare", "ok", 0, causal_work.as_ref());
+        let causal_build_started = causal_runtime_started();
         let work = crate::agent_sdk::RuntimeWork::Manage {
             context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             space: descriptor.identity.space,
@@ -1852,6 +1941,12 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             authority: None,
             observed_slot,
         };
+        let image_bytes = if causal_build_started.is_some() {
+            before.control.len().saturating_add(before.linear.len())
+                .saturating_add(before.merge.len()).saturating_add(before.local.len())
+        } else { 0 };
+        report_causal_runtime(causal_build_started, "inspect_work", "ok", image_bytes, causal_work.as_ref());
+        let causal_encode_started = causal_runtime_started();
         #[cfg(all(test, feature = "pvm"))]
         let returned: crate::agent_sdk::RuntimeTransition =
             if self.trust.use_native_clean_runtime_for_test() {
@@ -1860,22 +1955,31 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             } else {
                 let encoded = work
                     .encode()
-                    .map_err(|_| LocalReplayExecutorError::InvalidRequest)?;
+                    .map_err(|_| LocalReplayExecutorError::InvalidRequest);
+                report_causal_runtime(causal_encode_started, "inspect_encode", encoded.as_ref().map_or_else(causal_runtime_status, |_| "ok"), encoded.as_ref().map_or(0, Vec::len), causal_work.as_ref());
+                let encoded = encoded?;
+                let _causal_span = causal_runtime_span(causal_work.as_ref());
                 self.execute_agent_wire(runtime.program_bytes(), self.management_gas, &encoded)?
             };
         #[cfg(any(not(test), all(test, not(feature = "pvm"))))]
         let returned: crate::agent_sdk::RuntimeTransition = {
             let encoded = work
                 .encode()
-                .map_err(|_| LocalReplayExecutorError::InvalidRequest)?;
+                .map_err(|_| LocalReplayExecutorError::InvalidRequest);
+            report_causal_runtime(causal_encode_started, "inspect_encode", encoded.as_ref().map_or_else(causal_runtime_status, |_| "ok"), encoded.as_ref().map_or(0, Vec::len), causal_work.as_ref());
+            let encoded = encoded?;
+            let _causal_span = causal_runtime_span(causal_work.as_ref());
             self.execute_agent_wire(runtime.program_bytes(), self.management_gas, &encoded)?
         };
-        if returned.state.control != before.control
+        let causal_purity_started = causal_runtime_started();
+        let invalid = returned.state.control != before.control
             || returned.state.linear != before.linear
             || returned.state.merge != before.merge
             || returned.state.local != before.local
-            || !super::driver::sdk_management_reply_matches(&descriptor, request, &returned.outcome)
-        {
+            || !super::driver::sdk_management_reply_matches(&descriptor, request, &returned.outcome);
+        report_causal_runtime(causal_purity_started, "inspect_purity", if invalid { "invalid_state" } else { "ok" }, image_bytes, causal_work.as_ref());
+        report_causal_runtime(causal_purity_started, "inspect_outcome", causal_runtime_outcome(&returned.outcome), 0, causal_work.as_ref());
+        if invalid {
             return Err(LocalReplayExecutorError::InvalidState);
         }
         Ok(returned.outcome)
@@ -1892,6 +1996,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         before: &RuntimeState,
         invocation: &crate::agent_sdk::InvocationWork,
     ) -> Result<crate::agent_sdk::RuntimeOutcome, LocalReplayExecutorError> {
+        let causal_shape_started = causal_runtime_started();
         if self.external.is_some()
             || self.profile != AgentProfile::Shared
             || !invocation.validate()
@@ -1899,16 +2004,30 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             || invocation.recovery_only
             || invocation.gas > super::execution::MAX_EXECUTION_GAS
         {
+            report_causal_runtime(causal_shape_started, "observe_shape", "invalid_request", 0, None);
             return Err(LocalReplayExecutorError::InvalidRequest);
         }
-        let runtime = self.clean_runtime_package(binding)?;
+        let causal_work = causal_shape_started.map(|_| invocation.commitment().0);
+        report_causal_runtime(causal_shape_started, "observe_shape", "ok", 0, causal_work.as_ref());
+        let causal_prepare_started = causal_runtime_started();
+        let runtime = self.clean_runtime_package(binding).map_err(|error| {
+            report_causal_runtime(causal_prepare_started, "observe_prepare", causal_runtime_status(&error), 0, causal_work.as_ref());
+            error
+        })?;
         let descriptor = Self::current_clean_descriptor(
             self.clean_genesis_descriptor
                 .as_ref()
-                .ok_or(LocalReplayExecutorError::InvalidState)?,
+                .ok_or(LocalReplayExecutorError::InvalidState)
+                .map_err(|error| {
+                    report_causal_runtime(causal_prepare_started, "observe_prepare", causal_runtime_status(&error), 0, causal_work.as_ref());
+                    error
+                })?,
             binding,
             &runtime,
-        )?;
+        ).map_err(|error| {
+            report_causal_runtime(causal_prepare_started, "observe_prepare", causal_runtime_status(&error), 0, causal_work.as_ref());
+            error
+        })?;
         if !runtime.manifest().contract.supports_system_observation()
             || invocation.space != descriptor.identity.space
             || invocation.agent != descriptor.identity.agent
@@ -1917,9 +2036,15 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             || invocation.deployment != descriptor.authority.issuer.deployment
             || invocation.program != descriptor.authority.issuer.program
         {
+            report_causal_runtime(causal_prepare_started, "observe_prepare", "invalid_request", 0, causal_work.as_ref());
             return Err(LocalReplayExecutorError::InvalidRequest);
         }
-        let observed_slot = self.current_logical_slot()?;
+        let observed_slot = self.current_logical_slot().map_err(|error| {
+            report_causal_runtime(causal_prepare_started, "observe_prepare", causal_runtime_status(&error), 0, causal_work.as_ref());
+            error
+        })?;
+        report_causal_runtime(causal_prepare_started, "observe_prepare", "ok", 0, causal_work.as_ref());
+        let causal_build_started = causal_runtime_started();
         let work = crate::agent_sdk::RuntimeWork::Observe {
             context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             state: super::replay::sdk_runtime_state(before),
@@ -1929,17 +2054,34 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             )),
             observed_slot,
         };
+        let image_bytes = if causal_build_started.is_some() {
+            before.control.len().saturating_add(before.linear.len())
+                .saturating_add(before.merge.len()).saturating_add(before.local.len())
+        } else { 0 };
+        report_causal_runtime(causal_build_started, "observe_work", "ok", image_bytes, causal_work.as_ref());
+        let causal_encode_started = causal_runtime_started();
         let encoded = work
             .encode()
-            .map_err(|_| LocalReplayExecutorError::InvalidRequest)?;
+            .map_err(|_| LocalReplayExecutorError::InvalidRequest);
+        report_causal_runtime(causal_encode_started, "observe_encode", encoded.as_ref().map_or_else(causal_runtime_status, |_| "ok"), encoded.as_ref().map_or(0, Vec::len), causal_work.as_ref());
+        let encoded = encoded?;
         // Never substitute native Authority/Standard logic for this admitted
         // runtime, including in tests. Qualify the real physical boundary.
-        let returned: crate::agent_sdk::RuntimeTransition = self.execute_agent_wire(
-            runtime.program_bytes(),
-            self.management_gas.saturating_add(invocation.gas),
-            &encoded,
-        )?;
-        if !system_observation_transition_matches(invocation, before, &returned) {
+        let causal_execute_started = causal_runtime_started();
+        let returned: Result<crate::agent_sdk::RuntimeTransition, _> = {
+            let _causal_span = causal_runtime_span(causal_work.as_ref());
+            self.execute_agent_wire(
+                runtime.program_bytes(),
+                self.management_gas.saturating_add(invocation.gas),
+                &encoded,
+            )
+        };
+        report_causal_runtime(causal_execute_started, "observe_execute", returned.as_ref().map_or_else(causal_runtime_status, |returned| causal_runtime_outcome(&returned.outcome)), encoded.len(), causal_work.as_ref());
+        let returned = returned?;
+        let causal_purity_started = causal_runtime_started();
+        let matches = system_observation_transition_matches(invocation, before, &returned);
+        report_causal_runtime(causal_purity_started, "observe_purity", if matches { "ok" } else { "invalid_state" }, image_bytes, causal_work.as_ref());
+        if !matches {
             return Err(LocalReplayExecutorError::InvalidState);
         }
         Ok(returned.outcome)
@@ -2783,12 +2925,14 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         let encoded = runtime_work
             .encode()
             .map_err(|_| LocalReplayExecutorError::InvalidRequest)?;
+        let causal_work = causal_runtime_started().map(|_| work.commitment().0);
         #[cfg(all(test, feature = "pvm"))]
         let returned: crate::agent_sdk::RuntimeTransition =
             if self.trust.use_native_clean_runtime_for_test() {
                 super::wire::apply_standard_runtime_work(runtime_work)
                     .map_err(|_| LocalReplayExecutorError::RuntimeOutput)?
             } else {
+                let _causal_span = causal_runtime_span(causal_work.as_ref());
                 self.execute_agent_wire(
                     runtime.program_bytes(),
                     self.management_gas.saturating_add(work.gas),
@@ -2797,12 +2941,15 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             };
         #[cfg(any(not(test), all(test, not(feature = "pvm"))))]
         let returned: crate::agent_sdk::RuntimeTransition = {
+            let _causal_span = causal_runtime_span(causal_work.as_ref());
             self.execute_agent_wire(
                 runtime.program_bytes(),
                 self.management_gas.saturating_add(work.gas),
                 &encoded,
             )?
         };
+        report_causal_runtime(causal_runtime_started(), "preview_outcome",
+            causal_runtime_outcome(&returned.outcome), 0, causal_work.as_ref());
         let terminal = matches!(
             returned.outcome,
             crate::agent_sdk::RuntimeOutcome::Completed(_)
@@ -3721,6 +3868,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         input: &[u8],
     ) -> Result<T, LocalReplayExecutorError> {
         let started = std::time::Instant::now();
+        let causal_started = causal_runtime_started();
         #[cfg(test)]
         let observe = (input.len() > 700_000
             || std::env::var_os("VOS_AGENT_PROFILE_REFINE_ALL_INPUTS").is_some())
@@ -3745,29 +3893,57 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         let context = loaded.map_err(|error| match error {
             vos_pvm::refine::RefineError::Backend => LocalReplayExecutorError::RuntimeBackend,
             _ => LocalReplayExecutorError::RuntimeOutput,
-        })?;
+        });
+        report_causal_runtime(
+            causal_started,
+            "context_load",
+            context.as_ref().map_or_else(causal_runtime_status, |_| "ok"),
+            input.len(),
+            None,
+        );
+        let context = context?;
         let preparation_us = started.elapsed().as_micros() as u64;
         let execution_started = std::time::Instant::now();
+        let causal_execution_started = causal_runtime_started();
         #[cfg(test)]
         // PROFILE_REFINE_MACHINES also disables fixture-native execution.
         // DISABLE_REFINE_ATTRIBUTION keeps that real PVM path unobserved.
         let invocation = if observe {
-            profile_refine_machines(
+            Ok(profile_refine_machines(
                 context,
                 input.len(),
                 input
                     .get(4 + crate::agent_sdk::RUNTIME_ABI_ID.as_bytes().len())
                     .copied(),
-            )
+            ))
         } else {
             context
                 .try_run()
-                .map_err(|_| LocalReplayExecutorError::RuntimeBackend)?
+                .map_err(|_| LocalReplayExecutorError::RuntimeBackend)
         };
         #[cfg(not(test))]
         let invocation = context
             .try_run()
-            .map_err(|_| LocalReplayExecutorError::RuntimeBackend)?;
+            .map_err(|_| LocalReplayExecutorError::RuntimeBackend);
+        report_causal_runtime(
+            causal_execution_started,
+            "run",
+            match &invocation {
+                Ok(invocation) => match &invocation.exit {
+                    ExitReason::Halt => "halt",
+                    ExitReason::Trap => "trap",
+                    ExitReason::Panic => "panic",
+                    ExitReason::OutOfGas => "out_of_gas",
+                    ExitReason::PageFault(_) => "page_fault",
+                    ExitReason::HostCall(_) => "host_call",
+                    ExitReason::Ecall => "ecall",
+                },
+                Err(error) => causal_runtime_status(error),
+            },
+            input.len(),
+            None,
+        );
+        let invocation = invocation?;
         tracing::debug!(
             elapsed_us = started.elapsed().as_micros() as u64,
             preparation_us,
@@ -3783,10 +3959,28 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
                 pc: invocation.pc,
             });
         }
+        let causal_output_started = causal_runtime_started();
         let output = invocation
             .output_bounded(T::MAX_ENCODED_BYTES)
-            .ok_or(LocalReplayExecutorError::RuntimeOutput)?;
-        T::decode(&output).map_err(|_| LocalReplayExecutorError::RuntimeOutput)
+            .ok_or(LocalReplayExecutorError::RuntimeOutput);
+        report_causal_runtime(
+            causal_output_started,
+            "output_copy",
+            output.as_ref().map_or_else(causal_runtime_status, |_| "ok"),
+            output.as_ref().map_or(0, Vec::len),
+            None,
+        );
+        let output = output?;
+        let causal_decode_started = causal_runtime_started();
+        let decoded = T::decode(&output).map_err(|_| LocalReplayExecutorError::RuntimeOutput);
+        report_causal_runtime(
+            causal_decode_started,
+            "output_decode",
+            decoded.as_ref().map_or_else(causal_runtime_status, |_| "ok"),
+            output.len(),
+            None,
+        );
+        decoded
     }
 
     fn validate_state_size(

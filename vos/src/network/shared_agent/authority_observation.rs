@@ -6,6 +6,52 @@
 
 use super::*;
 
+fn causal_observation_started() -> Option<Instant> {
+    std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS")
+        .is_some()
+        .then(Instant::now)
+}
+
+fn causal_observation_status(error: &SharedAgentHostError) -> &'static str {
+    match error {
+        SharedAgentHostError::Unavailable => "unavailable",
+        SharedAgentHostError::DirectoryInUse => "directory_in_use",
+        SharedAgentHostError::InvalidScope => "invalid_scope",
+        SharedAgentHostError::ScopeMismatch => "scope_mismatch",
+        SharedAgentHostError::InvalidProvision => "invalid_provision",
+        SharedAgentHostError::Finality(_) => "finality",
+        SharedAgentHostError::InvalidCatalog => "invalid_catalog",
+        SharedAgentHostError::Conflict => "conflict",
+        SharedAgentHostError::CorruptResidue => "corrupt_residue",
+        SharedAgentHostError::AgentNotFound => "agent_not_found",
+        SharedAgentHostError::CapacityExhausted => "capacity_exhausted",
+        SharedAgentHostError::TransportNotAttached => "transport_not_attached",
+        SharedAgentHostError::SnapshotBoundaryRequired => "snapshot_boundary_required",
+        SharedAgentHostError::SnapshotCertificateInvalid => "snapshot_certificate_invalid",
+        SharedAgentHostError::SnapshotStale => "snapshot_stale",
+        SharedAgentHostError::SnapshotReplay => "snapshot_replay",
+        SharedAgentHostError::SnapshotEvidenceLimit => "snapshot_evidence_limit",
+        SharedAgentHostError::PortableBackupUnsupported => "portable_backup_unsupported",
+        SharedAgentHostError::PortableBackupInvalid => "portable_backup_invalid",
+    }
+}
+
+fn report_causal_observation(
+    started: Option<Instant>,
+    request: Hash,
+    agent: crate::service::AgentId,
+    node: Option<[u8; 32]>,
+    phase: &'static str,
+    status: &'static str,
+    count: usize,
+) {
+    if let Some(started) = started {
+        tracing::debug!(request = ?request.0, agent = ?agent.0, node = ?node,
+            phase, status, elapsed_us = started.elapsed().as_micros() as u64, count,
+            thread = ?std::thread::current().id(), "VOS causal observation");
+    }
+}
+
 fn fixed_observation_scope(
     fingerprint: &AttachmentFingerprint,
     local: NodeId,
@@ -132,8 +178,12 @@ impl SharedRouteHandler {
         // This is the freshness proof under the existing authenticated-CFT
         // contract. Local role/commit samples before and after only fence its
         // exact term/configuration; they never substitute for fresh quorum.
+        let causal_read_started = causal_observation_started();
         let read_index = futures_executor::block_on(worker.read_index_with_timeout(timeout))
-            .map_err(|_| SharedAgentHostError::Unavailable)?;
+            .map_err(|_| SharedAgentHostError::Unavailable);
+        report_causal_observation(causal_read_started, request.request, self.agent, Some(local.0),
+            "leader_read_index", read_index.as_ref().map_or_else(causal_observation_status, |_| "ok"), 0);
+        let read_index = read_index?;
         let after = futures_executor::block_on(worker.snapshot())
             .ok_or(SharedAgentHostError::Unavailable)?;
         let barrier = AuthorityReadBarrier {
@@ -173,48 +223,75 @@ impl SharedAgentNetworkHost {
         request: Hash,
         observe: impl FnOnce(&SharedAgentHost) -> Result<T, SharedAgentHostError>,
     ) -> Result<T, SharedAgentHostError> {
+        let causal_started = causal_observation_started();
+        let causal_node = causal_started.map(|_| self.network.agent_node_id().0);
+        let causal_event = |phase_started, phase, status, count| {
+            report_causal_observation(phase_started, request, agent, causal_node, phase, status, count);
+        };
+        // Refusals report call elapsed time; successful phase records report
+        // their own duration. Neither supplies freshness or authorization.
+        let causal_refused = |phase, error: SharedAgentHostError| {
+            causal_event(causal_started, phase, causal_observation_status(&error), 0);
+            error
+        };
+        causal_event(causal_started, "start", "enter", 0);
         if request == Hash::ZERO || !self.system_agents.contains(&agent) {
-            return Err(SharedAgentHostError::ScopeMismatch);
+            return Err(causal_refused("scope", SharedAgentHostError::ScopeMismatch));
         }
         let started = Instant::now();
         let deadline = started + ORDERED_REPLY_WAIT;
         let attached = self
             .generations
             .get(&agent)
-            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+            .ok_or_else(|| causal_refused("generation", SharedAgentHostError::TransportNotAttached))?;
+        if let Some(started) = causal_started {
+            let route = attached.fingerprint.protocol_route;
+            tracing::debug!(request = ?request.0, agent = ?agent.0, node = ?causal_node,
+                space = ?route.space.0, generation = ?route.generation.0,
+                phase = "binding", status = "ok", elapsed_us = started.elapsed().as_micros() as u64,
+                count = 0usize, thread = ?std::thread::current().id(), "VOS causal observation");
+        }
+        let causal_lifecycle_started = causal_observation_started();
         let live = attached
             .lifecycle
             .read()
-            .map_err(|_| SharedAgentHostError::Unavailable)?;
+            .map_err(|_| causal_refused("lifecycle_wait", SharedAgentHostError::Unavailable))?;
+        causal_event(causal_lifecycle_started, "lifecycle_wait", "ok", 0);
         if !*live || attached.stale.load(Ordering::Acquire) {
-            return Err(SharedAgentHostError::TransportNotAttached);
+            return Err(causal_refused("live", SharedAgentHostError::TransportNotAttached));
         }
         let local = self.network.agent_node_id();
-        fixed_observation_scope(&attached.fingerprint, local)?;
+        fixed_observation_scope(&attached.fingerprint, local)
+            .map_err(|error| causal_refused("fixed_scope", error))?;
         let worker = attached
             .coordinator
             .worker
             .as_ref()
-            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+            .ok_or_else(|| causal_refused("worker", SharedAgentHostError::TransportNotAttached))?;
+        let causal_snapshot_started = causal_observation_started();
         let initial = futures_executor::block_on(worker.snapshot())
-            .ok_or(SharedAgentHostError::Unavailable)?;
-        observation_configuration(&initial, &attached.fingerprint)?;
+            .ok_or_else(|| causal_refused("initial_snapshot", SharedAgentHostError::Unavailable))?;
+        causal_event(causal_snapshot_started, "initial_snapshot", "ok", 0);
+        observation_configuration(&initial, &attached.fingerprint)
+            .map_err(|error| causal_refused("configuration", error))?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(SharedAgentHostError::Unavailable);
+            return Err(causal_refused("remaining", SharedAgentHostError::Unavailable));
         }
         let input = AuthorityReadBarrierRequest { request };
+        let causal_barrier_started = causal_observation_started();
         let barrier = if initial.role == vos_raft::Role::Leader {
             attached
                 .coordinator
-                .authority_read_barrier(input, local, remaining)?
+                .authority_read_barrier(input, local, remaining)
+                .map_err(|error| causal_refused("fresh_barrier_local", error))?
         } else {
             let leader = initial
                 .leader_hint
                 .filter(|leader| {
                     *leader != local && attached.fingerprint.voters.binary_search(leader).is_ok()
                 })
-                .ok_or(SharedAgentHostError::Unavailable)?;
+                .ok_or_else(|| causal_refused("leader_hint", SharedAgentHostError::Unavailable))?;
             self.network
                 .send_agent_authority_read_barrier(
                     leader,
@@ -222,60 +299,93 @@ impl SharedAgentNetworkHost {
                     input,
                 )
                 .recv_timeout(remaining)
-                .map_err(|_| SharedAgentHostError::Unavailable)?
-                .map_err(|_| SharedAgentHostError::Unavailable)?
-                .ok_or(SharedAgentHostError::Unavailable)?
+                .map_err(|_| causal_refused("barrier_wait", SharedAgentHostError::Unavailable))?
+                .map_err(|_| causal_refused("barrier_transport", SharedAgentHostError::Unavailable))?
+                .ok_or_else(|| causal_refused("barrier_missing", SharedAgentHostError::Unavailable))?
         };
+        causal_event(causal_barrier_started, "fresh_barrier", "ok", 0);
         if barrier.request != request {
-            return Err(SharedAgentHostError::ScopeMismatch);
+            return Err(causal_refused("barrier_correlation", SharedAgentHostError::ScopeMismatch));
         }
         loop {
             if Instant::now() >= deadline || attached.stale.load(Ordering::Acquire) {
-                return Err(SharedAgentHostError::Unavailable);
+                return Err(causal_refused("loop_deadline_or_stale", SharedAgentHostError::Unavailable));
             }
             // No host/proposal mutex crosses this worker mailbox operation.
+            let causal_snapshot_started = causal_observation_started();
             let snapshot = futures_executor::block_on(worker.snapshot())
-                .ok_or(SharedAgentHostError::Unavailable)?;
-            observation_term_matches(&snapshot, &attached.fingerprint, local, barrier)?;
+                .ok_or_else(|| causal_refused("worker_snapshot", SharedAgentHostError::Unavailable))?;
+            causal_event(causal_snapshot_started, "worker_snapshot", "ok", 0);
+            observation_term_matches(&snapshot, &attached.fingerprint, local, barrier)
+                .map_err(|error| causal_refused("term_config", error))?;
             if snapshot.commit_index < barrier.read_index {
+                causal_event(causal_started, "commit_wait", "pending", 0);
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             }
+            let causal_host_started = causal_observation_started();
             let mut host = self
                 .host
                 .lock()
-                .map_err(|_| SharedAgentHostError::Unavailable)?;
+                .map_err(|_| causal_refused("host_wait", SharedAgentHostError::Unavailable))?;
+            causal_event(causal_host_started, "host_wait", "ok", 0);
             let status = host
-                .supervisor_attachment_status(agent)?
-                .ok_or(SharedAgentHostError::AgentNotFound)?;
+                .supervisor_attachment_status(agent)
+                .map_err(|error| causal_refused("attachment", error))?
+                .ok_or_else(|| causal_refused("attachment", SharedAgentHostError::AgentNotFound))?;
             if status.transport != SharedAgentTransportState::Attached
-                || AttachmentFingerprint::from_attachment_status(&status)? != attached.fingerprint
+                || AttachmentFingerprint::from_attachment_status(&status)
+                    .map_err(|error| causal_refused("attachment", error))? != attached.fingerprint
             {
-                return Err(SharedAgentHostError::Unavailable);
+                return Err(causal_refused("attachment", SharedAgentHostError::Unavailable));
             }
             // Apply only through the needed committed frontier, not an
             // unbounded drain chasing unrelated concurrent future proposals.
             // Keep this call-local audited cursor under the uninterrupted
             // host guard. Re-audit only after actual application progress;
             // collecting volatile replies cannot advance this cursor.
-            let mut applied = host.capacity(agent)?.0;
+            let causal_audit_started = causal_observation_started();
+            let mut applied = host.capacity(agent)
+                .map_err(|error| causal_refused("initial_audit", error))?.0;
+            causal_event(causal_audit_started, "initial_audit", "ok", 0);
             while applied < barrier.read_index {
                 if Instant::now() >= deadline {
-                    return Err(SharedAgentHostError::Unavailable);
+                    return Err(causal_refused("apply_deadline", SharedAgentHostError::Unavailable));
                 }
-                match host.apply_next(agent)? {
+                let causal_apply_started = causal_observation_started();
+                let outcome = host.apply_next(agent).map_err(|error| causal_refused("apply_step", error))?;
+                let causal_apply_status = match &outcome {
+                    SharedAgentApplyOutcome::Applied { .. } => "applied",
+                    SharedAgentApplyOutcome::Duplicate { .. } => "duplicate",
+                    SharedAgentApplyOutcome::Idle => "idle",
+                };
+                match outcome {
                     SharedAgentApplyOutcome::Applied { .. }
                     | SharedAgentApplyOutcome::Duplicate { .. } => {
-                        applied = host.capacity(agent)?.0;
+                        causal_event(causal_apply_started, "apply_step", causal_apply_status, 1);
+                        let causal_audit_started = causal_observation_started();
+                        let previous_applied = applied;
+                        applied = host.capacity(agent)
+                            .map_err(|error| causal_refused("apply_audit", error))?.0;
+                        causal_event(causal_audit_started, "apply_audit",
+                            if applied > previous_applied { "advanced" } else { "unchanged" },
+                            usize::from(applied > previous_applied));
                     }
-                    SharedAgentApplyOutcome::Idle => break,
+                    SharedAgentApplyOutcome::Idle => {
+                        causal_event(causal_apply_started, "apply_step", "idle", 0);
+                        break;
+                    }
                 }
             }
+            let causal_collect_started = causal_observation_started();
             attached
                 .coordinator
                 .ordered_replies
-                .collect_from(&mut host, agent)?;
+                .collect_from(&mut host, agent)
+                .map_err(|error| causal_refused("reply_collect", error))?;
+            causal_event(causal_collect_started, "reply_collect", "ok", 0);
             if applied < barrier.read_index {
+                causal_event(causal_started, "apply_wait", "pending", 0);
                 drop(host);
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
@@ -285,36 +395,47 @@ impl SharedAgentNetworkHost {
             // last have changed before R, so do not compare an OrderedClaim
             // index with the Raft read index. Pruned R is retryable, not an
             // invitation to trust a missing term or fabricate old evidence.
-            let database = host.raft_database(agent)?;
+            let causal_prefix_started = causal_observation_started();
+            let database = host.raft_database(agent)
+                .map_err(|error| causal_refused("local_prefix", error))?;
             let meta =
-                RaftMeta::load(&database).map_err(|_| SharedAgentHostError::CorruptResidue)?;
-            let log = RaftLog::open(database).map_err(|_| SharedAgentHostError::CorruptResidue)?;
+                RaftMeta::load(&database).map_err(|_| causal_refused("local_prefix", SharedAgentHostError::CorruptResidue))?;
+            let log = RaftLog::open(database)
+                .map_err(|_| causal_refused("local_prefix", SharedAgentHostError::CorruptResidue))?;
             observation_local_prefix(
                 &meta,
                 applied,
                 log.term_at(barrier.read_index)
-                    .map_err(|_| SharedAgentHostError::CorruptResidue)?,
+                    .map_err(|_| causal_refused("local_prefix", SharedAgentHostError::CorruptResidue))?,
                 barrier,
-            )?;
+            ).map_err(|error| causal_refused("local_prefix", error))?;
+            causal_event(causal_prefix_started, "local_prefix", "ok", 0);
             let current = worker
                 .cached_snapshot()
-                .ok_or(SharedAgentHostError::Unavailable)?;
-            observation_term_matches(&current, &attached.fingerprint, local, barrier)?;
+                .ok_or_else(|| causal_refused("pre_snapshot", SharedAgentHostError::Unavailable))?;
+            observation_term_matches(&current, &attached.fingerprint, local, barrier)
+                .map_err(|error| causal_refused("pre_term_config", error))?;
             if Instant::now() >= deadline {
-                return Err(SharedAgentHostError::Unavailable);
+                return Err(causal_refused("pre_deadline", SharedAgentHostError::Unavailable));
             }
-            host.validate_observation_owner(agent)?;
+            host.validate_observation_owner(agent)
+                .map_err(|error| causal_refused("pre_owner", error))?;
             let refused = |phase: &'static str, error| {
                 if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
                     tracing::debug!(phase, elapsed_us = started.elapsed().as_micros(),
                         "Authority observation terminal guard refused");
                 }
+                causal_event(causal_started, phase, causal_observation_status(&error), 0);
                 error
             };
+            let causal_callback_started = causal_observation_started();
+            causal_event(causal_callback_started, "callback", "enter", 0);
             let outcome = observe(&host).map_err(|error| refused("callback", error))?;
+            causal_event(causal_callback_started, "callback", "ok", 0);
             // Guest execution is bounded separately. A changed leader or
             // configuration during it discards this observation; no durable
             // query/result has been created and no cleanup proof is needed.
+            let causal_post_started = causal_observation_started();
             let current = worker
                 .cached_snapshot()
                 .ok_or_else(|| refused("snapshot", SharedAgentHostError::Unavailable))?;
@@ -328,6 +449,8 @@ impl SharedAgentNetworkHost {
             if Instant::now() >= deadline {
                 return Err(refused("deadline", SharedAgentHostError::Unavailable));
             }
+            causal_event(causal_post_started, "post_guard", "ok", 0);
+            causal_event(causal_started, "complete", "ok", 0);
             return Ok(outcome);
         }
     }

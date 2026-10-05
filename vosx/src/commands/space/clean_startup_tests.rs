@@ -1921,6 +1921,14 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
         #[cfg(not(feature = "experimental-state-blocks"))]
         let restarts: &[bool] = &[false, true];
         for &restart in restarts {
+            #[cfg(feature = "experimental-state-blocks")]
+            if restart && stage == FixedRosterStage::ColdInstallAll
+                && std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some()
+            {
+                tracing::debug!(target: "vos", phase = "cold_restart_entry",
+                    status = "start", attempt = 0u64,
+                    thread = ?std::thread::current().id(), "VOS causal fixture");
+            }
             // Include every locked constructor and production attachment in
             // the pending-recovery measurement, not just the later HTTP retry.
             #[cfg(feature = "experimental-state-blocks")]

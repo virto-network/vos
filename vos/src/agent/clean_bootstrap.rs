@@ -3348,12 +3348,17 @@ where
         let diagnostic_node = self.pins.node;
         let diagnostic_agent = self.pins.agent;
         let diagnostic_invocation = slot.intent().map(|intent| intent.call().invocation.0);
+        let diagnostic_root = diagnostic_started.and_then(|_| {
+            slot.intent().map(|intent| intent.call().commitment().0)
+        });
         let trace = |phase: &str, error: Option<&SharedAgentHostError>| {
             if let Some(started) = diagnostic_started {
                 tracing::debug!(
-                    node = ?diagnostic_node,
-                    agent = ?diagnostic_agent,
+                    node = ?diagnostic_node.0,
+                    agent = ?diagnostic_agent.0,
                     invocation = ?diagnostic_invocation,
+                    root = ?diagnostic_root,
+                    thread = ?std::thread::current().id(),
                     phase,
                     ?error,
                     elapsed_us = started.elapsed().as_micros(),
@@ -3420,6 +3425,12 @@ where
                 &authorization,
             ) {
                 return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            if diagnostic_started.is_some() {
+                tracing::debug!(node = ?self.pins.node.0, agent = ?self.pins.agent.0,
+                    root = ?diagnostic_root, invocation = ?work.invocation.0,
+                    work = ?work.commitment().0, authorization = ?authorization.commitment().0,
+                    phase = "authorization_child", "VOS causal owner");
             }
             let envelope = RuntimeWork::Invoke {
                 context: RuntimeExecutionContext::Direct,
@@ -3532,6 +3543,12 @@ where
             return Err(SharedAgentHostError::Unavailable);
         }
         trace("invoke_start", None);
+        if diagnostic_started.is_some() {
+            tracing::debug!(node = ?self.pins.node.0, agent = ?self.pins.agent.0,
+                root = ?diagnostic_root, invocation = ?work.invocation.0,
+                work = ?work.commitment().0, authorization = ?authorization.commitment().0,
+                phase = "authorization_child", "VOS causal owner");
+        }
         let outcome = self
             .supervisor_invoke_persisted_management(
                 identity,
@@ -3618,6 +3635,11 @@ where
             match error {
                 CleanManagementIssuerError::Rejected(reason) => {
                     trace("receipt_rejected", Some(&SharedAgentHostError::Unavailable));
+                    if diagnostic_started.is_some() {
+                        tracing::debug!(node = ?self.pins.node.0, agent = ?self.pins.agent.0,
+                            root = ?diagnostic_root, invocation = ?diagnostic_invocation,
+                            phase = "receipt_rejected", reason = ?reason, "VOS causal owner");
+                    }
                     crate::log::warn!("management receipt issuance rejected: {reason:?}")
                 }
                 CleanManagementIssuerError::Storage(_) => {
@@ -3730,12 +3752,18 @@ where
         J: CleanManagementIssuerStore,
     {
         use crate::actors::codec::Decode as _;
+        let diagnostic_node = self.pins.node.0;
+        let diagnostic_agent = self.pins.agent.0;
         let diagnostic = |phase: &'static str, error: Option<SharedAgentHostError>| {
             if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
                 if let Some(error) = error {
-                    tracing::debug!(management_finalization_phase = phase, error = ?error);
+                    tracing::debug!(node = ?diagnostic_node, agent = ?diagnostic_agent,
+                        root = ?terminal.facts().credential_call.0,
+                        management_finalization_phase = phase, error = ?error);
                 } else {
-                    tracing::debug!(management_finalization_phase = phase);
+                    tracing::debug!(node = ?diagnostic_node, agent = ?diagnostic_agent,
+                        root = ?terminal.facts().credential_call.0,
+                        management_finalization_phase = phase);
                 }
             }
         };
@@ -3837,6 +3865,13 @@ where
                 &authorization,
             ) {
                 return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                tracing::debug!(node = ?self.pins.node.0, agent = ?self.pins.agent.0,
+                    root = ?facts.credential_call.0, parent = ?facts.authorization_invocation.0,
+                    invocation = ?work.invocation.0, work = ?work.commitment().0,
+                    authorization = ?authorization.commitment().0,
+                    phase = "finalization_child", "VOS causal owner");
             }
             let envelope = RuntimeWork::Invoke {
                 context: RuntimeExecutionContext::Direct,
@@ -3941,6 +3976,13 @@ where
             return Err(SharedAgentHostError::Unavailable);
         }
         diagnostic("invoke_start", None);
+        if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+            tracing::debug!(node = ?self.pins.node.0, agent = ?self.pins.agent.0,
+                root = ?facts.credential_call.0, parent = ?facts.authorization_invocation.0,
+                invocation = ?work.invocation.0, work = ?work.commitment().0,
+                authorization = ?authorization.commitment().0,
+                phase = "finalization_child", "VOS causal owner");
+        }
         let outcome = self
             .supervisor_invoke_persisted_management(
                 identity,
@@ -4299,9 +4341,21 @@ where
         B: CleanManagementIssuerStore,
         J: CleanManagementIssuerStore,
     {
+        let diagnostic_node = self.pins.node.0;
+        let diagnostic_agent = self.pins.agent.0;
+        let trace = |phase: &'static str, status: &'static str| {
+            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                let facts = terminal.facts();
+                tracing::debug!(node = ?diagnostic_node, agent = ?diagnostic_agent,
+                    root = ?facts.credential_call.0, invocation = ?facts.authorization_invocation.0,
+                    phase, status, "VOS causal owner");
+            }
+        };
         // Always reverify the signed intent and finalized issuer acknowledgement,
         // even when recovering the durable marker rather than journal results.
-        self.retire_management_terminal_results(slot, managed, terminal, issuer)?;
+        self.retire_management_terminal_results(slot, managed, terminal, issuer)
+            .map_err(|error| { trace("runtime_retirement", "refused"); error })?;
+        trace("runtime_retirement", "complete");
         let authorization = slot
             .authorization_work()
             .map_err(|_| SharedAgentHostError::Unavailable)?
@@ -4317,18 +4371,27 @@ where
             .retirement_complete()
             .map_err(|_| SharedAgentHostError::Unavailable)?
         {
+            trace("terminal_restore", "complete");
+            trace("exclusion_release", "start");
             self._network_host
-                .release_completed_management_retirement(agent, [&authorization, &finalization])?;
+                .release_completed_management_retirement(agent, [&authorization, &finalization])
+                .map_err(|error| { trace("exclusion_release", "refused"); error })?;
+            trace("exclusion_release", "complete");
             // The reopened CMR2 terminal is durable before the owner pledges
             // quorum release; a timeout leaves that exact terminal retryable.
+            trace("retention_release", "start");
             self._network_host
-                .release_management_retention(agent, &authorization)?;
+                .release_management_retention(agent, &authorization)
+                .map_err(|error| { trace("retention_release", "refused"); error })?;
+            trace("retention_release", "complete");
             return Ok(false);
         }
+        trace("retirement_completion", "start");
         self._network_host.complete_management_retirement(
             agent,
             [&authorization, &finalization],
             || {
+                trace("terminal_persist", "start");
                 let committed = match terminal {
                     ManagementTerminalRef::Applied(ack) => slot.commit_retirement(ack),
                     ManagementTerminalRef::Rejected(failure) => {
@@ -4336,14 +4399,21 @@ where
                     }
                 };
                 committed
-                    .map(|_| ())
-                    .map_err(|_| SharedAgentHostError::Unavailable)
+                    .map(|_| { trace("terminal_persist", "complete"); () })
+                    .map_err(|_| {
+                        trace("terminal_persist", "refused");
+                        SharedAgentHostError::Unavailable
+                    })
             },
-        )?;
+        ).map_err(|error| { trace("retirement_completion", "refused"); error })?;
+        trace("retirement_completion", "complete");
         // CMR2 committed and all runtime results retired. Retention is released
         // only at this root lifecycle boundary, never an ancillary callback.
+        trace("retention_release", "start");
         self._network_host
-            .release_management_retention(agent, &authorization)?;
+            .release_management_retention(agent, &authorization)
+            .map_err(|error| { trace("retention_release", "refused"); error })?;
+        trace("retention_release", "complete");
         Ok(true)
     }
 
@@ -5538,6 +5608,13 @@ where
         // A fresh signed observation is independent of management reservation
         // ordering. It proves current decision state without retaining a child.
         let query = self.signed_genesis_decision_query(agent, nonce, signer)?;
+        if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+            tracing::debug!(node = ?self.pins.node.0, agent = ?self.pins.agent.0,
+                root = ?acknowledgement.credential_call.0,
+                invocation = ?acknowledgement.authorization_invocation.0,
+                request = ?query.commitment().0, phase = "genesis_decision_observation",
+                "VOS causal owner");
+        }
         let response = self.invoke_authority_observation(query).map_err(|error| {
             if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
                 tracing::debug!(?error, "Finalized genesis fresh decision refused");
@@ -5962,6 +6039,13 @@ where
                 ) {
                     return Err(SharedAgentHostError::ScopeMismatch);
                 }
+                if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                    tracing::debug!(node = ?self.pins.node.0, agent = ?self.pins.agent.0,
+                        root = ?slot.intent().map(|intent| intent.call().commitment().0),
+                        parent = ?candidate.authorization().0, invocation = ?work.invocation.0,
+                        work = ?work.commitment().0, authorization = ?authorization.commitment().0,
+                        phase = "publication_child", "VOS causal owner");
+                }
                 let envelope = RuntimeWork::Invoke {
                     context: RuntimeExecutionContext::Direct,
                     state: RuntimeState::default(),
@@ -6164,9 +6248,17 @@ where
             .extend(crate::actors::value::Msg::new("genesis_signing_committee").encode());
         #[cfg(feature = "experimental-state-blocks")]
         {
+            let observation_request = work.commitment();
+            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                tracing::debug!(node = ?self.pins.node.0, agent = ?self.pins.agent.0,
+                    root = ?slot.intent().map(|intent| intent.call().commitment().0),
+                    invocation = ?candidate.authorization().0, request = ?observation_request.0,
+                    observation = ?work.invocation.0, work = ?observation_request.0,
+                    kind = "committee", "VOS causal observation");
+            }
             let outcome = self._network_host.with_authority_observation(
                 agent,
-                work.commitment(),
+                observation_request,
                 |host| host.observe_system_authority(agent, &work),
             )?;
             let super::sdk::RuntimeOutcome::Completed(Ok(reply)) = outcome else {
@@ -8712,8 +8804,24 @@ where
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        let material =
-            self.supervisor_invocation_material(self.pins.agent, self.pins.authority.issuer.actor)?;
+        let diagnostic_started = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS")
+            .is_some().then(std::time::Instant::now);
+        let material = self
+            .supervisor_invocation_material(self.pins.agent, self.pins.authority.issuer.actor)
+            .map_err(|error| {
+                if let Some(started) = diagnostic_started {
+                    tracing::debug!(node = ?self.pins.node.0, agent = ?self.pins.agent.0,
+                        request = ?query.commitment().0, kind = "material", status = "refused",
+                        elapsed_us = started.elapsed().as_micros(), error = ?error,
+                        "VOS causal observation");
+                }
+                error
+            })?;
+        if let Some(started) = diagnostic_started {
+            tracing::debug!(node = ?self.pins.node.0, agent = ?self.pins.agent.0,
+                request = ?query.commitment().0, kind = "material", status = "complete",
+                elapsed_us = started.elapsed().as_micros(), "VOS causal observation");
+        }
         if material.actor.entry.actor != self.pins.authority.issuer.actor
             || material.actor.entry.deployment != self.pins.authority.issuer.deployment
             || material.actor.entry.program != self.pins.authority.issuer.program
@@ -8794,9 +8902,15 @@ where
         {
             use crate::actors::codec::Decode as _;
             let work = self.prepare_authority_observation_work(&query)?;
+            let observation_request = query.commitment();
+            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                tracing::debug!(node = ?self.pins.node.0, agent = ?self.pins.agent.0,
+                    request = ?observation_request.0, observation = ?work.invocation.0,
+                    work = ?work.commitment().0, kind = "projection", "VOS causal observation");
+            }
             let outcome = self._network_host.with_authority_observation(
                 crate::service::AgentId(self.pins.agent.0),
-                query.commitment(),
+                observation_request,
                 |host| {
                     let result = host.observe_system_authority(
                         crate::service::AgentId(self.pins.agent.0), &work,

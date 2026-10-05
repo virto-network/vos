@@ -242,11 +242,13 @@ impl SharedRouteHandler {
         let trace = |phase: &str| {
             if let (Some(started), Some((kind, metadata, key))) = (started, diagnostic) {
                 tracing::debug!(
-                    node = ?self.network.agent_node_id(), agent = ?self.agent,
-                    origin = ?sender, kind, metadata = ?metadata,
-                    invocation = ?key.map(|key| key.invocation),
-                    work = ?key.map(|key| key.work),
-                    authorization = ?key.map(|key| key.authorization),
+                    node = ?self.network.agent_node_id().0, agent = ?self.agent.0,
+                    route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                    thread = ?std::thread::current().id(),
+                    origin = ?sender.0, kind, metadata = ?metadata.map(|value| value.0),
+                    invocation = ?key.map(|key| key.invocation.0),
+                    work = ?key.map(|key| key.work.0),
+                    authorization = ?key.map(|key| key.authorization.0),
                     phase, elapsed_us = started.elapsed().as_micros(),
                     "management_metadata_leader"
                 );
@@ -255,8 +257,10 @@ impl SharedRouteHandler {
         let refused = |phase: &str, error: SharedAgentHostError| {
             trace(phase);
             if started.is_some() {
-                tracing::debug!(node = ?self.network.agent_node_id(), agent = ?self.agent,
-                    origin = ?sender, metadata = ?diagnostic.map(|(_, metadata, _)| metadata),
+                tracing::debug!(node = ?self.network.agent_node_id().0, agent = ?self.agent.0,
+                    route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                    thread = ?std::thread::current().id(),
+                    origin = ?sender.0, metadata = ?diagnostic.and_then(|(_, metadata, _)| metadata).map(|value| value.0),
                     phase, ?error, "management_metadata_leader refusal");
             }
             error
@@ -271,8 +275,10 @@ impl SharedRouteHandler {
             .worker
             .as_ref()
             .ok_or_else(|| refused("worker_missing", SharedAgentHostError::TransportNotAttached))?;
+        trace("before_snapshot_start");
         let before = futures_executor::block_on(worker.snapshot())
             .ok_or_else(|| refused("before_snapshot_missing", SharedAgentHostError::Unavailable))?;
+        trace("before_snapshot_complete");
         trace("strict_barrier_start");
         quiescent_proposal_commit(
             before.role,
@@ -282,10 +288,13 @@ impl SharedRouteHandler {
         )
         .map_err(|error| refused("strict_barrier_error", error))?;
         trace("strict_barrier_complete");
+        trace("host_wait_start");
         let mut host = self
             .host
             .lock()
             .map_err(|_| refused("host_lock_error", SharedAgentHostError::Unavailable))?;
+        trace("host_acquired");
+        trace("host_drain_start");
         drain_committed(&mut host, self.agent, &self.ordered_replies)
             .map_err(|error| refused("host_drain_error", error))?;
         trace("host_drained");
@@ -298,6 +307,7 @@ impl SharedRouteHandler {
                 SharedAgentHostError::ScopeMismatch,
             ));
         }
+        trace("manifest_start");
         let manifest = host
             .recovery_manifest(self.agent)
             .map_err(|error| refused("manifest_error", error))?;
@@ -309,10 +319,35 @@ impl SharedRouteHandler {
                 route: requested,
                 registration,
             } if *requested == route && registration.owner().0 == sender.0 => {
+                let trace_family = |status: &'static str| {
+                    if let Some(started) = started {
+                        let request = registration.request();
+                        let registration_id = registration.commitment().0;
+                        let root_member = request.members().first().map(|member| member.commitment().0);
+                        for (member_index, member) in request.members().iter().enumerate() {
+                            let key = ManagementInvocationKey::new(member.work(), member.authorization());
+                            tracing::debug!(node = ?self.network.agent_node_id().0, agent = ?self.agent.0,
+                                route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                                thread = ?std::thread::current().id(),
+                                genesis = ?request.generation().genesis().as_bytes(),
+                                admission = ?request.generation().admission().as_bytes(),
+                                committee = ?request.committee().as_bytes(), owner = ?request.owner().0,
+                                origin = ?request.origin_owner().0, registration = ?registration_id,
+                                predecessor = ?request.previous().map(|value| value.0), root_member = ?root_member,
+                                member_index, member = ?member.commitment().0,
+                                parent = ?member.parent().map(|value| value.0),
+                                invocation = ?key.invocation.0, work = ?key.work.0, authorization = ?key.authorization.0,
+                                sequence = request.sequence(), phase = "family_binding", status,
+                                poll = 0u64, elapsed_us = started.elapsed().as_micros(),
+                                "VOS causal management");
+                        }
+                    }
+                };
                 if manifest
                     .management_slot(registration.owner())
                     .is_some_and(|slot| slot.registration() == registration)
                 {
+                    trace_family("retained_registration");
                     trace("retained_registration");
                     return Ok(());
                 }
@@ -328,6 +363,7 @@ impl SharedRouteHandler {
                     &manifest,
                 )
                 .map_err(|error| refused("registration_validation_error", error))?;
+                trace_family("signed_registration");
                 trace("signed_registration_verified");
                 let required = host
                     .management_retention_admission_requirement_with_manifest(
@@ -382,15 +418,39 @@ impl SharedRouteHandler {
                 route: requested,
                 release,
             } if *requested == route && release.request().owner().0 == sender.0 => {
+                let trace_release = |status: &'static str| {
+                    if let Some(started) = started {
+                        let request = release.request();
+                        let slot = manifest.management_slot(request.owner());
+                        let root = slot.and_then(|slot| slot.members().first());
+                        let key = root.map(|member| ManagementInvocationKey::new(member.work(), member.authorization()));
+                        tracing::debug!(node = ?self.network.agent_node_id().0, agent = ?self.agent.0,
+                            route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                            thread = ?std::thread::current().id(),
+                            genesis = ?request.generation().genesis().as_bytes(),
+                            admission = ?request.generation().admission().as_bytes(),
+                            committee = ?request.committee().as_bytes(), owner = ?request.owner().0,
+                            metadata = ?release.commitment().0, scope = ?request.scope().0,
+                            registration = ?slot.map(|slot| slot.registration().commitment().0),
+                            root_member = ?root.map(|member| member.commitment().0),
+                            invocation = ?key.map(|key| key.invocation.0),
+                            work = ?key.map(|key| key.work.0), authorization = ?key.map(|key| key.authorization.0),
+                            sequence = request.sequence(), phase = "release_binding", status,
+                            poll = 0u64, elapsed_us = started.elapsed().as_micros(),
+                            "VOS causal management");
+                    }
+                };
                 if manifest
                     .management_slot(release.request().owner())
                     .is_some_and(|slot| slot.release() == Some(release))
                 {
+                    trace_release("retained_release");
                     trace("retained_release");
                     return Ok(());
                 }
                 host.validate_management_recovery_release(self.agent, release)
                     .map_err(|error| refused("release_validation_error", error))?;
+                trace_release("signed_release");
                 None
             }
             _ => {
@@ -546,9 +606,11 @@ impl SharedRouteHandler {
             .then(Instant::now);
         let trace = |phase: &str| {
             if let Some(started) = started {
-                tracing::debug!(node = ?self.network.agent_node_id(), agent = ?self.agent,
-                    origin = ?sender, registration = ?operation.registration,
-                    member = ?operation.member, operation = ?operation.operation,
+                tracing::debug!(node = ?self.network.agent_node_id().0, agent = ?self.agent.0,
+                    route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                    thread = ?std::thread::current().id(),
+                    origin = ?sender.0, registration = ?operation.registration.0,
+                    member = ?operation.member.0, operation = ?operation.operation,
                     phase, elapsed_us = started.elapsed().as_micros(),
                     "management_operation_leader"
                 );
@@ -557,19 +619,24 @@ impl SharedRouteHandler {
         let refused = |phase: &str, error: SharedAgentHostError| {
             trace(phase);
             if started.is_some() {
-                tracing::debug!(node = ?self.network.agent_node_id(), agent = ?self.agent,
-                    origin = ?sender, registration = ?operation.registration,
-                    member = ?operation.member, operation = ?operation.operation,
+                tracing::debug!(node = ?self.network.agent_node_id().0, agent = ?self.agent.0,
+                    route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                    thread = ?std::thread::current().id(),
+                    origin = ?sender.0, registration = ?operation.registration.0,
+                    member = ?operation.member.0, operation = ?operation.operation,
                     phase, ?error, "management_operation_leader refusal");
             }
             error
         };
         trace("receive");
         let (member, retained_input) = {
+            trace("host_wait_start");
             let mut host = self
                 .host
                 .lock()
                 .map_err(|_| refused("host_lock_error", SharedAgentHostError::Unavailable))?;
+            trace("host_acquired");
+            trace("host_drain_start");
             drain_committed(&mut host, self.agent, &self.ordered_replies)
                 .map_err(|error| refused("host_drain_error", error))?;
             trace("host_drained");
@@ -582,9 +649,11 @@ impl SharedRouteHandler {
                     SharedAgentHostError::ScopeMismatch,
                 ));
             }
+            trace("manifest_start");
             let manifest = host
                 .recovery_manifest(self.agent)
                 .map_err(|error| refused("manifest_error", error))?;
+            trace("manifest_verified");
             let slot = manifest
                 .management_slot(crate::service::NodeId(sender.0))
                 .filter(|slot| slot.registration().commitment().0 == operation.registration.0)
@@ -606,10 +675,12 @@ impl SharedRouteHandler {
                     slot.members()[index].work(),
                     slot.members()[index].authorization(),
                 );
-                tracing::debug!(node = ?self.network.agent_node_id(), agent = ?self.agent,
-                    origin = ?sender, registration = ?operation.registration,
-                    member = ?operation.member, invocation = ?key.invocation,
-                    work = ?key.work, authorization = ?key.authorization,
+                tracing::debug!(node = ?self.network.agent_node_id().0, agent = ?self.agent.0,
+                    route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                    thread = ?std::thread::current().id(),
+                    origin = ?sender.0, registration = ?operation.registration.0,
+                    member = ?operation.member.0, invocation = ?key.invocation.0,
+                    work = ?key.work.0, authorization = ?key.authorization.0,
                     "management_operation_leader exact member");
             }
             let evidence = match operation.operation {
@@ -627,9 +698,11 @@ impl SharedRouteHandler {
             // No new row or headroom is required for an authenticated first
             // capsule. In particular an ACKed approval is not a new denial.
             if started.is_some() {
-                tracing::debug!(node = ?self.network.agent_node_id(), agent = ?self.agent,
-                    origin = ?sender, registration = ?operation.registration,
-                    member = ?operation.member, ?input,
+                tracing::debug!(node = ?self.network.agent_node_id().0, agent = ?self.agent.0,
+                    route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                    thread = ?std::thread::current().id(),
+                    origin = ?sender.0, registration = ?operation.registration.0,
+                    member = ?operation.member.0, input = ?input.as_bytes(),
                     "management_operation_leader retained input");
             }
             trace("retained_availability_start");
@@ -686,10 +759,11 @@ impl SharedRouteHandler {
             started.map(|_| ManagementInvocationKey::new(request.work(), request.authorization()));
         let trace = |phase: &str| {
             if let Some(started) = started {
-                tracing::debug!(node = ?self.network.agent_node_id(), agent = ?self.agent,
-                    invocation = ?invocation,
-                    work = ?diagnostic_key.map(|key| key.work),
-                    authorization = ?diagnostic_key.map(|key| key.authorization),
+                tracing::debug!(node = ?self.network.agent_node_id().0, agent = ?self.agent.0,
+                    route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                    thread = ?std::thread::current().id(), invocation = ?invocation.0,
+                    work = ?diagnostic_key.map(|key| key.work.0),
+                    authorization = ?diagnostic_key.map(|key| key.authorization.0),
                     phase, elapsed_us = started.elapsed().as_micros(),
                     "management_operation_forward"
                 );
@@ -698,8 +772,9 @@ impl SharedRouteHandler {
         let refused = |phase: &str, error: SharedAgentHostError| {
             trace(phase);
             if started.is_some() {
-                tracing::debug!(node = ?self.network.agent_node_id(), agent = ?self.agent,
-                    invocation = ?invocation, phase, ?error,
+                tracing::debug!(node = ?self.network.agent_node_id().0, agent = ?self.agent.0,
+                    route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                    thread = ?std::thread::current().id(), invocation = ?invocation.0, phase, ?error,
                     "management_operation_forward refusal");
             }
             error
@@ -709,11 +784,15 @@ impl SharedRouteHandler {
             .worker
             .as_ref()
             .ok_or_else(|| refused("worker_missing", SharedAgentHostError::TransportNotAttached))?;
+        trace("before_snapshot_start");
         let before = futures_executor::block_on(worker.snapshot())
             .ok_or_else(|| refused("before_snapshot_missing", SharedAgentHostError::Unavailable))?;
+        trace("before_snapshot_complete");
         if started.is_some() {
-            tracing::debug!(node = ?self.network.agent_node_id(), agent = ?self.agent,
-                invocation = ?invocation, role = ?before.role, term = before.current_term,
+            tracing::debug!(node = ?self.network.agent_node_id().0, agent = ?self.agent.0,
+                route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                thread = ?std::thread::current().id(), invocation = ?invocation.0,
+                role = ?before.role, term = before.current_term,
                 committed = before.commit_index, last = before.last_log_index,
                 "management_operation_forward before barrier"
             );
@@ -743,17 +822,22 @@ impl SharedRouteHandler {
             }
         };
         let retained = {
+            trace("prepare_host_wait_start");
             let mut host = self.host.lock().map_err(|_| {
                 refused("prepare_host_lock_error", SharedAgentHostError::Unavailable)
             })?;
+            trace("prepare_host_acquired");
+            trace("prepare_host_drain_start");
             drain_committed(&mut host, self.agent, &self.ordered_replies)
                 .map_err(|error| refused("prepare_host_drain_error", error))?;
             trace("host_drained");
             self.management_fingerprint(&host)
                 .map_err(|error| refused("prepare_fingerprint_error", error))?;
+            trace("prepare_manifest_start");
             let manifest = host
                 .recovery_manifest(self.agent)
                 .map_err(|error| refused("prepare_manifest_error", error))?;
+            trace("prepare_manifest_verified");
             let slot = manifest
                 .management_slot(crate::service::NodeId(self.network.agent_node_id().0))
                 .ok_or_else(|| {
@@ -789,8 +873,10 @@ impl SharedRouteHandler {
                 )
             })?;
             if started.is_some() {
-                tracing::debug!(node = ?self.network.agent_node_id(), agent = ?self.agent,
-                    invocation = ?invocation, role = ?current.role, term = current.current_term,
+                tracing::debug!(node = ?self.network.agent_node_id().0, agent = ?self.agent.0,
+                    route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                    thread = ?std::thread::current().id(), invocation = ?invocation.0,
+                    role = ?current.role, term = current.current_term,
                     committed = current.commit_index, last = current.last_log_index,
                     "management_operation_forward current barrier"
                 );
@@ -812,9 +898,12 @@ impl SharedRouteHandler {
             }
         };
         if started.is_some() {
-            tracing::debug!(node = ?self.network.agent_node_id(), agent = ?self.agent,
-                invocation = ?invocation, ?leader, registration = ?retained.registration,
-                member = ?retained.member, operation = ?retained.operation,
+            tracing::debug!(node = ?self.network.agent_node_id().0, agent = ?self.agent.0,
+                route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                thread = ?std::thread::current().id(), invocation = ?invocation.0,
+                work = ?diagnostic_key.map(|key| key.work.0), authorization = ?diagnostic_key.map(|key| key.authorization.0),
+                leader = ?leader.0, registration = ?retained.registration.0,
+                member = ?retained.member.0, operation = ?retained.operation,
                 "management_operation_forward prepared");
         }
         let deadline = Instant::now() + ORDERED_REPLY_WAIT;
@@ -830,6 +919,19 @@ impl SharedRouteHandler {
         trace("local_custody_wait_start");
         #[cfg(test)]
         let mut hint_reported = false;
+        let trace_poll = |phase: &'static str, status: &'static str, poll: u64, phase_started: Option<Instant>| {
+            if let Some(phase_started) = phase_started {
+                tracing::debug!(node = ?self.network.agent_node_id().0, agent = ?self.agent.0,
+                    route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                    thread = ?std::thread::current().id(), invocation = ?invocation.0,
+                    work = ?diagnostic_key.map(|key| key.work.0), authorization = ?diagnostic_key.map(|key| key.authorization.0),
+                    registration = ?retained.registration.0, member = ?retained.member.0,
+                    operation = ?operation, phase, status, poll,
+                    elapsed_us = phase_started.elapsed().as_micros(), "VOS causal management");
+            }
+        };
+        let mut diagnostic_poll = 0u64;
+        let mut diagnostic_frontier = None;
         loop {
             #[cfg(test)]
             if !hint_reported && std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
@@ -842,22 +944,36 @@ impl SharedRouteHandler {
                             Err(std::sync::mpsc::TryRecvError::Disconnected) => "disconnected",
                             Err(std::sync::mpsc::TryRecvError::Empty) => "empty",
                         };
-                        tracing::debug!(node = ?self.network.agent_node_id(), agent = ?self.agent,
-                            invocation = ?invocation, category, "management_operation_forward reply hint");
+                        tracing::debug!(node = ?self.network.agent_node_id().0, agent = ?self.agent.0,
+                            route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                            thread = ?std::thread::current().id(), invocation = ?invocation.0,
+                            category, "management_operation_forward reply hint");
                     }
                 }
             }
-            let mut host = self
+            if started.is_some() {
+                diagnostic_poll = diagnostic_poll.saturating_add(1);
+            }
+            let phase_started = started.map(|_| Instant::now());
+            let host_result = self
                 .host
                 .lock()
-                .map_err(|_| refused("wait_host_lock_error", SharedAgentHostError::Unavailable))?;
-            drain_committed(&mut host, self.agent, &self.ordered_replies)
-                .map_err(|error| refused("wait_host_drain_error", error))?;
+                .map_err(|_| refused("wait_host_lock_error", SharedAgentHostError::Unavailable));
+            trace_poll("operation_host_wait", if host_result.is_ok() { "ok" } else { "error" }, diagnostic_poll, phase_started);
+            let mut host = host_result?;
+            let phase_started = started.map(|_| Instant::now());
+            let drain_result = drain_committed(&mut host, self.agent, &self.ordered_replies)
+                .map_err(|error| refused("wait_host_drain_error", error));
+            trace_poll("operation_drain", if drain_result.is_ok() { "ok" } else { "error" }, diagnostic_poll, phase_started);
+            drain_result?;
             self.management_fingerprint(&host)
                 .map_err(|error| refused("wait_fingerprint_error", error))?;
-            let manifest = host
+            let phase_started = started.map(|_| Instant::now());
+            let manifest_result = host
                 .recovery_manifest(self.agent)
-                .map_err(|error| refused("wait_manifest_error", error))?;
+                .map_err(|error| refused("wait_manifest_error", error));
+            trace_poll("operation_manifest", if manifest_result.is_ok() { "ok" } else { "error" }, diagnostic_poll, phase_started);
+            let manifest = manifest_result?;
             let (slot, index) = management_operation_wait_member(
                 manifest.management_slot(crate::service::NodeId(self.network.agent_node_id().0)),
                 &retained,
@@ -878,13 +994,35 @@ impl SharedRouteHandler {
                     slot.members_evidence()[index].acknowledgement()
                 }
             };
+            if let Some(started) = started {
+                // Compare only the observed retained position. This is not
+                // equality of state bytes or a proof reused by admission.
+                let frontier = manifest.management_slots().iter()
+                    .map(|slot| slot.last_position()).max().unwrap_or((0, 0));
+                tracing::debug!(node = ?self.network.agent_node_id().0, agent = ?self.agent.0,
+                    route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                    thread = ?std::thread::current().id(), invocation = ?invocation.0,
+                    work = ?diagnostic_key.map(|key| key.work.0), authorization = ?diagnostic_key.map(|key| key.authorization.0),
+                    registration = ?retained.registration.0, member = ?retained.member.0,
+                    operation = ?operation, phase = "operation_poll",
+                    status = if evidence.is_some() { "present" } else { "absent" },
+                    poll = diagnostic_poll, elapsed_us = started.elapsed().as_micros(),
+                    retained_index = frontier.0, retained_term = frontier.1,
+                    prior_frontier = diagnostic_frontier.is_some(),
+                    retained_frontier_equal = diagnostic_frontier == Some(frontier),
+                    "VOS causal management");
+                diagnostic_frontier = Some(frontier);
+            }
             if let Some(evidence) = evidence {
                 let input = evidence.input_id();
                 let outcome = evidence.outcome().clone();
                 trace("local_evidence");
                 if started.is_some() {
-                    tracing::debug!(node = ?self.network.agent_node_id(), agent = ?self.agent,
-                        invocation = ?invocation, ?input, "management_operation_forward local evidence");
+                    tracing::debug!(node = ?self.network.agent_node_id().0, agent = ?self.agent.0,
+                        route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                        thread = ?std::thread::current().id(), invocation = ?invocation.0,
+                        registration = ?retained.registration.0, member = ?retained.member.0,
+                        input = ?input.as_bytes(), "management_operation_forward local evidence");
                 }
                 drop(host);
                 trace("availability_start");

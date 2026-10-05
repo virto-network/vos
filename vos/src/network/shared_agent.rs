@@ -1667,18 +1667,35 @@ impl SharedRouteHandler {
         });
         let trace = |phase: &str| {
             if let (Some(started), Some((kind, metadata, key))) = (started, diagnostic) {
-                tracing::debug!(node = ?self.network.agent_node_id(), agent = ?self.agent,
-                    kind, metadata = ?metadata, invocation = ?key.map(|key| key.invocation),
-                    work = ?key.map(|key| key.work), authorization = ?key.map(|key| key.authorization),
+                tracing::debug!(node = ?self.network.agent_node_id().0, agent = ?self.agent.0,
+                    route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                    thread = ?std::thread::current().id(),
+                    kind, metadata = ?metadata.map(|value| value.0),
+                    invocation = ?key.map(|key| key.invocation.0),
+                    work = ?key.map(|key| key.work.0), authorization = ?key.map(|key| key.authorization.0),
                     phase, elapsed_us = started.elapsed().as_micros(),
                     "management_metadata_commit");
+            }
+        };
+        let trace_poll = |phase: &'static str, status: &'static str, poll: u64, phase_started: Option<Instant>| {
+            if let (Some(phase_started), Some((kind, metadata, key))) = (phase_started, diagnostic) {
+                tracing::debug!(node = ?self.network.agent_node_id().0, agent = ?self.agent.0,
+                    route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                    thread = ?std::thread::current().id(),
+                    kind, metadata = ?metadata.map(|value| value.0),
+                    invocation = ?key.map(|key| key.invocation.0),
+                    work = ?key.map(|key| key.work.0), authorization = ?key.map(|key| key.authorization.0),
+                    phase, status, poll, elapsed_us = phase_started.elapsed().as_micros(),
+                    "VOS causal management");
             }
         };
         let refused = |phase: &str, error: SharedAgentHostError| {
             trace(phase);
             if started.is_some() {
-                tracing::debug!(node = ?self.network.agent_node_id(), agent = ?self.agent,
-                    metadata = ?diagnostic.map(|(_, metadata, _)| metadata), phase, ?error,
+                tracing::debug!(node = ?self.network.agent_node_id().0, agent = ?self.agent.0,
+                    route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                    thread = ?std::thread::current().id(),
+                    metadata = ?diagnostic.and_then(|(_, metadata, _)| metadata).map(|value| value.0), phase, ?error,
                     "management_metadata_commit refusal");
             }
             error
@@ -1693,8 +1710,8 @@ impl SharedRouteHandler {
                 .management_leader(barrier)
                 .map_err(|error| refused("leader_unavailable", error))?;
             if started.is_some() {
-                tracing::debug!(node = ?self.network.agent_node_id(), agent = ?self.agent,
-                    ?leader, role = ?barrier.role, term = barrier.current_term,
+                tracing::debug!(node = ?self.network.agent_node_id().0, agent = ?self.agent.0,
+                    leader = ?leader.0, role = ?barrier.role, term = barrier.current_term,
                     committed = barrier.commit_index, last = barrier.last_log_index,
                     "management_metadata_commit forward");
             }
@@ -1730,13 +1747,24 @@ impl SharedRouteHandler {
             ));
         }
         trace("local_custody_wait_start");
+        let mut diagnostic_poll = 0u64;
+        let mut diagnostic_frontier = None;
         loop {
-            let mut host = self
+            if started.is_some() {
+                diagnostic_poll = diagnostic_poll.saturating_add(1);
+            }
+            let phase_started = started.map(|_| Instant::now());
+            let host_result = self
                 .host
                 .lock()
-                .map_err(|_| refused("wait_host_lock_error", SharedAgentHostError::Unavailable))?;
-            drain_committed(&mut host, self.agent, &self.ordered_replies)
-                .map_err(|error| refused("wait_host_drain_error", error))?;
+                .map_err(|_| refused("wait_host_lock_error", SharedAgentHostError::Unavailable));
+            trace_poll("metadata_host_wait", if host_result.is_ok() { "ok" } else { "error" }, diagnostic_poll, phase_started);
+            let mut host = host_result?;
+            let phase_started = started.map(|_| Instant::now());
+            let drain_result = drain_committed(&mut host, self.agent, &self.ordered_replies)
+                .map_err(|error| refused("wait_host_drain_error", error));
+            trace_poll("metadata_drain", if drain_result.is_ok() { "ok" } else { "error" }, diagnostic_poll, phase_started);
+            drain_result?;
             let status = host
                 .supervisor_attachment_status(self.agent)
                 .map_err(|error| refused("wait_attachment_error", error))?
@@ -1756,9 +1784,12 @@ impl SharedRouteHandler {
                     SharedAgentHostError::ScopeMismatch,
                 ));
             }
-            let manifest = host
+            let phase_started = started.map(|_| Instant::now());
+            let manifest_result = host
                 .recovery_manifest(self.agent)
-                .map_err(|error| refused("wait_manifest_error", error))?;
+                .map_err(|error| refused("wait_manifest_error", error));
+            trace_poll("metadata_manifest", if manifest_result.is_ok() { "ok" } else { "error" }, diagnostic_poll, phase_started);
+            let manifest = manifest_result?;
             let committed = match command {
                 shared_raft::AgentRaftCommand::RegisterManagementRecovery {
                     registration, ..
@@ -1777,6 +1808,25 @@ impl SharedRouteHandler {
                     ));
                 }
             };
+            if let (Some(started), Some((kind, metadata, key))) = (started, diagnostic) {
+                // Position comparison is diagnostic only. Equal retained
+                // frontiers do not authenticate equal manifest or state bytes.
+                let frontier = manifest.management_slots().iter()
+                    .map(|slot| slot.last_position()).max().unwrap_or((0, 0));
+                tracing::debug!(node = ?self.network.agent_node_id().0, agent = ?self.agent.0,
+                    route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                    thread = ?std::thread::current().id(),
+                    kind, metadata = ?metadata.map(|value| value.0),
+                    invocation = ?key.map(|key| key.invocation.0),
+                    work = ?key.map(|key| key.work.0), authorization = ?key.map(|key| key.authorization.0),
+                    phase = "metadata_poll", status = if committed { "present" } else { "absent" },
+                    poll = diagnostic_poll, elapsed_us = started.elapsed().as_micros(),
+                    retained_index = frontier.0, retained_term = frontier.1,
+                    prior_frontier = diagnostic_frontier.is_some(),
+                    retained_frontier_equal = diagnostic_frontier == Some(frontier),
+                    "VOS causal management");
+                diagnostic_frontier = Some(frontier);
+            }
             if committed {
                 trace("local_custody_complete");
                 return Ok(());
@@ -1799,6 +1849,8 @@ impl SharedRouteHandler {
         root: &crate::agent_sdk::RuntimeWork,
     ) -> Result<(), SharedAgentHostError> {
         let key = management_envelope_key(self.agent, root)?;
+        let diagnostic_started = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS")
+            .is_some().then(Instant::now);
         let _proposal = self
             .proposal
             .lock()
@@ -1869,6 +1921,20 @@ impl SharedRouteHandler {
         }
         let request = SharedManagementRecoveryReleaseRequest::for_slot(slot)
             .map_err(|_| SharedAgentHostError::Conflict)?;
+        if let Some(started) = diagnostic_started {
+            tracing::debug!(node = ?self.network.agent_node_id().0, agent = ?self.agent.0,
+                route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                thread = ?std::thread::current().id(),
+                genesis = ?request.generation().genesis().as_bytes(),
+                admission = ?request.generation().admission().as_bytes(),
+                committee = ?request.committee().as_bytes(), owner = ?request.owner().0,
+                scope = ?request.scope().0, registration = ?slot.registration().commitment().0,
+                root_member = ?slot.members().first().map(|member| member.commitment().0),
+                invocation = ?key.invocation.0, work = ?key.work.0, authorization = ?key.authorization.0,
+                sequence = request.sequence(), phase = "release_scope_binding", status = "verified_scope",
+                poll = 0u64, elapsed_us = started.elapsed().as_micros(),
+                "VOS causal management");
+        }
         // The complete tuple came from the first audit after the drain.
         // Only read-only attachment and exact manifest/request checks have
         // run under these uninterrupted proposal/host guards. Consume it
@@ -1886,6 +1952,20 @@ impl SharedRouteHandler {
             host.prepare_signed_management_recovery_release(self.agent, &request)?;
         let release = SharedManagementRecoveryRelease::new(candidate.request().clone(), signature)
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if let Some(started) = diagnostic_started {
+            tracing::debug!(node = ?self.network.agent_node_id().0, agent = ?self.agent.0,
+                route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                thread = ?std::thread::current().id(),
+                genesis = ?release.request().generation().genesis().as_bytes(),
+                admission = ?release.request().generation().admission().as_bytes(),
+                committee = ?release.request().committee().as_bytes(), owner = ?release.request().owner().0,
+                metadata = ?release.commitment().0, scope = ?release.request().scope().0,
+                registration = ?Some(slot.registration().commitment().0),
+                root_member = ?slot.members().first().map(|member| member.commitment().0),
+                invocation = ?Some(key.invocation.0), work = ?Some(key.work.0), authorization = ?Some(key.authorization.0),
+                sequence = release.request().sequence(), phase = "release_binding", status = "signed_candidate",
+                poll = 0u64, elapsed_us = started.elapsed().as_micros(), "VOS causal management");
+        }
         let command = shared_raft::AgentRaftCommand::ReleaseManagementRecovery {
             route: status.route,
             release,
@@ -1916,13 +1996,27 @@ impl SharedRouteHandler {
         F: FnOnce(&PendingManagement) -> Result<T, SharedAgentHostError>,
     {
         let key = management_envelope_key(self.agent, proposed)?;
+        let diagnostic_started = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS")
+            .is_some().then(Instant::now);
+        let trace_capture = |phase: &'static str| {
+            if let Some(started) = diagnostic_started {
+                tracing::debug!(node = ?self.network.agent_node_id().0, agent = ?self.agent.0,
+                    route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                    thread = ?std::thread::current().id(), invocation = ?key.invocation.0,
+                    work = ?key.work.0, authorization = ?key.authorization.0,
+                    phase, status = "candidate", poll = 0u64,
+                    elapsed_us = started.elapsed().as_micros(), "VOS causal management");
+            }
+        };
         if fresh_only && (!retain_management || predecessor.is_some() || !pending.is_empty() || !retiring.is_empty()) {
             return Err(SharedAgentHostError::Conflict);
         }
+        trace_capture("capture_proposal_start");
         let mut proposal = self
             .proposal
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
+        trace_capture("capture_proposal_acquired");
         let pending_keys = if pending.is_empty() {
             None
         } else {
@@ -1997,19 +2091,24 @@ impl SharedRouteHandler {
         if !(retain_management && self.management_retention) && !self.has_local_proposer(worker) {
             return Err(SharedAgentHostError::Unavailable);
         }
+        trace_capture("capture_worker_start");
         let barrier = futures_executor::block_on(worker.snapshot())
             .ok_or(SharedAgentHostError::Unavailable)?;
+        trace_capture("capture_worker_complete");
         quiescent_proposal_commit(
             barrier.role,
             barrier.commit_index,
             barrier.last_log_index,
             retain_management && self.management_retention,
         )?;
+        trace_capture("capture_host_start");
         let mut host = self
             .host
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
+        trace_capture("capture_host_acquired");
         drain_committed(&mut host, self.agent, &self.ordered_replies)?;
+        trace_capture("capture_host_drained");
         let (applied_slots, remaining_slots, _) = host.capacity(self.agent)?;
         let current = futures_executor::block_on(worker.snapshot())
             .ok_or(SharedAgentHostError::Unavailable)?;
@@ -2245,6 +2344,28 @@ impl SharedRouteHandler {
                         signature,
                     )
                     .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                    if let Some(started) = diagnostic_started {
+                        let request = registration.request();
+                        let registration_id = registration.commitment().0;
+                        let root_member = request.members().first().map(|member| member.commitment().0);
+                        for (member_index, member) in request.members().iter().enumerate() {
+                            let key = ManagementInvocationKey::new(member.work(), member.authorization());
+                            tracing::debug!(node = ?self.network.agent_node_id().0, agent = ?self.agent.0,
+                                route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                                thread = ?std::thread::current().id(),
+                                genesis = ?request.generation().genesis().as_bytes(),
+                                admission = ?request.generation().admission().as_bytes(),
+                                committee = ?request.committee().as_bytes(), owner = ?request.owner().0,
+                                origin = ?request.origin_owner().0, registration = ?registration_id,
+                                predecessor = ?request.previous().map(|value| value.0), root_member = ?root_member,
+                                member_index, member = ?member.commitment().0,
+                                parent = ?member.parent().map(|value| value.0),
+                                invocation = ?key.invocation.0, work = ?key.work.0, authorization = ?key.authorization.0,
+                                sequence = request.sequence(), phase = "family_binding", status = "signed_candidate",
+                                poll = 0u64, elapsed_us = started.elapsed().as_micros(),
+                                "VOS causal management");
+                        }
+                    }
                     let command = shared_raft::AgentRaftCommand::RegisterManagementRecovery {
                         route: status.route,
                         registration,
@@ -2624,10 +2745,11 @@ impl SharedRouteHandler {
             started.map(|_| ManagementInvocationKey::new(request.work(), request.authorization()));
         let trace = |phase: &str| {
             if let Some(started) = started {
-                tracing::debug!(node = ?diagnostic_node, agent = ?self.agent,
-                    invocation = ?diagnostic_invocation,
-                    work = ?management_diagnostic_key.map(|key| key.work),
-                    authorization = ?management_diagnostic_key.map(|key| key.authorization),
+                tracing::debug!(node = ?diagnostic_node.0, agent = ?self.agent.0,
+                    route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                    thread = ?std::thread::current().id(), invocation = ?diagnostic_invocation.0,
+                    work = ?management_diagnostic_key.map(|key| key.work.0),
+                    authorization = ?management_diagnostic_key.map(|key| key.authorization.0),
                     reserved_kind = diagnostic_reserved_kind, operation_kind = diagnostic_operation_kind,
                     phase, elapsed_us = started.elapsed().as_micros(),
                     "management_custody_submit");
@@ -2636,8 +2758,9 @@ impl SharedRouteHandler {
         let refused = |phase: &str, error: SharedAgentHostError| {
             trace(phase);
             if started.is_some() {
-                tracing::debug!(node = ?diagnostic_node, agent = ?self.agent,
-                    invocation = ?diagnostic_invocation, phase, ?error,
+                tracing::debug!(node = ?diagnostic_node.0, agent = ?self.agent.0,
+                    route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                    thread = ?std::thread::current().id(), invocation = ?diagnostic_invocation.0, phase, ?error,
                     "management_custody_submit refusal");
             }
             error
@@ -2714,12 +2837,16 @@ impl SharedRouteHandler {
                 reservation,
                 Some(ReservedSubmission::ManagementCustody { .. })
             ) {
+            trace("before_snapshot_start");
             let barrier = futures_executor::block_on(worker.snapshot()).ok_or_else(|| {
                 refused("before_snapshot_missing", SharedAgentHostError::Unavailable)
             })?;
+            trace("before_snapshot_complete");
             if started.is_some() {
-                tracing::debug!(node = ?diagnostic_node, agent = ?self.agent,
-                    invocation = ?diagnostic_invocation, role = ?barrier.role,
+                tracing::debug!(node = ?diagnostic_node.0, agent = ?self.agent.0,
+                    route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                    thread = ?std::thread::current().id(), invocation = ?diagnostic_invocation.0,
+                    role = ?barrier.role,
                     term = barrier.current_term, committed = barrier.commit_index,
                     last = barrier.last_log_index, "management_custody_submit barrier");
             }
@@ -2737,10 +2864,13 @@ impl SharedRouteHandler {
             None
         };
         let input = {
+            trace("host_wait_start");
             let mut host = self
                 .host
                 .lock()
                 .map_err(|_| refused("host_lock_error", SharedAgentHostError::Unavailable))?;
+            trace("host_acquired");
+            trace("host_drain_start");
             drain_committed(&mut host, self.agent, &self.ordered_replies)
                 .map_err(|error| refused("host_drain_error", error))?;
             trace("host_drained");
@@ -2954,10 +3084,12 @@ impl SharedRouteHandler {
             trace("prepare_complete");
             let input = prepared.input();
             if started.is_some() {
-                tracing::debug!(node = ?diagnostic_node, agent = ?self.agent,
-                    invocation = ?diagnostic_invocation, ?input,
-                    work = ?management_diagnostic_key.map(|key| key.work),
-                    authorization = ?management_diagnostic_key.map(|key| key.authorization),
+                tracing::debug!(node = ?diagnostic_node.0, agent = ?self.agent.0,
+                    route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                    thread = ?std::thread::current().id(), invocation = ?diagnostic_invocation.0,
+                    input = ?input.as_bytes(),
+                    work = ?management_diagnostic_key.map(|key| key.work.0),
+                    authorization = ?management_diagnostic_key.map(|key| key.authorization.0),
                     "management_custody_submit prepared input");
             }
             if let Some(observed) = anchored_input {
@@ -2996,12 +3128,15 @@ impl SharedRouteHandler {
             trace("propose_complete");
             input
         };
+        trace("post_propose_host_wait_start");
         let mut host = self.host.lock().map_err(|_| {
             refused(
                 "post_propose_host_lock_error",
                 SharedAgentHostError::Unavailable,
             )
         })?;
+        trace("post_propose_host_acquired");
+        trace("post_propose_drain_start");
         drain_committed(&mut host, self.agent, &self.ordered_replies)
             .map_err(|error| refused("post_propose_drain_error", error))?;
         trace("post_propose_drained");
@@ -3010,12 +3145,13 @@ impl SharedRouteHandler {
         let outcome = self.ordered_replies.wait(input).map_err(|_| {
             if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
                 tracing::debug!(
-                    node = ?diagnostic_node,
-                    agent = ?self.agent,
-                    invocation = ?diagnostic_invocation,
-                    ?input,
-                    work = ?management_diagnostic_key.map(|key| key.work),
-                    authorization = ?management_diagnostic_key.map(|key| key.authorization),
+                    node = ?diagnostic_node.0,
+                    agent = ?self.agent.0,
+                    route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                    thread = ?std::thread::current().id(), invocation = ?diagnostic_invocation.0,
+                    input = ?input.as_bytes(),
+                    work = ?management_diagnostic_key.map(|key| key.work.0),
+                    authorization = ?management_diagnostic_key.map(|key| key.authorization.0),
                     reserved_kind = diagnostic_reserved_kind,
                     operation_kind = diagnostic_operation_kind,
                     "Ordered submission result handoff failed"

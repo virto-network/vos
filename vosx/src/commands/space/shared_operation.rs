@@ -464,6 +464,24 @@ pub(super) fn create_materials(
     Ok((descriptor, committee))
 }
 
+fn trace_create_causal(
+    phase: &'static str,
+    status: &'static str,
+    submission: Option<&SharedCreateSubmission>,
+    started: Option<&std::time::Instant>,
+) {
+    if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+        tracing::debug!(target: "vos",
+            phase, status,
+            thread = ?std::thread::current().id(),
+            root = ?submission.map(|value| value.call().commitment().0),
+            invocation = ?submission.map(|value| value.call().invocation.0),
+            agent = ?submission.map(|value| value.call().managed.agent.0),
+            elapsed_us = started.map(|value| value.elapsed().as_micros()).unwrap_or(0),
+            "VOS causal client");
+    }
+}
+
 fn create_shared(
     data: &Path,
     address: SocketAddr,
@@ -472,6 +490,9 @@ fn create_shared(
     node_public: [u8; 32],
     args: &CreateSharedArgs,
 ) -> anyhow::Result<SharedCreateDisposition> {
+    let diagnostic_started = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS")
+        .map(|_| std::time::Instant::now());
+    trace_create_causal("entry", "start", None, diagnostic_started.as_ref());
     anyhow::ensure!(
         address.ip().is_loopback() && address.port() != 0,
         "Shared Create requires nonzero loopback HTTP"
@@ -520,12 +541,17 @@ fn create_shared(
                 &runtime,
                 &enrollments,
             )?;
+            trace_create_causal("credential_discovery", "start", None, diagnostic_started.as_ref());
             let (_, sequence) = super::local_create::discover_credential(
                 &operation.join("query"),
                 address,
                 operator,
                 authority,
-            )?;
+            ).map_err(|error| {
+                trace_create_causal("credential_discovery", "refused", None, diagnostic_started.as_ref());
+                error
+            })?;
+            trace_create_causal("credential_discovery", "complete", None, diagnostic_started.as_ref());
             let (valid_from, expires_at) = window()?;
             let call = sign_call(
                 operator,
@@ -556,9 +582,11 @@ fn create_shared(
             && submission.call().authority == authority,
         "retained Shared Create differs from selected Space, Root or originating node"
     );
+    trace_create_causal("retained_validated", "complete", Some(&submission), diagnostic_started.as_ref());
     let response = match store.load_response()? {
         Some(bytes) => bytes,
         None => {
+            trace_create_causal("http_delivery", "start", Some(&submission), diagnostic_started.as_ref());
             let (status, bytes) = super::local_create::post_binary_response(
                 address,
                 "/_vos/agents/shared/create",
@@ -568,7 +596,20 @@ fn create_shared(
                 Some(SharedCreateSubmission::MAX_RESPONSE_BYTES),
                 None,
             )
-            .map_err(super::local_create::retained_submission_error)?;
+            .map_err(|error| {
+                let status = match error.downcast_ref::<ureq::Error>() {
+                    Some(ureq::Error::Status(409, _)) => "http_conflict",
+                    Some(ureq::Error::Status(429, _)) => "http_busy",
+                    Some(ureq::Error::Status(503, _)) => "http_unavailable",
+                    Some(ureq::Error::Status(504, _)) => "http_timeout",
+                    Some(ureq::Error::Status(_, _)) => "http_other",
+                    Some(ureq::Error::Transport(_)) => "transport",
+                    None => "local_error",
+                };
+                trace_create_causal("http_delivery", status, Some(&submission), diagnostic_started.as_ref());
+                super::local_create::retained_submission_error(error)
+            })?;
+            trace_create_causal("http_delivery", "complete", Some(&submission), diagnostic_started.as_ref());
             let disposition = submission.decode_response(&bytes).map_err(|error| {
                 anyhow::anyhow!("invalid request-bound SCR1: {error:?}; request retained")
             })?;
@@ -577,6 +618,7 @@ fn create_shared(
                 "HTTP status differs from verified Shared Create disposition; request retained"
             );
             store.publish_response(&bytes)?;
+            trace_create_causal("response_retained", "complete", Some(&submission), diagnostic_started.as_ref());
             bytes
         }
     };
@@ -584,6 +626,10 @@ fn create_shared(
         .decode_response(&response)
         .map_err(|error| anyhow::anyhow!("invalid request-bound SCR1: {error:?}"))?;
     reservation.complete_shared_create(&mut store)?;
+    trace_create_causal("reservation_complete", match &disposition {
+        SharedCreateDisposition::Applied(_) => "applied",
+        SharedCreateDisposition::Denied(_) => "denied",
+    }, Some(&submission), diagnostic_started.as_ref());
     Ok(disposition)
 }
 

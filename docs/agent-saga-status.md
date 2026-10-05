@@ -37,11 +37,11 @@ deployment is automatic.
 
 ## Current position
 
-### Architecture review and planned causal diagnostics
+### Architecture review and authorized causal diagnostics
 
-The latest user direction authorizes a higher-level architectural review and
-planning of deeper diagnostics, followed by a fix decision based on demonstrated
-culprits. Three independent read-only source audits completed on clean
+The latest user direction authorizes the bounded causal investigation below;
+the fix or simplification decision follows its demonstrated culprits. Three
+independent read-only source audits completed on clean
 `6a6b929765638c7fcca12cac4718da1d4cb7a536`. That checkpoint differs from measured
 R49 source `40a7e553` only in the two live documents. No new build, fixture,
 runtime change, tuning candidate or redesign was executed during this review.
@@ -106,7 +106,19 @@ waits for, derives and confirms progress, followed by avoidable opaque-image
 copy/preparation work. No current evidence establishes that durable authority,
 quorum or runtime ABI must be redesigned.
 
-The next diagnostic session is planned, not executed:
+R50 is in progress from clean architecture checkpoint `96f07bb8`. Temporary
+host-only markers cover exact retained-family correlation, confirmation polls,
+observation/runtime boundaries and affirmative fixture stages. They preserve
+all existing reads, guards, validations, results and deadlines. No new guest,
+wire field, durable trace record, tuning candidate or redesign is authorized.
+Instrumentation independently passes source review; the finite reader is still
+under review. Freeze clean host source before the portable main/harness build,
+then finish reader review before fixture execution. No R50 build or fixture
+result exists yet. VM outcome markers report status after execution; use the
+separate context/run/output phases for duration. Retained frontier equality is
+diagnostic only and never equality of manifest/state bytes or reused proof.
+
+The authorized session has this sequence:
 
 1. Follow one **exact original public Shared Create family** through the existing
    packaged all-cold selector. Preserve its ordinary CLI request and every
