@@ -3730,6 +3730,15 @@ where
         J: CleanManagementIssuerStore,
     {
         use crate::actors::codec::Decode as _;
+        let diagnostic = |phase: &'static str, error: Option<SharedAgentHostError>| {
+            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                if let Some(error) = error {
+                    tracing::debug!(management_finalization_phase = phase, error = ?error);
+                } else {
+                    tracing::debug!(management_finalization_phase = phase);
+                }
+            }
+        };
         let facts = terminal.facts();
         let target = self.authority_target();
         let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
@@ -3742,7 +3751,10 @@ where
             ..
         }) = slot
             .authorization_work()
-            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .map_err(|_| {
+                diagnostic("authorization_work_read_refused", Some(SharedAgentHostError::Unavailable));
+                SharedAgentHostError::Unavailable
+            })?
         else {
             return Err(SharedAgentHostError::ScopeMismatch);
         };
@@ -3767,9 +3779,17 @@ where
             return Ok(false);
         }
         self._network_host
-            .ensure_reattached(crate::service::AgentId(self.pins.agent.0))?;
+            .ensure_reattached(crate::service::AgentId(self.pins.agent.0))
+            .map_err(|error| {
+                diagnostic("system_attachment_refused", Some(error));
+                error
+            })?;
         let mut material =
-            self.supervisor_invocation_material(self.pins.agent, target.binding.issuer.actor)?;
+            self.supervisor_invocation_material(self.pins.agent, target.binding.issuer.actor)
+                .map_err(|error| {
+                    diagnostic("physical_material_refused", Some(error));
+                    error
+                })?;
         if material.producer != target.binding.issuer.producer {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
@@ -3784,7 +3804,10 @@ where
         }
         if slot
             .finalization_work()
-            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .map_err(|_| {
+                diagnostic("finalization_work_read_refused", Some(SharedAgentHostError::Unavailable));
+                SharedAgentHostError::Unavailable
+            })?
             .is_none()
         {
             let mut work = (**original).clone();
@@ -3813,45 +3836,52 @@ where
             if recovering {
                 let predecessor = (
                     slot.authorization_anchor()
-                        .map_err(|_| SharedAgentHostError::Unavailable)?
+                        .map_err(|_| {
+                            diagnostic("predecessor_anchor_read_refused", Some(SharedAgentHostError::Unavailable));
+                            SharedAgentHostError::Unavailable
+                        })?
                         .ok_or(SharedAgentHostError::ScopeMismatch)?
                         .clone(),
                     slot.authorization_work()
-                        .map_err(|_| SharedAgentHostError::Unavailable)?
+                        .map_err(|_| {
+                            diagnostic("predecessor_work_read_refused", Some(SharedAgentHostError::Unavailable));
+                            SharedAgentHostError::Unavailable
+                        })?
                         .ok_or(SharedAgentHostError::ScopeMismatch)?
                         .clone(),
                 );
-                #[cfg(test)]
-                if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
-                    eprintln!(
-                        "management_finalization phase=extension_start node={:?}",
-                        self.pins.node
-                    );
-                }
+                diagnostic("extension_start", None);
                 self._network_host.extend_management_pending(
                     crate::service::AgentId(self.pins.agent.0),
                     &predecessor,
                     &envelope,
                     |(anchor, work)| {
                         slot.pledge_finalization_work(work.clone(), anchor.clone())
-                            .map_err(|_| SharedAgentHostError::Unavailable)
+                            .map_err(|_| {
+                                diagnostic("finalization_pledge_refused", Some(SharedAgentHostError::Unavailable));
+                                SharedAgentHostError::Unavailable
+                            })
                     },
                 ).map_err(|error| {
-                    #[cfg(test)]
-                    if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
-                        eprintln!("management_finalization phase=extension_error node={:?} error={error:?}", self.pins.node);
-                    }
+                    diagnostic("extension_error", Some(error));
                     error
                 })?;
+                diagnostic("extension_complete", None);
             } else {
                 self._network_host.record_management_anchor(
                     crate::service::AgentId(self.pins.agent.0),
                     &envelope,
                     |anchor| {
                         slot.pledge_finalization_work(envelope.clone(), anchor)
-                            .map_err(|_| SharedAgentHostError::Unavailable)
+                            .map_err(|_| {
+                                diagnostic("finalization_pledge_refused", Some(SharedAgentHostError::Unavailable));
+                                SharedAgentHostError::Unavailable
+                            })
                     },
-                )?;
+                ).map_err(|error| {
+                    diagnostic("anchor_registration_refused", Some(error));
+                    error
+                })?;
             }
         }
         let Some(RuntimeWork::Invoke {
@@ -3861,7 +3891,10 @@ where
             ..
         }) = slot
             .finalization_work()
-            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .map_err(|_| {
+                diagnostic("finalization_work_read_refused", Some(SharedAgentHostError::Unavailable));
+                SharedAgentHostError::Unavailable
+            })?
         else {
             return Err(SharedAgentHostError::ScopeMismatch);
         };
@@ -3883,32 +3916,38 @@ where
             self.finalization_failure_once = None;
             return Err(SharedAgentHostError::Unavailable);
         }
-        #[cfg(test)]
-        if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
-            eprintln!(
-                "management_finalization phase=invoke_start node={:?}",
-                self.pins.node
-            );
-        }
+        diagnostic("invoke_start", None);
         let outcome = self
             .supervisor_invoke_persisted_management(
                 identity,
                 (**work).clone(),
                 (**authorization).clone(),
                 slot.finalization_anchor()
-                    .map_err(|_| SharedAgentHostError::Unavailable)?
+                    .map_err(|_| {
+                        diagnostic("finalization_anchor_read_refused", Some(SharedAgentHostError::Unavailable));
+                        SharedAgentHostError::Unavailable
+                    })?
                     .ok_or(SharedAgentHostError::ScopeMismatch)?,
             )
             .map_err(|error| {
-                #[cfg(test)]
-                if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
-                    eprintln!(
-                        "management_finalization phase=invoke_error node={:?} error={error:?}",
-                        self.pins.node
-                    );
-                }
+                diagnostic("invoke_error", Some(error));
                 error
             })?;
+        if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+            let category = match &outcome {
+                super::sdk::RuntimeOutcome::Completed(Ok(reply)) => match reply.status {
+                    super::sdk::InvocationStatus::Done => "completed_done",
+                    super::sdk::InvocationStatus::Forbidden => "completed_forbidden",
+                    super::sdk::InvocationStatus::Panicked => "completed_panicked",
+                    super::sdk::InvocationStatus::OutOfGas => "completed_out_of_gas",
+                },
+                super::sdk::RuntimeOutcome::Completed(Err(_)) => "completed_error",
+                super::sdk::RuntimeOutcome::Management(_) => "management",
+                super::sdk::RuntimeOutcome::Yielded(_) => "yielded",
+                super::sdk::RuntimeOutcome::Acknowledged(_) => "acknowledged",
+            };
+            tracing::debug!(management_finalization_phase = "invoke_outcome", outcome = category);
+        }
         let super::sdk::RuntimeOutcome::Completed(Ok(reply)) = &outcome else {
             return Err(SharedAgentHostError::Unavailable);
         };
@@ -3921,18 +3960,26 @@ where
             || crate::actors::value::Value::try_decode(&reply.reply)
                 != Some(crate::actors::value::Value::Bool(true))
         {
+            diagnostic("reply_validation_refused", Some(SharedAgentHostError::ScopeMismatch));
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         let replayed = self
             .host
             .lock()
-            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .map_err(|_| {
+                diagnostic("durable_replay_lock_refused", Some(SharedAgentHostError::Unavailable));
+                SharedAgentHostError::Unavailable
+            })?
             .replay_durable_clean_terminal(
                 crate::service::AgentId(self.pins.agent.0),
                 (**work).clone(),
                 (**authorization).clone(),
-            )?;
+            ).map_err(|error| {
+                diagnostic("durable_replay_refused", Some(error));
+                error
+            })?;
         if replayed != outcome {
+            diagnostic("durable_replay_mismatch", Some(SharedAgentHostError::ScopeMismatch));
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         #[cfg(test)]
@@ -3940,13 +3987,21 @@ where
             self.finalization_failure_once = None;
             return Err(SharedAgentHostError::Unavailable);
         }
+        diagnostic("issuer_save_start", None);
         match terminal {
             ManagementTerminalRef::Applied(ack) => issuer.observe_durable_actor_finalization(ack),
             ManagementTerminalRef::Rejected(failure) => {
                 issuer.observe_durable_actor_failure_finalization(failure)
             }
         }
-        .map_err(|_| SharedAgentHostError::Unavailable)
+        .map(|changed| {
+            diagnostic("issuer_save_complete", None);
+            changed
+        })
+        .map_err(|_| {
+            diagnostic("issuer_save_refused", Some(SharedAgentHostError::Unavailable));
+            SharedAgentHostError::Unavailable
+        })
     }
 
     pub(crate) fn handoff_recovered_management(
@@ -6240,12 +6295,25 @@ where
             let observation = self
                 .host
                 .lock()
-                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .map_err(|_| {
+                    if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                        tracing::debug!(shared_install_recovery_phase = "recovered_observation_lock_refused", error = ?SharedAgentHostError::Unavailable);
+                    }
+                    SharedAgentHostError::Unavailable
+                })?
                 .observe_durable_install(
                     crate::service::AgentId(managed.agent.0),
                     intent.request(),
                     &receipt,
-                )?;
+                ).map_err(|error| {
+                    if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                        tracing::debug!(shared_install_recovery_phase = "recovered_observation_refused", error = ?error);
+                    }
+                    error
+                })?;
+            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                tracing::debug!(shared_install_recovery_phase = "recovered_observation_complete");
+            }
             let matches = match &terminal {
                 SignedManagementTerminal::Applied(ack) => {
                     observation.result() == &Ok(ack.application.clone())
@@ -6274,13 +6342,34 @@ where
         } else {
             self.apply_shared_install_from_management_intent(slot, package, issuer, signer)?
         };
+        if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+            tracing::debug!(shared_install_recovery_phase = "finalization_start");
+        }
         match &terminal {
             SignedManagementTerminal::Applied(ack) => {
-                self.finalize_management_intent_with_admission(slot, managed, ack, issuer, true)?;
+                self.finalize_management_intent_with_admission(slot, managed, ack, issuer, true)
+                    .map_err(|error| {
+                        if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                            tracing::debug!(shared_install_recovery_phase = "finalization_refused", error = ?error);
+                        }
+                        error
+                    })?;
+                if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                    tracing::debug!(shared_install_recovery_phase = "finalization_complete");
+                }
                 self.finish_live_management_intent(slot, managed, ack, issuer)?;
             }
             SignedManagementTerminal::Rejected(failure) => {
-                self.finalize_failed_install_with_admission(slot, managed, failure, issuer, true)?;
+                self.finalize_failed_install_with_admission(slot, managed, failure, issuer, true)
+                    .map_err(|error| {
+                        if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                            tracing::debug!(shared_install_recovery_phase = "finalization_refused", error = ?error);
+                        }
+                        error
+                    })?;
+                if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                    tracing::debug!(shared_install_recovery_phase = "finalization_complete");
+                }
                 self.finish_live_failed_install(slot, managed, failure, issuer)?;
             }
         }
@@ -6380,15 +6469,39 @@ where
         let observation = self
             .host
             .lock()
-            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .map_err(|_| {
+                if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                    tracing::debug!(shared_install_recovery_phase = "durable_observation_lock_refused", error = ?SharedAgentHostError::Unavailable);
+                }
+                SharedAgentHostError::Unavailable
+            })?
             .observe_durable_install(
                 crate::service::AgentId(managed.agent.0),
                 &request,
                 &receipt,
-            )?;
+            ).map_err(|error| {
+                if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                    tracing::debug!(shared_install_recovery_phase = "durable_observation_refused", error = ?error);
+                }
+                error
+            })?;
+        if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+            tracing::debug!(shared_install_recovery_phase = "durable_observation_complete");
+        }
         issuer
             .observe_shared_install(&observation, signer)
-            .map_err(|_| SharedAgentHostError::Unavailable)
+            .map(|terminal| {
+                if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                    tracing::debug!(shared_install_recovery_phase = "issuer_observation_complete");
+                }
+                terminal
+            })
+            .map_err(|_| {
+                if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                    tracing::debug!(shared_install_recovery_phase = "issuer_observation_refused", error = ?SharedAgentHostError::Unavailable);
+                }
+                SharedAgentHostError::Unavailable
+            })
     }
 
     /// Bind transport to this issuer's independently retained exact first
