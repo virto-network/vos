@@ -2652,6 +2652,7 @@ where
             0,
             0,
             true,
+            None,
         )
     }
 
@@ -2712,6 +2713,26 @@ where
         )
     }
 
+    /// The caller verified this manifest after draining under the same
+    /// uninterrupted host/proposal guards. Only new custody ACK admission uses
+    /// this borrowed view; fresh absence and physical availability stay below.
+    pub(crate) fn management_ack_retention_admission_with_manifest(
+        &self,
+        manifest: &SharedRecoveryManifest,
+    ) -> Result<Option<usize>, SharedJournalDriverError> {
+        let (pending, future_entries, future_bytes) =
+            management_retention_headroom(self.materialization.heads(), manifest, None)?;
+        self.management_recovery_admission_with_headroom_and_input(
+            &pending,
+            &[],
+            future_entries,
+            future_bytes,
+            false,
+            Some(manifest),
+        )
+        .map(|(requirement, _)| requirement)
+    }
+
     /// One budget for the exact read and every retained management owner's
     /// unfinished lifecycle. Separate successful checks would double-spend the
     /// same bounded suffix; read custody grants no parent release or extension.
@@ -2732,6 +2753,7 @@ where
             future_entries,
             future_bytes,
             false,
+            None,
         )
         .map(|(requirement, _)| requirement)
     }
@@ -2746,6 +2768,7 @@ where
         future_entries: usize,
         future_bytes: usize,
         select_input: bool,
+        verified_manifest: Option<&SharedRecoveryManifest>,
     ) -> Result<(Option<usize>, Option<ReplayInputId>), SharedJournalDriverError> {
         use crate::agent_sdk::{RuntimeOutcome, RuntimeWork};
         if select_input
@@ -2773,12 +2796,20 @@ where
         // The borrowed driver cannot publish or drain during this calculation.
         // Reuse only this call's freshly verified view for retained selectors;
         // each unseen registered member still proves absence against its own
-        // fresh settled physical prefix below. Never retain the view for
-        // another budget, preparation, peer operation or publication.
-        let manifest = if pending.is_empty() && retiring.is_empty() {
+        // fresh settled physical prefix below. A custody ACK may borrow its
+        // existing admission-guard view here; no view survives guard release,
+        // peer operation or publication.
+        let fresh_manifest = if verified_manifest.is_some()
+            || (pending.is_empty() && retiring.is_empty())
+        {
             None
         } else {
             self.verified_recovery_manifest()?
+        };
+        let manifest = if pending.is_empty() && retiring.is_empty() {
+            None
+        } else {
+            verified_manifest.or(fresh_manifest.as_ref())
         };
         // This proof never escapes this immutable budget calculation. The
         // first archived lookup authenticates its entire live/baseline view
@@ -2788,7 +2819,7 @@ where
         let mut available = |input| {
             self.available_ordered_claim_in_management_budget(
                 input,
-                manifest.as_ref(),
+                manifest,
                 &mut archived,
             )
         };
@@ -2815,7 +2846,7 @@ where
             if self.retained_positive_clean_acknowledgement_with_availability(
                 work,
                 authorization,
-                manifest.as_ref(),
+                manifest,
                 &mut available,
             )? {
                 let input = self
@@ -2823,14 +2854,14 @@ where
                         anchor.ordered,
                         envelope,
                         true,
-                        manifest.as_ref(),
+                        manifest,
                         &mut available,
                     )?
                     .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
                 let Some(RuntimeOutcome::Completed(Ok(reply))) = self
                     .retained_management_completed_outcome_with_availability(
                         input,
-                        manifest.as_ref(),
+                        manifest,
                         &mut available,
                     )?
                     .or_else(|| self.executor.clean_ordered_result(input))
@@ -2843,7 +2874,6 @@ where
                 // classes below: no new Ordered row or lifecycle release is
                 // authorized by this budget calculation.
                 let retained_terminal = manifest
-                    .as_ref()
                     .map(|manifest| {
                         exact_retained_management_member(manifest, Some(anchor.ordered), envelope)
                     })
@@ -2896,7 +2926,7 @@ where
                         anchor.ordered,
                         envelope,
                         false,
-                        manifest.as_ref(),
+                        manifest,
                         &mut available,
                     )?;
                     if selected_input != Some(input) {
@@ -2912,12 +2942,12 @@ where
                 anchor.ordered,
                 envelope,
                 false,
-                manifest.as_ref(),
+                manifest,
                 &mut available,
             )?;
             let capsule = self.retained_management_invocation_with_availability(
                 envelope,
-                manifest.as_ref(),
+                manifest,
                 &mut available,
             )?;
             let invoke = ReplayOperation::CleanInvoke {
@@ -2940,7 +2970,7 @@ where
                 && self.retained_positive_clean_acknowledgement_with_availability(
                     work,
                     authorization,
-                    manifest.as_ref(),
+                    manifest,
                     &mut available,
                 )?
             {
@@ -3011,7 +3041,7 @@ where
             retiring,
             index,
             parent,
-            manifest.as_ref(),
+            manifest,
             &mut available,
         )?;
         let entries = entries
@@ -4219,7 +4249,27 @@ where
         &self,
         request: CleanInvocationReplayRequest,
     ) -> Result<PreparedCleanOrdered, SharedJournalDriverError> {
-        self.prepare_clean_ordered_operation_with_policy(request, false, None, false)
+        self.prepare_clean_ordered_operation_with_policy(request, false, None, false, None)
+    }
+
+    /// Reuse only the manifest freshly verified for this custody ACK under
+    /// uninterrupted admission guards. It is used for the immutable retained
+    /// selector before preparing a new input; no view escapes this call.
+    pub(crate) fn prepare_management_ack_with_manifest(
+        &self,
+        request: CleanInvocationReplayRequest,
+        manifest: &SharedRecoveryManifest,
+    ) -> Result<PreparedCleanOrdered, SharedJournalDriverError> {
+        if !matches!(&request, CleanInvocationReplayRequest::Acknowledge { .. }) {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        self.prepare_clean_ordered_operation_with_policy(
+            request,
+            false,
+            None,
+            false,
+            Some(manifest),
+        )
     }
 
     /// Locally generated bootstrap work receives its unsigned preflight at
@@ -4236,7 +4286,13 @@ where
             unreachable!()
         };
         let observed_slot = preflight.observed_slot;
-        self.prepare_clean_ordered_operation_with_policy(request, false, Some(observed_slot), false)
+        self.prepare_clean_ordered_operation_with_policy(
+            request,
+            false,
+            Some(observed_slot),
+            false,
+            None,
+        )
     }
 
     /// Recover an already committed bootstrap result through fresh physical
@@ -4538,7 +4594,7 @@ where
         &self,
         request: CleanInvocationReplayRequest,
     ) -> Result<PreparedCleanOrdered, SharedJournalDriverError> {
-        self.prepare_clean_ordered_operation_with_policy(request, true, None, false)
+        self.prepare_clean_ordered_operation_with_policy(request, true, None, false, None)
     }
 
     /// Internal management work whose complete preflight envelope is already
@@ -4564,7 +4620,13 @@ where
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
         let observed_slot = preflight.observed_slot;
-        self.prepare_clean_ordered_operation_with_policy(request, true, Some(observed_slot), true)
+        self.prepare_clean_ordered_operation_with_policy(
+            request,
+            true,
+            Some(observed_slot),
+            true,
+            None,
+        )
     }
 
     fn prepare_clean_ordered_operation_with_policy(
@@ -4573,12 +4635,18 @@ where
         terminal_only: bool,
         accepted_observed_slot: Option<u64>,
         persisted_management: bool,
+        verified_manifest: Option<&SharedRecoveryManifest>,
     ) -> Result<PreparedCleanOrdered, SharedJournalDriverError> {
         // Retry identity excludes the trusted observation slot. The real slot
         // is sampled exactly once below only when a new operation is built.
         let operation = request.clone().into_operation(0);
-        let manifest = self.verified_recovery_manifest()?;
-        if let Some(manifest) = manifest.as_ref() {
+        let fresh_manifest = if verified_manifest.is_none() {
+            self.verified_recovery_manifest()?
+        } else {
+            None
+        };
+        let manifest = verified_manifest.or(fresh_manifest.as_ref());
+        if let Some(manifest) = manifest {
             if let Some(observation) = retained_management_operation(manifest, &operation)? {
                 if terminal_only
                     && !matches!(
@@ -4630,7 +4698,7 @@ where
                 authorization: Box::new(request.authorization().clone()),
                 observed_slot,
             };
-            if let Some(manifest) = manifest.as_ref()
+            if let Some(manifest) = manifest
                 && exact_retained_management_member(manifest, None, &envelope)?.is_some()
             {
                 if !management_first_invoke_clock_ready(manifest, observed_slot)? {

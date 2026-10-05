@@ -3279,6 +3279,30 @@ impl SharedAgentHost {
             .map_err(map_driver_error)
     }
 
+    /// Only the current custody ACK may borrow this call's post-drain verified
+    /// manifest, while the same host/proposal guards remain uninterrupted.
+    pub(crate) fn management_ack_retention_admission_with_manifest(
+        &mut self,
+        agent: AgentId,
+        manifest: &super::shared_recovery::SharedRecoveryManifest,
+    ) -> Result<Option<usize>, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        let hosted = self
+            .agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        if !matches!(
+            &hosted.intent.authority,
+            SharedGenesisAuthority::SystemBootstrap { .. }
+        ) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        hosted
+            .driver
+            .management_ack_retention_admission_with_manifest(manifest)
+            .map_err(map_driver_error)
+    }
+
     pub(crate) fn retained_positive_or_terminal_projection(
         &self,
         agent: AgentId,
@@ -3335,6 +3359,20 @@ impl SharedAgentHost {
             .driver
             .recovery_manifest()
             .map_err(map_driver_error)
+    }
+
+    /// Preserve this lookup's live lease/Agent fence while reusing only the
+    /// same custody ACK's verified manifest under uninterrupted host guards.
+    pub(crate) fn management_ack_has_pending_with_manifest(
+        &mut self,
+        agent: AgentId,
+        manifest: &super::shared_recovery::SharedRecoveryManifest,
+    ) -> Result<bool, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        Ok(manifest.has_pending_management())
     }
 
     /// Immutable admitted management recovery scope only.
@@ -3622,6 +3660,20 @@ impl SharedAgentHost {
             .ok_or(SharedAgentHostError::AgentNotFound)?
             .driver
             .prepare_clean_ordered_operation(request)
+            .map_err(map_driver_error)
+    }
+
+    pub(crate) fn prepare_management_ack_with_manifest(
+        &self,
+        agent: AgentId,
+        request: super::shared_journal_driver::CleanInvocationReplayRequest,
+        manifest: &super::shared_recovery::SharedRecoveryManifest,
+    ) -> Result<super::shared_journal_driver::PreparedCleanOrdered, SharedAgentHostError> {
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .prepare_management_ack_with_manifest(request, manifest)
             .map_err(map_driver_error)
     }
 

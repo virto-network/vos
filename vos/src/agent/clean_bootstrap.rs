@@ -3775,6 +3775,18 @@ where
             ManagementTerminalRef::Rejected(failure) => issuer.failure_finalization_status(failure),
         }
         .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some()
+            && managed.profile == AgentProfile::Local
+            && matches!(intent.request(), ManagementRequest::Install(_))
+            && let ManagementTerminalRef::Applied(ack) = terminal
+        {
+            // Private correlation only: the existing issuer check above binds
+            // these exact signed bytes. Completed readers export equality only.
+            tracing::debug!(
+                local_install_child_phase = "issuer_exact_ack_verified",
+                acknowledgement = ?ack.commitment().0,
+            );
+        }
         if finalized {
             return Ok(false);
         }
@@ -3850,6 +3862,18 @@ where
                         .ok_or(SharedAgentHostError::ScopeMismatch)?
                         .clone(),
                 );
+                if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some()
+                    && managed.profile == AgentProfile::Local
+                    && matches!(intent.request(), ManagementRequest::Install(_))
+                    && let Ok(bytes) = envelope.encode()
+                {
+                    tracing::debug!(
+                        local_install_child_phase = "proposed_envelope",
+                        envelope = ?Hash::digest(
+                            b"vos/agent/diagnostic/local-finalization-envelope/v1", &[&bytes],
+                        ).0,
+                    );
+                }
                 diagnostic("extension_start", None);
                 self._network_host.extend_management_pending(
                     crate::service::AgentId(self.pins.agent.0),
@@ -6814,6 +6838,83 @@ where
                     work_matches = root.envelope() == &work,
                     "Local image Install retained root family refused"
                 );
+                if intent.authorization_work().is_some()
+                    && finalization.is_none()
+                    && retained.origin_owner().0 == self.pins.node.0
+                    && retained.members().len() == 2
+                    && root.parent().is_none()
+                    && root.anchor() == &anchor
+                    && root.envelope() == &work
+                {
+                    use crate::actors::codec::Decode as _;
+                    use super::clean_management_intent::CleanManagementIntent;
+                    let child = &retained.members()[1];
+                    let ack = child.work().message.get(1..)
+                        .and_then(crate::actors::value::Msg::try_decode)
+                        .and_then(|message| match message.args.get("ack") {
+                            Some(crate::actors::value::Value::Bytes(bytes)) => {
+                                ManagementApplicationAck::decode(bytes).ok()
+                            }
+                            _ => None,
+                        });
+                    if let (
+                        Some(ack),
+                        RuntimeWork::Invoke {
+                            invocation: original, observed_slot: original_slot, ..
+                        },
+                        RuntimeWork::Invoke {
+                            context, state, invocation, authorization, observed_slot,
+                        },
+                    ) = (ack, root.envelope(), child.envelope()) {
+                        let message = CleanManagementIntent::finalization_message(&ack);
+                        let mut expected = (**original).clone();
+                        expected.invocation = ack.acknowledgement_invocation;
+                        expected.origin = super::sdk::InvocationOrigin::anonymous();
+                        expected.message = message.clone();
+                        let ack_binding = ack.authority == intent.call().authority
+                            && ack.managed == intent.call().managed
+                            && ack.authorization_invocation == intent.call().invocation
+                            && ack.acknowledgement_invocation
+                                == ManagementApproval::derive_acknowledgement_invocation(intent.call())
+                            && ack.credential_call == intent.call().commitment()
+                            && ack.request == intent.request().commitment();
+                        let anchor_scope = child.anchor().genesis == anchor.genesis
+                            && child.anchor().admission == anchor.admission
+                            && child.anchor().runtime == anchor.runtime
+                            && child.anchor().ordered.index >= anchor.ordered.index
+                            && (child.anchor().ordered.index != anchor.ordered.index
+                                || child.anchor().ordered.head == anchor.ordered.head);
+                        let canonical_envelope = *context == RuntimeExecutionContext::Direct
+                            && *state == RuntimeState::default()
+                            && **authorization == InvocationAuthorization::PublicPreflight(
+                                super::sdk::PublicPreflight::for_work(invocation, *observed_slot),
+                            );
+                        // No store load, signing, physical observation or
+                        // admission follows this diagnostic comparison.
+                        tracing::debug!(
+                            local_install_child_phase = "refused_child_binding",
+                            acknowledgement = ?ack.commitment().0,
+                            signature_valid = ack.verify_with(&RawCredentialVerifier).is_ok(),
+                            ack_binding, message_matches = invocation.message == message,
+                            whole_work_matches = invocation.as_ref() == &expected,
+                            canonical_envelope,
+                            clock_matches = *original_slot <= ack.applied_at
+                                && ack.applied_at <= *observed_slot,
+                            parent_matches = child.parent() == Some(root.commitment()),
+                            anchor_scope,
+                        );
+                        if let Ok(bytes) = child.envelope().encode() {
+                            tracing::debug!(
+                                local_install_child_phase = "refused_envelope",
+                                envelope = ?Hash::digest(
+                                    b"vos/agent/diagnostic/local-finalization-envelope/v1", &[&bytes],
+                                ).0,
+                            );
+                        }
+                    } else {
+                        tracing::debug!(local_install_child_phase = "refused_child_decode");
+                    }
+                }
             }
             return Err(refused("root_family", SharedAgentHostError::ScopeMismatch));
         }

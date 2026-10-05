@@ -103,15 +103,13 @@ Current O3 component evidence (logs under the native worktree's `target`):
 ### Current integration delta and blocking result
 
 Latest measured portable source is frozen at
-`941b3d3c6e3867c4f7cfa75601f397886e5c5a2a`; it includes the provisional
-Shared recovery transport refresh and temporary Local family diagnostics.
-Existing flag-gated observation/terminal and Shared transfer diagnostics are
-compiled and exercised. Portable main/harness **pass 394.099s / 457.467s**;
-main strict six-file verification **passes 0.101s**. Main is `433d28ac`;
-harness is `a16a00d0`. Empty
-RUSTFLAGS, unset encoded/target overrides, exact copied hashes, clean source
-before/after and owned-group completion are recorded in
-`task-tmp/r43-cli-build-941b3d3c/provenance.json`.
+`19e8d0515d5ab949d1f3ee2aca88f96c2afe4807`; it includes the provisional
+Shared recovery transport refresh and temporary Local family, transfer and
+observation/finalization diagnostics. Portable main/harness **pass 391.198s /
+449.955s**; main strict six-file verification **passes 0.101s**. Main is
+`3a9fcab0`; harness is `8637e90c`. Empty RUSTFLAGS, unset encoded/target
+overrides, exact copied hashes, clean source before/after and owned-group
+completion are recorded in `task-tmp/r44-cli-build-19e8d051/provenance.json`.
 Authority, Catalog, both runtime roles and coherent guest pins remain unchanged.
 Three focused exact-retention units on preceding `f4a3dc90` each execute one test and **pass
 0.101s / 0.101s / 0.601s** (credential query, reservation and exact Install),
@@ -232,81 +230,106 @@ worker checks attach only independently verified namespaces; public projection
 export stays closed while recovery is pending. No election, authorization,
 observation, protocol, resource or deadline change.
 
-Current quiet/scoped all-cold runs **fail 272.299s / 254.083s**, each one executed
-failing test, owned group gone and frozen source/artifact/provenance fences
-passing. Both fail constructor Shared recovery before routes with Unavailable.
-The scoped cold block now reaches Progress/Finish, then local timeout and peer
-row validation; exact retry observes **retained_evidence, availability_complete
-and origin_retained**. This crosses the earlier pre-Progress boundary, without
-proving signed Installed/SIR, finalization, terminal release, whole **30s**
-recovery or fresh Query. All logged terminal-retirement/ACK failures occur in
-initial setup. Cold records six guest Done, one freshness Unavailable and one
-matching GenesisDecision, with no terminal handoff event. Absence alone does
-not identify an unlogged failure.
+Latest quiet/scoped all-cold runs on clean `19e8d051` **fail 243.961s /
+201.317s**, each one executed failing test, owned group gone and frozen
+source/artifact/provenance fences passing. Both fail constructor Shared recovery
+before routes with Unavailable. The scoped cold episode reaches exact retained
+Install evidence after a Progress/Finish timeout and peer row validation. Durable
+and issuer observations complete. Finalization extension twice returns
+Unavailable, then succeeds; the first Invoke returns Unavailable, and exact
+retry returns **CompletedDone**. Issuer finalization saves and the cold handoff
+completes, before **submit_ack Unavailable** refuses retirement. This proves
+that episode's guest finalization and handoff, not terminal release, fresh Query,
+whole **30s** recovery or global guest-stack resolution.
 
-Next attribute durable Install observation, issuer terminal retention and
-finalization after the retained row. The temporary phase/outcome visibility
-delta is **APPLIED, UNBUILT and UNEXECUTED**: three existing host functions expose
-fixed observation/issuer/finalization boundaries and finite invocation outcomes;
-generic finalization logs also cover image Local. Call/error/lock/fault ordering
-and all authorization, work/anchor checks and bounds remain unchanged, with no
-extra I/O or audits. Reviewed patch SHA-256
+The cold ACK forwards and waits for local confirmation; the peer reaches capacity
+audit, custody validation and preparation start. Origin confirmation times out
+at approximately **1.887s** under the unchanged **1.8s** bound; peer preparation
+starts approximately 140ms before that timeout. No peer completion, late commit
+or exact failed-member identity is established. CMR2 save/root release are later
+phases and were not reached. The existing 30s retry window cannot schedule another
+retry after this returned failure; it does not bound nested execution. The scoped
+cold constructor interval is at least **57.868s**. These are failure boundaries,
+not a performance-only diagnosis or recovery pass.
+
+The new phase/outcome visibility is **BUILT and EXECUTED, UNQUALIFIED**. Original
+calls, error mappings, lock/fault order and bounds remain, with no extra I/O or
+audits. Patch SHA-256
 `340e33fe648a3026457cd9b392c6ddac70a3e7612c5c291de310ad95575fa8a8`.
-Freeze/rebuild current portable provenance and use the existing diagnostic runs.
-Then rerun isolated cold and returning recovery under unchanged bounds before
-resuming the remaining M1 gates. No global guest-stack or performance-only
-verdict is established.
+Remove temporary diagnostics when attribution no longer needs them.
 
-Current quiet evidence is `task-tmp/r43-pending-all-cold-941b3d3c`,
+Current quiet evidence: `task-tmp/r44-pending-all-cold-19e8d051`,
 safe-summary SHA-256
-`2dce6b83885f7e3225737107d24b54ece6c3287cdb6b3668602a92a1a9d0cad3`.
-Scoped evidence is `task-tmp/r43-pending-all-cold-scoped-941b3d3c`;
-transfer V2 reports **98 fixed events / zero unknown**, artifact SHA-256
-`fa4904855fc8899219d3b1e8b4a77fe231b2e0e53147cd9ae3fb1255a8040c1a`.
-`pending-host-fixed-order-safe.json` reports **144 fixed events / 83 host /
-zero unknown**, SHA-256
-`8d303c8b572fed428699b581c9bbd8e4e22054d54e4bb4cb84f8c2b4def7cb1b`;
-completed inputs were hash-fenced before/after extraction.
+`fe3dc356cb4e2533af38e8e1cfe5ca82a369d2c483d4ff2cbf034f70a0da8765`.
+Scoped evidence: `task-tmp/r44-pending-all-cold-scoped-19e8d051`.
+Finalization order reports **31 fixed events / zero unknown**, SHA-256
+`6ce9ec648b03bf4af04871a694647fb0888123da9b12827ab07a989850db7ba7`.
+Host order reports **132 fixed events / zero unknown**, SHA-256
+`250b03fdf135278fc584468cf260080a3bae58ee4d136b7b20acc40f21da2106`.
+Transfer V2 reports **86 fixed events / zero unknown**, SHA-256
+`b38b6175c3c664d333f79a6554b8d043382147854f641f501f875502ac2961f8`.
+Completed inputs/tools/provenance/strict verification are hash-fenced. Serial
+retained-issuer source plus reviewed order binds the cold episode; counts alone
+do not. Earlier `5c45f4a8` pre-Progress and `941b3d3c` retained-row evidence
+remain frozen under `task-tmp/r43-pending-all-cold-transfer-5c45f4a8`,
+`task-tmp/r43-pending-all-cold-941b3d3c` and
+`task-tmp/r43-pending-all-cold-scoped-941b3d3c`. Preserve their safe artifacts
+and earlier `be0844c3`/`f4a3dc90` failure boundaries.
 
-Earlier pre-correction private logs and fixed safe evidence remain under
-`task-tmp/r43-pending-all-cold-transfer-5c45f4a8`:
-`safe-summary.json` SHA-256
-`4fde20ee450c2266dedd62bb96df3dc4579361c7259d10bd821ee1dd52c8839f`;
-`shared-install-transfer-fixed-order-safe.json` SHA-256
-`ef5ed3798d017e579d128824bece6095a8b453461f01e7e652681e651313f231`.
-Its reviewed extractor V2 is exercised: **110 fixed events / zero unknown**.
-Earlier `be0844c3` scoped failure **262.079s** stays frozen under
-`task-tmp/r42-pending-all-cold-outcomes-be0844c3`; its ordered review separates
-initial terminal errors from cold recovery and proves System authorization/
-receipt success before Shared forwarding. Earlier `f4a3dc90` scoped failure
-**248.167s**, without core outcome visibility, remains at its frozen evidence
-boundary. Transfer/outcome diagnostics are compiled and exercised for attribution
-only; remove them when no longer needed. Guest bytes/pins remain unchanged.
-No global stack-resolution or performance-only verdict follows.
+The fresh target-only Local diagnostic on `19e8d051` **fails 208.124s**.
+It reports **123 root_family ScopeMismatch** checks: two members versus expected
+one, root-only CMI, matching original owner, parentless root, anchor and full root
+work; three checks report complete-family admission. There are 126 guard starts
+and zero unknowns. Three recorded daemons/zero matching survivors, owned group
+gone and source/artifact fences pass. The ordinary script is unchanged; no
+ordinary-default/recovery/SLA credit follows.
 
-The separate temporary image Local family diagnostic is **BUILT and EXECUTED**.
-Its fresh target-only CLI run on `941b3d3c` **fails 207.828s**: **117 root_family
-ScopeMismatch** checks see two members versus expected one, with no local CMI
-finalization work. Original owner, parentless root, anchor and full root work all
-match; four checks report complete-family admission.
-There are 121 guard starts and zero unknown records. Three recorded daemons/
-zero matching survivors, owned group gone and source/artifact fences pass.
-The ordinary acceptance script remains unchanged; this diagnostic run grants
-no ordinary-default/recovery/SLA credit and does not retrospectively prove the
-original `fcac175a` substage.
+Serial command/order evidence places **extension_start → extension_error
+Unavailable** inside Local Install. Registration forwards, waits, and confirmation
+times out at **1.837893s** under the unchanged **1.8s** bound. The extension error
+follows, without a pledge refusal or later Invoke. The next exact retry refuses
+the two-member/root-only family. Initial generic finalization events belong to
+Local Create, not this Install.
 
-Source permits a publication gap: signed root-plus-child registration commits
-before the independent CMI pledge callback. Confirmation timeout or CMI write
-failure can leave two members with a root-only intent; quarantine then prevents
-the existing exact-child recovery call. The actual child's full binding and
-first failure are not established by counts. Keep complete-family restrictions,
-original work/clock/anchor and cold-adoption refusal intact; use existing
-finalization diagnostics to establish the remaining cause before correction.
-Evidence: `task-tmp/r43-local-family-attribution-941b3d3c`,
-`local-family-fixed-summary.json` SHA-256
-`1c0354a14c46746399fae42e3a39683f2d8c400f3d5faf94ac6cd91b10a0a742`.
-The large copied-state proposal stays held/unqualified; no original stores
-were opened by it.
+This demonstrates registration confirmation failure before the CMI pledge,
+followed by the family admission gap. The actual child's complete original
+envelope/parent/anchor/clock and signed issuer-message binding remain unproved.
+Keep complete-family restrictions and cold bare-intent refusal; prove that exact
+child before permitting the existing original-envelope/CMI-callback retry.
+No admission correction is applied yet. Physical observation performs disk,
+guest and catalog work; issuer opening can reconcile staged records. Neither
+may be added as supposedly pure diagnostics.
+
+Evidence: `task-tmp/r44-local-finalization-attribution-19e8d051`.
+Family summary SHA-256
+`c023faf74745febf7c2bbc6634000dd8aa5fd6e03f62a89a043dab1cfa825494`;
+finalization order: **10 fixed events / zero unknown**, SHA-256
+`2d1ff7e0f49711ff86098a585254a1ba020b9b036677f9b938d4c8f3342898df`;
+command order: **405 fixed events / zero unknown**, SHA-256
+`0f87d21f5d0f3581fdfd9ed7940fa0e1d9de921a7ff7ec47c0060b656a1a089b`.
+Completed inputs/tools/provenance/strict verification are hash-fenced. Preserve
+the earlier `941b3d3c` count-only run; neither fresh run retrospectively
+attributes `fcac175a`. The large copied-state proposal stays held/unqualified
+and opened no original stores.
+
+Next close exact Local child proof/admission and review cold ACK confirmation
+using the approved same-guard immutable-manifest reuse seam. Preserve every
+fresh settled-prefix, physical availability/corruption and post-peer check.
+Fix only demonstrated causes, freeze current host provenance, then rerun quiet
+cold/returning and ordinary CLI under unchanged bounds. Native NRT1 terminal
+release remains separate and open.
+
+The measured ACK audit-reuse delta is **APPLIED, UNBUILT and UNEXECUTED**: a
+Current forwarded ManagementCustody ACK lends only its post-drain verified
+immutable manifest within uninterrupted host/proposal guards to existing
+budget/pending/early-preparation selectors. Four repeated source validations
+can disappear. Fresh absence/settled-prefix, physical availability/common
+closure, capacity, worker barriers and exact custody checks remain. The view
+is dropped before unlock/peer availability/publication; other paths stay fresh.
+Reviewed patch SHA-256
+`6d94a2f1dd66f588a2162f3e30ed8e4b821ea60c0fb4b4f29a128fa89d856866`.
+Compilation and runtime benefit are open; its next measured qualification
+counts as **service-tuning pass one**, with none measured yet.
 
 The fixture-only preparation correction is **BUILT and EXECUTED, UNQUALIFIED**.
 Normal credential/descriptor discovery retries the exact persisted credential
@@ -388,23 +411,26 @@ release ambiguity/recovery after the saved NRT1 witness and qualify full support
 fixed-three native NRT1 exact retry/reopen. Latest-row/root-fence source protection
 is not execution proof and supplies no demonstrated archive fix. Current quiet
 acceptance still fails; fix only a demonstrated native cause and remove diagnostics.
-Separately attribute the ordinary exact Local Install refusal. Fresh diagnostic
-`941b3d3c` isolates 117 root-family count refusals: two retained members,
-root-only CMI, matching original root/owner/anchor/work. Source permits an
-ambiguous child-publication gap before CMI pledge, but actual child legitimacy
-and first failure still need attribution. Preserve complete-family restrictions.
-The ordinary script's corrected Query predicate remains unreached.
-Current quiet/scoped cold runs **fail 272.299s / 254.083s** after the provisional
-transport refresh. Scoped transfer now reaches retained evidence/availability
-on exact retry; durable observation, issuer terminal and finalization remain
-unresolved. No signed Installed, whole30 recovery or fresh Query pass follows.
-Earlier returning/pre-cut failures stay frozen by reference. Narrow existing
-phase/outcome visibility is next, followed by current cold/returning and ordinary
-CLI qualification under unchanged bounds; no global guest-stack verdict follows.
-Recorded portable costs **394.099s / 457.467s** are high-confidence facts at
-clean `941b3d3c`; its core-changing rebuild takes **14.2 minutes** combined versus
-**7.4 minutes** for the preceding fixture-only build, measured variance without
-scope expansion.
+Fresh Local diagnostic `19e8d051` isolates 123 root-family count refusals:
+two retained members, root-only CMI, matching original root/owner/anchor/work.
+Ordered command evidence proves registration confirmation timeout before CMI
+pledge, followed by the family admission gap. Full child/issuer binding remains
+unproved. Pure private-commitment correlation is APPLIED, UNBUILT and UNEXECUTED:
+compare normal already-verified durable ACK/proposed envelope with the refused
+authenticated child, and fixed signature/work/clock/parent/anchor checks.
+This adds diagnostic CPU only; no store/guest/state/cache/admission change, and
+ScopeMismatch remains. Reader outputs equality/validation booleans only.
+Current physical-image equality remains unproved. Preserve complete-family and
+cold bare-intent refusal. The corrected ordinary Query predicate is unreached.
+Current quiet/scoped cold runs **fail 243.961s / 201.317s**. Scoped observation,
+guest finalization, issuer save and handoff succeed before retirement ACK
+confirmation times out. Peer reaches preparation start; no completion/late
+commit or whole30/fresh Query pass follows. Review only the approved same-guard
+immutable-manifest reuse seam, retaining fresh absence/physical/common-closure
+and worker checks. Earlier returning/pre-cut evidence stays frozen.
+Recorded portable costs **391.198s / 449.955s** are high-confidence facts at
+clean `19e8d051`: **14.0 minutes** combined, versus preceding `941b3d3c`
+**14.2 minutes** and fixture-only **7.4 minutes**, without scope expansion.
 The quiet failed-gate costs are observations, not a successful recovery range. A predictive
 **3–8 minutes per portable main/harness binary** range has moderate confidence
 from cache/source variation and is not an aggregate ETA. Earlier source/elapsed

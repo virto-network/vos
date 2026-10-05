@@ -2773,13 +2773,14 @@ impl SharedRouteHandler {
             } else {
                 None
             };
+            let mut ack_manifest = None;
             if let Some(ReservedSubmission::ManagementCustody {
                 owner,
                 registration,
                 member,
             }) = reservation
             {
-                let retained = self
+                let (retained, manifest) = self
                     .validate_management_custody(
                         &mut host,
                         owner,
@@ -2796,6 +2797,7 @@ impl SharedRouteHandler {
                 if let Some(retained) = retained {
                     #[cfg(test)]
                     assert_single_capacity_audit(&host);
+                    drop(manifest);
                     drop(host);
                     drop(proposal);
                     trace("fresh_custody_availability_start");
@@ -2805,12 +2807,25 @@ impl SharedRouteHandler {
                     trace("fresh_custody_availability_complete");
                     return Ok(retained);
                 }
+                if matches!(&request, CleanInvocationReplayRequest::Acknowledge { .. })
+                    && matches!(clock, InvocationClock::Current)
+                {
+                    // Freshly authenticated after draining and the strict
+                    // capacity/barrier check. Lend it only under these same
+                    // uninterrupted guards; discard before publication/I/O.
+                    ack_manifest = Some(manifest);
+                }
             }
             if self.management_retention {
-                let manifest = host
-                    .recovery_manifest(self.agent)
-                    .map_err(|error| refused("management_manifest_error", error))?;
-                if manifest.has_pending_management()
+                let has_pending_management = if let Some(manifest) = ack_manifest.as_ref() {
+                    host.management_ack_has_pending_with_manifest(self.agent, manifest)
+                        .map_err(|error| refused("management_manifest_error", error))?
+                } else {
+                    host.recovery_manifest(self.agent)
+                        .map_err(|error| refused("management_manifest_error", error))?
+                        .has_pending_management()
+                };
+                if has_pending_management
                     && !matches!(clock, InvocationClock::PersistedManagement(_))
                     && !matches!(
                         reservation,
@@ -2887,10 +2902,13 @@ impl SharedRouteHandler {
                 host.prepare_persisted_management_invocation(self.agent, request)
             } else if terminal_only {
                 host.prepare_terminal_clean_ordered_operation(self.agent, request)
+            } else if let Some(manifest) = ack_manifest.as_ref() {
+                host.prepare_management_ack_with_manifest(self.agent, request, manifest)
             } else {
                 host.prepare_clean_ordered_operation(self.agent, request)
             }
             .map_err(|error| refused("prepare_error", error))?;
+            drop(ack_manifest);
             trace("prepare_complete");
             let input = prepared.input();
             if started.is_some() {

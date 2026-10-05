@@ -435,7 +435,7 @@ impl SharedRouteHandler {
         request: &CleanInvocationReplayRequest,
         clock: InvocationClock<'_>,
         audited_remaining: u64,
-    ) -> Result<Option<CleanOrderedSubmission>, SharedAgentHostError> {
+    ) -> Result<(Option<CleanOrderedSubmission>, SharedRecoveryManifest), SharedAgentHostError> {
         let (_, fingerprint) = self.management_fingerprint(host)?;
         if fingerprint.voters.binary_search(&owner).is_err() {
             return Err(SharedAgentHostError::ScopeMismatch);
@@ -477,18 +477,26 @@ impl SharedRouteHandler {
             // before budgeting or preparing a row that will not be appended.
             // The caller still proves applied availability after dropping
             // both guards; this observation alone grants no quorum claim.
-            return Ok(Some(CleanOrderedSubmission {
-                input: Some(evidence.input_id()),
-                outcome: evidence.outcome().clone(),
-                new_slot: false,
-            }));
+            return Ok((
+                Some(CleanOrderedSubmission {
+                    input: Some(evidence.input_id()),
+                    outcome: evidence.outcome().clone(),
+                    new_slot: false,
+                }),
+                manifest,
+            ));
         }
         #[cfg(test)]
         self.management_custody_budget_checks
             .fetch_add(1, Ordering::Relaxed);
-        let required = host
-            .management_retention_admission_requirement(self.agent, None)?
-            .ok_or(SharedAgentHostError::CapacityExhausted)?;
+        let required = if matches!(request, CleanInvocationReplayRequest::Acknowledge { .. })
+            && matches!(clock, InvocationClock::Current)
+        {
+            host.management_ack_retention_admission_with_manifest(self.agent, &manifest)?
+        } else {
+            host.management_retention_admission_requirement(self.agent, None)?
+        }
+        .ok_or(SharedAgentHostError::CapacityExhausted)?;
         // Supplied by the caller's mandatory post-drain capacity audit and
         // fresh Raft barrier under these same uninterrupted admission guards.
         if audited_remaining
@@ -496,7 +504,7 @@ impl SharedRouteHandler {
         {
             return Err(SharedAgentHostError::CapacityExhausted);
         }
-        Ok(None)
+        Ok((None, manifest))
     }
 
     pub(super) fn handle_management_operation(
