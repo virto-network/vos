@@ -37,7 +37,7 @@ deployment is automatic.
 
 ## Current position
 
-### R56 registration-fold attribution
+### Completed R56 registration-fold attribution
 
 Continue the authorized causal investigation after completed R55 below. The
 largest measured branch is registration folding, but its removable share is
@@ -52,11 +52,166 @@ candidate assignment, physical reads, guards and deadlines retain their order.
 This is diagnostic only, not a sixth behavior candidate, fresh-audit suppression,
 guest change, architecture replacement or cap extension. The function timings
 are nested; repeated metadata/registration identities do not identify attempts
-or permit adjacency-based pairing. Independently review source/finite grammar,
-freeze clean source, rebuild current portable main/harness, strictly verify the
-unchanged bundle and run one isolated scoped all-cold attempt. Preserve every
-original evidence fence and admit completed evidence before reporting results.
-The later host-lock holder remains an independent unknown.
+or permit adjacency-based pairing.
+
+**Implementation:** diagnostic source is frozen at
+`53b7be162e122be3e8eb76a3add57ac5cb9862a7`. Independent source reviews pass. The
+finite reader retains both original audit validators and all admission fences;
+**54 acceptance / 72 refusal** synthetic cases and privacy/alias checks pass
+without loading helpers or private inputs.
+
+**Integration:** current portable main/harness pass **391.898s / 459.891s**,
+strict six-file verification **0.101s**. One isolated scoped all-cold attempt
+fails **245.670s**, one failed test, exhausted noninterrupted owned group. Exact
+source/artifact/environment/binary/input/before-after fences pass. The reviewed
+reader admits **15,518 records / 622 explicit edges / zero unknowns**. All 427
+complete audit bodies satisfy the four-branch partition; all 5,788 leaf records
+satisfy the finite source/context schema. No quiet R56 attempt was run.
+
+Create root `id24` reaches public Applied and exact Applied replay
+(e5698/e5756), including actual original-owner release completion after an
+earlier refusal. Install root `id159` crosses the verified pending cut/cold entry
+(e10973/e10994). Its retained family is unchanged: invocation/work/authorization
+`id158/id160/id161`, root member `id170`; registration `id186` sequence 5 binds
+final child invocation/work/authorization/member `id183/id184/id185/id188`.
+Root-bound issuer save (e14748) requires accepted finalization, exact reply and
+durable replay equality. Both ACK availability pairs, runtime retirement and
+terminal persistence complete (e14987/e14994/e15188/e15195/e15196/e15199).
+
+Original owner `id6` release `id195`, scope `id194`, then records 12 absent polls
+at `(49,2)` and timeout **1.847626s** (e15409–11), before leader `id5` proposal
+(e15434–35). The leader later confirms that exact release at `(50,2)` and
+completes custody/commit (e15516–18). This does not qualify original-owner
+confirmation, routes or whole30. Aliases are report-local; metadata identifies
+an immutable release, not a unique attempt.
+
+The exact release's two audit bodies take **982.647ms / 964.606ms**, with
+**0µs / 0µs** ledger acquisition and **0µs / 1µs** read start. Each has
+**49 rows / 5 registrations / 1 historical release / 14 Ordered**. Each explicit
+stage has one acquisition pair/body and 35 successful leaf records: seven per
+distinct registration, with no duplicate group-phase key. These are groups,
+not inferred call/row/attempt identities.
+
+| Existing registration phase, total across five registrations | Signed validation | Capacity |
+| --- | ---: | ---: |
+| Checked request | 116.951ms | 114.891ms |
+| Incoming verification | 35.478ms | 34.987ms |
+| Prospective evidence | 32.871ms | 32.401ms |
+| Constructed slot validation | 33.892ms | 34.576ms |
+| Changed-candidate validation | 46.148ms | 47.345ms |
+| Manifest finalization | 7.206ms | 7.664ms |
+| Physical commitment comparison | 23.059ms | 22.975ms |
+| Seven phase totals | 295.605ms | 294.839ms |
+| Enclosing registration branch | 410.793ms | 411.143ms |
+
+The seven brackets are sequential existing phase samples within the enclosing
+registration branch, not additional costs to add to that branch or either audit.
+They cover about 72% of registration folding. Residual **115.188ms / 116.304ms**
+includes untimed anchor/commitment work, clones/searches/positions and diagnostic
+identity hashing/tracing; its removable, CPU or diagnostic share is unproven.
+The largest timed phase is checked request. Incoming verification is only
+**8.64% / 8.51%** of registration cost and includes required signature, scope
+and bounds checks. Its entire **70.465ms** across both audits is only an upper
+bound on the repeated request validation proposed for reuse, not measured savings.
+The target-only `r56-registration-verification-proposal.patch` remains unapplied,
+uncompiled and unmeasured; this evidence does not prioritize a sixth tiny pass.
+
+Leader admission reaches commit start at **2.181219s**, after owner timeout.
+Later leader confirmation separately records **1688.862ms** host wait, followed
+by **140µs** drain and **101.365ms** manifest verification. Holder/work remain
+unknown; source proposal exclusion rules out competing proposal-first work on
+the same handler, not apply work, host-only paths, other shared-host handlers or
+scheduling. Unscoped rows are not assigned by proximity. Late leader presence
+follows the unchanged presence-before-expiry waiter ordering.
+
+Evidence below `target/task-tmp`:
+
+- `r56-cli-build-53b7be16/provenance.json`, SHA
+  `81eee2338384098672d6bb43ae3b6d94479df2b047375e1d59265d6da19288f9`.
+  Main/harness SHA
+  `f42b52e1293c2ca0c8966b2f37a2a4023e2e27b5f8a8e2eef59011ab63a46da0` /
+  `3675f06a8fe5a03cd1b8848e3a37bf2ea56c2547b3534062feef66837d73e009`.
+- `r56-pending-all-cold-scoped-53b7be16/registration-fold-safe.json`, SHA
+  `7a85c8a2913fc0e091a4d9b02018ecfd05d8498a179df04333644a7ce547d5ba`.
+  Reviewed reader `r56-registration-fold-safe-reader.py`, SHA
+  `030b07709fe5089e7a5096685e6bb06cf21df5ecfc9de58945df6ceb54770c22`.
+- `r56-registration-fold-synthetic-result.json`, SHA
+  `55f607c19e678259a1516212cb6bff8cd3f9ec2646a344ba8c6b3fb217049da1`.
+
+**Qualification and next decision:** M1 remains blocked at original-owner
+terminal-release confirmation; no recovery, controlled speedup or release benefit
+is credited. The reviewed source-only combined release-admission proposal below
+awaits separate direction:
+the existing full authenticated management preflight view contains both request
+validation facts and capacity. Derive scalar capacity in that same fresh guarded
+transaction, preserving driver provenance/signature order and the final worker
+barrier/prefix-checked proposal. This changes internal coordination and removes
+the second read/error boundary; it needs separate review and direction, not an
+automatic sixth tuning pass, redesign or week-cap extension. No view or authority
+may be cached/exported. The later host holder remains a separate unknown.
+Actual ordinary CLI, remaining packaged gates, M2 and local/external M3 remain
+open. Remedy/source hours and aggregate milestone effort are still unknown;
+this completed diagnostic attempt cost is not a recovery or remaining-work ETA.
+
+### Reviewed combined release-admission proposal — awaiting direction
+
+Concrete target-only patch `r56-signed-release-capacity-proposal-v4.patch`, SHA
+`dee945322575f55bb23097db0ecbd55a774f1ff259fb4230d76ee0bb6f18af90`, is
+10,680 bytes, mode 0600, against the unchanged product source at `53b7be16`.
+Root and independent source/tool reviews pass; **unapplied, uncompiled, untested
+and unmeasured**. No sixth behavior candidate or engineering-week extension is
+authorized by those reviews.
+
+The release-only checked ledger API keeps full signed release verification,
+the existing writes guard, one read transaction, complete management preflight
+and exact authenticated-slot/request check. It then derives scalar capacity
+inside that same view/transaction; no view, permit or authority is exported.
+Host lease/SystemBootstrap restrictions and driver provenance/error order stay
+before this signed ledger boundary. The network's retained-release fast path,
+exact sender/route, uninterrupted guards, current worker snapshot, role/term/
+commit/last barrier, audited apply equality and prefix-checked proposal remain.
+Both successful admission branches return tuples directly, removing the obsolete
+second-audit fallback. Registration's actual capacity call/order is unchanged.
+
+The removed second read also removes its independent I/O/corruption observation
+opportunity. Same-snapshot validation order is preserved; this is not a claim of
+identical inter-read failure behavior. The measured second audit is substantial,
+but its removal is not a promised owner-confirmation or whole30 fix, especially
+while the later host-holder/scheduling pressure is unresolved.
+
+If separately authorized, carry this one bounded proposal through these gates:
+
+1. Exercise the **new combined entry itself** with existing signed ledger
+   fixtures: compare capacity against original validate-plus-capacity on stable
+   bytes; assert one actual management preflight, zero generic capacity calls and
+   no durable writes. Keep the old general checked APIs and original differential
+   preservation tests.
+2. Verify bad signatures before fresh ledger preflight (driver provenance still
+   comes first), stale signed capsules, unacknowledged/complete-member and scope
+   restrictions, exact retained/reopened releases, fresh current-byte corruption
+   after prior success, pending reservations, valid-signed committee barriers and
+   committed/uncommitted tails. Refusals must not write; restore fixture-owned
+   corrupt bytes before assertions.
+3. Drive raw worker role/term/commit/last progress after preflight and before
+   publication, proving the unchanged final barrier/prefix refusal with no
+   proposal. Keep the original settled-prefix and corruption regressions.
+4. Review and pin a source-specific finite reader for the truthful cumulative
+   `release_capacity_from_preflight` leader phase. Refuse obsolete separate
+   capacity phases/spans; preserve original fences, aliases, privacy, branch
+   partitions and unsupported-context refusals. Do not fabricate an audit,
+   isolated duration, per-attempt ladder or missing-call inference.
+5. Freeze corrected source, rebuild current portable main/harness, verify exact
+   unchanged bundle pins and run isolated quiet/scoped all-cold acceptance.
+   Report owner confirmation, routes, fresh Query and whole30 independently.
+6. Continue remaining packaged/ordinary CLI M1 gates only on that exact resulting
+   source/artifact boundary, then M2 and locally possible M3. A passing unit,
+   audit count or leader custody result does not close M1.
+
+Implementation/regression effort remains uncertain until the proposed entry is
+compiled and exercised; there is no aggregate milestone ETA. Observed build/run
+durations are attempt costs only. The scope decision is whether to authorize
+this internal coordination change under all original limits; no deployment,
+master/reviewer promotion, new authority or automatic further candidate follows.
 
 ### Completed R55 release-bound audit attribution
 
@@ -149,7 +304,7 @@ Evidence below `target/task-tmp`:
   `f4765bc859664efaa43ff131543e51d064bf86449eb2907b9baf77a25b5ec68b`.
 
 **Qualification:** M1 is still blocked at original-owner terminal-release
-confirmation. R56 will split the largest measured branch before any sixth
+confirmation. R56 above splits the largest measured branch before any sixth
 behavior proposal; no audit/transaction reuse or redesign is authorized by
 these timings. Actual ordinary CLI, remaining packaged gates, M2 and local/
 external M3 remain open. Remedy/source hours and total milestone effort remain
@@ -2251,8 +2406,11 @@ Remaining release work, in dependency order:
    cryptography/encoding/removable share remain unknown. Independent fresh physical-prefix audits
    remain mandatory; host/proposal guards alone do not prevent raw Raft progress.
    R54's explicitly authorized fifth pass still fails. R55 locates body cost;
-   R56 splits existing registration operations only; no sixth behavior candidate,
-   material redesign or week-cap extension follows.
+   completed R56 shows incoming verification is a small measured share and does
+   not prioritize the unapplied tiny reuse proposal. The reviewed existing
+   preflight-view combined release-admission proposal awaits separate
+   direction; no sixth behavior candidate, material coordination change or
+   week-cap extension is automatic. Preserve the later host-holder unknown.
    Source review rules out a missing caller retry: existing same-held recovery
    already retries Unavailable within the original scheduling window. Preserve
    exact retained continuation, fresh absence/settled-prefix, physical

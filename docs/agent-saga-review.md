@@ -11,6 +11,49 @@ host source or the released workflow.
 
 ## Boundary and release claim
 
+R56 diagnostic attribution is complete on clean `53b7be16`: portable
+main/harness pass **391.898s / 459.891s**, strict six-file verification **0.101s**.
+One isolated scoped all-cold attempt fails **245.670s**, one failed test,
+exhausted noninterrupted owned group. The finite reader admits **15,518 records /
+622 edges / zero unknowns** through all original fences; 54 acceptance/72 refusal
+synthetics and privacy checks pass. Create reaches public Applied and exact
+Applied replay. Install accepts finalization, crosses both ACK availability
+boundaries and persists its terminal, then its original owner release times out
+at **1.847626s** before proposal. The leader later confirms the exact release;
+owner confirmation, routes and whole30 remain unqualified.
+
+The two release-bound audit bodies take **982.647ms / 964.606ms** with negligible
+ledger/read acquisition. Each exact stage records seven successful phases for
+each of five registrations, with no duplicate group-phase key. Incoming
+verification totals only **35.478ms / 34.987ms**, about 8.6% of registration cost;
+that whole phase includes mandatory signed checks and merely bounds possible
+reuse savings. The seven leaf clocks cover about 72% of registration folding;
+the untimed remainder includes diagnostic bookkeeping as well as production
+work. No isolated CPU/removable-cost or speedup claim follows. Admission reaches
+commit start at **2.181219s**. Later host wait **1688.862ms** remains separately
+unattributed. Nested clocks and repeated identities are not distinct attempts.
+
+The tiny verification proposal remains target-only and unapplied; these timings
+do not prioritize a sixth tiny pass. The reviewed source-only proposal
+combines release validation and scalar capacity from the existing fresh fully
+authenticated management preflight view. Driver/signature order, one unchanged
+guarded transaction and final worker barrier/prefix check must remain mandatory.
+Removing the second read changes coordination and its error boundary, requiring
+separate review and direction. No behavior implementation, view/cache export,
+new authority, sixth tuning pass, redesign or cap extension is automatic. The
+live plan owns exact evidence, forecasts and all remaining release gates.
+
+The concrete source-only proposal is
+`target/task-tmp/r56-signed-release-capacity-proposal-v4.patch`, SHA
+`dee945322575f55bb23097db0ecbd55a774f1ff259fb4230d76ee0bb6f18af90`.
+Root and independent source/tool reviews pass; it remains unapplied, uncompiled,
+untested and unmeasured. Read the live plan's
+[reviewed proposal and mandatory regressions](agent-saga-status.md#reviewed-combined-release-admission-proposal--awaiting-direction)
+before any decision. Generic capacity counters keep their meaning: proposed
+release delta zero, actual management-preflight delta one; registration keeps
+its actual generic capacity delta one. The new cumulative leader marker requires
+a source-specific strict reader update before diagnostic execution.
+
 R55 diagnostic attribution is complete on clean `29c29092`: current portable
 main/harness and strict six-file verification pass; one scoped all-cold attempt
 fails **236.658s**. The finite reader admits **9,655 records / 506 edges / zero
@@ -20,14 +63,6 @@ followed by late leader confirmation. The exact failing release's fresh audits
 take **909.181ms / 940.630ms**, with **0µs** ledger wait and **0/2µs** read start.
 Registration and Ordered folds dominate; isolated crypto/encoding/removable work
 and the later host holder remain unknown. No recovery or performance credit.
-
-R56 continues diagnostic-only investigation by timing the existing registration
-checks, incoming verification, evidence construction, candidate validation and
-manifest/physical commitment work. One std-only gated helper preserves all
-calls, errors, freshness, signatures, transactions, guard lifetimes and bounds.
-Nested clocks and repeated identities cannot be treated as distinct attempts.
-The live plan owns review, clean portable provenance and isolated evidence
-admission; no sixth behavior candidate, guest change or cap extension follows.
 
 R54 is complete on frozen `63b8203e`: independent source/test reviews and
 11 preservation units pass, including signed differentials against the original
@@ -176,42 +211,22 @@ Current O3 component evidence (logs under the native worktree's `target`):
 
 ### Current integration delta and blocking result
 
-Read [completed R55](agent-saga-status.md#completed-r55-release-bound-audit-attribution)
-in the sole live plan for source/binary/reader/artifact hashes and event limits.
-Portable main/harness pass **392.411s / 457.262s**, strict six-file verification
-**0.101s**. The scoped attempt admits **9,655 records / 506 explicit edges /
-zero unknowns**, one failed test and exhausted noninterrupted owned group.
-Public Create completes terminal/release and exact Applied replay, then the
-fixture verifies pending Install and enters cold restart. Exact Install
-finalization is delivered and accepted; root-bound issuer save requires actual
-Done, exact reply validation and durable replay equality. Both runtime retirements
-and terminal persistence complete. Current failure is its original owner's
-retention release: thirteen absent polls, timeout **1.873s** into confirmation,
-before leader proposal. The leader then observes that exact release present and
-completes local custody/commit. There is no tail attachment ScopeMismatch here;
-R52's late attachment refusal remains historical and cannot explain its earlier
-owner timeout. Late leader release is not original-owner completion or readiness.
+Read [completed R56](agent-saga-status.md#completed-r56-registration-fold-attribution)
+in the sole live plan for exact source/binary/reader/artifact hashes, phase totals
+and limits. Current portable builds/verification pass, but the isolated all-cold
+attempt fails **245.670s**. Create reaches public Applied and exact replay;
+Install accepts finalization, crosses ACK availability and persists its terminal.
+Its original owner then times out before proposal, followed by late leader
+confirmation. Late custody is not original-owner completion, routes or whole30.
 
-Exact Install release times: driver provenance **112.019ms**, signed-ledger
-validation **918.705ms**, capacity **940.716ms**, worker snapshot **32µs**.
-The validator's driver time is already nested in its enclosing leader interval.
-Its fresh settled-prefix preflight and the separate capacity transaction remain
-mandatory; these durations do not establish their removable fraction or a
-CPU-only cause. R55 explicitly binds audit bodies of **909.181ms / 940.630ms**
-to signed validation/capacity, with **0µs** guard wait and **0/2µs** read start.
-Registration accounts for **313.029ms / 338.641ms**, Ordered **246.904ms /
-249.913ms**, historical release **96.697ms / 93.294ms**. These are nested complete
-branch costs, not isolated signatures or safely removable checks. The second
-leader confirmation poll spends **1977.937ms** acquiring
-the host, **134µs** draining and **129.840ms** verifying manifest; the holder and
-its work remain unknown. Source confirms exact terminal-release retry already
-exists within one unchanged startup scheduling budget. Neither that budget's
-monotonic start nor exhaustion is logged. These independent fresh transactions
-cannot be cached away. Original-owner release completion, client recovery, routes, whole30,
-ordinary three-process CLI and M1 remain open. Broader simplifications stay later.
-No sixth behavior candidate or week-cap extension is automatic. R56 separates
-the largest measured registration branch's existing calls while the independently
-later host wait remains unattributed.
+Two explicitly release-bound fresh audit bodies dominate pre-proposal admission.
+Incoming verification is only a small part of registration folding and does not
+prioritize the unapplied tiny reuse patch. The later host holder remains unknown.
+The source-only combined admission proposal must retain a complete fresh guarded
+management preflight and final worker/prefix checks; removing the second read
+requires separately reviewed coordination/error-boundary changes, not a cache
+or authority shortcut. No sixth behavior candidate or week-cap extension follows.
+Ordinary three-process CLI, remaining packaged gates, M2 and M3 stay open.
 
 The reviewed proposal removes only repeated changed-candidate slot validation
 from historical release folding. It retains incoming signature-before-retry,
