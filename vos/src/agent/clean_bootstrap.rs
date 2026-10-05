@@ -4019,7 +4019,6 @@ where
         J: CleanManagementIssuerStore,
     {
         let refused = |phase: &str, error: SharedAgentHostError| {
-            #[cfg(test)]
             if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
                 tracing::debug!(phase, ?error, "Management terminal retirement refused");
             }
@@ -5461,14 +5460,12 @@ where
         // ordering. It proves current decision state without retaining a child.
         let query = self.signed_genesis_decision_query(agent, nonce, signer)?;
         let response = self.invoke_authority_observation(query).map_err(|error| {
-            #[cfg(test)]
             if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
                 tracing::debug!(?error, "Finalized genesis fresh decision refused");
             }
             error
         })?;
         let expected = record.provision().decision().encode();
-        #[cfg(test)]
         if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
             tracing::debug!(
                 response_bytes = response.len(),
@@ -8262,7 +8259,6 @@ where
         issuer: &DurableCleanManagementIssuer<J>,
     ) -> Result<(), SharedAgentHostError> {
         let refused = |phase: &str, error: SharedAgentHostError| {
-            #[cfg(test)]
             if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
                 tracing::debug!(phase, ?error, "Management terminal completion refused");
             }
@@ -8286,13 +8282,11 @@ where
             .finalization_work()
             .map_err(|_| SharedAgentHostError::Unavailable)?
             .ok_or(SharedAgentHostError::ScopeMismatch)?;
-        #[cfg(test)]
         if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
             tracing::debug!("Management terminal completion handoff start");
         }
         self.handoff_recovered_management(&[[authorization, finalization]])
             .map_err(|error| refused("handoff", error))?;
-        #[cfg(test)]
         if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
             tracing::debug!("Management terminal completion handoff complete");
         }
@@ -8458,7 +8452,6 @@ where
                     let result = host.observe_system_authority(
                         crate::service::AgentId(self.pins.agent.0), &work,
                     );
-                    #[cfg(test)]
                     if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
                         match &result {
                             Ok(super::sdk::RuntimeOutcome::Completed(Ok(reply))) => {
@@ -8475,7 +8468,6 @@ where
                     result
                 },
             ).map_err(|error| {
-                #[cfg(test)]
                 if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
                     tracing::debug!(?error, "Authority observation freshness or callback refused");
                 }

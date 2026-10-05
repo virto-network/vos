@@ -103,17 +103,20 @@ Current O3 component evidence (logs under the native worktree's `target`):
 ### Current integration delta and blocking result
 
 Latest measured portable source is frozen at
-`fcac175a79d43ab9268f66a008f68ce3fbb44f57`; production recovery correction
-remains `f9c61863`, with qualified journal/family tests, temporary existing-flag
-native diagnostics and the reviewed one-line empty Query assertion correction.
-Portable main/harness **pass 192.698s / 245.354s**; main strict six-file
-verification **passes 0.101s**. Main/harness hashes are identical to the measured
-`5750f0c2` binaries. Empty RUSTFLAGS, unset encoded/target overrides, exact
-copied hashes, clean source before/after and owned-group completion are recorded
-in `task-tmp/r42-cli-build-fcac175a/provenance.json`.
+`f4a3dc90849ea34d706269c016ebb35e8314e048`; production recovery correction
+remains `f9c61863`. The fixture-only pending-Install preparation correction is
+now compiled and exercised, with recovery qualification still open. Portable
+main/harness **pass 191.597s / 249.354s**; main strict six-file verification
+**passes 0.101s**. Main remains `005faa69`, identical to the measured `5750f0c2`
+and `fcac175a` binary; the corrected fixture harness is `667395e9`. Empty
+RUSTFLAGS, unset encoded/target overrides, exact copied hashes, clean source
+before/after and owned-group completion are recorded in
+`task-tmp/r42-cli-build-f4a3dc90/provenance.json`.
 Authority, Catalog, both runtime roles and coherent guest pins remain unchanged.
-Typed retained-client regressions remain component-qualified.
-Implementation/component and packaging passes do not close integration or M1.
+Three focused exact-retention units each execute one test and **pass
+0.101s / 0.101s / 0.601s** (credential query, reservation and exact Install),
+with owned groups gone. These and the earlier typed retained-client regressions
+are component evidence, not integrated recovery or M1 qualification.
 
 Latest completed quiet/scoped public runs on `5750f0c2` **fail
 412.139s / 366.996s** at the unchanged
@@ -161,7 +164,8 @@ backend/profile/stack settings; timing is diagnostic only, not quiet,
 ordinary-default or SLA evidence. Remove them after attribution.
 The other four selectors, ordinary CLI acceptance and M1/M2/M3 remain open.
 
-Current ordinary three-process CLI on clean `fcac175a` **fails 208.524s**
+Latest completed ordinary three-process CLI, frozen at clean `fcac175a`,
+**fails 208.524s**
 before Local Query or Shared. First-ready **passes 9.338s**; Local Create
 **passes 26.178s**, with an initial HTTP 503 and successful second exact retained
 attempt. Local Install makes **125 attempts**, spanning **169.760s** before the
@@ -187,34 +191,63 @@ Ordinary CLI integration needs attribution of the current exact Local Install
 refusal and a frozen-provenance rerun; no new source correction is established.
 Stage timings are not whole-recovery/SLA or complete workflow qualification.
 
-The independently run returning/all-cold pending-Install selectors **fail
-148.160s / 290.903s**, each one executed failing test with owned group gone and
-current fences passing. Returning fails at `member_cold_install_tests.rs:102`
-on credential HTTP 503 in `retain_install_for_test`, **before SIQ1 publication,
-receipt cut or recovery timer**. All-cold completes SIQ preparation, original
-shutdown, peer-leader selection and `open_origin`, then fails the pre-cut
-`returned_follower` wait at `member_workflow_tests.rs:721` /
-`member_cold_install_tests.rs:116`, **before `prepare_shared_install`, fault
-construction or recovery timing**. No native/frontphase/whole30 recovery markers
-are recorded. These are setup failures, not pending-Install recovery evidence;
-neither supplies a recovery or fresh-Query pass, and their causes are not
-established. Evidence is `task-tmp/r42-pending-install-fcac175a` and
-`task-tmp/r42-pending-all-cold-fcac175a`, with private logs/results and preserved
-current fences. Preserve both setup failures without crediting recovery.
+Current quiet returning/all-cold pending-Install runs on clean `f4a3dc90`
+**fail 186.302s / 244.666s**, each one executed failing test, owned group gone
+and frozen source/provenance/artifact fences passing. Both report **complete
+Shared recovery before routes: Unavailable**. Returning fails at
+`member_cold_install_tests.rs:46` in `open_origin`; that helper has both pre-cut
+and timed-recovery callers, so **receipt-cut occurrence is unestablished** from
+this quiet evidence. All-cold fails at `clean_startup_tests.rs:1981`, **replica 0
+restart=true**. Its source ordering proves the intended signed receipt cut and
+entry into all-owner reopen, but supplies **no successful recovery or fresh
+Query**. Neither failure identifies the inner guest, observation, storage or
+release cause, or supports a performance-only verdict. Existing whole **30s**
+recovery remains mandatory; no recovery or Query pass is credited.
 
-A fixture-only source correction is **APPLIED, UNBUILT, UNEXECUTED and
-UNQUALIFIED**. Normal credential/descriptor discovery now retries the exact
-persisted credential query while the original reservation/nonce remain held;
-SIQ1 signing/publication still occurs once. The existing **120s** setup deadline
-starts before preparation and is reused through the receipt cut, rejecting late
-results. Only the premature raw-lifecycle pre-cut follower wait is removed:
-normal authorization refreshes authenticated transport before receipt signing,
-and real returning-follower checks remain after normal production attachment.
-Exact SIQ1/no-response/staged-receipt/unchanged ordinary-journal assertions and
-whole **30s** recovery remain. No API/visibility, forced election/readiness or
-public admission is added. Compile and rerun both selectors before crediting
-recovery. This does not resolve ordinary Local ScopeMismatch or native NRT1
-terminal-release causes.
+The same-source scoped all-cold diagnostic also **fails 248.167s**, one
+executed failing test, owned group gone and current fences passing. It reaches
+the same **replica 0 restart=true / Shared recovery before routes Unavailable**
+boundary. Aggregate startup phase counts are **seven** each through `local_host`
+and **six** each for `shared_lifecycle_recovery` and `lifecycle_controller`;
+these interleaved counts do not bind a registration/release episode to the failed
+constructor. There are **zero native-operation phase records**. Existing
+observation/fresh-Genesis/management-terminal outcome traces are unavailable to
+the CLI-linked core because their hooks are `cfg(test)`; missing traces therefore
+establish no guest result or inner cause. Evidence is
+`task-tmp/r42-pending-all-cold-scoped-f4a3dc90`, with `safe-summary.json` SHA-256
+`e0c6d84a43ff4709a45a2281159423c1493d18022a4a8705a1015fcddd6e5a8a`.
+A minimal host diagnostic visibility correction is **APPLIED, UNBUILT and
+UNEXECUTED**: eight test-compilation gates were removed immediately before
+existing `VOS_TEST_BOOTSTRAP_DIAGNOSTICS`-gated observation/fresh-Genesis/
+management-terminal logs. Only fixed phase/status/error enums, booleans and
+lengths become visible to the CLI-linked host; fault gates, execution/guard order
+and original checks remain. Freeze/build current portable provenance, then run
+one isolated diagnostic before a cause correction. No cause correction is
+established; diagnostic timing is not quiet recovery/SLA qualification. Guest
+bytes/pins, protocols and bounds remain unchanged. Remove the temporary
+diagnostics after attribution.
+
+The fixture-only preparation correction is **BUILT and EXECUTED, UNQUALIFIED**.
+Normal credential/descriptor discovery retries the exact persisted credential
+query while the original reservation/nonce remain held; SIQ1 signing/publication
+still occurs once. The existing **120s** setup deadline starts before preparation
+and is reused through the receipt cut, rejecting late results. Only the premature
+raw-lifecycle pre-cut follower wait was removed: normal authorization refreshes
+authenticated transport before receipt signing, and real returning-follower
+checks remain after normal production attachment. Exact SIQ1/no-response/
+staged-receipt/unchanged ordinary-journal assertions and whole **30s** recovery
+remain. No API/visibility, forced election/readiness or public admission is added.
+
+Earlier `fcac175a` failures **148.160s / 290.903s** remain frozen setup evidence:
+returning credential HTTP 503 before SIQ1 publication, and all-cold pre-cut
+follower wait before receipt-fault construction. They do not qualify recovery;
+the current all-cold cut/reopen boundary must not be reduced to those earlier
+setup failures. The current quiet evidence and safe summaries are
+`task-tmp/r42-pending-install-f4a3dc90` and
+`task-tmp/r42-pending-all-cold-f4a3dc90`; summaries export fixed status/boolean
+boundaries only. Attribute the inner normal-startup Unavailable before changing
+source, then rerun both with unchanged bounds. This does not resolve ordinary
+Local ScopeMismatch or native NRT1 terminal-release causes.
 
 Their source-based independence still allows focused recovery qualification,
 but a fresh Query after timed recovery remains a distinct native-issuance probe
@@ -277,12 +310,21 @@ acceptance still fails; fix only a demonstrated native cause and remove diagnost
 Separately attribute the ordinary exact Local Install refusal; its repeated
 ScopeMismatch is a reported boundary with unknown substage/cause. The corrected
 Query predicate is unreached and does not close either integration gate.
-Independent pending-Install runs also fail during pre-cut setup, supplying no
-recovery proof. The reviewed fixture-only preparation correction is applied but
-unbuilt/unexecuted/unqualified and requires compilation plus both reruns.
+Current quiet pending-Install runs **fail 186.302s / 244.666s** during normal
+startup: returning cut occurrence is unestablished, while all-cold proves the
+receipt cut and all-owner reopen entry before replica 0 fails Unavailable.
+Neither supplies recovery or fresh-Query proof. The fixture-only preparation
+correction is built/executed but unqualified; the scoped all-cold diagnostic
+**fails 248.167s** at the same constructor context without usable inner outcome
+traces. Reviewed host-only visibility is applied but unbuilt/unexecuted; freeze
+current source/build provenance, then attribute in isolation before a cause
+correction and both reruns. Interleaved metadata
+counts supply no cause proof. Preserve the earlier `fcac175a` pre-cut setup
+failures by reference.
 Freeze any demonstrated correction/current portable provenance and rerun fresh
-ordinary CLI. Recorded portable costs **192.698s / 245.354s** are high-confidence
-facts at clean `fcac175a` with unchanged executable hashes; a predictive
+ordinary CLI. Recorded portable costs **191.597s / 249.354s** are high-confidence
+facts at clean `f4a3dc90`; main is unchanged, corrected harness provenance differs.
+The quiet failed-gate costs are observations, not a successful recovery range. A predictive
 **3–8 minutes per portable main/harness binary** range has moderate confidence
 from cache/source variation and is not an aggregate ETA. Earlier source/elapsed
 forecasts remain unreliable.
