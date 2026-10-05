@@ -5904,8 +5904,20 @@ mod application_ledger_v2 {
             &self,
             registration: &SharedManagementRecoveryRegistration,
         ) -> Result<(), AgentRaftApplicationErrorV2> {
-            registration
-                .verify(self.generation, &self.initial_committee)
+            let cost_started = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS")
+                .is_some()
+                .then(std::time::Instant::now);
+            let verified = registration.verify(self.generation, &self.initial_committee);
+            if let Some(started) = cost_started {
+                tracing::debug!(
+                    phase = "signed_request_verification",
+                    elapsed_us = started.elapsed().as_micros(),
+                    items = registration.request().members().len(),
+                    success = verified.is_ok(),
+                    "Shared management admission cost"
+                );
+            }
+            verified
                 .map_err(|_| AgentRaftApplicationErrorV2::InvalidCommandDisposition)?;
             self.validate_management_recovery_registration_request(registration.request())
         }
@@ -5950,7 +5962,20 @@ mod application_ledger_v2 {
                 .lock()
                 .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
             let transaction = self.database.begin_read()?;
-            let audited = self.management_recovery_preflight(&transaction)?;
+            let cost_started = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS")
+                .is_some()
+                .then(std::time::Instant::now);
+            let audited = self.management_recovery_preflight(&transaction);
+            if let Some(started) = cost_started {
+                tracing::debug!(
+                    phase = "request_preflight",
+                    elapsed_us = started.elapsed().as_micros(),
+                    items = request.members().len(),
+                    success = audited.is_ok(),
+                    "Shared management admission cost"
+                );
+            }
+            let audited = audited?;
             let manifest = audited.recovery.unwrap_or(
                 SharedRecoveryManifest::new(self.generation, self.initial_committee.clone())
                     .map_err(|_| AgentRaftApplicationErrorV2::ConfigurationMismatch)?,
@@ -5966,12 +5991,25 @@ mod application_ledger_v2 {
             // The anchor check above does not mutate them. Reuse that same
             // validation only for the remaining exact request check; keep the
             // fresh settled-prefix preflight and all request/family bounds.
-            super::super::shared_recovery::management::validate_management_registration_request_after_slots_validation(
+            let cost_started = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS")
+                .is_some()
+                .then(std::time::Instant::now);
+            let validated = super::super::shared_recovery::management::validate_management_registration_request_after_slots_validation(
                 manifest.management_slots(),
                 self.generation,
                 &self.initial_committee,
                 request,
-            )
+            );
+            if let Some(started) = cost_started {
+                tracing::debug!(
+                    phase = "request_succession",
+                    elapsed_us = started.elapsed().as_micros(),
+                    items = request.members().len(),
+                    success = validated.is_ok(),
+                    "Shared management admission cost"
+                );
+            }
+            validated
             .map_err(|_| AgentRaftApplicationErrorV2::InvalidCommandDisposition)?;
             Ok(())
         }

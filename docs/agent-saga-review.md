@@ -102,7 +102,26 @@ Current O3 component evidence (logs under the native worktree's `target`):
 
 ### Current integration delta and blocking result
 
-The user-authorized bounded R48 candidate is **measured and failed** on clean
+The user has authorized one further bounded **R49 investigation of remaining
+leader-admission costs** after the R48 handoff. Start from clean `19ede582`;
+the lease restoration and all exact-retry/freshness checks remain. Temporary
+payload-free diagnostics split signed request verification, fresh request
+preflight, request succession, headroom/budget, absence audit/evidence and
+terminal preview. They export only fixed phase names, durations, bounded counts
+and phase-success booleans under the existing diagnostic flag. No audit, check,
+guard, deadline, artifact or protocol is changed. Preview booleans do not export
+a full guest outcome; budget success includes Ok(None), and success-only phases
+may be absent on early errors. Missing markers remain unknown.
+No cross-request/node association or performance benefit is inferred.
+Freeze the diagnostic source, build portable main/harness with exact provenance,
+then run one isolated quiet all-cold gate and, if needed, one scoped run.
+Existing owned cleanup and finite evidence admission remain. This authorization
+is for investigation, not an automatic fourth tuning change or week-cap extension.
+Implementation timing is uncertain until the source review closes; portable
+build/run attempt costs remain the measured 20–26 minutes for that sequence.
+Qualification and the packaged M1 exit remain open.
+
+The preceding user-authorized bounded R48 candidate is **measured and failed** on clean
 source `89b40ba6e34b87d94a323b3fe54a08fea614afa5`. This is the **third measured
 candidate**, explicitly authorized after the original two failed passes; it
 supplies no recovery, performance benefit or M1 exit. The engineering-week

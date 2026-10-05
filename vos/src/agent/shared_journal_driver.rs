@@ -65,6 +65,29 @@ use crate::service::{BlobRef, Hash, NodeId};
 
 type SharedReplayError = MaterializeError<core::convert::Infallible, LocalReplayExecutorError>;
 
+fn management_admission_cost_started() -> Option<std::time::Instant> {
+    std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS")
+        .is_some()
+        .then(std::time::Instant::now)
+}
+
+fn trace_management_admission_cost(
+    phase: &'static str,
+    started: Option<std::time::Instant>,
+    items: usize,
+    success: bool,
+) {
+    if let Some(started) = started {
+        tracing::debug!(
+            phase,
+            elapsed_us = started.elapsed().as_micros() as u64,
+            items = items.min(super::journal::MAX_REPLAY_SUFFIX_ENTRIES),
+            success,
+            "Shared management admission cost"
+        );
+    }
+}
+
 fn clean_outcome_kind(outcome: Option<&crate::agent_sdk::RuntimeOutcome>) -> &'static str {
     use crate::agent_sdk::RuntimeOutcome;
     match outcome {
@@ -2646,14 +2669,17 @@ where
         anchor: &super::clean_management_intent::ManagementJournalAnchor,
         envelope: &crate::agent_sdk::RuntimeWork,
     ) -> Result<(Option<usize>, Option<ReplayInputId>), SharedJournalDriverError> {
-        self.management_recovery_admission_with_headroom_and_input(
+        let started = management_admission_cost_started();
+        let result = self.management_recovery_admission_with_headroom_and_input(
             &[(anchor, envelope)],
             &[],
             0,
             0,
             true,
             None,
-        )
+        );
+        trace_management_admission_cost("singleton_budget", started, 1, result.is_ok());
+        result
     }
 
     /// The caller keeps this custody Invoke's post-drain admission guards.
@@ -2665,14 +2691,17 @@ where
         envelope: &crate::agent_sdk::RuntimeWork,
         manifest: &SharedRecoveryManifest,
     ) -> Result<(Option<usize>, Option<ReplayInputId>), SharedJournalDriverError> {
-        self.management_recovery_admission_with_headroom_and_input(
+        let started = management_admission_cost_started();
+        let result = self.management_recovery_admission_with_headroom_and_input(
             &[(anchor, envelope)],
             &[],
             0,
             0,
             true,
             Some(manifest),
-        )
+        );
+        trace_management_admission_cost("singleton_budget", started, 1, result.is_ok());
+        result
     }
 
     /// One prospective Ordered chain for incomplete invocations and completed
@@ -2755,9 +2784,18 @@ where
                 verified_manifest,
             )?;
         }
-        let (pending, future_entries, future_bytes) =
-            management_retention_headroom(self.materialization.heads(), manifest, incoming)?;
-        self.management_recovery_admission_with_headroom_and_input(
+        let started = management_admission_cost_started();
+        let headroom =
+            management_retention_headroom(self.materialization.heads(), manifest, incoming);
+        trace_management_admission_cost(
+            "retention_headroom",
+            started,
+            manifest.management_slots().len(),
+            headroom.is_ok(),
+        );
+        let (pending, future_entries, future_bytes) = headroom?;
+        let started = management_admission_cost_started();
+        let result = self.management_recovery_admission_with_headroom_and_input(
             &pending,
             &[],
             future_entries,
@@ -2765,7 +2803,14 @@ where
             false,
             verified_manifest,
         )
-        .map(|(requirement, _)| requirement)
+        .map(|(requirement, _)| requirement);
+        trace_management_admission_cost(
+            "retention_budget",
+            started,
+            pending.len(),
+            result.is_ok(),
+        );
+        result
     }
 
     /// The caller verified this manifest after draining under the same
@@ -2775,9 +2820,18 @@ where
         &self,
         manifest: &SharedRecoveryManifest,
     ) -> Result<Option<usize>, SharedJournalDriverError> {
-        let (pending, future_entries, future_bytes) =
-            management_retention_headroom(self.materialization.heads(), manifest, None)?;
-        self.management_recovery_admission_with_headroom_and_input(
+        let started = management_admission_cost_started();
+        let headroom =
+            management_retention_headroom(self.materialization.heads(), manifest, None);
+        trace_management_admission_cost(
+            "custody_headroom",
+            started,
+            manifest.management_slots().len(),
+            headroom.is_ok(),
+        );
+        let (pending, future_entries, future_bytes) = headroom?;
+        let started = management_admission_cost_started();
+        let result = self.management_recovery_admission_with_headroom_and_input(
             &pending,
             &[],
             future_entries,
@@ -2785,7 +2839,14 @@ where
             false,
             Some(manifest),
         )
-        .map(|(requirement, _)| requirement)
+        .map(|(requirement, _)| requirement);
+        trace_management_admission_cost(
+            "custody_budget",
+            started,
+            pending.len(),
+            result.is_ok(),
+        );
+        result
     }
 
     /// One budget for the exact read and every retained management owner's
@@ -3511,7 +3572,8 @@ where
             // the complete stable applied/committed prefix under the existing
             // management barrier and compare it with this materialization.
             // An unsettled tail refuses absence without calling it corruption.
-            let (ordered, fresh) = self.ledger.management_absence_context().map_err(|error| {
+            let started = management_admission_cost_started();
+            let result = self.ledger.management_absence_context().map_err(|error| {
                 if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
                     tracing::debug!(
                         node = ?self.materialization.heads().node,
@@ -3523,13 +3585,17 @@ where
                     );
                 }
                 error
-            })?;
+            });
+            trace_management_admission_cost("absence_ledger", started, 1, result.is_ok());
+            let (ordered, fresh) = result?;
             if ordered != self.materialization.ordered_base() {
                 return Err(SharedJournalDriverError::CrossStoreMismatch);
             }
+            let started = management_admission_cost_started();
             let fresh = self
                 .verified_recovery_manifest_from_read(fresh)?
                 .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+            trace_management_admission_cost("absence_evidence", started, 1, true);
             let evidence = exact_retained_management_member(&fresh, Some(anchor), envelope)?
                 .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
             if let Some(observation) = evidence.invoke() {
@@ -4711,6 +4777,11 @@ where
         persisted_management: bool,
         verified_manifest: Option<&SharedRecoveryManifest>,
     ) -> Result<PreparedCleanOrdered, SharedJournalDriverError> {
+        let cost_started = if persisted_management {
+            management_admission_cost_started()
+        } else {
+            None
+        };
         // Retry identity excludes the trusted observation slot. The real slot
         // is sampled exactly once below only when a new operation is built.
         let operation = request.clone().into_operation(0);
@@ -4762,6 +4833,7 @@ where
         // Preserve all exact first selectors above. Only a genuinely unseen
         // fixed-three retained management member needs ordering and a successful
         // preview; singleton/ordinary/bootstrap execution remains unchanged.
+        trace_management_admission_cost("preparation_selectors", cost_started, 1, true);
         let successful_management = if persisted_management {
             let observed_slot =
                 accepted_observed_slot.ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
@@ -4816,6 +4888,11 @@ where
         #[cfg(not(feature = "experimental-state-blocks"))]
         let require_terminal = terminal_only || successful_management;
         if require_terminal {
+            let cost_started = if persisted_management {
+                management_admission_cost_started()
+            } else {
+                None
+            };
             #[cfg(feature = "experimental-state-blocks")]
             let terminal = if self.external.is_some() {
                 let work = super::replay::canonical_clean_runtime_work(
@@ -4886,6 +4963,7 @@ where
                     &input.runtime,
                 )?
             };
+            trace_management_admission_cost("preparation_preview", cost_started, 1, terminal);
             if !terminal {
                 if successful_management {
                     return Err(JournalStoreError::Unavailable.into());
@@ -5300,6 +5378,7 @@ where
         manifest: &SharedRecoveryManifest,
         baseline: Option<&SharedRecoveryManifest>,
     ) -> Result<(), SharedJournalDriverError> {
+        let started = management_admission_cost_started();
         for slot in manifest.management_slots() {
             let heads = self.materialization.heads();
             if slot.members().iter().any(|member| {
@@ -5363,6 +5442,12 @@ where
             }
             self.ledger.validate_recovery_observation(observation)?;
         }
+        trace_management_admission_cost(
+            "manifest_evidence",
+            started,
+            manifest.management_slots().len(),
+            true,
+        );
         Ok(())
     }
 
@@ -5464,14 +5549,16 @@ where
             authorization: (**authorization).clone(),
             observed_slot: *observed_slot,
         };
-        if !self
+        let started = management_admission_cost_started();
+        let terminal = self
             .executor
             .new_management_invocation_is_successful_terminal(
                 &operation,
                 self.materialization.state(),
                 self.materialization.runtime(),
-            )?
-        {
+            )?;
+        trace_management_admission_cost("clock_preview", started, 1, terminal);
+        if !terminal {
             return Err(JournalStoreError::Unavailable.into());
         }
         Ok(())

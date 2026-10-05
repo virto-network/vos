@@ -37,7 +37,26 @@ deployment is automatic.
 
 ## Current position
 
-The user-authorized bounded R48 candidate is **measured and failed** on clean
+The user has authorized one further bounded **R49 investigation of remaining
+leader-admission costs** after the R48 handoff. Start from clean `19ede582`;
+the lease restoration and all exact-retry/freshness checks remain. Temporary
+payload-free diagnostics split signed request verification, fresh request
+preflight, request succession, headroom/budget, absence audit/evidence and
+terminal preview. They export only fixed phase names, durations, bounded counts
+and phase-success booleans under the existing diagnostic flag. No audit, check,
+guard, deadline, artifact or protocol is changed. Preview booleans do not export
+a full guest outcome; budget success includes Ok(None), and success-only phases
+may be absent on early errors. Missing markers remain unknown.
+No cross-request/node association or performance benefit is inferred.
+Freeze the diagnostic source, build portable main/harness with exact provenance,
+then run one isolated quiet all-cold gate and, if needed, one scoped run.
+Existing owned cleanup and finite evidence admission remain. This authorization
+is for investigation, not an automatic fourth tuning change or week-cap extension.
+Implementation timing is uncertain until the source review closes; portable
+build/run attempt costs remain the measured 20–26 minutes for that sequence.
+Qualification and the packaged M1 exit remain open.
+
+The preceding user-authorized bounded R48 candidate is **measured and failed** on clean
 source `89b40ba6e34b87d94a323b3fe54a08fea614afa5`. This is the **third measured
 candidate**, explicitly authorized after the original two failed passes; it
 supplies no recovery, performance benefit or M1 exit. The engineering-week
@@ -1327,16 +1346,21 @@ snapshot return and leased comparison remain mandatory.
 
 Remaining release work, in dependency order:
 
-1. The lease restoration is frozen and passes core/ownership checks; current
-   portable integration remains open. R48's third measured candidate failed quiet and
-   scoped all-cold recovery; report that evidence and obtain go/no-go direction
-   before another service-tuning change, without an automatic week-cap extension.
+1. Complete the newly authorized bounded R49 leader-admission cost investigation:
+   freeze reviewed diagnostic-only source, rebuild portable main/harness and
+   run isolated quiet/scoped all-cold evidence with original fences. The lease
+   restoration passes core/ownership checks; its portable integration is open.
+   R48's third measured candidate failed quiet/scoped recovery. R49 does not
+   authorize a fourth tuning change or an automatic week-cap extension.
    Source review rules out a missing caller retry: existing same-held recovery
    already retries Unavailable within the original scheduling window. Preserve
    exact retained continuation, fresh absence/settled-prefix, physical
    availability/corruption, worker/post-peer checks and original deadlines.
-   The temporal timeline does not prove exact-request causality or a promised
-   fix. A pass still requires cold recovery, routes, fresh Query and whole30;
+   Attribute fresh-prefix audits, evidence verification, immutable validation
+   and preview separately. Phase success for budgets includes Ok(None), and
+   missing success-only markers are unknown. The temporal timeline does not
+   prove exact-request causality or a promised fix. A pass still requires
+   cold recovery, routes, fresh Query and whole30;
    build/unit/component passes do not close this gate. Any resumed integration
    must rebuild portable main/harness from the repaired source with exact
    provenance; the measured 89b40ba6 binaries precede the lease restoration.
