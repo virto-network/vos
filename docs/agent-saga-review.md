@@ -102,18 +102,47 @@ Current O3 component evidence (logs under the native worktree's `target`):
 
 ### Current integration delta and blocking result
 
-Latest measured portable source is frozen at
-`3b2d9b7420a6a4eba54a9ed66b011a54c48f9d8e`, including guarded ACK manifest
-reuse and full Local child correlation diagnostics. Portable main/harness
-**pass 393.998s / 459.572s**; strict six-file verification **passes 0.101s**.
-Main is `fe9d8599`; harness is `c38b732d`. Empty RUSTFLAGS, unset
-encoded/target overrides, exact copied hashes, clean source before/after and
-exhausted owned groups are recorded in
-`task-tmp/r45-cli-build-3b2d9b74/provenance.json`. Authority, Catalog, both
-runtime roles and coherent guest pins remain unchanged. Earlier `19e8d051`
-portable measurements remain frozen evidence, not current workflow qualification.
+Latest completed portable source is frozen at
+`76b3f7232e423a666f1240a4611f54a2fd732fef`, including the Local correction and
+guarded custody Invoke/ACK manifest reuse. Portable main/harness **pass
+389.506s / 459.188s**; strict six-file verification **passes 0.101s**.
+Main is `bc2eeab8`; harness is `2b3471aa`. Empty RUSTFLAGS, unset
+encoded/target overrides, exact copied hashes, clean source before/after,
+unchanged artifact inputs and exhausted owned groups are recorded in
+`task-tmp/r46-cli-build-76b3f723/provenance.json`. Authority, Catalog, both
+runtime roles and coherent guest pins remain unchanged. Earlier portable
+boundaries remain frozen evidence, not current workflow qualification.
 
-The first measured ACK tuning candidate remains **UNQUALIFIED**. Current
+The **second/final measured tuning pass fails**: quiet all-cold **223.845s**,
+one executed failing test, owned group gone and source/artifact/binary fences
+passing. Replica 0 `restart=true` fails Shared recovery before public routes at
+`clean_startup_tests.rs:1981` with Unavailable. No recovery, fresh Query,
+whole30 or inner guest outcome is established. Evidence:
+`task-tmp/r46-pending-all-cold-76b3f723/quiet-safe-summary.json`, SHA-256
+`8d0432aec6f78dfdec4fdc09c07665dc50cd7bffc63bb285e8d7ab2224f8364f`.
+
+The same-candidate scoped rerun **fails 170.388s**, one executed test and
+closed owned group, at `member_cold_install_tests.rs:165`:
+`prepare_shared_install` returns Unavailable while retaining the original
+actual signed Install, **before fault creation or the receipt cut**.
+It does not attribute the quiet run's cold failure. The fixed finalization
+reader reports **10 events / zero unknown** and transfer reader **50 / zero
+unknown**; these are setup events, with no all-owner cold cluster or recovery
+pass. Aggregated guest Done/finalization/retirement events cannot bind episodes
+or establish quiet-run causality. Scoped evidence:
+`task-tmp/r46-pending-all-cold-scoped-76b3f723`; safe artifact hashes
+`9f37e94c02f2a9156c3406da5e584b5a0aa56c81a46640eb5abf6f32a586701c`
+and `e54c375ce9f9f1f11e32ad03b5751486f7cb53b52a691aa692c3a3c48e543dbd`.
+Debug timing supplies attribution only, not quiet qualification.
+
+**Both measured tuning passes are consumed and failed to qualify recovery.**
+No benefit, performance-only cause, global guest-stack resolution or M1 exit is
+claimed. The existing two-pass gate requires go/no-go direction before further
+tuning; no third tuning change, deadline increase or cap extension is authorized.
+Current ordinary CLI, remaining packaged gates, full native NRT1 retry/reopen,
+Local whole30/remaining negatives, M2 and M3 remain open.
+
+The first measured ACK tuning candidate remains **UNQUALIFIED**. Its
 quiet/scoped all-cold runs **fail 239.765s / 242.958s**, one executed test each,
 owned groups gone and source/artifact fences passing. Cold durable and issuer
 observations complete. Extension twice returns Unavailable, then succeeds;
@@ -123,8 +152,8 @@ validation occurs after origin failure; later ordered-result availability also
 returns Unavailable. No cold guest outcome, issuer save, handoff, recovery,
 fresh Query or whole30 pass follows. The cold episode never reaches the ACK
 branch being optimized. No tuning benefit or performance-only/guest-failure
-verdict is established. This consumes **tuning pass one**, leaving one measured
-pass; a diagnostic rerun of this same candidate is not another tuning change.
+verdict is established. This was **tuning pass one**; the result above consumes
+the final pass. A same-candidate diagnostic rerun is not another tuning change.
 Evidence: `task-tmp/r45-pending-all-cold{,-scoped}-3b2d9b74`. The fixed
 forward/custody artifact has **114 records / zero unknown**, SHA-256
 `383ad432ae68d43d2bae6020af118e487b6291f92dc30890c938b98ce8b3f637`.
@@ -214,7 +243,7 @@ before any unit execution; V2 corrects only `evidence_ledger` to the compiled
 These existing units do not qualify the new borrowed Invoke path, Local
 callback, physical recovery bounds or M1; they consume no tuning measurement.
 
-The **second/final tuning candidate is CORE BUILT, UNQUALIFIED**.
+The **second/final tuning candidate is PORTABLE BUILT AND MEASURED, UNQUALIFIED**.
 Direct persisted ManagementCustody Invoke now may borrow only its own
 post-drain/capacity/barrier-verified manifest under uninterrupted admission
 guards, alongside the existing Current ACK path. Only immutable applied
@@ -224,11 +253,11 @@ preview, exact anchored-input agreement, every fresh absence/raw settled-prefix
 check, physical/common closure and availability remain. Defaults stay fresh;
 explicit disposal precedes publication, drain, unlock or peer I/O.
 No full audited view, result, absence or availability proof is cached.
-Independent source review and debug core compilation pass; runtime benefit
-and current portable qualification remain unproved.
+Independent source review, core/portable compilation and strict verification
+pass; failed packaged recovery supplies no runtime benefit or M1 qualification.
 Reviewed patch SHA-256
 `73550005e9d5ec39d3b5962fd83927164ef70bfaf425aa1d81b70d9ac2e197c3`.
-The second measured pass is not consumed until isolated measurement.
+The second measured pass is consumed by the quiet failure above.
 Three focused exact-retention units on preceding `f4a3dc90` each execute one test and **pass
 0.101s / 0.101s / 0.601s** (credential query, reservation and exact Install),
 with owned groups gone. These and the earlier typed retained-client regressions
@@ -430,12 +459,12 @@ the earlier `941b3d3c` count-only run; neither fresh run retrospectively
 attributes `fcac175a`. The large copied-state proposal stays held/unqualified
 and opened no original stores.
 
-Current Local proof/admission and partial component results are above. The live
-plan orders the portable build, final Invoke measurement and ordinary CLI. Preserve every
-fresh settled-prefix, physical availability/corruption and post-peer check.
-Fix only demonstrated causes, freeze current host provenance, then rerun quiet
-cold/returning and ordinary CLI under unchanged bounds. Native NRT1 terminal
-release remains separate and open.
+Current Local proof/admission and partial component results are above. Both
+measured tuning passes now fail; the live plan requires go/no-go direction at
+the exhausted cap before further qualification launches. Preserve every fresh
+settled-prefix, physical availability/corruption and post-peer check. Fix only
+demonstrated causes after that decision, with current provenance and unchanged
+bounds. Native NRT1 terminal release remains separate and open.
 
 The measured ACK audit-reuse delta is **CORE BUILT, UNQUALIFIED**: a
 Current forwarded ManagementCustody ACK lends only its post-drain verified
@@ -568,7 +597,8 @@ The quiet failed-gate costs are observations, not a successful recovery range. A
 **3–8 minutes per portable main/harness binary** range has moderate confidence
 from cache/source variation and is not an aggregate ETA. Earlier source/elapsed
 forecasts remain unreliable.
-First measured ACK tuning pass is consumed; no benefit is credited. One remains.
+Both measured tuning passes are consumed and failed to qualify recovery.
+No benefit is credited; the plan requires go/no-go direction before further tuning.
 
 The earlier corrected role-source boundary `2e19cd17` freezes these changes,
 which close demonstrated M1 defects without changing authorization, wire bounds
