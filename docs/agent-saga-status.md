@@ -37,7 +37,7 @@ deployment is automatic.
 
 ## Current position
 
-### R52 authorized bounded registration-validation pass
+### Completed R52 registration-validation pass; retention release remains blocked
 
 The user replied **"keep going"** to the concrete request for one bounded
 measured validation-helper pass after R51. This explicitly authorizes this
@@ -46,7 +46,7 @@ remain unchanged. It does not authorize another candidate, a redesign or a
 release promotion. Start from clean documentation checkpoint
 `3190343a82c63aa10188fe4fef425ea28935c0bd`, whose code is R51 `26c6023b`.
 
-Implement only same-call registration validation reuse in
+Implemented only same-call registration validation reuse in
 `shared_recovery.rs` and `shared_recovery/management.rs`. Retain the general
 checked entry point; the optimized manifest path must establish identical
 immutable current slots/request before calling the private body. Retain
@@ -56,30 +56,118 @@ success. No audit is reused across a mutation, read transaction, released guard
 or peer I/O. Physical/live-manifest freshness/corruption checks and all signed
 ownership/retention/retry restrictions remain authoritative.
 
-Independently review code and a signed differential against the original
-checked manifest path, run meaningful registration/recovery preservation units,
-then freeze clean source. Reuse the original owned portable main/harness build,
-strict six-file provenance and isolated quiet all-cold measurement; a scoped
-attempt on the same candidate attributes success/failure without counting as
-another tuning change. Admit all completed evidence through unchanged exact
-source/artifact/environment/binary/one-test/owned-group/input fences before
-documentation changes. Guest artifacts/pins stay unchanged. The final
-availability leaf from R51 remains unknown; a lower fold time cannot establish
-that its failure is only performance. No recovery or performance result is
-established for R52 yet. M1 remains the next integrated milestone.
+**Implementation:** frozen clean source
+`92702a0928bbe88d49d1c9dc2d68ed67c0cf90b3`. Two independent source reviews pass;
+core build passes **93.801s** and ten meaningful preservation/differential units
+pass. Production removes two repeated pure validation passes, not a physical
+audit. The differential reference follows the original checked wrapper plus
+full `validate_at`, comparing exact results and unchanged state on refusals.
+Existing component bounds make an isolated otherwise-valid whole-manifest
+overflow unconstructible; the actual whole-manifest bound remains explicit and
+source-reviewed. No large malformed fixture or limit relaxation was used.
 
-The candidate source and two signed differential tests now exist. Production
-code removes only the two repeated validation passes; its explicit manifest
-scope and actual whole-byte bound remain. The differential reference follows
-the original checked wrapper plus full `validate_at`, comparing exact results
-and unchanged state on refusals. Existing component bounds make an isolated
-otherwise-valid whole-manifest overflow unconstructible; do not manufacture a
-large malformed fixture or relax limits to test it. Source review must verify
-the retained whole-manifest bound, alongside signed-input/bounds regressions.
-Independent source and differential-test review passed. Compilation, unit
-execution and packaged measurement remain pending.
+**Integration:** the original owned portable main/harness build passes
+**425.826s / 491.986s**, strict six-file verification **0.101s**. Guest bytes/pins
+are unchanged. Quiet all-cold fails **262.880s**; its safe summary establishes
+Shared recovery before routes Unavailable, without an inner cause. The separate
+scoped attempt fails **209.225s**, admitting **7,619 records / 341 explicit edges /
+zero unknowns**. Both execute one test and exhaust their noninterrupted owned
+groups. All source/artifact/environment/binary/input/before-after fences pass.
+These are packaged fixtures, not the actual ordinary three-process CLI script.
+The scoped cause cannot be assigned retrospectively to the quiet failure.
+
+Scoped public Create `id24` completes Applied, exact Applied replay, retirement,
+terminal persistence and retained release. The pending Install cut is verified
+(e5780), then cold restart is entered (e5800). Install `id155` retains original
+invocation/work `id154/id156`, authorization/member `id157/id166`; finalization
+`id182/id183` retains authorization/member `id184/id187`, registration `id185`
+sequence 5. Owner/origin is `id1`, leader `id6`. Retry candidates do not replace
+these retained authorizations. Exact finalization availability completes and
+root-bound issuer save completes (e7230–33/e7240). Source requires actual Done,
+exact invocation/actor/deployment reply validation and durable replay equality
+before that save; an unkeyed outcome marker is not assigned by adjacency.
+Both runtime retirements and terminal persistence complete (e7515/e7518–19).
+
+The current scoped failure is **retention release `id194`**, explicitly bound to
+original invocation `id154` and scope `id193`. Twelve owner polls find release
+absent at retained frontier `(50,3)`; local custody times out **1.885s** into
+confirmation (e7595–97), before leader proposal (e7603). Leader release
+validation takes about **1.061s** after verified manifest, followed by about
+**0.986s** across capacity and worker snapshot. Those intervals are adjacent
+differences on one call, not nested clocks to add indiscriminately. Leader later
+refuses attachment scope (e7616–19), after the owner has already failed.
+Detached transport or a changed fingerprint satisfy that refusal; teardown is
+plausible but unproved. Do not weaken attachment checks or blame this later
+refusal for the earlier timeout. R51's availability refusal is historical;
+none appears in admitted R52 events. Release completion, routes, client recovery
+and whole30 are still unqualified.
+
+**Measured costs:** exactly observation-bound successful audit bodies have
+lower recorded medians for matching history compositions:
+
+| Rows / registered / released / Ordered | R51 → R52 samples | Body median, ms | Recovery-fold median, ms |
+| --- | ---: | ---: | ---: |
+| 42 / 3 / 1 / 10 | 111 → 35 | 1065.471 → 724.720 | 724.637 → 468.824 |
+| 43 / 3 / 1 / 10 | 14 → 10 | 939.509 → 813.579 | 643.410 → 525.528 |
+| 46 / 4 / 1 / 11 | 9 → 6 | 1113.515 → 861.659 | 887.061 → 659.857 |
+
+Signed datasets, scheduling and physical/live-manifest costs differ. This is
+evidence of lower recorded fold cost, not a controlled helper-only speedup or
+sufficient recovery benefit. Exact Create observations `id145` and cold `id179`
+complete Done with purity checks; 527 recorded VM runs halt. These facts do not
+qualify general guest-stack resolution. ReadIndex median is **1.370ms**, while
+some leader host waits reach **2.604s**. Unbridged projection requests are not
+assigned to Install by proximity.
+
+Evidence below `target/task-tmp`:
+
+- `r52-core-build-92702a09/provenance.json`, SHA
+  `247d2dfdbfafc7be087381ac7ffb8718e537ec90f50ed917118a87df7352bb51`.
+- `r52-registration-units-92702a09/safe-summary.json`, SHA
+  `a41194c4543a5f268909e681e2a89de9964dfceb5d969265093152d8ab5e0bc4`.
+- `r52-cli-build-92702a09/provenance.json`, SHA
+  `75113476056bce9fbda99bfaa9a3d5d6e237cc788d225f9582461917dcdaf7d7`.
+  Main/harness SHA
+  `744162b309486a2a502f64ea86378d09c5168afcb1fe59fd6da8c9e3be7769b3` /
+  `a6e8eead5ab2c36ecd433ac895040ecd76e7849543569655a94921ab743369e7`.
+- `r52-pending-all-cold-92702a09/quiet-stage-safe-summary.json`, SHA
+  `9e8481b07b0abfcbaa7b1a3abff4edeefbc794ae1247e32ae3eec5be2b15d105`.
+  Independently reviewed exact-source reader copy SHA
+  `cfe015b5ff3ec09b7ad51bf465540b1d7c28ced397daee64f58ec7f06fd55f5d`;
+  only its pinned HEAD differs from the preserved original reader.
+- `r52-pending-all-cold-scoped-92702a09/exact-family-audit-safe-v2.json`, SHA
+  `385170ba0c60a13fd54614b7c995c80ec7c16210ba9cb128c352c5b79c695a22`.
+  Unchanged independently reviewed reader SHA
+  `296fda5d735fedcc72b5aa4dff980a5f42e971531d5546dfcd5f19cc9b85a8ef`.
+
+**Qualification and next investigation:** M1 remains the next integrated
+milestone; M2/M3 stay open. Continue source/finite-evidence diagnosis of exact
+terminal-release retry and the demonstrated leader validation/capacity work.
+If needed, split only those existing calls with gated scalar diagnostics,
+without extra reads/checks/cache or altered deadlines. No fifth tuning candidate,
+redesign or cap extension follows automatically. Source/review/remedy effort is
+unknown. Observed paired-build range remains **14–35min** and failed-attempt
+range **2.3–6.1min**, medium-confidence attempt-cost guidance across different
+stages, not a remaining M1/M2/M3 forecast. The later failure stage explains run
+variance; it does not establish a qualified performance benefit.
 
 ### Architecture review and authorized causal diagnostics
+
+R53 is the next diagnostic-only follow-up to R52, within the user's direction
+to continue investigation before choosing another remedy. Split the already
+existing exact release driver provenance and signed-ledger validation calls,
+and leader release capacity versus worker snapshot. Use only the existing
+diagnostic gate, fixed phase/status scalars and existing release metadata key;
+add no reads, verification, durable identity, cache or changed guard/transaction.
+The current source cannot attribute unscoped audit bodies by proximity. Require
+independent source and finite-reader review, synthetic accept/refuse/privacy
+cases, clean frozen host source, the original portable pair/strict six-file
+provenance, and one isolated scoped all-cold attempt. Admit evidence through all
+original exact source/artifact/environment/binary/input/owned-group fences before
+documentation changes. This consumes no new tuning candidate. Source confirms
+saved-terminal release retry already exists on the same held recovery state,
+within one unchanged 30s scheduling budget; a running attempt is not interrupted.
+No missing retry loop, CPU-only cause or fingerprint defect is established.
 
 Latest direction (2026-10-05): continue causal investigation as needed and tackle
 demonstrated smaller defects before broader architectural simplifications. R51
@@ -1841,18 +1929,19 @@ snapshot return and leased comparison remain mandatory.
 
 Remaining release work, in dependency order:
 
-1. Use [completed R51](#completed-r51-audit-and-cold-install-investigation) for the
-   bounded remedy/go-no-go decision. Public Create and its exact replay complete;
-   verified pending Install reaches cold restart, then its finalization origin
-   times out before proposal and the leader later refuses applied availability
-   after local result handoff. Recovery folding dominates exactly scoped audit
-   bodies; measured ledger/read waits do not explain those bodies. Large leader
-   host waits, not ReadIndex, explain part of the observation-barrier delay.
-   The same-call duplicate-registration validation is a concrete small candidate,
-   but its removable cost and sufficient recovery benefit are unmeasured. The
-   precise availability leaf remains unknown, including the actual outcome enum.
-   Obtain explicit go/no-go direction before another tuning candidate or material
-   redesign. R49/R50/R51 grant no fourth tuning pass or week-cap extension.
+1. Use [completed R52](#completed-r52-registration-validation-pass-retention-release-remains-blocked)
+   and the bounded R53 release diagnostics for the remedy/go-no-go decision.
+   Public Create and exact replay complete. Cold Install now reaches accepted
+   finalization, runtime retirement and terminal persistence; exact retention
+   release times out before leader proposal. Its later attachment refusal is
+   not the cause of the earlier owner timeout. The quiet cause remains unknown.
+   Registration validation reuse has lower recorded same-composition fold
+   medians, without controlled or sufficient recovery benefit. Split current
+   release provenance/signed-ledger validation and capacity/worker snapshot
+   before selecting another remedy. Independent fresh physical-prefix audits
+   remain mandatory; host/proposal guards alone do not prevent raw Raft progress.
+   Obtain explicit go/no-go direction before a fifth tuning candidate or material
+   redesign; no week-cap extension follows.
    Source review rules out a missing caller retry: existing same-held recovery
    already retries Unavailable within the original scheduling window. Preserve
    exact retained continuation, fresh absence/settled-prefix, physical
@@ -1863,8 +1952,8 @@ Remaining release work, in dependency order:
    prove exact-request causality or a promised fix. A pass still requires
    cold recovery, routes, fresh Query and whole30;
    build/unit/component passes do not close this gate. Any resumed source change
-   must rebuild portable main/harness with exact provenance. R51 inputs remain
-   bound to clean `26c6023b`; later documentation is not execution evidence.
+   must rebuild portable main/harness with exact provenance. R52 inputs remain
+   bound to clean `92702a09`; later documentation is not execution evidence.
 2. Qualify Local callback recovery under unchanged whole30 and current ordinary
    three-process CLI/HTTP. The genuine child test proves admission, three
    refusals and original retry/release, then exceeds whole30 at a second
@@ -1936,7 +2025,10 @@ Separate forecasts and unknowns:
   is unmeasured. Its quiet/scoped attempts fail **144.379s / 145.283s** before any
   pending-Install/cold qualification. R51 main/harness take **458.658s / 541.572s**;
   its focused attempt fails **365.008s** after an actual pending cut and cold
-  restart. The failed-attempt range is now **2.3–6.1min** across different stages,
+  restart. R52 main/harness take **425.826s / 491.986s**; quiet/scoped attempts
+  fail **262.880s / 209.225s**, with the scoped run reaching terminal persistence
+  and then retention-release refusal. The failed-attempt range remains
+  **2.3–6.1min** across different stages,
   not repeated measurements of the same failure or evidence of a benefit.
   These are attempt costs, not success bounds. Source/review time and successful
   cold result, release, routes and whole30 remain unestimated.
@@ -2033,8 +2125,9 @@ across host-lock release/peer I/O or remove fresh physical corruption checks.
 
 No completion percentage, deployment date, release promotion or master change is
 established. Both original measured service-tuning passes are consumed without
-qualification or benefit credit. The renewed bounded R48 candidate has also
-failed; another tuning change requires direction. Do not extend the engineering-
+qualification or benefit credit. The renewed bounded R48 and R52 candidates have
+also failed to qualify recovery; a fifth tuning candidate requires direction.
+Do not extend the engineering-
 week go/no-go cap automatically.
 Architectural replacement and correctness diagnosis are not service-tuning passes.
 Hardware is unavailable; prepare tooling locally and

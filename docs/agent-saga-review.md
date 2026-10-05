@@ -11,15 +11,23 @@ host source or the released workflow.
 
 ## Boundary and release claim
 
-R52 is now explicitly authorized: the user replied **"keep going"** to one
-bounded measured registration-validation helper pass. The live plan owns its
-source/test/provenance sequence and unchanged cap. It preserves the checked
-entry point, incoming signature verification, complete candidate validation,
-manifest bounds/positions and fresh independent audits. Source implementation
-and independent review are complete; compilation and exact-candidate measurement
-are pending. No benefit or recovery claim is
-established. This permission does not automatically authorize another candidate,
-redesign, promotion or deadline increase.
+R52's explicitly authorized bounded registration-validation pass is complete
+on clean `92702a09`: independent source reviews and ten preservation/differential
+units pass; portable main/harness and strict six-file verification pass.
+Quiet/scoped all-cold attempts fail **262.880s / 209.225s**. Matching history
+compositions record lower fold medians, without a controlled helper-only speedup
+or sufficient recovery benefit. The scoped attempt reaches accepted Install
+finalization and terminal persistence, then exact retained release times out
+before leader proposal. The quiet inner cause remains independently unknown.
+M1 stays open. This permission does not authorize a fifth tuning candidate,
+redesign, promotion, cap extension or deadline increase.
+
+R53 continues the user's authorized causal investigation only: split existing
+exact release driver provenance/signed-ledger validation, leader capacity and
+worker snapshot calls with gated scalar timings. Preserve all calls, guard and
+transaction boundaries, fresh audits and errors. No behavior remedy is applied.
+Source/finite-reader review, clean freeze, portable build and isolated exact
+scoped measurement are required before attributing those costs.
 
 The latest user direction continues investigation and prioritizes demonstrated
 smaller defects before broader simplifications. R51 adds only narrow audit and
@@ -130,30 +138,37 @@ Current O3 component evidence (logs under the native worktree's `target`):
 
 ### Current integration delta and blocking result
 
-Read the [completed R51 investigation](agent-saga-status.md#completed-r51-audit-and-cold-install-investigation)
+Read [completed R52](agent-saga-status.md#completed-r52-registration-validation-pass-retention-release-remains-blocked)
 in the sole live plan for source/binary/reader/artifact hashes and event limits.
-Portable main/harness pass **458.658s / 541.572s**, strict six-file verification
-**0.201s**. The focused attempt admits **11,795 records / 487 explicit edges /
+Portable main/harness pass **425.826s / 491.986s**, strict six-file verification
+**0.101s**. The scoped attempt admits **7,619 records / 341 explicit edges /
 zero unknowns**, one failed test and exhausted noninterrupted owned group.
-Original public Create completes terminal persistence/release and exact Applied
-replay; the fixture then verifies pending Install and enters cold restart.
-The separate Install finalization origin times out before leader proposal. The
-leader later hands off its exact local result, then returns Unavailable from
-applied-availability. Its actual outcome enum and availability subcause remain
-unknown; the existing core `cfg(test)` availability-detail prefix is absent.
-Cold Install delivery/terminal/release, routes and whole30 remain unqualified.
+Public Create completes terminal/release and exact Applied replay, then the
+fixture verifies pending Install and enters cold restart. Exact Install
+finalization is delivered and accepted; root-bound issuer save requires actual
+Done, exact reply validation and durable replay equality. Both runtime retirements
+and terminal persistence complete. Current failure is its original owner's
+retention release: twelve absent polls, timeout **1.885s** into confirmation,
+before leader proposal. The leader's later attachment ScopeMismatch follows
+the owner failure and may be teardown; no changed component or causal lifecycle
+defect is proved. No current availability refusal is recorded. R51's precise
+availability subcause remains historical unknown.
 
-Exactly Create-bound late audit bodies spend **68–81%** in recovery folding;
-ledger/read acquisition reports **0µs**, with physical/live-manifest validation
-smaller. ReadIndex is **1–3ms**, while some leader host waits exceed one second.
-The known same-call duplicate-validation helper is the first measured candidate
-to consider, retaining incoming signatures, complete candidate verification,
-whole-manifest bounds/positions and fresh independent audits. Its removable
-share and recovery benefit are unknown. Attachment projection simplification
-is lower priority; runtime representation or quorum redesign is not justified.
-All 807 recorded runs halt, but unrelated halts and successful previews cannot
-provide the finalization's actual result enum or general stack qualification.
-No fourth tuning pass or week-cap extension is automatic.
+Same-composition recorded audit/fold medians are lower, but signed datasets,
+physical costs and schedules differ. Exact Create-bound observations complete
+Done/purity; 527 generic VM halts do not qualify general guest-stack resolution.
+The release validator combines driver provenance with a fresh signature-first
+settled-prefix audit; the following interval combines a separate fresh capacity
+audit and worker mailbox wait. Source confirms exact terminal-release retry
+already exists within one unchanged startup scheduling budget. Those independent
+fresh transactions cannot be cached away. Separate existing calls before
+choosing another remedy. Release completion, client recovery, routes, whole30,
+ordinary three-process CLI and M1 remain open. Broader simplifications stay later.
+No fifth tuning candidate or week-cap extension is automatic.
+
+Historical [R51](agent-saga-status.md#completed-r51-audit-and-cold-install-investigation)
+failed after exact local finalization-result handoff at applied availability.
+That outcome and its measurements do not define R52's later failure stage.
 
 Preceding R50: the user direction authorized investigation before choosing a fix or
 simplification. Three read-only source audits preceded independently reviewed
@@ -185,8 +200,8 @@ The architecture review remains [context for the decision](agent-saga-status.md#
 Internal generation attachment precedes public routes, and the older
 unfinished-Create/retired-generation observation cycle has an ordering fix.
 
-Use the completed R51 proof/cost boundaries for the next bounded diagnostic
-or remedy decision. No fourth tuning pass or cap extension is authorized by
+Use the completed R52 proof/cost boundaries for the next bounded diagnostic
+or remedy decision. No fifth tuning candidate or cap extension is authorized by
 these measurements.
 Preserve distinct intent, physical application, runtime ACK,
 owner terminal, certified publication and quorum-release authorities. Existing

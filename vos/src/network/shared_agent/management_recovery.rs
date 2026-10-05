@@ -466,16 +466,23 @@ impl SharedRouteHandler {
         // Do not retain the tuple across preparation, guard release or a drain.
         let (applied, _, _) = match audited_capacity {
             Some(capacity) => capacity,
-            None => host
-                .capacity(self.agent)
-                .map_err(|error| refused("release_capacity_error", error))?,
+            None => {
+                trace("release_capacity_start");
+                let capacity = host
+                    .capacity(self.agent)
+                    .map_err(|error| refused("release_capacity_error", error))?;
+                trace("release_capacity_complete");
+                capacity
+            }
         };
+        trace("current_snapshot_start");
         let current = futures_executor::block_on(worker.snapshot()).ok_or_else(|| {
             refused(
                 "current_snapshot_missing",
                 SharedAgentHostError::Unavailable,
             )
         })?;
+        trace("current_snapshot_complete");
         trace("final_barrier_start");
         CommittedProposalBarrier::from(&before)
             .validate_applied(CommittedProposalBarrier::from(&current), applied)

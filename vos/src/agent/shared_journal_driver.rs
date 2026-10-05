@@ -5630,13 +5630,27 @@ where
         &self,
         release: &super::shared_recovery::SharedManagementRecoveryRelease,
     ) -> Result<(), SharedJournalDriverError> {
-        self.verified_recovery_manifest()?;
+        let diagnostics = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some();
+        let trace = |phase: &'static str, started: Option<std::time::Instant>, success: bool| {
+            if let Some(started) = started {
+                tracing::debug!(metadata = ?release.commitment().0, phase,
+                    elapsed_us = started.elapsed().as_micros(), success,
+                    "Shared management release cost");
+            }
+        };
+        let started = diagnostics.then(std::time::Instant::now);
+        let verified = self.verified_recovery_manifest();
+        trace("driver_manifest", started, verified.is_ok());
+        verified?;
         // The signed ledger entry point performs its own exact request
         // preflight. Keep driver provenance and that signature-first boundary
         // without repeating the same settled physical-prefix audit here.
-        self.ledger
+        let started = diagnostics.then(std::time::Instant::now);
+        let validated = self.ledger
             .validate_management_recovery_release(release)
-            .map_err(Into::into)
+            .map_err(Into::into);
+        trace("signed_ledger_validation", started, validated.is_ok());
+        validated
     }
 
     pub(crate) fn uses_external_state(&self) -> bool {
