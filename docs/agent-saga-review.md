@@ -13,9 +13,12 @@ host source or the released workflow.
 
 The latest user direction continues investigation and prioritizes demonstrated
 smaller defects before broader simplifications. R51 adds only narrow audit and
-attachment timings on the R50 failure path. Its source/reader review, clean
-portable freeze and one isolated focused attempt are in progress; no R51 result
-or remedy exists yet. The live plan owns its exact scope and unchanged fences.
+attachment timings on the R50 failure path. It is complete on clean `26c6023b`:
+portable main/harness and strict six-file verification pass, but the one focused
+all-cold attempt fails **365.008s** after a verified pending-Install cut and cold
+restart. Recovery folding dominates the measured audit bodies; no remedy,
+performance benefit or fourth tuning candidate is established. The live plan
+owns exact evidence, remaining availability attribution and the go/no-go decision.
 
 R50 is the user-authorized bounded causal investigation of one exact public
 Create family through the existing all-cold selector. It is complete on clean
@@ -117,7 +120,32 @@ Current O3 component evidence (logs under the native worktree's `target`):
 
 ### Current integration delta and blocking result
 
-The latest user direction authorized investigation before choosing a fix or
+Read the [completed R51 investigation](agent-saga-status.md#completed-r51-audit-and-cold-install-investigation)
+in the sole live plan for source/binary/reader/artifact hashes and event limits.
+Portable main/harness pass **458.658s / 541.572s**, strict six-file verification
+**0.201s**. The focused attempt admits **11,795 records / 487 explicit edges /
+zero unknowns**, one failed test and exhausted noninterrupted owned group.
+Original public Create completes terminal persistence/release and exact Applied
+replay; the fixture then verifies pending Install and enters cold restart.
+The separate Install finalization origin times out before leader proposal. The
+leader later hands off its exact local result, then returns Unavailable from
+applied-availability. Its actual outcome enum and availability subcause remain
+unknown; the existing core `cfg(test)` availability-detail prefix is absent.
+Cold Install delivery/terminal/release, routes and whole30 remain unqualified.
+
+Exactly Create-bound late audit bodies spend **68–81%** in recovery folding;
+ledger/read acquisition reports **0µs**, with physical/live-manifest validation
+smaller. ReadIndex is **1–3ms**, while some leader host waits exceed one second.
+The known same-call duplicate-validation helper is the first measured candidate
+to consider, retaining incoming signatures, complete candidate verification,
+whole-manifest bounds/positions and fresh independent audits. Its removable
+share and recovery benefit are unknown. Attachment projection simplification
+is lower priority; runtime representation or quorum redesign is not justified.
+All 807 recorded runs halt, but unrelated halts and successful previews cannot
+provide the finalization's actual result enum or general stack qualification.
+No fourth tuning pass or week-cap extension is automatic.
+
+Preceding R50: the user direction authorized investigation before choosing a fix or
 simplification. Three read-only source audits preceded independently reviewed
 host-only instrumentation and finite readers on clean
 `d58af26f536f4a193a773ff2ad575716935c35af`. Portable main/harness pass
@@ -147,8 +175,9 @@ The architecture review remains [context for the decision](agent-saga-status.md#
 Internal generation attachment precedes public routes, and the older
 unfinished-Create/retired-generation observation cycle has an ordering fix.
 
-Use the measured proof/confirmation boundaries for the next bounded diagnostic
-or remedy decision; R50 authorizes no fix, fourth tuning pass or cap extension.
+Use the completed R51 proof/cost boundaries for the next bounded diagnostic
+or remedy decision. No fourth tuning pass or cap extension is authorized by
+these measurements.
 Preserve distinct intent, physical application, runtime ACK,
 owner terminal, certified publication and quorum-release authorities. Existing
 notifications may only be wake hints; freshness/corruption checks cannot become

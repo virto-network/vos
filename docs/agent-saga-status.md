@@ -53,15 +53,15 @@ waits outside its already measured ReadIndex. Early body
 errors without an aggregate remain explicit gaps; crypto remains inside the
 decode/fold categories. No reads/checks/guards/errors/artifacts/deadlines change.
 
-Review source and finite reader independently, freeze clean host source, then
-reuse unchanged portable build/strict six-file provenance and owned scoped
-all-cold tooling. One isolated focused attempt is initially authorized by this
-continuation; retain all original source/binary/artifact/environment/one-test/
-owned-group and before/after input fences. The completed d58 run cannot be
+Source and finite-reader reviews passed, followed by clean host freeze and the
+unchanged portable build/strict six-file provenance and owned scoped all-cold
+tooling. The one initially authorized focused attempt is complete; all original
+source/binary/artifact/environment/one-test/owned-group and before/after input
+fences passed. The completed d58 run cannot be
 re-read with its unchanged exact-current-source guard at the later docs HEAD;
 no exception, relabel, reset or helper override is allowed. Fresh instrumentation
 requires a fresh build/run. Recorded build pairs cost 14–35min and failed attempts
-2.3–5.7min, plus source/review work; these are medium-confidence attempt-cost
+2.3–6.1min, plus source/review work; these are medium-confidence attempt-cost
 ranges and low-confidence guidance for remaining effort, not a milestone ETA.
 Choose any bounded remedy from the demonstrated leaf cost; no automatic fourth
 tuning pass, cap extension or material redesign follows. Broader nonblocking
@@ -72,6 +72,116 @@ committee-state reads for one attachment projection. Neither has measured
 benefit. Whole preflight/capacity audits across released ledger guards remain
 fresh obligations even while the outer host/proposal guard stays held; source
 review found no missing required notification to repair.
+
+### Completed R51 audit and cold-Install investigation
+
+Measured source is clean `26c6023bf6f230db39ac8335a35c0b22c4d6aaeb`.
+Portable main/harness pass **458.658s / 541.572s**; strict six-file verification
+passes **0.201s**, with unchanged guest bytes/pins and portable flags. The single
+focused all-cold selector fails **365.008s**, one test, noninterrupted exhausted
+owned group. No quiet attempt or remedy was run. Its longer duration covers
+actual pending-Install/cold-restart progress absent from R50; it is not a slower
+measurement of the same failure stage or a demonstrated performance change.
+
+Evidence below `target/task-tmp`:
+
+- `r51-cli-build-26c6023b/provenance.json`, SHA
+  `c5f617a65036b2a1df8ba84367721020d657cfe9ec3fe9595ebdc9200b149d8d`.
+  Main/harness SHA
+  `2cc722109f5fa778a1c717dcdb07f01e9e65bd09e5b620278c3c93aa3d0e2824` /
+  `83d52439a1eeabb455c6476732ddd8403f95f2047e6aca3ee4b3e22f9c4127ed`.
+- `r51-pending-all-cold-scoped-26c6023b/exact-family-audit-safe-v2.json`, SHA
+  `722cf32986bef4b8a275570b017ad83994f382ab763f48cb3cbafe19e0d62b6e`:
+  **11,795 records, 487 explicit edges, zero unknowns**. Independently reviewed
+  reader SHA `296fda5d735fedcc72b5aa4dff980a5f42e971531d5546dfcd5f19cc9b85a8ef`;
+  synthetic cases accept 14/refuse 16 and alias projection passes. The original
+  prefix-ordering synthetic refusal is preserved; V2 corrected it before any
+  private execution, without changing admission or post-read fences.
+- `exact-family-availability-presence-safe.json` in that same run, SHA
+  `92ec0bc6798ff248c7d61e2779dc6c8b638e802c682d8aa79830aca38c082972`.
+  Separate reviewed reader SHA
+  `f5db70c74bb3745973c0a610eb2b2e527a396adb3a93293b50ebe643c2514a80`
+  adds only complete-line source-prefix counts after original admission and
+  before original post-fences. Eight pure synthetic cases pass; existing
+  aliases/events/edges/input fences equal V2. Both streams count **zero**
+  `availability_phase node=` lines. This core-library diagnostic is `cfg(test)`;
+  its absence from the packaged harness is a diagnostic gap, not nonexecution.
+  No raw lines, identities, requests, memory or private payloads are exported.
+
+**Integration:** original public Create root `id24` completes finalization,
+runtime retirement, owner terminal persistence and retained release
+(e2054/e2147/e2150/e2197), returns Applied (e2251–52), and its exact retained
+replay also returns Applied (e2308). The fixture affirmatively verifies the
+pending Install receipt cut (e10261) and enters cold restart (e10282).
+The later failure is a different Install root `id359`, original invocation/work
+`id358/id360`, with finalization `id383/id384`, registration/member `id386/id388`,
+retained authorization `id385` and original owner/origin `id6`. Retry candidates
+do not replace those retained authorizations. Its extension first times out,
+then commits on the new leader and is recovered (e11555–57/e11618–19/e11648).
+Finalization Invoke begins e11649. Fourteen origin polls find evidence absent
+at frontier `(47,3)`; custody timeout e11763 precedes leader proposal e11779.
+Leader cumulative phases reach capacity at **1.121s**, custody validation at
+**2.587s**, pending budget at **3.712s** and proposal at **4.315s**. These are
+overlapping call clocks, not phase durations to add.
+
+Prepared input `id391` is explicitly bound to that exact finalization work
+(e11778). Leader local result handoff completes e11787, then applied-availability
+returns Unavailable e11792–95. Source requires that evidence after local result
+handoff. The actual RuntimeOutcome enum and availability leaf (local claim,
+peer evidence, quorum timeout or final recheck) remain unestablished. The owner
+Invoke error e11765 returns before issuer finalization/retirement; no delivered
+Install finalization, owner terminal/release, public readiness or whole30 pass
+is established. All **807 recorded VM runs halt** and **115 observation outcomes
+are completed_done with purity ok**; generic halts and successful previews
+cannot supply the exact actual result enum or qualify general stack resolution.
+
+**Measured cost:** 141 exactly observation-scoped successful capacity audits
+report ledger wait/read-begin **0µs** at integer resolution. Their body median is
+**1.035s**, maximum **2.538s**. Recovery folding is the largest measured category:
+the explicitly Create-bound GenesisDecision `id346` bodies spend **68–71%**
+there; cold request `id377` spends **79–81%** (e9271/e9458/e9493/e10905/e11121).
+The latter takes **0.956–1.129s**, with **0.757–0.914s** recovery folding,
+**0.130–0.141s** physical verification and **0.037–0.038s** live-manifest work.
+Those 46 rows include four registrations, one release and eleven Ordered rows,
+not 46 accounts. Signatures/deep envelope work remain inside the fold category;
+no per-kind removable fraction, CPU-only cause or growth law is proved.
+
+ReadIndex median/maximum is **1.374/3.247ms** in 142 records. Leader host waits
+reach **1.796s before / 1.030s after** it; worker snapshots remain below 1ms.
+Attachment checks typically take tens of milliseconds. Exact `id377` has
+leader pre-host wait up to **0.962s**, attachment checks **14.879–18.171ms**
+before/**15.328–16.884ms** after and ReadIndex **1.230–1.315ms**. Its first
+observation refuses at pre_deadline; another completes and restores the original
+Create terminal/release. Projection requests `id374/id380` have no CLI-root
+bridge and are not assigned to Install by proximity. Do not pair separate calls
+sharing a request, add nested row/subphase clocks or use temporal neighbors as
+causal edges. The holder of a measured host wait is not identified by that wait.
+
+**Implementation decision:** no remedy or fourth tuning candidate is applied.
+The concrete smaller candidate factors a private same-call registration body
+after the outer immutable slots/request validation, retaining the general
+checked wrapper. It keeps incoming `registration.verify()` before exact-retry
+return, all owner/member/capsule restrictions, prospective evidence and complete
+candidate-slot verification. The already validated candidate must still pass
+the whole-manifest byte bound and position checks before assignment; replacing
+`validate_at` by positions alone is unsafe. No proof crosses mutation, host/ledger
+guard release, read transaction or peer I/O. Fresh preflight/capacity audits and
+physical/live-manifest corruption checks remain. Add a signed checked-wrapper
+vs manifest differential for success, exact retry and refusal/no-state-change,
+including signature and whole-manifest bounds, alongside existing preservation
+regressions. The dominant fold category justifies measuring this candidate;
+its removable share and sufficiency remain unknown. Triple committee projection
+is a later simplification given its smaller measured aggregate. Resolve the
+applied-availability leaf before asserting that this is only performance.
+
+**Qualification:** M1 remains open; M2 and local/external M3 gates are unchanged.
+There is no defensible remaining source-hour or combined milestone estimate.
+Paired builds **14–35min** and failed attempts **2.3–6.1min** are observed attempt
+costs with medium confidence, excluding implementation/review and mandatory
+successful qualification. Any further tuning candidate needs explicit go/no-go
+direction under the unchanged cap; bounded diagnostic reading consumed no pass.
+
+### Preceding architecture review and R50
 
 The preceding architecture review and R50 authorized investigation follow below;
 their measured outcomes are kept separate from R51. Three
@@ -1689,23 +1799,18 @@ snapshot return and leased comparison remain mandatory.
 
 Remaining release work, in dependency order:
 
-1. Use the completed R50 exact-family investigation to choose the next bounded
-   diagnostic or remedy. It establishes confirmation expiry before leader
-   proposal and late fresh-observation deadline failures on the path through the
-   authenticated capacity audit. Internal ledger-lock/database/proof costs and barrier
-   delay outside ReadIndex remain unsplit; no deadlock, performance-only cause
-   or necessary major redesign is proved. The latest user direction continues
-   the bounded leaf investigation and prioritizes smaller defects before broader
-   simplification; R51's exact source/measurement scope is above. Obtain explicit go/no-go
-   direction before another tuning candidate or material redesign. R50 grants
-   no cap extension. The bounded R49 cost investigation
-   is complete on frozen `40a7e553`; portable
-   binaries include the ownership repair, but the quiet selector fails Shared
-   startup recovery and the scoped run fails public Create before the cut.
-   The eligible immutable duplicate-validation helper is unmeasured and does
-   not directly target repeated physical manifest-evidence verification.
-   No demonstrated recovery correction or performance benefit is established.
-   R49 does not authorize a fourth tuning change or automatic week-cap extension.
+1. Use [completed R51](#completed-r51-audit-and-cold-install-investigation) for the
+   bounded remedy/go-no-go decision. Public Create and its exact replay complete;
+   verified pending Install reaches cold restart, then its finalization origin
+   times out before proposal and the leader later refuses applied availability
+   after local result handoff. Recovery folding dominates exactly scoped audit
+   bodies; measured ledger/read waits do not explain those bodies. Large leader
+   host waits, not ReadIndex, explain part of the observation-barrier delay.
+   The same-call duplicate-registration validation is a concrete small candidate,
+   but its removable cost and sufficient recovery benefit are unmeasured. The
+   precise availability leaf remains unknown, including the actual outcome enum.
+   Obtain explicit go/no-go direction before another tuning candidate or material
+   redesign. R49/R50/R51 grant no fourth tuning pass or week-cap extension.
    Source review rules out a missing caller retry: existing same-held recovery
    already retries Unavailable within the original scheduling window. Preserve
    exact retained continuation, fresh absence/settled-prefix, physical
@@ -1716,8 +1821,8 @@ Remaining release work, in dependency order:
    prove exact-request causality or a promised fix. A pass still requires
    cold recovery, routes, fresh Query and whole30;
    build/unit/component passes do not close this gate. Any resumed source change
-   must rebuild portable main/harness with exact provenance. Measured R49 inputs
-   remain bound to clean `40a7e553`; later documentation is not execution evidence.
+   must rebuild portable main/harness with exact provenance. R51 inputs remain
+   bound to clean `26c6023b`; later documentation is not execution evidence.
 2. Qualify Local callback recovery under unchanged whole30 and current ordinary
    three-process CLI/HTTP. The genuine child test proves admission, three
    refusals and original retry/release, then exceeds whole30 at a second
@@ -1787,7 +1892,12 @@ Separate forecasts and unknowns:
 - **Qualification:** paired portable rebuilds span **14–35 min** in the recorded
   attempts; R50 main/harness take **1414.511s / 678.723s**. The slower build cause
   is unmeasured. Its quiet/scoped attempts fail **144.379s / 145.283s** before any
-  pending-Install/cold qualification. These are attempt costs, not success bounds.
+  pending-Install/cold qualification. R51 main/harness take **458.658s / 541.572s**;
+  its focused attempt fails **365.008s** after an actual pending cut and cold
+  restart. The failed-attempt range is now **2.3–6.1min** across different stages,
+  not repeated measurements of the same failure or evidence of a benefit.
+  These are attempt costs, not success bounds. Source/review time and successful
+  cold result, release, routes and whole30 remain unestimated.
   Full physical runs are sequential; new guest/ABI artifacts require reproduction
   and new evidence. ReadIndex smoke is not System guest or released workflow
   qualification. No reliable aggregate qualification range exists yet.
