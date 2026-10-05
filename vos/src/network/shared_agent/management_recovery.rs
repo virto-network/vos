@@ -448,8 +448,16 @@ impl SharedRouteHandler {
                     trace("retained_release");
                     return Ok(());
                 }
-                host.validate_management_recovery_release(self.agent, release)
-                    .map_err(|error| refused("release_validation_error", error))?;
+                let validated = {
+                    let span = started.map(|_| tracing::debug_span!(
+                        "vos_causal_release_audit",
+                        metadata = ?release.commitment().0,
+                        stage = "signed_ledger_validation",
+                    ));
+                    let _span_guard = span.as_ref().map(|span| span.enter());
+                    host.validate_management_recovery_release(self.agent, release)
+                };
+                validated.map_err(|error| refused("release_validation_error", error))?;
                 trace_release("signed_release");
                 None
             }
@@ -468,9 +476,21 @@ impl SharedRouteHandler {
             Some(capacity) => capacity,
             None => {
                 trace("release_capacity_start");
-                let capacity = host
-                    .capacity(self.agent)
-                    .map_err(|error| refused("release_capacity_error", error))?;
+                let capacity = {
+                    let span = started.and_then(|_| match command {
+                        shared_raft::AgentRaftCommand::ReleaseManagementRecovery { release, .. } => {
+                            Some(tracing::debug_span!(
+                                "vos_causal_release_audit",
+                                metadata = ?release.commitment().0,
+                                stage = "capacity",
+                            ))
+                        }
+                        _ => None,
+                    });
+                    let _span_guard = span.as_ref().map(|span| span.enter());
+                    host.capacity(self.agent)
+                }
+                .map_err(|error| refused("release_capacity_error", error))?;
                 trace("release_capacity_complete");
                 capacity
             }

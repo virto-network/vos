@@ -11,14 +11,22 @@ host source or the released workflow.
 
 ## Boundary and release claim
 
-R54 is now authorized by the user's 2026-10-06 direction to keep going until
-the issue is resolved, answering the concrete fifth-pass proposal. It removes
-only repeated same-call release candidate-slot validation while retaining all
-checked request/signature/member/owner restrictions, whole-manifest bounds,
-positions and fresh physical audits. Signed differential, preservation checks,
-clean current portable provenance and isolated quiet/scoped measurements remain
-required. The live plan owns this sequence and unchanged cap; no benefit,
-recovery pass, material redesign or promotion is implied by approval.
+R54 is complete on frozen `63b8203e`: independent source/test reviews and
+11 preservation units pass, including signed differentials against the original
+checked release wrapper. Portable main/harness and strict six-file verification
+pass. Quiet/scoped all-cold still fail **191.409s / 188.508s**. The scoped run
+admits **7,604 records / 335 edges / zero unknowns** and reaches the same owner
+release timeout before leader proposal, followed by late leader confirmation.
+Recorded lower fold cost does not establish controlled or sufficient recovery
+benefit. Quiet's inner cause remains independently unknown; M1 stays open.
+
+The user's direction continues causal investigation. R55 is diagnostic only:
+bind existing fresh audits to exact release metadata and the signed-validation
+or capacity boundary, measure existing ledger/read acquisition, and partition
+the existing fold clock by source branch. No audit, freshness, guard, transaction,
+signature, limit, deadline or supported-path change. The live plan owns this
+sequence and unchanged cap; no sixth behavior candidate, redesign, promotion or
+release benefit is automatic.
 
 R52's explicitly authorized bounded registration-validation pass is complete
 on clean `92702a09`: independent source reviews and ten preservation/differential
@@ -28,8 +36,9 @@ compositions record lower fold medians, without a controlled helper-only speedup
 or sufficient recovery benefit. The scoped attempt reaches accepted Install
 finalization and terminal persistence, then exact retained release times out
 before leader proposal. The quiet inner cause remains independently unknown.
-M1 stays open. This permission does not authorize a fifth tuning candidate,
-redesign, promotion, cap extension or deadline increase.
+M1 stays open. R52's permission alone did not authorize a fifth tuning candidate;
+the later explicit R54 authorization is recorded above. No redesign, promotion,
+cap extension or deadline increase follows.
 
 R53 diagnostic-only investigation is complete on clean `e59c702f`: portable
 main/harness and strict six-file verification pass; one scoped all-cold attempt
@@ -152,42 +161,46 @@ Current O3 component evidence (logs under the native worktree's `target`):
 
 ### Current integration delta and blocking result
 
-Read [completed R53](agent-saga-status.md#completed-r53-exact-terminal-release-diagnostics)
+Read [completed R54](agent-saga-status.md#completed-r54-release-fold-validation-pass)
 in the sole live plan for source/binary/reader/artifact hashes and event limits.
-Portable main/harness pass **420.717s / 487.505s**, strict six-file verification
-**0.101s**. The scoped attempt admits **9,237 records / 501 explicit edges /
+Portable main/harness pass **429.634s / 479.365s**, strict six-file verification
+**0.101s**. The scoped attempt admits **7,604 records / 335 explicit edges /
 zero unknowns**, one failed test and exhausted noninterrupted owned group.
 Public Create completes terminal/release and exact Applied replay, then the
 fixture verifies pending Install and enters cold restart. Exact Install
 finalization is delivered and accepted; root-bound issuer save requires actual
 Done, exact reply validation and durable replay equality. Both runtime retirements
 and terminal persistence complete. Current failure is its original owner's
-retention release: twelve absent polls, timeout **1.907s** into confirmation,
+retention release: twelve absent polls, timeout **1.932s** into confirmation,
 before leader proposal. The leader then observes that exact release present and
 completes local custody/commit. There is no tail attachment ScopeMismatch here;
 R52's late attachment refusal remains historical and cannot explain its earlier
 owner timeout. Late leader release is not original-owner completion or readiness.
 
-Exact Install release times: driver provenance **106.798ms**, signed-ledger
-validation **942.592ms**, capacity **960.884ms**, worker snapshot **84µs**.
+Exact Install release times: driver provenance **98.224ms**, signed-ledger
+validation **845.669ms**, capacity **880.889ms**, worker snapshot **69µs**.
 The validator's driver time is already nested in its enclosing leader interval.
 Its fresh settled-prefix preflight and the separate capacity transaction remain
 mandatory; these durations do not establish their removable fraction or a
-CPU-only cause. The second leader confirmation poll spends **2291.921ms** acquiring
-the host, **131µs** draining and **130.251ms** verifying manifest; the holder and
+CPU-only cause. The second leader confirmation poll spends **2763.901ms** acquiring
+the host, **178µs** draining and **138.550ms** verifying manifest; the holder and
 its work remain unknown. Source confirms exact terminal-release retry already
 exists within one unchanged startup scheduling budget. Neither that budget's
 monotonic start nor exhaustion is logged. These independent fresh transactions
 cannot be cached away. Original-owner release completion, client recovery, routes, whole30,
 ordinary three-process CLI and M1 remain open. Broader simplifications stay later.
-No fifth tuning candidate or week-cap extension is automatic.
+No sixth behavior candidate or week-cap extension is automatic. The R55
+diagnostic-only follow-up separates exact release-bound audit branches and
+acquisition from the independently later, still-unattributed host wait.
 
 The reviewed proposal removes only repeated changed-candidate slot validation
 from historical release folding. It retains incoming signature-before-retry,
 complete checked request/candidate restrictions, explicit manifest scope/byte/
 position checks and assignment last. At the R53 evidence boundary the patch lived
 only in the target evidence directory, unapplied, uncompiled and unmeasured.
-R54 now authorizes its implementation; no current measurement exists yet.
+R54 implements it with signed differential preservation, but both workflow
+measurements still fail. Historical proposal-only status supplies no current
+benefit or qualification.
 Signed differential and
 preservation regressions plus exact portable quiet/scoped evidence are required
 for that approved pass. No measured sufficient benefit is promised.

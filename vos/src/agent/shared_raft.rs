@@ -6038,11 +6038,17 @@ mod application_ledger_v2 {
             &self,
             request: &SharedManagementRecoveryReleaseRequest,
         ) -> Result<(), AgentRaftApplicationErrorV2> {
-            let _guard = self
+            let causal_lock_started = causal_capacity_started();
+            let guard = self
                 .writes
                 .lock()
-                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
-            let transaction = self.database.begin_read()?;
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger);
+            self.report_causal_capacity(causal_lock_started, "ledger_wait", if guard.is_ok() { "ok" } else { "error" });
+            let _guard = guard?;
+            let causal_read_started = causal_capacity_started();
+            let transaction = self.database.begin_read();
+            self.report_causal_capacity(causal_read_started, "read_begin", if transaction.is_ok() { "ok" } else { "error" });
+            let transaction = transaction?;
             let audited = self.management_recovery_preflight(&transaction)?;
             let manifest = audited
                 .recovery
@@ -8747,6 +8753,10 @@ mod application_ledger_v2 {
             let mut row_decode_us = 0u64;
             let mut physical_row_us = 0u64;
             let mut recovery_fold_us = 0u64;
+            let mut registered_fold_us = 0u64;
+            let mut released_fold_us = 0u64;
+            let mut ordered_fold_us = 0u64;
+            let mut other_fold_us = 0u64;
             let mut committee_fold_us = 0u64;
             let mut registered_rows = 0u64;
             let mut released_rows = 0u64;
@@ -8805,6 +8815,7 @@ mod application_ledger_v2 {
                 let causal_recovery_started = causal_started.map(|_| std::time::Instant::now());
                 let observation =
                     read_recovery_observation(&observation_table, stored_key.value())?;
+                let mut causal_recovery_kind = 0u8;
                 match (&record.disposition, physical.command.as_ref()) {
                     (
                         AgentRaftApplyDispositionV2::ManagementRecoveryRegistered {
@@ -8814,6 +8825,7 @@ mod application_ledger_v2 {
                         Some(AgentRaftCommand::RegisterManagementRecovery { registration, .. }),
                     ) => {
                         if causal_started.is_some() {
+                            causal_recovery_kind = 1;
                             registered_rows = registered_rows.saturating_add(1);
                         }
                         if observation.is_some() || registration.commitment() != *expected {
@@ -8851,6 +8863,7 @@ mod application_ledger_v2 {
                         Some(AgentRaftCommand::ReleaseManagementRecovery { release, .. }),
                     ) => {
                         if causal_started.is_some() {
+                            causal_recovery_kind = 2;
                             released_rows = released_rows.saturating_add(1);
                         }
                         if observation.is_some() || release.commitment() != *expected {
@@ -8873,6 +8886,7 @@ mod application_ledger_v2 {
                         Some(AgentRaftCommand::Ordered { entry, .. }),
                     ) => {
                         if causal_started.is_some() {
+                            causal_recovery_kind = 3;
                             ordered_rows = ordered_rows.saturating_add(1);
                         }
                         management_runtime = Some(entry.input.runtime.commitment());
@@ -8929,7 +8943,18 @@ mod application_ledger_v2 {
                     _ => {}
                 }
                 if causal_recovery_started.is_some() {
-                    recovery_fold_us = recovery_fold_us.saturating_add(causal_capacity_elapsed(causal_recovery_started));
+                    // Partition this one existing fold sample by its successful
+                    // branch, including the observation lookup/decode above.
+                    // These totals are nested in recovery_fold_us, not extra work.
+                    let elapsed_us = causal_capacity_elapsed(causal_recovery_started);
+                    recovery_fold_us = recovery_fold_us.saturating_add(elapsed_us);
+                    let branch_us = match causal_recovery_kind {
+                        1 => &mut registered_fold_us,
+                        2 => &mut released_fold_us,
+                        3 => &mut ordered_fold_us,
+                        _ => &mut other_fold_us,
+                    };
+                    *branch_us = branch_us.saturating_add(elapsed_us);
                 }
                 let causal_committee_started = causal_started.map(|_| std::time::Instant::now());
                 replay_committee_disposition(
@@ -9046,6 +9071,7 @@ mod application_ledger_v2 {
                     thread = ?std::thread::current().id(), phase = "complete", status = "ok",
                     elapsed_us, rows = retained as u64, header_us, snapshot_us, row_total_us,
                     row_decode_us, physical_row_us, recovery_fold_us, committee_fold_us,
+                    registered_fold_us, released_fold_us, ordered_fold_us, other_fold_us,
                     live_manifest_us, boundary_us, reservation_us,
                     registered_rows, released_rows, ordered_rows, "VOS causal recovery audit");
             }
