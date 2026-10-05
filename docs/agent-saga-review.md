@@ -141,8 +141,8 @@ safe artifact SHA-256
 `a9c77026debe47eec3c9611e68b73fcacf5fb3134e691350b5fcb86bdff670ee`.
 Current physical-image equality is still unproved.
 
-The reviewed exact Local recovery correction is **APPLIED, UNBUILT,
-UNQUALIFIED**. Only the same-held production image Local controller may prove
+The reviewed exact Local recovery correction is **CORE BUILT,
+UNQUALIFIED** on `4ce0f46b` (36.439s). Only the same-held production image Local controller may prove
 this exact original-owner two-member, authorization-present/finalization-absent
 family. All original child bindings are checked before normal issuer recovery
 and physical observation; complete canonical ACK bytes and physical receipt,
@@ -156,6 +156,47 @@ not a pure-read claim. Patch SHA-256
 Meaningful callback negatives, exact retry, current portable builds and ordinary
 CLI/M1 qualification remain prerequisites. Existing component tests do not
 qualify the newly allowed branch.
+
+Existing strict Local cold-adoption refusal **passes 54.460s**. Existing
+registration-timeout exact retry **fails 65.472s** at
+`local_install_recovery.rs:1062`: completed issuer ACK, ready actor route and
+released family assertions passed, then a terminal retry returns before the
+unchanged **whole30** deadline assertion fails. Its exact ACK equality and
+later no-change assertions are unreached. Neither pass/failure qualifies the
+new child callback or ordinary CLI. Both execute one test, owned groups are gone
+and source/artifact fences pass. Evidence is
+`task-tmp/r46-local-{cold,registration}-compat-4ce0f46b`.
+The initial shortened-selector wrapper refusal launched no test and is not
+execution evidence.
+
+The genuine Local child-before-pledge regression is now **APPLIED, UNBUILT,
+UNEXECUTED**. It extends the existing fixed-three fixture with an exact CMI
+finalization-prewrite refusal after real child registration. It checks strict
+default refusal, held-controller admission, missing observed ACK, a different
+validly signed issuer ACK against the unchanged child, and actual physical
+image corruption; original child envelope/anchor, terminal retry, normal signer
+count and original whole30 remain mandatory. It uses non-clone memory lifecycle
+leases and physical images, not public HTTP or filesystem lifecycle custody.
+Full outer System/transport shutdown is outside that helper's whole30; lease
+release/owner extraction is inside. Typed observation-field mismatch and
+intervening fresh-family progression negatives remain explicitly open.
+Reviewed patch SHA-256
+`fefec4149bd87f8dbeccd66ca6ec804efe8285d9fc54338234898f347dda0ac2`.
+
+The **second/final tuning candidate is APPLIED, UNBUILT, UNQUALIFIED**.
+Direct persisted ManagementCustody Invoke now may borrow only its own
+post-drain/capacity/barrier-verified manifest under uninterrupted admission
+guards, alongside the existing Current ACK path. Only immutable applied
+selectors are reused: aggregate/pending/singleton budgets and persisted
+preparation. Original PublicPreflight/clock ordering, successful unseen-member
+preview, exact anchored-input agreement, every fresh absence/raw settled-prefix
+check, physical/common closure and availability remain. Defaults stay fresh;
+explicit disposal precedes publication, drain, unlock or peer I/O.
+No full audited view, result, absence or availability proof is cached.
+Independent source review passes, but no compiler/runtime benefit is claimed.
+Reviewed patch SHA-256
+`73550005e9d5ec39d3b5962fd83927164ef70bfaf425aa1d81b70d9ac2e197c3`.
+The second measured pass is not consumed until isolated measurement.
 Three focused exact-retention units on preceding `f4a3dc90` each execute one test and **pass
 0.101s / 0.101s / 0.601s** (credential query, reservation and exact Install),
 with owned groups gone. These and the earlier typed retained-client regressions

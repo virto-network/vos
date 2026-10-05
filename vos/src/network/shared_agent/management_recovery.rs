@@ -489,10 +489,15 @@ impl SharedRouteHandler {
         #[cfg(test)]
         self.management_custody_budget_checks
             .fetch_add(1, Ordering::Relaxed);
-        let required = if matches!(request, CleanInvocationReplayRequest::Acknowledge { .. })
-            && matches!(clock, InvocationClock::Current)
-        {
-            host.management_ack_retention_admission_with_manifest(self.agent, &manifest)?
+        let required = if matches!(
+            (request, clock),
+            (CleanInvocationReplayRequest::Acknowledge { .. }, InvocationClock::Current)
+                | (CleanInvocationReplayRequest::Invoke {
+                    context: RuntimeExecutionContext::Direct,
+                    ..
+                }, InvocationClock::PersistedManagement(_))
+        ) {
+            host.management_custody_retention_admission_with_manifest(self.agent, &manifest)?
         } else {
             host.management_retention_admission_requirement(self.agent, None)?
         }

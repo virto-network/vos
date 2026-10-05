@@ -2656,6 +2656,25 @@ where
         )
     }
 
+    /// The caller keeps this custody Invoke's post-drain admission guards.
+    /// Reuse only its verified immutable selectors; every unseen member still
+    /// receives the existing fresh settled-prefix absence and physical checks.
+    pub(crate) fn management_pending_admission_with_input_and_manifest(
+        &self,
+        anchor: &super::clean_management_intent::ManagementJournalAnchor,
+        envelope: &crate::agent_sdk::RuntimeWork,
+        manifest: &SharedRecoveryManifest,
+    ) -> Result<(Option<usize>, Option<ReplayInputId>), SharedJournalDriverError> {
+        self.management_recovery_admission_with_headroom_and_input(
+            &[(anchor, envelope)],
+            &[],
+            0,
+            0,
+            true,
+            Some(manifest),
+        )
+    }
+
     /// One prospective Ordered chain for incomplete invocations and completed
     /// results awaiting retirement. Independent per-set checks are insufficient
     /// because both consume the same suffix entry and byte budgets.
@@ -2714,9 +2733,9 @@ where
     }
 
     /// The caller verified this manifest after draining under the same
-    /// uninterrupted host/proposal guards. Only new custody ACK admission uses
-    /// this borrowed view; fresh absence and physical availability stay below.
-    pub(crate) fn management_ack_retention_admission_with_manifest(
+    /// uninterrupted host/proposal guards. Only new Current ACK or persisted
+    /// Invoke custody uses it; fresh absence and physical checks stay below.
+    pub(crate) fn management_custody_retention_admission_with_manifest(
         &self,
         manifest: &SharedRecoveryManifest,
     ) -> Result<Option<usize>, SharedJournalDriverError> {
@@ -2796,7 +2815,7 @@ where
         // The borrowed driver cannot publish or drain during this calculation.
         // Reuse only this call's freshly verified view for retained selectors;
         // each unseen registered member still proves absence against its own
-        // fresh settled physical prefix below. A custody ACK may borrow its
+        // fresh settled physical prefix below. A custody operation may borrow its
         // existing admission-guard view here; no view survives guard release,
         // peer operation or publication.
         let fresh_manifest = if verified_manifest.is_some()
@@ -4605,6 +4624,25 @@ where
         &self,
         request: CleanInvocationReplayRequest,
     ) -> Result<PreparedCleanOrdered, SharedJournalDriverError> {
+        self.prepare_persisted_management_invocation_with_policy(request, None)
+    }
+
+    /// Borrow only the freshly verified manifest of this guarded custody
+    /// Invoke. Original preflight, clock ordering, terminal preview and exact
+    /// retained-input checks remain on the existing persisted policy below.
+    pub(crate) fn prepare_persisted_management_invocation_with_manifest(
+        &self,
+        request: CleanInvocationReplayRequest,
+        manifest: &SharedRecoveryManifest,
+    ) -> Result<PreparedCleanOrdered, SharedJournalDriverError> {
+        self.prepare_persisted_management_invocation_with_policy(request, Some(manifest))
+    }
+
+    fn prepare_persisted_management_invocation_with_policy(
+        &self,
+        request: CleanInvocationReplayRequest,
+        verified_manifest: Option<&SharedRecoveryManifest>,
+    ) -> Result<PreparedCleanOrdered, SharedJournalDriverError> {
         let CleanInvocationReplayRequest::Invoke {
             context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             work,
@@ -4625,7 +4663,7 @@ where
             true,
             Some(observed_slot),
             true,
-            None,
+            verified_manifest,
         )
     }
 

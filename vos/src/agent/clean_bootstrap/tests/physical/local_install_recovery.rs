@@ -10,6 +10,8 @@ use super::*;
 mod cold_recovery;
 #[path = "local_install_pending_validation.rs"]
 mod pending_validation;
+#[path = "local_install_child_recovery.rs"]
+mod child_recovery;
 
 use crate::actors::codec::{Decode as _, Encode as _};
 use crate::agent::clean_management_intent::CleanManagementIntentSlot;
@@ -32,6 +34,7 @@ pub(super) enum Cut {
     RegistrationTimeout,
     HandoffWriteThenRegistrationTimeout,
     RegistrationTimeoutCold,
+    FinalizationPrewrite,
 }
 
 struct Stores {
@@ -42,6 +45,7 @@ struct Stores {
     opens: Arc<AtomicUsize>,
     live: Arc<AtomicUsize>,
     intent_fault: Arc<Mutex<Fault>>,
+    issuer_fault: Arc<Mutex<Fault>>,
 }
 impl LocalLifecycleStoreFactory for Stores {
     type Intent = LeaseStore;
@@ -61,7 +65,7 @@ impl LocalLifecycleStoreFactory for Stores {
             ),
             LeaseStore::new(
                 self.issuer.clone(),
-                Arc::new(Mutex::new(Fault::default())),
+                Arc::clone(&self.issuer_fault),
                 Arc::clone(&self.live),
             ),
         ))
@@ -354,6 +358,7 @@ pub(super) fn exercise(
     let opens = Arc::new(AtomicUsize::new(0));
     let live = Arc::new(AtomicUsize::new(0));
     let intent_fault = Arc::new(Mutex::new(Fault::default()));
+    let issuer_fault = Arc::new(Mutex::new(Fault::default()));
     let stores = Stores {
         space: descriptor.identity.space,
         agent: descriptor.identity.agent,
@@ -362,6 +367,7 @@ pub(super) fn exercise(
         opens: Arc::clone(&opens),
         live: Arc::clone(&live),
         intent_fault: Arc::clone(&intent_fault),
+        issuer_fault: Arc::clone(&issuer_fault),
     };
     let mut controller = LocalLifecycleController::new(
         owners[origin].take().unwrap(),
@@ -516,6 +522,14 @@ pub(super) fn exercise(
         .last_index();
     let recovery_started = std::time::Instant::now();
     let deadline = recovery_started + std::time::Duration::from_secs(30);
+    if cut == Cut::FinalizationPrewrite {
+        child_recovery::exercise(
+            origin, owners, controller, &descriptor, &install, &call, &package, &request,
+            &intent_store, &issuer_store, &intent_fault, &issuer_fault, &opens, &live,
+            &image_path, &request_path, &issuer_before, recovery_started, deadline,
+        );
+        return;
+    }
     if cut == Cut::HandoffWriteThenRegistrationTimeout {
         let previous = CleanManagementIntentSlot::open(intent_store.clone()).unwrap();
         assert!(previous.retirement_complete().unwrap());
@@ -616,6 +630,7 @@ pub(super) fn exercise(
         );
     }
     let retained = match cut {
+        Cut::FinalizationPrewrite => unreachable!(),
         Cut::AuthorizationPrewrite => {
             intent_fault
                 .lock()
@@ -740,6 +755,7 @@ pub(super) fn exercise(
             .current_management_pending(agent, call.invocation)
             .unwrap();
         match cut {
+            Cut::FinalizationPrewrite => unreachable!(),
             Cut::AuthorizationPrewrite => {
                 assert!(current_pending == Some((saved_anchor.clone(), saved_work.clone())));
                 original

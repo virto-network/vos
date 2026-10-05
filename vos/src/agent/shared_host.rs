@@ -3222,6 +3222,24 @@ impl SharedAgentHost {
             .map_err(map_driver_error)
     }
 
+    /// Borrow only this custody Invoke's verified manifest while the caller's
+    /// post-drain host/proposal guards remain uninterrupted. Absence and exact
+    /// physical availability are still freshly proved inside the driver.
+    pub(crate) fn management_pending_admission_with_input_and_manifest(
+        &self,
+        agent: AgentId,
+        anchor: &super::clean_management_intent::ManagementJournalAnchor,
+        envelope: &crate::agent_sdk::RuntimeWork,
+        manifest: &super::shared_recovery::SharedRecoveryManifest,
+    ) -> Result<(Option<usize>, Option<super::journal::ReplayInputId>), SharedAgentHostError> {
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .management_pending_admission_with_input_and_manifest(anchor, envelope, manifest)
+            .map_err(map_driver_error)
+    }
+
     pub(crate) fn management_recovery_admission_requirement(
         &self,
         agent: AgentId,
@@ -3279,9 +3297,9 @@ impl SharedAgentHost {
             .map_err(map_driver_error)
     }
 
-    /// Only the current custody ACK may borrow this call's post-drain verified
-    /// manifest, while the same host/proposal guards remain uninterrupted.
-    pub(crate) fn management_ack_retention_admission_with_manifest(
+    /// Only a Current custody ACK or persisted custody Invoke may borrow this
+    /// call's verified manifest under uninterrupted post-drain admission guards.
+    pub(crate) fn management_custody_retention_admission_with_manifest(
         &mut self,
         agent: AgentId,
         manifest: &super::shared_recovery::SharedRecoveryManifest,
@@ -3299,7 +3317,7 @@ impl SharedAgentHost {
         }
         hosted
             .driver
-            .management_ack_retention_admission_with_manifest(manifest)
+            .management_custody_retention_admission_with_manifest(manifest)
             .map_err(map_driver_error)
     }
 
@@ -3362,8 +3380,8 @@ impl SharedAgentHost {
     }
 
     /// Preserve this lookup's live lease/Agent fence while reusing only the
-    /// same custody ACK's verified manifest under uninterrupted host guards.
-    pub(crate) fn management_ack_has_pending_with_manifest(
+    /// same custody operation's verified manifest under uninterrupted guards.
+    pub(crate) fn management_custody_has_pending_with_manifest(
         &mut self,
         agent: AgentId,
         manifest: &super::shared_recovery::SharedRecoveryManifest,
@@ -3700,6 +3718,22 @@ impl SharedAgentHost {
             .ok_or(SharedAgentHostError::AgentNotFound)?
             .driver
             .prepare_persisted_management_invocation(request)
+            .map_err(map_driver_error)
+    }
+
+    /// The existing persisted-Invoke policy remains mandatory. Borrow only
+    /// the same custody admission's freshly verified immutable manifest.
+    pub(crate) fn prepare_persisted_management_invocation_with_manifest(
+        &self,
+        agent: AgentId,
+        request: super::shared_journal_driver::CleanInvocationReplayRequest,
+        manifest: &super::shared_recovery::SharedRecoveryManifest,
+    ) -> Result<super::shared_journal_driver::PreparedCleanOrdered, SharedAgentHostError> {
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .prepare_persisted_management_invocation_with_manifest(request, manifest)
             .map_err(map_driver_error)
     }
 

@@ -2773,7 +2773,7 @@ impl SharedRouteHandler {
             } else {
                 None
             };
-            let mut ack_manifest = None;
+            let mut custody_manifest = None;
             if let Some(ReservedSubmission::ManagementCustody {
                 owner,
                 registration,
@@ -2808,20 +2808,22 @@ impl SharedRouteHandler {
                     return Ok(retained);
                 }
                 if matches!(
-                    &request,
-                    crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Acknowledge { .. }
-                )
-                    && matches!(clock, InvocationClock::Current)
-                {
+                    (&request, clock),
+                    (crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Acknowledge { .. }, InvocationClock::Current)
+                        | (crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Invoke {
+                            context: RuntimeExecutionContext::Direct,
+                            ..
+                        }, InvocationClock::PersistedManagement(_))
+                ) {
                     // Freshly authenticated after draining and the strict
                     // capacity/barrier check. Lend it only under these same
                     // uninterrupted guards; discard before publication/I/O.
-                    ack_manifest = Some(manifest);
+                    custody_manifest = Some(manifest);
                 }
             }
             if self.management_retention {
-                let has_pending_management = if let Some(manifest) = ack_manifest.as_ref() {
-                    host.management_ack_has_pending_with_manifest(self.agent, manifest)
+                let has_pending_management = if let Some(manifest) = custody_manifest.as_ref() {
+                    host.management_custody_has_pending_with_manifest(self.agent, manifest)
                         .map_err(|error| refused("management_manifest_error", error))?
                 } else {
                     host.recovery_manifest(self.agent)
@@ -2866,8 +2868,16 @@ impl SharedRouteHandler {
                     authorization: Box::new(authorization.clone()),
                     observed_slot: preflight.observed_slot,
                 };
-                let (required, retained) = host
-                    .management_pending_admission_with_input(self.agent, anchor, &envelope)
+                let (required, retained) = if let Some(manifest) = custody_manifest.as_ref() {
+                    host.management_pending_admission_with_input_and_manifest(
+                        self.agent,
+                        anchor,
+                        &envelope,
+                        manifest,
+                    )
+                } else {
+                    host.management_pending_admission_with_input(self.agent, anchor, &envelope)
+                }
                     .map_err(|error| refused("pending_budget_error", error))?;
                 let required = required.ok_or(SharedAgentHostError::CapacityExhausted)?;
                 trace("pending_budget_complete");
@@ -2902,16 +2912,24 @@ impl SharedRouteHandler {
             let prepared = if matches!(clock, InvocationClock::Bootstrap) {
                 host.prepare_bootstrap_invocation(self.agent, request)
             } else if matches!(clock, InvocationClock::PersistedManagement(_)) {
-                host.prepare_persisted_management_invocation(self.agent, request)
+                if let Some(manifest) = custody_manifest.as_ref() {
+                    host.prepare_persisted_management_invocation_with_manifest(
+                        self.agent,
+                        request,
+                        manifest,
+                    )
+                } else {
+                    host.prepare_persisted_management_invocation(self.agent, request)
+                }
             } else if terminal_only {
                 host.prepare_terminal_clean_ordered_operation(self.agent, request)
-            } else if let Some(manifest) = ack_manifest.as_ref() {
+            } else if let Some(manifest) = custody_manifest.as_ref() {
                 host.prepare_management_ack_with_manifest(self.agent, request, manifest)
             } else {
                 host.prepare_clean_ordered_operation(self.agent, request)
             }
             .map_err(|error| refused("prepare_error", error))?;
-            drop(ack_manifest);
+            drop(custody_manifest);
             trace("prepare_complete");
             let input = prepared.input();
             if started.is_some() {

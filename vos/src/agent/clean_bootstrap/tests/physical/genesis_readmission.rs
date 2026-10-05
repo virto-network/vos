@@ -12,11 +12,14 @@ use crate::agent::clean_management_intent::CleanManagementIntent;
 #[derive(Default)]
 pub(super) struct Fault {
     load_once: bool,
+    loaded_reads: usize,
     commit_then_error_at: Option<usize>,
     committed_writes: usize,
     commit_then_error_failures: usize,
     install_authorization_prewrite_once: bool,
     install_authorization_prewrite_failures: usize,
+    install_finalization_prewrite_once: bool,
+    install_finalization_prewrite_failures: usize,
 }
 
 impl Fault {
@@ -28,6 +31,10 @@ impl Fault {
 
     pub(super) fn committed_writes(&self) -> usize {
         self.committed_writes
+    }
+
+    pub(super) fn loaded_reads(&self) -> usize {
+        self.loaded_reads
     }
 
     pub(super) fn commit_then_error_failures(&self) -> usize {
@@ -42,6 +49,16 @@ impl Fault {
 
     pub(super) fn install_authorization_prewrite_failures(&self) -> usize {
         self.install_authorization_prewrite_failures
+    }
+
+    pub(super) fn refuse_install_finalization_before_write_once(&mut self) {
+        assert!(!self.install_finalization_prewrite_once);
+        assert_eq!(self.install_finalization_prewrite_failures, 0);
+        self.install_finalization_prewrite_once = true;
+    }
+
+    pub(super) fn install_finalization_prewrite_failures(&self) -> usize {
+        self.install_finalization_prewrite_failures
     }
 }
 
@@ -73,14 +90,43 @@ impl Drop for LeaseStore {
 impl CleanManagementIssuerStore for LeaseStore {
     type Error = MemoryError;
     fn load(&mut self) -> Result<Option<Vec<u8>>, MemoryError> {
-        if core::mem::take(&mut self.fault.lock().unwrap().load_once) {
-            return Err(MemoryError);
+        {
+            let mut fault = self.fault.lock().unwrap();
+            fault.loaded_reads += 1;
+            if core::mem::take(&mut fault.load_once) {
+                return Err(MemoryError);
+            }
         }
         self.inner.load()
     }
     fn commit(&mut self, bytes: &[u8]) -> Result<(), MemoryError> {
         {
             let mut fault = self.fault.lock().unwrap();
+            if fault.install_finalization_prewrite_once {
+                if let Ok(next) = CleanManagementIntent::decode(bytes) {
+                    if matches!(next.request(), ManagementRequest::Install(_))
+                        && next.authorization_work().is_some()
+                        && next.finalization_work().is_some()
+                    {
+                        let current = CleanManagementIntent::decode(
+                            &self.inner.load()?.expect("finalization cut requires retained CMI"),
+                        )
+                        .unwrap();
+                        assert!(current.request() == next.request());
+                        assert!(current.call() == next.call());
+                        assert!(current.authorization_work().is_some());
+                        assert!(current.authorization_work() == next.authorization_work());
+                        assert!(current.finalization_work().is_none());
+                        // Canonical CMI decoding already checks paired anchors;
+                        // the fixture separately checks its unchanged Root
+                        // anchor against the actual authenticated registration.
+                        current.call().verify_with(&RawCredentialVerifier).unwrap();
+                        fault.install_finalization_prewrite_once = false;
+                        fault.install_finalization_prewrite_failures += 1;
+                        return Err(MemoryError);
+                    }
+                }
+            }
             if fault.install_authorization_prewrite_once {
                 if let Ok(next) = CleanManagementIntent::decode(bytes) {
                     if matches!(next.request(), ManagementRequest::Install(_))
