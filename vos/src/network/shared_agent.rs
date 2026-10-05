@@ -2807,7 +2807,10 @@ impl SharedRouteHandler {
                     trace("fresh_custody_availability_complete");
                     return Ok(retained);
                 }
-                if matches!(&request, CleanInvocationReplayRequest::Acknowledge { .. })
+                if matches!(
+                    &request,
+                    crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Acknowledge { .. }
+                )
                     && matches!(clock, InvocationClock::Current)
                 {
                     // Freshly authenticated after draining and the strict

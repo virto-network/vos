@@ -330,6 +330,9 @@ Reviewed patch SHA-256
 `6d94a2f1dd66f588a2162f3e30ed8e4b821ea60c0fb4b4f29a128fa89d856866`.
 Compilation and runtime benefit are open; its next measured qualification
 counts as **service-tuning pass one**, with none measured yet.
+First core build on `7aa46a57` **fails 16.617s** before execution at the new
+network match's missing qualified enum path. That reference is corrected;
+the failed build/exhausted owned group are retained, without test/tuning credit.
 
 The fixture-only preparation correction is **BUILT and EXECUTED, UNQUALIFIED**.
 Normal credential/descriptor discovery retries the exact persisted credential
