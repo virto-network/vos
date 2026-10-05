@@ -37,6 +37,28 @@ pub(crate) use management::{
     SharedManagementRecoveryRelease, SharedManagementRecoverySlot,
 };
 
+#[cfg(feature = "std")]
+pub(super) fn registration_fold_cost_started() -> Option<std::time::Instant> {
+    std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS")
+        .is_some()
+        .then(std::time::Instant::now)
+}
+
+#[cfg(feature = "std")]
+pub(super) fn trace_registration_fold_cost(
+    registration: &SharedManagementRecoveryRegistration,
+    phase: &'static str,
+    started: Option<std::time::Instant>,
+    success: bool,
+) {
+    if let Some(started) = started {
+        let elapsed_us = started.elapsed().as_micros() as u64;
+        tracing::debug!(registration = ?registration.commitment().0, phase,
+            elapsed_us, success, thread = ?std::thread::current().id(),
+            "VOS causal registration fold");
+    }
+}
+
 /// Fixed founding-voter and independent management-holder bound.
 pub const MAX_SHARED_RECOVERY_SLOTS: usize = 3;
 pub const MAX_SHARED_RECOVERY_REQUEST_BYTES: usize =
@@ -412,7 +434,15 @@ impl SharedRecoveryManifest {
         index: u64,
         term: u64,
     ) -> Result<bool, SharedRecoveryError> {
-        self.validate_management_registration_request(registration.request())?;
+        let causal_request_started = registration_fold_cost_started();
+        let checked = self.validate_management_registration_request(registration.request());
+        trace_registration_fold_cost(
+            registration,
+            "checked_request",
+            causal_request_started,
+            checked.is_ok(),
+        );
+        checked?;
         let mut candidate = self.clone();
         let changed = management::apply_management_registration_after_request_validation(
             &mut candidate.management,
@@ -431,9 +461,16 @@ impl SharedRecoveryManifest {
             // including signatures and all inherited evidence, against this
             // unchanged generation/committee. Keep the remaining manifest
             // scope, whole encoded bound and positions before publication.
+            let causal_finalize_started = registration_fold_cost_started();
             validate_scope(candidate.generation, &candidate.committee)?;
             bound(&candidate, MAX_SHARED_RECOVERY_MANIFEST_BYTES)?;
             candidate.validate_positions_after_validation(index)?;
+            trace_registration_fold_cost(
+                registration,
+                "manifest_finalize",
+                causal_finalize_started,
+                true,
+            );
             *self = candidate;
         }
         Ok(changed)

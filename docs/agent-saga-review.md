@@ -11,6 +11,24 @@ host source or the released workflow.
 
 ## Boundary and release claim
 
+R55 diagnostic attribution is complete on clean `29c29092`: current portable
+main/harness and strict six-file verification pass; one scoped all-cold attempt
+fails **236.658s**. The finite reader admits **9,655 records / 506 edges / zero
+unknowns** through all original fences; 25 acceptance/41 refusal synthetics and
+privacy checks pass. Original-owner release still times out before proposal,
+followed by late leader confirmation. The exact failing release's fresh audits
+take **909.181ms / 940.630ms**, with **0µs** ledger wait and **0/2µs** read start.
+Registration and Ordered folds dominate; isolated crypto/encoding/removable work
+and the later host holder remain unknown. No recovery or performance credit.
+
+R56 continues diagnostic-only investigation by timing the existing registration
+checks, incoming verification, evidence construction, candidate validation and
+manifest/physical commitment work. One std-only gated helper preserves all
+calls, errors, freshness, signatures, transactions, guard lifetimes and bounds.
+Nested clocks and repeated identities cannot be treated as distinct attempts.
+The live plan owns review, clean portable provenance and isolated evidence
+admission; no sixth behavior candidate, guest change or cap extension follows.
+
 R54 is complete on frozen `63b8203e`: independent source/test reviews and
 11 preservation units pass, including signed differentials against the original
 checked release wrapper. Portable main/harness and strict six-file verification
@@ -20,13 +38,10 @@ release timeout before leader proposal, followed by late leader confirmation.
 Recorded lower fold cost does not establish controlled or sufficient recovery
 benefit. Quiet's inner cause remains independently unknown; M1 stays open.
 
-The user's direction continues causal investigation. R55 is diagnostic only:
-bind existing fresh audits to exact release metadata and the signed-validation
-or capacity boundary, measure existing ledger/read acquisition, and partition
-the existing fold clock by source branch. No audit, freshness, guard, transaction,
-signature, limit, deadline or supported-path change. The live plan owns this
-sequence and unchanged cap; no sixth behavior candidate, redesign, promotion or
-release benefit is automatic.
+The user's direction continues causal investigation. R55 changed no audit,
+freshness, guard, transaction, signature, limit, deadline or supported path.
+The live plan owns the unchanged cap; no sixth behavior candidate, redesign,
+promotion or release benefit is automatic.
 
 R52's explicitly authorized bounded registration-validation pass is complete
 on clean `92702a09`: independent source reviews and ten preservation/differential
@@ -161,37 +176,42 @@ Current O3 component evidence (logs under the native worktree's `target`):
 
 ### Current integration delta and blocking result
 
-Read [completed R54](agent-saga-status.md#completed-r54-release-fold-validation-pass)
+Read [completed R55](agent-saga-status.md#completed-r55-release-bound-audit-attribution)
 in the sole live plan for source/binary/reader/artifact hashes and event limits.
-Portable main/harness pass **429.634s / 479.365s**, strict six-file verification
-**0.101s**. The scoped attempt admits **7,604 records / 335 explicit edges /
+Portable main/harness pass **392.411s / 457.262s**, strict six-file verification
+**0.101s**. The scoped attempt admits **9,655 records / 506 explicit edges /
 zero unknowns**, one failed test and exhausted noninterrupted owned group.
 Public Create completes terminal/release and exact Applied replay, then the
 fixture verifies pending Install and enters cold restart. Exact Install
 finalization is delivered and accepted; root-bound issuer save requires actual
 Done, exact reply validation and durable replay equality. Both runtime retirements
 and terminal persistence complete. Current failure is its original owner's
-retention release: twelve absent polls, timeout **1.932s** into confirmation,
+retention release: thirteen absent polls, timeout **1.873s** into confirmation,
 before leader proposal. The leader then observes that exact release present and
 completes local custody/commit. There is no tail attachment ScopeMismatch here;
 R52's late attachment refusal remains historical and cannot explain its earlier
 owner timeout. Late leader release is not original-owner completion or readiness.
 
-Exact Install release times: driver provenance **98.224ms**, signed-ledger
-validation **845.669ms**, capacity **880.889ms**, worker snapshot **69µs**.
+Exact Install release times: driver provenance **112.019ms**, signed-ledger
+validation **918.705ms**, capacity **940.716ms**, worker snapshot **32µs**.
 The validator's driver time is already nested in its enclosing leader interval.
 Its fresh settled-prefix preflight and the separate capacity transaction remain
 mandatory; these durations do not establish their removable fraction or a
-CPU-only cause. The second leader confirmation poll spends **2763.901ms** acquiring
-the host, **178µs** draining and **138.550ms** verifying manifest; the holder and
+CPU-only cause. R55 explicitly binds audit bodies of **909.181ms / 940.630ms**
+to signed validation/capacity, with **0µs** guard wait and **0/2µs** read start.
+Registration accounts for **313.029ms / 338.641ms**, Ordered **246.904ms /
+249.913ms**, historical release **96.697ms / 93.294ms**. These are nested complete
+branch costs, not isolated signatures or safely removable checks. The second
+leader confirmation poll spends **1977.937ms** acquiring
+the host, **134µs** draining and **129.840ms** verifying manifest; the holder and
 its work remain unknown. Source confirms exact terminal-release retry already
 exists within one unchanged startup scheduling budget. Neither that budget's
 monotonic start nor exhaustion is logged. These independent fresh transactions
 cannot be cached away. Original-owner release completion, client recovery, routes, whole30,
 ordinary three-process CLI and M1 remain open. Broader simplifications stay later.
-No sixth behavior candidate or week-cap extension is automatic. The R55
-diagnostic-only follow-up separates exact release-bound audit branches and
-acquisition from the independently later, still-unattributed host wait.
+No sixth behavior candidate or week-cap extension is automatic. R56 separates
+the largest measured registration branch's existing calls while the independently
+later host wait remains unattributed.
 
 The reviewed proposal removes only repeated changed-candidate slot validation
 from historical release folding. It retains incoming signature-before-retry,

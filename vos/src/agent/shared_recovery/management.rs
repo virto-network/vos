@@ -1116,14 +1116,34 @@ pub(super) fn apply_management_registration_after_request_validation(
     raft_index: u64,
     raft_term: u64,
 ) -> Result<bool, SharedRecoveryError> {
-    registration.verify(generation, committee)?;
+    #[cfg(feature = "std")]
+    let incoming_started = super::registration_fold_cost_started();
+    let verified = registration.verify(generation, committee);
+    #[cfg(feature = "std")]
+    super::trace_registration_fold_cost(
+        registration,
+        "incoming_verification",
+        incoming_started,
+        verified.is_ok(),
+    );
+    verified?;
     let existing =
         slots.binary_search_by_key(&registration.owner(), SharedManagementRecoverySlot::owner);
     if existing.is_ok_and(|index| slots[index].registration == *registration) {
         return Ok(false);
     }
     validate_later_position(management_last_position(slots), raft_index, raft_term)?;
-    let evidence = prospective_management_evidence(slots, registration.request())?;
+    #[cfg(feature = "std")]
+    let evidence_started = super::registration_fold_cost_started();
+    let evidence = prospective_management_evidence(slots, registration.request());
+    #[cfg(feature = "std")]
+    super::trace_registration_fold_cost(
+        registration,
+        "prospective_evidence",
+        evidence_started,
+        evidence.is_ok(),
+    );
+    let evidence = evidence?;
     let slot = SharedManagementRecoverySlot {
         registration: registration.clone(),
         raft_index,
@@ -1131,13 +1151,33 @@ pub(super) fn apply_management_registration_after_request_validation(
         members_evidence: evidence,
         release: None,
     };
-    slot.validate_at(raft_index)?;
+    #[cfg(feature = "std")]
+    let constructed_started = super::registration_fold_cost_started();
+    let validated = slot.validate_at(raft_index);
+    #[cfg(feature = "std")]
+    super::trace_registration_fold_cost(
+        registration,
+        "constructed_slot_validation",
+        constructed_started,
+        validated.is_ok(),
+    );
+    validated?;
     let mut candidate = slots.clone();
     match existing {
         Ok(index) => candidate[index] = slot,
         Err(index) => candidate.insert(index, slot),
     }
-    validate_management_slots(&candidate, generation, committee)?;
+    #[cfg(feature = "std")]
+    let candidate_started = super::registration_fold_cost_started();
+    let validated = validate_management_slots(&candidate, generation, committee);
+    #[cfg(feature = "std")]
+    super::trace_registration_fold_cost(
+        registration,
+        "changed_candidate_validation",
+        candidate_started,
+        validated.is_ok(),
+    );
+    validated?;
     *slots = candidate;
     Ok(true)
 }

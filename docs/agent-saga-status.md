@@ -37,7 +37,28 @@ deployment is automatic.
 
 ## Current position
 
-### R55 release-bound audit attribution
+### R56 registration-fold attribution
+
+Continue the authorized causal investigation after completed R55 below. The
+largest measured branch is registration folding, but its removable share is
+unknown. R56 measures the existing checked request, incoming verification,
+prospective evidence, constructed-slot validation, changed-candidate validation,
+manifest finalization and physical commitment comparison. Reuse one std-only
+gated timing helper, existing release/observation spans and exact registration
+commitments; no body, signature, memory address or diagnostic input is exported.
+
+All original calls, Result propagation, signature-before-retry, validation,
+candidate assignment, physical reads, guards and deadlines retain their order.
+This is diagnostic only, not a sixth behavior candidate, fresh-audit suppression,
+guest change, architecture replacement or cap extension. The function timings
+are nested; repeated metadata/registration identities do not identify attempts
+or permit adjacency-based pairing. Independently review source/finite grammar,
+freeze clean source, rebuild current portable main/harness, strictly verify the
+unchanged bundle and run one isolated scoped all-cold attempt. Preserve every
+original evidence fence and admit completed evidence before reporting results.
+The later host-lock holder remains an independent unknown.
+
+### Completed R55 release-bound audit attribution
 
 Continue the user's 2026-10-06 direction to investigate until the demonstrated
 blocker is understood. R54 below does not qualify recovery. R55 is diagnostic
@@ -54,10 +75,85 @@ decoding, not isolated cryptography or CPU time. Metadata remains an exact
 release identity, not a unique attempt. Keep repeated-group ambiguity explicit.
 The later host-lock holder remains unknown and is a separate diagnostic need;
 do not assign unscoped audit rows by timestamp or thread proximity.
-Independently review source and the finite reader, preserve all original
-evidence fences, freeze clean source, rebuild portable main/harness and run one
-isolated scoped all-cold attempt. Admit completed evidence before updating its
-result. No automatic sixth tuning patch follows.
+**Implementation:** frozen diagnostic-only source
+`29c2909203cd941562339b86468273a7f52c5a7d`. Independent reviews pass. The finite
+reader preserves the original admission fences, rejects mixed unsupported
+contexts, checks exact inline metadata and branch partition sums, and passes
+**25 accepted / 41 refusal** synthetic cases plus privacy/alias checks. It loads
+no helper or private input during those synthetic checks.
+
+**Integration:** portable main/harness pass **392.411s / 457.262s**, strict
+six-file verification **0.101s**. One scoped all-cold attempt fails **236.658s**,
+one failed test, exhausted noninterrupted owned group. All original exact
+source/artifact/environment/binary/input/before-after fences pass. The reviewed
+reader admits **9,655 records / 506 explicit edges / zero unknowns**. No quiet
+attempt was run on R55; earlier quiet inner causes remain separate and unknown.
+
+Create `id24` completes Applied and exact Applied replay (e4330/e4367).
+Pending Install cut/cold entry are verified (e7780/e7797). Install root `id159`
+preserves original invocation/work/authorization `id158/id160/id161`; final child
+`id183/id184` retains authorization/member `id185/id188` under registration
+`id186` sequence 5. Root-bound issuer save completes (e9260), requiring accepted
+Done, exact reply and durable replay equality. Both ACK availability boundaries,
+runtime retirement and terminal persistence complete (e9398/e9405/e9529/e9536/
+e9537/e9540). Owner `id6` release `id195`, scope `id194`, then has 13 absent polls
+at `(49,2)` and timeout **1.873020s** (e9628–30), before leader `id1` proposal
+(e9639). The leader later confirms that exact release at `(50,2)` and completes
+local custody/commit (e9653–55). Owner completion, routes and whole30 are open.
+
+The new direct spans bind both audit bodies to this release on leader `id1`,
+generation `id4`, thread47, each with **49 rows / 5 registrations / 1 historical
+release / 14 Ordered**. Each stage has one acquisition pair and completed body;
+the leader has one complete phase ladder. Metadata still identifies a release,
+not a unique attempt; routing and audit scopes are not equated by inference.
+
+| Exact release-bound measurement | Signed validation | Capacity |
+| --- | ---: | ---: |
+| Ledger guard wait | 0µs | 0µs |
+| Read transaction start | 0µs | 2µs |
+| Complete audit body | 909.181ms | 940.630ms |
+| Recovery fold | 656.634ms | 681.851ms |
+| Registration branch | 313.029ms | 338.641ms |
+| Historical release branch | 96.697ms | 93.294ms |
+| Ordered branch | 246.904ms | 249.913ms |
+| Other | 4µs | 3µs |
+
+The four branches partition the same fold sample exactly. Fold occupies about
+72% of both audit bodies; registration is its largest branch, with Ordered also
+substantial. The historical release row is not incoming `id195`. These complete
+branch clocks include observation lookup/decode, structural/capsule checks,
+signatures and encoding. They do not isolate CPU, cryptography or removable work.
+This attributes pre-proposal pressure to audit bodies rather than acquisition
+in this sample; independent freshness/physical-prefix audits remain mandatory.
+
+Driver manifest is **112.019ms**, outer signed validation **918.705ms**, outer
+capacity **940.716ms**, snapshot **32µs**, admission before commit **2.096502s**.
+Audit/branch clocks are nested and cannot be added to enclosing clocks. Later
+leader confirmation separately waits **1977.937ms** for the host, followed by
+**134µs** drain and **129.840ms** manifest verification; holder/work are unknown.
+Its late presence-first success follows the unchanged waiter ordering, not a
+waived deadline. No performance benefit, owner recovery or M1 exit is established.
+
+Evidence below `target/task-tmp`:
+
+- `r55-cli-build-29c29092/provenance.json`, SHA
+  `c949c0282da7efbca7ec35b6cab9cc68b0643ba0442a484e5d77383f64ce94e4`.
+  Main/harness SHA
+  `42c2c210a886c9fcbf7a2b534fe8ae7fa58efe69cbd8a57d8c1f6ca38a6093af` /
+  `326385ca1aa750aad8424ef070e1c22e85b778df952ece775068490e8cd5e424`.
+- `r55-pending-all-cold-scoped-29c29092/release-audit-safe.json`, SHA
+  `8fa3aa1fedccfcb8b9787c5b0207e05ba323932f8232811127dd2a25895c5cf7`.
+  Reviewed reader `r55-release-audit-safe-reader.py`, SHA
+  `bc72eac3a3d322084631c350055f20c3c74741c5c1e030f54bbe4957795ebc5c`.
+- `r55-release-audit-synthetic-result.json`, SHA
+  `f4765bc859664efaa43ff131543e51d064bf86449eb2907b9baf77a25b5ec68b`.
+
+**Qualification:** M1 is still blocked at original-owner terminal-release
+confirmation. R56 will split the largest measured branch before any sixth
+behavior proposal; no audit/transaction reuse or redesign is authorized by
+these timings. Actual ordinary CLI, remaining packaged gates, M2 and local/
+external M3 remain open. Remedy/source hours and total milestone effort remain
+unknown; observed build/failed-attempt ranges below remain attempt costs only.
 
 ### Completed R54 release-fold validation pass
 
@@ -2138,8 +2234,8 @@ snapshot return and leased comparison remain mandatory.
 
 Remaining release work, in dependency order:
 
-1. Use [completed R54](#completed-r54-release-fold-validation-pass)
-   and the diagnostic-only R55 attribution, keeping every quiet inner cause
+1. Use [completed R55](#completed-r55-release-bound-audit-attribution)
+   and the diagnostic-only R56 attribution, keeping every quiet inner cause
    separate from scoped evidence.
    Public Create and exact replay complete. Cold Install now reaches accepted
    finalization, runtime retirement and terminal persistence; exact retention
@@ -2149,11 +2245,13 @@ Remaining release work, in dependency order:
    Registration/release validation reuse has lower recorded same-composition fold
    medians, without controlled or sufficient recovery benefit. R53/R54 isolate
    expensive signed-ledger validation/capacity and later host acquisition;
-   worker snapshots are small in those samples. The host holder and internal
-   preflight contention/body cost remain unknown. Independent fresh physical-prefix audits
+   worker snapshots are small in those samples. R55 binds two expensive audit
+   bodies to the failing release, with negligible guard/read acquisition and
+   registration/Ordered folds dominant. The host holder and isolated
+   cryptography/encoding/removable share remain unknown. Independent fresh physical-prefix audits
    remain mandatory; host/proposal guards alone do not prevent raw Raft progress.
-   R54's explicitly authorized fifth pass still fails. R55 adds exact release
-   audit binding and branch/acquisition clocks only; no sixth behavior candidate,
+   R54's explicitly authorized fifth pass still fails. R55 locates body cost;
+   R56 splits existing registration operations only; no sixth behavior candidate,
    material redesign or week-cap extension follows.
    Source review rules out a missing caller retry: existing same-held recovery
    already retries Unavailable within the original scheduling window. Preserve
@@ -2165,8 +2263,8 @@ Remaining release work, in dependency order:
    prove exact-request causality or a promised fix. A pass still requires
    cold recovery, routes, fresh Query and whole30;
    build/unit/component passes do not close this gate. Any resumed source change
-   must rebuild portable main/harness with exact provenance. R54 inputs remain
-   bound to clean `63b8203e`; later documentation is not execution evidence.
+   must rebuild portable main/harness with exact provenance. R55 inputs remain
+   bound to clean `29c29092`; later documentation is not execution evidence.
 2. Qualify Local callback recovery under unchanged whole30 and current ordinary
    three-process CLI/HTTP. The genuine child test proves admission, three
    refusals and original retry/release, then exceeds whole30 at a second

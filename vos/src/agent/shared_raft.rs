@@ -8851,7 +8851,15 @@ mod application_ledger_v2 {
                         manifest
                             .apply_management_registration(registration, record.index, record.term)
                             .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
-                        if manifest.commitment() != *root {
+                        let causal_commitment_started = super::super::shared_recovery::registration_fold_cost_started();
+                        let commitment_matches = manifest.commitment() == *root;
+                        super::super::shared_recovery::trace_registration_fold_cost(
+                            registration,
+                            "physical_manifest_commitment",
+                            causal_commitment_started,
+                            commitment_matches,
+                        );
+                        if !commitment_matches {
                             return Err(AgentRaftApplicationErrorV2::CorruptLedger);
                         }
                     }
