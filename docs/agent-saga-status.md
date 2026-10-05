@@ -37,24 +37,108 @@ deployment is automatic.
 
 ## Current position
 
-The user has authorized one further bounded **R49 investigation of remaining
-leader-admission costs** after the R48 handoff. Start from clean `19ede582`;
-the lease restoration and all exact-retry/freshness checks remain. Temporary
-payload-free diagnostics split signed request verification, fresh request
-preflight, request succession, headroom/budget, absence audit/evidence and
-terminal preview. They export only fixed phase names, durations, bounded counts
-and phase-success booleans under the existing diagnostic flag. No audit, check,
-guard, deadline, artifact or protocol is changed. Preview booleans do not export
-a full guest outcome; budget success includes Ok(None), and success-only phases
-may be absent on early errors. Missing markers remain unknown.
-No cross-request/node association or performance benefit is inferred.
-Freeze the diagnostic source, build portable main/harness with exact provenance,
-then run one isolated quiet all-cold gate and, if needed, one scoped run.
-Existing owned cleanup and finite evidence admission remain. This authorization
-is for investigation, not an automatic fourth tuning change or week-cap extension.
-Implementation timing is uncertain until the source review closes; portable
-build/run attempt costs remain the measured 20–26 minutes for that sequence.
-Qualification and the packaged M1 exit remain open.
+### Completed R49 bounded admission-cost investigation
+
+The user-authorized investigation is **complete, without a recovery pass or
+performance benefit**. Frozen clean source is
+`40a7e553396e68f6e3eebbea0ed3dc9e2afe0fa2`, including the `64c7f528` ownership
+repair. Independently reviewed temporary diagnostics export only fixed phases,
+durations, bounded counts and source-success booleans. No validation, audit,
+guard, deadline, artifact, guest or protocol was changed. This is investigation,
+not a fourth tuning candidate or an engineering-week cap extension.
+
+Portable main/harness **pass 448.359s / 510.131s**; strict six-file verification
+**passes 0.101s**. Empty RUSTFLAGS, unset overrides, exact frozen clean source,
+binaries/artifact inputs and exhausted owned groups are checked. Guest bytes
+and pins are unchanged. Provenance:
+`task-tmp/r49-cli-build-40a7e553/provenance.json`, SHA-256
+`fb49f727f640cdb72b6d9a0e686f50273f99649f2cc21eabea1f08bc364be083`.
+
+Quiet selector **fails 340.264s**, one executed test, at Shared recovery before
+routes with Unavailable (`clean_startup_tests.rs:1981`). Its finite projection
+does not establish the inner cause or receipt-cut occurrence. Safe artifact:
+`task-tmp/r49-pending-all-cold-40a7e553/quiet-safe-summary.json`, SHA-256
+`900b73eadef1f8a263a15220d77d1543fa2a4f0666efced59469c5c555798c73`.
+The 5.67-minute attempt exceeds the preceding 3–5-minute failed-run band;
+variance was reported before the scoped run, without changing any deadline.
+
+Scoped selector **fails 135.554s**, one executed test, during **ordinary packaged
+Shared Create before the pending Install receipt cut**. The affirmative public
+phase label and assertion at `member_handoff_tests.rs:492` establish exhaustion
+of the existing retry bound in its retryable transport/status branch. Private
+error detail and exact HTTP status remain unclassified. Missing cold frames did
+not establish this stage; the source-bound label did. This run cannot attribute
+or qualify the quiet recovery failure. Separately, the fixed observation guard
+records one deadline refusal at **2.068986s** against unchanged **1.8s**, without
+exact-request association or a quiet-run cause. Finalization markers record
+extension refusals, extension completion and Invoke Unavailable; no full guest
+outcome or saved-result marker is admitted.
+
+The reviewed finite cost reader admits **1,041 records / 14 phase groups / zero
+unknown**. The original reader refused three rows because an existing
+`durable_terminal_verification` tracing span added two prefix fields. V2
+normalizes only that exact source-declared bounded prefix; all other extra
+fields, malformed scalars or unknown phases still refuse. Original readers,
+refusal/schema explanations and private inputs remain preserved. Original
+source/provenance/artifact/binary/test/owned-process and before/after input
+fences remain. No raw memory or private diagnostic inputs were exported; both
+loopback executions passed normal automatic approval.
+
+Selected completed-call measurements from scoped preparation:
+
+| Phase | Calls | Per-call elapsed range |
+| --- | ---: | ---: |
+| Signed request verification | 3 | 2.430–16.815ms |
+| Request succession | 12 | 2.299–27.819ms |
+| Fresh request preflight | 12 | 17.741–448.095ms |
+| Fresh absence ledger audit | 7 | 64.172–792.327ms |
+| Retention budget | 6 | 59.418–351.570ms |
+| Custody budget | 4 | 143.619–1,028.118ms |
+| Singleton budget | 3 | 142.816–947.506ms |
+| Manifest evidence verification | 965 | 8.333–192.864ms |
+| Clock preview | 6 | 302.640–738.536ms |
+| Preparation preview | 3 | 475.641–779.760ms |
+
+These are call durations, not cumulative phase clocks. Calls nest, repeat and
+interleave across owners; their totals are not CPU time, one request's latency
+or whole recovery. No exact request/node correlation is available. All observed
+success fields are true, but budgets include Ok(None), previews report the
+original terminal predicate, and early errors can omit records. Missing markers
+remain unknown. Diagnostic timing supplies no quiet/default performance,
+cold guest-outcome, whole30, SLA or M1 claim.
+
+The manifest timer measures physical/cross-store observation and positioned
+result evidence, not initial decoding/signature validation, guest execution or
+the full ledger fold (`shared_journal_driver.rs:5356–5445`). One item means one
+management slot, which can contain eight members and evolving evidence. Equal
+counts do not permit reuse across guard release, progress, checkpoint or reopen.
+
+Evidence under `task-tmp/r49-pending-all-cold-scoped-40a7e553`:
+
+- `management-admission-cost-v2-safe.json`, SHA-256
+  `7ae634ad1663ef02edf658d576264438f72d0376cbbd9aef70493aea4f56c37a`;
+  reader `task-tmp/r49-management-admission-cost-reader-v2.py`, SHA-256
+  `3c7bc79ac9f43601a672f8fb46d74dcb1b81d5c8175b974246ac3cc5e3103671`.
+- `all-cold-public-retry-stage-safe.json`, SHA-256
+  `f9e1e83d214482457911b98d503b4de6d4300e4d5c6dc71445c8073d30e03a9c`;
+  reader `task-tmp/r49-all-cold-public-retry-stage-reader.py`, SHA-256
+  `29de7bc69b5d729359727bec5b18c83c0c2d6aa5bb272aa6008e0cf89bf8a750`.
+- `management-finalization-fixed-order-safe.json`, SHA-256
+  `00301ef13a4acebec93b0ef29c7506785069d2b4f6a7fcabdf4965f2c8bb585d`;
+  `observation-guard-fixed-order-safe.json`, SHA-256
+  `a8b05abab36bd535598f80c33cd680e300cb577c064e975bb44f9df46f58819e`.
+
+Source review permits one narrowly dominated immutable validation removal in
+`SharedRecoveryManifest::apply_management_registration`: the unchanged clone
+immediately repeats the outer call's exact request/old-slot validation. Its own
+cost is **not separately measured**; it does not directly target the 965 measured
+manifest-evidence calls or replace any fresh audit, incoming signature, final
+candidate validation, owner/family restriction or terminal preview. Independent
+interpretation is **no-go for treating this micro-change as the demonstrated
+recovery fix**. No safe correction to the blocking deadline is established.
+Another tuning candidate requires explicit go/no-go direction; the cap is not
+renewed. Temporary diagnostics remain available for unresolved attribution and
+must be removed when it no longer needs them.
 
 The preceding user-authorized bounded R48 candidate is **measured and failed** on clean
 source `89b40ba6e34b87d94a323b3fe54a08fea614afa5`. This is the **third measured
@@ -75,9 +159,9 @@ identity, not combined custody timing. Core provenance:
 `fd4b570054410d6139cb7cfb466ffb133f448d5639190ebbba65402c5ae8121f`;
 `task-tmp/r48-lease-units-64c7f528/safe-summary.json`, SHA-256
 `c3aecf87da381a86dc61a13df88298f1a2e7dc82e68269c998eff998df186a2d`.
-Measured R48 portable binaries precede the repair; current portable/recovery
-qualification is open. This is a correctness preservation repair, not another
-service-tuning candidate.
+Measured R48 portable binaries precede the repair. R49's portable binaries
+include it, but recovery qualification still fails. This is a correctness
+preservation repair, not another service-tuning candidate.
 
 R48 reads the completed R47 logs without rerunning a fixture. Its independently
 reviewed finite reader reports **689 events / eight temporal intervals / zero
@@ -165,8 +249,10 @@ or reset deadline would not close this gate.
 **Implementation:** replacement/removal and reviewed preservation repair exist;
 remaining integrated recovery defects are unresolved. No defensible remaining
 source-hour range is established. **Integration:** measured portable build
-attempts take **14–16 minutes** and failed all-cold runs **3–5 minutes**, high
-confidence as attempt costs only. **Qualification:** M1 is still open; remaining
+attempts take **14–16 minutes**; R49's failed quiet/scoped selector attempts take
+**2.3–5.7 minutes**, high confidence as attempt costs only. The scoped attempt
+fails before the cut, so this is not a cold-recovery effort range.
+**Qualification:** M1 is still open; remaining
 packaged gates, M2 and local M3 have no defensible aggregate effort range.
 External hardware qualification remains open. No completion percentage, date,
 performance credit or cap rollover follows these internal passes.
@@ -1346,24 +1432,26 @@ snapshot return and leased comparison remain mandatory.
 
 Remaining release work, in dependency order:
 
-1. Complete the newly authorized bounded R49 leader-admission cost investigation:
-   freeze reviewed diagnostic-only source, rebuild portable main/harness and
-   run isolated quiet/scoped all-cold evidence with original fences. The lease
-   restoration passes core/ownership checks; its portable integration is open.
-   R48's third measured candidate failed quiet/scoped recovery. R49 does not
-   authorize a fourth tuning change or an automatic week-cap extension.
+1. Obtain explicit go/no-go direction before another tuning candidate. The
+   bounded R49 cost investigation is complete on frozen `40a7e553`; portable
+   binaries include the ownership repair, but the quiet selector fails Shared
+   startup recovery and the scoped run fails public Create before the cut.
+   The eligible immutable duplicate-validation helper is unmeasured and does
+   not directly target repeated physical manifest-evidence verification.
+   No demonstrated recovery correction or performance benefit is established.
+   R49 does not authorize a fourth tuning change or automatic week-cap extension.
    Source review rules out a missing caller retry: existing same-held recovery
    already retries Unavailable within the original scheduling window. Preserve
    exact retained continuation, fresh absence/settled-prefix, physical
    availability/corruption, worker/post-peer checks and original deadlines.
-   Attribute fresh-prefix audits, evidence verification, immutable validation
-   and preview separately. Phase success for budgets includes Ok(None), and
+   Preserve separate attribution of fresh-prefix audits, evidence verification,
+   immutable validation and preview. Phase success for budgets includes Ok(None), and
    missing success-only markers are unknown. The temporal timeline does not
    prove exact-request causality or a promised fix. A pass still requires
    cold recovery, routes, fresh Query and whole30;
-   build/unit/component passes do not close this gate. Any resumed integration
-   must rebuild portable main/harness from the repaired source with exact
-   provenance; the measured 89b40ba6 binaries precede the lease restoration.
+   build/unit/component passes do not close this gate. Any resumed source change
+   must rebuild portable main/harness with exact provenance. Measured R49 inputs
+   remain bound to clean `40a7e553`; later documentation is not execution evidence.
 2. Qualify Local callback recovery under unchanged whole30 and current ordinary
    three-process CLI/HTTP. The genuine child test proves admission, three
    refusals and original retry/release, then exceeds whole30 at a second

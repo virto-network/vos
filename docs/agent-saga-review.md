@@ -102,24 +102,36 @@ Current O3 component evidence (logs under the native worktree's `target`):
 
 ### Current integration delta and blocking result
 
-The user has authorized one further bounded **R49 investigation of remaining
-leader-admission costs** after the R48 handoff. Start from clean `19ede582`;
-the lease restoration and all exact-retry/freshness checks remain. Temporary
-payload-free diagnostics split signed request verification, fresh request
-preflight, request succession, headroom/budget, absence audit/evidence and
-terminal preview. They export only fixed phase names, durations, bounded counts
-and phase-success booleans under the existing diagnostic flag. No audit, check,
-guard, deadline, artifact or protocol is changed. Preview booleans do not export
-a full guest outcome; budget success includes Ok(None), and success-only phases
-may be absent on early errors. Missing markers remain unknown.
-No cross-request/node association or performance benefit is inferred.
-Freeze the diagnostic source, build portable main/harness with exact provenance,
-then run one isolated quiet all-cold gate and, if needed, one scoped run.
-Existing owned cleanup and finite evidence admission remain. This authorization
-is for investigation, not an automatic fourth tuning change or week-cap extension.
-Implementation timing is uncertain until the source review closes; portable
-build/run attempt costs remain the measured 20–26 minutes for that sequence.
-Qualification and the packaged M1 exit remain open.
+The user-authorized **R49 bounded admission-cost investigation is complete,
+without a recovery pass or performance benefit**. Frozen clean source is
+`40a7e553396e68f6e3eebbea0ed3dc9e2afe0fa2`, including the ownership repair.
+Portable main/harness pass **448.359s / 510.131s** and strict six-file verification
+passes **0.101s**, with unchanged guest bytes/pins and original provenance fences.
+Quiet selector fails **340.264s** at Shared recovery before routes, inner cause
+and receipt-cut occurrence unestablished. Scoped selector fails **135.554s**:
+affirmative source-bound evidence locates ordinary packaged Shared Create's
+retryable transport deadline assertion **before the pending Install cut**.
+It cannot qualify or explain the quiet recovery failure.
+
+The reviewed finite cost reader admits **1,041 records / 14 phase groups / zero
+unknown**, normalizing only three exact existing tracing-span prefixes. Original
+refusal evidence remains preserved. Fresh audits, budgets and previews take
+hundreds of milliseconds; manifest evidence verification occurs 965 times at
+8.333–192.864ms. This timer checks physical and positioned-result evidence;
+initial decoding/signature checks, guest execution and the full ledger fold
+are separate. Interleaved/nested totals are not CPU time or request latency.
+Source-success booleans, absent early-error markers and diagnostic timing do
+not establish a cold guest outcome, performance benefit, whole30 or M1 exit.
+
+The separately reviewed immutable duplicate-validation helper is source-eligible
+but unmeasured and does not directly target those manifest-evidence calls. It is
+**no-go as a demonstrated recovery fix**. No fourth tuning candidate or week-cap
+extension is authorized. Review exact costs, reader/input hashes, caveats and
+next dependencies in the
+[live R49 evidence](agent-saga-status.md#completed-r49-bounded-admission-cost-investigation).
+All checks, owner/family restrictions, freshness and deadlines remain mandatory.
+No raw memory/private diagnostic inputs were exported; both loopback executions
+passed normal automatic approval. Earlier rejected work remains untouched.
 
 The preceding user-authorized bounded R48 candidate is **measured and failed** on clean
 source `89b40ba6e34b87d94a323b3fe54a08fea614afa5`. This is the **third measured
@@ -140,9 +152,9 @@ identity, not combined custody timing. Core provenance:
 `fd4b570054410d6139cb7cfb466ffb133f448d5639190ebbba65402c5ae8121f`;
 `task-tmp/r48-lease-units-64c7f528/safe-summary.json`, SHA-256
 `c3aecf87da381a86dc61a13df88298f1a2e7dc82e68269c998eff998df186a2d`.
-Measured R48 portable binaries precede the repair; current portable/recovery
-qualification is open. This is a correctness preservation repair, not another
-service-tuning candidate.
+Measured R48 portable binaries precede the repair. R49's portable binaries
+include it, but recovery qualification still fails. This is a correctness
+preservation repair, not another service-tuning candidate.
 
 R48 reads the completed R47 logs without rerunning a fixture. Its independently
 reviewed finite reader reports **689 events / eight temporal intervals / zero
@@ -230,8 +242,10 @@ or reset deadline would not close this gate.
 **Implementation:** replacement/removal and reviewed preservation repair exist;
 remaining integrated recovery defects are unresolved. No defensible remaining
 source-hour range is established. **Integration:** measured portable build
-attempts take **14–16 minutes** and failed all-cold runs **3–5 minutes**, high
-confidence as attempt costs only. **Qualification:** M1 is still open; remaining
+attempts take **14–16 minutes**; R49's failed quiet/scoped selector attempts take
+**2.3–5.7 minutes**, high confidence as attempt costs only. The scoped attempt
+fails before the cut, so this is not a cold-recovery effort range.
+**Qualification:** M1 is still open; remaining
 packaged gates, M2 and local M3 have no defensible aggregate effort range.
 External hardware qualification remains open. No completion percentage, date,
 performance credit or cap rollover follows these internal passes.
