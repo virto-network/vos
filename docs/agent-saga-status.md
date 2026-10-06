@@ -164,8 +164,9 @@ its preservation/qualification gates. This authorizes the one bounded release-on
 coordination change and continued integration, with all original limits and the
 engineering-week cap unchanged. The lower-priority tiny verification patch is
 not included. Root applied the exact reviewed v4 patch after checking clean
-`e30e7b03` and unchanged product source. Source is applied, **not yet built,
-tested or measured**. Root and independent reviews pass on the new combined-entry
+`e30e7b03` and unchanged product source. Production source is implemented;
+corrected regression execution and packaged measurement remain open. Root and
+independent reviews pass on the new combined-entry
 preservation cases and two real-worker component regressions. The latter use
 three actual workers/storage and real quorum replies under existing limits;
 later follower samples exercise the generic barrier, while the separate leader
@@ -175,9 +176,21 @@ build. The first frozen source `b3caa646` core build failed **31.932s** with six
 type errors from one test-fixture voter collection (service node IDs versus SDK
 worker IDs); its owned group was exhausted and noninterrupted. The correction
 converts those same 32 bytes to the worker's SDK node type in one test-only line.
-No production call, identity, limit or deadline changed; tests have not run yet.
-Preserve that failed evidence as `r57-core-build-b3caa646` and rebuild a corrected
-clean source. The source-specific reader passes **51 acceptance / 96 refusal** synthetic
+No production call, identity, limit or deadline changed. The corrected clean
+`1c5279d4` debug core build passes **76.189s**, exhausted and noninterrupted.
+Its preservation runner passes the first **13 exact units**; unit 14 fails
+**0.201s** while applying committee Prepare in an ineligible retained-management
+fixture, before reaching the combined API. Units 15–19 were not run.
+The production transition guard correctly refuses **any canonical recovery
+manifest**, including an exactly released retained manifest. A reviewed test-only
+correction explicitly checks both no-write refusals and uses a separate legal
+ledger with identical signed scope to exercise prepare/joint/steady barriers.
+The latter proves barrier ordering before absent-slot lookup, not supported
+retained Shared committee migration. No production rule or bound changes.
+Freeze and rebuild this corrected fixture, then rerun all nineteen exact units.
+Preserve `r57-core-build-b3caa646`, `r57-core-build-1c5279d4` and
+`r57-preservation-19-1c5279d4` as distinct source-bound evidence.
+The source-specific reader passes **51 acceptance / 96 refusal** synthetic
 cases and privacy/alias checks, with zero helper loads/private input reads. No
 recovery or performance benefit is credited.
 
@@ -238,8 +251,9 @@ Carry this approved bounded change through these gates:
    source/artifact boundary, then M2 and locally possible M3. A passing unit,
    audit count or leader custody result does not close M1.
 
-Implementation/regression effort remains uncertain until the proposed entry is
-compiled and exercised; there is no aggregate milestone ETA. Observed build/run
+Implementation/regression effort remains uncertain until the corrected fixture
+and real-worker cases execute; there is no aggregate milestone ETA. Observed
+build/run
 durations are attempt costs only. This internal coordination change is now
 authorized under all original limits; no deployment,
 master/reviewer promotion, new authority or automatic further candidate follows.

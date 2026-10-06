@@ -15,13 +15,21 @@ R57's concrete combined release-admission patch was explicitly approved on
 2026-10-06: "approved, just keep going". Root applied reviewed v4 after verifying
 clean `e30e7b03` and unchanged product source. Combined-entry preservation tests
 and two real-worker component regressions are implemented and independently
-reviewed; nineteen exact units await the owned core build.
+reviewed; nineteen exact units form the owned preservation gate.
 Initial frozen `b3caa646` core compilation failed in a test-only service/SDK
-node-type conversion; its one-line byte-preserving correction awaits rebuilding.
-No production behavior, bounds or deadline changed. The finite reader
+node-type conversion. Its byte-preserving correction at clean `1c5279d4`
+builds in **76.189s**; the first thirteen units pass, then unit 14 fails
+**0.201s** on an illegal committee-transition fixture before the combined API.
+Units 15–19 were not run. A reviewed test-only correction preserves Prepare's
+no-write refusal for both live and released retained manifests, then uses a
+separate legal ledger to test signed transition-barrier ordering. It does not
+qualify retained Shared committee migration. The corrected fixture awaits a
+fresh build and all nineteen units. No production behavior, bounds or deadline
+changed. The finite reader
 passes 51 acceptance/96 refusal synthetic cases with privacy and original fences
 preserved. Component worker cases do not qualify host/custody/public recovery;
-there is no build, recovery or performance credit yet. The one release-only
+the prior debug build is component evidence only, with no recovery or performance
+credit yet. The one release-only
 coordination change is authorized under the
 original limits; further candidates, redesign or a week-cap extension are not.
 
@@ -60,8 +68,8 @@ live plan owns exact evidence, forecasts and all remaining release gates.
 The concrete source-only proposal is
 `target/task-tmp/r56-signed-release-capacity-proposal-v4.patch`, SHA
 `dee945322575f55bb23097db0ecbd55a774f1ff259fb4230d76ee0bb6f18af90`.
-Root and independent source/tool reviews pass; it is applied, uncompiled,
-untested and unmeasured. Read the live plan's
+Root and independent source/tool reviews pass; it is applied and debug-compiled,
+with corrected regressions and packaged measurement still open. Read the live plan's
 [approved change and mandatory regressions](agent-saga-status.md#r57-approved-combined-release-admission--implementation-in-progress).
 Generic capacity counters keep their meaning: proposed
 release delta zero, actual management-preflight delta one; registration keeps

@@ -11425,6 +11425,55 @@ mod application_ledger_v2 {
                 1,
                 10,
             );
+            // A canonical management manifest prevents committee preparation,
+            // including after its exact signed release. Preserve that apply
+            // restriction rather than using a retained-scope transition fixture.
+            let blocked_prepare = append_management(
+                &ledger,
+                AgentRaftCommand::PrepareCommitteeChange(change.clone()),
+            );
+            let before = durable_rows(&ledger);
+            assert!(matches!(
+                ledger.apply_foundation_slot(&blocked_prepare),
+                Err(AgentRaftApplicationErrorV2::TransitionBarrier)
+            ));
+            assert_eq!(durable_rows(&ledger), before);
+            let (_retained_directory, retained, retained_template) =
+                fixture("management_release_combined_committee_retained");
+            let (_, retained_release) =
+                acknowledged_release_fixture(&retained, &retained_template);
+            assert_eq!(retained_release, release);
+            let release_slot = append_management(
+                &retained,
+                AgentRaftCommand::ReleaseManagementRecovery {
+                    route: route(&retained_template),
+                    release: retained_release,
+                },
+            );
+            retained.apply_foundation_slot(&release_slot).unwrap();
+            assert!(retained.recovery_manifest().unwrap()
+                .management_slot(retained_template.owner()).unwrap().is_released());
+            assert_combined_release_capacity_readonly(&retained, &release);
+            let blocked_prepare = append_management(
+                &retained,
+                AgentRaftCommand::PrepareCommitteeChange(change.clone()),
+            );
+            let before = durable_rows(&retained);
+            assert!(matches!(
+                retained.apply_foundation_slot(&blocked_prepare),
+                Err(AgentRaftApplicationErrorV2::TransitionBarrier)
+            ));
+            assert_eq!(durable_rows(&retained), before);
+
+            // A separate ordinary ledger with the identical signed scope and
+            // authority may transition. The release still verifies first;
+            // each committee barrier must refuse it before looking up its slot.
+            let (_transition_directory, ledger, transition_template) =
+                fixture("management_release_combined_committee_transition");
+            assert_eq!(transition_template.generation(), template.generation());
+            assert_eq!(ledger.initial_committee, initial);
+            assert!(ledger.recovery_manifest_if_present().unwrap().is_none());
+            release.verify(template.generation(), &initial).unwrap();
             let prepare = append_management(
                 &ledger,
                 AgentRaftCommand::PrepareCommitteeChange(change.clone()),
