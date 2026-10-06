@@ -37,14 +37,15 @@ deployment is automatic.
 
 ## Current position
 
-Latest completed evidence is bound to clean
-`4b5e3b8e2d818e3f8230ede6757ba490791e5a52`.
-[Completed R57](#completed-r57-combined-release-admission)
-proves the integrated combined release path and late exact original-owner
-confirmation. The unchanged whole30 recovery assertion and actual ordinary CLI
-acceptance still fail. R56's owner timeout below is a frozen earlier result,
-not the current release-confirmation boundary. R58 diagnostic source is applied
-and awaits its own freeze/build/evidence. M1 remains open.
+Latest admitted evidence is bound to clean
+`7870d4982d8a38fb978250a5d06f4b6c785b7461`.
+[Completed R58](#completed-r58-custody-and-startup-attribution)
+preserves late exact original-owner release and establishes an earlier blocker:
+one constructor records **70.734s** before all three startup constructors are
+joined and the public Install retry begins. The unchanged whole30 assertion
+fails. R57 remains the latest ordinary CLI attempt: Local Create/Install
+complete, then Query authorization preparation fails HTTP 503 before Invoke.
+R56/R57 are frozen preceding boundaries; M1 remains open.
 
 ### Completed R56 registration-fold attribution
 
@@ -296,29 +297,118 @@ Remaining source effort and aggregate integration/qualification effort are
 unknown; recorded attempt costs are not an ETA. No deployment, master/reviewer
 promotion, new authority or automatic further candidate follows.
 
-### R58 request-bound custody and applier diagnostics — source applied
+### Completed R58 custody and startup attribution
 
-Continue causal attribution after the current R57 result. Root applied the
-reviewed target-only `r57b-custody-cost-proposal-v2.patch`, SHA
-`049feb26de886d4cf81bd2814bedb137923ad3d4506581c0a1074c2b6cbedb45`,
-against frozen `4b5e3b8e`. **Implementation:** two network source files add three
-std/env-gated exact invocation/work/authorization spans around existing custody
-budget, singleton budget and preparation calls; one existing worker snapshot
-duration; and applier host-wait/drain/attachment/host-work scalar brackets.
-Independent source-preservation reviews pass. Original calls, checks, Result
-propagation, lock acquisition, poison/retirement paths and guard/drop order stay
-intact. No added read, cache, holder token, address or guest behavior; bundle pins
-and limits/deadlines remain unchanged.
+**Implementation:** diagnostic-only source is frozen at
+`7870d4982d8a38fb978250a5d06f4b6c785b7461`. Independent reviews preserve original
+calls, checks, errors, guards/drop order, guest bytes, pins and limits/deadlines.
+Three exact-work budget/preparation spans, the existing worker snapshot and
+applier scalar brackets add no reads, cache, authority or behavior candidate.
 
-The source-specific finite normalization review is pending. Repeated identities
-are not attempt IDs; a span does not identify the historical audit row being
-folded. Applier host-work ends before final diagnostic emission/unlock and is
-not exact guard duration. Nested brackets and overlapping host waits must not
-be added or assigned to a named holder. Missing poison/early-error samples remain
-unknown. **Integration:** the owned portable build has not started; no new run
-result. **Qualification:** none is credited. This is diagnostic only, not another
-behavior candidate, redesign or cap extension. Use the results to choose the
-next demonstrated cause, preserving the remaining M1 gates and M2/M3 envelope.
+**Integration:** portable main/harness pass **419.537s / 462.088s** and strict
+unchanged six-file verification **0.101s**, with clean before/after source,
+empty release RUSTFLAGS and exhausted noninterrupted owned groups. One isolated
+scoped all-cold attempt fails **267.691s**. The original reader refuses two
+existing release-scoped admission scalars and writes no SAFE report. Reviewed v2
+admits only the source's successful driver `manifest_evidence` inside exact
+signed-release validation; original fences stay intact. Its pure synthetics pass
+**115 acceptance / 187 refusal**, privacy/aliases, zero helper/private-input loads.
+
+The same completed immutable input is then reread through reviewed startup v4,
+without another build or fixture run. It admits **18,498 records / 578 explicit
+edges / zero unknowns**, adding 119 closed scalar records to v2's 18,379. Every
+original record, identity, thread alias and edge is preserved except event-index
+shifts. V4 pure synthetics pass **145 acceptance / 269 refusal** and privacy.
+
+**New blocking boundary:** one recorded lifecycle constructor reaches cumulative
+**70.734s before return**. The fixture starts recovery before spawning three
+locked constructors, joins all three, then passes that unchanged start to
+`member_cold_install::finish`. Its line 277 assertion precedes the public retry
+and fails the unchanged **30s** bound. Thus this helper already exceeds the bound
+before its public retry; this is not an actor Query failure. Source anchors are
+`clean_startup_tests.rs:1935`/constructor join and `member_cold_install_tests.rs:277`.
+
+| Post-cold cumulative phase (ms; three samples per phase, unpaired) | Recorded values |
+| --- | --- |
+| Lifecycle constructor: shared lifecycle recovery | 22,279 / 26,101 / 70,733 |
+| Lifecycle constructor: controller completion | 22,280 / 26,102 / 70,734 |
+| Lifecycle constructor: System owner complete | 15,768 / 16,513 / 19,637 |
+| Separate owner entry clock: open Shared host | 9,448 / 10,022 / 10,236 |
+| Separate owner entry clock: drain entries | 11,470 / 12,246 / 12,595 |
+
+The nine lifecycle phase points use each function instance's own clock after preflight
+(`clean_startup.rs:1218`). Owner recovery and attached-bootstrap clocks start
+separately (`clean_bootstrap.rs:2451`/`:2813`). No record declares node/thread/call
+identity: do not pair these lists, subtract phases or treat cumulative points as
+isolated work. The last lifecycle stages include synchronous Shared runtime-admission
+recovery, endorsement callback installation, operations and admins; the sample
+does not isolate those components or measure endorsement execution.
+
+Exact Install root `id171` retains invocation/work/authorization `id170/id172/id173`
+and root member `id179`. Final child `id192/id193/id194`, registration `id195`
+sequence 5/member `id197`, preserves original authorization after fresh candidate
+refusals. **V2 indexes:** issuer save e17113 proves accepted exact Done/Bool(true)
+and durable replay equality; both member ACK availability completes e17400/e17630,
+retirement e17633, terminal persistence e17637 and owner release e18080 complete.
+Release `id204`, scope `id203`, is confirmed by owner `id5` at **4.591318s**;
+leader `id6` completes earlier at **4.500218s**. Host waits **2.968715s / 2.907577s**
+have unknown holders/overlap. Presence-before-expiry remains unchanged, without
+timely 1.8s confirmation credit. V4 shifts cold entry e12999→e13067, first final
+child e15777→e15894 and release completion e18080→e18197; never mix report indexes.
+
+The final child's explicitly scoped custody/singleton absence audits take
+**1.117393s / 1.205947s**; budget samples **1.473447s / 1.486434s** and preview
+**600.041ms** are nested costs, not additive totals or unique attempts. Worker
+snapshot samples are tens of microseconds. Its exact release records one audit
+**1.007761s**, 49 rows/5 registrations/1 historical release/14 Ordered, and commit
+start **1.251922s**. Rows are generation history, not one family or accounts.
+
+There are **18 System applier samples per phase after cold entry**, versus 183
+mixed-agent samples across the whole run. System drain median/max are
+**942.621ms / 2.958973s**; host-work median/max **961.283ms / 2.978737s**;
+attachment **12.435–20.853ms**. These prove expensive applier work exists, not
+which work held a particular wait. Drain aggregates repeated `apply_next` and
+waiter collection. Brackets overlap; host-work ends before final trace/unlock.
+Independent absence snapshots and pre/post-apply progress/corruption checks retain
+different obligations; no audit suppression or cross-guard loan is justified.
+
+**Qualification:** whole30, client Applied, routes and fresh Query remain open.
+R57b and R58 both confirm late release but differ in schedule/history; no controlled
+speedup or general guest-stack verdict follows. Small release-audit savings alone
+cannot close the observed constructor overrun. Latest ordinary CLI remains R57's
+Local Create/Install success then Query authorization-preparation HTTP 503 before
+Invoke; no R58 ordinary CLI run occurred. Next attribution concerns constructor
+recovery, explicitly bound owner authorization/observations and slow drain internals.
+Unlinked projection deadline refusals do not establish Install-root causality.
+No further behavior candidate, redesign, cap extension or milestone ETA follows.
+
+Evidence below `target/task-tmp`:
+
+- `r58-cli-build-7870d498/provenance.json`, SHA `deebcfb97205ac77c32c380624fc27aee50e0695275beb928b2e543cdd48bf3a`;
+  main/harness SHA `24b8e063f88e01a997aba014f19b7858a0d6f267eaf0c243fedbec53909dd4fa` / `bfc466fd9c83c91dd65ae81ab4ccfb587d0c34daeafa601b4fad3b2cb9ab4553`.
+- `r58-pending-all-cold-scoped-7870d498/custody-cost-safe-v2.json`, SHA `098f23e1bd4fea89d6407df421f4fe865ed0dfcd91e9f2f516ca58391decc99f`;
+  `startup-cost-safe-v4.json`, SHA `2e40f00e4c033666bbd2f0a836242ca08aabe9f2ff954350985ed95fe402471f`; `safe-summary.json`, SHA `3ea74500ccbd207a7b6904f52ffac26d902d5fc21f1c94170a38880556d09c05`, in the same directory.
+- Reviewed `r58-custody-cost-safe-reader-v2.py` / `r58-startup-cost-safe-reader-v4.py`, SHA `d3373a03142e42db320f61a46b662306f13257947ef813ef63c3c8b3ec76d8de` / `c029a250009b3f814a9284f16bc29860e4a8aa1a97f0e869b3e38bdc0758505b`;
+  pure result SHA `e8f58b539bfbd5ae07f5363bacf2483c883bef95e9995ab518f422bbae587739` / `e0c84ad0e2d9d05091cf39527a8a157df8f8c111cd64c9d079cce5cef8df5ff1`.
+
+### R59 retained Install interval diagnostics — applied
+
+**Implementation:** Root applied the independently reviewed four std/env-gated
+brackets around existing retained-owner lookup, management submission and
+durable/issuer observations. They copy the original invocation, add no hashes or
+reads, and preserve calls, Results, checks and guards/drop order. The source patch
+`task-tmp/r59-install-interval-cost-proposal.patch` has SHA
+`b94698c15ebb195b7ea29ebbde6f4bb7b83825f6681d35f76b667dd264830cee`.
+
+**Integration:** the owned build provenance will record this exact checkpoint.
+New portable main/harness builds, finite reader admission and a fresh fixture
+remain pending. The v5 target-only host/driver startup-marker
+extension is reviewed but unexecuted, not admitted R58 evidence. R59's reader is
+being prepared with a declared original-root bridge, no attempt or authorization
+inference. Completed R58 on `7870d498` remains the latest admitted boundary.
+
+**Qualification:** none follows; this is diagnostic-only, not a behavior candidate,
+new authority, automatic remedy or cap extension. Original deadlines remain.
 
 ### Completed R55 release-bound audit attribution
 
@@ -1899,8 +1989,8 @@ unrelated zero-selection filters are not evidence.
 | --- | --- | --- |
 | Internal Authority observations | O1/O2 and O3 removal are implemented: no read custody/transport/apply/expiry lifecycle. Management retention and public Invoke/ACK remain. | Current physical observation **passes 67.75s**, including exactly one caught-up audit and existing freshness/no-write/cancellation/reopen cases. Optimized management/replay/owner/supervisor/protocol/observation checks **241/241** pass (10 ignored, 7.09s). SDK **259 + 256 passed**, each 1 ignored. Paired signed-role/purity probes **pass 4.64s** with explicit, unmeasured limits. Packaged closure/startup/retry checks **40 passed**, 2 ignored. No released workflow or SLA pass. |
 | External storage/restore | Incremental executor, immutable closure, ACX1 publication and exact marker retirement exist. | Historical optimized reopen/crash-cut slices pass; the released workflow must requalify. |
-| System management recovery | Parent retention, immutable MRQ2 first-owner binding, exact mutation evidence, signed terminal release and recovery remain. R57 derives scalar capacity from one fresh guarded signed-release preflight; final worker barrier and prefix-checked proposal remain. | Latest R57b all-cold run proves the verified pending cut/cold entry, accepted finalization, complete-member ACK, terminal persistence and late exact original-owner release, then fails the unchanged whole30 assertion at `member_cold_install_tests.rs:277`. Routes, client Applied and fresh Query remain unqualified. All nineteen R57 preservation units pass on `4b5e3b8e`, as component evidence only. Earlier isolated offline-pruning **419.04s / finalization 21.588s**, contended 32.979s failure and preparation-only `b20faacd` passes remain frozen. Earlier saved NRT1/forwarded-release timeout and returning startup Unavailable with cut occurrence unestablished are separate frozen boundaries; neither explains the latest whole30 failure or qualifies pending-Install recovery. |
-| Member/public management | Packaged PublicWorkflow selects exact bundled roles and ordinary CLI Create. Ambiguous publication re-admits the original leased stores before exact retry. Finalization retains publication protection and verifies fresh decision state before exact terminal cleanup. Packaged reopen helpers explicitly use normal startup admission. Provision components use the existing boxed decoder without changing wire, validation or limits. | Native genesis **15 passed** and coherent exact-finalization retry **96.21s** remain frozen component evidence under unchanged 30s phases. Source and six-file bundle reproduction pass. Latest R57b public Create reaches Applied/exact replay; cold Install accepts finalization and confirms exact release late but fails whole30 without qualified client Applied/routes/fresh Query. Current ordinary CLI completes normal image Local Create (**33.304s / 2 attempts**) and Install (**70.208s / 8 attempts**), then Query authorization preparation returns HTTP 503/CLI exit 1 before Invoke. Shared/reopen are unreached; cleanup exits 1 despite zero survivors. Earlier Local Install ScopeMismatch and `5750f0c2` Local Query/ACK remain frozen evidence, not current attribution. Lost-result/reopen, pending-Install recovery and complete three-process acceptance remain open. |
+| System management recovery | Parent retention, immutable MRQ2 first-owner binding, exact mutation evidence, signed terminal release and recovery remain. R57 derives scalar capacity from one fresh guarded signed-release preflight; final worker barrier and prefix-checked proposal remain. | Latest R58 all-cold evidence proves accepted finalization, complete-member ACK, terminal persistence and late exact original-owner release. It fails unchanged whole30 at `member_cold_install_tests.rs:277`; one startup constructor records **70.734s** before the joined constructors reach public retry. Routes, client Applied and fresh Query remain unqualified. All nineteen R57 preservation units pass on `4b5e3b8e`, as component evidence only. Earlier isolated offline-pruning **419.04s / finalization 21.588s**, contended 32.979s failure and preparation-only `b20faacd` passes remain frozen. Earlier saved NRT1/forwarded-release timeout and returning startup Unavailable with cut occurrence unestablished are separate frozen boundaries; neither explains the latest whole30 failure or qualifies pending-Install recovery. |
+| Member/public management | Packaged PublicWorkflow selects exact bundled roles and ordinary CLI Create. Ambiguous publication re-admits the original leased stores before exact retry. Finalization retains publication protection and verifies fresh decision state before exact terminal cleanup. Packaged reopen helpers explicitly use normal startup admission. Provision components use the existing boxed decoder without changing wire, validation or limits. | Native genesis **15 passed** and coherent exact-finalization retry **96.21s** remain frozen component evidence under unchanged 30s phases. Source and six-file bundle reproduction pass. Latest R58 public Create reaches Applied/exact replay; cold Install accepts finalization and confirms exact release late, but startup exceeds whole30 before public retry. Client Applied/routes/fresh Query remain unqualified. Latest ordinary CLI is still R57: normal image Local Create (**33.304s / 2 attempts**) and Install (**70.208s / 8 attempts**) complete, then Query authorization preparation returns HTTP 503/CLI exit 1 before Invoke. Shared/reopen are unreached; cleanup exits 1 despite zero survivors. Earlier Local Install ScopeMismatch and `5750f0c2` Local Query/ACK remain frozen evidence, not current attribution. Lost-result/reopen, pending-Install recovery and complete three-process acceptance remain open. |
 | Service/operations | Offline signed corpus generator, bounded public corpus loader and read-only hardware collector exist. Loader resumes exact private ATQ1 through existing CLI/ASR1 verification and independently replays accepted seeds/order for all six maps. | Loader tooling tests **7 passed, 0.10s**; it has not executed public data. M1 setup and pre-granted signed Clerk Operator/Member roles are prerequisites. Public retained loading, resources/recovery, backup/restore, overload, soak and hardware qualification remain open. |
 
 R36y is the frozen, superseded legacy-read diagnostic boundary, not qualification
@@ -2496,26 +2586,23 @@ snapshot return and leased comparison remain mandatory.
 
 Remaining release work, in dependency order:
 
-1. Use [completed R57](#completed-r57-combined-release-admission) and the
-   diagnostic-only R58 continuation, keeping the first quiet/scoped Create
-   failures separate from the later cold Install and actual CLI outcomes.
-   The current combined release path is implemented and component-preserved;
-   its repeated integrated run proves accepted finalization, complete-member ACK,
-   terminal persistence and late exact original-owner release. Whole30 still
-   fails; routes, fresh Query and client Applied remain unqualified. Attribute
-   request-bound budgets/preparation and applier work/host waits next, without
-   inferring holders or pairing repeated identities by proximity. Historical
-   R56's two audits and owner timeout explain the approved coordination change,
-   not the latest remaining assertion. R57 records one release audit, not a
-   controlled performance improvement. Independent fresh physical-prefix audits
-   remain mandatory; host/proposal guards do not prevent raw Raft progress.
-   Existing same-held recovery already retries Unavailable within the original
-   scheduling window. Preserve exact retained continuation, fresh absence/
-   settled-prefix, physical availability/corruption, worker/post-peer checks and
-   original deadlines. Any resumed source change needs fresh portable main/
-   harness provenance and isolated acceptance. R58 diagnostics are not a further
-   behavior candidate or a week-cap extension. Build/unit/component passes and
-   late custody do not close the whole recovery gate.
+1. Use [completed R58](#completed-r58-custody-and-startup-attribution).
+   Its same-input startup projection proves a **70.734s** constructor boundary
+   before the three joined startups reach public retry; whole30 already fails.
+   Attribute constructor recovery, owner authorization observations and slow
+   drain internals before selecting a remedy. Exact Install finalization,
+   complete-member ACK, terminal persistence and late original-owner release
+   are proven, while routes, fresh Query and client Applied remain unqualified.
+   Keep earlier Create failures, R56's owner timeout and R57 ordinary CLI
+   outcomes at their own boundaries. Separate cumulative startup clocks and
+   nested custody/applier costs do not identify holders or removable work;
+   do not pair repeated identities by proximity. Independent fresh physical
+   audits remain mandatory; host/proposal guards do not prevent raw Raft
+   progress. Preserve exact retained continuation, fresh absence/settled-prefix,
+   physical availability/corruption, worker/post-peer checks and original
+   deadlines. Any authorized source remedy requires fresh portable main/harness
+   provenance and isolated acceptance. R58 is diagnostic attribution, not a
+   behavior candidate, week-cap extension or controlled performance improvement.
 2. Qualify Local callback recovery under unchanged whole30 and current ordinary
    three-process CLI/HTTP. Current R57 ordinary CLI completes Local Create and
    Install, then Query authorization preparation returns HTTP 503/CLI exit 1
@@ -2563,25 +2650,27 @@ Separate forecasts and unknowns:
   signed runtime roles, decoder correction, startup snapshot/factory checks and
   approved integrated recovery corrections are implemented. R57's combined
   release entry and all nineteen component preservation cases pass on frozen
-  `4b5e3b8e`; R58 adds only gated diagnostics. Remaining remedy/source-hour effort
-  has low forecast confidence and no defensible range until the remaining
-  request-bound/applier cause is established. The original **22–44 source-hour**
+  `4b5e3b8e`; R58 gated diagnostics are built/measured on `7870d498`. Remaining
+  remedy/source-hour effort has low forecast confidence and no defensible range
+  until constructor recovery/owner authorization/slow drain causes are established.
+  The original **22–44 source-hour**
   O1–O3 and earlier conditional **1–4 source-hour / 2–6 elapsed-hour** bands are
   historical estimates, not current remaining forecasts. No new observation
   design, cache, framework, larger limit or deadline is authorized by variance.
-- **Integration:** latest paired portable builds take **430.947s / 528.764s**,
-  **16.0 minutes combined**, plus **0.201s** strict bundle verification.
-  Completed R57 failed selector attempts take **132.155–251.574s**
-  (**2.2–4.2 minutes**); the actual CLI attempt takes **131.247s**. Confidence in
+- **Integration:** latest paired portable builds take **419.537s / 462.088s**,
+  **14.7 minutes combined**, plus **0.101s** strict bundle verification.
+  R58's failed scoped attempt takes **267.691s** (**4.5 minutes**). Earlier R57
+  failed selectors take **132.155–251.574s**, actual CLI **131.247s**. Confidence in
   these exact measured attempt costs is high. They are different stages and
   schedules, not success bounds or a remaining-work ETA. Unknowns include the
-  request-bound preparation cost, applier/host-holder work, current Local Query
+  constructor recovery, owner authorization and applier/host-holder work, Local Query
   authorization-preparation refusal and whether later required recovery/pruning
   gates expose further defects. A new source boundary requires new current
   portable binaries and evidence; no defensible aggregate integration range
   exists yet. Earlier build/failed-run variance remains at its frozen references.
 - **Qualification:** M1 remains open despite late original-owner release and
-  ordinary image Local Create/Install completion. Whole30, client Applied,
+  ordinary image Local Create/Install completion. One constructor already records
+  **70.734s** before public retry; whole30, client Applied,
   routes/fresh Query, Shared ordinary CLI/reopen, returning pending Install,
   leader loss, forwarding/mutation negatives and cumulative >256 pruning still
   need exact resulting-artifact evidence. No sufficient recovery benefit,

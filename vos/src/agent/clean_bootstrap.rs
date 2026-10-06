@@ -6510,6 +6510,8 @@ where
     {
         let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
         let managed = intent.call().managed;
+        #[cfg(feature = "std")]
+        let diagnostic_invocation = intent.call().invocation.0;
         let request = intent.request().clone();
         if managed.profile != AgentProfile::Shared
             || managed.agent == self.pins.agent
@@ -6553,14 +6555,37 @@ where
             .ok_or(SharedAgentHostError::Unavailable)?;
         let receipt =
             self.issue_management_intent_with_admission(slot, managed, issuer, signer, true)?;
-        let submission = if let Some(owner) = self.retained_shared_install_owner(slot)? {
+        #[cfg(feature = "std")]
+        let diagnostics = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some();
+        #[cfg(feature = "std")]
+        let diagnostic_node = self.pins.node.0;
+        #[cfg(feature = "std")]
+        let diagnostic_agent = self.pins.agent.0;
+        #[cfg(feature = "std")]
+        let trace_install_cost = |phase: &'static str, started: Option<std::time::Instant>, success: bool| {
+            if let Some(started) = started {
+                let elapsed_us = started.elapsed().as_micros() as u64;
+                tracing::debug!(node = ?diagnostic_node, agent = ?diagnostic_agent,
+                    invocation = ?diagnostic_invocation, thread = ?std::thread::current().id(),
+                    phase, elapsed_us, success, "VOS causal install recovery cost");
+            }
+        };
+        #[cfg(feature = "std")]
+        let retained_owner_started = diagnostics.then(std::time::Instant::now);
+        let retained_owner = self.retained_shared_install_owner(slot);
+        #[cfg(feature = "std")]
+        trace_install_cost("retained_owner", retained_owner_started, retained_owner.is_ok());
+        let retained_owner = retained_owner?;
+        #[cfg(feature = "std")]
+        let submission_started = diagnostics.then(std::time::Instant::now);
+        let submission = if let Some(owner) = retained_owner {
             self._network_host.manage_clean_from_retained_owner(
                 crate::service::AgentId(managed.agent.0),
                 request.clone(),
                 receipt.clone(),
                 SdkManagementArtifacts::Actor(&retained),
                 owner,
-            )?
+            )
         } else {
             // The singleton path keeps its existing admission and execution.
             self._network_host.manage_clean(
@@ -6568,8 +6593,11 @@ where
                 request.clone(),
                 receipt.clone(),
                 SdkManagementArtifacts::Actor(&retained),
-            )?
+            )
         };
+        #[cfg(feature = "std")]
+        trace_install_cost("management_submission", submission_started, submission.is_ok());
+        let submission = submission?;
         if !matches!(
             submission,
             crate::network::shared_agent::CleanManagementSubmission::Applied {
@@ -6582,6 +6610,8 @@ where
             // such a return must never become signed application failure.
             return Err(SharedAgentHostError::Conflict);
         }
+        #[cfg(feature = "std")]
+        let observation_started = diagnostics.then(std::time::Instant::now);
         let observation = self
             .host
             .lock()
@@ -6600,11 +6630,16 @@ where
                     tracing::debug!(shared_install_recovery_phase = "durable_observation_refused", error = ?error);
                 }
                 error
-            })?;
+            });
+        #[cfg(feature = "std")]
+        trace_install_cost("durable_observation", observation_started, observation.is_ok());
+        let observation = observation?;
         if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
             tracing::debug!(shared_install_recovery_phase = "durable_observation_complete");
         }
-        issuer
+        #[cfg(feature = "std")]
+        let issuer_observation_started = diagnostics.then(std::time::Instant::now);
+        let terminal = issuer
             .observe_shared_install(&observation, signer)
             .map(|terminal| {
                 if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
@@ -6617,7 +6652,10 @@ where
                     tracing::debug!(shared_install_recovery_phase = "issuer_observation_refused", error = ?SharedAgentHostError::Unavailable);
                 }
                 SharedAgentHostError::Unavailable
-            })
+            });
+        #[cfg(feature = "std")]
+        trace_install_cost("issuer_observation", issuer_observation_started, terminal.is_ok());
+        terminal
     }
 
     /// Bind transport to this issuer's independently retained exact first

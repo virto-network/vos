@@ -11,71 +11,54 @@ host source or the released workflow.
 
 ## Boundary and release claim
 
-R57's concrete combined release-admission patch was explicitly approved on
-2026-10-06: "approved, just keep going". Root applied reviewed v4 after verifying
-clean `e30e7b03` and unchanged product source. Corrected source is frozen at
-`4b5e3b8e2d818e3f8230ede6757ba490791e5a52`. Independent reviews pass; the core
-build passes **36.541s**, and all **19 exact preservation units** pass
-(**13.127s summed unit elapsed**, not runner wall time). They cover the new
-combined checked API, original checked APIs, signed refusal/no-write behavior,
-fresh corruption, retained/reopened releases, reservation/committee/tail barriers
-and real fixed-three worker progress. Worker cases are component proof; later
-follower samples do not qualify the actual leader preflight or public custody.
-The source-specific reader passes 51 acceptance/96 refusal synthetic cases,
-with original fences/privacy preserved. The earlier failed compile and illegal
-committee fixture are frozen separately in the live plan; current corrected
-results do not erase them or qualify retained Shared committee migration.
+The latest admitted source/evidence boundary is
+`7870d4982d8a38fb978250a5d06f4b6c785b7461`.
+[Completed R58](agent-saga-status.md#completed-r58-custody-and-startup-attribution)
+adds only gated exact-work budget/preparation, existing worker-snapshot and
+applier timing. Source-preservation reviews pass; no product checks, reads,
+guards, limits, deadlines, guest bytes or pins change. Portable main/harness pass
+**419.537s / 462.088s**, strict six-file verification **0.101s**. The scoped
+fixture fails **267.691s** under its original whole pending-Install **30s** bound.
 
-Portable main/harness pass **430.947s / 528.764s**, strict unchanged six-file
-verification **0.201s**. The first quiet/scoped attempts fail **132.155s /
-134.950s** in public Create before combined-release proof. The repeated scoped
-attempt fails **251.574s**; its finite reader admits **14,424 records / 404
-explicit edges / zero unknowns**. It proves accepted Install finalization,
-complete-member ACK availability, terminal persistence, the integrated one-audit
-combined path, and exact release confirmation by the original owner at
-**4.905637s**. That result supersedes R56's original-owner timeout as the latest
-confirmation boundary, while the unchanged whole pending-Install **30s** recovery
-assertion still fails. Routes, fresh Query and client SIR1 Applied are not
-qualified. Late presence follows the existing presence-before-expiry waiter;
-it is not timely 1.8s confirmation or a waived deadline.
+A source-closed reader extension on that same completed input admits **18,498
+records / 578 explicit edges / zero unknowns**. Removing its 119 newly recognized
+startup scalars exactly preserves the prior 18,379 records, identities and edges
+apart from event-index shifts; no new build or fixture run occurred. The three
+post-cold lifecycle-controller cumulative values are **22.280s / 26.102s /
+70.734s**. Source starts the fixture clock before spawning three constructors,
+joins all of them, then checks the original absolute deadline before public retry.
+Thus one constructor alone records 70.734s before retry; this is not an actor
+Query failure. Separate owner/attached clocks carry no node/call binding and
+cannot be paired or subtracted. Constructor-internal attribution remains open.
 
-Actual ordinary three-process CLI acceptance also fails **131.247s**. Normal
-image Local Create/Install complete, but Query's authorization preparation
-returns HTTP 503/CLI exit 1 before Invoke. This is not evidence of an actor Query
-failure. Shared/reopen stages are unreached. Three launches leave zero survivors,
-but the cleanup row exits 1, so cleanup is not credited as passing. M1 remains
-open; no controlled speedup or sufficient recovery/service benefit is claimed.
-Read [completed R57](agent-saga-status.md#completed-r57-combined-release-admission)
-for exact source/binary/artifact/reader/evidence hashes, retained-family aliases,
-phase boundaries and qualification limits.
+R58 still proves exact root-bound Install finalization, issuer save, complete
+member ACK, terminal persistence and late original-owner retention release.
+Owner confirmation is **4.591318s**, leader completion **4.500218s** on separate
+clocks; unknown host-wait holders and nested audit/budget/applier costs do not
+establish removable work or a controlled speedup. Presence-before-expiry retains
+its original semantics, not timely 1.8s confirmation. Routes, fresh Query and
+client SIR1 Applied remain unqualified.
 
-The combined API derives scalar capacity from the existing fresh fully
-authenticated release preflight in one unchanged guarded read transaction.
-Driver provenance and full signed verification remain before the read; exact
-owner/member restrictions, final worker barrier and prefix-checked proposal
-remain mandatory. General checked APIs stay intact. Removing the second read
-changes coordination and removes its independent I/O/corruption observation
-opportunity; no view/cache/authority is exported and no identical inter-read
-error behavior is claimed. Source and component tests establish release's
-management-preflight delta one and generic-capacity delta zero; registration
-keeps generic-capacity delta one. The packaged harness links `vos` without its
-`cfg(test)` counter assertions; its recorded audit/derived phase and source call
-graph supply the integrated evidence.
+R57's separately approved combined release API retains driver provenance and full
+signed verification before one fresh guarded preflight, scalar capacity only,
+exact owner/member restrictions and final worker/prefix checks. Its nineteen
+preservation units pass on `4b5e3b8e`; these prove component counter deltas, while
+the packaged harness links `vos` without `cfg(test)` counter assertions.
+Recorded release audit/derived phase plus source call graph supply integrated
+evidence. General checked APIs remain intact; removing a second read changed
+coordination and its separate I/O opportunity, without exporting a view or cache.
 
-R58 is diagnostic attribution only: request-bound budget/preparation, existing
-worker sampling and applier work/host acquisition. Applied source and pending
-integration/qualification are recorded in the live plan. Nested durations,
-unknown holders, repeated identities and missing early-error markers retain
-their limits. Further behavior candidates, redesign, new authority, promotion
-or engineering-week-cap extension are not automatic.
-
-Earlier R56/R55/R54/R53/R52/R51/R50 measurements remain frozen at their exact
-source and evidence boundaries in the live plan. Their original-owner timeouts,
-late leader completions and different failure stages do not retrospectively
-explain the latest quiet/scoped/ordinary CLI failures or prove a controlled
-optimization benefit. The tiny verification proposal remains target-only,
-unapplied and unmeasured. Repeated metadata identifies immutable work, not a
-unique attempt; audit/leaf clocks are nested, not CPU or removable-cost estimates.
+The latest actual ordinary CLI remains R57: Local Create/Install complete, then
+Query authorization preparation returns HTTP 503/CLI exit 1 before Invoke.
+Shared/reopen are unreached; cleanup exits 1 despite zero survivors. No R58
+ordinary workflow ran. M1 remains open. Next source attribution concerns startup,
+owner authorization observations and slow drains; no new behavior candidate,
+redesign, cap extension, promotion or sufficient performance benefit follows.
+Earlier failed compile/fixture and R56/R57 outcomes remain frozen at their exact
+references, rather than retrospectively explaining the current failure.
+Applied [R59 diagnostics](agent-saga-status.md#r59-retained-install-interval-diagnostics--applied)
+await portable builds, reader admission and a fresh fixture at the checkpoint
+recorded by the owned build provenance; completed R58 remains latest.
 
 The review branch remains `e6f2bb45` on `saga/agents`. Original replacement
 source `8128e677` and its role bundle `7085c220` precede the corrected integration
@@ -168,40 +151,33 @@ Current O3 component evidence (logs under the native worktree's `target`):
 
 ### Current integration delta and blocking result
 
-Read [completed R57](agent-saga-status.md#completed-r57-combined-release-admission)
-for the latest admitted evidence boundary `4b5e3b8e` and exact hashes. The
-approved combined release path is implemented, all nineteen component units
-pass, and a repeated packaged scoped run proves one fresh signed-ledger audit,
-accepted root-bound finalization, complete-member ACK, terminal persistence and
-late exact original-owner retention release. It still fails the unchanged whole
-pending-Install 30s assertion. Serving routes, client SIR1 Applied and fresh
-Query remain unqualified. First quiet/scoped Create failures are separate;
-quiet supplies no inner cause and missing release markers prove no nonexecution.
+Read [completed R58](agent-saga-status.md#completed-r58-custody-and-startup-attribution)
+for source `7870d498`, admitted evidence and exact hashes. The scoped run fails
+**267.691s**. The same completed input now establishes that a startup constructor
+records **70.734s** before returning; all three constructors are joined before
+the public retry and unchanged whole30 assertion at
+`member_cold_install_tests.rs:277`. This earlier boundary cannot be closed by
+small final-release audit savings alone. The nine cumulative lifecycle phases
+use each function instance's own post-preflight clock; owner/attached clocks lack node/call
+binding. No subtraction, adjacency pairing or isolated stage cost is inferred.
 
-The exact release's audit takes **1.048938s**; signed validation completes in
-**1.056841s**, derived capacity is recorded at cumulative **1.310281s**, and
-commit starts at **1.316203s**. Original-owner confirmation is **4.905637s**;
-leader commit completes later at **4.938622s**. Their **3.247490s / 3.272231s**
-host waits overlap with unknown holders. These clocks do not establish a holder,
-unique attempt, CPU/removable cost, controlled speedup or timely 1.8s confirmation.
-The old general checked APIs and final worker/prefix checks remain mandatory;
-one guarded fresh release preflight derives only scalar capacity.
+Exact Install root 171 retains original Invoke/work/authorization 170/172/173.
+Accepted child finalization, issuer save, complete-member ACK, terminal
+persistence and original-owner release remain proven. One release-bound audit
+takes **1.007761s**; owner confirmation is **4.591318s**, while leader completion
+is **4.500218s** on a distinct clock. Unknown host-wait holders, two separate
+fresh-absence audits and nested preparation/applier brackets do not prove a
+removable cost or authorize suppressing physical checks. Eighteen post-cold
+System applier samples are distinguished from 183 mixed-agent samples; slow drain
+work exists, but no recorded request/holder binding attributes it to exact waits.
 
-Actual ordinary CLI reaches normal image Local Create/Install completion, then
-fails HTTP 503/CLI exit 1 in Query authorization preparation before Invoke.
-Shared/reopen are unreached; zero survivors does not turn cleanup's exit 1 into
-a pass. This failure needs request-bound attribution, not an actor Query or
-recovery-success claim.
-
-[R58](agent-saga-status.md#r58-request-bound-custody-and-applier-diagnostics--source-applied)
-adds only gated exact-work budget/preparation spans, existing worker-snapshot
-and applier host-work timing. Applied source-preservation review passes; source
-freeze, finite-reader review, new portable builds and measurements are pending.
-No new behavior candidate, cap extension or qualification follows. M1 remains
-the next integrated milestone; remaining packaged/ordinary CLI gates precede
-M2 and locally possible M3, with external hardware explicitly open. Source and
-aggregate integration/qualification effort remain uncertain; completed build/run
-durations are attempt costs, not a milestone ETA.
+Latest ordinary CLI evidence is still R57: normal Local Create/Install complete,
+then Query authorization preparation fails HTTP 503 before Invoke. No R58 actual
+CLI acceptance ran; Shared/reopen, routes, fresh Query and client Applied remain
+unqualified. Next attribution targets constructor recovery, owner authorization
+observations and slow drain internals. M1 remains the next integrated milestone;
+build/component passes and late custody do not close it. No new behavior
+candidate or cap extension follows, and measured attempt costs are not an ETA.
 
 ### Frozen preceding integration evidence
 
