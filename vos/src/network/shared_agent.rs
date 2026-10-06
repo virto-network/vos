@@ -2930,9 +2930,15 @@ impl SharedRouteHandler {
                     reservation,
                     Some(ReservedSubmission::ManagementCustody { .. })
                 ) {
-                    let (capacity, manifest) = host
-                        .capacity_and_recovery_manifest(self.agent)
-                        .map_err(|error| refused("capacity_error", error))?;
+                    let (capacity, manifest) = {
+                        #[cfg(feature = "std")]
+                        let _causal_span = causal_custody_audit_span(
+                            management_diagnostic_key.filter(|_| trace_enabled),
+                            "capacity_manifest",
+                        );
+                        host.capacity_and_recovery_manifest(self.agent)
+                    }
+                    .map_err(|error| refused("capacity_error", error))?;
                     capacity_manifest = Some(manifest);
                     capacity
                 } else {
