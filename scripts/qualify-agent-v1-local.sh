@@ -363,8 +363,10 @@ run_lifecycle shared-create a space create-shared-agent "$name" --runtime "$evid
     --archive-out "$evidence/shared.ogar" --http "127.0.0.1:$((base_port+3))"
 jq -e '.phase == "applied" and .ready == false and .management_completed == true and .response_retained == true' "$evidence/logs/shared-create.stdout" >/dev/null || fail "Shared Create did not retain Applied"
 shared_agent=$(jq -er '.agent | select(test("^[0-9a-f]{64}$"))' "$evidence/logs/shared-create.stdout")
-index=0
-for persona in a b c; do
+# Create retains the creator's issuer publication; hand off the same archive
+# only to the other voters, keeping their original HTTP member indices.
+index=1
+for persona in b c; do
     run "admit-$persona" "$persona" space admit-shared "$name" --archive "$evidence/shared.ogar" --http "127.0.0.1:$((base_port+3+index))"
     ((index+=1))
 done
