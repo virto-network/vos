@@ -610,6 +610,12 @@ impl SharedRouteHandler {
                     ..
                 }, InvocationClock::PersistedManagement(_))
         ) {
+            #[cfg(feature = "std")]
+            let diagnostic_key = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS")
+                .is_some()
+                .then(|| ManagementInvocationKey::new(request.work(), request.authorization()));
+            #[cfg(feature = "std")]
+            let _causal_span = causal_custody_audit_span(diagnostic_key, "custody_budget");
             host.management_custody_retention_admission_with_manifest(self.agent, &manifest)?
         } else {
             host.management_retention_admission_requirement(self.agent, None)?

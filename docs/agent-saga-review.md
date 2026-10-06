@@ -13,134 +13,69 @@ host source or the released workflow.
 
 R57's concrete combined release-admission patch was explicitly approved on
 2026-10-06: "approved, just keep going". Root applied reviewed v4 after verifying
-clean `e30e7b03` and unchanged product source. Combined-entry preservation tests
-and two real-worker component regressions are implemented and independently
-reviewed; nineteen exact units form the owned preservation gate.
-Initial frozen `b3caa646` core compilation failed in a test-only service/SDK
-node-type conversion. Its byte-preserving correction at clean `1c5279d4`
-builds in **76.189s**; the first thirteen units pass, then unit 14 fails
-**0.201s** on an illegal committee-transition fixture before the combined API.
-Units 15–19 were not run. A reviewed test-only correction preserves Prepare's
-no-write refusal for both live and released retained manifests, then uses a
-separate legal ledger to test signed transition-barrier ordering. It does not
-qualify retained Shared committee migration. The corrected fixture awaits a
-fresh build and all nineteen units. No production behavior, bounds or deadline
-changed. The finite reader
-passes 51 acceptance/96 refusal synthetic cases with privacy and original fences
-preserved. Component worker cases do not qualify host/custody/public recovery;
-the prior debug build is component evidence only, with no recovery or performance
-credit yet. The one release-only
-coordination change is authorized under the
-original limits; further candidates, redesign or a week-cap extension are not.
+clean `e30e7b03` and unchanged product source. Corrected source is frozen at
+`4b5e3b8e2d818e3f8230ede6757ba490791e5a52`. Independent reviews pass; the core
+build passes **36.541s**, and all **19 exact preservation units** pass
+(**13.127s summed unit elapsed**, not runner wall time). They cover the new
+combined checked API, original checked APIs, signed refusal/no-write behavior,
+fresh corruption, retained/reopened releases, reservation/committee/tail barriers
+and real fixed-three worker progress. Worker cases are component proof; later
+follower samples do not qualify the actual leader preflight or public custody.
+The source-specific reader passes 51 acceptance/96 refusal synthetic cases,
+with original fences/privacy preserved. The earlier failed compile and illegal
+committee fixture are frozen separately in the live plan; current corrected
+results do not erase them or qualify retained Shared committee migration.
 
-R56 diagnostic attribution is complete on clean `53b7be16`: portable
-main/harness pass **391.898s / 459.891s**, strict six-file verification **0.101s**.
-One isolated scoped all-cold attempt fails **245.670s**, one failed test,
-exhausted noninterrupted owned group. The finite reader admits **15,518 records /
-622 edges / zero unknowns** through all original fences; 54 acceptance/72 refusal
-synthetics and privacy checks pass. Create reaches public Applied and exact
-Applied replay. Install accepts finalization, crosses both ACK availability
-boundaries and persists its terminal, then its original owner release times out
-at **1.847626s** before proposal. The leader later confirms the exact release;
-owner confirmation, routes and whole30 remain unqualified.
+Portable main/harness pass **430.947s / 528.764s**, strict unchanged six-file
+verification **0.201s**. The first quiet/scoped attempts fail **132.155s /
+134.950s** in public Create before combined-release proof. The repeated scoped
+attempt fails **251.574s**; its finite reader admits **14,424 records / 404
+explicit edges / zero unknowns**. It proves accepted Install finalization,
+complete-member ACK availability, terminal persistence, the integrated one-audit
+combined path, and exact release confirmation by the original owner at
+**4.905637s**. That result supersedes R56's original-owner timeout as the latest
+confirmation boundary, while the unchanged whole pending-Install **30s** recovery
+assertion still fails. Routes, fresh Query and client SIR1 Applied are not
+qualified. Late presence follows the existing presence-before-expiry waiter;
+it is not timely 1.8s confirmation or a waived deadline.
 
-The two release-bound audit bodies take **982.647ms / 964.606ms** with negligible
-ledger/read acquisition. Each exact stage records seven successful phases for
-each of five registrations, with no duplicate group-phase key. Incoming
-verification totals only **35.478ms / 34.987ms**, about 8.6% of registration cost;
-that whole phase includes mandatory signed checks and merely bounds possible
-reuse savings. The seven leaf clocks cover about 72% of registration folding;
-the untimed remainder includes diagnostic bookkeeping as well as production
-work. No isolated CPU/removable-cost or speedup claim follows. Admission reaches
-commit start at **2.181219s**. Later host wait **1688.862ms** remains separately
-unattributed. Nested clocks and repeated identities are not distinct attempts.
+Actual ordinary three-process CLI acceptance also fails **131.247s**. Normal
+image Local Create/Install complete, but Query's authorization preparation
+returns HTTP 503/CLI exit 1 before Invoke. This is not evidence of an actor Query
+failure. Shared/reopen stages are unreached. Three launches leave zero survivors,
+but the cleanup row exits 1, so cleanup is not credited as passing. M1 remains
+open; no controlled speedup or sufficient recovery/service benefit is claimed.
+Read [completed R57](agent-saga-status.md#completed-r57-combined-release-admission)
+for exact source/binary/artifact/reader/evidence hashes, retained-family aliases,
+phase boundaries and qualification limits.
 
-The tiny verification proposal remains target-only and unapplied; these timings
-do not prioritize a sixth tiny pass. The reviewed source-only proposal
-combines release validation and scalar capacity from the existing fresh fully
-authenticated management preflight view. Driver/signature order, one unchanged
-guarded transaction and final worker barrier/prefix check must remain mandatory.
-Removing the second read changes coordination and its error boundary; R57 now
-has the separate review and explicit direction above. No view/cache export,
-new authority, further candidate, redesign or cap extension is automatic. The
-live plan owns exact evidence, forecasts and all remaining release gates.
+The combined API derives scalar capacity from the existing fresh fully
+authenticated release preflight in one unchanged guarded read transaction.
+Driver provenance and full signed verification remain before the read; exact
+owner/member restrictions, final worker barrier and prefix-checked proposal
+remain mandatory. General checked APIs stay intact. Removing the second read
+changes coordination and removes its independent I/O/corruption observation
+opportunity; no view/cache/authority is exported and no identical inter-read
+error behavior is claimed. Source and component tests establish release's
+management-preflight delta one and generic-capacity delta zero; registration
+keeps generic-capacity delta one. The packaged harness links `vos` without its
+`cfg(test)` counter assertions; its recorded audit/derived phase and source call
+graph supply the integrated evidence.
 
-The concrete source-only proposal is
-`target/task-tmp/r56-signed-release-capacity-proposal-v4.patch`, SHA
-`dee945322575f55bb23097db0ecbd55a774f1ff259fb4230d76ee0bb6f18af90`.
-Root and independent source/tool reviews pass; it is applied and debug-compiled,
-with corrected regressions and packaged measurement still open. Read the live plan's
-[approved change and mandatory regressions](agent-saga-status.md#r57-approved-combined-release-admission--implementation-in-progress).
-Generic capacity counters keep their meaning: proposed
-release delta zero, actual management-preflight delta one; registration keeps
-its actual generic capacity delta one. The new cumulative leader marker requires
-a source-specific strict reader update before diagnostic execution.
+R58 is diagnostic attribution only: request-bound budget/preparation, existing
+worker sampling and applier work/host acquisition. Applied source and pending
+integration/qualification are recorded in the live plan. Nested durations,
+unknown holders, repeated identities and missing early-error markers retain
+their limits. Further behavior candidates, redesign, new authority, promotion
+or engineering-week-cap extension are not automatic.
 
-R55 diagnostic attribution is complete on clean `29c29092`: current portable
-main/harness and strict six-file verification pass; one scoped all-cold attempt
-fails **236.658s**. The finite reader admits **9,655 records / 506 edges / zero
-unknowns** through all original fences; 25 acceptance/41 refusal synthetics and
-privacy checks pass. Original-owner release still times out before proposal,
-followed by late leader confirmation. The exact failing release's fresh audits
-take **909.181ms / 940.630ms**, with **0µs** ledger wait and **0/2µs** read start.
-Registration and Ordered folds dominate; isolated crypto/encoding/removable work
-and the later host holder remain unknown. No recovery or performance credit.
-
-R54 is complete on frozen `63b8203e`: independent source/test reviews and
-11 preservation units pass, including signed differentials against the original
-checked release wrapper. Portable main/harness and strict six-file verification
-pass. Quiet/scoped all-cold still fail **191.409s / 188.508s**. The scoped run
-admits **7,604 records / 335 edges / zero unknowns** and reaches the same owner
-release timeout before leader proposal, followed by late leader confirmation.
-Recorded lower fold cost does not establish controlled or sufficient recovery
-benefit. Quiet's inner cause remains independently unknown; M1 stays open.
-
-The user's direction continues causal investigation. R55 changed no audit,
-freshness, guard, transaction, signature, limit, deadline or supported path.
-The live plan owns the unchanged cap; no sixth behavior candidate, redesign,
-promotion or release benefit is automatic.
-
-R52's explicitly authorized bounded registration-validation pass is complete
-on clean `92702a09`: independent source reviews and ten preservation/differential
-units pass; portable main/harness and strict six-file verification pass.
-Quiet/scoped all-cold attempts fail **262.880s / 209.225s**. Matching history
-compositions record lower fold medians, without a controlled helper-only speedup
-or sufficient recovery benefit. The scoped attempt reaches accepted Install
-finalization and terminal persistence, then exact retained release times out
-before leader proposal. The quiet inner cause remains independently unknown.
-M1 stays open. R52's permission alone did not authorize a fifth tuning candidate;
-the later explicit R54 authorization is recorded above. No redesign, promotion,
-cap extension or deadline increase follows.
-
-R53 diagnostic-only investigation is complete on clean `e59c702f`: portable
-main/harness and strict six-file verification pass; one scoped all-cold attempt
-fails **267.579s**, admitting **9,237 records / 501 edges / zero unknowns** through
-all original evidence fences. Install finalization/terminal complete, its owner
-release wait expires before proposal, then the leader confirms the exact release
-late. Signed-ledger validation and capacity dominate admission; worker snapshot
-is small in the measured calls. Later confirmation waits over two seconds for
-the host lock, whose holder is unidentified. No behavior remedy is applied.
-The live plan records the subsequently authorized R54 release-fold candidate;
-no cap extension follows. Its reviewed proposal precedes implementation and
-supplies no measured benefit.
-
-The latest user direction continues investigation and prioritizes demonstrated
-smaller defects before broader simplifications. R51 adds only narrow audit and
-attachment timings on the R50 failure path. It is complete on clean `26c6023b`:
-portable main/harness and strict six-file verification pass, but the one focused
-all-cold attempt fails **365.008s** after a verified pending-Install cut and cold
-restart. Recovery folding dominates the measured audit bodies; no remedy,
-performance benefit or fourth tuning candidate is established. The live plan
-owns exact evidence, remaining availability attribution and the go/no-go decision.
-
-R50 is the user-authorized bounded causal investigation of one exact public
-Create family through the existing all-cold selector. It is complete on clean
-diagnostic source `d58af26f`: quiet/scoped attempts fail **144.379s / 145.283s**.
-The admitted alias trace establishes confirmation timeouts before leader
-proposal and later fresh-observation deadline failures after the capacity audit
-or callback. No fix, performance benefit, deadlock or necessary redesign is proved.
-Keep R49 outcomes separate. The live plan owns the exact evidence, remaining
-internal attribution gaps and subsequent user decision.
+Earlier R56/R55/R54/R53/R52/R51/R50 measurements remain frozen at their exact
+source and evidence boundaries in the live plan. Their original-owner timeouts,
+late leader completions and different failure stages do not retrospectively
+explain the latest quiet/scoped/ordinary CLI failures or prove a controlled
+optimization benefit. The tiny verification proposal remains target-only,
+unapplied and unmeasured. Repeated metadata identifies immutable work, not a
+unique attempt; audit/leaf clocks are nested, not CPU or removable-cost estimates.
 
 The review branch remains `e6f2bb45` on `saga/agents`. Original replacement
 source `8128e677` and its role bundle `7085c220` precede the corrected integration
@@ -233,22 +168,42 @@ Current O3 component evidence (logs under the native worktree's `target`):
 
 ### Current integration delta and blocking result
 
-Read [completed R56](agent-saga-status.md#completed-r56-registration-fold-attribution)
-in the sole live plan for exact source/binary/reader/artifact hashes, phase totals
-and limits. Current portable builds/verification pass, but the isolated all-cold
-attempt fails **245.670s**. Create reaches public Applied and exact replay;
-Install accepts finalization, crosses ACK availability and persists its terminal.
-Its original owner then times out before proposal, followed by late leader
-confirmation. Late custody is not original-owner completion, routes or whole30.
+Read [completed R57](agent-saga-status.md#completed-r57-combined-release-admission)
+for the latest admitted evidence boundary `4b5e3b8e` and exact hashes. The
+approved combined release path is implemented, all nineteen component units
+pass, and a repeated packaged scoped run proves one fresh signed-ledger audit,
+accepted root-bound finalization, complete-member ACK, terminal persistence and
+late exact original-owner retention release. It still fails the unchanged whole
+pending-Install 30s assertion. Serving routes, client SIR1 Applied and fresh
+Query remain unqualified. First quiet/scoped Create failures are separate;
+quiet supplies no inner cause and missing release markers prove no nonexecution.
 
-Two explicitly release-bound fresh audit bodies dominate pre-proposal admission.
-Incoming verification is only a small part of registration folding and does not
-prioritize the unapplied tiny reuse patch. The later host holder remains unknown.
-The source-only combined admission proposal must retain a complete fresh guarded
-management preflight and final worker/prefix checks; removing the second read
-has separately reviewed and approved coordination/error-boundary changes, not a
-cache or authority shortcut. No further behavior candidate or week-cap extension follows.
-Ordinary three-process CLI, remaining packaged gates, M2 and M3 stay open.
+The exact release's audit takes **1.048938s**; signed validation completes in
+**1.056841s**, derived capacity is recorded at cumulative **1.310281s**, and
+commit starts at **1.316203s**. Original-owner confirmation is **4.905637s**;
+leader commit completes later at **4.938622s**. Their **3.247490s / 3.272231s**
+host waits overlap with unknown holders. These clocks do not establish a holder,
+unique attempt, CPU/removable cost, controlled speedup or timely 1.8s confirmation.
+The old general checked APIs and final worker/prefix checks remain mandatory;
+one guarded fresh release preflight derives only scalar capacity.
+
+Actual ordinary CLI reaches normal image Local Create/Install completion, then
+fails HTTP 503/CLI exit 1 in Query authorization preparation before Invoke.
+Shared/reopen are unreached; zero survivors does not turn cleanup's exit 1 into
+a pass. This failure needs request-bound attribution, not an actor Query or
+recovery-success claim.
+
+[R58](agent-saga-status.md#r58-request-bound-custody-and-applier-diagnostics--source-applied)
+adds only gated exact-work budget/preparation spans, existing worker-snapshot
+and applier host-work timing. Applied source-preservation review passes; source
+freeze, finite-reader review, new portable builds and measurements are pending.
+No new behavior candidate, cap extension or qualification follows. M1 remains
+the next integrated milestone; remaining packaged/ordinary CLI gates precede
+M2 and locally possible M3, with external hardware explicitly open. Source and
+aggregate integration/qualification effort remain uncertain; completed build/run
+durations are attempt costs, not a milestone ETA.
+
+### Frozen preceding integration evidence
 
 The reviewed proposal removes only repeated changed-candidate slot validation
 from historical release folding. It retains incoming signature-before-retry,
@@ -301,9 +256,9 @@ The architecture review remains [context for the decision](agent-saga-status.md#
 Internal generation attachment precedes public routes, and the older
 unfinished-Create/retired-generation observation cycle has an ordering fix.
 
-Use the completed R53 proof/cost boundaries for the next bounded diagnostic
-or remedy decision. No fifth tuning candidate or cap extension is authorized by
-these measurements.
+These completed R53 proof/cost boundaries are historical; subsequent separately
+authorized R54/R57 changes and their results are recorded above. The measurements
+alone authorize no further candidate or cap extension.
 Preserve distinct intent, physical application, runtime ACK,
 owner terminal, certified publication and quorum-release authorities. Existing
 notifications may only be wake hints; freshness/corruption checks cannot become

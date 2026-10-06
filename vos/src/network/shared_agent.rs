@@ -896,6 +896,20 @@ impl ManagementInvocationKey {
     }
 }
 
+// Diagnostic context identifies exact work, not a unique call attempt or
+// a particular historical row visited by a nested recovery audit.
+#[cfg(feature = "std")]
+fn causal_custody_audit_span(
+    key: Option<ManagementInvocationKey>,
+    stage: &'static str,
+) -> Option<tracing::span::EnteredSpan> {
+    key.map(|key| {
+        tracing::debug_span!("vos_causal_custody_audit",
+            invocation = ?key.invocation.0, work = ?key.work.0,
+            authorization = ?key.authorization.0, stage).entered()
+    })
+}
+
 fn management_retirement_keys(
     agent: crate::service::AgentId,
     envelopes: [&crate::agent_sdk::RuntimeWork; 2],
@@ -2910,7 +2924,21 @@ impl SharedRouteHandler {
                         .map_err(|error| refused("capacity_error", error))?
                 };
                 trace("capacity_audited");
-                let current = futures_executor::block_on(worker.snapshot()).ok_or_else(|| {
+                #[cfg(feature = "std")]
+                let snapshot_started = started.map(|_| Instant::now());
+                let current = futures_executor::block_on(worker.snapshot());
+                #[cfg(feature = "std")]
+                if let Some(snapshot_started) = snapshot_started {
+                    let elapsed_us = snapshot_started.elapsed().as_micros() as u64;
+                    tracing::debug!(node = ?diagnostic_node.0, agent = ?self.agent.0,
+                        route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                        thread = ?std::thread::current().id(), invocation = ?diagnostic_invocation.0,
+                        work = ?management_diagnostic_key.map(|key| key.work.0),
+                        authorization = ?management_diagnostic_key.map(|key| key.authorization.0),
+                        phase = "post_capacity_snapshot", elapsed_us,
+                        success = current.is_some(), "VOS causal custody");
+                }
+                let current = current.ok_or_else(|| {
                     refused(
                         "current_snapshot_missing",
                         SharedAgentHostError::Unavailable,
@@ -3019,16 +3047,24 @@ impl SharedRouteHandler {
                     authorization: Box::new(authorization.clone()),
                     observed_slot: preflight.observed_slot,
                 };
-                let (required, retained) = if let Some(manifest) = custody_manifest.as_ref() {
-                    host.management_pending_admission_with_input_and_manifest(
-                        self.agent,
-                        anchor,
-                        &envelope,
-                        manifest,
-                    )
-                } else {
-                    host.management_pending_admission_with_input(self.agent, anchor, &envelope)
-                }
+                let pending_budget_result = {
+                    #[cfg(feature = "std")]
+                    let _causal_span = causal_custody_audit_span(
+                        management_diagnostic_key.filter(|_| trace_enabled),
+                        "singleton_budget",
+                    );
+                    if let Some(manifest) = custody_manifest.as_ref() {
+                        host.management_pending_admission_with_input_and_manifest(
+                            self.agent,
+                            anchor,
+                            &envelope,
+                            manifest,
+                        )
+                    } else {
+                        host.management_pending_admission_with_input(self.agent, anchor, &envelope)
+                    }
+                };
+                let (required, retained) = pending_budget_result
                     .map_err(|error| refused("pending_budget_error", error))?;
                 let required = required.ok_or(SharedAgentHostError::CapacityExhausted)?;
                 trace("pending_budget_complete");
@@ -3060,26 +3096,34 @@ impl SharedRouteHandler {
             #[cfg(test)]
             assert_single_capacity_audit(&host);
             trace("prepare_start");
-            let prepared = if matches!(clock, InvocationClock::Bootstrap) {
-                host.prepare_bootstrap_invocation(self.agent, request)
-            } else if matches!(clock, InvocationClock::PersistedManagement(_)) {
-                if let Some(manifest) = custody_manifest.as_ref() {
-                    host.prepare_persisted_management_invocation_with_manifest(
-                        self.agent,
-                        request,
-                        manifest,
-                    )
+            let prepared_result = {
+                #[cfg(feature = "std")]
+                let _causal_span = causal_custody_audit_span(
+                    management_diagnostic_key.filter(|_| trace_enabled),
+                    "preparation",
+                );
+                if matches!(clock, InvocationClock::Bootstrap) {
+                    host.prepare_bootstrap_invocation(self.agent, request)
+                } else if matches!(clock, InvocationClock::PersistedManagement(_)) {
+                    if let Some(manifest) = custody_manifest.as_ref() {
+                        host.prepare_persisted_management_invocation_with_manifest(
+                            self.agent,
+                            request,
+                            manifest,
+                        )
+                    } else {
+                        host.prepare_persisted_management_invocation(self.agent, request)
+                    }
+                } else if terminal_only {
+                    host.prepare_terminal_clean_ordered_operation(self.agent, request)
+                } else if let Some(manifest) = custody_manifest.as_ref() {
+                    host.prepare_management_ack_with_manifest(self.agent, request, manifest)
                 } else {
-                    host.prepare_persisted_management_invocation(self.agent, request)
+                    host.prepare_clean_ordered_operation(self.agent, request)
                 }
-            } else if terminal_only {
-                host.prepare_terminal_clean_ordered_operation(self.agent, request)
-            } else if let Some(manifest) = custody_manifest.as_ref() {
-                host.prepare_management_ack_with_manifest(self.agent, request, manifest)
-            } else {
-                host.prepare_clean_ordered_operation(self.agent, request)
-            }
-            .map_err(|error| refused("prepare_error", error))?;
+            };
+            let prepared = prepared_result
+                .map_err(|error| refused("prepare_error", error))?;
             drop(custody_manifest);
             trace("prepare_complete");
             let input = prepared.input();
@@ -6000,6 +6044,21 @@ impl SharedAgentNetworkHost {
                 .name(format!("shared-agent-apply-{:02x?}", &agent.0[..4]))
                 .spawn(move || {
                     while receiver.recv().is_ok() {
+                        #[cfg(feature = "std")]
+                        let diagnostic_enabled =
+                            std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some();
+                        #[cfg(feature = "std")]
+                        let trace_host_work = |phase: &'static str, phase_started: Option<Instant>, success: bool| {
+                            if let Some(phase_started) = phase_started {
+                                let elapsed_us = phase_started.elapsed().as_micros() as u64;
+                                tracing::debug!(node = ?network.agent_node_id().0, agent = ?agent.0,
+                                    route_space = ?route.space.0, route_group = ?route.generation.0,
+                                    thread = ?std::thread::current().id(), phase, elapsed_us, success,
+                                    "VOS causal applier host work");
+                            }
+                        };
+                        #[cfg(feature = "std")]
+                        let host_wait_started = diagnostic_enabled.then(Instant::now);
                         let Ok(mut host) = host.lock() else {
                             ordered_replies.fail_all();
                             thread_stale.store(true, Ordering::Release);
@@ -6015,7 +6074,16 @@ impl SharedAgentNetworkHost {
                             );
                             return;
                         };
-                        if let Err(error) = drain_committed(&mut host, agent, &ordered_replies) {
+                        #[cfg(feature = "std")]
+                        let host_work_started = diagnostic_enabled.then(Instant::now);
+                        #[cfg(feature = "std")]
+                        trace_host_work("host_wait", host_wait_started, true);
+                        #[cfg(feature = "std")]
+                        let drain_started = diagnostic_enabled.then(Instant::now);
+                        let drain_result = drain_committed(&mut host, agent, &ordered_replies);
+                        #[cfg(feature = "std")]
+                        trace_host_work("drain", drain_started, drain_result.is_ok());
+                        if let Err(error) = drain_result {
                             tracing::warn!(
                                 ?agent,
                                 ?error,
@@ -6027,6 +6095,8 @@ impl SharedAgentNetworkHost {
                             if let Some(worker) = &thread_worker {
                                 let _ = worker.sender().send(vos_raft::RaftMsg::Shutdown);
                             }
+                            #[cfg(feature = "std")]
+                            trace_host_work("host_work", host_work_started, false);
                             drop(host);
                             retire_route_with_lease(
                                 &network,
@@ -6036,6 +6106,8 @@ impl SharedAgentNetworkHost {
                             );
                             return;
                         }
+                        #[cfg(feature = "std")]
+                        let attachment_started = diagnostic_enabled.then(Instant::now);
                         let current = host
                             .supervisor_attachment_status(agent)
                             .ok()
@@ -6044,12 +6116,16 @@ impl SharedAgentNetworkHost {
                                 AttachmentFingerprint::from_attachment_status(&status).ok()
                             });
                         if current.as_ref() != Some(&attached_fingerprint) {
+                            #[cfg(feature = "std")]
+                            trace_host_work("attachment", attachment_started, false);
                             ordered_replies.fail_all();
                             thread_stale.store(true, Ordering::Release);
                             thread_merge_stop.store(true, Ordering::Release);
                             if let Some(worker) = &thread_worker {
                                 let _ = worker.sender().send(vos_raft::RaftMsg::Shutdown);
                             }
+                            #[cfg(feature = "std")]
+                            trace_host_work("host_work", host_work_started, false);
                             drop(host);
                             retire_route_with_lease(
                                 &network,
@@ -6059,6 +6135,10 @@ impl SharedAgentNetworkHost {
                             );
                             return;
                         }
+                        #[cfg(feature = "std")]
+                        trace_host_work("attachment", attachment_started, true);
+                        #[cfg(feature = "std")]
+                        trace_host_work("host_work", host_work_started, true);
                     }
                     // A closed notifier without an owning retirement means
                     // the worker stopped unexpectedly. Revoke the route and
