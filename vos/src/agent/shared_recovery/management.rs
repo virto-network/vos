@@ -1296,8 +1296,9 @@ pub(crate) fn observe_management(
 }
 
 /// Fold only into a disposable candidate owned by SharedRecoveryManifest::observe.
-/// That caller validates the immutable incoming observation, validates the
-/// complete resulting manifest (including signatures, bounds and contradictions),
+/// The capability constructor validates the immutable incoming observation.
+/// The caller validates the complete resulting manifest (including signatures,
+/// bounds and contradictions),
 /// then checks its global position before publication. Preserve the independent
 /// local index/term rule too: a global lexicographic maximum need not carry the
 /// same term as the management-only maximum in an invalid candidate.
@@ -2957,6 +2958,48 @@ mod tests {
         );
     }
 
+    // Reference the immediate pre-change complete manifest fold, retaining its
+    // incoming validation and candidate/check/publication ordering exactly.
+    fn checked_manifest_observation(
+        manifest: &mut SharedRecoveryManifest,
+        verified: &VerifiedSharedRecoveryObservation,
+    ) -> Result<bool, SharedRecoveryError> {
+        let observation = verified.observation();
+        observation.validate()?;
+        if observation.generation() != manifest.generation() {
+            return Err(SharedRecoveryError::ScopeMismatch);
+        }
+        let mut candidate = manifest.clone();
+        let changed = observe_management_candidate(&mut candidate.management, verified)?;
+        candidate.validate()?;
+        if changed {
+            let previous = manifest.last_position();
+            if observation.raft_index() <= previous.0 || observation.raft_term() < previous.1 {
+                return Err(SharedRecoveryError::InvalidObservation);
+            }
+            *manifest = candidate;
+        }
+        Ok(changed)
+    }
+
+    fn assert_observation_paths(
+        manifest: &mut SharedRecoveryManifest,
+        verified: &VerifiedSharedRecoveryObservation,
+        expected: Result<bool, SharedRecoveryError>,
+    ) {
+        let before = manifest.clone();
+        let before_bytes = before.encode();
+        let mut checked = before.clone();
+        assert_eq!(checked_manifest_observation(&mut checked, verified), expected);
+        assert_eq!(manifest.observe(verified), expected);
+        assert_eq!(*manifest, checked);
+        assert_eq!(manifest.encode(), checked.encode());
+        if expected != Ok(true) {
+            assert_eq!(*manifest, before, "retry/refusal must not publish a candidate");
+            assert_eq!(manifest.encode(), before_bytes);
+        }
+    }
+
     #[test]
     fn management_candidate_fold_matches_checked_wrapper_and_keeps_first_capsules() {
         let member = member(40, None);
@@ -2964,19 +3007,32 @@ mod tests {
         let mut checked = manifest.management.clone();
         for (index, acknowledgement) in [(2, false), (3, true), (4, false), (5, true)] {
             let observation = observe(&member, index, acknowledgement);
-            let expected = observe_management(&mut checked, &observation);
-            assert_eq!(manifest.observe(&observation), expected);
+            // Keep the older checked slot wrapper as a separate successful/retry
+            // comparator; it is not the reference for whole-manifest error order.
+            assert_eq!(observe_management(&mut checked, &observation), Ok(index <= 3));
+            assert_observation_paths(&mut manifest, &observation, Ok(index <= 3));
             assert_eq!(manifest.management, checked);
             manifest.validate_at(index).unwrap();
         }
         let first = manifest.management[0].members_evidence.clone();
+        let mut changed_later = observe(&member, 6, false).observation().clone();
+        let RuntimeOutcome::Completed(Ok(reply)) = &mut changed_later.outcome else {
+            unreachable!()
+        };
+        reply.reply.push(0x5a);
+        let changed_later =
+            VerifiedSharedRecoveryObservation::from_audited_record(changed_later).unwrap();
+        assert_eq!(observe_management(&mut checked, &changed_later), Ok(false));
+        assert_observation_paths(&mut manifest, &changed_later, Ok(false));
+        assert_eq!(manifest.management, checked);
+        assert_eq!(manifest.management[0].members_evidence, first);
         let terminal = sign_release(&manifest.management[0], 1);
         manifest.apply_management_release(&terminal, 6, 3).unwrap();
         checked = manifest.management.clone();
         for (index, acknowledgement) in [(7, false), (8, true)] {
             let observation = observe(&member, index, acknowledgement);
-            assert_eq!(manifest.observe(&observation), Ok(false));
             assert_eq!(observe_management(&mut checked, &observation), Ok(false));
+            assert_observation_paths(&mut manifest, &observation, Ok(false));
             assert_eq!(manifest.management, checked);
             assert_eq!(manifest.management[0].members_evidence, first);
         }
@@ -2988,7 +3044,7 @@ mod tests {
     fn management_candidate_fold_still_checks_final_contradictions_signatures_and_bounds() {
         let member = member(41, None);
         let mut manifest = candidate_manifest(&member);
-        manifest.observe(&observe(&member, 2, false)).unwrap();
+        assert_observation_paths(&mut manifest, &observe(&member, 2, false), Ok(true));
         let shadow = sign_registration_from(2, node(1), 1, None, alloc::vec![member.clone()]);
         manifest
             .apply_management_registration(&shadow, 3, 3)
@@ -3001,12 +3057,11 @@ mod tests {
         reply.reply.push(0xa5);
         conflicting.validate().unwrap();
         manifest.management[1].members_evidence[0].invoke = Some(conflicting);
-        let before = manifest.encode();
-        assert_eq!(
-            manifest.observe(&observe(&member, 4, true)),
+        assert_observation_paths(
+            &mut manifest,
+            &observe(&member, 4, true),
             Err(SharedRecoveryError::Conflict),
         );
-        assert_eq!(manifest.encode(), before);
 
         let mut unsigned = valid.clone();
         let signing_message = unsigned.management[0]
@@ -3016,12 +3071,11 @@ mod tests {
         unsigned.management[0].registration.signature =
             ReplicaCommitSignature::new(node(1), key(2).sign(&signing_message.0).to_bytes())
                 .unwrap();
-        let before = unsigned.encode();
-        assert_eq!(
-            unsigned.observe(&observe(&member, 4, true)),
+        assert_observation_paths(
+            &mut unsigned,
+            &observe(&member, 4, true),
             Err(SharedRecoveryError::InvalidSignature),
         );
-        assert_eq!(unsigned.encode(), before);
 
         let mut oversized = valid;
         let RuntimeWork::Invoke { invocation, .. } =
@@ -3032,42 +3086,39 @@ mod tests {
         invocation
             .message
             .resize(sdk::MAX_INVOCATION_MESSAGE_BYTES + 1, 0);
-        let before = oversized.clone();
-        assert_eq!(
-            oversized.observe(&observe(&member, 4, true)),
+        assert_observation_paths(
+            &mut oversized,
+            &observe(&member, 4, true),
             Err(SharedRecoveryError::InvalidEnvelope),
         );
-        assert_eq!(oversized, before);
     }
 
     #[test]
     fn management_candidate_fold_refuses_early_ack_and_position_without_publication() {
         let member = member(42, None);
         let mut manifest = candidate_manifest(&member);
-        let before = manifest.clone();
-        assert_eq!(
-            manifest.observe(&observe(&member, 2, true)),
+        assert_observation_paths(
+            &mut manifest,
+            &observe(&member, 2, true),
             Err(SharedRecoveryError::InvalidObservation),
         );
-        assert_eq!(manifest, before);
-        assert_eq!(
-            manifest.observe(&observe(&member, 1, false)),
+        assert_observation_paths(
+            &mut manifest,
+            &observe(&member, 1, false),
             Err(SharedRecoveryError::InvalidObservation),
         );
-        assert_eq!(manifest, before);
 
-        manifest.observe(&observe(&member, 2, false)).unwrap();
-        let before = manifest.clone();
+        assert_observation_paths(&mut manifest, &observe(&member, 2, false), Ok(true));
         let mut lower_term = observe(&member, 3, true).observation().clone();
         lower_term.raft_term = 2;
         lower_term.claim = lower_term.claim.with_raft_foundation(3, 2).unwrap();
         let lower_term =
             VerifiedSharedRecoveryObservation::from_audited_record(lower_term).unwrap();
-        assert_eq!(
-            manifest.observe(&lower_term),
+        assert_observation_paths(
+            &mut manifest,
+            &lower_term,
             Err(SharedRecoveryError::InvalidObservation),
         );
-        assert_eq!(manifest, before);
         let mut changed_first = observe(&member, 2, false).observation().clone();
         let RuntimeOutcome::Completed(Ok(reply)) = &mut changed_first.outcome else {
             unreachable!()
@@ -3075,11 +3126,87 @@ mod tests {
         reply.reply.push(0x5a);
         let changed_first =
             VerifiedSharedRecoveryObservation::from_audited_record(changed_first).unwrap();
-        assert_eq!(
-            manifest.observe(&changed_first),
+        assert_observation_paths(
+            &mut manifest,
+            &changed_first,
             Err(SharedRecoveryError::Conflict),
         );
-        assert_eq!(manifest, before);
+    }
+
+    #[test]
+    fn management_verified_observation_fold_matches_full_checked_manifest() {
+        let root = member(44, None);
+        let child = member(45, Some(root.commitment()));
+        let mut manifest = candidate_manifest(&root);
+        assert_observation_paths(&mut manifest, &observe(&root, 2, false), Ok(true));
+        assert_observation_paths(&mut manifest, &observe(&root, 3, true), Ok(true));
+        let first_root = manifest.management_slot(node(1)).unwrap().members_evidence[0].clone();
+        let extension = sign_registration(
+            1, 2, Some(manifest.management_slot(node(1)).unwrap().commitment()),
+            alloc::vec![root.clone(), child.clone()],
+        );
+        manifest.apply_management_registration(&extension, 4, 3).unwrap();
+        let shadow = sign_registration_from(
+            2, node(1), 1, None, alloc::vec![root.clone(), child.clone()],
+        );
+        manifest.apply_management_registration(&shadow, 5, 3).unwrap();
+        for owner in [node(1), node(2)] {
+            let slot = manifest.management_slot(owner).unwrap();
+            assert_eq!(slot.origin_owner(), node(1));
+            assert_eq!(slot.members().len(), 2);
+            assert_eq!(slot.members_evidence[0], first_root);
+        }
+        assert_observation_paths(
+            &mut manifest, &observe(&child, 6, true),
+            Err(SharedRecoveryError::InvalidObservation),
+        );
+        assert_observation_paths(&mut manifest, &observe(&child, 6, false), Ok(true));
+        assert_observation_paths(&mut manifest, &observe(&child, 7, true), Ok(true));
+        assert_observation_paths(&mut manifest, &observe(&root, 2, false), Ok(false));
+        assert_observation_paths(&mut manifest, &observe(&child, 8, false), Ok(false));
+        let complete = manifest.clone();
+
+        let mut wrong_generation = complete.clone();
+        wrong_generation.generation = AgentGenerationRouteKey::new(
+            complete.generation().space(), complete.generation().agent(),
+            Hash([0x75; 32]), complete.generation().admission(),
+        ).unwrap();
+        assert_observation_paths(
+            &mut wrong_generation, &observe(&child, 8, false),
+            Err(SharedRecoveryError::ScopeMismatch),
+        );
+        let mut wrong_committee = complete.clone();
+        let members = complete.committee().members().iter().map(|member| {
+            if member.replica().node != node(1) { return member.clone(); }
+            let mut replica = member.replica();
+            replica.role = ReplicaRole::Observer;
+            super::super::super::genesis::AgentReplicaMember::new(
+                replica, member.peer_id().to_vec(), *member.ed25519_public_key(), None,
+            ).unwrap()
+        }).collect();
+        wrong_committee.committee = AgentReplicaCommittee::new(
+            complete.generation().space(), complete.generation().agent(),
+            AgentProfile::Shared, members,
+        ).unwrap();
+        assert_observation_paths(
+            &mut wrong_committee, &observe(&child, 8, false),
+            Err(SharedRecoveryError::ScopeMismatch),
+        );
+
+        for (owner, index) in [(1, 9), (2, 10)] {
+            let release = sign_release(manifest.management_slot(node(owner)).unwrap(), owner);
+            manifest.apply_management_release(&release, index, 3).unwrap();
+        }
+        assert_observation_paths(&mut manifest, &observe(&child, 11, true), Ok(false));
+        for owner in [node(1), node(2)] {
+            let slot = manifest.management_slot(owner).unwrap();
+            assert!(slot.is_released());
+            assert_eq!(
+                slot.members_evidence,
+                complete.management_slot(owner).unwrap().members_evidence,
+            );
+        }
+        manifest.validate_at(10).unwrap();
     }
 
     #[test]

@@ -592,7 +592,9 @@ impl SharedRecoveryManifest {
         verified: &VerifiedSharedRecoveryObservation,
     ) -> Result<bool, SharedRecoveryError> {
         let observation = verified.observation();
-        observation.validate()?;
+        // The private capability owns an immutable observation whose complete
+        // validation was checked when minted at the physical apply/replay boundary.
+        // Reusing that proof does not validate a later storage read or candidate.
         if observation.generation != self.generation {
             return Err(SharedRecoveryError::ScopeMismatch);
         }
