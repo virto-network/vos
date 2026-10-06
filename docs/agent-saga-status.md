@@ -38,15 +38,18 @@ deployment is automatic.
 ## Current position
 
 Latest admitted evidence is bound to clean
-`d94b7e33a2d242378470bf7beb303aa569719f9e`.
-[Completed R59](#completed-r59-retained-install-interval-attribution)
-fails quiet and scoped all-cold startup with Shared recovery before routes
-Unavailable. Scoped evidence reaches a finalization extension, then the original
-owner's Invoke returns Unavailable; it supplies no accepted finalization/release
-proof. R58's 70.734s constructor overrun and late exact release are frozen
-preceding evidence. R57 remains the latest ordinary CLI: Local Create/Install
-complete, then Query authorization preparation fails HTTP 503 before Invoke.
-M1 remains open.
+`2d2ce1dd41351f7648276c2e2ac7f9cb810e64f1`.
+[Completed R60](#completed-r60-ordered-publication-attribution) fails quiet and
+scoped all-cold startup with Shared recovery before routes Unavailable. Scoped
+evidence binds the full finalization input to its exact work and a returned local
+append index, then records an absent result poll and the unchanged waiter timeout.
+Quorum commit, accepted application/finalization and release remain unproved.
+Post-cold unbound constructor-helper completions report 29.158s and 32.127s on
+their own clocks; no actual shutdown or quorum-loss cause is established.
+R58/R59 are frozen preceding evidence. R57 remains the latest ordinary CLI:
+Local Create/Install complete, then Query authorization preparation fails HTTP
+503 before Invoke. M1 remains open. [R61 retirement diagnostics](#r61-attachment-retirement-diagnostics--applied)
+are applied, awaiting a new checkpoint/build/reader/fixture boundary.
 
 ### Completed R56 registration-fold attribution
 
@@ -465,8 +468,9 @@ points are **4.414915s / 4.419233s** on another clock. Child-bound audits
 **1.053244s / 0.890237s**, budgets **1.424541s / 1.131181s** and preview **0.513088s**
 are nested/repeated costs, not removable totals or a controlled speedup. Existing
 waiter Debug prints only four input bytes and cannot join full input `id221`.
-Applied [R60 diagnostics](#r60-ordered-publication-and-result-diagnostics--applied)
-await new integration; positive-apply/result attribution remains an evidence gap.
+[Completed R60](#completed-r60-ordered-publication-attribution) supplies the later
+full-input/local-append join; R59's truncated-input boundary remains frozen.
+Quorum/application and accepted result attribution remain open.
 
 **Qualification:** startup/recovery whole30, client Applied, routes/fresh Query and
 the remaining M1 gates stay open. Quiet labels locate a public startup refusal,
@@ -484,24 +488,129 @@ Evidence below `target/task-tmp`:
 - `r59-install-cost-synthetic-failure.json`, SHA `1efaa7035080c32c968421ef4b28c5e0eb2a36fa1ac814883000e8cde3965417`; corrected `r59-install-cost-synthetic-result-v2.json`, SHA `663e412b330c64488a93b4c7eb411130a323f8c0eb707de83d5bb8c8ce0b5479`.
 - `r59-scoped-preflight-refusal.json`, SHA `6c140583254009fcb86b1c61b217ab56bb27b196cbc8aaa3d4026eae2ff1fc70`, is nonexecution evidence only.
 
-### R60 ordered publication and result diagnostics — applied
+### Completed R60 ordered publication attribution
 
-**Implementation:** Root applied the independently reviewed two-file diagnostic
-patch `r60-ordered-publication-diagnostic-proposal-v2.patch`, SHA
-`8376b82bd1267015a95ce855b3d6291bad3c96485e9dc05b8e17c9b5db7954e7`.
-It reports full existing waiter input and returned proposal index, plus gated
+**Implementation:** diagnostic-only source is frozen at
+`2d2ce1dd41351f7648276c2e2ac7f9cb810e64f1`. Independently reviewed patch
+`r60-ordered-publication-diagnostic-proposal-v2.patch`, SHA
+`8376b82bd1267015a95ce855b3d6291bad3c96485e9dc05b8e17c9b5db7954e7`,
+reports full existing waiter input/returned proposal index and positive
 committed-seen/anchor/result-poll/Waiting→Ready facts. No new hash, I/O, cache,
-clone, API, checks, guard/drop or deadline change; guest bytes/pins stay unchanged.
+clone or API. Original checks, guard/drop ordering, limits and deadlines remain
+unchanged, as do guest bytes/pins. This is not a behavior candidate.
 
-Early committed-seen has no input; index alone cannot join exact retained work.
-Anchor input is Some only from the existing registered-input lookup, None for
-unregistered work. Commit frontier is the original slot snapshot. Ready records
-buffer state, not delivery/ACK/terminal completion. Missing markers are inconclusive.
+**Integration:** portable main/harness pass **458.977s / 575.718s**, strict
+six-file verification **0.201s**, with the original source/command/environment,
+frozen-binary and exhausted/noninterrupted ownership fences. Independent review
+found the initial reader draft's source/proposal constants unenforced; corrected
+v2 enforces them before private evidence execution. The initial draft was not
+run on private evidence. Reviewed pure synthetics pass **201 acceptance /
+557 refusal**, plus **8 source-enforcement refusals**, alias/privacy checks and
+zero helper/private-input loads.
+One scoped fixture fails **291.822s**, exit 101/one failed test/exhausted/
+noninterrupted. Strict admission yields **16,616 records / 383 explicit edges /
+263 identity aliases / 52 thread aliases / zero unknowns**. One quiet fixture fails **244.365s**
+on the same frozen binaries, likewise exhausted/noninterrupted. Its literal-only
+HEAD adapter preserves the original grammar/fences.
 
-**Integration:** owned build provenance will record the exact new checkpoint.
-Portable builds, reader admission and fresh fixture remain pending. Latest
-admitted evidence stays R59 on `d94b7e33`. **Qualification:** none follows; no
-behavior candidate, new authority, automatic remedy or cap/deadline extension.
+Quiet admission records Shared recovery before routes Unavailable once and public
+panic `clean_startup_tests.rs:1989:29`, zero unknown locations and no proven bound
+labels. Scoped finite summary has the same refusal, no pending-fixture source
+rows, and seven startup phase samples except six Shared-recovery/controller
+completions. This is a constructor refusal before successful full join/public
+retry, not R58's line-277 whole30 assertion or an actor Query verdict.
+
+Public Create root `id30` reaches Applied/exact replay. Verified pending cut
+e12426 and cold entry e12470 precede unbound post-cold controller completions
+e14501 **29.158s** and e14820 **32.127s**; Shared-recovery points e14500/e14819
+are **29.156s / 32.126s**. Each is cumulative on its own helper's clock, starting
+after readonly preflight (`clean_startup.rs:1218`), before constructor return and
+public retry. No node/call pairing, subtraction, global clock or failed-owner
+binding follows. The 32.127s helper sample itself exceeds the unchanged 30s
+target; the actual public panic remains the constructor refusal.
+
+Declared Install root `id225` retains original invocation/work/authorization
+`id224/id226/id227` on owner `id1`/System agent `id2`; candidate authorizations
+remain distinct. Original-invocation intervals record retained-owner lookup
+**51.663ms / 56.861ms** Ok, submission **3.352023s** refused/**11.656ms** Ok,
+durable observation **50.776ms** Ok and issuer observation **3.459ms** Ok.
+These API Results do not identify attempts, cover all startup work, or prove
+accepted finalization; nested/repeated clocks are not added.
+
+Final child `id255/work256/auth257`, registration `id258` sequence 5/member
+`id260`, extends root member `id236`. Candidates `id261/id262` stay separate
+from original `id257`. Extension completes e16303, then owner Invoke starts
+e16304. Owner records fourteen absent polls at retained frontier (47,3), custody
+timeout e16528 and Invoke Unavailable e16530. The declared-root subset supplies
+no accepted finalization issuer save, retirement, terminal/full-member ACK or
+release proof. Three completed-Done previews for work `id256` are not those
+accepted boundaries or a general guest-stack verdict.
+
+Leader `id6` explicitly prepares full input `id263` e16602 with invocation/
+work/auth `id255/id256/id257` and returns **local append index 48** e16605.
+Result poll e16609 declares the same input absent; waiter failure e16612 declares
+that full input and **1,800,073us waiting_timeout**. The latter two records have
+no node/thread/attempt identity. Repeated immutable input/work identifies exact
+content, not a unique attempt. Owner and leader clocks remain independent.
+No exact input263 positive durable-anchor/Waiting→Ready record is admitted;
+local append is not quorum commit/application proof and missing markers do not
+prove nonexecution. Seven earlier full inputs have positive anchors on all
+three nodes and true result-poll/Waiting→Ready records, a component-positive
+diagnostic control, not client delivery/ACK proof. Early committed-seen has no
+input; index alone cannot join work. Anchor input is Some only from the existing
+registered lookup, None otherwise; commit frontier is the original slot snapshot.
+
+The consuming Shared constructor propagates recovery error and drops lifecycle
+ownership (`local_lifecycle.rs:3951–3963`). The lifecycle owns its System-owner
+Arc (`local_lifecycle.rs:3536`); that owner holds the network host
+(`clean_bootstrap.rs:1653`). Releasing the last owner can invoke owning retirement
+before/independently of test joins. Separately, join panic can unwind returned
+owner values (`clean_startup_tests.rs:1984–1992`). Actual teardown, attachment/
+voter stop and any quorum effect remain unobserved source-only hypotheses.
+
+Source inventory is complete: existing records do not prove attachment/voter
+stop or the exact post-append frontier. A new frontier sample would require an
+extra read. Applied R61 below observes only existing owning-retirement boundaries;
+positive lifecycle and commit/application attribution remain open. R60 supplies
+no behavior remedy.
+
+**Qualification:** whole30, client Applied, routes/fresh Query and M1 remain
+open. Quiet labels do not establish scoped inner causes. R58/R59/R60 are
+uncontrolled outcomes, not a speedup/regression measurement. No current ordinary
+CLI workflow ran; R57's Query authorization-preparation HTTP 503 remains latest.
+No new authority, behavior candidate, cap/deadline extension or readiness follows.
+
+The initial quiet permission review timed out before process creation. Its
+nonexecution record states no unsafe verdict and permits one identical retry;
+that retry produced the single measured quiet fixture, not a second test attempt.
+
+Evidence below `target/task-tmp`:
+
+- `r60-cli-build-2d2ce1dd/provenance.json`, SHA `a341a8183384e07df78fb308439ecad7908e50f5b8a3bb2af16746f18b9db5e3`; frozen main/harness SHA `e3f82b4da6413eb487f1e576d744f469c0a13e7c6b771489a15ba43e89d8c016` / `c01a09bdac32bfcbfef3b91dc0a6d24488153dcddcdf49de0ea5862a74c58d9d`; strict verification result SHA `26cb54391b2e5603ab6322ac93b78cff6d8faf6cd6fb6873c69fea153a92deda`.
+- `r60-pending-all-cold-scoped-2d2ce1dd/ordered-publication-safe-v2.json`, SHA `312b685d1cd3b8d7e20f8f3765a6ccc2d519f4bfc70d0e7b71363f0b636c35ab`; `safe-summary.json` in that directory, SHA `32a24f0a888afaa129a03168f62da2ad415e3480aa066cd9ce6ca8853e1f684d`.
+- `r60-pending-all-cold-quiet-2d2ce1dd/quiet-stage-safe-summary.json`, SHA `00a322533a0b5cebdcef29d3c887222d8d26eee4b4fe4c3570134eaa05365f24`; scoped/quiet reader SHA `fe2e3296b4f8c8ffab6334890f0717b6bf202400a24d0ce845f59cf112c2b531` / `fad5775fe9aa8ec92bdd75cee44462b55344a8ad6cef91d9018af783b40f1979`.
+- `r60-ordered-publication-v2-synthetic-result.json`, SHA `fb8a96c245a682edc31e77683d2e3703cdf1c9d4b695c1fe9ecaba37c56357e1`; `r60-quiet-launch-permission-timeout.json`, SHA `350e12e31e01c3dd04413d1fd0070d613eb6b2d287a64fcd7d768b2bdb70b2ff`, is nonexecution evidence only.
+
+### R61 attachment retirement diagnostics — applied
+
+**Implementation:** Root applied independently reviewed
+`r61-retirement-boundary-diagnostic-proposal.patch`, SHA
+`575a77e5abca2bd9c3e6f345446fc25d821c1e45c93b1ad5a7c5f126317861c0`.
+Only `vos/src/network/shared_agent.rs` changes (source SHA
+`eea71b6ac11ed4c80386d5c721b9c9057e271ec89d0d4ef67d3741a893f6b40d`).
+Six std/env-gated records copy node/agent/route metadata at existing retirement
+start, ingress return, lifecycle-wait/revocation and worker-shutdown start/return.
+Ingress return includes its existing removal boolean. No new hash, ledger/
+frontier I/O or API. Original checks, guard/drop order, guest/pins, limits and
+deadlines remain unchanged.
+
+These phases do not identify a caller/attempt, prove quorum loss or complete
+thread joins/retirement. Missing markers are inconclusive. **Integration:**
+the new checkpoint will be recorded in owned build provenance; portable builds,
+source-specific reader admission and fresh fixture are pending. **Qualification:**
+none; latest admitted evidence remains R60 on `2d2ce1dd`. This is approved
+diagnostic attribution, not a behavior candidate, new authority, remedy,
+cap/deadline extension or promotion.
 
 ### Completed R55 release-bound audit attribution
 
@@ -2082,8 +2191,8 @@ unrelated zero-selection filters are not evidence.
 | --- | --- | --- |
 | Internal Authority observations | O1/O2 and O3 removal are implemented: no read custody/transport/apply/expiry lifecycle. Management retention and public Invoke/ACK remain. | Current physical observation **passes 67.75s**, including exactly one caught-up audit and existing freshness/no-write/cancellation/reopen cases. Optimized management/replay/owner/supervisor/protocol/observation checks **241/241** pass (10 ignored, 7.09s). SDK **259 + 256 passed**, each 1 ignored. Paired signed-role/purity probes **pass 4.64s** with explicit, unmeasured limits. Packaged closure/startup/retry checks **40 passed**, 2 ignored. No released workflow or SLA pass. |
 | External storage/restore | Incremental executor, immutable closure, ACX1 publication and exact marker retirement exist. | Historical optimized reopen/crash-cut slices pass; the released workflow must requalify. |
-| System management recovery | Parent retention, immutable MRQ2 first-owner binding, exact mutation evidence, signed terminal release and recovery remain. R57 derives scalar capacity from one fresh guarded signed-release preflight; final worker barrier and prefix-checked proposal remain. | Latest R59 quiet/scoped startup fails Shared recovery before routes Unavailable. Scoped Install completes a finalization extension, then owner Invoke returns Unavailable; accepted finalization/issuer save/retirement/release are unproved. Whole30/routes/client Applied/fresh Query remain open. R58’s accepted late exact release and 70.734s constructor overrun are frozen preceding evidence. All nineteen R57 preservation units pass on `4b5e3b8e`, as component evidence only. Earlier offline-pruning **419.04s / finalization 21.588s**, contended 32.979s failure and preparation-only `b20faacd` passes remain frozen. Earlier NRT1/forwarded-release timeout and returning startup Unavailable are separate frozen boundaries, not attribution or qualification of current recovery. |
-| Member/public management | Packaged PublicWorkflow selects exact bundled roles and ordinary CLI Create. Ambiguous publication re-admits the original leased stores before exact retry. Finalization retains publication protection and verifies fresh decision state before exact terminal cleanup. Packaged reopen helpers explicitly use normal startup admission. Provision components use the existing boxed decoder without changing wire, validation or limits. | Native genesis **15 passed** and coherent exact-finalization retry **96.21s** remain frozen component evidence under unchanged 30s phases. Source and six-file bundle reproduction pass. Latest R59 public Create reaches Applied/exact replay; cold Install completes a finalization extension, then owner Invoke returns Unavailable and startup fails before routes. R58’s late exact release/constructor overrun remain historical. Client Applied/routes/fresh Query remain unqualified. Latest ordinary CLI is still R57: normal image Local Create (**33.304s / 2 attempts**) and Install (**70.208s / 8 attempts**) complete, then Query authorization preparation returns HTTP 503/CLI exit 1 before Invoke. Shared/reopen are unreached; cleanup exits 1 despite zero survivors. Earlier Local Install ScopeMismatch and `5750f0c2` Local Query/ACK remain frozen evidence, not current attribution. Lost-result/reopen, pending-Install recovery and complete three-process acceptance remain open. |
+| System management recovery | Parent retention, immutable MRQ2 first-owner binding, exact mutation evidence, signed terminal release and recovery remain. R57 derives scalar capacity from one fresh guarded signed-release preflight; final worker barrier and prefix-checked proposal remain. | Latest R60 quiet/scoped startup fails Shared recovery before routes Unavailable. Exact finalization input/work reaches local append index 48, then absent result polling/waiter timeout; owner Invoke separately returns Unavailable. Quorum/application and accepted finalization/issuer save/retirement/release remain unproved. Whole30/routes/client Applied/fresh Query remain open. R58’s accepted late exact release and 70.734s constructor overrun are frozen preceding evidence. All nineteen R57 preservation units pass on `4b5e3b8e`, as component evidence only. Earlier offline-pruning **419.04s / finalization 21.588s**, contended 32.979s failure and preparation-only `b20faacd` passes remain frozen. Earlier NRT1/forwarded-release timeout and returning startup Unavailable are separate frozen boundaries, not attribution or qualification of current recovery. |
+| Member/public management | Packaged PublicWorkflow selects exact bundled roles and ordinary CLI Create. Ambiguous publication re-admits the original leased stores before exact retry. Finalization retains publication protection and verifies fresh decision state before exact terminal cleanup. Packaged reopen helpers explicitly use normal startup admission. Provision components use the existing boxed decoder without changing wire, validation or limits. | Native genesis **15 passed** and coherent exact-finalization retry **96.21s** remain frozen component evidence under unchanged 30s phases. Source and six-file bundle reproduction pass. Latest R60 public Create reaches Applied/exact replay; cold Install completes a finalization extension, with exact finalization input locally appended but accepted application/result unproved. Owner Invoke returns Unavailable and startup fails before routes. R58’s late exact release/constructor overrun remain historical. Client Applied/routes/fresh Query remain unqualified. Latest ordinary CLI is still R57: normal image Local Create (**33.304s / 2 attempts**) and Install (**70.208s / 8 attempts**) complete, then Query authorization preparation returns HTTP 503/CLI exit 1 before Invoke. Shared/reopen are unreached; cleanup exits 1 despite zero survivors. Earlier Local Install ScopeMismatch and `5750f0c2` Local Query/ACK remain frozen evidence, not current attribution. Lost-result/reopen, pending-Install recovery and complete three-process acceptance remain open. |
 | Service/operations | Offline signed corpus generator, bounded public corpus loader and read-only hardware collector exist. Loader resumes exact private ATQ1 through existing CLI/ASR1 verification and independently replays accepted seeds/order for all six maps. | Loader tooling tests **7 passed, 0.10s**; it has not executed public data. M1 setup and pre-granted signed Clerk Operator/Member roles are prerequisites. Public retained loading, resources/recovery, backup/restore, overload, soak and hardware qualification remain open. |
 
 R36y is the frozen, superseded legacy-read diagnostic boundary, not qualification
@@ -2679,22 +2788,27 @@ snapshot return and leased comparison remain mandatory.
 
 Remaining release work, in dependency order:
 
-1. Use [completed R59](#completed-r59-retained-install-interval-attribution).
-   Quiet and scoped startup fail Shared recovery before routes Unavailable;
-   current scoped finalization extends the exact member, then owner Invoke
-   returns Unavailable without accepted issuer/retirement/release proof.
-   Attribute exact ordered publication, returned index and positive application/
-   result delivery before selecting a remedy. Truncated waiter input cannot
-   supply that join; applied R60 diagnostics await new integration. Preserve separate
-   constructor clocks and earlier R58 whole30/late-release evidence, keeping
-   current quiet labels free of guessed inner/scoped-family causes. No nested
-   cost addition, proximity pairing, unique-attempt or removable-work inference.
+1. Use [completed R60](#completed-r60-ordered-publication-attribution).
+   Quiet/scoped constructor recovery fails before routes; exact finalization work
+   reaches full-input local append index 48, absent result polling and waiter
+   timeout. Attribute post-proposal quorum/commit/application and positive owner/
+   attachment lifecycle before selecting a remedy. A failed consuming Shared
+   constructor can drop lifecycle/System/network ownership before test joins;
+   constructor-error teardown remains a source-only hypothesis, not quorum-loss
+   proof. Post-cold
+   unbound helper clocks 29.158s/32.127s do not identify the failed owner; retain
+   separate clocks and historical R58 whole30/late-release and R59 references.
+   Keep quiet labels free of guessed scoped causes. No nested-cost addition,
+   proximity pairing, unique-attempt or missing-marker nonexecution inference.
    Independent fresh physical audits remain mandatory; host/proposal guards
    do not prevent raw Raft progress. Preserve retained continuation, fresh
    absence/settled-prefix, availability/corruption, worker/post-peer checks and
    original deadlines. Any authorized remedy requires fresh portable main/
-   harness provenance and isolated acceptance. No further behavior candidate,
-   week-cap extension or controlled speedup is authorized by these diagnostics.
+   harness provenance and isolated acceptance. R61 retirement diagnostics are
+   applied awaiting the new frozen build/reader/fixture boundary. Source inventory
+   is complete: existing records do not prove attachment/voter stop or the exact
+   post-append frontier; an extra frontier read is outside R61. No behavior candidate,
+   week-cap extension or controlled speedup is authorized by these results.
 2. Qualify Local callback recovery under unchanged whole30 and current ordinary
    three-process CLI/HTTP. Current R57 ordinary CLI completes Local Create and
    Install, then Query authorization preparation returns HTTP 503/CLI exit 1
@@ -2742,25 +2856,29 @@ Separate forecasts and unknowns:
   signed runtime roles, decoder correction, startup snapshot/factory checks and
   approved integrated recovery corrections are implemented. R57's combined
   release entry and all nineteen component preservation cases pass on frozen
-  `4b5e3b8e`; R58/R59 gated diagnostics are measured on `7870d498`/`d94b7e33`. Remaining
-  remedy/source-hour effort has low forecast confidence and no defensible range
-  until exact publication/application/result-delivery and startup causes are established.
+  `4b5e3b8e`; R58/R59/R60 gated diagnostics are measured on
+  `7870d498`/`d94b7e33`/`2d2ce1dd`. Remaining remedy/source-hour effort has low
+  forecast confidence and no defensible range until post-proposal commit/
+  application/result delivery and constructor/attachment lifetime causes are
+  established. A local append-index proof supplies no behavioral remedy.
   The original **22–44 source-hour**
   O1–O3 and earlier conditional **1–4 source-hour / 2–6 elapsed-hour** bands are
   historical estimates, not current remaining forecasts. No new observation
   design, cache, framework, larger limit or deadline is authorized by variance.
-- **Integration:** latest paired portable builds take **418.124s / 511.230s**,
-  **15.5 minutes combined**, plus **0.101s** strict bundle verification.
-  R59's failed scoped/quiet attempts take **287.509s / 216.134s** (**4.8 / 3.6
-  minutes**). Earlier R58/R57 attempt costs stay at frozen references. Confidence in
-  these exact measured attempt costs is high. They are different stages and
-  schedules, not success bounds or a remaining-work ETA. Unknowns include the
-  constructor recovery, exact ordered publication/apply/result delivery and Local Query
-  authorization-preparation refusal and whether later required recovery/pruning
-  gates expose further defects. A new source boundary requires new current
-  portable binaries and evidence; no defensible aggregate integration range
-  exists yet. Earlier build/failed-run variance remains at its frozen references.
-- **Qualification:** M1 remains open. R59 quiet/scoped startup fails before a
+- **Integration:** latest paired portable builds take **458.977s / 575.718s**,
+  **17.25 minutes combined**, plus **0.201s** strict bundle verification.
+  R59's paired build cost was 15.5 minutes; causes of this build variance are
+  unmeasured, with no application-regression or cap-expansion inference.
+  R60's failed scoped/quiet attempts take **291.822s / 244.365s** (**4.9 / 4.1
+  minutes**). Earlier R59/R58/R57 attempt costs stay at frozen references.
+  Confidence in these exact measured attempt costs is high. They are different
+  stages/schedules, not success bounds or a remaining-work ETA. Unknowns include
+  constructor/attachment lifetime, post-proposal quorum/application/result
+  delivery, Local Query authorization-preparation refusal and further required
+  recovery/pruning defects. A new source boundary requires current portable
+  binaries and evidence; no defensible aggregate integration range exists yet.
+  Earlier build/failed-run variance remains at its frozen references.
+- **Qualification:** M1 remains open. R60 quiet/scoped startup fails before a
   successful join/public retry; R58's historical **70.734s** constructor and late
   release do not qualify current artifacts. Whole30, client Applied,
   routes/fresh Query, Shared ordinary CLI/reopen, returning pending Install,
@@ -2775,7 +2893,7 @@ Separate forecasts and unknowns:
 
 The one focused engineering-week go/no-go cap remains unchanged. Both original
 measured service-tuning passes failed to qualify recovery; separately authorized
-R48/R52/R54 candidates and R57 coordination likewise do not close M1. R58 is
+R48/R52/R54 candidates and R57 coordination likewise do not close M1. R58–R60 are
 causal diagnostics, not automatic authorization for another behavior candidate
 or cap rollover. Broader simplification remains context for a separate decision
 once the demonstrated blocking causes are understood. Keep distinct physical,

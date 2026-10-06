@@ -7337,11 +7337,32 @@ impl SharedAgentNetworkHost {
         let Some(mut attached) = self.generations.remove(&agent) else {
             return Ok(());
         };
+        #[cfg(feature = "std")]
+        let retirement_diagnostics = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS")
+            .is_some()
+            .then(|| (self.network.agent_node_id(), attached.fingerprint.protocol_route));
+        #[cfg(feature = "std")]
+        let trace_retirement = |phase: &'static str| {
+            if let Some((node, route)) = retirement_diagnostics {
+                tracing::debug!(node = ?node.0, agent = ?agent.0,
+                    route_space = ?route.space.0, route_group = ?route.generation.0,
+                    phase, "VOS causal attachment retirement");
+            }
+        };
+        #[cfg(feature = "std")]
+        trace_retirement("start");
         // Stop admitting work before waiting on the host mutex. The existing
         // Attached lease already blocks snapshot/GC, and removing the route
         // bounds the set of callers which can still contend for this host.
-        self.network
+        let _ingress_removed = self.network
             .retire_agent_route(attached.fingerprint.protocol_route, &attached.handler);
+        #[cfg(feature = "std")]
+        if let Some((node, route)) = retirement_diagnostics {
+            tracing::debug!(node = ?node.0, agent = ?agent.0,
+                route_space = ?route.space.0, route_group = ?route.generation.0,
+                phase = "ingress_returned", removed = _ingress_removed,
+                "VOS causal attachment retirement");
+        }
         // Reserve the destructive storage boundary throughout ordered route
         // revocation and worker/thread shutdown. Snapshot replacement and GC
         // remain blocked until every cached database user is gone.
@@ -7351,14 +7372,22 @@ impl SharedAgentNetworkHost {
             .map_err(|_| SharedAgentHostError::Unavailable)
             .and_then(|mut host| host.mark_transport_stopping(agent));
         attached.merge_stop.store(true, Ordering::Release);
+        #[cfg(feature = "std")]
+        trace_retirement("lifecycle_wait_start");
         let mut live = attached
             .lifecycle
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *live = false;
         drop(live);
+        #[cfg(feature = "std")]
+        trace_retirement("lifecycle_revoked");
         if let Some(worker) = attached.worker.take() {
+            #[cfg(feature = "std")]
+            trace_retirement("worker_shutdown_start");
             worker.shutdown();
+            #[cfg(feature = "std")]
+            trace_retirement("worker_shutdown_returned");
         }
         if let Some(thread) = attached.apply_thread.take() {
             let _ = thread.join();
