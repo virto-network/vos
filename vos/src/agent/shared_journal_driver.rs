@@ -7060,6 +7060,19 @@ where
             return Ok(SharedPhysicalApplyOutcome::Idle);
         };
         let index = slot.index();
+        #[cfg(feature = "std")]
+        let diagnostic_enabled = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some();
+        #[cfg(feature = "std")]
+        if diagnostic_enabled
+            && let CommittedSharedRaftSlot::Command(command) = &slot
+            && let AgentRaftCommand::Ordered { route, .. } = command.entry().command()
+        {
+            tracing::debug!(node = ?self.local_node.0, agent = ?route.agent().0,
+                space = ?route.space().0, genesis = ?route.genesis().as_bytes(),
+                admission = ?route.admission().as_bytes(), index,
+                term = slot.term(), committed = slot.committed_index(),
+                phase = "committed_seen", "VOS causal ordered application");
+        }
         let outcome = match &slot {
             CommittedSharedRaftSlot::LeaderNoop(_) | CommittedSharedRaftSlot::Configuration(_) => {
                 let outcome = match self.ledger.apply_foundation_slot(&slot)? {
@@ -7261,11 +7274,19 @@ where
                                 publication
                             }
                         };
+                        #[cfg(feature = "std")]
+                        let mut diagnostic_input = None;
                         let observation = if self.ledger.recovery_input_registered(&entry.input)? {
+                            let entry_id = entry.id();
+                            let input_id = entry.input.id();
                             let outcome = self
                                 .executor
-                                .clean_ordered_result_at(entry.id(), entry.input.id())
+                                .clean_ordered_result_at(entry_id, input_id)
                                 .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+                            #[cfg(feature = "std")]
+                            if diagnostic_enabled {
+                                diagnostic_input = Some(input_id);
+                            }
                             if matches!(
                                 outcome,
                                 crate::agent_sdk::RuntimeOutcome::Acknowledged(Err(_))
@@ -7291,6 +7312,15 @@ where
                         )?;
                         if let Some(batch) = artifact_batch {
                             self.artifacts.retire(*route, *batch)?;
+                        }
+                        #[cfg(feature = "std")]
+                        if diagnostic_enabled {
+                            tracing::debug!(node = ?self.local_node.0, agent = ?route.agent().0,
+                                space = ?route.space().0, genesis = ?route.genesis().as_bytes(),
+                                admission = ?route.admission().as_bytes(), index,
+                                term = slot.term(), committed = slot.committed_index(),
+                                input = ?diagnostic_input.map(|input| *input.as_bytes()),
+                                phase = "durable_anchor", "VOS causal ordered application");
                         }
                         command_outcome(completion, index)
                     }

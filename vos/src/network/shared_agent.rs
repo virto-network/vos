@@ -636,9 +636,18 @@ impl OrderedReplyWaiters {
         if inputs.is_empty() {
             return Ok(());
         }
+        #[cfg(feature = "std")]
+        let diagnostic_enabled = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some();
         let mut completed = Vec::new();
         for input in inputs {
-            if let Some(outcome) = host.try_take_clean_ordered_result(agent, input)? {
+            let outcome = host.try_take_clean_ordered_result(agent, input)?;
+            #[cfg(feature = "std")]
+            if diagnostic_enabled {
+                tracing::debug!(agent = ?agent.0, input = ?input.as_bytes(),
+                    phase = "result_poll", present = outcome.is_some(),
+                    "VOS causal ordered handoff");
+            }
+            if let Some(outcome) = outcome {
                 completed.push((input, outcome));
             }
         }
@@ -650,8 +659,15 @@ impl OrderedReplyWaiters {
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
         for (input, outcome) in completed {
-            if matches!(replies.get(&input), Some(OrderedReplyState::Waiting)) {
+            let waiting = matches!(replies.get(&input), Some(OrderedReplyState::Waiting));
+            if waiting {
                 replies.insert(input, OrderedReplyState::Ready(outcome));
+            }
+            #[cfg(feature = "std")]
+            if diagnostic_enabled {
+                tracing::debug!(agent = ?agent.0, input = ?input.as_bytes(),
+                    phase = "waiter_ready", present = waiting,
+                    "VOS causal ordered handoff");
             }
         }
         self.changed.notify_all();
@@ -677,7 +693,7 @@ impl OrderedReplyWaiters {
         let trace_failure = |reason: &'static str| {
             if let Some(started) = diagnostic_started {
                 tracing::debug!(
-                    ?input,
+                    input = ?input.as_bytes(),
                     reason,
                     elapsed_us = started.elapsed().as_micros(),
                     "Ordered reply waiter failed"
@@ -3164,12 +3180,25 @@ impl SharedRouteHandler {
                 .into_payload()
                 .ok_or(SharedAgentHostError::Conflict)?;
             trace("propose_start");
-            if let Err(error) = futures_executor::block_on(worker.propose(payload)) {
-                tracing::debug!(?error, "clean ordered proposal did not commit");
-                self.ordered_replies.cancel(input);
-                return Err(refused("propose_error", SharedAgentHostError::Unavailable));
-            }
+            let proposed_index = match futures_executor::block_on(worker.propose(payload)) {
+                Ok(index) => index,
+                Err(error) => {
+                    tracing::debug!(?error, "clean ordered proposal did not commit");
+                    self.ordered_replies.cancel(input);
+                    return Err(refused("propose_error", SharedAgentHostError::Unavailable));
+                }
+            };
             trace("propose_complete");
+            #[cfg(feature = "std")]
+            if started.is_some() {
+                tracing::debug!(node = ?diagnostic_node.0, agent = ?self.agent.0,
+                    route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
+                    thread = ?std::thread::current().id(), invocation = ?diagnostic_invocation.0,
+                    work = ?management_diagnostic_key.map(|key| key.work.0),
+                    authorization = ?management_diagnostic_key.map(|key| key.authorization.0),
+                    input = ?input.as_bytes(), index = proposed_index,
+                    "management_custody_submit appended input");
+            }
             input
         };
         trace("post_propose_host_wait_start");
