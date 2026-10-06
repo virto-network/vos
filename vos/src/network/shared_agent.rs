@@ -37,6 +37,8 @@ use crate::agent::shared_commit::{
 use crate::agent::shared_host::{
     SharedAgentApplyOutcome, SharedAgentHost, SharedAgentHostError, SharedAgentRuntimeProjection,
     SharedAgentStatus, SharedAgentTransportState,
+    admission_capture_span, admission_diagnostic_result, admission_diagnostic_started,
+    trace_admission_diagnostic,
 };
 use crate::agent::shared_journal_driver::SharedMergeObject;
 use crate::agent::shared_raft::{
@@ -1745,8 +1747,11 @@ impl SharedRouteHandler {
                     "release_poll", phase, Some(metadata), Some(poll));
             }
         };
-        let refused = |phase: &str, error: SharedAgentHostError| {
+        let refused = |phase: &'static str, error: SharedAgentHostError| {
             trace(phase);
+            tracing::warn!(phase, unavailable = matches!(error, SharedAgentHostError::Unavailable),
+                metadata = ?diagnostic.and_then(|(_, metadata, _)| metadata).map(|value| value.0),
+                "VOS management metadata diagnostic");
             if started.is_some() {
                 tracing::debug!(node = ?self.network.agent_node_id().0, agent = ?self.agent.0,
                     route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
@@ -2060,6 +2065,7 @@ impl SharedRouteHandler {
         F: FnOnce(&PendingManagement) -> Result<T, SharedAgentHostError>,
     {
         let key = management_envelope_key(self.agent, proposed)?;
+        let _capture_span = admission_capture_span(key.invocation, "management_capture");
         let diagnostic_started = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS")
             .is_some().then(Instant::now);
         let trace_capture = |phase: &'static str| {
@@ -2076,10 +2082,15 @@ impl SharedRouteHandler {
             return Err(SharedAgentHostError::Conflict);
         }
         trace_capture("capture_proposal_start");
+        let started = admission_diagnostic_started();
         let mut proposal = self
             .proposal
             .lock()
-            .map_err(|_| SharedAgentHostError::Unavailable)?;
+            .map_err(|_| {
+                trace_admission_diagnostic("proposal_lock", started, false, true);
+                SharedAgentHostError::Unavailable
+            })?;
+        trace_admission_diagnostic("proposal_lock", started, true, false);
         trace_capture("capture_proposal_acquired");
         let pending_keys = if pending.is_empty() {
             None
@@ -2153,38 +2164,57 @@ impl SharedRouteHandler {
             .as_ref()
             .ok_or(SharedAgentHostError::TransportNotAttached)?;
         if !(retain_management && self.management_retention) && !self.has_local_proposer(worker) {
+            trace_admission_diagnostic("proposer_unavailable", None, false, true);
             return Err(SharedAgentHostError::Unavailable);
         }
         trace_capture("capture_worker_start");
-        let barrier = futures_executor::block_on(worker.snapshot())
-            .ok_or(SharedAgentHostError::Unavailable)?;
+        let started = admission_diagnostic_started();
+        let barrier = admission_diagnostic_result("initial_snapshot", started,
+            futures_executor::block_on(worker.snapshot())
+                .ok_or(SharedAgentHostError::Unavailable))?;
         trace_capture("capture_worker_complete");
-        quiescent_proposal_commit(
+        let started = admission_diagnostic_started();
+        admission_diagnostic_result("initial_prefix", started, quiescent_proposal_commit(
             barrier.role,
             barrier.commit_index,
             barrier.last_log_index,
             retain_management && self.management_retention,
-        )?;
+        ))?;
         trace_capture("capture_host_start");
+        let started = admission_diagnostic_started();
         let mut host = self
             .host
             .lock()
-            .map_err(|_| SharedAgentHostError::Unavailable)?;
+            .map_err(|_| {
+                trace_admission_diagnostic("host_lock", started, false, true);
+                SharedAgentHostError::Unavailable
+            })?;
+        trace_admission_diagnostic("host_lock", started, true, false);
         trace_capture("capture_host_acquired");
-        drain_committed(&mut host, self.agent, &self.ordered_replies)?;
+        let started = admission_diagnostic_started();
+        admission_diagnostic_result("drain", started,
+            drain_committed(&mut host, self.agent, &self.ordered_replies))?;
         trace_capture("capture_host_drained");
-        let (applied_slots, remaining_slots, _) = host.capacity(self.agent)?;
-        let current = futures_executor::block_on(worker.snapshot())
-            .ok_or(SharedAgentHostError::Unavailable)?;
-        CommittedProposalBarrier::from(&barrier)
-            .validate_applied(CommittedProposalBarrier::from(&current), applied_slots)?;
+        let started = admission_diagnostic_started();
+        let (applied_slots, remaining_slots, _) = admission_diagnostic_result("capacity", started,
+            host.capacity(self.agent))?;
+        let started = admission_diagnostic_started();
+        let current = admission_diagnostic_result("capacity_snapshot", started,
+            futures_executor::block_on(worker.snapshot())
+                .ok_or(SharedAgentHostError::Unavailable))?;
+        let started = admission_diagnostic_started();
+        admission_diagnostic_result("capacity_prefix", started, CommittedProposalBarrier::from(&barrier)
+            .validate_applied(CommittedProposalBarrier::from(&current), applied_slots))?;
         // Singleton System keeps its historical management lane. The custody
         // manifest is a fixed-three contract, not an empty singleton fallback.
         let fixed_three_retention = if retain_management {
-            let status = host
-                .supervisor_attachment_status(self.agent)?
+            let started = admission_diagnostic_started();
+            let status = admission_diagnostic_result("attachment", started, host
+                .supervisor_attachment_status(self.agent))?
                 .ok_or(SharedAgentHostError::AgentNotFound)?;
-            AttachmentFingerprint::from_attachment_status(&status)?
+            let started = admission_diagnostic_started();
+            admission_diagnostic_result("attachment_fingerprint", started,
+                AttachmentFingerprint::from_attachment_status(&status))?
                 .members
                 .len()
                 == 3
@@ -2192,10 +2222,13 @@ impl SharedRouteHandler {
             false
         };
         if !fixed_three_retention && barrier.role != vos_raft::Role::Leader {
+            trace_admission_diagnostic("retention_role", None, false, true);
             return Err(SharedAgentHostError::Unavailable);
         }
         let retained_member = if fixed_three_retention {
-            let manifest = host.recovery_manifest(self.agent)?;
+            let started = admission_diagnostic_started();
+            let manifest = admission_diagnostic_result("member_manifest", started,
+                host.recovery_manifest(self.agent))?;
             if fresh_only && manifest.management_slots().iter().any(|slot| {
                 slot.members().iter().any(|member| member.work().invocation == key.invocation)
             }) {
@@ -2231,7 +2264,9 @@ impl SharedRouteHandler {
         } else if let Some(member) = retained_member {
             (member.anchor().clone(), member.envelope().clone())
         } else {
-            let position = host.journal_position(self.agent)?;
+            let started = admission_diagnostic_started();
+            let position = admission_diagnostic_result("journal_position", started,
+                host.journal_position(self.agent))?;
             (
                 crate::agent::clean_management_intent::ManagementJournalAnchor {
                     genesis: position.genesis,
@@ -2250,15 +2285,16 @@ impl SharedRouteHandler {
             combined.push(candidate.clone());
         }
         let keys = pending_management_keys(self.agent, &combined)?;
-        let required = if predecessor.is_none() {
-            host.management_initial_admission_requirement(self.agent, &candidate.0, &candidate.1)?
+        let started = admission_diagnostic_started();
+        let required = admission_diagnostic_result("initial_budget", started, if predecessor.is_none() {
+            host.management_initial_admission_requirement(self.agent, &candidate.0, &candidate.1)
         } else {
             host.management_recovery_admission_requirement(
                 self.agent,
                 &pending_management_refs(&combined),
                 &retiring.iter().flatten().collect::<Vec<_>>(),
-            )?
-        };
+            )
+        })?;
         let Some(required) = required else {
             tracing::warn!(
                 agent = ?self.agent,
@@ -2290,10 +2326,13 @@ impl SharedRouteHandler {
         }
         let mut publication_checked = false;
         if retain_management {
-            let status = host
-                .supervisor_attachment_status(self.agent)?
+            let started = admission_diagnostic_started();
+            let status = admission_diagnostic_result("registration_attachment", started, host
+                .supervisor_attachment_status(self.agent))?
                 .ok_or(SharedAgentHostError::AgentNotFound)?;
-            let fingerprint = AttachmentFingerprint::from_attachment_status(&status)?;
+            let started = admission_diagnostic_started();
+            let fingerprint = admission_diagnostic_result("registration_fingerprint", started,
+                AttachmentFingerprint::from_attachment_status(&status))?;
             if fingerprint.members.len() == 3 {
                 if status.transport != SharedAgentTransportState::Attached
                     || fingerprint.protocol_route != self.route
@@ -2303,7 +2342,9 @@ impl SharedRouteHandler {
                 {
                     return Err(SharedAgentHostError::ScopeMismatch);
                 }
-                let manifest = host.recovery_manifest(self.agent)?;
+                let started = admission_diagnostic_started();
+                let manifest = admission_diagnostic_result("registration_manifest", started,
+                    host.recovery_manifest(self.agent))?;
                 let owner = crate::service::NodeId(self.network.agent_node_id().0);
                 let previous = manifest.management_slot(owner);
                 let retained = previous.filter(|slot| !slot.is_released());
@@ -2375,12 +2416,13 @@ impl SharedRouteHandler {
                         members,
                     )
                     .map_err(|_| SharedAgentHostError::CapacityExhausted)?;
-                    let joint_required = host
+                    let started = admission_diagnostic_started();
+                    let joint_required = admission_diagnostic_result("joint_budget", started, host
                         .management_retention_admission_requirement_with_manifest(
                             self.agent,
                             Some(&request),
                             &manifest,
-                        )?
+                        ))?
                         .ok_or(SharedAgentHostError::CapacityExhausted)?;
                     let old_metadata = retained
                         .map(|slot| {
@@ -2397,12 +2439,13 @@ impl SharedRouteHandler {
                     if remaining_slots < joint_required as u64 + joint_metadata as u64 {
                         return Err(SharedAgentHostError::CapacityExhausted);
                     }
-                    let (registration_candidate, signature) = host
+                    let started = admission_diagnostic_started();
+                    let (registration_candidate, signature) = admission_diagnostic_result("registration_prepare", started, host
                         .prepare_signed_management_recovery_registration_with_manifest(
                             self.agent,
                             &request,
                             &manifest,
-                        )?;
+                        ))?;
                     let registration = SharedManagementRecoveryRegistration::new(
                         registration_candidate.request().clone(),
                         signature,
@@ -2434,9 +2477,12 @@ impl SharedRouteHandler {
                         route: status.route,
                         registration,
                     };
-                    let current = futures_executor::block_on(worker.snapshot())
-                        .ok_or(SharedAgentHostError::Unavailable)?;
-                    CommittedProposalBarrier::from(&barrier)
+                    let started = admission_diagnostic_started();
+                    let current = admission_diagnostic_result("publication_snapshot", started,
+                        futures_executor::block_on(worker.snapshot())
+                            .ok_or(SharedAgentHostError::Unavailable))?;
+                    let started = admission_diagnostic_started();
+                    admission_diagnostic_result("publication_prefix", started, CommittedProposalBarrier::from(&barrier)
                         .validate_applied(CommittedProposalBarrier::from(&current), applied_slots)
                         .map_err(|error| {
                             if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
@@ -2458,12 +2504,14 @@ impl SharedRouteHandler {
                                 );
                             }
                             error
-                        })?;
+                        }))?;
                     if let Some(validate) = before_publication.as_mut() {
                         // No retained family or volatile pair was adopted.
                         // Mint only this open owner's fresh publication proof
                         // under the same guards, immediately before metadata I/O.
-                        validate(&candidate, retained, pending, retiring, true)?;
+                        let started = admission_diagnostic_started();
+                        admission_diagnostic_result("publication_callback", started,
+                            validate(&candidate, retained, pending, retiring, true))?;
                         publication_checked = true;
                     }
                     drop(manifest);
@@ -2471,11 +2519,15 @@ impl SharedRouteHandler {
                     // No intent or dispatch is published on an ambiguous
                     // append. A retry first proves the entire tail committed,
                     // then recovers the original member from the manifest.
-                    self.commit_management_metadata(worker, &current, &fingerprint, &command)?;
+                    let started = admission_diagnostic_started();
+                    admission_diagnostic_result("metadata_commit", started,
+                        self.commit_management_metadata(worker, &current, &fingerprint, &command))?;
                 } else if let Some(validate) = before_publication.as_mut() {
                     // Existing exact roots still require the marked complete
                     // family and original pair before the independent WAL write.
-                    validate(&candidate, retained, pending, retiring, true)?;
+                    let started = admission_diagnostic_started();
+                    admission_diagnostic_result("publication_callback", started,
+                        validate(&candidate, retained, pending, retiring, true))?;
                     publication_checked = true;
                 }
             }
@@ -2484,14 +2536,17 @@ impl SharedRouteHandler {
             // The historical singleton lane has no registration metadata.
             // Preserve its callback recovery without adopting an old pair.
             if let Some(validate) = before_publication {
-                validate(&candidate, None, pending, retiring, false)?;
+                let started = admission_diagnostic_started();
+                admission_diagnostic_result("publication_callback", started,
+                    validate(&candidate, None, pending, retiring, false))?;
             }
         }
         proposal.management_pending = Some(keys);
         *pending = combined;
         // Like anchor publication, the callback may only write the independent
         // intent store and must not re-enter the host/coordinator.
-        record(&candidate)
+        let started = admission_diagnostic_started();
+        admission_diagnostic_result("persist_callback", started, record(&candidate))
     }
 
     fn reserve_management_retirement_set(
@@ -4896,14 +4951,20 @@ impl SharedAgentNetworkHost {
     where
         F: FnOnce(&PendingManagement) -> Result<T, SharedAgentHostError>,
     {
-        let attached = self
+        let started = admission_diagnostic_started();
+        let attached = admission_diagnostic_result("attachment_presence", started, self
             .generations
             .get(&agent)
-            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+            .ok_or(SharedAgentHostError::TransportNotAttached))?;
+        let started = admission_diagnostic_started();
         let live = attached
             .lifecycle
             .read()
-            .map_err(|_| SharedAgentHostError::Unavailable)?;
+            .map_err(|_| {
+                trace_admission_diagnostic("lifecycle_lock", started, false, true);
+                SharedAgentHostError::Unavailable
+            })?;
+        trace_admission_diagnostic("lifecycle_lock", started, true, false);
         if !*live || attached.stale.load(Ordering::Acquire) {
             return Err(SharedAgentHostError::TransportNotAttached);
         }
@@ -4983,7 +5044,8 @@ impl SharedAgentNetworkHost {
         F: FnOnce(&PendingManagement) -> Result<T, SharedAgentHostError>,
         V: FnMut(&PendingManagement, Option<&crate::agent::shared_recovery::management::SharedManagementRecoverySlot>, &[PendingManagement], &[[crate::agent_sdk::RuntimeWork; 2]], bool) -> Result<(), SharedAgentHostError>,
     {
-        self.ensure_reattached(agent)?;
+        let started = admission_diagnostic_started();
+        admission_diagnostic_result("refresh", started, self.ensure_reattached(agent))?;
         self.capture_management_pending_guarded(agent, proposed, false, Some(&mut before_publication), record)
     }
 
@@ -5001,16 +5063,19 @@ impl SharedAgentNetworkHost {
         F: FnOnce(&PendingManagement) -> Result<T, SharedAgentHostError>,
         V: FnMut(&PendingManagement, Option<&crate::agent::shared_recovery::management::SharedManagementRecoverySlot>, &[PendingManagement], &[[crate::agent_sdk::RuntimeWork; 2]], bool) -> Result<(), SharedAgentHostError>,
     {
-        self.ensure_reattached(agent)?;
+        let started = admission_diagnostic_started();
+        admission_diagnostic_result("refresh", started, self.ensure_reattached(agent))?;
         let mut record = Some(record);
         let publication_attempted = core::cell::Cell::new(false);
         let mut publication_guard = |pending: &PendingManagement, slot: Option<&crate::agent::shared_recovery::management::SharedManagementRecoverySlot>, previous: &[PendingManagement], retiring: &[[crate::agent_sdk::RuntimeWork; 2]], fixed_three| {
             publication_attempted.set(true);
             before_publication(pending, slot, previous, retiring, fixed_three)
         };
-        let result = self.capture_management_pending_guarded(agent, proposed, fresh_only, if fresh_only { Some(&mut publication_guard) } else { None }, |pending| {
+        let started = admission_diagnostic_started();
+        let result = admission_diagnostic_result("guarded_capture", started,
+            self.capture_management_pending_guarded(agent, proposed, fresh_only, if fresh_only { Some(&mut publication_guard) } else { None }, |pending| {
             record.take().expect("capture callback runs once")(pending)
-        });
+        }));
         if !matches!(result, Err(SharedAgentHostError::CapacityExhausted))
             || record.is_none()
             || publication_attempted.get()
@@ -5029,16 +5094,18 @@ impl SharedAgentNetworkHost {
         else {
             return Err(SharedAgentHostError::ScopeMismatch);
         };
-        self.certified_checkpoint_for_admission(
+        let started = admission_diagnostic_started();
+        admission_diagnostic_result("checkpoint_repair", started, self.certified_checkpoint_for_admission(
             agent,
             invocation,
             authorization,
             expected_committee,
             signer,
-        )?;
-        self.capture_management_pending_guarded(
+        ))?;
+        let started = admission_diagnostic_started();
+        admission_diagnostic_result("guarded_recapture", started, self.capture_management_pending_guarded(
             agent, proposed, fresh_only, if fresh_only { Some(&mut publication_guard) } else { None }, record.expect("unpublished callback"),
-        )
+        ))
     }
 
     /// Native terminal bridge only. The caller pledges successful durable

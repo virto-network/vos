@@ -20,6 +20,9 @@ use crate::agent::authority_operation_coordinator::{
 };
 use crate::agent::clean_management_intent::ManagementJournalAnchor;
 use crate::agent::sdk::InvocationContext;
+use crate::agent::shared_host::{
+    admission_capture_span, admission_diagnostic_result, admission_diagnostic_started,
+};
 use crate::agent::sdk::authority_operation::{
     AuthorityOperationApproval, AuthorityOperationCall, AuthorityOperationIssuanceAck,
     MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES, MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES,
@@ -664,18 +667,23 @@ where
             return Err(SharedAgentHostError::Conflict);
         }
         let journal = &mut self.journal;
-        let record = self
-            .owner
-            .capture_fresh_authority_operation(call, |record| {
-                journal
+        let record = {
+            let _capture_span = admission_capture_span(call.invocation, "fresh_capture");
+            let started = admission_diagnostic_started();
+            admission_diagnostic_result("fresh_capture", started, self
+                .owner
+                .capture_fresh_authority_operation(call, |record| {
+                let started = admission_diagnostic_started();
+                admission_diagnostic_result("journal_retain", started, journal
                     .retain(
                         call.invocation,
                         &record
                             .encode()
                             .map_err(|_| SharedAgentHostError::ScopeMismatch)?,
                     )
-                    .map_err(|_| SharedAgentHostError::Unavailable)
-            })
+                    .map_err(|_| SharedAgentHostError::Unavailable))
+            }))
+        }
             .map_err(|error| {
                 tracing::warn!(invocation = ?call.invocation.0, phase = "fresh_capture",
                     unavailable = matches!(error, SharedAgentHostError::Unavailable),
@@ -1451,7 +1459,12 @@ where
             {
                 return Err(SharedAgentHostError::Conflict);
             }
-            self.pending_authority_operation_dispatch(call, None)
+            {
+                let _capture_span = admission_capture_span(call.invocation, "retained_lookup");
+                let started = admission_diagnostic_started();
+                admission_diagnostic_result("retained_lookup", started,
+                    self.pending_authority_operation_dispatch(call, None))
+            }
                 .map_err(|error| {
                     tracing::warn!(invocation = ?call.invocation.0, phase = "retained_lookup",
                         unavailable = matches!(error, SharedAgentHostError::Unavailable),
@@ -1460,7 +1473,12 @@ where
                 })?;
             // Re-enter existing admission with the original full input after a
             // pre-append interruption. Never resample its material or clock.
-            return self.capture_prepared_authority_operation(request, &expected.envelope, false, persist)
+            return {
+                let _capture_span = admission_capture_span(call.invocation, "retained_capture");
+                let started = admission_diagnostic_started();
+                admission_diagnostic_result("retained_capture", started,
+                    self.capture_prepared_authority_operation(request, &expected.envelope, false, persist))
+            }
                 .map_err(|error| {
                     tracing::warn!(invocation = ?call.invocation.0, phase = "retained_capture",
                         unavailable = matches!(error, SharedAgentHostError::Unavailable),
@@ -1468,8 +1486,12 @@ where
                     error
                 });
         }
-        let material = self
-            .supervisor_invocation_material(self.pins.agent, call.authority.binding.issuer.actor)
+        let material = {
+            let _capture_span = admission_capture_span(call.invocation, "physical_material");
+            let started = admission_diagnostic_started();
+            admission_diagnostic_result("physical_material", started, self
+                .supervisor_invocation_material(self.pins.agent, call.authority.binding.issuer.actor))
+        }
             .map_err(|error| {
                 tracing::warn!(invocation = ?call.invocation.0, phase = "physical_material",
                     unavailable = matches!(error, SharedAgentHostError::Unavailable),
@@ -1502,7 +1524,12 @@ where
         let proposed = self.prepare_operation_from_material(&request, material)?;
         // The existing physical validation above precedes a guarded fresh-only
         // check. That check mints per-open proof immediately before metadata I/O.
-        self.capture_prepared_authority_operation(&request, &proposed, true, persist)
+        {
+            let _capture_span = admission_capture_span(call.invocation, "fresh_admission");
+            let started = admission_diagnostic_started();
+            admission_diagnostic_result("fresh_admission", started,
+                self.capture_prepared_authority_operation(&request, &proposed, true, persist))
+        }
             .map_err(|error| {
                 tracing::warn!(invocation = ?call.invocation.0, phase = "fresh_admission",
                     unavailable = matches!(error, SharedAgentHostError::Unavailable),

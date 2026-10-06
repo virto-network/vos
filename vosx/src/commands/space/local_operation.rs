@@ -323,6 +323,9 @@ fn authorize_with_application_validity(
                     && call.intent.matches_invocation_work(prepared.work()),
                 "retained call differs from operator, node or actor preparation"
             );
+            tracing::info!(invocation = ?call.invocation.0,
+                phase = "client_prepare", category = "original_call",
+                "VOS operation preparation diagnostic");
             let bytes = super::operation_authorization::prepare_retained(
                 &mut host_preparation,
                 address,

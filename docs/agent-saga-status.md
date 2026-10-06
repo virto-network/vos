@@ -24,11 +24,11 @@ Measure bounded memory, descriptors, queues, retained results and disk under rea
 ## Current position and evidence boundary
 
 **Next integrated milestone: M1.** Implementation exists; integration still fails; service/operations qualification remains open.
-Latest admitted evidence source was clean **1bf30df26128eb59d4bb4e5837660b38d360fe35** throughout build/runs/readers, branch wip/ch08-runtime-directory.
-Current worktree additionally contains only the unqualified script correction described below; it is a different, unmeasured source pending a new checkpoint/build/workflow.
+Latest admitted build/ordinary source is clean **1ce4ea7cbcb648c2af94de1c27f5c177208ee44b** (R67), branch wip/ch08-runtime-directory; script c880 and the compact documents are frozen there.
+Latest cold-recovery evidence remains R66 at 1bf30df26128eb59d4bb4e5837660b38d360fe35; the script/docs-only delta leaves host binaries and six-file bundle/Clerk unchanged.
 Repository/worktree: /home/daniel/src/virto/vos/.worktrees/ch08-runtime-directory.
 Master remains d2378274c0503d9737edce9bcb189d24c3d4e247; reviewer saga/agents remains e6f2bb4551274064e3d080c64763e95faa8c5ebb.
-The next documentation checkpoint will not retrospectively become the measured 1bf30df2 source.
+The next checkpoint will not retrospectively become either measured source. The requested R67 recap is complete; current R68 diagnostic changes await review and a new frozen source/build boundary.
 
 | Area | Implementation | Integration / qualification |
 | --- | --- | --- |
@@ -36,11 +36,18 @@ The next documentation checkpoint will not retrospectively become the measured 1
 | Runtime/artifact/startup | Corrected decoder, separate signed System-image/Shared-external roles, coherent pins, strict six-file verification and normal fixed-three startup exist; Local canonical image is unchanged. | Coherent reproduction/prewrite/factory/finalization components passed before deliberately opening startup; no M1 claim follows. |
 | Publication/recovery | Exact ambiguous publication re-admits original leased stores; pending protection survives finalization/retirement; fresh exact GenesisDecision precedes terminal cleanup. First-owner/full-family restrictions remain. | Historical same-source cold outcomes vary: some accept finalization/ACK/terminal/release late; others refuse startup or availability. Whole30, recovered client Applied/routes/fresh Query remain open. |
 | Signed release | R57 derives scalar capacity from one fresh signed-release preflight under its existing guard/read transaction; final worker snapshot/barrier and prefix-checked proposal remain. | Nineteen signed preservation/component tests prove counter deltas and raw-worker/prefix restrictions. Packaged vosx links non-cfg(test) vos: those counters are not packaged execution proof. |
-| Current ordinary CLI | Existing public CLI/HTTP and owned three-process script are used. | R66 completes Local Create/Install/Query and Shared Create, then fails admit-a; Shared Install/reopen are unreached. |
-| Current cold recovery | R66 diagnostics add source-bound local preparation/capacity and guard/error context; unchanged recovery/deadline rules. | Quiet and scoped R66 fail Shared-before-routes; scoped owner constructor returns Err. Ordinary admit-a is HTTP503; its inner cause remains unknown. |
+| Current ordinary CLI | Existing public CLI/HTTP and owned three-process script are used. | R67 completes Local Create/Install then fails Query authorization preparation HTTP503 before actor Invoke; Shared Create/Install and corrected handoff/reopen are unreached. R66's Query success did not repeat. |
+| Current cold recovery | R66 diagnostics add source-bound local preparation/capacity and guard/error context; unchanged recovery/deadline rules. | Latest cold evidence: quiet/scoped R66 fail Shared-before-routes, scoped owner constructor Err. R66 admit-a HTTP503 remains independent; no R67 cold rerun. |
 | Data/service/operations | Signed offline corpus, bounded public-loader preparation and read-only hardware collector exist. | Public full data, all-owner parity, resources, backup/restore, service, fault/soak/hardware and final review remain open. |
 
-## R66: applied diagnostics and completed current evidence
+## Approved R68 diagnostic session
+
+User approved **diagnosis and a fix proposal only**, with a four-hour wall-clock cap: start 2026-10-06 19:40:09 UTC, deadline 23:40:09 UTC, including review/builds/runs/evidence/cleanup. This does not renew the engineering-week cap or authorize a behavior remedy.
+One reviewed host-only closed admission/error/timing bundle and finite reader extension; preserve original calls, masks, guards, callback/assignment order and checkpoint fallback. Bind the already-decoded original AOC5, not unique attempts; keep physical error categories payload-free and source-context restricted.
+Existing core preservation tests may compile their debug harness before **one portable CLI main/harness build cycle**; core evidence is not portable CLI provenance. Then sequential ordinary CLI, fresh quiet all-cold, and scoped all-cold only after admitted quiet failure. At most one same-artifact replay for a named non-reproduction/unreached branch, with ordinary priority; no automatic second portable build. Preserve all original evidence fences, environments, deadlines and owned cleanup.
+Deliver separate causal timelines/direct durations with unknown intervals, focused proof/recovery/readiness review and ranked fix proposals. CPU flamegraphs, guest symbol export, held Shared-admission probe, new frameworks and runtime behavior changes are outside this session. Report at one hour and at completion/cap; M1/M2/M3 remain open.
+
+## R66 diagnostics and current R67 evidence
 
 **Implementation:** source-preserving diagnostics only; no behavior remedy, new authority, tuning authorization or cap/deadline extension.
 Original reviewed proposals in disk-backed task-tmp:
@@ -59,7 +66,7 @@ No new hash, read, clone, lock, product API, physical audit, deadline or limit; 
 Frozen 1dab33473f82f412ab3c27edcfa4cb045292029e main build failed **15.616s/exit101**, E0308 at shared_agent.rs:1745:49: SDK Hash versus service Hash in diagnostic metadata.
 No harness, verification or runtime evidence followed that failure.
 Reviewed correction r66-host-guard-metadata-type-correction.patch, SHA 821bad6596dd73b217a89491e8f01a90c4a346052afa6dfc1dcee9a7875c3db5, changes only the optional metadata type to crate::service::Hash.
-Corrected measured source is 1bf30df2; failed evidence remains preserved.
+Correction was measured at 1bf30df2; R67's script/docs-only source is 1ce4ea7c. Failed evidence remains preserved.
 
 | Current source file | SHA-256 |
 | --- | --- |
@@ -67,23 +74,27 @@ Corrected measured source is 1bf30df2; failed evidence remains preserved.
 | vos/src/agent/clean_operation_controller.rs | 8996cfb830d05214eb86a85b26005f4ab3dad8fd19f8277a148acee10a3273f5 |
 | vos/src/agent/clean_operation_dispatch.rs | c414afb53ea44f198e4f2556af7c780040abb31dadc41195bb686f5e471fc458 |
 
-**Integration:** original portable owner/fences independently admit clean before/after/current 1bf30df2, exact toolchain/commands/features/environment, unchanged six-file bundle plus Clerk, owned exhausted noninterrupted groups and frozen binaries.
-Main **414.230s**, harness **482.831s**, strict verification **0.101s**; combined build cost **897.061s/14.95min**, not application performance or remaining ETA.
-Build directory: task-tmp/r66-cli-build-1bf30df2.
-Provenance SHA c0ee4a317bb1abc828b2dd1dfb906f4a74aec50c3c387a0d2cc469bede4ab3e2.
+**Integration:** R67 original portable owner/fences independently admit clean before/after/current 1ce4ea7c, exact toolchain/commands/features/environment, unchanged six-file bundle plus Clerk, owned exhausted noninterrupted groups and frozen binaries.
+Main **205.313s**, harness **264.286s**, strict verification **0.101s**; combined build cost **469.700s/7.83min**, not application performance or remaining ETA. R66's earlier 897.061s is uncontrolled build variation.
+Build directory: task-tmp/r67-cli-build-1ce4ea7c.
+Provenance SHA f092dee83a03b7401dc339bb186d9b0b4569a82b3742103a9a4808852eb474a2.
 Frozen main SHA 2ee75c2e815cb2a37ba8e271ff03de2200e43834b171f338187ee56e985252a9.
 Frozen harness SHA ef58d3f94f58391df3f1e86dcbe340fd6d38b34b2515b0297535acd27d416a74.
-Verification-result SHA 19e450a780f17ffde0db78ab75149ccff351458a6ad54ceccd8de0fb47864d2d.
+R67 verification-result SHA 23884dc294365d625246d1e33f48f49f5b33ebfc86e1d4af2b5ac0c178f18718; main/harness hashes are identical to R66 (unchanged host code), not new service evidence.
 Mutable Cargo target binaries are not the original admission boundary.
 
-| Isolated run at 1bf30df2 | Admitted outcome | Exact limits |
+| Isolated run (source stated) | Admitted outcome | Exact limits |
 | --- | --- | --- |
+| **Latest ordinary R67**, task-tmp/r67-current-actual-cli-1ce4ea7c | **FAIL 99.208s/script1**, exhausted/noninterrupted. Ready10.063s; Local Create22.141s/one attempt and Install52.295s/five attempts complete (four exit1, fifth0); Query8.948s/exit1. | No Query value assertion; Shared Create/Install attempts0, handoff/reopen unreached. Cleanup3.009s/exit0, three launches/zero owned survivors passes. No controlled speedup or repeatable Query success. |
 | Ordinary three-process CLI, task-tmp/r66-current-actual-cli-1bf30df2 | **FAIL 192.208s/script1**, exhausted/noninterrupted. Ready 9.530s; Local Create 14.145s/one attempt, Install 30.242s/one attempt and Query 47.686s/exit0 complete; Query value assertion verified by reaching Shared stage. Shared Create 81.369s/one attempt completes; admit-a 2.382s/exit1. | Shared Install attempts 0; admit-b/c, Shared queries and reopen unreached. Graceful stop 4.141s/exit0, three recorded launches and zero owned survivors: cleanup passed. No controlled speedup or retrospective cause for earlier Query failures. |
 | Quiet all-cold, task-tmp/r66-pending-all-cold-quiet-1bf30df2 | **FAIL 246.768s/exit101**, one failed test, exhausted/noninterrupted. Shared-before-routes Unavailable count1; fixed public clean_startup_tests.rs:2013:29 count1; unknown0. | Constructor refusal, not whole30 assertion277. Bound/affirmative maps empty; no inner-cause, exact-family or scoped-cost attribution. |
 | Scoped all-cold, task-tmp/r66-pending-all-cold-scoped-1bf30df2 | **FAIL 260.885s/exit101**, one failed test, exhausted/noninterrupted; strict reader admits 18,236 records/528 explicit edges/216 identity aliases/43 thread aliases/291 phase groups/zero unknowns. Shared-before-routes Unavailable1. | Owner constructor Err54.475594s; peers Ok24.764687s/24.656347s. Root-bound finalization/refusal limits below; no scoped exact public panic-row or whole30 assertion277 claim. |
 | Ordinary admit-a finite error classification | Shared-member-admission **HTTP503**, no exported response body/detail; all native/preparation warning counts0/unmapped0. | Not the source-predicted Conflict409. Readiness/queue/controller/inner stage unknown; zero warnings do not prove those branches were absent. |
 
-Ordinary metadata SAFE SHA 8f5e844fda8ff831f0a75c2c847aff87628f927b52e70311e0f7b133098b4dc4.
+R67 metadata SAFE SHA 587fb1aa5e90b9dec32d8dce8136d1d8e3127651738db469aa7d7fdb7974b281; native-error SAFE b7b8e662aab24d4e674caf81fcf8eff52fd2ddfb8c9114c8791ebbada28f01d1.
+R67 Query authorization preparation returns HTTP503/exact retained AOC5 suffix before actor Invoke. Daemon a records fresh_admission/unavailable then outer fresh_capture/unavailable on one file-local invocation alias; source permits propagation, not two independent causes/unique attempts or an explicit HTTP Query/System-root join. Deeper leaf remains unknown; old flat Unavailable1 and b/c zero records supply no such binding.
+R67 metadata pure26 accepted/141 refused, result a1342c046b5bec068eaeabee617b98e5ce524936a04c9207720e860dc14ec1fa; native grammar pure109/15 plus20 activation refusals, unchanged grammar/fences, are tooling only.
+Frozen R66 ordinary metadata SAFE SHA 8f5e844fda8ff831f0a75c2c847aff87628f927b52e70311e0f7b133098b4dc4.
 Quiet SAFE SHA 9842c5ef98fa5caba68e927a4fdd71ab84f71ef4398e5432ddf36784fb99dc75.
 Scoped local-guard-safe.json SHA d52521c265d0125a003551e98d8aa0b3ba82e84e547dbfc585f3086f0bfe01dd; basic safe-summary.json SHA 76409cd6077ae54920e13d98da069f4a7bff247218987647b3f6bf69b590fe62.
 Ordinary ordinary-admit-errors-safe-v2.json SHA c3a3db572717a2ea48b76e7ca1d2a33182d6e9648ece69ba59ed6ac0cc395246.
@@ -93,7 +104,7 @@ Any backtrace unsetting is an invocation fact, not a field certified by the fini
 Scoped pure synthetic result r66a-local-guard-synthetic-result.json:
 **364 accepted/1457 refused**, SHA 2c521cb8eec2c8277d12e3c1b9f8e25a8447441eb67ea1b09267312975431801; privacy/source/alias checks pass, zero helpers/private inputs.
 Metadata draft pure 25/136 and native-error draft pure 109/15 are tooling evidence only.
-The prior Query-failure reader is ineligible for this successful Query boundary; do not weaken its context to force admission.
+The Query-failure reader was ineligible for successful R66 Query; it is eligible for current R67 failure with unchanged grammar/fences. R67 reader f7408399659ae130aa465ed1a4ac89ca28045076d820abb55567950d5978058b.
 
 Scoped exact Install lineage is root181/original invocation180/work182/authorization183, owner node2/System4; final child208/work209/original authorization210. Prospective authorizations remain distinct.
 Earlier Create root30 terminal restore/release is a different family; it supplies no Install181 completion proof.
@@ -108,19 +119,19 @@ No new local_capacity/local_manifest/local_singleton_budget/local_preparation co
 Guard markers record182 acquired/180 pending+released phases (applier173 each; release_poll9 acquired/7 explicit drops); successful implicit drops remain blind. No post-cold release_poll record or holder proof follows.
 Post-cold metadata_host_wait max2.672861s is register211/node1/poll2, not release. Exact shared keys alone do not pair guard holders/calls or attribute that wait.
 
-**Qualification:** M1 remains open. Current ordinary Shared/reopen and cold bounded readiness are unqualified; M2/M3 remain open.
+**Qualification:** M1 remains open. Latest ordinary fails before Shared; corrected handoff is unexercised. Latest cold R66 still fails bounded readiness; M2/M3 remain open.
 The new outcomes do not retrospectively explain earlier frozen refusals, prove a general guest/stack verdict, or authorize another behavior candidate.
 
 ### Current admission-tooling source defect — applied
 
-The script creates Shared on a, then attempts admission on a/b/c. Native Create retains the creator's canonical issuer entry.
+The measured R66 script created Shared on a, then attempted admission on a/b/c. Native Create retains the creator's canonical issuer entry.
 Native member locator validation requires disjoint issuer/member agents; admitting that same creator again is a source-predicted Conflict. The existing packaged handoff fixture admits only indices 1..3.
-Current admitted HTTP503 is different from that Conflict409; the source defect is not a demonstrated cause of this run or a proven HTTP503 remedy.
+R66 admitted HTTP503 is different from that Conflict409; the source defect is not a demonstrated cause of that run or a proven HTTP503 remedy.
 Reviewed r66-origin-member-handoff-script-correction-proposal.patch, SHA f1eacdf646a288913d2cc2ebe645e78d5769fdc9f8c1861f51b3089eeb5a5c99, changes only index=1 and personas b/c.
 It preserves their original endpoints, exact archive/Root/authorization checks, all-three queries, later Shared Install, reopen, cleanup and every limit/deadline.
 Applied current script SHA c880a1f5dde65ecca874da1fee31ec7a97d419da2cfefe16d45697a6289cfc8c; measured original SHA 6930e0aef12c89e6fc4e8bb18a6b7743627bdbdf70a98d342f47fa8cc6205b28.
 Independent source review, bash syntax and dry-run patch checks pass; root applied the exact +4/-2 tooling correction only after all original 1bf30df2 admission fences closed.
-**Applied, runtime-unexecuted and unqualified.** Next checkpoint/build/ordinary rerun is pending; no product behavior/invariant/limit change or promotion.
+**Applied/frozen at 1ce4ea7c; corrected Shared handoff unexercised/unqualified.** R67 built and ran the script but failed Local Query before Shared. No product behavior/invariant/limit change or promotion.
 
 ## Replacement contract and simplification evidence
 
@@ -197,7 +208,7 @@ Any guest change requires renewed independent reproduction/coherent pins. Curren
 
 ## Remaining prerequisites in dependency order
 
-1. Freeze the applied source-valid creator-handoff script correction with these current documents, then build verified current portable binaries and rerun actual ordinary acceptance. Its success is unproven; original admit-a HTTP503 remains an independent readiness/queue/controller attribution gap.
+1. Execute the approved bounded R68 diagnostic session above: recorded fresh_admission/current Query failure and cold original-owner custody confirmation. No deeper leaf or behavior remedy is established. Creator-handoff correction is frozen/built but unreached; R66 admit-a503 remains independent.
    Distinguish original-owner local custody, guest completion, durable application, full ACK availability, terminal persistence, release and public readiness. Existing diagnostic markers are not attempt IDs.
    Resolve demonstrated System-open/local Persisted budget, retained submission/registration-confirmation interiors and post-proposal/availability gaps with bounded evidence; earlier release-holder questions remain separate. No local leaf timing or removable fresh work follows from this scoped run.
 2. Qualify automatic cold/returning/mixed pending-generation recovery and image Local callback recovery under unchanged whole30, then full public exact loss/retry/locked reopen.
@@ -207,7 +218,7 @@ Any guest change requires renewed independent reproduction/coherent pins. Curren
    Prove recovered client Applied/routes/fresh Query separately from guest/GenesisDecision/ACK; qualify cumulative >256 authorizations/pruning and complete retained scopes.
    Run actual three-process script through Shared/reopen; genuine mutation-response loss remains a separate fixture requirement.
 4. Close all M2 public retained corpus/parity/resource/checkpoint/catch-up/reopen/backup gates, rerun M1 exact resulting artifacts, and continue locally possible M3. Leave unavailable hardware qualification explicitly open.
-No behavior remedy or broader redesign is selected. Stop for direction for new authority/material scope or after exhausted local resources; no automatic cap renewal or extra tuning pass.
+The prepared Shared-admission error diagnostic remains target-only/unapplied/conditional; it is not a selected runtime remedy. No behavior remedy or broader redesign is selected. Stop for direction for new authority/material scope or after exhausted local resources; no automatic cap renewal or extra tuning pass.
 
 ## Mandatory workflow and operations checklist
 
@@ -244,8 +255,8 @@ Broader simplifications can be revisited after lower-level causes; no architectu
 
 | Work type | Remaining forecast and confidence | Evidence / unknowns |
 | --- | --- | --- |
-| Implementation | No defensible aggregate remaining source-hour range; low confidence until demonstrated leaf causes/remedy scope are established. | O1/O2/O3, corrected decoder/roles/startup/recovery and approved validation/release changes exist. R66 diagnostics compile; creator-handoff tooling correction is applied but unexecuted. Observed HTTP503 inner stage, owner custody confirmation, forward-leader availability and unassigned local/guard interiors remain. |
-| Integration | Exact current attempt costs have high confidence; number of remaining correction/reproduction/acceptance cycles is unknown, so no aggregate range or ETA. | Current build14.95min; ordinary failed run3.20min; quiet/scoped failed runs4.11/4.35min. Older uncontrolled build/run variation is not application regression or speedup. Guest changes need coherent reproduction. |
+| Implementation | No defensible aggregate remaining source-hour range; low confidence until demonstrated leaf causes/remedy scope are established. | O1/O2/O3, corrected decoder/roles/startup/recovery and approved validation/release changes exist. R66 diagnostics and R67 tooling compile; corrected handoff remains unreached. Current fresh_admission's deeper leaf/HTTP association, historical admission503, cold custody confirmation/leader availability and local/guard interiors remain. |
+| Integration | Exact current attempt costs have high confidence; number of remaining correction/reproduction/acceptance cycles is unknown, so no aggregate range or ETA. | Current R67 build7.83min/ordinary failure1.65min; latest cold R66 quiet/scoped4.11/4.35min. Earlier build14.95min is uncontrolled variation. Older uncontrolled build/run variation is not application regression or speedup. Guest changes need coherent reproduction. |
 | Qualification | M1/M2/local M3 aggregate effort is unbounded by admitted evidence; hardware M3 has a known external dependency. | M1 Shared/reopen/loss/recovery/negatives/pruning remains; M2 public data/parity/resources/Agent backup and M3 prescribed workload/soak/faults remain. Local tooling cannot close external gates. |
 
 Original O1 6–12/O2 8–16/O3 8–16 = **22–44 source hours plus qualification** is historical, not remaining effort or calendar delivery.

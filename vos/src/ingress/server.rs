@@ -653,8 +653,16 @@ fn handle_operation_preparation(
         Err(LocalLifecycleIngressError::Invalid) => {
             return text(400, "invalid signed operation call");
         }
-        Err(LocalLifecycleIngressError::Busy) => return text(503, "Local lifecycle queue is full"),
+        Err(LocalLifecycleIngressError::Busy) => {
+            tracing::warn!(invocation = ?call.invocation.0,
+                phase = "server_reply", category = "queue_busy",
+                "VOS operation preparation diagnostic");
+            return text(503, "Local lifecycle queue is full");
+        }
         Err(LocalLifecycleIngressError::Unavailable) => {
+            tracing::warn!(invocation = ?call.invocation.0,
+                phase = "server_reply", category = "queue_unavailable",
+                "VOS operation preparation diagnostic");
             return text(503, "operation preparation unavailable");
         }
     };
@@ -665,16 +673,24 @@ fn handle_operation_preparation(
         },
         Ok(Ok(_)) => text(500, "invalid operation preparation binding"),
         Ok(Err(error)) => {
+            tracing::warn!(invocation = ?call.invocation.0,
+                phase = "server_reply", category = "owner_error",
+                "VOS operation preparation diagnostic");
             tracing::warn!(?error, "native operation preparation incomplete");
             text(
                 503,
                 "operation preparation incomplete; retry identical AOC5",
             )
         }
-        Err(_) => text(
-            504,
-            "operation preparation outcome unknown; retry identical AOC5",
-        ),
+        Err(_) => {
+            tracing::warn!(invocation = ?call.invocation.0,
+                phase = "server_reply", category = "reply_timeout_or_disconnect",
+                "VOS operation preparation diagnostic");
+            text(
+                504,
+                "operation preparation outcome unknown; retry identical AOC5",
+            )
+        }
     }
 }
 

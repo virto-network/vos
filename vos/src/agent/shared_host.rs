@@ -89,6 +89,52 @@ const MAX_COMMON_RESTORE_BYTES: usize = MAX_COMMON_CHECKPOINT_BUNDLE_BYTES
     + super::shared_commit::MAX_SHARED_AGENT_LOCAL_SNAPSHOT_BINDING_BYTES
     + MAX_JOURNAL_RECORD_BYTES;
 
+pub(crate) fn admission_diagnostic_started() -> Option<std::time::Instant> {
+    std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS")
+        .is_some().then(std::time::Instant::now)
+}
+
+pub(crate) fn admission_capture_span(
+    invocation: super::sdk::InvocationId,
+    stage: &'static str,
+) -> tracing::span::EnteredSpan {
+    tracing::warn_span!("vos_admission_capture", invocation = ?invocation.0, stage).entered()
+}
+
+pub(crate) fn trace_admission_diagnostic(
+    phase: &'static str,
+    started: Option<std::time::Instant>,
+    success: bool,
+    unavailable: bool,
+) {
+    let elapsed_us = started.map(|started| started.elapsed().as_micros());
+    if !success {
+        tracing::warn!(phase, status = "error", unavailable, elapsed_us = ?elapsed_us,
+            "VOS admission diagnostic");
+    } else if elapsed_us.is_some() {
+        tracing::debug!(phase, status = "ok", unavailable = false, elapsed_us = ?elapsed_us,
+            "VOS admission diagnostic");
+    }
+}
+
+pub(crate) fn admission_diagnostic_result<T>(
+    phase: &'static str,
+    started: Option<std::time::Instant>,
+    result: Result<T, SharedAgentHostError>,
+) -> Result<T, SharedAgentHostError> {
+    trace_admission_diagnostic(phase, started, result.is_ok(),
+        matches!(&result, Err(SharedAgentHostError::Unavailable)));
+    result
+}
+
+fn trace_physical_admission_refusal(category: &'static str) {
+    if tracing::Span::current().metadata()
+        .is_some_and(|metadata| metadata.name() == "vos_admission_capture")
+    {
+        tracing::warn!(category, "VOS physical admission diagnostic");
+    }
+}
+
 #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
 mod external_maintenance;
 #[cfg(all(target_os = "linux", feature = "experimental-state-blocks"))]
@@ -6517,6 +6563,9 @@ fn map_apply_outcome(outcome: SharedPhysicalApplyOutcome) -> SharedAgentApplyOut
 }
 
 fn map_outer_lease_error(error: AgentHostError) -> SharedAgentHostError {
+    if matches!(&error, AgentHostError::Unavailable) {
+        trace_physical_admission_refusal("outer_lease_unavailable");
+    }
     match error {
         AgentHostError::DirectoryInUse => SharedAgentHostError::DirectoryInUse,
         AgentHostError::InvalidScope => SharedAgentHostError::InvalidScope,
@@ -6542,6 +6591,15 @@ fn map_provision_verification_error(
 
 fn map_driver_error(error: SharedJournalDriverError) -> SharedAgentHostError {
     tracing::warn!(?error, "Shared journal operation failed");
+    match &error {
+        SharedJournalDriverError::Store(super::journal_store::JournalStoreError::Unavailable) => {
+            trace_physical_admission_refusal("journal_unavailable");
+        }
+        SharedJournalDriverError::Executor(
+            super::local_journal_driver::LocalReplayExecutorError::TrustUnavailable,
+        ) => trace_physical_admission_refusal("trust_unavailable"),
+        _ => {}
+    }
     match error {
         SharedJournalDriverError::Ledger(error) => map_ledger_error(error),
         SharedJournalDriverError::Artifact(error) => map_artifact_error(error),
@@ -6578,6 +6636,15 @@ fn map_driver_error(error: SharedJournalDriverError) -> SharedAgentHostError {
 }
 
 fn map_ledger_error(error: AgentRaftApplicationErrorV2) -> SharedAgentHostError {
+    match &error {
+        AgentRaftApplicationErrorV2::RecoveryPrefixUnsettled { .. } => {
+            trace_physical_admission_refusal("recovery_prefix_unsettled");
+        }
+        AgentRaftApplicationErrorV2::Backend(_) => {
+            trace_physical_admission_refusal("ledger_backend");
+        }
+        _ => {}
+    }
     match error {
         AgentRaftApplicationErrorV2::BacklogLimit => SharedAgentHostError::CapacityExhausted,
         AgentRaftApplicationErrorV2::SnapshotBoundaryRequired => {
@@ -6604,6 +6671,9 @@ fn map_ledger_error(error: AgentRaftApplicationErrorV2) -> SharedAgentHostError 
 }
 
 fn map_artifact_error(error: SharedArtifactStagerError) -> SharedAgentHostError {
+    if matches!(&error, SharedArtifactStagerError::Unavailable) {
+        trace_physical_admission_refusal("artifact_unavailable");
+    }
     match error {
         SharedArtifactStagerError::Unavailable => SharedAgentHostError::Unavailable,
         SharedArtifactStagerError::Conflict => SharedAgentHostError::Conflict,
