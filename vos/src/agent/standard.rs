@@ -3104,6 +3104,34 @@ impl StandardAgentRuntime {
         authorization: &crate::agent_sdk::InvocationAuthorization,
         observed_slot: u64,
     ) -> Result<(), crate::agent_sdk::InvocationError> {
+        self.validate_system_authority_observation_inner(work, authorization, observed_slot, false)
+    }
+
+    /// Reuse complete canonical work validation for this same immutable work;
+    /// descriptor, observation authorization and clock checks remain current.
+    #[cfg(all(feature = "pvm", feature = "experimental-state-blocks"))]
+    pub(super) fn validate_validated_system_authority_observation(
+        &self,
+        validated: super::wire::ValidatedInvocationWork<'_>,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        observed_slot: u64,
+    ) -> Result<(), crate::agent_sdk::InvocationError> {
+        self.validate_system_authority_observation_inner(
+            validated.work(),
+            authorization,
+            observed_slot,
+            true,
+        )
+    }
+
+    #[cfg(all(feature = "pvm", feature = "experimental-state-blocks"))]
+    fn validate_system_authority_observation_inner(
+        &self,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        observed_slot: u64,
+        work_already_validated: bool,
+    ) -> Result<(), crate::agent_sdk::InvocationError> {
         use crate::actors::codec::{Decode as _, Encode as _};
         use crate::actors::value::{Msg, TAG_DYNAMIC};
         use crate::agent_sdk::{InvocationAuthorization, InvocationError};
@@ -3122,7 +3150,7 @@ impl StandardAgentRuntime {
             || work.program != descriptor.authority.issuer.program
             || work.mode != crate::agent_sdk::MethodMode::Query
             || work.recovery_only
-            || !work.validate()
+            || (!work_already_validated && !work.validate())
             || !preflight.matches(work, observed_slot)
             || work.origin.principal.is_some()
             || work.origin.credential.is_some()

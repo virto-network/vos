@@ -1,8 +1,8 @@
 # Agent saga: single live v1 plan
 
 This is the single live plan. [agent-saga-review.md](agent-saga-review.md) is the sole reviewer entry point.
-Detailed preceding evidence is frozen at **1bf30df26128eb59d4bb4e5837660b38d360fe35:docs/agent-saga-status.md** and the corresponding reviewer document.
-Use that immutable Git object for R37–R64 histories, exact old selectors/logs/hashes and earlier failed experiments; they are evidence, not another live plan.
+Detailed preceding R66/R67 evidence is frozen at **56bb1a9f849165f4581ba2f4df5d247180acdceb:docs/agent-saga-status.md** and the corresponding reviewer document; R37–R64 histories are frozen at **1bf30df26128eb59d4bb4e5837660b38d360fe35:docs/agent-saga-status.md**.
+Use those immutable Git objects for exact old selectors/logs/hashes and earlier failed experiments; they are evidence, not another live plan.
 This consolidation does not change the measured source, authorize a behavior candidate or close a release gate.
 
 ## Approved scope and milestones
@@ -24,11 +24,18 @@ Measure bounded memory, descriptors, queues, retained results and disk under rea
 ## Current position and evidence boundary
 
 **Next integrated milestone: M1.** Implementation exists; integration still fails; service/operations qualification remains open.
-Latest admitted build/ordinary source is clean **1ce4ea7cbcb648c2af94de1c27f5c177208ee44b** (R67), branch wip/ch08-runtime-directory; script c880 and the compact documents are frozen there.
-Latest cold-recovery evidence remains R66 at 1bf30df26128eb59d4bb4e5837660b38d360fe35; the script/docs-only delta leaves host binaries and six-file bundle/Clerk unchanged.
+Latest admitted build and four-workflow source is clean **56bb1a9f849165f4581ba2f4df5d247180acdceb** (R68), branch wip/ch08-runtime-directory. Only host diagnostics changed; signed guest/runtime bundle and Clerk pins are unchanged.
+R68 quiet/scoped fixtures failed initial Shared Create setup before the cold cut. Latest evidence that actually reached pending Install cold recovery remains R66 at 1bf30df26128eb59d4bb4e5837660b38d360fe35.
 Repository/worktree: /home/daniel/src/virto/vos/.worktrees/ch08-runtime-directory.
 Master remains d2378274c0503d9737edce9bcb189d24c3d4e247; reviewer saga/agents remains e6f2bb4551274064e3d080c64763e95faa8c5ebb.
-The next checkpoint will not retrospectively become either measured source. The requested R67 recap is complete; current R68 diagnostic changes await review and a new frozen source/build boundary.
+This closeout document edit follows completed original admission fences and does not become the measured binary source. R68 diagnosis and ranked fix proposal are complete; no runtime remedy or further tuning pass is authorized by that diagnostic session.
+
+## Approved ordered fixes after R68
+
+The user subsequently approved proceeding in order: implement decoded Observe validation reuse first, preserve the fully checked constructed entry, test it and measure its effect before deciding whether verified-observation reuse in the fresh audit is needed.
+This authorizes the named first remedy and necessary source review, preservation/differential tests, independent coherent artifact reproduction and exact-artifact integration/measurement. It does not restart design, renew the engineering-week cap, raise limits/deadlines or authorize unrelated tuning. The second narrow proposal remains conditional on first-fix evidence; transaction redesign and broader architecture remain deferred.
+Current implementation work begins from56bb1a9f with the two R68 closeout document edits preserved. R68 source/artifacts/SAFE remain immutable baseline evidence; candidate/component results will remain distinct from coherent released-bundle qualification. M1/M2/M3 remain open.
+The first source patch and real signed Observe regression have passed independent source review. Only the decoded Observe arm can mint the existing borrowed work-validation proof; constructed Observe retains its checked entry, and only the later duplicate full-work predicate is omitted. All other predicate/restore/execution/purity ordering is preserved. The test-only accessor returns owned fixture state/slot after live-lease validation and grants no admission proof. Native execution, guest builds, coherent reproduction and measured benefit remain pending.
 
 | Area | Implementation | Integration / qualification |
 | --- | --- | --- |
@@ -36,8 +43,8 @@ The next checkpoint will not retrospectively become either measured source. The 
 | Runtime/artifact/startup | Corrected decoder, separate signed System-image/Shared-external roles, coherent pins, strict six-file verification and normal fixed-three startup exist; Local canonical image is unchanged. | Coherent reproduction/prewrite/factory/finalization components passed before deliberately opening startup; no M1 claim follows. |
 | Publication/recovery | Exact ambiguous publication re-admits original leased stores; pending protection survives finalization/retirement; fresh exact GenesisDecision precedes terminal cleanup. First-owner/full-family restrictions remain. | Historical same-source cold outcomes vary: some accept finalization/ACK/terminal/release late; others refuse startup or availability. Whole30, recovered client Applied/routes/fresh Query remain open. |
 | Signed release | R57 derives scalar capacity from one fresh signed-release preflight under its existing guard/read transaction; final worker snapshot/barrier and prefix-checked proposal remain. | Nineteen signed preservation/component tests prove counter deltas and raw-worker/prefix restrictions. Packaged vosx links non-cfg(test) vos: those counters are not packaged execution proof. |
-| Current ordinary CLI | Existing public CLI/HTTP and owned three-process script are used. | R67 completes Local Create/Install then fails Query authorization preparation HTTP503 before actor Invoke; Shared Create/Install and corrected handoff/reopen are unreached. R66's Query success did not repeat. |
-| Current cold recovery | R66 diagnostics add source-bound local preparation/capacity and guard/error context; unchanged recovery/deadline rules. | Latest cold evidence: quiet/scoped R66 fail Shared-before-routes, scoped owner constructor Err. R66 admit-a HTTP503 remains independent; no R67 cold rerun. |
+| Current ordinary CLI | Existing public CLI/HTTP and owned three-process script are used. | Both R68 ordinary runs stop during Local Create; Install/Query/Shared and corrected handoff/reopen are unreached. R67 Query503 remains an independent deeper-leaf question. |
+| Current cold recovery | R68 adds source-bound admission phases and closed refusal categories; unchanged recovery/deadline rules. | R68 quiet/scoped fail earlier Shared Create setup; scoped committee guest completes purely but observations exceed1.8s. Actual R66 cold owner-confirmation failure remains unqualified. |
 | Data/service/operations | Signed offline corpus, bounded public-loader preparation and read-only hardware collector exist. | Public full data, all-owner parity, resources, backup/restore, service, fault/soak/hardware and final review remain open. |
 
 ## Approved R68 diagnostic session
@@ -45,93 +52,114 @@ The next checkpoint will not retrospectively become either measured source. The 
 User approved **diagnosis and a fix proposal only**, with a four-hour wall-clock cap: start 2026-10-06 19:40:09 UTC, deadline 23:40:09 UTC, including review/builds/runs/evidence/cleanup. This does not renew the engineering-week cap or authorize a behavior remedy.
 One reviewed host-only closed admission/error/timing bundle and finite reader extension; preserve original calls, masks, guards, callback/assignment order and checkpoint fallback. Bind the already-decoded original AOC5, not unique attempts; keep physical error categories payload-free and source-context restricted.
 Existing core preservation tests may compile their debug harness before **one portable CLI main/harness build cycle**; core evidence is not portable CLI provenance. Then sequential ordinary CLI, fresh quiet all-cold, and scoped all-cold only after admitted quiet failure. At most one same-artifact replay for a named non-reproduction/unreached branch, with ordinary priority; no automatic second portable build. Preserve all original evidence fences, environments, deadlines and owned cleanup.
-Deliver separate causal timelines/direct durations with unknown intervals, focused proof/recovery/readiness review and ranked fix proposals. CPU flamegraphs, guest symbol export, held Shared-admission probe, new frameworks and runtime behavior changes are outside this session. Report at one hour and at completion/cap; M1/M2/M3 remain open.
+Delivered separate causal boundaries/direct durations with unknown intervals, focused proof/recovery/readiness review and ranked fix proposals below. One-hour checkpoint reported; the finite one-build/four-workflow cycle ended before the cap. CPU flamegraphs, guest symbol export, held Shared-admission probe, new frameworks and runtime behavior changes remained outside this session. M1/M2/M3 remain open.
 
-## R66 diagnostics and current R67 evidence
+## R68 diagnostics and admitted evidence
 
-**Implementation:** source-preserving diagnostics only; no behavior remedy, new authority, tuning authorization or cap/deadline extension.
-Original reviewed proposals in disk-backed task-tmp:
-- r64-host-guard-boundary-diagnostic-proposal-v2.patch — c633ac4091e24e0a6add84847459fda8a450afc3ce3249980cae3a01ca2d9434.
-- r64-local-management-context-diagnostic-proposal.patch — f3ba54c177d406b75a72556b02ed77537ad21762319fb168db5802966b35f4aa.
-- r64-native-operation-preparation-error-diagnostic-proposal.patch — 7f7184c1317f02fdd28566520d24d59724b8346f663bad58af83c390c081ca41.
+**Implementation:** frozen diagnostic source **56bb1a9f849165f4581ba2f4df5d247180acdceb** adds closed admission phases, source-bound physical/metadata refusal categories and original AOC5 preparation entry/reply markers. Original Results/masks/calls/guards/drops/signing/callback/assignment order, proof checks, deadlines and pins are unchanged. No runtime remedy or guest change.
+Reviewed five-file proposal: task-tmp/r68-admission-diagnostic-source.patch, SHA 1a9feb44d2cd0f3b2812895d838f45f995c6c23ec63ddd9df9cea6fa7fbb234a.
+Successful timing records require the scoped diagnostic environment; ordinary error WARNs use closed payload-free categories. Capture invocation is caller context, not an individual attempt or a historical row/work identity.
 
-Local capacity/manifest/singleton-budget/preparation gains exact caller context around existing calls.
-Release wait/acquired/release-pending/released and applier guard phases use existing identities. Same-Arc/same-open source proof is required; markers do not identify every holder or create a global pairing token.
-Guard-held intervals are distinct from total mutex wait; missing release markers after a successful early Present return are inconclusive.
-Native error-only WARN phases are controller_validation, fresh_capture, retained_lookup, retained_capture, physical_material and fresh_admission.
-Controller categories are wrong_authority/completion/issuer_open/coordinator_open/coordinate; original masking/error/drop/check order remains.
-Network diagnostics are std/env gated; native error WARNs are ungated and error-only, preserving the ordinary script environment.
-No new hash, read, clone, lock, product API, physical audit, deadline or limit; no request/error payload is emitted.
+Core debug compile90.495s and two raw-worker preservation tests1.609s pass. Four isolated physical exact-retry cuts pass at30.034/28.731/29.231/38.239s: registration timeout, journal prewrite, write-then-error confirmation/proof cleanup and cold missing-journal refusal.
+Original core features are experimental-state-blocks,http-ingress,agent-runtime. Exact request/window/anchor/full-family, no premature WAL, ambiguous retention and worker/prefix barriers remain covered; these are components, not public-workflow qualification.
+Evidence: task-tmp/r68-core-preservation-56bb1a9f and the four r68-operation-* directories.
 
-Frozen 1dab33473f82f412ab3c27edcfa4cb045292029e main build failed **15.616s/exit101**, E0308 at shared_agent.rs:1745:49: SDK Hash versus service Hash in diagnostic metadata.
-No harness, verification or runtime evidence followed that failure.
-Reviewed correction r66-host-guard-metadata-type-correction.patch, SHA 821bad6596dd73b217a89491e8f01a90c4a346052afa6dfc1dcee9a7875c3db5, changes only the optional metadata type to crate::service::Hash.
-Correction was measured at 1bf30df2; R67's script/docs-only source is 1ce4ea7c. Failed evidence remains preserved.
+**Integration:** exactly one portable main/harness build cycle and four sequential permitted workflows; no second build or extra replay.
+Original source/toolchain/commands/features/environment/frozen binaries/six-file bundle+Clerk/private ownership/group exhaustion/noninterruption fences independently pass for each run.
+Build: task-tmp/r68-cli-build-56bb1a9f, main441.148s/harness840.133s/strict verification0.605s, all0; total1281.886s/21.36min is build cost, not application performance.
+Provenance SHA 2d2e224355d11e88485e11b2d213244bd8cd0dec5a5dce8f2cf0170525fdca9c.
+Frozen main SHA 24f0b97264f6e3fbc34230deb75cc1c03bf7121592c3ec56122cdafa35cb43ab; harness ade639a38f4920e45ad49e416c7a5a542d4ac0edea12a1e74e3116d656edf4fd.
+Strict-verification result SHA 7a6b18627919a1581b47dc3c5574381d322e9ea387997b9d1846b5b501c548d8. Mutable Cargo target binaries are not the admission boundary.
 
-| Current source file | SHA-256 |
+| R68 run, all at frozen 56bb1a9f | Admitted outcome and limits |
 | --- | --- |
-| vos/src/network/shared_agent.rs | 59ca888e50adddadcbaf962f366d59dbd6bbefd0982d54ea5809bbbe693a13f5 |
-| vos/src/agent/clean_operation_controller.rs | 8996cfb830d05214eb86a85b26005f4ab3dad8fd19f8277a148acee10a3273f5 |
-| vos/src/agent/clean_operation_dispatch.rs | c414afb53ea44f198e4f2556af7c780040abb31dadc41195bb686f5e471fc458 |
+| Ordinary, task-tmp/r68-current-actual-cli-56bb1a9f | **FAIL242.650s/script1.** Ready63.381s; Local Create170.150s/28 attempts, first27 exit1, final child124. Install/Query/Shared/handoff/reopen unreached. Cleanup0.373s/0, three launches/zero survivors. No inner Local Create cause classified. |
+| Fresh quiet all-cold, task-tmp/r68-pending-all-cold-quiet-56bb1a9f | **FAIL166.276s/101**, one failed test. Closed ordinary_packaged_shared_create_retryable_timeout1 at member_handoff_tests.rs:504:17: initial ordinary Shared Create setup's120s retry bound. No cold cut or whole30 qualification; no inner cause attributed from another run. |
+| Eligible scoped all-cold, task-tmp/r68-pending-all-cold-scoped-56bb1a9f | **FAIL187.939s/101**, one failed test. Reader admits5035 records/142 explicit edges/71 identity aliases/20 thread aliases/203 phase groups/zero unknowns. Initial Shared Create authorization and exact committee observation findings below; no accepted cold-cut/finalization/release proof. |
+| One reserved ordinary replay, task-tmp/r68-current-actual-cli-replay-56bb1a9f | **FAIL242.849s/script1.** Ready63.807s;26 recorded Local Create attempts, all exit1; no aggregate Local Create row establishes the final branch/duration. Install/Query/Shared/handoff/reopen unreached. Cleanup0.481s/0, three launches/zero survivors. No fifth workflow permitted. |
 
-**Integration:** R67 original portable owner/fences independently admit clean before/after/current 1ce4ea7c, exact toolchain/commands/features/environment, unchanged six-file bundle plus Clerk, owned exhausted noninterrupted groups and frozen binaries.
-Main **205.313s**, harness **264.286s**, strict verification **0.101s**; combined build cost **469.700s/7.83min**, not application performance or remaining ETA. R66's earlier 897.061s is uncontrolled build variation.
-Build directory: task-tmp/r67-cli-build-1ce4ea7c.
-Provenance SHA f092dee83a03b7401dc339bb186d9b0b4569a82b3742103a9a4808852eb474a2.
-Frozen main SHA 2ee75c2e815cb2a37ba8e271ff03de2200e43834b171f338187ee56e985252a9.
-Frozen harness SHA ef58d3f94f58391df3f1e86dcbe340fd6d38b34b2515b0297535acd27d416a74.
-R67 verification-result SHA 23884dc294365d625246d1e33f48f49f5b33ebfc86e1d4af2b5ac0c178f18718; main/harness hashes are identical to R66 (unchanged host code), not new service evidence.
-Mutable Cargo target binaries are not the original admission boundary.
+Ordinary metadata SAFE SHA e987bbcbdf893697c9086003713dbb54ad5a9f098a3f01575767e66325c07869; replay e9c9952f5f6b506e84703a46025e2df148eee84dc7fa0ea1314048a0080afb99.
+Quiet SAFE8ff595d2f111bc0acfc4b9b1a0a88160f55e7a7ed08c4ebe371c328f619cd362; scoped basicSAFEf68661c6d19475f1004e7110db6b57cb247e6593069bca519a0eb577c2226128.
+Detailed scoped admission-critical-path-safe.json SHA **2d9b2a3c2f60093503a8eb159ca51a5d4fcadd1baf5dd8647c4cfc8221b84728**; reader r68-admission-critical-path-safe-reader-v2.py SHA62dd3bc3157c501ec2012a452c62ee2a8059ea59ceebd826cfe92ec3701b20df.
+All groups ended normally/exhausted/noninterrupted; cleanup outcome and zero survivors are separate facts.
 
-| Isolated run (source stated) | Admitted outcome | Exact limits |
-| --- | --- | --- |
-| **Latest ordinary R67**, task-tmp/r67-current-actual-cli-1ce4ea7c | **FAIL 99.208s/script1**, exhausted/noninterrupted. Ready10.063s; Local Create22.141s/one attempt and Install52.295s/five attempts complete (four exit1, fifth0); Query8.948s/exit1. | No Query value assertion; Shared Create/Install attempts0, handoff/reopen unreached. Cleanup3.009s/exit0, three launches/zero owned survivors passes. No controlled speedup or repeatable Query success. |
-| Ordinary three-process CLI, task-tmp/r66-current-actual-cli-1bf30df2 | **FAIL 192.208s/script1**, exhausted/noninterrupted. Ready 9.530s; Local Create 14.145s/one attempt, Install 30.242s/one attempt and Query 47.686s/exit0 complete; Query value assertion verified by reaching Shared stage. Shared Create 81.369s/one attempt completes; admit-a 2.382s/exit1. | Shared Install attempts 0; admit-b/c, Shared queries and reopen unreached. Graceful stop 4.141s/exit0, three recorded launches and zero owned survivors: cleanup passed. No controlled speedup or retrospective cause for earlier Query failures. |
-| Quiet all-cold, task-tmp/r66-pending-all-cold-quiet-1bf30df2 | **FAIL 246.768s/exit101**, one failed test, exhausted/noninterrupted. Shared-before-routes Unavailable count1; fixed public clean_startup_tests.rs:2013:29 count1; unknown0. | Constructor refusal, not whole30 assertion277. Bound/affirmative maps empty; no inner-cause, exact-family or scoped-cost attribution. |
-| Scoped all-cold, task-tmp/r66-pending-all-cold-scoped-1bf30df2 | **FAIL 260.885s/exit101**, one failed test, exhausted/noninterrupted; strict reader admits 18,236 records/528 explicit edges/216 identity aliases/43 thread aliases/291 phase groups/zero unknowns. Shared-before-routes Unavailable1. | Owner constructor Err54.475594s; peers Ok24.764687s/24.656347s. Root-bound finalization/refusal limits below; no scoped exact public panic-row or whole30 assertion277 claim. |
-| Ordinary admit-a finite error classification | Shared-member-admission **HTTP503**, no exported response body/detail; all native/preparation warning counts0/unmapped0. | Not the source-predicted Conflict409. Readiness/queue/controller/inner stage unknown; zero warnings do not prove those branches were absent. |
+### Scoped initial Shared Create: demonstrated boundary
 
-R67 metadata SAFE SHA 587fb1aa5e90b9dec32d8dce8136d1d8e3127651738db469aa7d7fdb7974b281; native-error SAFE b7b8e662aab24d4e674caf81fcf8eff52fd2ddfb8c9114c8791ebbada28f01d1.
-R67 Query authorization preparation returns HTTP503/exact retained AOC5 suffix before actor Invoke. Daemon a records fresh_admission/unavailable then outer fresh_capture/unavailable on one file-local invocation alias; source permits propagation, not two independent causes/unique attempts or an explicit HTTP Query/System-root join. Deeper leaf remains unknown; old flat Unavailable1 and b/c zero records supply no such binding.
-R67 metadata pure26 accepted/141 refused, result a1342c046b5bec068eaeabee617b98e5ce524936a04c9207720e860dc14ec1fa; native grammar pure109/15 plus20 activation refusals, unchanged grammar/fences, are tooling only.
-Frozen R66 ordinary metadata SAFE SHA 8f5e844fda8ff831f0a75c2c847aff87628f927b52e70311e0f7b133098b4dc4.
-Quiet SAFE SHA 9842c5ef98fa5caba68e927a4fdd71ab84f71ef4398e5432ddf36784fb99dc75.
-Scoped local-guard-safe.json SHA d52521c265d0125a003551e98d8aa0b3ba82e84e547dbfc585f3086f0bfe01dd; basic safe-summary.json SHA 76409cd6077ae54920e13d98da069f4a7bff247218987647b3f6bf69b590fe62.
-Ordinary ordinary-admit-errors-safe-v2.json SHA c3a3db572717a2ea48b76e7ca1d2a33182d6e9648ece69ba59ed6ac0cc395246.
-Original quiet adapter changes only the pinned full HEAD; grammar/fences remain unchanged.
-Any backtrace unsetting is an invocation fact, not a field certified by the finite environment metadata.
+Report-local root57/original invocation58/work60/original authorization61 belongs to owner node1/System4; managed Shared59.
+Initial management capture passes initial/capacity/publication prefix checks e2914/e2934/e2986. Direct registration_prepare2.867783s/e2983, metadata_commit1.188907s/e3061 and persist_callback88.264ms/e3070 are separate nested boundaries, not additive preparation latency.
+Exact authorization input68 is prepared e3179/appended at34 e3182; its waiter times out at1.800082s/e3203.
+The same full input is later durably anchored on nodes1/2/3 at e3210/e3231/e3233. Append/anchor alone is not delivered authorization.
+Exact retained retries positively record invoke_complete and validated receipt_complete ten times (first e3402/e3404, last e4955/e4957).
 
-Scoped pure synthetic result r66a-local-guard-synthetic-result.json:
-**364 accepted/1457 refused**, SHA 2c521cb8eec2c8277d12e3c1b9f8e25a8447441eb67ea1b09267312975431801; privacy/source/alias checks pass, zero helpers/private inputs.
-Metadata draft pure 25/136 and native-error draft pure 109/15 are tooling evidence only.
-The Query-failure reader was ineligible for successful R66 Query; it is eligible for current R67 failure with unchanged grammar/fences. R67 reader f7408399659ae130aa465ed1a4ac89ca28045076d820abb55567950d5978058b.
+Committee request69/observation70/work71 is explicitly bound to the same root and original authorization invocation (first e3415).
+Ten enclosing observe_execute records return completed_done and ten purity records return ok; ten callbacks return ok, then ten receiver deadline refusals report **2.120670–2.222227s** cumulative observation time.
+Source authority_observation.rs:260 uses the existing **1.8s** ORDERED_REPLY_WAIT for the whole observation; its post-callback check at480 rejects these completed observations.
+This demonstrates a scoped observation deadline blocker after successful guest execution/purity. It does not establish a general guest/stack verdict, prefix instability, corrupt state or policy denial.
 
-Scoped exact Install lineage is root181/original invocation180/work182/authorization183, owner node2/System4; final child208/work209/original authorization210. Prospective authorizations remain distinct.
-Earlier Create root30 terminal restore/release is a different family; it supplies no Install181 completion proof.
-Owner exact final key208/209/210 records forward-sent e17937 at cumulative1.048941s, then local-custody-timeout e18076 at cumulative2.859256s on its source clock.
-Owner invoke_error e18078, helper Unavailable35.167235s/e18080 and constructor Err54.475594s/e18100 follow. Five source-local returned ordinals are not globally unique attempts or additive clocks.
-Leader final-key audit bodies e18034/e18117/e18158 cost1.044866s/1.061743s/0.816599s in capacity_manifest/custody_budget/singleton_budget; each has46 rows/5 registered/1 released/11 Ordered. Nested folds, enclosing budgets and preview are not added and do not establish removable validation.
-Final input216 is prepared e18174, locally appended at index47/e18177, anchored on leader node1/e18195, polled present/Ready e18196–97, then wait completes/e18199 and availability refuses/e18218.
-These later records follow owner System ingress removal/e18091 and constructor Err; that later refusal cannot establish the earlier owner's failure cause. Buffered Ready is not ACK/availability/client delivery.
-No root-bound accepted Install issuer-save, terminal-persistence or retention-release proof is recorded; missing markers are inconclusive about unlogged execution.
-Original-work submission records report success=false3.425217s and later true11.455ms, durable observation48.042ms/issuer observation3.933ms; they do not bind final-child interiors or prove Applied.
-No new local_capacity/local_manifest/local_singleton_budget/local_preparation context appears in the SAFE. Recorded noncustody exact keys declare forwarding; source follower return precedes local spans, so no local leaf cost is assigned.
-Guard markers record182 acquired/180 pending+released phases (applier173 each; release_poll9 acquired/7 explicit drops); successful implicit drops remain blind. No post-cold release_poll record or holder proof follows.
-Post-cold metadata_host_wait max2.672861s is register211/node1/poll2, not release. Exact shared keys alone do not pair guard holders/calls or attribute that wait.
+| Exact committee observation direct clocks, ten samples each | Recorded range |
+| --- | --- |
+| ReadIndex coordination | 4.672–7.074ms |
+| Fresh barrier, including leader attachment checks | 174.472–185.573ms |
+| Receiver host-lock wait | 0–0.544ms |
+| Initial fresh audit | 658.595–735.457ms |
+| VM run, halt status | 1.037649–1.099056s |
+| Enclosing observation execution (observe_execute), completed_done | 1.051371–1.114491s |
+| Callback, enclosing guest work | 1.161326–1.214998s |
+| Receiver deadline refusal, whole observation clock | 2.120670–2.222227s |
 
-**Qualification:** M1 remains open. Latest ordinary fails before Shared; corrected handoff is unexercised. Latest cold R66 still fails bounded readiness; M2/M3 remain open.
-The new outcomes do not retrospectively explain earlier frozen refusals, prove a general guest/stack verdict, or authorize another behavior candidate.
+These clocks are direct samples; nested intervals are not summed, subtracted or paired into unique attempts. Repeated aliases declare semantic identity, not individual calls.
+Every exact committee observation audit records34 ledger rows/one registered/no released/five Ordered rows. Inner audit total658.363–735.254ms contains recovery fold287.189–347.416ms, registered fold157.728–201.006ms and Ordered fold129.455–146.406ms. These nested clocks do not establish removable validation, touched-account cost or full-data scaling.
 
-### Current admission-tooling source defect — applied
+Existing Refine counters were independently admitted from the same completed scoped input; no additional runtime run, trace framework or guest instrumentation was added.
+Refine SAFE: task-tmp/r68-pending-all-cold-scoped-56bb1a9f/refine-execution-safe-v4.json, SHA **56cf75516e1c621e4e9c0a7ec951c8f5463816f848f8006fe906065846f313e5**;5224 records/142 edges/71 aliases/20 threads/204 phase groups/zero unknowns.
+Ten own-work counters bind the committee observation through the same explicitly declared invocation-work domain. They are aggregate phase clocks, not CPU samples or per-function flamegraphs.
 
-The measured R66 script created Shared on a, then attempted admission on a/b/c. Native Create retains the creator's canonical issuer entry.
-Native member locator validation requires disjoint issuer/member agents; admitting that same creator again is a source-predicted Conflict. The existing packaged handoff fixture admits only indices 1..3.
-R66 admitted HTTP503 is different from that Conflict409; the source defect is not a demonstrated cause of that run or a proven HTTP503 remedy.
-Reviewed r66-origin-member-handoff-script-correction-proposal.patch, SHA f1eacdf646a288913d2cc2ebe645e78d5769fdc9f8c1861f51b3089eeb5a5c99, changes only index=1 and personas b/c.
-It preserves their original endpoints, exact archive/Root/authorization checks, all-three queries, later Shared Install, reopen, cleanup and every limit/deadline.
-Applied current script SHA c880a1f5dde65ecca874da1fee31ec7a97d419da2cfefe16d45697a6289cfc8c; measured original SHA 6930e0aef12c89e6fc4e8bb18a6b7743627bdbdf70a98d342f47fa8cc6205b28.
-Independent source review, bash syntax and dry-run patch checks pass; root applied the exact +4/-2 tooling correction only after all original 1bf30df2 admission fences closed.
-**Applied/frozen at 1ce4ea7c; corrected Shared handoff unexercised/unqualified.** R67 built and ran the script but failed Local Query before Shared. No product behavior/invariant/limit change or promotion.
+| Exact committee work: Refine counters, ten samples | Recorded range |
+| --- | --- |
+| Outer runtime execution | 973.000–1032.692ms |
+| Inner create, including decode/preparation | 15.924–19.010ms |
+| Inner invoke, including frame/refund handling | 29.252–34.753ms |
+| Other host dispatch | 15.758–27.057ms |
+| Outer slices | 39 each |
+
+Source pvm/runtime/src/refine_host.rs:177–224 times outer resume and source-selected dispatch phases; context load/output decode are excluded. Drop emits counters even on error, so counters alone prove no successful outcome. Guest Done/purity evidence is separate.
+This isolates most VM time in the outer runtime rather than inner Authority execution on this exact scoped work; it does not locate the outer leaf or measure proposed duplicate-validation savings. Program preparation caches already exist; no cache-miss/eviction claim or controlled speedup follows.
+No admitted finalization_child, issuer save, terminal/release or cold-constructor proof follows for this family. The failed initial Create setup supplies no cold Install/whole30 result.
+R68 ordinary Local Create failures remain separate lifecycle paths; the AOC5 Query-entry probes were unreached. Their missing records cannot classify Local Create or transfer the scoped cause into quiet/ordinary runs.
+
+### Reader correction and privacy boundary
+
+Initial reader317a refused two full-input waiter records lacking same-stream management prepared/appended declarations; it produced no partial SAFE.
+A reviewed count-only locator9347 retained that refusal and exposed only the fixed ordered_waiter_full_input_declaration_missing category/count2.
+Source proves ordinary invocation and clean-management submission also use OrderedReplyWaiters::wait without those management declaration markers.
+Narrow reader62dd therefore admits only the waiter's own exact source/full32-byte ReplayInputId/five closed reasons/u128 duration, with no caller/route/family/attempt or successful-append inference. All seven other binding validators, parser/projection and original pre/post fences remain unchanged.
+Pure4ca79a7f4a50ad332517731c0b4057ea2742db9c6cdf5a94855bf9a366217fec passes13 accepted/61 refused plus one actual source-fence mutation; privacy passes, zero helpers/private inputs. Root executed each reviewed actual reader once after owned groups ended; failed readers/evidence remain preserved.
+Other pure tooling: metadata26/141, Query admission230/87 plus20 activation and three source refusals, scoped405/1528; these qualify readers, not v1.
+Refine extension admits only the existing exact vos_pvm::refine_host five-u64 source schema and its own full work commitment. Generic runtime domain resolution remains based on explicit typed declarations; it adds no caller/node/root/proximity edge.
+Source-valid no-own-work records are fully validated then unselected, including strict supported capture-stage checks. Unknown targets, malformed fields and unsupported/mixed contexts still refuse. All original parser/bindings/private source/tool/build/artifact/process pre/post fences remain.
+Final Refine reader09ba277bddea87be22da542e8644e6990c0eac645174aa2486063b2f154937ff and pureb622e202170ae0760f956cf7e8b0181d2d41f55c47c1d5bb9fbbb12a882dd5b7 were independently reviewed before root's one execution of each. Pure36 accepted/185 refused/six source-fence mutations,12 valid unselected cases and absolute-path1 accepted/3 refused; zero helper/private reads.
+Earlier immutable Refine versions retain their failures: first synthetic formatter-target gap, then28 no-work context refusals isolated by fixed source-site locator; relative-path v3 invocation failed before helper/input reads. No partial report was admitted, no runtime outcome inferred and no original fence was relaxed to obtain the v4 pass.
+SAFE and conversation expose only reviewed finite aliases and scalar phase/status summaries; raw request payloads, error details and credentials are not exported. Private stdout/stderr remain preserved evidence. No new raw-memory collection or guest-symbol export was performed.
+
+**Qualification:** M1 remains OPEN. No public Shared Install/lost-mutation/reopen, returning/all-cold pending Install, leader-loss, cumulative >256/pruning or service gate closes. M2/M3 remain OPEN.
+Prior R66/R67 full evidence is frozen at **56bb1a9f:docs/agent-saga-status.md** and its reviewer document; earlier R37–R64 at1bf30df2. R67 Query503 and actual R66 cold custody-confirmation/late-application failures remain independent; current setup failures do not retrospectively explain them.
+The creator-admission script correction c880 (admit b/c only, preserving all-three queries/Install/reopen/limits) remains built but unreached/unqualified.
+No controlled replacement speedup, quiet inner-cause claim or new tuning authorization follows.
+
+## Ranked fix proposal — separate implementation decision
+
+The first demonstrated R68 blocker is fresh committee observation cost on exact Shared Create root57, after successful retained authorization and guest purity. This is a scoped result; quiet/ordinary failures, R67 Query503 and R66 cold Install remain distinct.
+No behavior remedy was implemented or authorized in R68. The subsequent ordered-fix approval above now authorizes the first proposal's implementation and measurement; these proposals reuse existing mechanisms and larger protocol redesign remains deferred.
+
+1. **Decoded Observe: reuse existing validated-work capability.** The canonical SDK decoder validates the complete immutable InvocationWork, including availability preimage hashes (vos-agent-sdk/src/wire.rs:3992; runtime.rs:95). Observe then reaches another full work.validate in standard.rs:3101. General Invoke already distinguishes canonical decoded input from fully checked constructed values using private ValidatedInvocationWork in wire.rs:2224.
+   Propose the same internal distinction for Observe, removing only this proved duplicate full-work validation on canonical decoded input. Keep constructed-value APIs fully checked; preserve descriptor/installed Authority target, distinct ProgramId digest, Query/anonymity/preflight/clock, signed query/guest authorization, state restore/schema/storage and whole opaque-state purity. No isolated removable cost or deadline success has been measured.
+   Required evidence: decoded-versus-constructed real signed Observe differential, malformed/corrupt/truncated/trailing preimages and all authorization/target/clock/purity negatives; existing physical unchanged-opaque and fresh term/prefix/cancellation/corruption-after-progress tests. Any guest change requires independent Authority/Catalog/both-runtime-role reproduction and coherent six-file pins before public acceptance.
+2. **Fresh audit: same-object repeated validation only.** Canonical SharedRecoveryObservation decode, validate_binding and SharedRecoveryManifest::observe repeat validation of unchanged observation material. The narrow candidate reuses the existing immutable VerifiedSharedRecoveryObservation at manifest.observe, retaining canonical decode and constructor validate_binding, canonical physical read, exact index/term/claim/full-input binding, fresh corruption checks and complete changed-candidate validation. Any earlier decoder reuse would need a separate private decoded proof; neither candidate nor retained-slot validation is presumed redundant. The measured audit is substantial; its individually removable validation cost is unknown. No cross-lock cache, stale manifest or skipped fresh audit is proposed.
+3. **Attachment view: prove one authenticated committee view in the same read transaction before reuse.** active_route, network_committee_state and local_role reconstruct committee information under one host guard but currently take separate DB snapshots. Reuse requires same-transaction dominance and preserved corrupt-later-read/error ordering. Retain both leader checks around ReadIndex and post-I/O receiver rechecks; one host guard alone proves no snapshot equivalence.
+4. **Separate delivery and recovery investigation.** Initial exact authorization input68 times out before later three-node anchors and retained receipt success; classify its confirmation path separately if still blocking after the targeted observation remedy. Likewise preserve R66's actual pending Install owner-confirmation failure, and obtain evidence for ordinary Local Create before attributing its cause. Current AOC5 public Query probes were unreached.
+
+The outer and inner exact-program preparation caches already exist; these measurements do not prove cache misses, eviction or a need for another cache. RuntimeState::validate is four length checks, not a measured heavy validator. The owned opaque-state move pattern used by Invoke is a lower-ranked Observe candidate with unmeasured clone cost.
+Do not raise deadlines/limits, restore old read custody, use a native Authority oracle, drop certificate/signature/ProgramId validation or infer publication/release/readiness from Done/anchor/Ready.
 
 ## Replacement contract and simplification evidence
 
@@ -189,7 +217,7 @@ Strict release expects these **six files**, unchanged through current evidence:
 Bundle: target/agent-release-reproduction/run.ykT3eh/release under the native worktree.
 Clerk: target/agent-release-reproduction/run.1JsTwa/first/clerk/clerk-ledger.vos, SHA dd33d2b3ddbc4d31e5d389ad340d8561bed4afb3ba004fb09d2c1b4da65a595b.
 Pins in support/production-artifacts.toml and vosx/build.rs move coherently only after reproduction/verification; candidate/test-signer evidence never promotes them.
-Any guest change requires renewed independent reproduction/coherent pins. Current std-only diagnostics do not change guest bytes.
+Any guest change requires renewed independent reproduction/coherent pins. R68 std-only diagnostics did not change guest bytes; the subsequently approved decoded Observe candidate changes the System guest path and remains unqualified until the reproduction/integration gates pass.
 
 ## Recovery and authorization invariants
 
@@ -208,17 +236,17 @@ Any guest change requires renewed independent reproduction/coherent pins. Curren
 
 ## Remaining prerequisites in dependency order
 
-1. Execute the approved bounded R68 diagnostic session above: recorded fresh_admission/current Query failure and cold original-owner custody confirmation. No deeper leaf or behavior remedy is established. Creator-handoff correction is frozen/built but unreached; R66 admit-a503 remains independent.
-   Distinguish original-owner local custody, guest completion, durable application, full ACK availability, terminal persistence, release and public readiness. Existing diagnostic markers are not attempt IDs.
-   Resolve demonstrated System-open/local Persisted budget, retained submission/registration-confirmation interiors and post-proposal/availability gaps with bounded evidence; earlier release-holder questions remain separate. No local leaf timing or removable fresh work follows from this scoped run.
-2. Qualify automatic cold/returning/mixed pending-generation recovery and image Local callback recovery under unchanged whole30, then full public exact loss/retry/locked reopen.
+1. R68 diagnosis is complete and the first narrow remedy is now separately approved. Implement canonical decoded Observe's proved duplicate work validation reuse, preserving the fully checked constructed entry and all other proof/check ordering; measure its benefit on exact committee work before selecting another change. The diagnostic approval itself does not authorize a remedy or additional tuning pass.
+   Component preservation and meaningful Observe differential/hostility tests precede a source freeze. Any guest change then requires independent Authority/Catalog/both-runtime-role reproduction, coherent six-file pins, strict portable verification and exact resulting-artifact integration. Host-only changes still require current frozen CLI provenance.
+   Reproduce ordinary Local Create, Shared Create/committee observation and the historical Query authorization lane separately. Initial input68 delivery, R67 Query503, R66 admit-a503 and actual cold Install confirmation remain independent; no generic prefix retry, deadline change or wider redesign is selected.
+2. Qualify automatic cold/returning/mixed pending-generation recovery and image Local callback recovery under unchanged whole30, then full public exact loss/retry/locked reopen. R68 initial Create failure did not reach this gate.
    Preserve historical NRT1 terminal-release ambiguity independently: saved NRT1/actor ACK then 1.8s release confirmation timeout and 120s issuance exhaustion are not fixed by hot-row/root-fence protection.
    Full supported fixed-three NRT1 retry/reopen, Local second-terminal-retry whole30/result/signer checks and typed/fresh-family negatives remain open.
 3. Run current packaged public workflow, returning/all-cold Install, leader loss, original-owner/wrong-shadow/absent-origin forwarding, mutation-expiry/denial and observation freshness/cancellation.
    Prove recovered client Applied/routes/fresh Query separately from guest/GenesisDecision/ACK; qualify cumulative >256 authorizations/pruning and complete retained scopes.
    Run actual three-process script through Shared/reopen; genuine mutation-response loss remains a separate fixture requirement.
 4. Close all M2 public retained corpus/parity/resource/checkpoint/catch-up/reopen/backup gates, rerun M1 exact resulting artifacts, and continue locally possible M3. Leave unavailable hardware qualification explicitly open.
-The prepared Shared-admission error diagnostic remains target-only/unapplied/conditional; it is not a selected runtime remedy. No behavior remedy or broader redesign is selected. Stop for direction for new authority/material scope or after exhausted local resources; no automatic cap renewal or extra tuning pass.
+The prepared Shared-admission error diagnostic remains target-only/unapplied/conditional; it is not a selected runtime remedy. Implementation authority is limited to the separately approved ordered fixes above. Stop for direction for new authority/material scope or after exhausted local resources; no automatic cap renewal or unrelated tuning pass.
 
 ## Mandatory workflow and operations checklist
 
@@ -255,14 +283,14 @@ Broader simplifications can be revisited after lower-level causes; no architectu
 
 | Work type | Remaining forecast and confidence | Evidence / unknowns |
 | --- | --- | --- |
-| Implementation | No defensible aggregate remaining source-hour range; low confidence until demonstrated leaf causes/remedy scope are established. | O1/O2/O3, corrected decoder/roles/startup/recovery and approved validation/release changes exist. R66 diagnostics and R67 tooling compile; corrected handoff remains unreached. Current fresh_admission's deeper leaf/HTTP association, historical admission503, cold custody confirmation/leader availability and local/guard interiors remain. |
-| Integration | Exact current attempt costs have high confidence; number of remaining correction/reproduction/acceptance cycles is unknown, so no aggregate range or ETA. | Current R67 build7.83min/ordinary failure1.65min; latest cold R66 quiet/scoped4.11/4.35min. Earlier build14.95min is uncontrolled variation. Older uncontrolled build/run variation is not application regression or speedup. Guest changes need coherent reproduction. |
-| Qualification | M1/M2/local M3 aggregate effort is unbounded by admitted evidence; hardware M3 has a known external dependency. | M1 Shared/reopen/loss/recovery/negatives/pruning remains; M2 public data/parity/resources/Agent backup and M3 prescribed workload/soak/faults remain. Local tooling cannot close external gates. |
+| Implementation | No defensible aggregate remaining source-hour range; low confidence in total effort. Source confidence in the two narrow reuse candidates is high; removable cost and integration benefit remain unmeasured. | R68 host diagnostics and preservation checks compile/pass. Exact scoped observation's successful guest/purity and deadline refusal are established; outer execution and fresh audit are measured. Ordinary Local Create, historical Query/admission503, actual cold owner confirmation and additional release/readiness defects remain unknown. No runtime fix has been implemented. |
+| Integration | Observed portable build-cycle cost **7.83–21.36min** (R67/R68); current R68 workflow attempts **2.77–4.05min**. High confidence in these recorded costs, low confidence in any aggregate remaining range: correction/reproduction/acceptance cycle count is unknown. | Current main441.148s/harness840.133s/verify0.605s; four workflows166.276–242.849s. These uncontrolled costs are neither benchmarks nor future upper bounds/speedup/ETA. A guest remedy adds mandatory coherent independent reproduction whose current cost is unmeasured. Failed setup supplies no cold30 result. |
+| Qualification | M1/M2/local M3 aggregate effort remains unknown; hardware M3 has a known external dependency. The prescribed30-minute load and24-hour soak are fixed execution requirements, not a delivery estimate. | M1 Shared/reopen/loss/returning/all-cold/leader-loss/negatives/pruning remains; M2 public data/parity/resources/Agent backup and M3 workload/faults remain. Hardware availability is unknown; local tooling cannot close external gates. |
 
 Original O1 6–12/O2 8–16/O3 8–16 = **22–44 source hours plus qualification** is historical, not remaining effort or calendar delivery.
 Retain the focused **one engineering-week go/no-go cap**; explain variance before expanding scope, never quietly roll it forward.
 Both original measured service-tuning passes were consumed and failed. Later R48 (explicit third), R52/R54 and R57 coordination were separately authorized; none closes M1 or renews the cap.
-R58–R66 diagnostics do not automatically authorize another behavior candidate. Another tuning change/material architecture decision requires explicit direction.
+R58–R68 diagnostics do not automatically authorize another behavior candidate. Another tuning change/material architecture decision requires explicit direction.
 Historical conditional effort bands stay in the immutable record, not a new current forecast. No completion percentage, deployment date or readiness claim.
 
 ## Working and evidence rules
@@ -276,4 +304,4 @@ Scoped logging can perturb timing; quiet runs remain independent. No quiet inner
 Use admitted finite SAFE aliases/scalars only in summaries; keep credentials, bodies/private diagnostics out of output. Aliases/threads/local ordinals are not unique attempts/calls/holders.
 No adjacency/proximity joins, cross-domain index joins, sums/subtractions of nested or independently started clocks, or missing-marker=nonexecution claims.
 Preserve user-owned dirty work/evidence. Apply narrow patches, avoid whole-file style churn. Remove temporary tracked scaffolding when no longer needed; retain useful regressions/evidence references.
-Frozen older evidence: 1bf30df2:docs includes complete R histories; e6f2bb45/6d3a4926/62ffbc20 and target release-integration-docs-pre-consolidation-r31.txt remain immutable references.
+Frozen older evidence:56bb1a9f:docs retains R66/R67,1bf30df2:docs retains R37–R64; e6f2bb45/6d3a4926/62ffbc20 and target release-integration-docs-pre-consolidation-r31.txt remain immutable references.

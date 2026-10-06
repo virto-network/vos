@@ -3150,6 +3150,24 @@ impl SharedAgentHost {
             .map_err(map_driver_error)
     }
 
+    /// Fixture data only: this copy is not a fresh observation-admission proof.
+    /// The caller owns the host guard; no guard or storage view escapes.
+    #[cfg(all(test, feature = "experimental-state-blocks"))]
+    pub(crate) fn observation_runtime_state_for_test(
+        &self,
+        agent: AgentId,
+    ) -> Result<(crate::agent_sdk::RuntimeState, u64), SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        let hosted = self
+            .agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        Ok((
+            super::replay::sdk_runtime_state(hosted.driver.materialization().state()),
+            hosted.driver.current_logical_slot().map_err(map_driver_error)?,
+        ))
+    }
+
     #[cfg(test)]
     pub(crate) fn snapshot_state_for_test(
         &self,

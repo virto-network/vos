@@ -2,7 +2,7 @@
 //! no query custody, result retirement, or read-specific durable publication.
 
 use super::*;
-use crate::actors::codec::Decode as _;
+use crate::actors::codec::{Decode as _, Encode as _};
 use crate::agent_sdk::authority::{
     AuthorityAdminCall, AuthorityAdminOperation, AuthorityAdminResult,
     AuthorityCredentialEnrollment, AuthorityCredentialProjection, AuthorityInventoryProjectionPage,
@@ -408,6 +408,173 @@ fn exercise_revocation(
     }
 }
 
+fn check_decoded_observation_against_checked_work(
+    owner: &MemoryBootstrapOwner,
+    request: &AuthorityProjectionQuery,
+    expected: &AuthorityCredentialProjection,
+) {
+    use crate::agent_sdk as sdk;
+    use crate::agent::wire::{apply_standard_runtime_input, apply_standard_runtime_work};
+    use crate::service::wire::ServiceWire as _;
+
+    let agent = HostAgentId(owner.pins.agent.0);
+    let (state, observed_slot) = owner
+        .host
+        .lock()
+        .unwrap()
+        .observation_runtime_state_for_test(agent)
+        .unwrap();
+    // Execute owned fixture copies outside the host guard. These component
+    // comparisons grant no fresh ReadIndex proof or permission to publish.
+    let signed = owner.prepare_authority_observation_work(request).unwrap();
+    let envelope = |invocation: sdk::InvocationWork, slot| sdk::RuntimeWork::Observe {
+        context: sdk::RuntimeExecutionContext::Direct,
+        state: state.clone(),
+        authorization: Box::new(sdk::InvocationAuthorization::PublicPreflight(
+            sdk::PublicPreflight::for_work(&invocation, slot),
+        )),
+        invocation: Box::new(invocation),
+        observed_slot: slot,
+    };
+    let compare = |work: &sdk::RuntimeWork| {
+        // The constructed entry remains the independent fully checked path.
+        let checked = apply_standard_runtime_work(work.clone()).unwrap();
+        let decoded = apply_standard_runtime_input(&work.encode().unwrap()).unwrap();
+        assert_eq!(decoded.encode().unwrap(), checked.encode().unwrap());
+        assert_eq!(decoded.state, state, "all four opaque components remain exact");
+        decoded
+    };
+    let reply_bytes = |returned: &sdk::RuntimeTransition| {
+        let sdk::RuntimeOutcome::Completed(Ok(reply)) = &returned.outcome else {
+            panic!("observation did not return a terminal actor reply");
+        };
+        assert_eq!(reply.status, sdk::InvocationStatus::Done);
+        let Some(crate::actors::value::Value::Bytes(bytes)) =
+            crate::actors::value::Value::try_decode(&reply.reply)
+        else {
+            panic!("Authority reply is not a byte value");
+        };
+        bytes
+    };
+    let signed_work = envelope(signed.clone(), observed_slot);
+    let returned = compare(&signed_work);
+    assert_eq!(
+        AuthorityCredentialProjection::decode(&reply_bytes(&returned)).unwrap(),
+        *expected,
+    );
+
+    // Reuse the real installed target/artifacts and existing nonzero query ID.
+    // This is the production committee message shape, not a GenesisCandidate
+    // root-lineage assertion or a fabricated genesis nonce.
+    let mut committee = signed.clone();
+    committee.origin = sdk::InvocationOrigin::anonymous();
+    committee.message = vec![crate::actors::value::TAG_DYNAMIC];
+    committee.message.extend(crate::actors::value::Msg::new("genesis_signing_committee").encode());
+    let returned = compare(&envelope(committee, observed_slot));
+    let decoded_committee = AuthorityCommittee::decode(&reply_bytes(&returned)).unwrap();
+    assert_eq!(decoded_committee.space(), HostSpaceId(owner.pins.space.0));
+    assert_eq!(
+        decoded_committee.authority_binding(),
+        HostHash(owner.pins.authority.commitment().0),
+    );
+
+    let reject = |work: &sdk::RuntimeWork| {
+        let returned = compare(work);
+        assert!(matches!(returned.outcome, sdk::RuntimeOutcome::Completed(Err(_))));
+    };
+    let mut wrong_target = signed.clone();
+    wrong_target.actor = sdk::ActorId([0xfe; 32]);
+    reject(&envelope(wrong_target, observed_slot));
+    let mut claimed_origin = signed.clone();
+    claimed_origin.origin.principal = Some(owner.pins.descriptor.identity.owner);
+    reject(&envelope(claimed_origin, observed_slot));
+    let mut missing_installation = signed.clone();
+    missing_installation.installation_data = None;
+    reject(&envelope(missing_installation, observed_slot));
+    reject(&envelope(signed.clone(), 0));
+
+    let material = owner
+        .supervisor_invocation_material(owner.pins.agent, signed.actor)
+        .unwrap();
+    let mut wrong_program = signed.clone();
+    let program = wrong_program.availability.iter_mut()
+        .find(|blob| blob.reference == material.program.reference).unwrap();
+    program.bytes[0] ^= 1;
+    program.reference = sdk::BlobRef::of_bytes(&program.bytes);
+    wrong_program.availability.sort_unstable_by(|a, b| a.reference.cmp(&b.reference));
+    assert!(wrong_program.validate(), "canonical BlobRef validity does not prove the installed ProgramId");
+    reject(&envelope(wrong_program, observed_slot));
+    let mut wrong_schema = signed.clone();
+    let schema = wrong_schema.availability.iter_mut()
+        .find(|blob| blob.reference == material.schema.reference).unwrap();
+    schema.bytes[0] ^= 1;
+    schema.reference = sdk::BlobRef::of_bytes(&schema.bytes);
+    wrong_schema.availability.sort_unstable_by(|a, b| a.reference.cmp(&b.reference));
+    assert!(wrong_schema.validate());
+    reject(&envelope(wrong_schema, observed_slot));
+
+    let mut malformed_state = signed_work.clone();
+    let sdk::RuntimeWork::Observe { state: malformed, .. } = &mut malformed_state
+    else { unreachable!() };
+    malformed.control[0] ^= 1;
+    let encoded_malformed = malformed_state.encode().unwrap();
+    let checked_error = apply_standard_runtime_work(malformed_state).unwrap_err();
+    assert_eq!(checked_error, crate::service::wire::DecodeError::InvalidPlatform);
+    assert_eq!(apply_standard_runtime_input(&encoded_malformed).unwrap_err(), checked_error);
+
+    // Canonical work validation is not a substitute for installed guest
+    // authentication. Shape-valid bad signatures must still return refusal.
+    let mut bad_query = request.clone();
+    let AuthorityIngressAuthentication::SshNodeAttestation { signature, .. } =
+        &mut bad_query.authentication
+    else { unreachable!() };
+    signature[0] ^= 1;
+    let bad_signed = owner.prepare_authority_observation_work(&bad_query).unwrap();
+    assert!(reply_bytes(&compare(&envelope(bad_signed, observed_slot))).is_empty());
+
+    let encoded = signed_work.encode().unwrap();
+    let largest = signed.availability.iter().max_by_key(|blob| blob.bytes.len()).unwrap();
+    // Availability follows the opaque state in AWRK. Choose its final exact
+    // preimage occurrence, never a matching artifact retained in the state.
+    let offset = encoded.windows(largest.bytes.len())
+        .rposition(|bytes| bytes == largest.bytes).unwrap();
+    let mut corrupt = encoded.clone();
+    corrupt[offset] ^= 1;
+    assert!(apply_standard_runtime_input(&corrupt).is_err());
+    assert!(apply_standard_runtime_input(&encoded[..encoded.len() - 1]).is_err());
+    let mut trailing = encoded;
+    trailing.push(0);
+    assert!(apply_standard_runtime_input(&trailing).is_err());
+
+    // Constructed-value callers cannot mint the decoder's borrowed proof.
+    let mut corrupt_constructed = signed.clone();
+    let preimage = corrupt_constructed.availability.iter_mut()
+        .max_by_key(|blob| blob.bytes.len()).unwrap();
+    preimage.bytes[0] ^= 1;
+    let returned = apply_standard_runtime_work(envelope(corrupt_constructed, observed_slot)).unwrap();
+    assert_eq!(returned.state, state);
+    assert!(matches!(returned.outcome, sdk::RuntimeOutcome::Completed(Err(_))));
+    for variant in 0..3 {
+        let mut invalid = signed_work.clone();
+        let sdk::RuntimeWork::Observe { invocation, authorization, .. } = &mut invalid
+        else { unreachable!() };
+        match variant {
+            0 => invocation.mode = sdk::MethodMode::Linear,
+            1 => invocation.recovery_only = true,
+            2 => {
+                let sdk::InvocationAuthorization::PublicPreflight(preflight) = authorization.as_mut()
+                else { unreachable!() };
+                preflight.observed_slot += 1;
+            }
+            _ => unreachable!(),
+        }
+        assert!(invalid.encode().is_err());
+        let returned = apply_standard_runtime_work(invalid).unwrap();
+        assert_eq!(returned.state, state);
+        assert!(matches!(returned.outcome, sdk::RuntimeOutcome::Completed(Err(_))));
+    }
+}
+
 pub(super) fn exercise(
     leader: usize,
     owners: &mut [Option<MemoryBootstrapOwner>],
@@ -464,6 +631,7 @@ pub(super) fn exercise(
         audits_before + 1,
         "caught-up observation performs one fresh capacity audit, not two",
     );
+    check_decoded_observation_against_checked_work(caught_up, &request, &expected);
     let physical: Vec<_> = owners
         .iter()
         .map(|owner| native_owner_physical_state(owner.as_ref().unwrap()))

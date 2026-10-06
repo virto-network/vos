@@ -2269,6 +2269,14 @@ pub fn apply_standard_runtime_input(
             authorization,
             ..
         } => apply_clean_acknowledge(state, *invocation, *authorization),
+        #[cfg(feature = "experimental-state-blocks")]
+        crate::agent_sdk::RuntimeWork::Observe {
+            state,
+            invocation,
+            authorization,
+            observed_slot,
+            ..
+        } => apply_clean_observe_inner(state, *invocation, *authorization, observed_slot, true),
         other => apply_standard_runtime_work(other),
     }
 }
@@ -3073,13 +3081,34 @@ fn apply_clean_observe(
     authorization: crate::agent_sdk::InvocationAuthorization,
     observed_slot: u64,
 ) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
+    apply_clean_observe_inner(state, work, authorization, observed_slot, false)
+}
+
+#[cfg(all(feature = "pvm", feature = "experimental-state-blocks"))]
+fn apply_clean_observe_inner(
+    state: crate::agent_sdk::RuntimeState,
+    work: crate::agent_sdk::InvocationWork,
+    authorization: crate::agent_sdk::InvocationAuthorization,
+    observed_slot: u64,
+    decoded_work: bool,
+) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
     use crate::agent_sdk::InvocationError;
     if !state.validate() {
         return Err(DecodeError::LimitExceeded);
     }
     let (runtime, _) = restore_standard_runtime_state(&clean_state_to_legacy(&state))?;
     let result = (|| {
-        runtime.validate_system_authority_observation(&work, &authorization, observed_slot)?;
+        if decoded_work {
+            // Only the canonical decoded-input entry selects this branch;
+            // the exact work remains immutable until this borrowed proof ends.
+            runtime.validate_validated_system_authority_observation(
+                ValidatedInvocationWork(&work),
+                &authorization,
+                observed_slot,
+            )?;
+        } else {
+            runtime.validate_system_authority_observation(&work, &authorization, observed_slot)?;
+        }
         let resolved = runtime.resolve_clean_invocation_for_execution(&work)?;
         let (invocation, actor_pvm, schema, policies, installation_data) = resolved.parts();
         runtime
