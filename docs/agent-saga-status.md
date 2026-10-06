@@ -171,7 +171,13 @@ three actual workers/storage and real quorum replies under existing limits;
 later follower samples exercise the generic barrier, while the separate leader
 case checks last/commit prefix refusal. They do not prove host/custody/public startup.
 Nineteen exact preservation/regression selectors are ready for the owned core
-build. The source-specific reader passes **51 acceptance / 96 refusal** synthetic
+build. The first frozen source `b3caa646` core build failed **31.932s** with six
+type errors from one test-fixture voter collection (service node IDs versus SDK
+worker IDs); its owned group was exhausted and noninterrupted. The correction
+converts those same 32 bytes to the worker's SDK node type in one test-only line.
+No production call, identity, limit or deadline changed; tests have not run yet.
+Preserve that failed evidence as `r57-core-build-b3caa646` and rebuild a corrected
+clean source. The source-specific reader passes **51 acceptance / 96 refusal** synthetic
 cases and privacy/alias checks, with zero helper loads/private input reads. No
 recovery or performance benefit is credited.
 

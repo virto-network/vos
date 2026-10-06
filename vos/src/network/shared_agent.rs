@@ -7609,7 +7609,7 @@ mod tests {
             let voters = manifest.committee().members().iter()
                 .map(|member| {
                     assert_eq!(member.replica().role, ReplicaRole::Voter);
-                    member.replica().node
+                    NodeId(member.replica().node.0)
                 }).collect::<Vec<_>>();
             assert_eq!(voters.len(), 3);
             let peers = Arc::new(std::sync::RwLock::new(BTreeMap::new()));

@@ -15,7 +15,10 @@ R57's concrete combined release-admission patch was explicitly approved on
 2026-10-06: "approved, just keep going". Root applied reviewed v4 after verifying
 clean `e30e7b03` and unchanged product source. Combined-entry preservation tests
 and two real-worker component regressions are implemented and independently
-reviewed; nineteen exact units await the owned core build. The finite reader
+reviewed; nineteen exact units await the owned core build.
+Initial frozen `b3caa646` core compilation failed in a test-only service/SDK
+node-type conversion; its one-line byte-preserving correction awaits rebuilding.
+No production behavior, bounds or deadline changed. The finite reader
 passes 51 acceptance/96 refusal synthetic cases with privacy and original fences
 preserved. Component worker cases do not qualify host/custody/public recovery;
 there is no build, recovery or performance credit yet. The one release-only
