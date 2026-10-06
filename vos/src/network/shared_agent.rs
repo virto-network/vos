@@ -935,7 +935,7 @@ fn trace_causal_host_guard(
     route: AgentGenerationRoute,
     operation: &'static str,
     phase: &'static str,
-    metadata: Option<Hash>,
+    metadata: Option<crate::service::Hash>,
     poll: Option<u64>,
 ) {
     tracing::debug!(node = ?node.0, agent = ?agent.0,

@@ -67,10 +67,12 @@ Persisted-budget work, the failed Install submission's interior and the
 release host-wait holder. The current local-proposer paths lack the new
 ManagementCustody audit binding in the frozen R64 sample.
 [R66 diagnostics](#r66-local-recovery-and-native-preparation-attribution--applied)
-are now **applied**, awaiting checkpoint/build/source-specific reader/harness
-and fresh evidence. They bind existing local capacity/budget/preparation,
+are **applied with a narrow compile-type correction**. Frozen
+`1dab3347` failed its main build in 15.616s; the corrected source awaits a new
+checkpoint/build/source-specific reader/harness and fresh ordinary CLI, then
+scoped recovery evidence. They bind existing local capacity/budget/preparation,
 same-Arc host-guard phases and closed native-preparation errors. Latest admitted
-evidence remains R64 on `97fee97e`; no R66 outcome, behavior remedy/candidate
+evidence remains R64 on `97fee97e`; no R66 runtime outcome, behavior remedy/candidate
 or architecture is selected.
 
 R63's accepted finalization then ACKReady→availability refusal, R62's late
@@ -1160,8 +1162,13 @@ Evidence below `target/task-tmp`:
 ### R66 local recovery and native preparation attribution — applied
 
 **Implementation:** root applied three independently reviewed diagnostic
-proposals after completed R64 admission. Current HEAD remains `97fee97e` with
-the three source files and these live docs pending a new checkpoint.
+proposals after completed R64 admission and froze exactly three source files
+plus these two docs at `1dab33473f82f412ab3c27edcfa4cb045292029e`.
+That freeze failed to compile the metadata diagnostic: its optional hash used
+SDK Hash where the existing release commitment has `crate::service::Hash`.
+Root applied the independently reviewed one-line type correction; current
+network source SHA is `59ca888e50adddadcbaf962f366d59dbd6bbefd0982d54ea5809bbbe693a13f5`,
+awaiting a new checkpoint. R64 admitted evidence remains frozen at `97fee97e`.
 Network/source-context diagnostics use the existing std/environment gate;
 six native-preparation warnings are error-only and require no environment
 change. Original calls, reads, validation/Results, guards/drop order, fresh
@@ -1180,15 +1187,19 @@ Controller errors map to five closed categories before the unchanged
 Unavailable return; dispatcher warnings retain the original error and expose
 only an Unavailable boolean. No error payload is formatted at these boundaries.
 
-**Integration:** new checkpoint/provenance, portable main/harness,
-source-specific finite readers/harnesses and fresh isolated evidence are
-pending. **Qualification:** none for R66; R64's whole30/ordinary Query failures
+**Integration:** preserved `r66-cli-build-1dab3347` main result failed
+15.616s/exit 101 with E0308 at `shared_agent.rs:1745:49`; no harness, strict
+verification or runtime ran. A corrected checkpoint, fresh owned portable
+main/harness/provenance, source-specific finite readers/harnesses and ordinary
+CLI followed by isolated scoped recovery evidence remain pending. **Qualification:** none for R66; R64's whole30/ordinary Query failures
 remain the latest admitted results. Missing markers remain inconclusive;
 these diagnostics promise attribution, not a remedy or performance benefit.
 
 Applied proposal/source pins below `target/task-tmp`:
 
-- `r64-host-guard-boundary-diagnostic-proposal-v2.patch` SHA `c633ac4091e24e0a6add84847459fda8a450afc3ce3249980cae3a01ca2d9434`; `r64-local-management-context-diagnostic-proposal.patch` SHA `f3ba54c177d406b75a72556b02ed77537ad21762319fb168db5802966b35f4aa`. Combined `vos/src/network/shared_agent.rs` SHA `d753c2a7425b8bb5e4ecb168db8fbdec1a8504a50e4f7cd43ba3d60f0e61037c`.
+- `r66-host-guard-metadata-type-correction.patch` SHA `821bad6596dd73b217a89491e8f01a90c4a346052afa6dfc1dcee9a7875c3db5`; one-line metadata type correction only, no runtime evidence.
+
+- `r64-host-guard-boundary-diagnostic-proposal-v2.patch` SHA `c633ac4091e24e0a6add84847459fda8a450afc3ce3249980cae3a01ca2d9434`; `r64-local-management-context-diagnostic-proposal.patch` SHA `f3ba54c177d406b75a72556b02ed77537ad21762319fb168db5802966b35f4aa`. Frozen failed `1dab3347` network source SHA `d753c2a7425b8bb5e4ecb168db8fbdec1a8504a50e4f7cd43ba3d60f0e61037c`; corrected current source SHA `59ca888e50adddadcbaf962f366d59dbd6bbefd0982d54ea5809bbbe693a13f5`.
 - `r64-native-operation-preparation-error-diagnostic-proposal.patch` SHA `7f7184c1317f02fdd28566520d24d59724b8346f663bad58af83c390c081ca41`; `vos/src/agent/clean_operation_controller.rs` SHA `8996cfb830d05214eb86a85b26005f4ab3dad8fd19f8277a148acee10a3273f5`; `vos/src/agent/clean_operation_dispatch.rs` SHA `c414afb53ea44f198e4f2556af7c780040abb31dadc41195bb686f5e471fc458`.
 
 ### Completed R55 release-bound audit attribution
@@ -3383,8 +3394,10 @@ Remaining release work, in dependency order:
    local-proposer audits have no demonstrated removable duplicate.
    [Applied R66](#r66-local-recovery-and-native-preparation-attribution--applied)
    adds local capacity/budget/preparation context, same-Arc guard-phase markers
-   and closed preparation-error phases. New checkpoint/build/readers/harnesses/
-   fresh evidence are pending; no behavior or qualification follows.
+   and closed preparation-error phases. Frozen `1dab3347` main build failed
+   15.616s/E0308; the one-line metadata type correction is applied. A new
+   checkpoint/build/readers/harnesses, ordinary CLI then scoped evidence are
+   pending; no runtime or qualification follows.
    Initial scoped post-proposal frontier/caller and historical R63 availability,
    R62 delay/R60 refusal remain independent unknowns. Fresh Authority/physical,
    settled-prefix, continuation, corruption and worker/post-peer checks remain
@@ -3441,8 +3454,9 @@ Separate forecasts and unknowns:
   are measured, latest `97fee97e`; replay proves accepted late finalization/
   terminal/release but fails whole30. No behavior remedy is implemented or
   selected. R66 diagnostics are applied for local preparation/capacity,
-  same-Arc guard phases and native-preparation errors, awaiting a new checkpoint/
-  build/readers/harnesses/fresh evidence. They remain unqualified. Remedy/source-hour
+  same-Arc guard phases and native-preparation errors. Frozen `1dab3347`
+  failed to compile; the narrow metadata type correction is applied, awaiting
+  a new checkpoint/build/readers/harnesses/fresh evidence. They remain unqualified. Remedy/source-hour
   confidence stays low, with no defensible remaining range until System
   opening/local Persisted-budget work, failed-submission interior and release
   host-wait causes are established. Original **22–44 source hours** and
@@ -3458,8 +3472,10 @@ Separate forecasts and unknowns:
   Unknowns include startup/owner call composition, initial scoped post-proposal
   frontier/retirement caller, prior R63 ACK availability, R62 delay/R60 refusal,
   current Local Query preparation's first failed branch and further mandatory
-  defects. Applied R66 needs new frozen provenance/current binaries/finite
-  readers/fresh evidence; aggregate effort has no defensible range.
+  defects. R66's 15.616s compile failure is measured build cost, not runtime
+  evidence; its corrected source needs a new frozen provenance/current
+  binaries/finite readers, then ordinary CLI and scoped evidence. Aggregate
+  effort has no defensible range.
   Between-attempt scheduling budgets do not interrupt inner calls.
 - **Qualification:** M1 remains open. Initial R64 scoped/quiet fail before routes;
   same-frozen replay accepts exact finalization/both ACKs/terminal/release and

@@ -71,8 +71,12 @@ holder. Mandatory current Create decision and local-proposer audits have no
 demonstrated removable duplicate.
 [Applied R66](agent-saga-status.md#r66-local-recovery-and-native-preparation-attribution--applied)
 now adds local capacity/budget/preparation context, same-Arc guard markers and
-closed error-only native-preparation phases. New checkpoint/build/finite reader/
-harness/fresh evidence are pending; latest admitted R64 evidence stays frozen. No behavior
+closed error-only native-preparation phases. Frozen
+`1dab33473f82f412ab3c27edcfa4cb045292029e` failed its main build in
+15.616s/exit 101 (metadata SDK Hash/service Hash E0308); no harness, verification
+or runtime ran. The independently reviewed one-line metadata type correction
+is applied, awaiting a new checkpoint/build/finite reader/harness, ordinary CLI
+then scoped evidence. Latest admitted R64 evidence stays frozen. No behavior
 remedy/candidate or architecture is selected. Current ordinary R64 fails **105.923s** after Local Create **25.719s / 2 attempts** and
 Install **56.899s / 5 attempts** complete. Query **9.696s / CLI exit 1** returns preparation HTTP 503/
 retained AOC5 before actor Invoke; unpaired native Unavailable count 1 is not a temporary-
@@ -224,9 +228,12 @@ The bracket is not a direct duration, total blocking time, unique global
 attempt or proof of every holder. Six error-only native-preparation phases
 preserve original errors; five static controller categories replace no checks
 and expose no error payload. Network diagnostics retain the existing std/
-environment gate; ordinary script environment is unchanged. New checkpoint/
-build/source-specific reader/harness/fresh evidence are pending; source/proposal
-pins and implementation are in the sole plan. R64 next-proposal UNAPPLIED
+environment gate; ordinary script environment is unchanged. Frozen `1dab3347`
+main build failed 15.616s/exit 101 with metadata Hash type E0308; no harness,
+verification or runtime ran. Current network source is corrected to
+`59ca888e50adddadcbaf962f366d59dbd6bbefd0982d54ea5809bbbe693a13f5`.
+New checkpoint/build/source-specific reader/harness, ordinary CLI then scoped
+evidence are pending; exact source/correction pins are in the sole plan. R64 next-proposal UNAPPLIED
 status is historical; latest admitted evidence remains `97fee97e`. No behavior remedy/new candidate,
 architecture, authority, cap/deadline extension or audit suppression selected.
 
