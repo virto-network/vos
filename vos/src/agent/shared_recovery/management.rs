@@ -3141,15 +3141,20 @@ mod tests {
         assert_observation_paths(&mut manifest, &observe(&root, 2, false), Ok(true));
         assert_observation_paths(&mut manifest, &observe(&root, 3, true), Ok(true));
         let first_root = manifest.management_slot(node(1)).unwrap().members_evidence[0].clone();
+        // Each holder first acquires a root-only capsule, then appends the child
+        // with its own signed sequence and predecessor.
+        let shadow = sign_registration_from(2, node(1), 1, None, alloc::vec![root.clone()]);
+        manifest.apply_management_registration(&shadow, 4, 3).unwrap();
         let extension = sign_registration(
             1, 2, Some(manifest.management_slot(node(1)).unwrap().commitment()),
             alloc::vec![root.clone(), child.clone()],
         );
-        manifest.apply_management_registration(&extension, 4, 3).unwrap();
-        let shadow = sign_registration_from(
-            2, node(1), 1, None, alloc::vec![root.clone(), child.clone()],
+        manifest.apply_management_registration(&extension, 5, 3).unwrap();
+        let shadow_extension = sign_registration_from(
+            2, node(1), 2, Some(manifest.management_slot(node(2)).unwrap().commitment()),
+            alloc::vec![root.clone(), child.clone()],
         );
-        manifest.apply_management_registration(&shadow, 5, 3).unwrap();
+        manifest.apply_management_registration(&shadow_extension, 6, 3).unwrap();
         for owner in [node(1), node(2)] {
             let slot = manifest.management_slot(owner).unwrap();
             assert_eq!(slot.origin_owner(), node(1));
@@ -3157,13 +3162,13 @@ mod tests {
             assert_eq!(slot.members_evidence[0], first_root);
         }
         assert_observation_paths(
-            &mut manifest, &observe(&child, 6, true),
+            &mut manifest, &observe(&child, 7, true),
             Err(SharedRecoveryError::InvalidObservation),
         );
-        assert_observation_paths(&mut manifest, &observe(&child, 6, false), Ok(true));
-        assert_observation_paths(&mut manifest, &observe(&child, 7, true), Ok(true));
+        assert_observation_paths(&mut manifest, &observe(&child, 7, false), Ok(true));
+        assert_observation_paths(&mut manifest, &observe(&child, 8, true), Ok(true));
         assert_observation_paths(&mut manifest, &observe(&root, 2, false), Ok(false));
-        assert_observation_paths(&mut manifest, &observe(&child, 8, false), Ok(false));
+        assert_observation_paths(&mut manifest, &observe(&child, 9, false), Ok(false));
         let complete = manifest.clone();
 
         let mut wrong_generation = complete.clone();
@@ -3172,7 +3177,7 @@ mod tests {
             crate::agent::journal::AgentJournalGenesisId([0x75; 32]), complete.generation().admission(),
         ).unwrap();
         assert_observation_paths(
-            &mut wrong_generation, &observe(&child, 8, false),
+            &mut wrong_generation, &observe(&child, 9, false),
             Err(SharedRecoveryError::ScopeMismatch),
         );
         let mut wrong_committee = complete.clone();
@@ -3189,15 +3194,15 @@ mod tests {
             AgentProfile::Shared, members,
         ).unwrap();
         assert_observation_paths(
-            &mut wrong_committee, &observe(&child, 8, false),
+            &mut wrong_committee, &observe(&child, 9, false),
             Err(SharedRecoveryError::ScopeMismatch),
         );
 
-        for (owner, index) in [(1, 9), (2, 10)] {
+        for (owner, index) in [(1, 10), (2, 11)] {
             let release = sign_release(manifest.management_slot(node(owner)).unwrap(), owner);
             manifest.apply_management_release(&release, index, 3).unwrap();
         }
-        assert_observation_paths(&mut manifest, &observe(&child, 11, true), Ok(false));
+        assert_observation_paths(&mut manifest, &observe(&child, 12, true), Ok(false));
         for owner in [node(1), node(2)] {
             let slot = manifest.management_slot(owner).unwrap();
             assert!(slot.is_released());
@@ -3206,7 +3211,7 @@ mod tests {
                 complete.management_slot(owner).unwrap().members_evidence,
             );
         }
-        manifest.validate_at(10).unwrap();
+        manifest.validate_at(11).unwrap();
     }
 
     #[test]
