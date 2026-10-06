@@ -12,59 +12,75 @@ host source or the released workflow.
 ## Boundary and release claim
 
 The latest admitted source/evidence boundary is
-`7c53fbf35969d19ccfcc5923b9eb804491e68ae0`.
-[Completed R63](agent-saga-status.md#completed-r63-borrowed-recovery-call-attribution)
-adds gated own-node/thread/local-ordinal direct recovery-call/helper timings.
-Original calls/Results/System guard/signer, 30s between-attempt budget/10ms
-cadence, physical proofs, guest/pins and limits/deadlines remain unchanged.
-Pure checks pass 238 accepted/988 refused, alias/privacy/source, original 8+3+7
-and new 5 source/6 shape refusals, zero helper/private loads. Portable main/
-harness pass **436.855s / 559.598s**, strict six-file verification **0.101s**.
-Original source/proposal/artifact/owned-group fences pass; frozen executables
-are the binary boundaries.
+`97fee97e0d2c1abbc9cc7eccc306ef3703b4930c`.
+[Completed R64](agent-saga-status.md#completed-r64-custody-capacity-context-attribution)
+adds existing exact-work custody context solely around the original capacity-
+and-manifest call. Calls/reads/checks/Results/guards/clocks/guest/pins/authority/
+limits/deadlines remain unchanged. Pure checks pass **263 accepted / 1084 refused**,
+alias/privacy/source, old fences plus 5 capacity source/6 shape refusals, zero
+helper/private loads. Portable main/harness pass **449.260s / 529.763s**, strict
+six-file verification **0.201s**; original source/proposal/artifact/group/frozen-bin
+fences independently pass.
 
-Scoped fixture fails **220.033s**, admitting **14,965** records/328 explicit edges/
-219 identity aliases/51 thread aliases/286 phase groups/zero unknowns.
-Quiet same-frozen fixture fails **293.321s**: Shared-before-routes Unavailable once/
-public `clean_startup_tests.rs:2013:29`, empty bound/affirmative label maps,
-zero unknown locations. Each is one failed/exhausted/noninterrupted test.
-Quiet labels establish no scoped inner cause; backtrace-unset is a root
-invocation fact, not metadata certification. This is constructor refusal
-before public retry, not the later whole pending-Install 30s assertion.
+Three same-frozen runs are separately admitted:
+initial scoped **FAIL 273.599s**, 17,738 records/514 edges/219 identity aliases/
+52 thread aliases/288 groups/zero unknowns; quiet **FAIL 228.846s**, fixed
+Shared-before-routes Unavailable/public `clean_startup_tests.rs:2013:29` once,
+empty bound/affirmative maps and zero unknown locations; additional scoped
+replay **FAIL 229.450s**, 15,936 records/324 edges/250 identity aliases/57 thread
+aliases/276 groups/zero unknowns. Each is one failed/exhausted/noninterrupted
+test. The first two refuse before routes; replay completes all constructors
+then fails whole pending-Install 30s/public `member_cold_install_tests.rs:277`.
+Quiet labels do not establish scoped inner cause or exact family; backtrace-
+unset is invocation fact only. Aliases/local ordinals are report-local, not
+physical thread counts or unique attempts. No nested-clock addition/subtraction
+or proximity pairing.
 
-Original-owner replica 0/node `id1`/thread36 directly returns Err at **57.248496s**;
-replicas 1/2 return Ok at 23.324822s / 26.300708s. Four direct returned calls report
-Unavailable at 14.889635s / 3.174096s / 7.814612s / 11.710376s; helper ordinal 4 reports
-Unavailable at 37.619044s. Local ordinals reset per helper, never global attempt/
-family/branch IDs; constructor/helper/call clocks nest and are never summed,
-subtracted or paired by proximity. This proves slow calls plus repeated
-Unavailable in this stream, not inner cause or R62-delay attribution.
+Initial scoped root `id181`/original `id180/work182/auth183` reaches
+final `id211/work212/auth213` extension and three explicit 46-row fresh final-Invoke audits
+0.895176s/1.511968s/1.392634s with nested categories. Owner confirmation timeout
+and helper Unavailable precede declared attachment retirement; caller/frontier
+unknown. Input `id219` appends at 47, polls Absent and waits 1.800061s. No positive
+accepted issuer/terminal/release proof; missing markers do not prove absent
+commitment/application or guest failure. These are initial-run costs.
 
-Exact root `id183`/original `id182/work184/auth185` retains final child
-`id210/work211/auth212`. Input `id218` at 48 has all-three anchors/Ready and
-root-bound issuer_save_complete e14648. Exact Done/Bool(true), matching durable
-replay and successful issuer save prove accepted finalization. Retirement
-refuses e14883. Later original ACK `id219` at 49 has leader/follower anchors,
-result-poll/Ready e14932–33 and wait_complete e14935, then separate availability
-Unavailable e14947–48. Buffered result wait is distinct from ACK availability/
-owner confirmation/full-member release. No owner-anchor/terminal-persist/
-release-complete marker is observed; absence proves neither nonexecution
-nor subcause.
+Replay exact root `id195`/original `id194/work196/auth197` retains final
+`id222/work223/auth224` on owner `id2`/System `id4`. Invoke `id228` at 48 has
+all-three full-input anchors/Ready/availability completion and root issuer
+save e14756 after exact Done/Bool(true)/durable replay/issuer checks.
+Original ACK `id229` at 49 and final ACK `id230` at 50 each have all-three anchors and
+availability completion. Root runtime retirement e14941, terminal_persist/status=complete e14945 and
+retention_release/status=complete e15271 are positive. Exact
+signed release `id232/scope231/reg225/rootmember200` binds original owner;
+Present e15269 precedes custody complete at 3.246925s cumulative and release.
+Separate direct host wait 2.942006s has unknown holder. Late positive confirmation uses the original success-before-deadline-check
+semantics and does not prove timely 1.8s or whole30. All constructors Ok: owner **55.444526s**,
+peers 25.572441s / 35.601312s. Own helper **35.216967s**/Ok and calls 10.960675s/
+Unavailable, 24.246181s/Ok remain separate nested clocks.
 
-ACK `work184` already has ONE capacity-and-manifest fresh audit. Only final
-Invoke `work211` owns two fresh 47-row absence audits 0.942498s / 0.984799s;
-raw-worker/settled-prefix checks remain mandatory. ACK's bound custody-budget
-0.277962s is not a guest-preparation timer. Next bounded attribution concerns
-owner ACK recovery/waits, leader admission/post-wait availability and earlier
-finalization refusals. [R64 capacity-context diagnostics](agent-saga-status.md#r64-custody-capacity-context-attribution--applied)
-are applied, awaiting new checkpoint/build/reader/fixture; no remedy is selected.
-R62 late accepted release/66.719104s Ok and R60 separate refusal remain
-historical/unattributed; required earlier-Create fresh verification is not a
-removable duplicate. Latest ordinary CLI stays R57 Local Create/Install then
-Query authorization-preparation HTTP 503 before Invoke. No R63 ordinary run.
-M1/whole30/fresh Query/current Shared/reopen/M2/M3 remain open. Costs are not
-speedup/ETA; no new behavior candidate, architecture, authority, cap/deadline
-extension or promotion follows.
+Replay final Invoke reserved-none/ACK management_retirement are owner-local,
+not forwarded ManagementCustody: no new capacity_manifest-bound post-cold
+ACK audit body. Unscoped costs cannot be assigned. Earlier Create successes
+and R63 ACKReady→availability/R62 late-release/R60 refusal remain distinct
+frozen histories, not retrospective explanations. Fresh physical/Authority/
+worker-prefix/current-byte checks remain mandatory.
+
+Next bounded source investigation concerns current System opening/local
+Persisted-budget work, failed Install submission interior and release host-wait
+holder. Mandatory current Create decision and local-proposer audits have no
+demonstrated removable duplicate.
+[Applied R66](agent-saga-status.md#r66-local-recovery-and-native-preparation-attribution--applied)
+now adds local capacity/budget/preparation context, same-Arc guard markers and
+closed error-only native-preparation phases. New checkpoint/build/finite reader/
+harness/fresh evidence are pending; latest admitted R64 evidence stays frozen. No behavior
+remedy/candidate or architecture is selected. Current ordinary R64 fails **105.923s** after Local Create **25.719s / 2 attempts** and
+Install **56.899s / 5 attempts** complete. Query **9.696s / CLI exit 1** returns preparation HTTP 503/
+retained AOC5 before actor Invoke; unpaired native Unavailable count 1 is not a temporary-
+failure or policy-denial diagnosis. Shared/reopen unreached. Graceful-stop
+**1.146s / exit 0**, three launches/zero owned survivors pass current cleanup, distinct
+from historical R57 cleanup exit 1.
+M1/whole30/routes/recovered-Install client Applied/fresh Query/M2/M3 remain open.
+No controlled speedup/ETA/authority/cap/deadline extension or promotion.
 
 The review branch remains `e6f2bb45` on `saga/agents`. Original replacement
 source `8128e677` and its role bundle `7085c220` precede the corrected integration
@@ -157,58 +173,78 @@ Current O3 component evidence (logs under the native worktree's `target`):
 
 ### Current integration delta and blocking result
 
-Read [completed R63](agent-saga-status.md#completed-r63-borrowed-recovery-call-attribution)
-for clean `7c53fbf3` and exact hashes. Scoped/quiet fail **220.033s / 293.321s**
-before routes; quiet public constructor error is 2013:29, not assertion 277.
-Original-owner replica0 directly returns Err at **57.248496s**; peers return
-Ok at 23.324822s / 26.300708s. Four borrowed direct returns are Unavailable
-14.889635s/3.174096s/7.814612s/11.710376s; helper returns ordinal 4/
-Unavailable at 37.619044s. Own node/thread/local ordinal supplies no global
-attempt/family/branch identity; no nested-clock addition/subtraction or
-chronological pairing.
+Read [completed R64](agent-saga-status.md#completed-r64-custody-capacity-context-attribution)
+for clean `97fee97e` and exact source/build/pure/SAFE pins. Initial scoped
+273.599s fails Shared recovery before routes; quiet **228.846s** independently
+records public 2013:29. Initial owner 54.797111s/Err/helper 33.145925s/Unavailable
+and final Invoke `id211/work212/auth213` retain original authorization but provide
+no accepted current issuer/terminal/release proof. Three bound 46-row audit
+bodies in capacity_manifest/custody_budget/singleton_budget are 0.895176s/
+1.511968s/1.392634s, with nested categories, not summed costs or cold ACK proof.
+Capacity/current-physical and settled-absence proofs have different obligations;
+raw Raft progresses outside ledger/host guards, so no as-is audit consolidation
+is proved. Owner confirmation timeout/helper refusal precede attachment retirement,
+without exact caller/base Network shutdown/commit frontier attribution.
+Input `id219` appends at 47, polls Absent and waits 1.800061s; these prove
+local admission and those result checks, not absent quorum/application or guest failure.
 
-Root `id183` retains original `id182/work184/auth185` on owner `id1`/
-System `id4`, candidates `id192/id196` distinct. Final child
-`id210/work211/auth212` keeps candidates `id216/id217` separate. Invoke
-input `id218` appends 48/e14538; all-three anchors e14568/e14606/e14610,
-result-poll/Ready e14569–70 and root-bound
-`management_finalization_phase=issuer_save_complete` e14648 prove accepted
-exact finalization through Done/Bool(true), durable replay and issuer-save
-checks. Owner runtime-retirement refuses e14883.
+The separately admitted same-frozen replay **229.450s** reaches a later boundary:
+root `id195`/original `id194/work196/auth197`→final
+`id222/work223/auth224`; Invoke `id228` at 48,
+original ACK `id229` at 49 and final ACK `id230` at 50 have all-three exact full-input anchors,
+buffer Ready and availability completion. Root issuer-save e14756 proves accepted
+finalization; runtime retirement e14941/terminal complete e14945/release complete
+e15271 are positive. Signed release `id232/scope231/reg225/rootmember200` retains
+original owner `id2`. Owner Present e15269→custody complete e15270 at 3.246925s cumulative
+→retention release e15271. Direct host wait 2.942006s has unknown holder; neither
+clock establishes timely 1.8s/whole30. All constructors Ok at 25.572441s / 35.601312s /
+55.444526s; original-owner helper **35.216967s**/Ok has returned calls 10.960675s/
+Unavailable and 24.246181s/Ok, never summed/subtracted or treated as globally
+unique attempts. Source/basic summary row 277 proves unchanged whole30 failure
+after accepted release, not before-routes constructor refusal.
 
-Later original ACK `id219` appends 49/e14902; leader/follower anchors
-e14931/e14941, result-poll/Ready e14932–33 and explicit ACK wait_complete
-e14935 are positive. Its 2.599777s and later availability_error 4.403645s
-are cumulative points, never added/direct phase durations. Separate
-post-wait availability returns Unavailable e14948. No owner node id1 anchor
-or root terminal-persist/release-complete marker is observed; missing
-records do not prove nonexecution. Ready/result wait is distinct from
-availability/owner ACK/complete-member retirement/release.
+Replay owner-local management-retirement ACKs are not forwarded
+ManagementCustody. New capacity_manifest span has no bound post-cold ACK body
+here; unscoped audit work stays unassigned. This positive replay is neither a
+controlled improvement nor retrospective attribution of initial R64, R63,
+R62 or R60. Their original full proofs and unknowns remain frozen.
+Replay own node/thread phase-clock points System 19.672s / local 19.673s and
+Shared 54.890s / controller 54.891s are cumulative, not subtracted or added to direct
+helper/call clocks. Exact work196/input209 retry availability positives are
+not new appends. Direct submission 3.240248s/refused then 11.654ms/Ok leaves
+its interior unknown; durable 49.886ms / issuer 3.613ms are separate. Earlier
+Create current decision request `id216` completes 1.377733s with nested audit/
+callback costs, mandatory verification without removable-work proof.
+Next bounded source investigation concerns System opening/local Persisted-
+budget work, failed-submission interior and release host-wait holder.
+[Applied R66](agent-saga-status.md#r66-local-recovery-and-native-preparation-attribution--applied)
+adds caller context to existing local capacity/manifest/singleton-budget/
+preparation and same-Arc acquired→release_pending→released guard markers.
+The bracket is not a direct duration, total blocking time, unique global
+attempt or proof of every holder. Six error-only native-preparation phases
+preserve original errors; five static controller categories replace no checks
+and expose no error payload. Network diagnostics retain the existing std/
+environment gate; ordinary script environment is unchanged. New checkpoint/
+build/source-specific reader/harness/fresh evidence are pending; source/proposal
+pins and implementation are in the sole plan. R64 next-proposal UNAPPLIED
+status is historical; latest admitted evidence remains `97fee97e`. No behavior remedy/new candidate,
+architecture, authority, cap/deadline extension or audit suppression selected.
 
-ACK already lends ONE fresh capacity-and-manifest to checked preparation.
-Custody-budget 0.277962s/two items does not attribute capacity/guest work.
-Only final Invoke has two fresh 47-row absence audits 0.942498s / 0.984799s;
-distinct settled transactions/raw-worker progress forbid assuming proof
-reuse across those boundaries. Earlier extension refusals/completion and
-owner forwarding timeout precede accepted issuer save; repeated family
-IDs are not one attempt. Next attribution is owner ACK recovery/waits
-versus leader admission/post-wait availability and earlier registration/
-finalization refusals. Availability's exact claim/attachment/quorum/final-
-check reason is unlogged. Applied R64 adds one gated capacity_manifest context
-around the original capacity-and-manifest call; all calls/checks/read/guard/
-error order stay unchanged. New checkpoint/build/finite-reader/fresh fixture
-are pending. No behavior remedy or audit suppression follows.
-
-R62 late accepted release/66.719104s Ok and R60 constructor/local-append
-history remain frozen; current timings do not explain them retrospectively.
-Earlier Create current Authority verification/retained generation progress
-supplies no removable duplicate/new mutation. Fresh physical/member/runtime-
-ACK/worker-prefix/original deadline checks remain mandatory.
-Latest ordinary CLI is R57 Query authorization-preparation HTTP 503 after Local
-Create/Install; no R63 ordinary run. M1 remains next.
-Build **16.61 minutes** and scoped/quiet **3.67 / 4.89 minutes** are uncontrolled costs,
-not application performance or remaining ETA. Remedy/qualification effort
-remains uncertain; no cap/deadline extension or promotion.
+Current ordinary CLI fails **105.923s**: ready **9.748s**, Local Create **25.719s / 2 attempts**
+and Install **56.899s / 5 attempts** complete; Query **9.696s / CLI exit 1** is fixed preparation HTTP 503
+with exact retained AOC5 suffix, before actor Invoke. Unpaired native Unavailable count 1
+with zero unmapped markers does not identify a failed check, temporary failure
+or policy denial; controller validation can mask integrity errors. Source-closed
+first-preparation-branch attribution is next, not a rerun without new evidence.
+Shared/reopen remain unreached. Graceful stop **1.146s / exit 0** and three owned launches/
+zero survivors pass current cleanup; historical R57 cleanup exit 1 remains distinct.
+Original metadata/error reader source/pin/private/env/group fences pass;
+pure 20/123 + parent 5/13 + error 55/14 are tooling-only, zero helper/private loads.
+Metadata SAFE `347c53`/error SAFE `72bc3b` are linked in the sole plan.
+M1 remains next. Build **16.32 minutes**;
+initial scoped/quiet/replay **4.56 / 3.81 / 3.82 minutes** are uncontrolled measured costs,
+not application performance or remaining ETA. Recovered-Install client Applied,
+routes/fresh Query/whole30/whole acceptance stay open.
 
 ### Frozen preceding integration evidence
 

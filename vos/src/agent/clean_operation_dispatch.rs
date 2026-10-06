@@ -675,6 +675,12 @@ where
                             .map_err(|_| SharedAgentHostError::ScopeMismatch)?,
                     )
                     .map_err(|_| SharedAgentHostError::Unavailable)
+            })
+            .map_err(|error| {
+                tracing::warn!(invocation = ?call.invocation.0, phase = "fresh_capture",
+                    unavailable = matches!(error, SharedAgentHostError::Unavailable),
+                    "native operation preparation branch refused");
+                error
             })?;
         Ok(record.request.context)
     }
@@ -1445,13 +1451,31 @@ where
             {
                 return Err(SharedAgentHostError::Conflict);
             }
-            self.pending_authority_operation_dispatch(call, None)?;
+            self.pending_authority_operation_dispatch(call, None)
+                .map_err(|error| {
+                    tracing::warn!(invocation = ?call.invocation.0, phase = "retained_lookup",
+                        unavailable = matches!(error, SharedAgentHostError::Unavailable),
+                        "native operation preparation branch refused");
+                    error
+                })?;
             // Re-enter existing admission with the original full input after a
             // pre-append interruption. Never resample its material or clock.
-            return self.capture_prepared_authority_operation(request, &expected.envelope, false, persist);
+            return self.capture_prepared_authority_operation(request, &expected.envelope, false, persist)
+                .map_err(|error| {
+                    tracing::warn!(invocation = ?call.invocation.0, phase = "retained_capture",
+                        unavailable = matches!(error, SharedAgentHostError::Unavailable),
+                        "native operation preparation branch refused");
+                    error
+                });
         }
         let material = self
-            .supervisor_invocation_material(self.pins.agent, call.authority.binding.issuer.actor)?;
+            .supervisor_invocation_material(self.pins.agent, call.authority.binding.issuer.actor)
+            .map_err(|error| {
+                tracing::warn!(invocation = ?call.invocation.0, phase = "physical_material",
+                    unavailable = matches!(error, SharedAgentHostError::Unavailable),
+                    "native operation preparation branch refused");
+                error
+            })?;
         let observed_slot = material.observed_slot;
         if observed_slot < call.requested_valid_from || observed_slot > call.requested_expires_at {
             return Err(SharedAgentHostError::ScopeMismatch);
@@ -1479,6 +1503,12 @@ where
         // The existing physical validation above precedes a guarded fresh-only
         // check. That check mints per-open proof immediately before metadata I/O.
         self.capture_prepared_authority_operation(&request, &proposed, true, persist)
+            .map_err(|error| {
+                tracing::warn!(invocation = ?call.invocation.0, phase = "fresh_admission",
+                    unavailable = matches!(error, SharedAgentHostError::Unavailable),
+                    "native operation preparation branch refused");
+                error
+            })
     }
 
     /// Extend only the exact retained authorization with its signed issuance

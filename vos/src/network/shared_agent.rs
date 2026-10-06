@@ -926,6 +926,25 @@ fn causal_custody_audit_span(
     })
 }
 
+// These source-owned fields identify an already owned attachment, not a
+// mutex address, global call attempt or proof that every holder is observed.
+#[cfg(feature = "std")]
+fn trace_causal_host_guard(
+    node: NodeId,
+    agent: crate::service::AgentId,
+    route: AgentGenerationRoute,
+    operation: &'static str,
+    phase: &'static str,
+    metadata: Option<Hash>,
+    poll: Option<u64>,
+) {
+    tracing::debug!(node = ?node.0, agent = ?agent.0,
+        route_space = ?route.space.0, route_group = ?route.generation.0,
+        thread = ?std::thread::current().id(), operation, phase,
+        metadata = ?metadata.map(|value| value.0), poll = ?poll,
+        "VOS causal host guard");
+}
+
 fn management_retirement_keys(
     agent: crate::service::AgentId,
     envelopes: [&crate::agent_sdk::RuntimeWork; 2],
@@ -1719,6 +1738,13 @@ impl SharedRouteHandler {
                     "VOS causal management");
             }
         };
+        #[cfg(feature = "std")]
+        let trace_host_guard = |phase: &'static str, poll: u64| {
+            if let (Some(_), Some(("release", Some(metadata), _))) = (started, diagnostic) {
+                trace_causal_host_guard(self.network.agent_node_id(), self.agent, self.route,
+                    "release_poll", phase, Some(metadata), Some(poll));
+            }
+        };
         let refused = |phase: &str, error: SharedAgentHostError| {
             trace(phase);
             if started.is_some() {
@@ -1783,6 +1809,8 @@ impl SharedRouteHandler {
             if started.is_some() {
                 diagnostic_poll = diagnostic_poll.saturating_add(1);
             }
+            #[cfg(feature = "std")]
+            trace_host_guard("wait_start", diagnostic_poll);
             let phase_started = started.map(|_| Instant::now());
             let host_result = self
                 .host
@@ -1790,6 +1818,8 @@ impl SharedRouteHandler {
                 .map_err(|_| refused("wait_host_lock_error", SharedAgentHostError::Unavailable));
             trace_poll("metadata_host_wait", if host_result.is_ok() { "ok" } else { "error" }, diagnostic_poll, phase_started);
             let mut host = host_result?;
+            #[cfg(feature = "std")]
+            trace_host_guard("acquired", diagnostic_poll);
             let phase_started = started.map(|_| Instant::now());
             let drain_result = drain_committed(&mut host, self.agent, &self.ordered_replies)
                 .map_err(|error| refused("wait_host_drain_error", error));
@@ -1861,7 +1891,11 @@ impl SharedRouteHandler {
                 trace("local_custody_complete");
                 return Ok(());
             }
+            #[cfg(feature = "std")]
+            trace_host_guard("release_pending", diagnostic_poll);
             drop(host);
+            #[cfg(feature = "std")]
+            trace_host_guard("released", diagnostic_poll);
             if Instant::now() >= deadline {
                 return Err(refused(
                     "local_custody_timeout",
@@ -2942,8 +2976,15 @@ impl SharedRouteHandler {
                     capacity_manifest = Some(manifest);
                     capacity
                 } else {
-                    host.capacity(self.agent)
-                        .map_err(|error| refused("capacity_error", error))?
+                    {
+                        #[cfg(feature = "std")]
+                        let _causal_span = causal_custody_audit_span(
+                            management_diagnostic_key,
+                            "local_capacity",
+                        );
+                        host.capacity(self.agent)
+                    }
+                    .map_err(|error| refused("capacity_error", error))?
                 };
                 trace("capacity_audited");
                 #[cfg(feature = "std")]
@@ -3027,9 +3068,16 @@ impl SharedRouteHandler {
                     host.management_custody_has_pending_with_manifest(self.agent, manifest)
                         .map_err(|error| refused("management_manifest_error", error))?
                 } else {
-                    host.recovery_manifest(self.agent)
-                        .map_err(|error| refused("management_manifest_error", error))?
-                        .has_pending_management()
+                    {
+                        #[cfg(feature = "std")]
+                        let _causal_span = causal_custody_audit_span(
+                            management_diagnostic_key.filter(|_| !trace_enabled),
+                            "local_manifest",
+                        );
+                        host.recovery_manifest(self.agent)
+                    }
+                    .map_err(|error| refused("management_manifest_error", error))?
+                    .has_pending_management()
                 };
                 if has_pending_management
                     && !matches!(clock, InvocationClock::PersistedManagement(_))
@@ -3072,8 +3120,8 @@ impl SharedRouteHandler {
                 let pending_budget_result = {
                     #[cfg(feature = "std")]
                     let _causal_span = causal_custody_audit_span(
-                        management_diagnostic_key.filter(|_| trace_enabled),
-                        "singleton_budget",
+                        management_diagnostic_key,
+                        if trace_enabled { "singleton_budget" } else { "local_singleton_budget" },
                     );
                     if let Some(manifest) = custody_manifest.as_ref() {
                         host.management_pending_admission_with_input_and_manifest(
@@ -3121,8 +3169,8 @@ impl SharedRouteHandler {
             let prepared_result = {
                 #[cfg(feature = "std")]
                 let _causal_span = causal_custody_audit_span(
-                    management_diagnostic_key.filter(|_| trace_enabled),
-                    "preparation",
+                    management_diagnostic_key,
+                    if trace_enabled { "preparation" } else { "local_preparation" },
                 );
                 if matches!(clock, InvocationClock::Bootstrap) {
                     host.prepare_bootstrap_invocation(self.agent, request)
@@ -6092,6 +6140,7 @@ impl SharedAgentNetworkHost {
                                     "VOS causal applier host work");
                             }
                         };
+                        {
                         #[cfg(feature = "std")]
                         let host_wait_started = diagnostic_enabled.then(Instant::now);
                         let Ok(mut host) = host.lock() else {
@@ -6111,6 +6160,11 @@ impl SharedAgentNetworkHost {
                         };
                         #[cfg(feature = "std")]
                         let host_work_started = diagnostic_enabled.then(Instant::now);
+                        #[cfg(feature = "std")]
+                        if diagnostic_enabled {
+                            trace_causal_host_guard(network.agent_node_id(), agent, route,
+                                "applier", "acquired", None, None);
+                        }
                         #[cfg(feature = "std")]
                         trace_host_work("host_wait", host_wait_started, true);
                         #[cfg(feature = "std")]
@@ -6132,7 +6186,17 @@ impl SharedAgentNetworkHost {
                             }
                             #[cfg(feature = "std")]
                             trace_host_work("host_work", host_work_started, false);
+                            #[cfg(feature = "std")]
+                            if diagnostic_enabled {
+                                trace_causal_host_guard(network.agent_node_id(), agent, route,
+                                    "applier", "release_pending", None, None);
+                            }
                             drop(host);
+                            #[cfg(feature = "std")]
+                            if diagnostic_enabled {
+                                trace_causal_host_guard(network.agent_node_id(), agent, route,
+                                    "applier", "released", None, None);
+                            }
                             retire_route_with_lease(
                                 &network,
                                 route,
@@ -6161,7 +6225,17 @@ impl SharedAgentNetworkHost {
                             }
                             #[cfg(feature = "std")]
                             trace_host_work("host_work", host_work_started, false);
+                            #[cfg(feature = "std")]
+                            if diagnostic_enabled {
+                                trace_causal_host_guard(network.agent_node_id(), agent, route,
+                                    "applier", "release_pending", None, None);
+                            }
                             drop(host);
+                            #[cfg(feature = "std")]
+                            if diagnostic_enabled {
+                                trace_causal_host_guard(network.agent_node_id(), agent, route,
+                                    "applier", "released", None, None);
+                            }
                             retire_route_with_lease(
                                 &network,
                                 route,
@@ -6174,6 +6248,17 @@ impl SharedAgentNetworkHost {
                         trace_host_work("attachment", attachment_started, true);
                         #[cfg(feature = "std")]
                         trace_host_work("host_work", host_work_started, true);
+                        #[cfg(feature = "std")]
+                        if diagnostic_enabled {
+                            trace_causal_host_guard(network.agent_node_id(), agent, route,
+                                "applier", "release_pending", None, None);
+                        }
+                        }
+                        #[cfg(feature = "std")]
+                        if diagnostic_enabled {
+                            trace_causal_host_guard(network.agent_node_id(), agent, route,
+                                "applier", "released", None, None);
+                        }
                     }
                     // A closed notifier without an owning retirement means
                     // the worker stopped unexpectedly. Revoke the route and

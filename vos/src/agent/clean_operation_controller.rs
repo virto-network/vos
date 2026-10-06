@@ -497,7 +497,22 @@ where
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         self.validate()
-            .map_err(|_| SharedAgentHostError::Unavailable)?;
+            .map_err(|error| {
+                let category = match &error {
+                    NativeAuthorityOperationControllerError::WrongAuthority => "wrong_authority",
+                    NativeAuthorityOperationControllerError::Completion(_) => "completion",
+                    NativeAuthorityOperationControllerError::OpenIssuer(_) => "issuer_open",
+                    NativeAuthorityOperationControllerError::OpenCoordinator(_) => "coordinator_open",
+                    NativeAuthorityOperationControllerError::Coordinate(_) => "coordinate",
+                };
+                // Preserve disposal of the masked store/controller error before
+                // logging; never format its payload at this boundary.
+                drop(error);
+                tracing::warn!(invocation = ?call.invocation.0,
+                    phase = "controller_validation", category,
+                    "native operation preparation branch refused");
+                SharedAgentHostError::Unavailable
+            })?;
         if let Some((context, _)) = self.retired_for_call(call, None, None)? {
             return Ok(context);
         }
