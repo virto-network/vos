@@ -1952,12 +1952,26 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
                         let operator = &operator;
                         let bundle = &bundle;
                         let inputs = &inputs;
+                        #[cfg(feature = "experimental-state-blocks")]
+                        let constructor_node = enrollments[index].node;
                         scope.spawn(move || {
                             let certified = (!restart).then(|| {
                                 read_certified_bootstrap_bundle(bundle, space.0, operator, daemon)
                                     .unwrap()
                             });
-                            open_clean_system_lifecycle_with_roster_policy(
+                            #[cfg(feature = "experimental-state-blocks")]
+                            let constructor_started = (restart
+                                && stage == FixedRosterStage::ColdInstallAll
+                                && std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some())
+                            .then(std::time::Instant::now);
+                            #[cfg(feature = "experimental-state-blocks")]
+                            if constructor_started.is_some() {
+                                tracing::debug!(node = ?constructor_node.0,
+                                    replica_index = index as u64, restart,
+                                    thread = ?std::thread::current().id(), phase = "start",
+                                    "VOS causal cold constructor");
+                            }
+                            let result = open_clean_system_lifecycle_with_roster_policy(
                                 network,
                                 data,
                                 space.0,
@@ -1977,7 +1991,17 @@ fn check_fixed_roster_preparation(stage: FixedRosterStage) {
                                     | FixedRosterStage::ColdInstallReturning => Some(inputs),
                                     _ => None,
                                 },
-                            )
+                            );
+                            #[cfg(feature = "experimental-state-blocks")]
+                            if let Some(started) = constructor_started {
+                                let elapsed_us = started.elapsed().as_micros() as u64;
+                                tracing::debug!(node = ?constructor_node.0,
+                                    replica_index = index as u64, restart,
+                                    thread = ?std::thread::current().id(), phase = "returned",
+                                    elapsed_us, success = result.is_ok(),
+                                    "VOS causal cold constructor");
+                            }
+                            result
                         })
                     })
                     .collect();

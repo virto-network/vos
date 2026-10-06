@@ -571,6 +571,8 @@ pub(crate) fn start_clean_system_agent(
         PROJECTION_RECONCILE_INTERVAL,
     )?;
     tracing::debug!(
+        node = ?clean_node.0,
+        thread = ?std::thread::current().id(),
         phase = "production_ready",
         elapsed_ms = startup_started.elapsed().as_millis() as u64,
         "Clean system Agent startup phase complete"
@@ -1216,13 +1218,6 @@ fn open_clean_system_lifecycle_with_roster_policy(
     }
     super::local_config::validate_local_storage_roots(data_dir, local_storage)?;
     let startup_started = std::time::Instant::now();
-    let report_phase = |phase: &'static str| {
-        tracing::debug!(
-            phase,
-            elapsed_ms = startup_started.elapsed().as_millis() as u64,
-            "Clean system Agent startup phase complete"
-        );
-    };
     require_ed25519(operator, "space root")?;
     require_ed25519(daemon, "node transport")?;
 
@@ -1238,6 +1233,15 @@ fn open_clean_system_lifecycle_with_roster_policy(
 
     let peer = daemon.public().to_peer_id();
     let clean_node = node_id_from_authenticated_peer(&peer);
+    let report_phase = |phase: &'static str| {
+        tracing::debug!(
+            node = ?clean_node.0,
+            thread = ?std::thread::current().id(),
+            phase,
+            elapsed_ms = startup_started.elapsed().as_millis() as u64,
+            "Clean system Agent startup phase complete"
+        );
+    };
 
     let stores =
         CleanSystemAgentFileStores::open_or_create(data_dir.join(SYSTEM_AGENT_CONTROL_DIRECTORY))?;
