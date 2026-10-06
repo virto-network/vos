@@ -3169,7 +3169,7 @@ mod tests {
         let mut wrong_generation = complete.clone();
         wrong_generation.generation = AgentGenerationRouteKey::new(
             complete.generation().space(), complete.generation().agent(),
-            Hash([0x75; 32]), complete.generation().admission(),
+            crate::agent::journal::AgentJournalGenesisId([0x75; 32]), complete.generation().admission(),
         ).unwrap();
         assert_observation_paths(
             &mut wrong_generation, &observe(&child, 8, false),
