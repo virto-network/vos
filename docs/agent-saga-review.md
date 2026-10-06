@@ -11,6 +11,17 @@ host source or the released workflow.
 
 ## Boundary and release claim
 
+R57's concrete combined release-admission patch was explicitly approved on
+2026-10-06: "approved, just keep going". Root applied reviewed v4 after verifying
+clean `e30e7b03` and unchanged product source. Combined-entry preservation tests
+and two real-worker component regressions are implemented and independently
+reviewed; nineteen exact units await the owned core build. The finite reader
+passes 51 acceptance/96 refusal synthetic cases with privacy and original fences
+preserved. Component worker cases do not qualify host/custody/public recovery;
+there is no build, recovery or performance credit yet. The one release-only
+coordination change is authorized under the
+original limits; further candidates, redesign or a week-cap extension are not.
+
 R56 diagnostic attribution is complete on clean `53b7be16`: portable
 main/harness pass **391.898s / 459.891s**, strict six-file verification **0.101s**.
 One isolated scoped all-cold attempt fails **245.670s**, one failed test,
@@ -38,18 +49,18 @@ do not prioritize a sixth tiny pass. The reviewed source-only proposal
 combines release validation and scalar capacity from the existing fresh fully
 authenticated management preflight view. Driver/signature order, one unchanged
 guarded transaction and final worker barrier/prefix check must remain mandatory.
-Removing the second read changes coordination and its error boundary, requiring
-separate review and direction. No behavior implementation, view/cache export,
-new authority, sixth tuning pass, redesign or cap extension is automatic. The
+Removing the second read changes coordination and its error boundary; R57 now
+has the separate review and explicit direction above. No view/cache export,
+new authority, further candidate, redesign or cap extension is automatic. The
 live plan owns exact evidence, forecasts and all remaining release gates.
 
 The concrete source-only proposal is
 `target/task-tmp/r56-signed-release-capacity-proposal-v4.patch`, SHA
 `dee945322575f55bb23097db0ecbd55a774f1ff259fb4230d76ee0bb6f18af90`.
-Root and independent source/tool reviews pass; it remains unapplied, uncompiled,
+Root and independent source/tool reviews pass; it is applied, uncompiled,
 untested and unmeasured. Read the live plan's
-[reviewed proposal and mandatory regressions](agent-saga-status.md#reviewed-combined-release-admission-proposal--awaiting-direction)
-before any decision. Generic capacity counters keep their meaning: proposed
+[approved change and mandatory regressions](agent-saga-status.md#r57-approved-combined-release-admission--implementation-in-progress).
+Generic capacity counters keep their meaning: proposed
 release delta zero, actual management-preflight delta one; registration keeps
 its actual generic capacity delta one. The new cumulative leader marker requires
 a source-specific strict reader update before diagnostic execution.
@@ -224,8 +235,8 @@ Incoming verification is only a small part of registration folding and does not
 prioritize the unapplied tiny reuse patch. The later host holder remains unknown.
 The source-only combined admission proposal must retain a complete fresh guarded
 management preflight and final worker/prefix checks; removing the second read
-requires separately reviewed coordination/error-boundary changes, not a cache
-or authority shortcut. No sixth behavior candidate or week-cap extension follows.
+has separately reviewed and approved coordination/error-boundary changes, not a
+cache or authority shortcut. No further behavior candidate or week-cap extension follows.
 Ordinary three-process CLI, remaining packaged gates, M2 and M3 stay open.
 
 The reviewed proposal removes only repeated changed-candidate slot validation

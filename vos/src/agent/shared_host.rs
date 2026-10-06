@@ -3577,6 +3577,30 @@ impl SharedAgentHost {
             .map_err(map_driver_error)
     }
 
+    /// Signed release admission with capacity from that same fresh preflight.
+    /// The caller retains host/proposal guards and checks its worker barrier.
+    pub(crate) fn validate_management_recovery_release_and_capacity(
+        &mut self,
+        agent: AgentId,
+        release: &super::shared_recovery::management::SharedManagementRecoveryRelease,
+    ) -> Result<(u64, u64, bool), SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        let hosted = self
+            .agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        if !matches!(
+            &hosted.intent.authority,
+            SharedGenesisAuthority::SystemBootstrap { .. }
+        ) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        hosted
+            .driver
+            .validate_management_recovery_release_and_capacity(release)
+            .map_err(map_driver_error)
+    }
+
     /// Called before the native owner writes this immutable member to its
     /// management intent. Proposal ordering and the durable intent obligation
     /// remain at the native boundary, not in this typed signing seam.

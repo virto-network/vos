@@ -7535,6 +7535,304 @@ mod tests {
         database
     }
 
+    // Component fixture: all quorum replies come from real fixed-voter
+    // workers. It does not construct a public Shared host or claim startup
+    // qualification. Gating delivery lets raw consensus progress be placed
+    // precisely between the caller's existing admission barriers.
+    struct RawWorkerTransport {
+        local: NodeId,
+        peers: Arc<std::sync::RwLock<BTreeMap<NodeId, vos_raft::WorkerHandle<NodeId>>>>,
+        deliver: Arc<AtomicBool>,
+    }
+
+    impl RawWorkerTransport {
+        fn peer(&self, peer: NodeId, sender: NodeId) -> Result<vos_raft::WorkerHandle<NodeId>, ()> {
+            if sender != self.local || !self.deliver.load(Ordering::Acquire) {
+                return Err(());
+            }
+            self.peers.read().unwrap().get(&peer).cloned().ok_or(())
+        }
+    }
+
+    impl vos_raft::Transport<NodeId> for RawWorkerTransport {
+        type Error = ();
+
+        async fn send_append(
+            &self,
+            peer: NodeId,
+            request: vos_raft::AppendEntriesReq<NodeId>,
+        ) -> Result<vos_raft::AppendEntriesResp, ()> {
+            Ok(self.peer(peer, request.leader)?
+                .handle_authenticated_inbound_append(self.local, request).await)
+        }
+
+        async fn send_vote(
+            &self,
+            peer: NodeId,
+            request: vos_raft::RequestVoteReq<NodeId>,
+        ) -> Result<vos_raft::RequestVoteResp, ()> {
+            Ok(self.peer(peer, request.candidate)?
+                .handle_authenticated_inbound_vote(self.local, request).await)
+        }
+
+        async fn send_prevote(
+            &self,
+            peer: NodeId,
+            request: vos_raft::PreVoteReq<NodeId>,
+        ) -> Result<vos_raft::PreVoteResp, ()> {
+            Ok(self.peer(peer, request.candidate)?
+                .handle_authenticated_inbound_prevote(self.local, request).await)
+        }
+
+        async fn send_install(
+            &self,
+            peer: NodeId,
+            request: vos_raft::InstallSnapshotReq<NodeId>,
+        ) -> Result<vos_raft::InstallSnapshotResp, ()> {
+            Ok(self.peer(peer, request.leader)?
+                .handle_authenticated_inbound_install(self.local, request).await)
+        }
+    }
+
+    struct RawWorkerCluster {
+        // Workers join before their databases and owned files are dropped.
+        _workers: Vec<vos_raft::Worker<NodeId>>,
+        databases: BTreeMap<NodeId, Arc<Database>>,
+        _paths: Vec<TempDatabase>,
+        handles: BTreeMap<NodeId, vos_raft::WorkerHandle<NodeId>>,
+        delivery: BTreeMap<NodeId, Arc<AtomicBool>>,
+    }
+
+    impl RawWorkerCluster {
+        fn new(label: &str) -> Self {
+            let manifest = crate::agent::shared_recovery::management_manifest_for_test();
+            let voters = manifest.committee().members().iter()
+                .map(|member| {
+                    assert_eq!(member.replica().role, ReplicaRole::Voter);
+                    member.replica().node
+                }).collect::<Vec<_>>();
+            assert_eq!(voters.len(), 3);
+            let peers = Arc::new(std::sync::RwLock::new(BTreeMap::new()));
+            let mut cluster = Self {
+                _workers: Vec::new(), databases: BTreeMap::new(), _paths: Vec::new(),
+                handles: BTreeMap::new(), delivery: BTreeMap::new(),
+            };
+            for node in &voters {
+                let path = TempDatabase::new(label);
+                let database = initialize_database(&path.0);
+                let deliver = Arc::new(AtomicBool::new(true));
+                let transport = Arc::new(RawWorkerTransport {
+                    local: *node, peers: Arc::clone(&peers), deliver: Arc::clone(&deliver),
+                });
+                let mut config = vos_raft::Config::new(*node, voters.clone(), [0x72; 32]);
+                config.max_append_entries = MAX_SHARED_RAFT_APPEND_ENTRIES;
+                let worker = vos_raft::Worker::try_spawn(
+                    AgentNodeStorage::open(Arc::clone(&database), (0, 0)).unwrap(),
+                    transport, config, None,
+                ).unwrap();
+                worker.wait_init().unwrap();
+                let handle = worker.handler();
+                peers.write().unwrap().insert(*node, handle.clone());
+                cluster._workers.push(worker);
+                cluster.databases.insert(*node, database);
+                cluster._paths.push(path);
+                cluster.handles.insert(*node, handle);
+                cluster.delivery.insert(*node, deliver);
+            }
+            cluster
+        }
+
+        fn settled_leader(&self) -> (NodeId, vos_raft::WorkerSnapshot<NodeId>) {
+            let deadline = Instant::now() + ORDERED_REPLY_WAIT;
+            loop {
+                for (node, handle) in &self.handles {
+                    let snapshot = futures_executor::block_on(handle.snapshot()).unwrap();
+                    if snapshot.role == vos_raft::Role::Leader
+                        && snapshot.last_log_index > 0
+                        && snapshot.commit_index == snapshot.last_log_index
+                    {
+                        let settled = self.handles.iter().all(|(peer, handle)| {
+                            if peer == node { return true; }
+                            let follower = futures_executor::block_on(handle.snapshot()).unwrap();
+                            follower.role == vos_raft::Role::Follower
+                                && follower.current_term == snapshot.current_term
+                                && follower.last_log_index == snapshot.last_log_index
+                                && follower.commit_index == snapshot.commit_index
+                                && follower.leader_hint == Some(*node)
+                        });
+                        let current = futures_executor::block_on(handle.snapshot()).unwrap();
+                        if settled && CommittedProposalBarrier::from(&current)
+                            == CommittedProposalBarrier::from(&snapshot)
+                        {
+                            return (*node, current);
+                        }
+                    }
+                }
+                assert!(Instant::now() < deadline, "fixed-three worker election did not settle");
+                std::thread::yield_now();
+            }
+        }
+
+        fn isolate(&self) {
+            for deliver in self.delivery.values() {
+                deliver.store(false, Ordering::Release);
+            }
+        }
+
+        fn last_term(&self, node: NodeId, index: u64) -> u64 {
+            RaftLog::open(Arc::clone(&self.databases[&node])).unwrap()
+                .term_at(index).unwrap().unwrap()
+        }
+    }
+
+    fn signed_management_race_commands() -> (shared_raft::AgentRaftCommand, shared_raft::AgentRaftCommand) {
+        use crate::agent::shared_commit::ReplicaCommitSignature;
+        use ed25519_dalek::{Signer as _, SigningKey};
+
+        let manifest = crate::agent::shared_recovery::completed_management_manifest_for_test();
+        let owner = crate::agent::shared_recovery::management_node_for_test(1);
+        let slot = manifest.management_slot(owner).unwrap();
+        let registration = slot.registration().clone();
+        registration.verify(manifest.generation(), manifest.committee()).unwrap();
+        let request = SharedManagementRecoveryReleaseRequest::for_slot(slot).unwrap();
+        let signature = ReplicaCommitSignature::new(owner,
+            SigningKey::from_bytes(&[1; 32]).sign(&request.signing_message().0).to_bytes()).unwrap();
+        let release = SharedManagementRecoveryRelease::new(request, signature).unwrap();
+        release.verify(manifest.generation(), manifest.committee()).unwrap();
+        let scope = manifest.generation();
+        let route = shared_raft::AgentRouteKey::new(scope.space(), scope.agent(), scope.genesis(),
+            scope.admission(), manifest.committee().id()).unwrap();
+        let registration = shared_raft::AgentRaftCommand::RegisterManagementRecovery { route, registration };
+        let release = shared_raft::AgentRaftCommand::ReleaseManagementRecovery { route, release };
+        registration.validate().unwrap();
+        release.validate().unwrap();
+        (registration, release)
+    }
+
+    #[test]
+    fn raw_worker_progress_after_preflight_invalidates_each_proposal_barrier_field() {
+        let cluster = RawWorkerCluster::new("raw_preflight_progress");
+        let (local, mut before) = cluster.settled_leader();
+        cluster.isolate();
+        let handle = &cluster.handles[&local];
+        let sender = *cluster.handles.keys().find(|node| **node != local).unwrap();
+        let (_, release) = signed_management_race_commands();
+
+        for change in 0..4 {
+            // Raft RPCs carry authenticated identities, not signature fields.
+            // The appended application payload is a genuinely signed release.
+            let term = before.current_term + u64::from(change == 1);
+            let entry = (change == 2).then(|| LogEntry::data(
+                before.last_log_index + 1, term, release.encode()));
+            let response = futures_executor::block_on(handle.handle_authenticated_inbound_append(
+                sender, vos_raft::AppendEntriesReq {
+                    leader: sender, term, prev_log_index: before.last_log_index,
+                    prev_log_term: cluster.last_term(local, before.last_log_index),
+                    leader_commit: if change == 3 { before.last_log_index } else { before.commit_index },
+                    entries: entry.into_iter().collect(),
+                },
+            ));
+            assert!(response.success);
+            let current = futures_executor::block_on(handle.snapshot()).unwrap();
+            match change {
+                0 => {
+                    assert_eq!(before.role, vos_raft::Role::Leader);
+                    assert_eq!(current.role, vos_raft::Role::Follower);
+                    assert_eq!(current.current_term, before.current_term);
+                }
+                1 => {
+                    assert_eq!(current.role, before.role);
+                    assert_eq!(current.current_term, before.current_term + 1);
+                }
+                2 => assert_eq!(current.last_log_index, before.last_log_index + 1),
+                3 => assert_eq!(current.commit_index, before.commit_index + 1),
+                _ => unreachable!(),
+            }
+            if change != 2 { assert_eq!(current.last_log_index, before.last_log_index); }
+            if change != 3 { assert_eq!(current.commit_index, before.commit_index); }
+            if change >= 2 {
+                assert_eq!(current.role, before.role);
+                assert_eq!(current.current_term, before.current_term);
+            }
+            // The capacity frontier may still be old or already drained to the
+            // newer commit. Both invalidate this sampled preflight; neither
+            // is classified as stable-store corruption. These are component
+            // barrier cases: the later follower samples are not actual leader
+            // release preflights, and custody needs the separate host fixture.
+            for applied in [before.commit_index, current.commit_index] {
+                assert_eq!(CommittedProposalBarrier::from(&before).validate_applied(
+                    CommittedProposalBarrier::from(&current), applied),
+                    Err(SharedAgentHostError::Unavailable));
+            }
+            assert!(matches!(futures_executor::block_on(handle.propose_if_prefix(
+                release.encode(), before.current_term, before.last_log_index, before.commit_index)),
+                Err(vos_raft::ProposeError::PrefixChanged)));
+            assert_eq!(futures_executor::block_on(handle.snapshot()).unwrap(), current);
+            before = current;
+        }
+    }
+
+    #[test]
+    fn raw_worker_progress_before_publish_refuses_stale_signed_management_prefix() {
+        let cluster = RawWorkerCluster::new("raw_publish_progress");
+        let (local, final_snapshot) = cluster.settled_leader();
+        cluster.isolate();
+        let handle = &cluster.handles[&local];
+        let (registration, release) = signed_management_race_commands();
+        assert_eq!(CommittedProposalBarrier::from(&final_snapshot).validate_applied(
+            CommittedProposalBarrier::from(&final_snapshot), final_snapshot.commit_index), Ok(()));
+
+        // Another raw proposal lands after the final host snapshot. The actual
+        // worker CAS must refuse before appending the release, independently
+        // of the earlier host/proposal guards.
+        let index = futures_executor::block_on(handle.propose(registration.encode())).unwrap();
+        let after_append = futures_executor::block_on(handle.snapshot()).unwrap();
+        assert_eq!(index, final_snapshot.last_log_index + 1);
+        assert_eq!(after_append.role, final_snapshot.role);
+        assert_eq!(after_append.current_term, final_snapshot.current_term);
+        assert_eq!(after_append.commit_index, final_snapshot.commit_index);
+        let refuse = |prefix: &vos_raft::WorkerSnapshot<NodeId>| {
+            let before = futures_executor::block_on(handle.snapshot()).unwrap();
+            assert!(matches!(futures_executor::block_on(handle.propose_if_prefix(
+                release.encode(), prefix.current_term, prefix.last_log_index, prefix.commit_index)),
+                Err(vos_raft::ProposeError::PrefixChanged)));
+            assert_eq!(futures_executor::block_on(handle.snapshot()).unwrap(), before);
+        };
+        refuse(&final_snapshot);
+
+        // Real peers acknowledge that same row, changing only the commit
+        // frontier. A snapshot from before quorum commitment is still stale.
+        cluster.delivery[&local].store(true, Ordering::Release);
+        let deadline = Instant::now() + ORDERED_REPLY_WAIT;
+        let committed = loop {
+            let snapshot = futures_executor::block_on(handle.snapshot()).unwrap();
+            assert_eq!(snapshot.role, vos_raft::Role::Leader);
+            assert_eq!(snapshot.current_term, after_append.current_term);
+            assert_eq!(snapshot.last_log_index, after_append.last_log_index);
+            if snapshot.commit_index == index { break snapshot; }
+            assert!(Instant::now() < deadline, "fixed-three raw proposal did not commit");
+            std::thread::yield_now();
+        };
+        cluster.isolate();
+        refuse(&after_append);
+        let log = RaftLog::open(Arc::clone(&cluster.databases[&local])).unwrap();
+        let entries = log.entries(index, index).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(shared_raft::decode_agent_raft_entry_kind(&entries[0].payload).unwrap(),
+            EntryKind::Data { payload: registration.encode() });
+
+        // The same release is admissible to the worker with the fresh exact
+        // committed prefix, so malformed payloads are not causing refusal.
+        let released_at = futures_executor::block_on(handle.propose_if_prefix(
+            release.encode(), committed.current_term, committed.last_log_index,
+            committed.commit_index)).unwrap();
+        assert_eq!(released_at, index + 1);
+        let entries = log.entries(released_at, released_at).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(shared_raft::decode_agent_raft_entry_kind(&entries[0].payload).unwrap(),
+            EntryKind::Data { payload: release.encode() });
+    }
+
     #[test]
     fn promotion_deadline_consults_serialized_state_and_requires_full_commit() {
         let snapshot = |role, committed| (role, committed, 1);

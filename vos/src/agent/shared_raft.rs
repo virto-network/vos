@@ -6034,6 +6034,43 @@ mod application_ledger_v2 {
             self.validate_management_recovery_release_request(release.request())
         }
 
+        /// Signed release admission and capacity from one fresh settled-prefix
+        /// audit. Return only call-local scalars; never loan the audited view.
+        pub(crate) fn validate_management_recovery_release_and_capacity(
+            &self,
+            release: &SharedManagementRecoveryRelease,
+        ) -> Result<(u64, u64, bool), AgentRaftApplicationErrorV2> {
+            release
+                .verify(self.generation, &self.initial_committee)
+                .map_err(|_| AgentRaftApplicationErrorV2::InvalidCommandDisposition)?;
+            let causal_lock_started = causal_capacity_started();
+            let guard = self
+                .writes
+                .lock()
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger);
+            self.report_causal_capacity(causal_lock_started, "ledger_wait", if guard.is_ok() { "ok" } else { "error" });
+            let _guard = guard?;
+            let causal_read_started = causal_capacity_started();
+            let transaction = self.database.begin_read();
+            self.report_causal_capacity(causal_read_started, "read_begin", if transaction.is_ok() { "ok" } else { "error" });
+            let transaction = transaction?;
+            let audited = self.management_recovery_preflight(&transaction)?;
+            let manifest = audited
+                .recovery
+                .as_ref()
+                .ok_or(AgentRaftApplicationErrorV2::InvalidCommandDisposition)?;
+            // This same read's complete preflight authenticated these exact
+            // immutable slots. Retain the exact current-capsule request check.
+            super::super::shared_recovery::management::validate_management_release_request_after_slots_validation(
+                manifest.management_slots(),
+                self.generation,
+                &self.initial_committee,
+                release.request(),
+            )
+            .map_err(|_| AgentRaftApplicationErrorV2::InvalidCommandDisposition)?;
+            Ok(audited.capacity())
+        }
+
         pub(crate) fn validate_management_recovery_release_request(
             &self,
             request: &SharedManagementRecoveryReleaseRequest,
@@ -10602,7 +10639,10 @@ mod application_ledger_v2 {
 
     #[cfg(test)]
     mod recovery_staging_tests {
-        use super::super::tests::{TempDirectory, committee_authority_binding};
+        use super::super::tests::{
+            TempDirectory, committee_authority_binding, committee_change,
+            member as committee_member,
+        };
         use super::*;
         use crate::agent::shared_recovery::management::{
             SharedManagementRecoveryMember, SharedManagementRecoveryRegistrationRequest,
@@ -10916,6 +10956,72 @@ mod application_ledger_v2 {
             reserve_exact_observation(ledger, template, prototype)
         }
 
+        fn sign_management_release(
+            template: &ManagementRecoveryFixture,
+            request: SharedManagementRecoveryReleaseRequest,
+        ) -> SharedManagementRecoveryRelease {
+            let signature = ReplicaCommitSignature::new(
+                template.owner(),
+                SigningKey::from_bytes(&[1; 32])
+                    .sign(&request.signing_message().0)
+                    .to_bytes(),
+            )
+            .unwrap();
+            SharedManagementRecoveryRelease::new(request, signature).unwrap()
+        }
+
+        fn acknowledged_release_fixture(
+            ledger: &AgentRaftApplicationLedgerV2,
+            template: &ManagementRecoveryFixture,
+        ) -> (SharedManagementRecoveryMember, SharedManagementRecoveryRelease) {
+            let member = management_member(template, 7, None, management_anchor(template));
+            let registration = management_registration(template, 1, None, vec![member.clone()]);
+            let slot = append_management(
+                ledger,
+                AgentRaftCommand::RegisterManagementRecovery {
+                    route: route(template),
+                    registration,
+                },
+            );
+            ledger.apply_foundation_slot(&slot).unwrap();
+            for acknowledgement in [false, true] {
+                let observed =
+                    reserve_management_observation(ledger, template, &member, acknowledgement);
+                ledger
+                    .complete_reserved_command(&observed.0, observed.1, Some(&observed.2))
+                    .unwrap();
+            }
+            let manifest = ledger.recovery_manifest().unwrap();
+            let request = SharedManagementRecoveryReleaseRequest::for_slot(
+                manifest.management_slot(template.owner()).unwrap(),
+            )
+            .unwrap();
+            (member, sign_management_release(template, request))
+        }
+
+        fn assert_combined_release_capacity_readonly(
+            ledger: &AgentRaftApplicationLedgerV2,
+            release: &SharedManagementRecoveryRelease,
+        ) {
+            let before = durable_rows(ledger);
+            // Keep the original checked validation and independent capacity
+            // read as the reference for this unchanged signed fixture.
+            ledger.validate_management_recovery_release(release).unwrap();
+            let expected = ledger.capacity().unwrap();
+            assert_eq!(durable_rows(ledger), before);
+            let preflights = ledger.management_preflight_audits_for_test();
+            let capacities = ledger.capacity_audits_for_test();
+            assert_eq!(
+                ledger
+                    .validate_management_recovery_release_and_capacity(release)
+                    .unwrap(),
+                expected,
+            );
+            assert_eq!(ledger.management_preflight_audits_for_test(), preflights + 1);
+            assert_eq!(ledger.capacity_audits_for_test(), capacities);
+            assert_eq!(durable_rows(ledger), before);
+        }
+
         #[derive(Debug, PartialEq, Eq)]
         struct DurableRows {
             tables: Vec<Vec<(Vec<u8>, Vec<u8>)>>,
@@ -11144,7 +11250,233 @@ mod application_ledger_v2 {
                 ));
                 assert_eq!(ledger.management_preflight_audits_for_test(), audits + 1);
                 assert_eq!(durable_rows(&ledger), before);
+                let capacities = ledger.capacity_audits_for_test();
+                assert!(matches!(
+                    ledger.validate_management_recovery_release_and_capacity(&release),
+                    Err(AgentRaftApplicationErrorV2::RecoveryPrefixUnsettled {
+                        applied: actual_applied,
+                        committed: actual_commit,
+                        last,
+                    }) if actual_applied == applied
+                        && actual_commit == applied + u64::from(committed)
+                        && last == applied + 1
+                ));
+                assert_eq!(ledger.management_preflight_audits_for_test(), audits + 2);
+                assert_eq!(ledger.capacity_audits_for_test(), capacities);
+                assert_eq!(durable_rows(&ledger), before);
             }
+        }
+
+        #[test]
+        fn management_release_combined_capacity_requires_every_current_member_ack() {
+            let (_directory, ledger, template) = fixture("management_release_combined_members");
+            let (root, original_release) = acknowledged_release_fixture(&ledger, &template);
+            let manifest = ledger.recovery_manifest().unwrap();
+            let previous = manifest
+                .management_slot(template.owner())
+                .unwrap()
+                .commitment();
+            let mut anchor = management_anchor(&template);
+            anchor.ordered = ledger.management_absence_context().unwrap().0;
+            let child = management_member(&template, 8, Some(root.commitment()), anchor);
+            let extension = management_registration(
+                &template,
+                2,
+                Some(previous),
+                vec![root, child.clone()],
+            );
+            let slot = append_management(
+                &ledger,
+                AgentRaftCommand::RegisterManagementRecovery {
+                    route: route(&template),
+                    registration: extension,
+                },
+            );
+            ledger.apply_foundation_slot(&slot).unwrap();
+
+            for child_invoked in [false, true] {
+                if child_invoked {
+                    let observed =
+                        reserve_management_observation(&ledger, &template, &child, false);
+                    ledger
+                        .complete_reserved_command(&observed.0, observed.1, Some(&observed.2))
+                        .unwrap();
+                }
+                let current = ledger.recovery_manifest().unwrap();
+                let current_slot = current.management_slot(template.owner()).unwrap();
+                assert_eq!(current_slot.members().len(), 2);
+                assert!(current_slot.members_evidence()[0].acknowledgement().is_some());
+                assert!(current_slot.members_evidence()[1].acknowledgement().is_none());
+                // An admitted owner can sign a syntactically valid request
+                // naming the current sequence/scope even before every ACK.
+                // Strict decode and actual signature verification must pass;
+                // release admission must still refuse the incomplete member.
+                let mut bytes = original_release.request().encode();
+                let end = bytes.len();
+                bytes[end - 40..end - 32].copy_from_slice(&current_slot.sequence().to_le_bytes());
+                bytes[end - 32..].copy_from_slice(&current_slot.commitment().0);
+                let request = SharedManagementRecoveryReleaseRequest::decode(&bytes).unwrap();
+                assert_eq!(request.sequence(), current_slot.sequence());
+                assert_eq!(request.scope(), current_slot.commitment());
+                let incomplete = sign_management_release(&template, request);
+                incomplete
+                    .verify(template.generation(), &ledger.initial_committee)
+                    .unwrap();
+                let before = durable_rows(&ledger);
+                let preflights = ledger.management_preflight_audits_for_test();
+                let capacities = ledger.capacity_audits_for_test();
+                assert!(matches!(
+                    ledger.validate_management_recovery_release(&incomplete),
+                    Err(AgentRaftApplicationErrorV2::InvalidCommandDisposition)
+                ));
+                assert!(matches!(
+                    ledger.validate_management_recovery_release_and_capacity(&incomplete),
+                    Err(AgentRaftApplicationErrorV2::InvalidCommandDisposition)
+                ));
+                assert_eq!(ledger.management_preflight_audits_for_test(), preflights + 2);
+                assert_eq!(ledger.capacity_audits_for_test(), capacities);
+                assert_eq!(durable_rows(&ledger), before);
+            }
+
+            let ack = reserve_management_observation(&ledger, &template, &child, true);
+            ledger
+                .complete_reserved_command(&ack.0, ack.1, Some(&ack.2))
+                .unwrap();
+            let current = ledger.recovery_manifest().unwrap();
+            let request = SharedManagementRecoveryReleaseRequest::for_slot(
+                current.management_slot(template.owner()).unwrap(),
+            )
+            .unwrap();
+            let complete = sign_management_release(&template, request);
+            assert_combined_release_capacity_readonly(&ledger, &complete);
+            // A formerly complete scope cannot release the later complete
+            // extension under its old sequence/commitment.
+            original_release
+                .verify(template.generation(), &ledger.initial_committee)
+                .unwrap();
+            let before = durable_rows(&ledger);
+            let preflights = ledger.management_preflight_audits_for_test();
+            let capacities = ledger.capacity_audits_for_test();
+            assert!(matches!(
+                ledger.validate_management_recovery_release(&original_release),
+                Err(AgentRaftApplicationErrorV2::InvalidCommandDisposition)
+            ));
+            assert!(matches!(
+                ledger.validate_management_recovery_release_and_capacity(&original_release),
+                Err(AgentRaftApplicationErrorV2::InvalidCommandDisposition)
+            ));
+            assert_eq!(ledger.management_preflight_audits_for_test(), preflights + 2);
+            assert_eq!(ledger.capacity_audits_for_test(), capacities);
+            assert_eq!(durable_rows(&ledger), before);
+        }
+
+        #[test]
+        fn management_release_combined_capacity_preserves_pending_reservation_barrier() {
+            let (_directory, ledger, template) = fixture("management_release_combined_reserved");
+            let (_, release) = acknowledged_release_fixture(&ledger, &template);
+            let _reserved = reserve_observation(&ledger, &template, false);
+            release
+                .verify(template.generation(), &ledger.initial_committee)
+                .unwrap();
+            let before = durable_rows(&ledger);
+            let preflights = ledger.management_preflight_audits_for_test();
+            let capacities = ledger.capacity_audits_for_test();
+            assert!(matches!(
+                ledger.validate_management_recovery_release(&release),
+                Err(AgentRaftApplicationErrorV2::TransitionBarrier)
+            ));
+            assert!(matches!(
+                ledger.validate_management_recovery_release_and_capacity(&release),
+                Err(AgentRaftApplicationErrorV2::TransitionBarrier)
+            ));
+            assert_eq!(ledger.management_preflight_audits_for_test(), preflights + 2);
+            assert_eq!(ledger.capacity_audits_for_test(), capacities);
+            assert_eq!(durable_rows(&ledger), before);
+        }
+
+        #[test]
+        fn management_release_combined_capacity_preserves_signed_committee_barriers() {
+            let (_directory, ledger, template) = fixture("management_release_combined_committee");
+            let (_, release) = acknowledged_release_fixture(&ledger, &template);
+            assert_combined_release_capacity_readonly(&ledger, &release);
+            let initial = ledger.initial_committee.clone();
+            let replacement =
+                committee_member(&SigningKey::from_bytes(&[4; 32]), ReplicaRole::Voter);
+            let replaced = crate::agent::shared_recovery::management_node_for_test(3);
+            let mut members = initial.members().to_vec();
+            let index = members
+                .iter()
+                .position(|member| member.replica().node == replaced)
+                .unwrap();
+            members[index] = replacement;
+            members.sort_by_key(|member| member.replica().node);
+            let next = AgentReplicaCommittee::new(
+                initial.space(),
+                initial.agent(),
+                AgentProfile::Shared,
+                members,
+            )
+            .unwrap();
+            let change = committee_change(
+                template.generation(),
+                &initial,
+                &next,
+                committee_authority_binding().initial_epoch(),
+                1,
+                10,
+            );
+            let prepare = append_management(
+                &ledger,
+                AgentRaftCommand::PrepareCommitteeChange(change.clone()),
+            );
+            ledger.apply_foundation_slot(&prepare).unwrap();
+            for (phase, configuration) in [
+                None,
+                Some(vos_raft::EntryKind::ConfigChange {
+                    joint_old: Some(change.previous_voters().to_vec()),
+                    members: change.next_voters().to_vec(),
+                }),
+                Some(vos_raft::EntryKind::ConfigChange {
+                    joint_old: None,
+                    members: change.next_voters().to_vec(),
+                }),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if let Some(configuration) = configuration {
+                    ledger.append_committed_for_test(3, &configuration).unwrap();
+                    let slot = ledger.next_committed_slot().unwrap().unwrap();
+                    ledger.apply_foundation_slot(&slot).unwrap();
+                }
+                if phase < 2 {
+                    assert_eq!(ledger.active_committee().unwrap(), initial);
+                    assert_eq!(
+                        ledger.pending_transition().unwrap(),
+                        Some((change.transition(), phase == 1)),
+                    );
+                } else {
+                    assert_eq!(ledger.active_committee().unwrap(), next);
+                    assert_eq!(ledger.pending_transition().unwrap(), None);
+                }
+                release.verify(template.generation(), &initial).unwrap();
+                let before = durable_rows(&ledger);
+                let preflights = ledger.management_preflight_audits_for_test();
+                let capacities = ledger.capacity_audits_for_test();
+                assert!(matches!(
+                    ledger.validate_management_recovery_release(&release),
+                    Err(AgentRaftApplicationErrorV2::TransitionBarrier)
+                ));
+                assert!(matches!(
+                    ledger.validate_management_recovery_release_and_capacity(&release),
+                    Err(AgentRaftApplicationErrorV2::TransitionBarrier)
+                ));
+                assert_eq!(ledger.management_preflight_audits_for_test(), preflights + 2);
+                assert_eq!(ledger.capacity_audits_for_test(), capacities);
+                assert_eq!(durable_rows(&ledger), before);
+            }
+            assert_eq!(ledger.active_committee().unwrap(), next);
+            assert_eq!(ledger.pending_transition().unwrap(), None);
         }
 
         #[test]
@@ -11311,6 +11643,7 @@ mod application_ledger_v2 {
                 .unwrap();
             assert_eq!(ledger.management_preflight_audits_for_test(), audits + 1);
             assert_eq!(durable_rows(&ledger), before_release);
+            assert_combined_release_capacity_readonly(&ledger, &release);
 
             let mut signature = *release.signature().signature();
             signature[0] ^= 1;
@@ -11325,6 +11658,14 @@ mod application_ledger_v2 {
                 Err(AgentRaftApplicationErrorV2::InvalidCommandDisposition)
             ));
             assert_eq!(ledger.management_preflight_audits_for_test(), audits);
+            assert_eq!(durable_rows(&ledger), before_release);
+            let capacities = ledger.capacity_audits_for_test();
+            assert!(matches!(
+                ledger.validate_management_recovery_release_and_capacity(&substituted),
+                Err(AgentRaftApplicationErrorV2::InvalidCommandDisposition)
+            ));
+            assert_eq!(ledger.management_preflight_audits_for_test(), audits);
+            assert_eq!(ledger.capacity_audits_for_test(), capacities);
             assert_eq!(durable_rows(&ledger), before_release);
 
             let mut bytes = request.encode();
@@ -11350,6 +11691,14 @@ mod application_ledger_v2 {
                 Err(AgentRaftApplicationErrorV2::InvalidCommandDisposition)
             ));
             assert_eq!(ledger.management_preflight_audits_for_test(), audits + 1);
+            assert_eq!(durable_rows(&ledger), before_release);
+            let capacities = ledger.capacity_audits_for_test();
+            assert!(matches!(
+                ledger.validate_management_recovery_release_and_capacity(&stale),
+                Err(AgentRaftApplicationErrorV2::InvalidCommandDisposition)
+            ));
+            assert_eq!(ledger.management_preflight_audits_for_test(), audits + 2);
+            assert_eq!(ledger.capacity_audits_for_test(), capacities);
             assert_eq!(durable_rows(&ledger), before_release);
 
             // A fresh call must still audit current bytes, not reuse the
@@ -11379,6 +11728,12 @@ mod application_ledger_v2 {
             let rejected = ledger.validate_management_recovery_release(&release);
             let audits_after_rejection = ledger.management_preflight_audits_for_test();
             let after_rejection = durable_rows(&ledger);
+            let capacities = ledger.capacity_audits_for_test();
+            let combined_rejected =
+                ledger.validate_management_recovery_release_and_capacity(&release);
+            let combined_audits = ledger.management_preflight_audits_for_test();
+            let combined_capacities = ledger.capacity_audits_for_test();
+            let after_combined_rejection = durable_rows(&ledger);
             let transaction = ledger.database.begin_write().unwrap();
             transaction
                 .open_table(RECOVERY_MANIFEST_TABLE_V2)
@@ -11392,13 +11747,20 @@ mod application_ledger_v2 {
             ));
             assert_eq!(audits_after_rejection, audits + 1);
             assert_eq!(after_rejection, corrupted);
+            assert!(matches!(
+                combined_rejected,
+                Err(AgentRaftApplicationErrorV2::CorruptLedger)
+            ));
+            assert_eq!(combined_audits, audits + 2);
+            assert_eq!(combined_capacities, capacities);
+            assert_eq!(after_combined_rejection, corrupted);
             assert_eq!(durable_rows(&ledger), before_release);
             ledger
                 .validate_management_recovery_release(&release)
                 .unwrap();
             let release_command = AgentRaftCommand::ReleaseManagementRecovery {
                 route: route(&template),
-                release,
+                release: release.clone(),
             };
             assert_eq!(release_command.encode()[SERVICE_WIRE_HEADER_BYTES], 7);
             assert_eq!(
@@ -11412,6 +11774,7 @@ mod application_ledger_v2 {
             ledger
                 .validate_management_recovery_slot_release(&expected.management_slots()[0])
                 .unwrap();
+            assert_combined_release_capacity_readonly(&ledger, &release);
             let repeated = append_management(&ledger, release_command);
             ledger.apply_foundation_slot(&repeated).unwrap();
             assert_eq!(ledger.recovery_manifest().unwrap(), expected);
@@ -11452,6 +11815,7 @@ mod application_ledger_v2 {
             reopened
                 .validate_management_recovery_slot_release(&expected.management_slots()[0])
                 .unwrap();
+            assert_combined_release_capacity_readonly(&reopened, &release);
             reopened.audit_recovery().unwrap();
             // The old tags and complete encoding remain unchanged.
             let legacy = AgentRaftCommand::ArtifactAbort {
@@ -12151,7 +12515,7 @@ mod tests {
         AgentNodeId([byte; 32])
     }
 
-    fn member(key: &SigningKey, role: ReplicaRole) -> AgentReplicaMember {
+    pub(super) fn member(key: &SigningKey, role: ReplicaRole) -> AgentReplicaMember {
         let peer = peer_id(key);
         let public_key = key.verifying_key().to_bytes();
         AgentReplicaMember::new(
@@ -12397,7 +12761,7 @@ mod tests {
     }
 
     #[cfg(feature = "storage")]
-    fn committee_change(
+    pub(super) fn committee_change(
         generation: AgentGenerationRouteKey,
         previous: &AgentReplicaCommittee,
         next: &AgentReplicaCommittee,

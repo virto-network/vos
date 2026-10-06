@@ -314,6 +314,15 @@ impl SharedRouteHandler {
         trace("manifest_verified");
         #[cfg(test)]
         let capacity_audits_before = host.capacity_audits_for_test(self.agent)?;
+        #[cfg(test)]
+        let release_preflight_audits_before = if matches!(
+            command,
+            shared_raft::AgentRaftCommand::ReleaseManagementRecovery { .. }
+        ) {
+            Some(host.management_preflight_audits_for_test(self.agent)?)
+        } else {
+            None
+        };
         let audited_capacity = match command {
             shared_raft::AgentRaftCommand::RegisterManagementRecovery {
                 route: requested,
@@ -412,7 +421,7 @@ impl SharedRouteHandler {
                 )
                 .map_err(|error| refused("clock_preview_error", error))?;
                 trace("clock_preview_verified");
-                Some(capacity)
+                capacity
             }
             shared_raft::AgentRaftCommand::ReleaseManagementRecovery {
                 route: requested,
@@ -455,11 +464,12 @@ impl SharedRouteHandler {
                         stage = "signed_ledger_validation",
                     ));
                     let _span_guard = span.as_ref().map(|span| span.enter());
-                    host.validate_management_recovery_release(self.agent, release)
+                    host.validate_management_recovery_release_and_capacity(self.agent, release)
                 };
-                validated.map_err(|error| refused("release_validation_error", error))?;
+                let capacity = validated.map_err(|error| refused("release_validation_error", error))?;
+                trace("release_capacity_from_preflight");
                 trace_release("signed_release");
-                None
+                capacity
             }
             _ => {
                 return Err(refused(
@@ -468,33 +478,12 @@ impl SharedRouteHandler {
                 ));
             }
         };
-        // These uninterrupted host/proposal guards exclude ledger publication,
-        // reservations and snapshot installation. The intervening clock preview
-        // is read-only for capacity; release admission still audits for itself.
+        // Registration's capacity audit or release's signed settled-prefix
+        // preflight supplies this same-call tuple. These uninterrupted guards
+        // exclude host publication, reservations and snapshot installation;
+        // raw Raft progress still requires the final worker/prefix barriers.
         // Do not retain the tuple across preparation, guard release or a drain.
-        let (applied, _, _) = match audited_capacity {
-            Some(capacity) => capacity,
-            None => {
-                trace("release_capacity_start");
-                let capacity = {
-                    let span = started.and_then(|_| match command {
-                        shared_raft::AgentRaftCommand::ReleaseManagementRecovery { release, .. } => {
-                            Some(tracing::debug_span!(
-                                "vos_causal_release_audit",
-                                metadata = ?release.commitment().0,
-                                stage = "capacity",
-                            ))
-                        }
-                        _ => None,
-                    });
-                    let _span_guard = span.as_ref().map(|span| span.enter());
-                    host.capacity(self.agent)
-                }
-                .map_err(|error| refused("release_capacity_error", error))?;
-                trace("release_capacity_complete");
-                capacity
-            }
-        };
+        let (applied, _, _) = audited_capacity;
         trace("current_snapshot_start");
         let current = futures_executor::block_on(worker.snapshot()).ok_or_else(|| {
             refused(
@@ -509,11 +498,24 @@ impl SharedRouteHandler {
             .map_err(|error| refused("final_barrier_error", error))?;
         trace("final_barrier_verified");
         #[cfg(test)]
-        assert_eq!(
-            host.capacity_audits_for_test(self.agent)?,
-            capacity_audits_before + 1,
-            "metadata admission must perform one actual capacity audit under its uninterrupted guards"
-        );
+        if let Some(preflight_before) = release_preflight_audits_before {
+            assert_eq!(
+                host.capacity_audits_for_test(self.agent)?,
+                capacity_audits_before,
+                "signed release must derive capacity from its preflight without a generic capacity audit"
+            );
+            assert_eq!(
+                host.management_preflight_audits_for_test(self.agent)?,
+                preflight_before + 1,
+                "signed release admission must perform exactly one actual fresh management preflight"
+            );
+        } else {
+            assert_eq!(
+                host.capacity_audits_for_test(self.agent)?,
+                capacity_audits_before + 1,
+                "registration admission must perform one actual capacity audit under its uninterrupted guards"
+            );
+        }
         drop(manifest);
         drop(host);
         trace("commit_start");

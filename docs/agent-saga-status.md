@@ -141,26 +141,51 @@ Evidence below `target/task-tmp`:
 **Qualification and next decision:** M1 remains blocked at original-owner
 terminal-release confirmation; no recovery, controlled speedup or release benefit
 is credited. The reviewed source-only combined release-admission proposal below
-awaits separate direction:
+was explicitly authorized for implementation and qualification on 2026-10-06:
 the existing full authenticated management preflight view contains both request
 validation facts and capacity. Derive scalar capacity in that same fresh guarded
 transaction, preserving driver provenance/signature order and the final worker
 barrier/prefix-checked proposal. This changes internal coordination and removes
-the second read/error boundary; it needs separate review and direction, not an
-automatic sixth tuning pass, redesign or week-cap extension. No view or authority
+the second read/error boundary. This approval does not authorize a further
+candidate, redesign or week-cap extension. No view or authority
 may be cached/exported. The later host holder remains a separate unknown.
 Actual ordinary CLI, remaining packaged gates, M2 and local/external M3 remain
 open. Remedy/source hours and aggregate milestone effort are still unknown;
 this completed diagnostic attempt cost is not a recovery or remaining-work ETA.
 
-### Reviewed combined release-admission proposal — awaiting direction
+### R57 approved combined release admission — implementation in progress
 
 Concrete target-only patch `r56-signed-release-capacity-proposal-v4.patch`, SHA
 `dee945322575f55bb23097db0ecbd55a774f1ff259fb4230d76ee0bb6f18af90`, is
 10,680 bytes, mode 0600, against the unchanged product source at `53b7be16`.
-Root and independent source/tool reviews pass; **unapplied, uncompiled, untested
-and unmeasured**. No sixth behavior candidate or engineering-week extension is
-authorized by those reviews.
+Root and independent source/tool reviews pass. On 2026-10-06 the user explicitly
+approved: **"approved, just keep going"**, in response to this concrete patch and
+its preservation/qualification gates. This authorizes the one bounded release-only
+coordination change and continued integration, with all original limits and the
+engineering-week cap unchanged. The lower-priority tiny verification patch is
+not included. Root applied the exact reviewed v4 patch after checking clean
+`e30e7b03` and unchanged product source. Source is applied, **not yet built,
+tested or measured**. Root and independent reviews pass on the new combined-entry
+preservation cases and two real-worker component regressions. The latter use
+three actual workers/storage and real quorum replies under existing limits;
+later follower samples exercise the generic barrier, while the separate leader
+case checks last/commit prefix refusal. They do not prove host/custody/public startup.
+Nineteen exact preservation/regression selectors are ready for the owned core
+build. The source-specific reader passes **51 acceptance / 96 refusal** synthetic
+cases and privacy/alias checks, with zero helper loads/private input reads. No
+recovery or performance benefit is credited.
+
+Prepared tools below `target/task-tmp`:
+
+- `r57-combined-release-preservation-units.py`, SHA
+  `957fa64a23d27ae62339eade27aa91d7779c37a0b980f344768814a9567782f0`;
+  only the selector tuple/docstring differ from the reviewed original runner.
+- `r57-single-preflight-safe-reader.py`, SHA
+  `2294a473496da622f12f8a43338fbb9252e26a596267702a0f9400ed410eddac`.
+  Original main, schemas, projection and audit validators are unchanged; closed
+  source-specific phases/spans and the derived-phase no-span rule are reviewed.
+- `r57-single-preflight-synthetic-result.json`, SHA
+  `45585158f86c6f5c0e7d798de7a268921a766e2a593dff8a96cb1ee021e92cf6`.
 
 The release-only checked ledger API keeps full signed release verification,
 the existing writes guard, one read transaction, complete management preflight
@@ -179,7 +204,7 @@ identical inter-read failure behavior. The measured second audit is substantial,
 but its removal is not a promised owner-confirmation or whole30 fix, especially
 while the later host-holder/scheduling pressure is unresolved.
 
-If separately authorized, carry this one bounded proposal through these gates:
+Carry this approved bounded change through these gates:
 
 1. Exercise the **new combined entry itself** with existing signed ledger
    fixtures: compare capacity against original validate-plus-capacity on stable
@@ -209,8 +234,8 @@ If separately authorized, carry this one bounded proposal through these gates:
 
 Implementation/regression effort remains uncertain until the proposed entry is
 compiled and exercised; there is no aggregate milestone ETA. Observed build/run
-durations are attempt costs only. The scope decision is whether to authorize
-this internal coordination change under all original limits; no deployment,
+durations are attempt costs only. This internal coordination change is now
+authorized under all original limits; no deployment,
 master/reviewer promotion, new authority or automatic further candidate follows.
 
 ### Completed R55 release-bound audit attribution
@@ -2408,9 +2433,11 @@ Remaining release work, in dependency order:
    R54's explicitly authorized fifth pass still fails. R55 locates body cost;
    completed R56 shows incoming verification is a small measured share and does
    not prioritize the unapplied tiny reuse proposal. The reviewed existing
-   preflight-view combined release-admission proposal awaits separate
-   direction; no sixth behavior candidate, material coordination change or
-   week-cap extension is automatic. Preserve the later host-holder unknown.
+   preflight-view combined release-admission proposal is explicitly approved as
+   R57 above. Qualify its new checked entry and worker/prefix barriers, freeze
+   current artifacts and run isolated acceptance before benefit credit. No
+   further behavior candidate or week-cap extension is automatic. Preserve the
+   later host-holder unknown.
    Source review rules out a missing caller retry: existing same-held recovery
    already retries Unavailable within the original scheduling window. Preserve
    exact retained continuation, fresh absence/settled-prefix, physical
