@@ -1482,16 +1482,25 @@ pub(super) fn exercise(
     // merely roots. This existing cut is after its durable extension/WAL and
     // before first Invoke; no failure mechanism or clock rewrite is added.
     owner.fail_finalization_once_for_test(0);
-    assert_eq!(
-        owner.finalize_management_intent_with_admission(
+    exact_management_retry("retained finalization pre-Invoke cut", || {
+        let result = owner.finalize_management_intent_with_admission(
             &mut slot,
             call.managed,
             &acknowledgement,
             &mut issuer,
             true,
-        ),
-        Err(SharedAgentHostError::Unavailable),
-    );
+        );
+        if owner.finalization_failure_once.is_none() {
+            assert_eq!(result, Err(SharedAgentHostError::Unavailable));
+            return Ok(());
+        }
+        // An earlier transient refusal does not establish the post-WAL cut.
+        match result {
+            Err(error) => Err(error),
+            Ok(_) => panic!("finalization completed before consuming its interruption cut"),
+        }
+    });
+    assert!(owner.finalization_failure_once.is_none());
     let saved_finalization = slot.finalization_work().unwrap().unwrap().clone();
     let held = owner
         ._network_host

@@ -155,6 +155,9 @@ fn create_and_admit(
     signer: &mut CountingSigner,
 ) -> (Controller, AgentGenesisArchiveRecord) {
     let owner = owners[origin].as_mut().unwrap();
+    // Member admission uses fresh API observations, independently of receipt
+    // signing. Enroll through the existing signed administrator path first.
+    super::authority_observation::enroll_api_projection_credential(owner, origin, &signer.key);
     let target = owner.authority_target();
     let mut controller = Controller::new(target, vec![]).unwrap();
     controller.recover(owner, signer).unwrap();
