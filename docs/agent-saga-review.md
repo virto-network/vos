@@ -6,8 +6,8 @@ Those immutable Git objects preserve earlier claims/logs/selectors/hashes; they 
 
 ## Boundary and release claim
 
-Latest admitted one-build/four-workflow source: **56bb1a9f849165f4581ba2f4df5d247180acdceb**, clean throughout original admission, wip/ch08-runtime-directory.
-R68 changes host diagnostics only; six signed bundle files and Clerk remain unchanged. This docs closeout follows completed fences and is not the measured binary source.
+Latest implemented/native/component and independently reproduced artifact source: **b5aca82d18962511558e3660f2da90f39f6e61d0** (R69), clean throughout its completed admission, wip/ch08-runtime-directory.
+Latest admitted portable/public four-workflow source remains **56bb1a9f849165f4581ba2f4df5d247180acdceb** (R68). Its old bundle/Clerk remain frozen baseline evidence. This coherent repin/document checkpoint is not the measured component binary source; new all-mode/portable/public qualification remains pending.
 Worktree: /home/daniel/src/virto/vos/.worktrees/ch08-runtime-directory.
 Master d2378274c0503d9737edce9bcb189d24c3d4e247 and reviewer saga/agents e6f2bb4551274064e3d080c64763e95faa8c5ebb remain unchanged; no push/promotion/deployment.
 
@@ -18,6 +18,14 @@ M1 is a recorded small-workload pilot; M2 requires public1,000-account/100,000-r
 Hardware unavailable; preparation does not qualify it. Operator cutover and final review remain required.
 
 ## Current implementation, integration and qualification
+
+**Current R69 implementation:** decoded Observe uses the existing private borrowed work-validation proof; the constructed entry remains fully checked and only the proved duplicate predicate is omitted. Independent source review, core build47.848s and six preservation tests2.408s pass. Both exact real-guest physical observation arms pass75.979/72.577s, including signed decoded/constructed differential, whole-opaque/durable/no-ACK, corruption/authentication, reopen, revocation, quorum and cancellation controls.
+Each finite SAFE admits82 Done/82 purity/82 own-work Refine records. Thirty-two Refine records bind to three explicitly declared projection works: baseline outer141.538–168.248ms, corrected108.550–128.070ms,29 slices each. No committee declaration exists; this does not qualify R68 committee deadline benefit, isolated savings, matched-input/public/quiet/SLA performance or M1.
+Immediate prepatch56bb System guest29.931s/link1.502s directly matches the old baseline ELF/PVM bytes. Two independent current source role/Authority/Catalog/signed-Clerk builds pass548.479s, preserve all actor locks and exactly reproduce the measured corrected System ELF/PVM; Catalog and Clerk remain unchanged. Byte equivalence and lower recorded component projection outer ranges are established; committee/public benefit remains unmeasured.
+Review [R69 complete component evidence and coherent repin](agent-saga-status.md#r69-first-remedy-components-and-coherent-repin): SAFE hashes a1adeb00114c6de6740835fe6d5f8bdd4f8033f058641fc71eacf7e5ed353a2d/57807cd52b2a07a86ed49687a74a08d8f22dab4cda1e37eab92e26eaaac0658f; baseline provenance1d6992d014c9a8c2abd2158cabcdc16c569e2df4c70462999a7a107255fb9a57; coherent provenance8fed3d7241f9fa395c3cc019bf43767751d266783a1d53dc5a7f66f634a839b3.
+Current repin stages exact signed blobs/build.rs/TOML from b5; a following manifest-only checkpoint must point the builder revision to the actual artifact checkpoint. Canonical all-mode six-file verification, fresh portable main/harness and ordinary/quiet/conditional-scoped public integration remain OPEN. The conditional second audit remedy is not implemented or selected.
+
+The following R68 evidence remains the latest public-workflow baseline:
 
 The [approved R68 session](agent-saga-status.md#approved-r68-diagnostic-session) delivered diagnosis plus a ranked fix proposal only within its four-hour cap (2026-10-06 19:40:09–23:40:09 UTC), including review/evidence/cleanup.
 One reviewed host-only probe, one portable main/harness cycle, four sequential workflows and bounded readers; no behavior fix, extra tuning pass, profiling framework, held Shared-admission probe or cap renewal.
@@ -61,9 +69,9 @@ Review the [ranked concrete proposals and preservation tests](agent-saga-status.
 3. Committee-view reuse needs one authenticated committee view in the same read transaction; current separate DB snapshots under one guard are not equivalent.
 4. Keep initial authorization confirmation, ordinary Local Create, historical Query503/admission503 and actual cold Install owner confirmation separate until their own evidence exists.
 
-**R68 implemented/authorized no runtime remedy or redesign.** The user subsequently [approved proceeding in order](agent-saga-status.md#approved-ordered-fixes-after-r68): implement and measure the first decoded Observe remedy before deciding whether the second audit remedy is needed. Neither candidate yet has measured isolated savings or qualified deadline success. Real Observe-specific differential/hostility checks precede any freeze; guest changes require independent coherent Authority/Catalog/both-role reproduction, six-file pins and current portable/public acceptance. No deadline/limit increase, unrelated tuning or broader redesign is authorized.
+**R68 implemented/authorized no runtime remedy or redesign.** The user subsequently [approved proceeding in order](agent-saga-status.md#approved-ordered-fixes-after-r68). R69 implements/tests/measures the first decoded Observe remedy in components; current coherent-artifact committee/public evidence must precede the second audit decision. Neither isolated savings nor committee deadline success is qualified. Guest changes require independent coherent Authority/Catalog/both-role reproduction, six-file pins and current portable/public acceptance. No deadline/limit increase, unrelated tuning or broader redesign is authorized.
 Quiet/ordinary failures do not inherit the scoped cause. Current AOC5 Query probes, corrected creator handoff, Shared Install/lost response/reopen and cold cut remain unreached.
-The first decoded Observe patch and real signed differential/hostility fixture now pass independent source review. Execution and measured benefit are pending; no release pin or qualification claim changes at this source checkpoint.
+The first decoded Observe patch and real signed differential/hostility fixture pass source review and execution; projection component measurements and reproduction pass. Current role pins change coherently; all-mode/public qualification remains pending as recorded above.
 Initial native compile44ab6d89 failed23.627s/E0596 in the cfg(test)-only accessor; the narrow mutable-receiver correction preserves its existing lease validation and grants no admission proof. No runtime execution followed that failed build; its evidence is retained.
 Actual R66 cold Install owner timeout/late leader application and R67 Query fresh_admission/unavailable→fresh_capture/unavailable remain independent historical evidence, fully frozen at56bb1a9f:docs.
 M1/M2/M3 remain OPEN; passing components/build/readers does not close them.
@@ -132,8 +140,8 @@ Rerun M1 exact full-data artifacts, then prescribed M3 hardware/load/soak/faults
 ## Effort and evidence discipline
 
 Original O1–O3 **22–44 source hours plus qualification** is historical, not current remaining forecast.
-Implementation remaining source-hour confidence is low; aggregate integration/qualification ranges are not defensible until causal scope/remaining cycles are established. Exact measured attempt costs have high confidence, not ETA/performance credit.
-The [live effort table](agent-saga-status.md#effort-variance-and-gono-go-discipline) records uncontrolled portable cycles7.83–21.36min and current workflow attempts2.77–4.05min; these are observed costs, not future bounds or a remaining forecast.
+First remedy implementation and components pass; aggregate remaining source-hour/integration/qualification ranges remain uncertain until current committee/public scope and remaining cycles are established. Exact measured attempt costs have high confidence, not ETA or public performance credit.
+The [live effort table](agent-saga-status.md#effort-variance-and-gono-go-discipline) records uncontrolled portable cycles7.83–21.36min, public attempts2.77–4.05min and R69 independent coherent candidate reproduction9.14min; these are observed costs, not future bounds or a remaining forecast.
 Focused engineering-week go/no-go cap unchanged. Both original tuning passes consumed/failed; later explicitly authorized R48/R52/R54/R57 do not close M1/renew cap. Diagnostics do not authorize another candidate or redesign.
 Preserve approved hardware/workload/latency/recovery/count/byte/gas/windows/deadlines; no percentage/date/readiness/promotion.
 
