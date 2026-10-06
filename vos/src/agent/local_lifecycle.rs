@@ -3960,9 +3960,65 @@ where
                 .system
                 .lock()
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
-            shared_recovery_retry::recover_shared_before_publication(|| {
-                shared.recover(&mut system, &mut self.signer)
-            })?;
+            let diagnostic_node = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS")
+                .map(|_| system.pins().node());
+            let mut diagnostic_ordinal = 0u64;
+            let helper_started = diagnostic_node.map(|_| std::time::Instant::now());
+            let result = shared_recovery_retry::recover_shared_before_publication(|| {
+                if diagnostic_node.is_some() {
+                    diagnostic_ordinal = diagnostic_ordinal.saturating_add(1);
+                }
+                if let Some(node) = diagnostic_node {
+                    tracing::debug!(
+                        target: "vos::agent::local_lifecycle",
+                        node = ?node.0,
+                        thread = ?std::thread::current().id(),
+                        ordinal = diagnostic_ordinal,
+                        phase = "attempt_start",
+                        "VOS causal Shared startup retry"
+                    );
+                }
+                let attempt_started = diagnostic_node.map(|_| std::time::Instant::now());
+                let result = shared.recover(&mut system, &mut self.signer);
+                if let (Some(node), Some(started)) = (diagnostic_node, attempt_started) {
+                    let elapsed_us = started.elapsed().as_micros() as u64;
+                    let outcome = match &result {
+                        Ok(()) => "ok",
+                        Err(SharedAgentHostError::Unavailable) => "unavailable",
+                        Err(_) => "other_error",
+                    };
+                    tracing::debug!(
+                        target: "vos::agent::local_lifecycle",
+                        node = ?node.0,
+                        thread = ?std::thread::current().id(),
+                        ordinal = diagnostic_ordinal,
+                        phase = "attempt_returned",
+                        elapsed_us,
+                        outcome,
+                        "VOS causal Shared startup retry"
+                    );
+                }
+                result
+            });
+            if let (Some(node), Some(started)) = (diagnostic_node, helper_started) {
+                let elapsed_us = started.elapsed().as_micros() as u64;
+                let outcome = match &result {
+                    Ok(()) => "ok",
+                    Err(SharedAgentHostError::Unavailable) => "unavailable",
+                    Err(_) => "other_error",
+                };
+                tracing::debug!(
+                    target: "vos::agent::local_lifecycle",
+                    node = ?node.0,
+                    thread = ?std::thread::current().id(),
+                    ordinal = diagnostic_ordinal,
+                    phase = "helper_returned",
+                    elapsed_us,
+                    outcome,
+                    "VOS causal Shared startup retry"
+                );
+            }
+            result?;
         }
         self.shared_genesis = Some(shared);
         Ok(self)

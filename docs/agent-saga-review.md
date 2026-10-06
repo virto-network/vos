@@ -12,61 +12,58 @@ host source or the released workflow.
 ## Boundary and release claim
 
 The latest admitted source/evidence boundary is
-`f7d894649afcf798c333c6ce3d8e36cc238a10a8`.
-[Completed R61](agent-saga-status.md#completed-r61-attachment-retirement-attribution)
-adds six std/env-gated owning-retirement phases, copying existing node/agent/route
-and ingress-return boolean. Original checks, calls, guard/drop order, guest/pins,
-limits/deadlines remain unchanged; no new hash, ledger/frontier I/O or API.
-Portable main/harness pass **402.228s / 453.086s**, strict six-file verification
-**0.101s**. Reviewed pure synthetics pass 208 acceptance/715 refusal, eight
-existing/three retirement source-enforcement refusals, alias/privacy and zero
-helper/private-input loads.
+`06f22acc4620e4cbd2c43c97b462f753073046c5`.
+[Completed R62](agent-saga-status.md#completed-r62-constructor-attribution)
+adds own node/thread to existing helper/production_ready records and an exact
+cfg(test) cold-constructor bracket. Product calls/checks/Results/guard/drop order,
+clock placement, guest/pins and limits/deadlines stay unchanged; no new token,
+ledger/frontier read, API or authority. Portable main/harness pass
+**193.802s / 257.464s**, strict six-file verification **0.101s**.
+Pure synthetics pass 219 acceptance/847 refusal, eight existing/three retirement/
+seven startup source-enforcement refusals, alias/privacy and zero helper/private
+loads. Original source/proposal and artifact/owned-group fences pass.
 
-Scoped fixture fails **236.565s**, admitting **18,529 records / 568 explicit
-edges / 214 identity aliases / 52 thread aliases / zero unknowns**. Quiet on
-the same frozen binaries fails **219.740s**; finite admission records whole
-pending-Install 30s once/public panic `member_cold_install_tests.rs:277:9`,
-no Shared-before-routes refusal and zero unknown locations. Both are exhausted/
-noninterrupted one-test failures. Quiet labels locate a public bound, not its
-scoped inner cause or an actor Query verdict.
+Scoped fixture fails **245.666s**, admitting **18,677 records / 572 explicit
+edges / 223 identity aliases / 57 thread aliases / zero unknowns**. Quiet on the
+same frozen binaries fails **238.263s**, whole pending-Install 30s once/public
+panic `member_cold_install_tests.rs:277:9`, no Shared-before-routes refusal and
+zero unknown locations. Both are one-test exhausted/noninterrupted failures;
+quiet labels do not attribute a scoped inner cause.
 
-Scoped root `id166` preserves original `id165/work167/auth168`. Final child
-`id193/work194/auth195` has exact input `id201` appended at 47, all-three
-durable anchors and true result-poll/Waiting→Ready. Root-bound issuer save e17175
-requires exact Done/Bool(true) plus matching durable terminal replay. Original/
-final ACK inputs `id202/id203` also anchor on all three nodes. Runtime retirement
-e17721, terminal persistence e17725 and signed release `id205` lead to original
-owner Present/custody/retention-release e18161–63. This is accepted exact family
-recovery late, not a preview or general guest verdict. Owner 4.358759s and leader
-3.337097s use independent cumulative clocks and do not qualify timely 1.8s
-confirmation or whole30. Ready is buffering, not client Applied.
+Constructor returned records directly report replica 1/node `id2` 21.960971s,
+replica 2/node `id3` 24.875109s and replica 0/node `id1` 66.719104s, all Ok.
+Each owns its full elapsed/Result/configured node/replica/restart/thread and
+includes preflight. No record pairing, cumulative subtraction/addition or unique
+attempt follows. Slow original owner `id1`/`thread35` reports helper points
+16.047s System owner and 66.258s Shared recovery; these are cumulative on the
+separate post-preflight helper clock, not stage durations.
 
-Unbound helper completions report 20.487s/20.698s/66.435s on their own post-
-preflight clocks before public retry. No node/call pairing or clock addition
-follows. Eighty-four owning-retirement records provide fourteen records of each
-phase and ingress-return true controls, not fourteen attempts/calls. None is
-recorded cold entry e13071→exact release e18163. This does not prove continuous
-attachment/quorum, exclude other route/lease retirement, or attribute R60.
-The fixture retains base Network objects across restart; attachment retirement
-must not be relabeled as base-Network shutdown. Source-only constructor-drop
-hypotheses and R58–R60 evidence remain frozen at their original boundaries.
+Exact root `id166`/`id165/work167/auth168` final child `id193/work194/auth195`
+has all-three Invoke/ACK anchors and root-bound accepted issuer save e17080.
+Runtime retirement/terminal e17613/e17617 and original-owner release e18051
+precede its recorded late constructor return. This proves accepted family
+finalization/release, not timely whole30, client Applied for recovered Install or
+a general guest verdict. Source accepts late Present with original bounds intact.
 
-R57's approved one-guard release preflight and nineteen component preservation
-cases remain; general checked APIs, independent physical proofs and final worker/
-prefix barriers are mandatory. Packaged `vos` lacks `cfg(test)` counters;
-component counter proof stays separate from records/source integration evidence.
-Latest ordinary CLI is R57: Local Create/Install complete, then Query authorization
-preparation returns HTTP 503 before Invoke; Shared/reopen are unreached and cleanup
-exits 1 despite zero survivors. No R61 ordinary workflow ran.
+Required post-cold fresh verification of earlier Create `id30` completes a
+current GenesisDecision and durable terminal restore; completed retirement
+short-circuits another ACK. Generation recovery stays set across later Install
+retries. No new mutation or demonstrated removable duplicate is established.
+Next bounded source question is one long borrowed Shared recovery call versus
+repeated Unavailable/retry-budget amplification.
+[R63 borrowed-recovery diagnostics](agent-saga-status.md#r63-borrowed-recovery-call-attribution--applied)
+are applied, awaiting a new checkpoint/build/finite-reader/fresh fixture; no
+remedy is implemented. R60's separate constructor refusal remains unknown. Owning-
+retirement absence does not prove continuous quorum or explain that history.
 
-M1, whole30, client Applied, fresh Query and later milestones remain open.
-[R62 startup attribution](agent-saga-status.md#r62-constructor-and-startup-clock-attribution--applied)
-is applied after independent source review: own node/thread on existing helper
-clocks and an exact cold-constructor bracket including preflight. New checkpoint/
-build/source-specific reader/harness/fresh fixture remain pending/unexecuted.
-Latest admitted evidence stays R61; no remedy, new behavior candidate, authority,
-cap/deadline extension or performance benefit follows.
-Earlier source/reader/permission-review failures remain frozen evidence.
+R57's one-guard release preflight/component cases and all independent fresh
+physical proofs/worker-prefix barriers remain mandatory. Latest ordinary CLI
+is R57's Local Create/Install then Query authorization-preparation HTTP 503 before
+Invoke; no R62 ordinary workflow ran. M1, whole30, fresh Query, current Shared/
+reopen and later milestones remain open. Measured build/fixture costs are not a
+speedup or ETA. No new behavior candidate, architecture, authority, cap/deadline
+extension or promotion follows. Earlier source/reader/permission failures stay
+frozen evidence.
 
 The review branch remains `e6f2bb45` on `saga/agents`. Original replacement
 source `8128e677` and its role bundle `7085c220` precede the corrected integration
@@ -159,53 +156,55 @@ Current O3 component evidence (logs under the native worktree's `target`):
 
 ### Current integration delta and blocking result
 
-Read [completed R61](agent-saga-status.md#completed-r61-attachment-retirement-attribution)
-for clean source `f7d89464`, admitted evidence and exact hashes. Quiet/scoped
-fixtures fail **219.740s / 236.565s** at the unchanged whole pending-Install 30s
-assertion, line 277, after constructor progress rather than R60's line-1989
-constructor refusal. Scoped helper completions 20.487s/20.698s/66.435s are
-unbound own-clock cumulative samples after preflight, not paired node timings.
+Read [completed R62](agent-saga-status.md#completed-r62-constructor-attribution)
+for clean source `06f22acc` and exact evidence hashes. Quiet/scoped fixtures fail
+**238.263s / 245.666s** at the unchanged whole pending-Install 30s assertion,
+line 277. Direct constructor elapsed/Result is 21.960971s/Ok replica 1,
+24.875109s/Ok replica 2 and **66.719104s/Ok original-owner replica 0/node id1**.
+Each returned record owns its caller bracket including preflight. Own helper
+points 16.047s System owner/66.258s Shared recovery on node id1/thread35 remain
+cumulative; no subtraction, clock addition or per-attempt pairing follows.
 
-Root `id166` retains `id165/work167/auth168`. Final child
-`id193/work194/auth195`, registration `id196` sequence 5/member `id198`, extends
-root member `id174`. Earlier extension/Invoke refusals precede an accepted exact
-recovery history; this does not retrospectively attribute separate attempts.
-Input `id201` at index 47 anchors on all three nodes; issuer-save e17175 proves
-Done/Bool(true)/durable-terminal equality for the declared root. Original/final
-ACK inputs `id202/id203` at 48/49 also anchor on all three nodes. Runtime
-retirement e17721 and terminal persistence e17725 precede signed release `id205`,
-scope `id204`, bound to that same registration/root member and owner `id5`.
-Owner Present at (50,2) e18161→custody complete e18162→retention complete e18163;
-leader `id1` independently confirms e18166–67. The release is accepted late
-under original Present-before-expiry semantics, not timely 1.8s or whole30 proof.
-No global guest-stack verdict, client Applied or fresh Query qualification follows.
+Root `id166` retains `id165/work167/auth168` on original owner `id1`/System `id4`.
+Final child `id193/work194/auth195` keeps candidates distinct. Exact Invoke input
+`id201` at 47 and original/final ACK inputs `id202/id203` at 48/49 have all-three
+durable anchors. Issuer-save e17080 requires exact Done/Bool(true) and matching
+durable replay; runtime retirement e17613, terminal persistence e17617 and exact
+signed release `id205` culminate in owner Present/custody/retention e18049–51.
+Leader `id2` separately confirms. Accepted exact recovery completes before the
+recorded late constructor return; Ready/anchors alone would not prove issuer/
+client acceptance. Whole30 and timely 1.8s confirmation remain unqualified.
 
-R61's positive owning-retirement controls occur around the existing cold cut and
-later cleanup; none is recorded cold entry e13071→release e18163. Repeated route
-keys/counts cannot pair calls; missing markers do not rule out other retirement,
-connectivity or quorum gaps. Existing same-three base Network objects stay across
-restart; Agent attachment retirement is distinct. This does not explain R60's
-different constructor/local-append-only history.
+Pre-cut Create `id30` is already Applied/request-bound cached Applied. Post-cold
+fresh request `id184` completes 1.326277s and enters durable CMR2 restore; this
+verification is required current Authority proof, not a demonstrated duplicate
+or new mutation. Already complete retirement skips another ACK; the generation
+recovery flag stays set through later fallible Install retry. Retention-complete
+records do not distinguish every already-released/older-family shortcut.
 
-Applied R62 adds own node/thread to nine existing helper completion and
-production_ready records without moving their clocks, plus a cfg(test) exact
-ColdInstallAll restart constructor bracket including preflight. Original product
-calls/checks/Result/guard/drop ordering, guest/pins and limits/deadlines remain.
-Source proposal `32943da41f5cb093b5fd1bff9029abf0dab897d21132ec4e6c27100ae4501c2f`
-passes root/runtime/tool review; exact source hashes and pending integration are
-in the live plan. Source-specific reader/harness drafts are being prepared,
-unexecuted; new checkpoint/build/actual fixture boundary is pending.
-Existing Shared retry scheduling checks its 30s budget between attempts; an inner
-successful call can return after that budget. This source fact does not attribute
-R61's unbound clocks or authorize deadline changes. Latest admitted evidence
-stays R61 on `f7d89464`; no qualification or behavior remedy follows.
+Next bounded source assessment concerns individual borrowed `shared.recover`
+durations/Results versus repeated Unavailable and between-attempt scheduling.
+The existing 30s retry budget does not interrupt one inner call and accepts a
+late successful return. Current constructor/helper records do not measure those
+individual attempts. Applied R63 source proposal
+`102627c7f57fd32346dbc10f84c90568283daa198a0d701c73aa3bb1a727decd`
+adds three gated own-node/thread/local-ordinal phases with direct callback/helper
+elapsed and closed outcomes. Calls/Results/System guard/signer/scheduling bounds
+stay unchanged; local ordinals are not unique attempts or family/branch bindings,
+and overlapping clocks are not added. Exact applied source SHA and pending
+new checkpoint/build/finite-reader/fresh fixture are in the live plan.
+Latest admitted evidence stays R62; no behavior remedy is implemented.
+Owning-retirement absence in this accepted history cannot explain R60's separate
+constructor/local-append-only failure, exclude other retirement or prove quorum.
+All fresh physical, owner/member, raw-worker/prefix and original deadline checks
+stay mandatory.
 
 Latest ordinary CLI remains R57's Query authorization-preparation HTTP 503 before
-Invoke after Local Create/Install complete. No R61 ordinary workflow ran. M1
-remains next. Latest paired portable cost is 14.26 minutes plus strict verification;
-scoped/quiet attempts 3.94/3.66 minutes are measured costs, not an ETA or speedup.
-Variance is uncontrolled; aggregate remedy/qualification effort remains uncertain.
-No behavior candidate, new authority, cap extension or promotion follows.
+Invoke after Local Create/Install. No R62 ordinary workflow ran. M1 remains next.
+Paired portable build cost 7.52 minutes and scoped/quiet 4.09/3.97 minutes are
+uncontrolled measured costs, not application performance or remaining-work ETA.
+Remedy/qualification effort remains uncertain; no new behavior candidate,
+architecture, authority, cap extension or promotion follows.
 
 ### Frozen preceding integration evidence
 
