@@ -34,8 +34,15 @@ impl SharedRouteHandler {
         sender: NodeId,
         request: &ForwardedSharedInstallRequest,
     ) -> Result<u64, SharedAgentHostError> {
+        let refused = |phase: &'static str, error: SharedAgentHostError| {
+            if matches!(&request.operation, ForwardedSharedInstallOperation::Finish) {
+                install_receiver_refused(phase, error)
+            } else {
+                error
+            }
+        };
         if !request.is_valid(self.route) {
-            return Err(SharedAgentHostError::ScopeMismatch);
+            return Err(refused("receiver_request", SharedAgentHostError::ScopeMismatch));
         }
         // Do not keep this preparation lock across ordinary management submit:
         // that existing path freshly validates owner proof under both guards.
@@ -43,25 +50,30 @@ impl SharedRouteHandler {
             let proposal = self
                 .proposal
                 .lock()
-                .map_err(|_| SharedAgentHostError::Unavailable)?;
+                .map_err(|_| SharedAgentHostError::Unavailable)
+                .map_err(|error| refused("package_proposal_lock", error))?;
             if proposal.is_reserved() {
-                return Err(SharedAgentHostError::Conflict);
+                return Err(refused("package_reserved", SharedAgentHostError::Conflict));
             }
             let worker = self
                 .worker
                 .as_ref()
-                .ok_or(SharedAgentHostError::TransportNotAttached)?;
+                .ok_or(SharedAgentHostError::TransportNotAttached)
+                .map_err(|error| refused("package_worker", error))?;
             if !self.has_local_proposer(worker) {
-                return Err(SharedAgentHostError::Unavailable);
+                return Err(refused("package_proposer", SharedAgentHostError::Unavailable));
             }
             let mut host = self
                 .host
                 .lock()
-                .map_err(|_| SharedAgentHostError::Unavailable)?;
-            drain_committed(&mut host, self.agent, &self.ordered_replies)?;
-            let (_, fingerprint) = self.forwarded_install_fingerprint(&host)?;
+                .map_err(|_| SharedAgentHostError::Unavailable)
+                .map_err(|error| refused("package_host_lock", error))?;
+            drain_committed(&mut host, self.agent, &self.ordered_replies)
+                .map_err(|error| refused("package_drain", error))?;
+            let (_, fingerprint) = self.forwarded_install_fingerprint(&host)
+                .map_err(|error| refused("package_fingerprint", error))?;
             if fingerprint.voters.binary_search(&sender).is_err() {
-                return Err(SharedAgentHostError::ScopeMismatch);
+                return Err(refused("package_sender", SharedAgentHostError::ScopeMismatch));
             }
             match &request.operation {
                 ForwardedSharedInstallOperation::Progress
@@ -70,7 +82,8 @@ impl SharedRouteHandler {
                         .transfer_forwarded_shared_install_package(self.agent, sender, request);
                 }
                 ForwardedSharedInstallOperation::Finish => {
-                    host.load_forwarded_shared_install_package(self.agent, sender, request)?
+                    host.load_forwarded_shared_install_package(self.agent, sender, request)
+                        .map_err(|error| refused("package_load", error))?
                 }
             }
         };
@@ -79,7 +92,7 @@ impl SharedRouteHandler {
             request.authority.clone(),
             SdkManagementArtifacts::Actor(&package),
             Some((sender, request.owner)),
-        )?;
+        ).map_err(|error| refused("management_submit", error))?;
         match submission {
             CleanManagementSubmission::Applied { .. } => {
                 // Cleanup cannot change terminal evidence or authorize another
@@ -87,14 +100,16 @@ impl SharedRouteHandler {
                 let mut host = self
                     .host
                     .lock()
-                    .map_err(|_| SharedAgentHostError::Unavailable)?;
-                host.retire_forwarded_shared_install_package(self.agent, sender, request)?;
+                    .map_err(|_| SharedAgentHostError::Unavailable)
+                    .map_err(|error| refused("cleanup_host_lock", error))?;
+                host.retire_forwarded_shared_install_package(self.agent, sender, request)
+                    .map_err(|error| refused("cleanup_package", error))?;
                 let crate::agent_sdk::ManagementRequest::Install(install) = &request.request else {
-                    return Err(SharedAgentHostError::ScopeMismatch);
+                    return Err(refused("cleanup_request", SharedAgentHostError::ScopeMismatch));
                 };
                 Ok(install.package.len)
             }
-            CleanManagementSubmission::Denied { .. } => Err(SharedAgentHostError::Unavailable),
+            CleanManagementSubmission::Denied { .. } => Err(refused("receiver_denied", SharedAgentHostError::Unavailable)),
         }
     }
 
