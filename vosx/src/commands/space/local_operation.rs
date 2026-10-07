@@ -77,6 +77,9 @@ fn run_with_application(args: AuthorizeLocalArgs, apply: bool) -> anyhow::Result
         output.as_object_mut().expect("object").remove("applied");
         output["delivery_retired"] = true.into();
         output["reservation_pending"] = false.into();
+        // The applied resume already verified exact delivery and positive ACK;
+        // expose the same original request-bound actor result as the human call.
+        output["result"] = super::local_call::retained_result(&root)?;
     }
     crate::output::print_json(&output);
     Ok(())

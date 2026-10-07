@@ -140,7 +140,7 @@ fn policy_claims(
     }
 }
 
-fn retained_result(request_dir: &std::path::Path) -> anyhow::Result<Json> {
+pub(super) fn retained_result(request_dir: &std::path::Path) -> anyhow::Result<Json> {
     let application = request_dir
         .parent()
         .ok_or_else(|| anyhow::anyhow!("invalid retained operation path"))?

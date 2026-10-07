@@ -100,15 +100,18 @@ lifecycle_fence() {
     # These private hashes are a delivery fence, not a wire/authentication
     # decoder. The ordinary CLI still validates Space, credential, nonce and
     # signed request. This fresh persona has one serialized client operation.
-    python3 - "$1" "$evidence/$2/space/agent-client" "$space_id" "$evidence/logs/$3.binding.json" "$3.request" <<'PY'
+    python3 - "$1" "$evidence/$2/space/agent-client" "$space_id" "$evidence/logs/$3.binding.json" "$3.request" "${4:-lifecycle}" <<'PY'
 import hashlib, json, re, sys
 from pathlib import Path
 
-mode, client_path, space, state_path, request_name = sys.argv[1:]
+mode, client_path, space, state_path, request_name, family = sys.argv[1:]
 client, state_file = Path(client_path), Path(state_path)
 
 def refuse():
     raise SystemExit("qualification refused: lifecycle operation binding changed; inspect private evidence")
+
+if family not in {"lifecycle", "invocation"}:
+    refuse()
 
 def entries(directory):
     if not directory.exists():
@@ -172,10 +175,19 @@ else:
     current = files(client / "operations" / state["operation"])
     if any(current.get(name) != value for name, value in state["files"].items()):
         refuse()
-    other_requests = {"local-create.request", "local-install.request", "shared-create.request", "shared-install.request"} - {request_name}
+    lifecycle_requests = {"local-create.request", "local-install.request", "shared-create.request", "shared-install.request"}
+    other_requests = lifecycle_requests if family == "invocation" else lifecycle_requests - {request_name}
     if any(Path(name).name in other_requests for name in current):
         refuse()
-    if f"request/{request_name}" not in current and "query/credential.query" not in current:
+    if family == "invocation":
+        # This retry cut requires the original ATQ1, its bound ATP1 and signed
+        # AOC5. Keep every previously published file byte-exact, including
+        # continuation history; later progressive ambiguity fails closed here.
+        required = {"preparation/preparation.request", "preparation/preparation.response",
+                    "authorization-preparation/authorization-preparation.request"}
+        if not required <= current.keys():
+            refuse()
+    elif f"request/{request_name}" not in current and "query/credential.query" not in current:
         refuse()
     state["files"] = current
     if mode == "success":
@@ -208,17 +220,18 @@ raise SystemExit(0 if transport and (retained or loopback) else 1)
 PY
 }
 run_lifecycle() {
-    local step=$1 persona=$2 started clock_start deadline now attempt=0 code=0 duration attempt_started attempt_clock remaining
+    local step=$1 persona=$2 started clock_start deadline now attempt=0 code=0 duration attempt_started attempt_clock remaining family=lifecycle
     local -a resume=()
     shift 2
+    if [[ ${1-} == space && ${2-} == call-agent-actor ]]; then family=invocation; fi
     clock_start=$(monotonic_ms); started=$(date +%s%3N); deadline=$((clock_start + 180000))
-    lifecycle_fence begin "$persona" "$step"
+    lifecycle_fence begin "$persona" "$step" "$family"
     while true; do
         now=$(monotonic_ms); remaining=$((deadline - now))
         # Keep the existing ten-second CLI termination grace inside the whole
         # step bound. Every attempt uses only the remaining budget.
         (( remaining > 10000 )) || fail "$step has no CLI budget left within its existing 180s command bound; inspect retained attempts"
-        if (( attempt > 0 )); then lifecycle_fence verify "$persona" "$step"; fi
+        if (( attempt > 0 )); then lifecycle_fence verify "$persona" "$step" "$family"; fi
         now=$(monotonic_ms); remaining=$((deadline - now - 10000))
         (( remaining > 0 )) || fail "$step has no CLI budget left within its existing 180s command bound; inspect retained attempts"
         printf -v duration '%d.%03ds' "$((remaining / 1000))" "$((remaining % 1000))"
@@ -230,7 +243,7 @@ run_lifecycle() {
         install -m 0600 -- "$evidence/logs/$step.attempt-$attempt.stderr" "$evidence/logs/$step.stderr"
         (( now < deadline )) || fail "$step exceeded its existing 180s command bound; inspect retained attempts"
         if (( code == 0 )); then
-            if (( attempt > 1 )); then lifecycle_fence success "$persona" "$step"; fi
+            if (( attempt > 1 )); then lifecycle_fence success "$persona" "$step" "$family"; fi
             now=$(monotonic_ms)
             printf '%s\t%s\t%s\t0\n' "$step" "$started" "$((now - clock_start))" >> "$evidence/timings.tsv"
             (( now < deadline )) || fail "$step completed after its existing 180s command bound"
@@ -240,7 +253,12 @@ run_lifecycle() {
             printf '%s\t%s\t%s\t%s\n' "$step" "$started" "$((now - clock_start))" "$code" >> "$evidence/timings.tsv"
             fail "$step failed ($code) without a retryable retained transport outcome; inspect retained logs"
         fi
-        lifecycle_fence bind "$persona" "$step"
+        lifecycle_fence bind "$persona" "$step" "$family"
+        if [[ ${1-} == space && ${2-} == call-agent-actor ]]; then
+            # A human call mints its nonce once. Retry only the retained
+            # credential operation; invoke-agent resumes authorization and ACK.
+            set -- space invoke-agent "$3" --http "${@: -1}"
+        fi
         resume=(--resume)
         sleep 0.1
     done
@@ -350,7 +368,7 @@ start_all() {
 }
 query() {
     local step=$1 persona=$2 agent=$3 port=$4
-    run "$step" "$persona" space call-agent-actor "$name" "$agent" clerk-ledger journal_id --package "$clerk" --args '{}' --http "127.0.0.1:$port"
+    run_lifecycle "$step" "$persona" space call-agent-actor "$name" "$agent" clerk-ledger journal_id --package "$clerk" --args '{}' --http "127.0.0.1:$port"
     jq -e '.decision == "issued" and .delivery_retired == true and .result.status == "Done" and .result.value == "0x"' "$evidence/logs/$step.stdout" >/dev/null || fail "$step did not complete the actual empty Clerk query/ACK"
 }
 start_all first
