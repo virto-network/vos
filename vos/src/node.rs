@@ -2299,11 +2299,14 @@ impl IngressHandle {
         &self,
         query: &crate::agent::sdk::authority::AuthorityProjectionQuery,
     ) -> Option<crate::agent::supervisor_adapters::CredentialObservationDiagnostics> {
-        std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some().then(|| {
-            crate::agent::supervisor_adapters::CredentialObservationDiagnostics {
-                query: query.commitment(),
-                node: self.shared_network.agent_node_id(),
-            }
+        if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_none() {
+            return None;
+        }
+        let node = self.shared_network.lock().ok()
+            .and_then(|network| network.as_ref().map(|network| network.agent_node_id()))?;
+        Some(crate::agent::supervisor_adapters::CredentialObservationDiagnostics {
+            query: query.commitment(),
+            node,
         })
     }
 
