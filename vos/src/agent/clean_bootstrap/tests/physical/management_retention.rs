@@ -413,8 +413,109 @@ fn prune_and_catch_up_offline_management(
             });
             source.is_some()
         }));
+        let old_source = source.unwrap();
+        assert_ne!(old_source, origin);
+        let offline_database = offline_host.lock().unwrap().raft_database(system).unwrap();
+        let offline_raft = crate::raft::RaftMeta::load(&offline_database).unwrap();
+        drop(offline_database);
+        let offline_applied = offline_host.lock().unwrap().capacity(system).unwrap().0;
+        // Readiness already drained the source. Drain each other survivor
+        // before recording an equal logical baseline, so preexisting follower
+        // catch-up cannot be mistaken for actor execution by the new no-op.
+        let settled_source = native_owner_physical_state(owners[old_source].as_ref().unwrap());
+        let logical_before = owners
+            .iter()
+            .enumerate()
+            .filter_map(|(index, owner)| {
+                let owner = owner.as_ref()?;
+                let before = exact_management_retry("management no-op logical baseline", || {
+                    let manifest = owner._network_host.management_recovery_manifest(system)?;
+                    let Some(slot) = manifest.management_slot(HostNodeId(node.0)) else {
+                        return Err(SharedAgentHostError::Unavailable);
+                    };
+                    assert_eq!(slot, retained);
+                    let before = native_owner_physical_state(owner);
+                    if before.0 != settled_source.0 || before.1 != settled_source.1 {
+                        return Err(SharedAgentHostError::Unavailable);
+                    }
+                    Ok((before.0, before.1))
+                });
+                Some((index, before))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(logical_before.len(), 2);
+        let previous_database = owners[old_source]
+            .as_ref()
+            .unwrap()
+            .host
+            .lock()
+            .unwrap()
+            .raft_database(system)
+            .unwrap();
+        let previous_raft = crate::raft::RaftMeta::load(&previous_database).unwrap();
+        drop(previous_database);
+        let previous_applied = owners[old_source]
+            .as_ref()
+            .unwrap()
+            .host
+            .lock()
+            .unwrap()
+            .capacity(system)
+            .unwrap()
+            .0;
+        // Ordinary work is excluded while the offline owner's completion
+        // headroom is retained. Re-elect through the two live voters instead:
+        // the genuine worker must commit its new-term LeaderNoop, while the
+        // offline owner and every actor/Ordered result remain untouched.
+        owners[old_source]
+            .as_mut()
+            .unwrap()
+            ._network_host
+            .retire_attachment_for_test(system)
+            .unwrap();
+        owners[old_source]
+            .as_mut()
+            .unwrap()
+            ._network_host
+            .refresh()
+            .unwrap();
+        source = None;
+        assert!(wait_until(std::time::Duration::from_secs(30), || {
+            source = owners.iter().enumerate().find_map(|(index, owner)| {
+                let owner = owner.as_ref()?;
+                if !owner._network_host.bootstrap_is_local_leader(system).unwrap() {
+                    return None;
+                }
+                let database = owner.host.lock().unwrap().raft_database(system).unwrap();
+                let raft = crate::raft::RaftMeta::load(&database).unwrap();
+                drop(database);
+                let applied = owner.host.lock().unwrap().capacity(system).unwrap().0;
+                (raft.current_term > previous_raft.current_term
+                    && applied > previous_applied
+                    && applied > offline_applied
+                    && applied > offline_raft.last_applied
+                    && applied > offline_raft.commit_index
+                    && applied > offline_raft.snap_last_index)
+                    .then_some(index)
+            });
+            source.is_some()
+        }));
         let source = source.unwrap();
         assert_ne!(source, origin);
+        assert!(owners[origin].is_none());
+        for (index, before) in &logical_before {
+            let survivor = owners[*index].as_ref().unwrap();
+            let manifest = exact_management_retry("management no-op survivor manifest", || {
+                survivor._network_host.management_recovery_manifest(system)
+            });
+            assert_eq!(manifest.management_slot(HostNodeId(node.0)), Some(retained));
+            let after = native_owner_physical_state(survivor);
+            assert_eq!(
+                (after.0, after.1),
+                *before,
+                "leader no-op progress must not execute or change actor/Ordered work"
+            );
+        }
         let owner = owners[source].as_mut().unwrap();
         // Read-only evidence on survivors is not mutation execution authority.
         assert_eq!(
@@ -426,44 +527,10 @@ fn prune_and_catch_up_offline_management(
                 .unwrap(),
             Some(first.input_id())
         );
-        // Advance the live source through the ordinary signed Query
-        // Invoke/ACK contract. Constructing checkpoint gate work alone does
-        // not create a newer prefix than the detached destination.
+        // This ordinary signed work identifies the existing checkpoint gate;
+        // it is constructed only and is never submitted as Invoke or ACK.
         let request = query(owner, source, nonce + cycle);
-        let (work, authorization, identity) = public_query_work(owner, &request);
-        let before_query = owner.ordered_index_for_test().unwrap();
-        let outcome = exact_management_retry("management catch-up public Query", || {
-            owner.supervisor_invoke_terminal(identity, work.clone(), authorization.clone())
-        });
-        let RuntimeOutcome::Completed(Ok(reply)) = outcome else {
-            panic!("management catch-up public Query did not complete");
-        };
-        assert_eq!(reply.status, InvocationStatus::Done);
-        let Some(crate::actors::value::Value::Bytes(bytes)) =
-            crate::actors::value::Value::try_decode(&reply.reply)
-        else {
-            panic!("management catch-up public Query returned no projection bytes");
-        };
-        let projection =
-            crate::agent_sdk::authority::AuthorityCredentialProjection::decode(&bytes).unwrap();
-        assert_eq!(projection.query, request);
-        assert_eq!(projection.query.credential, request.credential);
-        assert_eq!(
-            projection.status,
-            crate::agent_sdk::authority::AuthorityCredentialStatus::Active
-        );
-        assert_ne!(projection.principal, PrincipalId::ZERO);
-        let acknowledged = exact_management_retry("management catch-up public Query ACK", || {
-            owner.supervisor_acknowledge(identity, work.clone(), authorization.clone())
-        });
-        let RuntimeOutcome::Acknowledged(Ok(acknowledged)) = acknowledged else {
-            panic!("management catch-up public Query was not positively acknowledged");
-        };
-        assert_eq!(acknowledged.invocation, work.invocation);
-        assert_eq!(acknowledged.actor, work.actor);
-        assert_eq!(acknowledged.work, work.commitment());
-        assert_eq!(acknowledged.authorization, authorization.commitment());
-        assert!(owner.ordered_index_for_test().unwrap() > before_query);
+        let (work, authorization, _) = public_query_work(owner, &request);
         // Qualify the real candidate's same-call audited-manifest handoff
         // before QC collection, so a later vote timeout cannot mask whether
         // this exact source/read-count assertion ran.
@@ -575,10 +642,6 @@ fn prune_and_catch_up_offline_management(
             "survivors retain the original response without reexecuting the mutation"
         );
         assert_eq!(owner.ordered_index_for_test().unwrap(), before);
-        let offline_database = offline_host.lock().unwrap().raft_database(system).unwrap();
-        let offline_raft = crate::raft::RaftMeta::load(&offline_database).unwrap();
-        drop(offline_database);
-        let offline_applied = offline_host.lock().unwrap().capacity(system).unwrap().0;
         let target = certificate.claim().ordered();
         assert!(
             target.raft_index() > offline_applied

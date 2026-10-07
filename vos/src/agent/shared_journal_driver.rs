@@ -9387,6 +9387,215 @@ mod keyed_actor_cursor_tests {
     }
 
     #[test]
+    fn management_retention_headroom_counts_exact_signed_shadow_once() {
+        use super::super::journal::{JournalHeads, MergeFrontierId};
+        use super::super::shared_recovery::management::{
+            SharedManagementRecoveryMember, SharedManagementRecoveryRegistration,
+            SharedManagementRecoveryRegistrationRequest,
+        };
+        use super::super::shared_recovery::{
+            management_node_for_test, management_observation_for_test,
+            management_recovery_fixture_for_test,
+        };
+        use crate::service::wire::ServiceWire as _;
+        use ed25519_dalek::{Signer as _, SigningKey};
+        let (admitted, root, _) = management_capsule_fixture(false);
+        let original = admitted.management_slots()[0].registration().clone();
+        // A new holder must acquire the root at its exact current anchor,
+        // before any Invoke advances the authenticated logical prefix.
+        let mut manifest = super::SharedRecoveryManifest::new(
+            admitted.generation(), admitted.committee().clone(),
+        )
+        .unwrap();
+        manifest.apply_management_registration(&original, 1, 3).unwrap();
+        let original_owner = original.owner();
+        let shadow_owner = management_node_for_test(2);
+        let incoming = SharedManagementRecoveryRegistrationRequest::new(
+            manifest.generation(),
+            manifest.committee().id(),
+            shadow_owner,
+            original_owner,
+            1,
+            None,
+            vec![root.clone()],
+        )
+        .unwrap();
+        manifest.validate_management_registration_request(&incoming).unwrap();
+        let sign = |request: SharedManagementRecoveryRegistrationRequest, seed: u8| {
+            let signature = super::super::shared_commit::ReplicaCommitSignature::new(
+                request.owner(),
+                SigningKey::from_bytes(&[seed; 32])
+                    .sign(&request.signing_message().0)
+                    .to_bytes(),
+            )
+            .unwrap();
+            SharedManagementRecoveryRegistration::new(request, signature).unwrap()
+        };
+        let shadow = sign(incoming, 2);
+        shadow.verify(manifest.generation(), manifest.committee()).unwrap();
+        let common = super::super::shared_commit::common_snapshot_claim_for_test();
+        let heads = JournalHeads::initial(
+            common.ordered().genesis(),
+            common.ordered().admission(),
+            shadow_owner,
+            MergeFrontierId([0x91; 32]),
+            common.ordered().runtime().clone(),
+        );
+        let future = super::management_finalization_headroom(&heads, root.envelope()).unwrap();
+        let immutable = manifest.encode();
+        let (pending, entries, bytes) =
+            super::management_retention_headroom(&heads, &manifest, Some(shadow.request())).unwrap();
+        assert_eq!(pending.len(), 1, "exact shadow custody must budget one runtime invocation");
+        assert_eq!(pending, vec![(root.anchor(), root.envelope())]);
+        assert_eq!((entries, bytes), (2 * future.0, 2 * future.1));
+        assert_eq!(entries, 4, "each holder keeps its full future finalization reserve");
+        assert_eq!(manifest.encode(), immutable);
+        manifest.apply_management_registration(&shadow, 2, 3).unwrap();
+        for owner in [original_owner, shadow_owner] {
+            let slot = manifest.management_slot(owner).unwrap();
+            assert_eq!(slot.origin_owner(), original_owner);
+            assert_eq!(slot.members(), &[root.clone()]);
+            assert!(slot.members_evidence()[0].invoke().is_none());
+            assert!(slot.members_evidence()[0].acknowledgement().is_none());
+        }
+        let template = management_recovery_fixture_for_test(1, 7);
+        let first = management_observation_for_test(&template, 3, false);
+        manifest.observe(&first).unwrap();
+        for owner in [original_owner, shadow_owner] {
+            let slot = manifest.management_slot(owner).unwrap();
+            assert_eq!(slot.members_evidence()[0].invoke().unwrap().input_id(), first.input_id());
+            assert!(slot.members_evidence()[0].acknowledgement().is_none());
+        }
+        let (pending, registered_entries, registered_bytes) =
+            super::management_retention_headroom(&heads, &manifest, None).unwrap();
+        assert_eq!(pending, vec![(root.anchor(), root.envelope())]);
+        assert_eq!((registered_entries, registered_bytes), (entries, bytes));
+        manifest.observe(&management_observation_for_test(&template, 4, true)).unwrap();
+        let (pending, acked_entries, acked_bytes) =
+            super::management_retention_headroom(&heads, &manifest, None).unwrap();
+        assert!(pending.is_empty());
+        assert_eq!((acked_entries, acked_bytes), (entries, bytes));
+
+        // Acquire root-only custody first, then legally append the same child
+        // through each holder's own predecessor commitment and full member set.
+        let (_, other, _) = management_capsule_fixture_for_owner(1, 8, false);
+        let child = SharedManagementRecoveryMember::new(
+            Some(root.commitment()),
+            other.anchor().clone(),
+            other.envelope().clone(),
+        )
+        .unwrap();
+        for (owner, seed, position) in [(original_owner, 1, 5), (shadow_owner, 2, 6)] {
+            let previous = manifest.management_slot(owner).unwrap();
+            let request = SharedManagementRecoveryRegistrationRequest::new(
+                manifest.generation(),
+                manifest.committee().id(),
+                owner,
+                original_owner,
+                previous.sequence() + 1,
+                Some(previous.commitment()),
+                vec![root.clone(), child.clone()],
+            )
+            .unwrap();
+            manifest.validate_management_registration_request(&request).unwrap();
+            let registration = sign(request, seed);
+            registration.verify(manifest.generation(), manifest.committee()).unwrap();
+            let (pending, child_entries, child_bytes) =
+                super::management_retention_headroom(&heads, &manifest, Some(registration.request()))
+                    .unwrap();
+            assert_eq!(pending, vec![(child.anchor(), child.envelope())]);
+            assert_eq!((child_entries, child_bytes), (entries, bytes));
+            manifest.apply_management_registration(&registration, position, 3).unwrap();
+        }
+        let (pending, child_entries, child_bytes) =
+            super::management_retention_headroom(&heads, &manifest, None).unwrap();
+        assert_eq!(pending, vec![(child.anchor(), child.envelope())]);
+        assert_eq!((child_entries, child_bytes), (entries, bytes));
+    }
+
+    #[test]
+    fn management_retention_headroom_preserves_conflicting_same_invocation_refusal() {
+        use super::super::journal::{JournalHeads, MergeFrontierId, OrderedEntryId};
+        use super::super::shared_recovery::management::{
+            SharedManagementRecoveryMember, SharedManagementRecoveryRegistration,
+            SharedManagementRecoveryRegistrationRequest,
+        };
+        use super::super::shared_recovery::{management_node_for_test, SharedRecoveryError};
+        use crate::service::wire::ServiceWire as _;
+        use ed25519_dalek::{Signer as _, SigningKey};
+        let (mut manifest, root, _) = management_capsule_fixture(false);
+        let original_owner = manifest.management_slots()[0].owner();
+        let shadow_owner = management_node_for_test(2);
+        let mut later_anchor = root.anchor().clone();
+        later_anchor.ordered = super::OrderedBase {
+            index: 1,
+            head: Some(OrderedEntryId([0x95; 32])),
+        };
+        let different_anchor = SharedManagementRecoveryMember::new(
+            None, later_anchor, root.envelope().clone(),
+        )
+        .unwrap();
+        let mut different_envelope = root.envelope().clone();
+        let crate::agent_sdk::RuntimeWork::Invoke {
+            invocation, authorization, observed_slot, ..
+        } = &mut different_envelope else {
+            unreachable!()
+        };
+        invocation.gas = invocation.gas.checked_sub(1).unwrap();
+        **authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+            crate::agent_sdk::PublicPreflight::for_work(invocation, *observed_slot),
+        );
+        let different_work = SharedManagementRecoveryMember::new(
+            None, root.anchor().clone(), different_envelope,
+        )
+        .unwrap();
+        let common = super::super::shared_commit::common_snapshot_claim_for_test();
+        let heads = JournalHeads::initial(
+            common.ordered().genesis(),
+            common.ordered().admission(),
+            shadow_owner,
+            MergeFrontierId([0x91; 32]),
+            common.ordered().runtime().clone(),
+        );
+        let immutable = manifest.encode();
+        for conflicting in [different_anchor, different_work] {
+            assert_eq!(conflicting.work().invocation, root.work().invocation);
+            let request = SharedManagementRecoveryRegistrationRequest::new(
+                manifest.generation(), manifest.committee().id(), shadow_owner,
+                original_owner, 1, None, vec![conflicting.clone()],
+            )
+            .unwrap();
+            assert_eq!(
+                manifest.validate_management_registration_request(&request),
+                Err(SharedRecoveryError::Conflict),
+            );
+            let signature = super::super::shared_commit::ReplicaCommitSignature::new(
+                shadow_owner,
+                SigningKey::from_bytes(&[2; 32])
+                    .sign(&request.signing_message().0)
+                    .to_bytes(),
+            )
+            .unwrap();
+            let registration = SharedManagementRecoveryRegistration::new(request, signature).unwrap();
+            registration.verify(manifest.generation(), manifest.committee()).unwrap();
+            assert_eq!(
+                manifest.apply_management_registration(&registration, 4, 3),
+                Err(SharedRecoveryError::Conflict),
+            );
+            assert_eq!(manifest.encode(), immutable);
+            // This pure selector is not admission. It must leave distinct
+            // same-ID pairs intact for the unchanged checked budget refusal.
+            let (pending, _, _) =
+                super::management_retention_headroom(&heads, &manifest, Some(registration.request()))
+                    .unwrap();
+            assert_eq!(pending.len(), 2);
+            assert!(pending.contains(&(root.anchor(), root.envelope())));
+            assert!(pending.contains(&(conflicting.anchor(), conflicting.envelope())));
+            assert_ne!(pending[0], pending[1]);
+        }
+    }
+
+    #[test]
     fn management_retention_headroom_replaces_only_incoming_owner_scope() {
         use super::super::journal::{JournalHeads, MergeFrontierId};
         use super::super::shared_recovery::management::{

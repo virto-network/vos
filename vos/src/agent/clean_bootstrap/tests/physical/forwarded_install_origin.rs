@@ -211,7 +211,30 @@ fn create_and_admit(
         "receiver fixture Create publication",
         || controller.publish_pending_create(owner, locator, vec![signature.clone()], signer),
     );
+    let retained_signatures = record
+        .provision()
+        .evidence()
+        .certificate()
+        .signatures()
+        .to_vec();
     super::management_retention::exact_management_retry("receiver fixture Create terminal", || {
+        // Match the public owner's exact retry composition: re-admit the
+        // original leased publication before completion, without re-endorsing.
+        match controller.publish_pending_create(owner, locator, retained_signatures.clone(), signer) {
+            Ok(published) => assert!(
+                published == record,
+                "receiver fixture exact publication changed its archive"
+            ),
+            Err(SharedAgentHostError::Conflict) => {
+                // Retired publications refuse this call. Archive equality is
+                // not terminal proof; normal fresh completion still follows.
+                assert!(
+                    controller.create_archive(locator)?.as_ref() == Some(&record),
+                    "receiver fixture publication conflict changed its retained archive"
+                );
+            }
+            Err(error) => return Err(error),
+        }
         controller.complete_pending_create(owner, locator, signer)
     });
     assert!(!owner.management_admission_held().unwrap());
