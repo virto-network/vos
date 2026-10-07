@@ -241,7 +241,30 @@ pub(super) fn post_binary(
     bytes: &[u8],
     maximum: usize,
 ) -> anyhow::Result<Vec<u8>> {
-    post_binary_response(address, path, status, bytes, maximum, None, None).map(|(_, bytes)| bytes)
+    let diagnostics = (path == "/__agents/invoke"
+        && std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some())
+        .then(|| vos::agent::sdk::Hash::digest(
+            b"vos/agent/supervisor-invocation-request/v1", &[bytes],
+        ));
+    if let Some(request) = diagnostics {
+        tracing::debug!(target: "vosx::invoke_diagnostic", stage = "client_request",
+            request = ?request.0, address = %address, "invoke_diagnostic");
+    }
+    let result = post_binary_response(address, path, status, bytes, maximum, None, None)
+        .map(|(_, bytes)| bytes);
+    if let Some(request) = diagnostics {
+        let (category, status) = match &result {
+            Ok(_) => ("ok", status),
+            Err(error) => match error.downcast_ref::<ureq::Error>() {
+                Some(ureq::Error::Status(status, _)) => ("http_error", *status),
+                Some(ureq::Error::Transport(_)) => ("transport_error", 0),
+                None => ("other_error", 0),
+            },
+        };
+        tracing::debug!(target: "vosx::invoke_diagnostic", stage = "client_http_result",
+            request = ?request.0, address = %address, category, status, "invoke_diagnostic");
+    }
+    result
 }
 
 pub(super) fn post_binary_authenticated(

@@ -39,6 +39,69 @@ const MAX_BLOCKING_REQUESTS: usize = 64;
 // and execution even if the HTTP connection is cancelled.
 static LIFECYCLE_UPLOADS: Semaphore = Semaphore::const_new(2);
 
+#[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+#[derive(Clone, Copy)]
+struct InvokeHttpDiagnostics {
+    request: crate::agent::sdk::Hash,
+    node: Option<crate::agent::sdk::NodeId>,
+}
+
+#[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+impl InvokeHttpDiagnostics {
+    fn for_request(request: &super::types::Request, handle: &IngressHandle) -> Option<Self> {
+        if request.uri().path() != "/__agents/invoke"
+            || std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_none()
+            || request.body().len() > MAX_BODY_BYTES
+        {
+            return None;
+        }
+        Some(Self {
+            // Identical to AgentInvocationRequest::commitment for a canonical
+            // frame. This diagnostic does not decode or admit the request.
+            request: crate::agent::sdk::Hash::digest(
+                b"vos/agent/supervisor-invocation-request/v1", &[request.body()],
+            ),
+            node: handle.agent_diagnostic_node(),
+        })
+    }
+
+    fn event(self, stage: &'static str, category: &'static str) {
+        tracing::debug!(target: "vos::invoke_diagnostic",
+            request = ?self.request.0, node = ?self.node.map_or([0; 32], |node| node.0),
+            node_known = self.node.is_some(), stage, category, "invoke_diagnostic");
+    }
+
+    fn error(self, stage: &'static str, error: crate::agent::supervisor::AgentSupervisorError) {
+        // This enum and both nested error enums contain only closed variants.
+        tracing::debug!(target: "vos::invoke_diagnostic",
+            request = ?self.request.0, node = ?self.node.map_or([0; 32], |node| node.0),
+            node_known = self.node.is_some(), stage, category = ?error, "invoke_diagnostic");
+    }
+}
+
+#[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+fn trace_credential_http_refusal(
+    request: &super::types::Request,
+    handle: &IngressHandle,
+    category: &'static str,
+) {
+    use crate::agent::sdk::authority::AuthorityProjectionQuery;
+    use crate::agent::sdk::wire::CanonicalWire as _;
+    if request.uri().path() != "/__agents/credential"
+        || std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_none()
+        || request.body().len() > AuthorityProjectionQuery::MAX_ENCODED_BYTES
+    {
+        return;
+    }
+    // Diagnostic-only decode on a refusal already selected by ingress. It
+    // grants no admission and does not consult Authority or local actor state.
+    if let Ok(query) = AuthorityProjectionQuery::decode(request.body())
+        && let Some(diagnostics) = handle.credential_observation_diagnostics(&query)
+    {
+        diagnostics.refused("ingress", category);
+    }
+}
+
 fn admit_lifecycle_upload(
     maximum_body: usize,
     budget: &Semaphore,
@@ -283,6 +346,12 @@ async fn handle_request(
         }
     };
     let request = http::Request::from_parts(parts, body);
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    let invoke_diagnostics = InvokeHttpDiagnostics::for_request(&request, &handle);
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    if let Some(diagnostics) = invoke_diagnostics {
+        diagnostics.event("ingress", "received");
+    }
     shared_create_http_phase(
         &path,
         Some(inner.bound_port),
@@ -305,6 +374,10 @@ async fn handle_request(
                 "/_vos/agents/shared/create" | "/_vos/agents/shared/install"
             )))
     {
+        if let Some(diagnostics) = invoke_diagnostics {
+            diagnostics.event("ingress", "space_recovering");
+        }
+        trace_credential_http_refusal(&request, &handle, "space_recovering");
         shared_create_http_phase(
             &path,
             Some(inner.bound_port),
@@ -337,6 +410,12 @@ async fn handle_request(
         super::routing::dispatch(&request, &inner, &mut context)
     } else {
         let Ok(permit) = blocking.try_acquire_owned() else {
+            #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+            if let Some(diagnostics) = invoke_diagnostics {
+                diagnostics.event("ingress", "http_worker_capacity");
+            }
+            #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+            trace_credential_http_refusal(&request, &handle, "http_worker_capacity");
             shared_create_http_phase(
                 &path,
                 Some(inner.bound_port),
@@ -1251,6 +1330,7 @@ fn handle_clean_invocation(
         AgentAcknowledgementRequest, AgentInvocationRequest, AgentResumeRequest,
         dispatch_encoded_acknowledgement, dispatch_encoded_invocation, dispatch_encoded_resume,
     };
+    let diagnostics = InvokeHttpDiagnostics::for_request(request, handle);
 
     if request.body().len() > MAX_BODY_BYTES {
         return text(413, "request body too large");
@@ -1318,7 +1398,18 @@ fn handle_clean_invocation(
             "unsigned public invocation cannot assert caller identity or roles",
         );
     }
+    if let Some(diagnostics) = diagnostics {
+        tracing::debug!(target: "vos::invoke_diagnostic",
+            request = ?diagnostics.request.0,
+            node = ?diagnostics.node.map_or([0; 32], |node| node.0),
+            node_known = diagnostics.node.is_some(), invocation = ?work.invocation.0,
+            work = ?work.commitment().0, authorization = ?authorization.commitment().0,
+            actor = ?work.actor.0, stage = "decoded", category = "ok", "invoke_diagnostic");
+    }
     let Some(supervisor) = handle.clean_agent_supervisor() else {
+        if let Some(diagnostics) = diagnostics {
+            diagnostics.event("handler", "supervisor_missing");
+        }
         return text(503, "clean agent supervisor unavailable");
     };
     let key = match AgentRouteKey::new(work.space, work.agent, work.actor) {
@@ -1327,7 +1418,12 @@ fn handle_clean_invocation(
     };
     let snapshot = match supervisor.snapshot(key) {
         Ok(snapshot) => snapshot,
-        Err(_) => return text(503, "clean invocation route unavailable"),
+        Err(error) => {
+            if let Some(diagnostics) = diagnostics {
+                diagnostics.error("snapshot", error);
+            }
+            return text(503, "clean invocation route unavailable");
+        },
     };
     // The exact bytes, including authorization and recovery intent, survive
     // retries. Dispatch checks the live identity and exact response commitment.
@@ -1344,16 +1440,25 @@ fn handle_clean_invocation(
     };
     match response {
         Ok(response) => match response {
-            Ok(bytes) => with_content_type(200, "application/octet-stream", bytes),
-            Err(_) => text(
-                503,
-                "clean invocation response unavailable; retain exact request",
-            ),
+            Ok(bytes) => {
+                if let Some(diagnostics) = diagnostics {
+                    diagnostics.event("handler", "response_encoded");
+                }
+                with_content_type(200, "application/octet-stream", bytes)
+            },
+            Err(_) => {
+                if let Some(diagnostics) = diagnostics {
+                    diagnostics.event("handler", "response_encode_failed");
+                }
+                text(503, "clean invocation response unavailable; retain exact request")
+            },
         },
-        Err(_) => text(
-            503,
-            "clean invocation incomplete; retain and retry the exact request",
-        ),
+        Err(error) => {
+            if let Some(diagnostics) = diagnostics {
+                diagnostics.error("dispatch", error);
+            }
+            text(503, "clean invocation incomplete; retain and retry the exact request")
+        },
     }
 }
 

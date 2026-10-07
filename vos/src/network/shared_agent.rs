@@ -1606,7 +1606,25 @@ impl SharedRouteHandler {
     }
 
     fn has_local_proposer(&self, worker: &vos_raft::WorkerHandle<NodeId>) -> bool {
-        if worker.role() == vos_raft::Role::Leader {
+        self.has_local_proposer_diagnostic(worker, None)
+    }
+
+    fn has_local_proposer_diagnostic(
+        &self,
+        worker: &vos_raft::WorkerHandle<NodeId>,
+        diagnostics: Option<crate::agent::shared_host::SharedInvokeDiagnostics>,
+    ) -> bool {
+        let role = worker.role();
+        if let Some(diagnostics) = diagnostics {
+            let category = match role {
+                vos_raft::Role::Follower => "Follower",
+                vos_raft::Role::PreCandidate => "PreCandidate",
+                vos_raft::Role::Candidate => "Candidate",
+                vos_raft::Role::Leader => "Leader",
+            };
+            diagnostics.trace("local_proposer_role", category);
+        }
+        if role == vos_raft::Role::Leader {
             return true;
         }
         // A freshly reopened one-voter generation has no remote leader to
@@ -1623,6 +1641,31 @@ impl SharedRouteHandler {
             std::thread::sleep(Duration::from_millis(5));
         }
         true
+    }
+
+    fn invoke_diagnostics(
+        &self,
+        request: &crate::agent::shared_journal_driver::CleanInvocationReplayRequest,
+        ordinary: bool,
+    ) -> Option<crate::agent::shared_host::SharedInvokeDiagnostics> {
+        (ordinary && std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some()).then(|| {
+            let key = ManagementInvocationKey::new(request.work(), request.authorization());
+            let operation = match request {
+                crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Invoke { .. } => "invoke",
+                crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Resume { .. } => "resume",
+                crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Acknowledge { .. } => "acknowledge",
+            };
+            crate::agent::shared_host::SharedInvokeDiagnostics {
+                invocation: key.invocation.0,
+                node: self.network.agent_node_id().0,
+                agent: self.agent.0,
+                route_space: self.route.space.0,
+                route_group: self.route.generation.0,
+                work: key.work.0,
+                authorization: key.authorization.0,
+                operation,
+            }
+        })
     }
 
     /// Capture and durably record a pre-dispatch anchor while proposals and
@@ -2826,6 +2869,10 @@ impl SharedRouteHandler {
         reservation: Option<ReservedSubmission>,
         clock: InvocationClock<'_>,
     ) -> Result<CleanOrderedSubmission, SharedAgentHostError> {
+        let invoke_diagnostics = self.invoke_diagnostics(
+            &request,
+            matches!(clock, InvocationClock::Current) && reservation.is_none(),
+        );
         let diagnostic_node = self.network.agent_node_id();
         let diagnostic_invocation = request.work().invocation;
         let diagnostic_reserved_kind = match reservation {
@@ -2862,7 +2909,19 @@ impl SharedRouteHandler {
         .then(Instant::now);
         let management_diagnostic_key =
             started.map(|_| ManagementInvocationKey::new(request.work(), request.authorization()));
-        let trace = |phase: &str| {
+        let trace = |phase: &'static str| {
+            if let Some(diagnostics) = invoke_diagnostics {
+                match phase {
+                    "start" | "proposal_acquired" | "host_wait_start" | "host_acquired"
+                    | "host_drain_start" | "host_drained" | "prepare_start" | "prepare_complete"
+                    | "retained_availability_start" | "retained_availability_complete"
+                    | "propose_start" | "propose_complete" | "post_propose_host_wait_start"
+                    | "post_propose_host_acquired" | "post_propose_drain_start"
+                    | "post_propose_drained" | "wait_start" | "wait_complete"
+                    | "availability_start" | "availability_complete" => diagnostics.trace(phase, "reached"),
+                    _ => {},
+                }
+            }
             if let Some(started) = started {
                 tracing::debug!(node = ?diagnostic_node.0, agent = ?self.agent.0,
                     route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
@@ -2874,8 +2933,11 @@ impl SharedRouteHandler {
                     "management_custody_submit");
             }
         };
-        let refused = |phase: &str, error: SharedAgentHostError| {
+        let refused = |phase: &'static str, error: SharedAgentHostError| {
             trace(phase);
+            if let Some(diagnostics) = invoke_diagnostics {
+                diagnostics.refused(phase, &error);
+            }
             if started.is_some() {
                 tracing::debug!(node = ?diagnostic_node.0, agent = ?self.agent.0,
                     route_space = ?self.route.space.0, route_group = ?self.route.generation.0,
@@ -2905,6 +2967,9 @@ impl SharedRouteHandler {
             false
         };
         if proposal.checkpoint_gate.is_some() {
+            if let Some(diagnostics) = invoke_diagnostics {
+                diagnostics.refused("checkpoint_gate", &SharedAgentHostError::CapacityExhausted);
+            }
             return Err(SharedAgentHostError::CapacityExhausted);
         }
         match (&proposal.management_retirement, reservation) {
@@ -2917,7 +2982,12 @@ impl SharedRouteHandler {
             (_, Some(ReservedSubmission::ManagementResult(actual)))
                 if proposal.management_pending.as_ref().is_some_and(|pending| pending.iter().any(|(key, _)| *key == actual))
                     && matches!(&request, crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Acknowledge { .. }) => {},
-            _ => return Err(SharedAgentHostError::CapacityExhausted),
+            _ => {
+                if let Some(diagnostics) = invoke_diagnostics {
+                    diagnostics.refused("retirement_reservation", &SharedAgentHostError::CapacityExhausted);
+                }
+                return Err(SharedAgentHostError::CapacityExhausted);
+            },
         }
         if proposal.management_pending.is_some()
             && !pending_invoke
@@ -2930,13 +3000,21 @@ impl SharedRouteHandler {
                 )
             )
         {
+            if let Some(diagnostics) = invoke_diagnostics {
+                diagnostics.refused("pending_reservation", &SharedAgentHostError::CapacityExhausted);
+            }
             return Err(SharedAgentHostError::CapacityExhausted);
         }
         let worker = self
             .worker
             .as_ref()
-            .ok_or(SharedAgentHostError::TransportNotAttached)?;
-        if !self.has_local_proposer(worker) {
+            .ok_or_else(|| {
+                if let Some(diagnostics) = invoke_diagnostics {
+                    diagnostics.refused("worker_missing", &SharedAgentHostError::TransportNotAttached);
+                }
+                SharedAgentHostError::TransportNotAttached
+            })?;
+        if !self.has_local_proposer_diagnostic(worker, invoke_diagnostics) {
             if matches!(clock, InvocationClock::PersistedManagement(_))
                 || matches!(
                     reservation,
@@ -2948,6 +3026,9 @@ impl SharedRouteHandler {
             {
                 drop(proposal);
                 return self.forward_management_operation(request, clock);
+            }
+            if let Some(diagnostics) = invoke_diagnostics {
+                diagnostics.refused("no_local_proposer", &SharedAgentHostError::Unavailable);
             }
             return Err(SharedAgentHostError::Unavailable);
         }
@@ -3147,6 +3228,9 @@ impl SharedRouteHandler {
                 {
                     // Replicate the existing exclusion: another node must not
                     // consume the offline owner's reserved completion headroom.
+                    if let Some(diagnostics) = invoke_diagnostics {
+                        diagnostics.refused("pending_manifest_reservation", &SharedAgentHostError::CapacityExhausted);
+                    }
                     return Err(SharedAgentHostError::CapacityExhausted);
                 }
             }
@@ -3207,11 +3291,13 @@ impl SharedRouteHandler {
             #[cfg(feature = "experimental-state-blocks")]
             if matches!(clock, InvocationClock::Current)
                 && reservation.is_none()
-                && let Some(proof) = host.inspect_external_retained_reply(self.agent, &request)?
+                && let Some(proof) = host.inspect_external_retained_reply(self.agent, &request)
+                    .map_err(|error| refused("external_retained_lookup", error))?
             {
                 drop(host);
                 drop(proposal);
-                let outcome = self.require_retained_external_availability(&request, &proof)?;
+                let outcome = self.require_retained_external_availability(&request, &proof)
+                    .map_err(|error| refused("external_retained_availability", error))?;
                 return Ok(CleanOrderedSubmission {
                     input: None,
                     outcome,
@@ -3244,7 +3330,7 @@ impl SharedRouteHandler {
                 } else if let Some(manifest) = custody_manifest.as_ref() {
                     host.prepare_management_ack_with_manifest(self.agent, request, manifest)
                 } else {
-                    host.prepare_clean_ordered_operation(self.agent, request)
+                    host.prepare_clean_ordered_operation_diagnostic(self.agent, request, invoke_diagnostics)
                 }
             };
             let prepared = prepared_result
@@ -3284,10 +3370,20 @@ impl SharedRouteHandler {
             }
             self.ordered_replies
                 .register(input)
-                .map_err(|_| SharedAgentHostError::Conflict)?;
+                .map_err(|_| {
+                    if let Some(diagnostics) = invoke_diagnostics {
+                        diagnostics.refused("reply_registration", &SharedAgentHostError::Conflict);
+                    }
+                    SharedAgentHostError::Conflict
+                })?;
             let payload = prepared
                 .into_payload()
-                .ok_or(SharedAgentHostError::Conflict)?;
+                .ok_or_else(|| {
+                    if let Some(diagnostics) = invoke_diagnostics {
+                        diagnostics.refused("prepared_payload", &SharedAgentHostError::Conflict);
+                    }
+                    SharedAgentHostError::Conflict
+                })?;
             trace("propose_start");
             let proposed_index = match futures_executor::block_on(worker.propose(payload)) {
                 Ok(index) => index,
@@ -6947,6 +7043,19 @@ impl SharedAgentNetworkHost {
         terminal_only: bool,
         admission: SupervisorAdmission<'_>,
     ) -> Result<RuntimeOutcome, SharedAgentHostError> {
+        let diagnostics = attached.coordinator.invoke_diagnostics(
+            &request,
+            matches!(admission, SupervisorAdmission::Ordinary),
+        );
+        let refused = |stage: &'static str, error: SharedAgentHostError| {
+            if let Some(diagnostics) = diagnostics {
+                diagnostics.refused(stage, &error);
+            }
+            error
+        };
+        if let Some(diagnostics) = diagnostics {
+            diagnostics.trace("generation_enter", "reached");
+        }
         let work = request.work();
         if matches!(
             admission,
@@ -6958,12 +7067,12 @@ impl SharedAgentNetworkHost {
                 crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Acknowledge { .. }
             ))
         {
-            return Err(SharedAgentHostError::ScopeMismatch);
+            return Err(refused("execution_scope", SharedAgentHostError::ScopeMismatch));
         }
         let authorization = request.authorization();
         let agent = crate::service::AgentId(work.agent.0);
         if agent != attached.coordinator.agent {
-            return Err(SharedAgentHostError::ScopeMismatch);
+            return Err(refused("agent_binding", SharedAgentHostError::ScopeMismatch));
         }
         // Keep the same lifecycle -> host order as the network route handler.
         // `retire` releases its host guard before requesting the write lease.
@@ -6971,25 +7080,34 @@ impl SharedAgentNetworkHost {
             .coordinator
             .lifecycle
             .read()
-            .map_err(|_| SharedAgentHostError::Unavailable)?;
+            .map_err(|error| {
+                drop(error);
+                refused("lifecycle_lock", SharedAgentHostError::Unavailable)
+            })?;
         if !*live || attached.stale.load(Ordering::Acquire) {
-            return Err(SharedAgentHostError::TransportNotAttached);
+            return Err(refused("lifecycle_inactive", SharedAgentHostError::TransportNotAttached));
         }
         {
             let host = attached
                 .coordinator
                 .host
                 .lock()
-                .map_err(|_| SharedAgentHostError::Unavailable)?;
+                .map_err(|error| {
+                    drop(error);
+                    refused("generation_host_lock", SharedAgentHostError::Unavailable)
+                })?;
             let status = host
-                .supervisor_attachment_status(agent)?
-                .ok_or(SharedAgentHostError::AgentNotFound)?;
+                .supervisor_attachment_status(agent)
+                .map_err(|error| refused("attachment_status", error))?
+                .ok_or_else(|| refused("attachment_missing", SharedAgentHostError::AgentNotFound))?;
             if status.transport != SharedAgentTransportState::Attached
-                || AttachmentFingerprint::from_attachment_status(&status)? != *attached.fingerprint
+                || AttachmentFingerprint::from_attachment_status(&status)
+                    .map_err(|error| refused("attachment_fingerprint", error))? != *attached.fingerprint
             {
-                return Err(SharedAgentHostError::TransportNotAttached);
+                return Err(refused("attachment_scope", SharedAgentHostError::TransportNotAttached));
             }
-            let material = host.supervisor_invocation_material(agent, work.actor)?;
+            let material = host.supervisor_invocation_material(agent, work.actor)
+                .map_err(|error| refused("physical_material", error))?;
             if !crate::agent::supervisor_adapters::physical_material_authorizes_work(
                 &material,
                 expected,
@@ -6997,7 +7115,7 @@ impl SharedAgentNetworkHost {
                 work,
                 authorization,
             ) {
-                return Err(SharedAgentHostError::InvalidProvision);
+                return Err(refused("physical_authorization", SharedAgentHostError::InvalidProvision));
             }
             let projection = SharedAgentRuntimeProjection {
                 descriptor: material.descriptor,
@@ -7016,11 +7134,11 @@ impl SharedAgentNetworkHost {
                 || projection.actors[0].entry.deployment != expected.actor_deployment()
                 || projection.actors[0].entry.program != expected.actor_program()
             {
-                return Err(SharedAgentHostError::ScopeMismatch);
+                return Err(refused("projection_binding", SharedAgentHostError::ScopeMismatch));
             }
         }
         if attached.stale.load(Ordering::Acquire) {
-            return Err(SharedAgentHostError::TransportNotAttached);
+            return Err(refused("attachment_stale", SharedAgentHostError::TransportNotAttached));
         }
         let scope = work.mode.invocation_scope();
         let _nonordered_admission =
@@ -7029,15 +7147,18 @@ impl SharedAgentNetworkHost {
                     .coordinator
                     .proposal
                     .lock()
-                    .map_err(|_| SharedAgentHostError::Unavailable)?;
+                    .map_err(|error| {
+                        drop(error);
+                        refused("nonordered_proposal_lock", SharedAgentHostError::Unavailable)
+                    })?;
                 if proposal.is_reserved() {
-                    return Err(SharedAgentHostError::CapacityExhausted);
+                    return Err(refused("nonordered_reservation", SharedAgentHostError::CapacityExhausted));
                 }
                 Some(proposal)
             } else {
                 None
             };
-        match scope {
+        let result = match scope {
             InvocationScope::Ordered
                 if matches!(admission, SupervisorAdmission::ReservedManagementResult) =>
             {
@@ -7094,15 +7215,28 @@ impl SharedAgentNetworkHost {
                 .coordinator
                 .host
                 .lock()
-                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .map_err(|error| {
+                    drop(error);
+                    refused("merge_host_lock", SharedAgentHostError::Unavailable)
+                })?
                 .apply_clean_merge_operation(agent, request),
             InvocationScope::Local => attached
                 .coordinator
                 .host
                 .lock()
-                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .map_err(|error| {
+                    drop(error);
+                    refused("local_host_lock", SharedAgentHostError::Unavailable)
+                })?
                 .apply_clean_local_operation(agent, request),
+        };
+        if let Some(diagnostics) = diagnostics {
+            match &result {
+                Ok(outcome) => diagnostics.outcome(outcome),
+                Err(error) => diagnostics.refused("generation_return_error", error),
+            }
         }
+        result
     }
 
     /// Internal root bootstrap only; ordinary routed calls retain their exact

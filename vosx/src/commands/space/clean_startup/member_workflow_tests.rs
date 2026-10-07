@@ -349,6 +349,13 @@ pub(super) fn exercise(
         request.authorization(),
         vos::agent::sdk::InvocationAuthorization::AuthorityReceipt(_)
     ));
+    if !leader_loss && std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+        tracing::debug!(target: "vosx::invoke_diagnostic", stage = "fixture_request",
+            category = "clerk_bootstrap", request = ?request.commitment().0,
+            invocation = ?request.work().invocation.0, work = ?request.work().commitment().0,
+            authorization = ?request.authorization().commitment().0,
+            actor = ?request.work().actor.0, "invoke_diagnostic");
+    }
     let first_response = if leader_loss {
         exercise_leader_loss(
             nodes,

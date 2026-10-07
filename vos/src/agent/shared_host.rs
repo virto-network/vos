@@ -193,6 +193,101 @@ pub enum SharedAgentHostError {
     PortableBackupInvalid,
 }
 
+/// Private opt-in observation of one exact ordinary routed request. These
+/// commitments identify work, not an attempt, admission proof or completion.
+#[derive(Clone, Copy)]
+pub(crate) struct SharedInvokeDiagnostics {
+    pub(crate) invocation: [u8; 32],
+    pub(crate) node: [u8; 32],
+    pub(crate) agent: [u8; 32],
+    pub(crate) route_space: [u8; 32],
+    pub(crate) route_group: [u8; 32],
+    pub(crate) work: [u8; 32],
+    pub(crate) authorization: [u8; 32],
+    pub(crate) operation: &'static str,
+}
+
+impl SharedInvokeDiagnostics {
+    pub(crate) fn trace(&self, stage: &'static str, category: &'static str) {
+        tracing::debug!(target: "vos::invoke_diagnostic",
+            invocation = ?self.invocation, node = ?self.node, agent = ?self.agent,
+            route_space = ?self.route_space, route_group = ?self.route_group,
+            work = ?self.work, authorization = ?self.authorization,
+            operation = self.operation, stage, category, "invoke_diagnostic");
+    }
+
+    pub(crate) fn refused(&self, stage: &'static str, error: &SharedAgentHostError) {
+        let category = match error {
+            SharedAgentHostError::Unavailable => "Unavailable",
+            SharedAgentHostError::DirectoryInUse => "DirectoryInUse",
+            SharedAgentHostError::InvalidScope => "InvalidScope",
+            SharedAgentHostError::ScopeMismatch => "ScopeMismatch",
+            SharedAgentHostError::InvalidProvision => "InvalidProvision",
+            SharedAgentHostError::InvalidCatalog => "InvalidCatalog",
+            SharedAgentHostError::Conflict => "Conflict",
+            SharedAgentHostError::CorruptResidue => "CorruptResidue",
+            SharedAgentHostError::AgentNotFound => "AgentNotFound",
+            SharedAgentHostError::CapacityExhausted => "CapacityExhausted",
+            SharedAgentHostError::TransportNotAttached => "TransportNotAttached",
+            SharedAgentHostError::SnapshotBoundaryRequired => "SnapshotBoundaryRequired",
+            SharedAgentHostError::SnapshotCertificateInvalid => "SnapshotCertificateInvalid",
+            SharedAgentHostError::SnapshotStale => "SnapshotStale",
+            SharedAgentHostError::SnapshotReplay => "SnapshotReplay",
+            SharedAgentHostError::SnapshotEvidenceLimit => "SnapshotEvidenceLimit",
+            SharedAgentHostError::PortableBackupUnsupported => "PortableBackupUnsupported",
+            SharedAgentHostError::PortableBackupInvalid => "PortableBackupInvalid",
+            SharedAgentHostError::Finality(error) => match error {
+                AgentGenesisFinalityError::Unavailable => "FinalityUnavailable",
+                AgentGenesisFinalityError::NotFinalized => "FinalityNotFinalized",
+                AgentGenesisFinalityError::WrongSystemAgent => "FinalityWrongSystemAgent",
+                AgentGenesisFinalityError::Conflict => "FinalityConflict",
+                AgentGenesisFinalityError::Corrupt => "FinalityCorrupt",
+            },
+        };
+        self.trace(stage, category);
+    }
+
+    pub(crate) fn outcome(&self, outcome: &crate::agent_sdk::RuntimeOutcome) {
+        use crate::agent_sdk::{InvocationError, RuntimeOutcome};
+        let category = match outcome {
+            RuntimeOutcome::Completed(Ok(_)) => "completed_ok",
+            RuntimeOutcome::Completed(Err(_)) => "completed_error",
+            RuntimeOutcome::Acknowledged(Ok(_)) => "acknowledged_ok",
+            RuntimeOutcome::Acknowledged(Err(_)) => "acknowledged_error",
+            RuntimeOutcome::Yielded(_) => "yielded",
+            RuntimeOutcome::Management(Ok(_)) => "management_ok",
+            RuntimeOutcome::Management(Err(_)) => "management_error",
+        };
+        self.trace("returned_outcome", category);
+        if let RuntimeOutcome::Completed(Err(error)) | RuntimeOutcome::Acknowledged(Err(error)) = outcome {
+            let category = match error {
+                InvocationError::NotCreated => "NotCreated",
+                InvocationError::NotFound => "NotFound",
+                InvocationError::StaleIncarnation => "StaleIncarnation",
+                InvocationError::Suspended => "Suspended",
+                InvocationError::StaleDeployment => "StaleDeployment",
+                InvocationError::WrongProgram => "WrongProgram",
+                InvocationError::UnsupportedMethod => "UnsupportedMethod",
+                InvocationError::UnsupportedResultStorage => "UnsupportedResultStorage",
+                InvocationError::MissingState => "MissingState",
+                InvocationError::InvalidAvailability => "InvalidAvailability",
+                InvocationError::InvalidInput => "InvalidInput",
+                InvocationError::InvalidActorOutput => "InvalidActorOutput",
+                InvocationError::DivergentInvocation => "DivergentInvocation",
+                InvocationError::ResultCapacity => "ResultCapacity",
+                InvocationError::InvalidAuthorization => "InvalidAuthorization",
+                InvocationError::AuthorityExpired => "AuthorityExpired",
+                InvocationError::AuthoritySlotRegressed => "AuthoritySlotRegressed",
+                InvocationError::UnsupportedHostCall(_) => "UnsupportedHostCall",
+                InvocationError::StaleContinuation => "StaleContinuation",
+                InvocationError::NotReady => "NotReady",
+                InvocationError::ExpiredBeforeExecution => "ExpiredBeforeExecution",
+            };
+            self.trace("returned_invocation_error", category);
+        }
+    }
+}
+
 pub(crate) enum SharedAuthorityProjectionAudit {
     Ready(Vec<super::supervisor::AgentRouteIdentity>),
     Lag,
@@ -3894,12 +3989,38 @@ impl SharedAgentHost {
         agent: AgentId,
         request: super::shared_journal_driver::CleanInvocationReplayRequest,
     ) -> Result<super::shared_journal_driver::PreparedCleanOrdered, SharedAgentHostError> {
+        self.prepare_clean_ordered_operation_diagnostic(agent, request, None)
+    }
+
+    pub(crate) fn prepare_clean_ordered_operation_diagnostic(
+        &self,
+        agent: AgentId,
+        request: super::shared_journal_driver::CleanInvocationReplayRequest,
+        diagnostics: Option<SharedInvokeDiagnostics>,
+    ) -> Result<super::shared_journal_driver::PreparedCleanOrdered, SharedAgentHostError> {
         self.agents
             .get(&agent)
             .ok_or(SharedAgentHostError::AgentNotFound)?
             .driver
             .prepare_clean_ordered_operation(request)
-            .map_err(map_driver_error)
+            .map_err(|error| {
+                if let Some(diagnostics) = diagnostics {
+                    let category = match &error {
+                        SharedJournalDriverError::Store(_) => "store",
+                        SharedJournalDriverError::Replay(_) => "replay",
+                        SharedJournalDriverError::Ledger(_) => "ledger",
+                        SharedJournalDriverError::Artifact(_) => "artifact",
+                        SharedJournalDriverError::WrongReplica => "wrong_replica",
+                        SharedJournalDriverError::InvalidProfile => "invalid_profile",
+                        SharedJournalDriverError::InvalidArtifactBatch => "invalid_artifact_batch",
+                        SharedJournalDriverError::CrossStoreMismatch => "cross_store_mismatch",
+                        SharedJournalDriverError::Snapshot(_) => "snapshot",
+                        SharedJournalDriverError::Executor(_) => "executor",
+                    };
+                    diagnostics.trace("preparation_driver_error", category);
+                }
+                map_driver_error(error)
+            })
     }
 
     pub(crate) fn prepare_management_ack_with_manifest(
