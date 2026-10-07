@@ -60,16 +60,32 @@ pub(super) fn exercise(
             .as_ref()
             .expect("initial public workflow completed its loss seam");
         let address = listen(&mut nodes[0], "public-clerk-reopened");
+        let recovery_started =
+            owner_recovery_started.expect("reopen timer starts before locked constructors");
+        let application_address = if leader_loss {
+            None
+        } else {
+            let deadline = recovery_started + Duration::from_secs(30);
+            let leader = shared_leader(networks, enrollments, record, &[0, 1, 2], deadline);
+            let application_address = if leader == 0 {
+                address
+            } else {
+                listen(&mut nodes[leader], "public-clerk-reopened-application-leader")
+            };
+            assert!(std::time::Instant::now() <= deadline);
+            Some(application_address)
+        };
         resume_after_reopen(
             nodes,
             &data[0],
             address,
+            application_address,
             operator,
             space,
             node_public,
             agent,
             previous,
-            owner_recovery_started.expect("reopen timer starts before locked constructors"),
+            recovery_started,
         );
         return;
     }
@@ -374,9 +390,20 @@ pub(super) fn exercise(
             &invocation_request,
         )
     } else {
-        super::member_handoff::retry_exact("public Clerk bootstrap", || {
+        // Nonleader Install and Authority issuance stay on the original owner.
+        // Ordinary ordered actor delivery uses this exact Shared generation's
+        // real leader; discovery is part of the same bootstrap phase bound.
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        let leader = shared_leader(networks, enrollments, record, &[0, 1, 2], deadline);
+        let application_address = if leader == 0 {
+            address
+        } else {
+            listen(&mut nodes[leader], "public-clerk-application-leader")
+        };
+        assert!(std::time::Instant::now() <= deadline);
+        super::member_handoff::retry_exact_until("public Clerk bootstrap", deadline, || {
             commands::local_create::post_binary(
-                address,
+                application_address,
                 "/__agents/invoke",
                 200,
                 &invocation_request,
@@ -1050,6 +1077,7 @@ fn resume_after_reopen(
     nodes: &[VosNode],
     data: &Path,
     address: SocketAddr,
+    application_address: Option<SocketAddr>,
     operator: &Keypair,
     space: SpaceId,
     node_public: [u8; 32],
@@ -1095,7 +1123,7 @@ fn resume_after_reopen(
         deadline,
         || {
             commands::local_create::post_binary(
-                address,
+                application_address.unwrap_or(address),
                 "/__agents/invoke",
                 200,
                 &previous.invocation_request,
@@ -1110,18 +1138,31 @@ fn resume_after_reopen(
         vos::value::Value::Bytes(vec![0]),
     );
     assert!(std::time::Instant::now() < deadline);
-    commands::local_invocation::submit(&previous.application_root, None, address).unwrap();
-    assert!(std::time::Instant::now() <= deadline);
-    let (authorization_root, _) = commands::local_operation::authorize_with_application(
-        data,
-        address,
-        operator,
-        space,
-        node_public,
-        None,
-        true,
-    )
-    .expect("real CLI exact bootstrap application and ACK resume");
+    let (authorization_root, _) = if let Some(application_address) = application_address {
+        complete_application_at(
+            data,
+            address,
+            application_address,
+            operator,
+            space,
+            node_public,
+            &previous.authorization_root,
+            Some(deadline),
+        )
+    } else {
+        commands::local_invocation::submit(&previous.application_root, None, address).unwrap();
+        assert!(std::time::Instant::now() <= deadline);
+        commands::local_operation::authorize_with_application(
+            data,
+            address,
+            operator,
+            space,
+            node_public,
+            None,
+            true,
+        )
+        .expect("real CLI exact bootstrap application and ACK resume")
+    };
     assert!(std::time::Instant::now() <= deadline);
     assert_eq!(authorization_root, previous.authorization_root);
     let mut application =
@@ -1176,16 +1217,38 @@ fn resume_after_reopen(
         InvocationRoleClaims::none(),
         0xe2,
     );
-    let (root, _) = commands::local_operation::authorize_with_application(
-        data,
-        address,
-        operator,
-        space,
-        node_public,
-        Some(&query),
-        true,
-    )
-    .expect("real public Clerk state query after all-owner reopen");
+    let (root, _) = if let Some(application_address) = application_address {
+        let (root, _) = commands::local_operation::authorize(
+            data,
+            address,
+            operator,
+            space,
+            node_public,
+            Some(&query),
+        )
+        .expect("real public Clerk state query authorization after all-owner reopen");
+        complete_application_at(
+            data,
+            address,
+            application_address,
+            operator,
+            space,
+            node_public,
+            &root,
+            None,
+        )
+    } else {
+        commands::local_operation::authorize_with_application(
+            data,
+            address,
+            operator,
+            space,
+            node_public,
+            Some(&query),
+            true,
+        )
+        .expect("real public Clerk state query after all-owner reopen")
+    };
     let mut application = commands::clean_store::CleanInvocationFile::open_or_create(
         root.parent().unwrap().join("application"),
     )
@@ -1199,4 +1262,65 @@ fn resume_after_reopen(
         "public_clerk_workflow phase=persisted_journal_read scope=locked_owner_reopen recovery_ms={recovery_ms} probe_inclusive_ms={}",
         started.elapsed().as_millis()
     );
+}
+
+/// Deliver the exact retained application to its Shared leader while keeping
+/// authorization and credential completion on the original issuer endpoint.
+#[allow(clippy::too_many_arguments)]
+fn complete_application_at(
+    data: &Path,
+    issuer_address: SocketAddr,
+    application_address: SocketAddr,
+    operator: &Keypair,
+    space: SpaceId,
+    node_public: [u8; 32],
+    authorization_root: &Path,
+    deadline: Option<std::time::Instant>,
+) -> (PathBuf, Vec<u8>) {
+    let identity = commands::clean_identity::CleanOperatorIdentitySigner::new(operator).unwrap();
+    let mut reservation = commands::clean_store::CleanCredentialReservation::open_or_create(
+        &data.join("agent-client/credentials"),
+        space,
+        identity.credential(),
+    )
+    .unwrap();
+    let application_root = authorization_root.parent().unwrap().join("application");
+    let mut application =
+        commands::clean_store::CleanInvocationFile::open_or_create(&application_root).unwrap();
+    let bytes = application.load_request().unwrap().unwrap();
+    let request = commands::local_invocation::validate_request(&bytes).unwrap();
+    assert!(matches!(
+        reservation.current().unwrap(),
+        Some((nonce, commands::clean_store::CredentialReservationStatus::Pending))
+            if nonce.0 == request.work().invocation.0
+    ));
+    drop(application);
+    if let Some(deadline) = deadline {
+        assert!(std::time::Instant::now() < deadline);
+    }
+    commands::local_invocation::submit(&application_root, None, application_address).unwrap();
+    if let Some(deadline) = deadline {
+        assert!(std::time::Instant::now() <= deadline);
+    }
+    commands::invocation_progress::continue_retained(&application_root, application_address)
+        .unwrap();
+    if let Some(deadline) = deadline {
+        assert!(std::time::Instant::now() <= deadline);
+    }
+    // The original composite reacquires this lease and verifies the cached
+    // exact decision, response and positive retirement before completion.
+    // Its application submit/progress perform no HTTP after the steps above.
+    drop(reservation);
+    let completed = commands::local_operation::authorize_with_application(
+        data,
+        issuer_address,
+        operator,
+        space,
+        node_public,
+        None,
+        true,
+    )
+    .expect("real CLI exact application and ACK completion on original issuer");
+    assert!(completed.0.as_path() == authorization_root);
+    completed
 }
