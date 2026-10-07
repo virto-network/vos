@@ -8942,9 +8942,10 @@ where
             let work = self.prepare_authority_observation_work(&query)?;
             let observation_request = query.commitment();
             if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
-                tracing::debug!(node = ?self.pins.node.0, agent = ?self.pins.agent.0,
-                    request = ?observation_request.0, observation = ?work.invocation.0,
-                    work = ?work.commitment().0, kind = "projection", "VOS causal observation");
+                tracing::debug!(target: "vos::agent::local_lifecycle", node = ?self.pins.node.0,
+                                    request = ?observation_request.0, observation = ?work.invocation.0,
+                                    phase = "start", category = "projection",
+                    work = ?work.commitment().0, "authority_observation");
             }
             let outcome = self._network_host.with_authority_observation(
                 crate::service::AgentId(self.pins.agent.0),
@@ -8956,21 +8957,34 @@ where
                     if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
                         match &result {
                             Ok(super::sdk::RuntimeOutcome::Completed(Ok(reply))) => {
-                                tracing::debug!(status = ?reply.status, reply_bytes = reply.reply.len(),
-                                    "Authority observation guest completed");
+                                tracing::debug!(target: "vos::agent::local_lifecycle", node = ?self.pins.node.0,
+                                    request = ?observation_request.0, observation = ?work.invocation.0,
+                                    phase = "guest", category = "completed",
+                                    reply_done = reply.status == super::sdk::InvocationStatus::Done,
+                                    reply_bytes = reply.reply.len(), "authority_observation");
                             }
-                            Ok(super::sdk::RuntimeOutcome::Completed(Err(error))) => {
-                                tracing::debug!(?error, "Authority observation guest refused");
+                            Ok(super::sdk::RuntimeOutcome::Completed(Err(_))) => {
+                                tracing::debug!(target: "vos::agent::local_lifecycle", node = ?self.pins.node.0,
+                                    request = ?observation_request.0, observation = ?work.invocation.0,
+                                    phase = "guest", category = "refused", "authority_observation");
                             }
-                            Ok(_) => tracing::debug!("Authority observation guest non-completed outcome"),
-                            Err(error) => tracing::debug!(?error, "Authority observation host refused"),
+                            Ok(_) => tracing::debug!(target: "vos::agent::local_lifecycle", node = ?self.pins.node.0,
+                                    request = ?observation_request.0, observation = ?work.invocation.0,
+                                    phase = "guest", category = "non_completed", "authority_observation"),
+                            Err(error) => tracing::debug!(target: "vos::agent::local_lifecycle", node = ?self.pins.node.0,
+                                    request = ?observation_request.0, observation = ?work.invocation.0,
+                                    phase = "guest", category = "host_error",
+                                error_code = error.diagnostic_category(), "authority_observation"),
                         }
                     }
                     result
                 },
             ).map_err(|error| {
                 if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
-                    tracing::debug!(?error, "Authority observation freshness or callback refused");
+                    tracing::debug!(target: "vos::agent::local_lifecycle", node = ?self.pins.node.0,
+                                    request = ?observation_request.0, observation = ?work.invocation.0,
+                                    phase = "delivery", category = "freshness_or_callback_error",
+                        error_code = error.diagnostic_category(), "authority_observation");
                 }
                 error
             })?;

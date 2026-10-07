@@ -8,6 +8,20 @@ use crate::agent::clean_management_intent::{
 #[cfg(feature = "experimental-state-blocks")]
 use alloc::boxed::Box;
 
+/// Payload-free opt-in reporting of an existing Shared startup refusal.
+fn trace_shared_recovery_refusal(
+    node: super::super::sdk::NodeId,
+    stage: &'static str,
+    error: SharedAgentHostError,
+) -> SharedAgentHostError {
+    if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+        tracing::debug!(target: "vos::agent::local_lifecycle", node = ?node.0,
+            thread = ?std::thread::current().id(), stage,
+            error_code = error.diagnostic_category(), "shared_recovery_refusal");
+    }
+    error
+}
+
 /// The only pre-archive retained phase is the original Create authorization.
 /// Publication (and its optional finalization successor) requires the selected
 /// archive even when no ordinary generation has yet been physically opened.
@@ -1475,19 +1489,19 @@ where
         S: CleanManagementReceiptSigner,
     {
         if self.recovered {
-            return Err(SharedAgentHostError::Conflict);
+            return Err(trace_shared_recovery_refusal(owner.pins.node, "controller_guard", SharedAgentHostError::Conflict));
         }
         if owner.authority_target() != self.authority {
-            return Err(SharedAgentHostError::ScopeMismatch);
+            return Err(trace_shared_recovery_refusal(owner.pins.node, "scope_guard", SharedAgentHostError::ScopeMismatch));
         }
         if !self.member_archives.is_empty()
             && signer.public_key() != self.authority.binding.public_key
         {
             // Refuse before recovering any read WAL or issuing retained work.
-            return Err(SharedAgentHostError::ScopeMismatch);
+            return Err(trace_shared_recovery_refusal(owner.pins.node, "scope_guard", SharedAgentHostError::ScopeMismatch));
         }
         if self.entries.is_empty() && self.member_archives.is_empty() {
-            owner.verify_empty_shared_genesis_startup()?;
+            owner.verify_empty_shared_genesis_startup().map_err(|error| trace_shared_recovery_refusal(owner.pins.node, "empty_namespace", error))?;
             self.recovered = true;
             return Ok(());
         }
@@ -1538,7 +1552,8 @@ where
                 return Some(Err(SharedAgentHostError::ScopeMismatch));
             }
             Some(Ok(record))
-        }).collect::<Result<Vec<_>, _>>()?;
+        }).collect::<Result<Vec<_>, _>>()
+            .map_err(|error| trace_shared_recovery_refusal(owner.pins.node, "member_archives", error))?;
         let records = self
             .entries
             .iter_mut()
@@ -1577,12 +1592,13 @@ where
                 }
                 Ok(Some(record))
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| trace_shared_recovery_refusal(owner.pins.node, "issuer_archives", error))?;
         #[cfg(feature = "experimental-state-blocks")]
         {
             let mut cold_records = records.iter().flatten().collect::<Vec<_>>();
             cold_records.extend(member_records.iter());
-            owner.validate_recovery_member_set(&cold_records)?;
+            owner.validate_recovery_member_set(&cold_records).map_err(|error| trace_shared_recovery_refusal(owner.pins.node, "member_set", error))?;
         }
         // Replay retained mutation work using its immutable preflight.
         // Non-retaining observations do not advance the guest's logical clock.
@@ -1594,17 +1610,18 @@ where
             if let Some(slot) = recovery.management_intent.as_mut() {
                 if slot
                     .denial_complete()
-                    .map_err(|_| SharedAgentHostError::Unavailable)?
+                    .map_err(|_| trace_shared_recovery_refusal(owner.pins.node, "retained_store", SharedAgentHostError::Unavailable))?
                 {
                     let issuer = recovery
                         .management_issuer
                         .as_ref()
-                        .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                        .ok_or(SharedAgentHostError::ScopeMismatch)
+                    .map_err(|error| trace_shared_recovery_refusal(owner.pins.node, "retained_binding", error))?;
                     // A durable CND1 omits runtime admission, not the exact
                     // owner's quorum-release obligation. Retry its verified
                     // terminal before fresh genesis reads or the later skip.
-                    if !owner.finish_denied_shared_install(slot, issuer, signer)? {
-                        return Err(SharedAgentHostError::ScopeMismatch);
+                    if !owner.finish_denied_shared_install(slot, issuer, signer).map_err(|error| trace_shared_recovery_refusal(owner.pins.node, "install_denial", error))? {
+                        return Err(trace_shared_recovery_refusal(owner.pins.node, "install_denial", SharedAgentHostError::ScopeMismatch));
                     }
                     recovery.management_pending.clear();
                     recovery.management_retirements.clear();
@@ -1618,12 +1635,15 @@ where
             let slot = recovery
                 .management_intent
                 .as_mut()
-                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                .ok_or(SharedAgentHostError::ScopeMismatch)
+                    .map_err(|error| trace_shared_recovery_refusal(owner.pins.node, "retained_binding", error))?;
             let issuer = recovery
                 .management_issuer
                 .as_mut()
-                .ok_or(SharedAgentHostError::ScopeMismatch)?;
-            let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
+                .ok_or(SharedAgentHostError::ScopeMismatch)
+                    .map_err(|error| trace_shared_recovery_refusal(owner.pins.node, "retained_binding", error))?;
+            let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)
+                    .map_err(|error| trace_shared_recovery_refusal(owner.pins.node, "retained_binding", error))?;
             let managed = intent.call().managed;
             let observed = issuer
                 .recover_observed_terminal(
@@ -1633,16 +1653,16 @@ where
                     intent.call(),
                     &RawCredentialVerifier,
                 )
-                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                .map_err(|_| trace_shared_recovery_refusal(owner.pins.node, "retained_terminal", SharedAgentHostError::ScopeMismatch))?;
             if recovery.management_pending.len() == 1 {
                 if observed.is_none() {
                     if let Err(error) = owner
                         .issue_management_intent_with_admission(slot, managed, issuer, signer, true)
                     {
                         if error != SharedAgentHostError::ScopeMismatch
-                            || !owner.finish_denied_shared_install(slot, issuer, signer)?
+                            || !owner.finish_denied_shared_install(slot, issuer, signer).map_err(|error| trace_shared_recovery_refusal(owner.pins.node, "install_denial", error))?
                         {
-                            return Err(error);
+                            return Err(trace_shared_recovery_refusal(owner.pins.node, "retained_replay", error));
                         }
                         recovery.management_pending.clear();
                     }
@@ -1651,32 +1671,34 @@ where
                 // verification and physical application prove a signed outcome.
                 continue;
             }
-            let (_, terminal) = observed.ok_or(SharedAgentHostError::ScopeMismatch)?;
+            let (_, terminal) = observed.ok_or(SharedAgentHostError::ScopeMismatch)
+                    .map_err(|error| trace_shared_recovery_refusal(owner.pins.node, "retained_binding", error))?;
             match terminal {
                 SignedManagementTerminal::Applied(ack) => {
                     owner.finalize_management_intent_with_admission(
                         slot, managed, &ack, issuer, true,
-                    )?;
-                    owner.finish_live_management_intent(slot, managed, &ack, issuer)?
+                    ).map_err(|error| trace_shared_recovery_refusal(owner.pins.node, "install_finalization", error))?;
+                    owner.finish_live_management_intent(slot, managed, &ack, issuer).map_err(|error| trace_shared_recovery_refusal(owner.pins.node, "install_release", error))?
                 }
                 SignedManagementTerminal::Rejected(failure) => {
                     owner.finalize_failed_install_with_admission(
                         slot, managed, &failure, issuer, true,
-                    )?;
-                    owner.finish_live_failed_install(slot, managed, &failure, issuer)?
+                    ).map_err(|error| trace_shared_recovery_refusal(owner.pins.node, "failed_install_finalization", error))?;
+                    owner.finish_live_failed_install(slot, managed, &failure, issuer).map_err(|error| trace_shared_recovery_refusal(owner.pins.node, "failed_install_release", error))?
                 }
             }
             recovery.management_pending.clear();
             recovery.management_retirements.clear();
         }
         for ((recovery, _), record) in self.entries.iter_mut().zip(&records) {
-            if record.is_none() && owner.finish_denied_shared_genesis(recovery, signer)? {
+            if record.is_none() && owner.finish_denied_shared_genesis(recovery, signer).map_err(|error| trace_shared_recovery_refusal(owner.pins.node, "create_denial", error))? {
                 continue;
             }
             if record.is_none() && !recovery.pending.is_empty() {
                 let replicas = recovery
-                    .retained_replicas()?
-                    .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                    .retained_replicas().map_err(|error| trace_shared_recovery_refusal(owner.pins.node, "retained_replicas", error))?
+                    .ok_or(SharedAgentHostError::ScopeMismatch)
+                    .map_err(|error| trace_shared_recovery_refusal(owner.pins.node, "retained_binding", error))?;
                 // Saved receipts and committee replies are not execution
                 // authority. Replay their original journal intervals before
                 // accepting the retained pre-publication phase. Do not endorse
@@ -1685,8 +1707,8 @@ where
                 if let Err(error) =
                     owner.resume_shared_genesis_preparation(recovery, &replicas, signer)
                 {
-                    if !owner.finish_denied_shared_genesis(recovery, signer)? {
-                        return Err(error);
+                    if !owner.finish_denied_shared_genesis(recovery, signer).map_err(|error| trace_shared_recovery_refusal(owner.pins.node, "create_denial", error))? {
+                        return Err(trace_shared_recovery_refusal(owner.pins.node, "retained_replay", error));
                     }
                 }
             }
@@ -1735,21 +1757,21 @@ where
                     }
                     Ok(())
                 },
-            )?;
+            ).map_err(|error| trace_shared_recovery_refusal(owner.pins.node, "deferred_generations", error))?;
             self.generations_recovered = true;
         }
         drop(entries);
         // Every voter must attach its independently verified generations before
         // an original owner can recover an Install through their Raft quorum.
         // Keep completed physical recovery across a fallible attachment retry.
-        owner._network_host.refresh()?;
+        owner._network_host.refresh().map_err(|error| trace_shared_recovery_refusal(owner.pins.node, "network_attachment", error))?;
         for (entry, _) in &mut self.entries {
             let Some(slot) = entry.management_intent.as_mut() else {
                 continue;
             };
             if let Some(record) = slot
                 .load_shared_install_handoff()
-                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .map_err(|_| trace_shared_recovery_refusal(owner.pins.node, "retained_store", SharedAgentHostError::Unavailable))?
             {
                 verify_shared_handoff_generation(
                     owner,
@@ -1757,8 +1779,9 @@ where
                     entry
                         .management_issuer
                         .as_ref()
-                        .ok_or(SharedAgentHostError::ScopeMismatch)?,
-                )?;
+                        .ok_or(SharedAgentHostError::ScopeMismatch)
+                    .map_err(|error| trace_shared_recovery_refusal(owner.pins.node, "retained_binding", error))?,
+                ).map_err(|error| trace_shared_recovery_refusal(owner.pins.node, "install_handoff_generation", error))?;
             }
         }
         let mut installs = Vec::new();
@@ -1768,17 +1791,18 @@ where
             };
             if slot
                 .denial_complete()
-                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .map_err(|_| trace_shared_recovery_refusal(owner.pins.node, "retained_store", SharedAgentHostError::Unavailable))?
             {
                 continue;
             }
             let Some(anchor) = slot
                 .authorization_anchor()
-                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .map_err(|_| trace_shared_recovery_refusal(owner.pins.node, "retained_store", SharedAgentHostError::Unavailable))?
             else {
                 continue;
             };
-            let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
+            let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)
+                    .map_err(|error| trace_shared_recovery_refusal(owner.pins.node, "retained_binding", error))?;
             installs.push((
                 anchor.ordered.index,
                 intent.call().request_sequence.get(),
@@ -1788,10 +1812,10 @@ where
         }
         installs.sort_unstable();
         for (_, _, _, index) in installs {
-            Self::complete_retained_install(owner, &mut self.entries[index].0, signer)?;
+            Self::complete_retained_install(owner, &mut self.entries[index].0, signer).map_err(|error| trace_shared_recovery_refusal(owner.pins.node, "retained_install", error))?;
         }
         #[cfg(feature = "experimental-state-blocks")]
-        self.refresh_member_projection_scope(owner)?;
+        self.refresh_member_projection_scope(owner).map_err(|error| trace_shared_recovery_refusal(owner.pins.node, "member_projection", error))?;
         owner.shared_lifecycle_recovery_pending = false;
         self.recovered = true;
         Ok(())
