@@ -471,7 +471,7 @@ impl SharedAgentNetworkHost {
                 .cached_snapshot()
                 .ok_or_else(|| refused("snapshot", SharedAgentHostError::Unavailable))?;
             observation_term_matches(&current, &attached.fingerprint, local, barrier)
-                .map_err(|error| refused("term_config", error))?;
+                .map_err(|error| refused("post_term_config", error))?;
             host.validate_observation_owner(agent)
                 .map_err(|error| refused("owner", error))?;
             if attached.stale.load(Ordering::Acquire) {
