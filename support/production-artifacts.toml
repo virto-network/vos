@@ -12,7 +12,7 @@ host_toolchain = "nightly-2025-05-09"
 
 # Public, non-authoritative signed templates. Space creation re-signs these
 # packages with its actual root; this signer is never an operator credential.
-system_templates_source_revision = "b5aca82d18962511558e3660f2da90f39f6e61d0"
+system_templates_source_revision = "aaef12b803e65d8e9c0424d6d6a9753abc373b4e"
 system_templates_builder_revision = "c377d5082f051f70ed7acfd818e017eb4004ec1d"
 system_templates_public_signing_seed_hex = "5454545454545454545454545454545454545454545454545454545454545454"
 system_authority_package_blake2b_256 = "ace7b8d24be6b9ac7ccc0a1a26a65bb5da440a244514390b8503c2b87762d97d"
@@ -21,8 +21,8 @@ system_catalog_package_blake2b_256 = "5b91c5054c8316f947e13634cbab1e3e395c31236a
 # Separate signed roles reproduced twice from this immutable source. These
 # pins make packaged integration possible; startup/recovery/capacity acceptance
 # is tracked in the one live checklist, not implied by artifact reproduction.
-runtime_roles_source_revision = "b5aca82d18962511558e3660f2da90f39f6e61d0"
-runtime_roles_materializer_revision = "b5aca82d18962511558e3660f2da90f39f6e61d0"
+runtime_roles_source_revision = "aaef12b803e65d8e9c0424d6d6a9753abc373b4e"
+runtime_roles_materializer_revision = "aaef12b803e65d8e9c0424d6d6a9753abc373b4e"
 system_image_runtime_package_blake2b_256 = "de580cfb3c7e2ba39339d90a62dcf517171b5ef12a3219d618dfac64a83395d5"
 system_image_runtime_program_id = "fd8be42c48f464d9d2bae1e5bd0d6664a2e50a48088c65ca60d9e9e8563028c2"
 system_image_runtime_elf_blake2b_256 = "dc25890fd2979bfb534defd069522ef22f5b1e8808761f907c20cde66eb1c6ea"
