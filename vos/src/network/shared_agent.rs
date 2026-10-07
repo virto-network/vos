@@ -66,18 +66,6 @@ use super::agent_protocol::{
 };
 use super::agent_raft_transport::AgentRaftTransport;
 
-// Temporary, payload-free Finish attribution under the existing diagnostic
-// flag. The public Copy error contains only closed unit/finality categories.
-fn install_receiver_refused(
-    phase: &'static str,
-    error: SharedAgentHostError,
-) -> SharedAgentHostError {
-    if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
-        tracing::debug!(phase, status = "error", ?error, "Shared Install receiver refused");
-    }
-    error
-}
-
 const MAX_AGENT_VOTERS: usize = crate::agent::MAX_AGENT_REPLICAS;
 const MAX_PENDING_ORDERED_REPLIES: usize = 1_024;
 const MAX_MERGE_SYNC_SCAN_EVENTS: usize = MAX_REPLAY_SUFFIX_ENTRIES + MAX_MERGE_FRONTIER_ENTRIES;
@@ -3392,39 +3380,26 @@ impl SharedRouteHandler {
                     .map(|(sender, _)| (sender, request.commitment(), authority.commitment()))
             })
             .flatten();
-        let refused = |phase: &'static str, error: SharedAgentHostError| {
-            // Reuse the existing forwarded-only declaration decision. No
-            // identity, commitment, or new node lookup is introduced here.
-            if forwarding_provenance.is_some() {
-                install_receiver_refused(phase, error)
-            } else {
-                error
-            }
-        };
         let proposal = self
             .proposal
             .lock()
-            .map_err(|_| SharedAgentHostError::Unavailable)
-            .map_err(|error| refused("submit_proposal_lock", error))?;
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
         if proposal.is_reserved() {
-            return Err(refused("submit_reserved", SharedAgentHostError::CapacityExhausted));
+            return Err(SharedAgentHostError::CapacityExhausted);
         }
         let worker = self
             .worker
             .as_ref()
-            .ok_or(SharedAgentHostError::TransportNotAttached)
-            .map_err(|error| refused("submit_worker", error))?;
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
         if !self.has_local_proposer(worker) {
-            return Err(refused("submit_proposer", SharedAgentHostError::Unavailable));
+            return Err(SharedAgentHostError::Unavailable);
         }
         let input = {
             let mut host = self
                 .host
                 .lock()
-                .map_err(|_| SharedAgentHostError::Unavailable)
-                .map_err(|error| refused("prepare_host_lock", error))?;
-            drain_committed(&mut host, self.agent, &self.ordered_replies)
-                .map_err(|error| refused("prepare_drain", error))?;
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            drain_committed(&mut host, self.agent, &self.ordered_replies)?;
             if let Some((sender, owner)) = origin {
                 #[cfg(target_os = "linux")]
                 host.validate_forwarded_shared_install_owner(
@@ -3434,7 +3409,7 @@ impl SharedRouteHandler {
                     owner.member,
                     &request,
                     &authority,
-                ).map_err(|error| refused("owner_proof", error))?;
+                )?;
                 #[cfg(not(target_os = "linux"))]
                 {
                     let _ = (sender, owner);
@@ -3442,65 +3417,33 @@ impl SharedRouteHandler {
                 }
             }
             let prepared =
-                host.prepare_clean_management(self.agent, request, authority, artifacts)
-                    .map_err(|error| refused("ordinary_prepare", error))?;
+                host.prepare_clean_management(self.agent, request, authority, artifacts)?;
             let observed_slot = prepared.observed_slot();
             if let Some(outcome) = prepared.denied().cloned() {
-                let _ = refused("ordinary_denied", SharedAgentHostError::Unavailable);
-                if forwarding_provenance.is_some()
-                    && std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some()
-                {
-                    // Classify the already-owned denial; lifecycle debt stays private.
-                    if let crate::agent_sdk::RuntimeOutcome::Management(Err(error)) = &outcome {
-                        use crate::agent_sdk::ManagementError;
-                        let category = match error {
-                            ManagementError::NotCreated => "NotCreated",
-                            ManagementError::AlreadyCreated => "AlreadyCreated",
-                            ManagementError::NotFound => "NotFound",
-                            ManagementError::AlreadyExists => "AlreadyExists",
-                            ManagementError::StaleDeployment => "StaleDeployment",
-                            ManagementError::UnsupportedRuntime => "UnsupportedRuntime",
-                            ManagementError::UnsupportedLane => "UnsupportedLane",
-                            ManagementError::Busy(_) => "Busy",
-                            ManagementError::DirectoryFull => "DirectoryFull",
-                            ManagementError::InvalidRequest => "InvalidRequest",
-                            ManagementError::AuthoritySequenceRegressed => "AuthoritySequenceRegressed",
-                            ManagementError::AuthoritySequenceConflict => "AuthoritySequenceConflict",
-                            ManagementError::AuthoritySlotRegressed => "AuthoritySlotRegressed",
-                            ManagementError::ResourceLimit => "ResourceLimit",
-                            ManagementError::ExpiredBeforeApplication => "ExpiredBeforeApplication",
-                        };
-                        tracing::debug!(category, "Shared Install ordinary management denied");
-                    }
-                }
                 return Ok(CleanManagementSubmission::Denied {
                     outcome,
                     observed_slot,
                 });
             }
             if let Some(outcome) = prepared.retained().cloned() {
-                let input = prepared.input().ok_or(SharedAgentHostError::Conflict)
-                    .map_err(|error| refused("retained_input", error))?;
+                let input = prepared.input().ok_or(SharedAgentHostError::Conflict)?;
                 drop(host);
                 drop(proposal);
-                self.require_ordered_availability(input)
-                    .map_err(|error| refused("retained_availability", error))?;
+                self.require_ordered_availability(input)?;
                 return Ok(CleanManagementSubmission::Applied {
                     outcome,
                     observed_slot,
                     new_slot: false,
                 });
             }
-            let input = prepared.input().ok_or(SharedAgentHostError::Conflict)
-                .map_err(|error| refused("prepared_input", error))?;
+            let input = prepared.input().ok_or(SharedAgentHostError::Conflict)?;
             let commands = prepared.into_commands();
             if commands.is_empty() {
-                return Err(refused("prepared_commands", SharedAgentHostError::Conflict));
+                return Err(SharedAgentHostError::Conflict);
             }
             self.ordered_replies
                 .register(input)
-                .map_err(|_| SharedAgentHostError::Conflict)
-                .map_err(|error| refused("waiter_register", error))?;
+                .map_err(|_| SharedAgentHostError::Conflict)?;
             if let Some((sender, request, authority)) = forwarding_provenance {
                 // This is a fresh, validated application, not upload progress
                 // or a retained result. Successful local replay/availability
@@ -3520,7 +3463,7 @@ impl SharedRouteHandler {
             for payload in commands {
                 if futures_executor::block_on(worker.propose(payload)).is_err() {
                     self.ordered_replies.cancel(input);
-                    return Err(refused("propose", SharedAgentHostError::Unavailable));
+                    return Err(SharedAgentHostError::Unavailable);
                 }
             }
             (input, observed_slot)
@@ -3528,19 +3471,15 @@ impl SharedRouteHandler {
         let mut host = self
             .host
             .lock()
-            .map_err(|_| SharedAgentHostError::Unavailable)
-            .map_err(|error| refused("post_propose_host_lock", error))?;
-        drain_committed(&mut host, self.agent, &self.ordered_replies)
-            .map_err(|error| refused("post_propose_drain", error))?;
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        drain_committed(&mut host, self.agent, &self.ordered_replies)?;
         drop(host);
         let outcome = self
             .ordered_replies
             .wait(input.0)
-            .map_err(|_| SharedAgentHostError::Unavailable)
-            .map_err(|error| refused("result_wait", error))?;
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
         drop(proposal);
-        self.require_ordered_availability(input.0)
-            .map_err(|error| refused("applied_availability", error))?;
+        self.require_ordered_availability(input.0)?;
         Ok(CleanManagementSubmission::Applied {
             outcome,
             observed_slot: input.1,

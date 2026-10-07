@@ -19,14 +19,6 @@ const MAX_BINDING_BYTES: usize = crate::agent_sdk::wire::MAX_MANAGEMENT_REQUEST_
     + crate::agent_sdk::wire::MAX_AUTHORITY_RECEIPT_WIRE_BYTES
     + 1024;
 
-// No driver error payload is exported. The stage names identify only the
-// existing failed branch; require_approval is the caller's existing mode.
-fn forwarded_owner_refused(phase: &'static str, require_approval: bool) {
-    if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
-        tracing::debug!(phase, require_approval, status = "error", "Shared Install owner proof refused");
-    }
-}
-
 fn fd_path(file: &File) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
 }
@@ -747,33 +739,16 @@ impl FileDriver {
             // Reuse the existing driver verifier on the freshly settled
             // ledger view, not a second independently selected manifest.
             self.verified_recovery_manifest_from_read(
-                self.ledger.current_management_recovery_manifest().map_err(|error| {
-                    let phase = if matches!(&error, super::super::shared_raft::AgentRaftApplicationErrorV2::RecoveryPrefixUnsettled { .. }) {
-                        "owner_initial_prefix_unsettled"
-                    } else {
-                        "owner_initial_manifest_read"
-                    };
-                    forwarded_owner_refused(phase, require_approval);
-                    error
-                })?,
-            ).map_err(|error| {
-                forwarded_owner_refused("owner_initial_manifest_verify", require_approval);
-                error
-            })?
+                self.ledger.current_management_recovery_manifest()?,
+            )?
         } else {
             // Bounded uploads are not mutation admission or proof of policy
             // approval; do not repeat full physical/capsule audits per chunk.
-            self.ledger.recovery_manifest_if_present().map_err(|error| {
-                forwarded_owner_refused("owner_upload_manifest_read", require_approval);
-                error
-            })?
+            self.ledger.recovery_manifest_if_present()?
         }
         .ok_or(SharedJournalDriverError::Store(
             JournalStoreError::Unavailable,
-        )).map_err(|error| {
-            forwarded_owner_refused("owner_manifest_missing", require_approval);
-            error
-        })?;
+        ))?;
         let slot = manifest
             .management_slot(NodeId(sender.0))
             .filter(|slot| {
@@ -781,10 +756,7 @@ impl FileDriver {
             })
             .ok_or(SharedJournalDriverError::Store(
                 JournalStoreError::Unavailable,
-            )).map_err(|error| {
-                forwarded_owner_refused("owner_unreleased_slot_missing", require_approval);
-                error
-            })?;
+            ))?;
         self.validate_management_registration_runtime(slot.registration().request())?;
         slot.registration()
             .verify(route.generation(), &committee)
@@ -877,10 +849,7 @@ impl FileDriver {
                     .invoke()
                     .ok_or(SharedJournalDriverError::Store(
                         JournalStoreError::Unavailable,
-                    )).map_err(|error| {
-                        forwarded_owner_refused("owner_first_invoke_missing", require_approval);
-                        error
-                    })?;
+                    ))?;
             let RuntimeOutcome::Completed(Ok(reply)) = evidence.outcome() else {
                 return Err(invalid_owner());
             };
@@ -907,16 +876,7 @@ impl FileDriver {
             // The global host guard excludes application/materialization
             // writes. The independent System worker may still move its raw
             // commit/log cursor: preserve the existing strict physical gate.
-            if self.ledger.current_management_recovery_manifest().map_err(|error| {
-                let phase = if matches!(&error, super::super::shared_raft::AgentRaftApplicationErrorV2::RecoveryPrefixUnsettled { .. }) {
-                    "owner_final_prefix_unsettled"
-                } else {
-                    "owner_final_manifest_read"
-                };
-                forwarded_owner_refused(phase, require_approval);
-                error
-            })?.as_ref() != Some(&manifest) {
-                forwarded_owner_refused("owner_final_manifest_changed", require_approval);
+            if self.ledger.current_management_recovery_manifest()?.as_ref() != Some(&manifest) {
                 return Err(SharedJournalDriverError::Store(
                     JournalStoreError::Unavailable,
                 ));
