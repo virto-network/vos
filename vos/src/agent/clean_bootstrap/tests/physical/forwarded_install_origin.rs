@@ -438,6 +438,13 @@ pub(super) fn exercise(
     let (descriptor, roster) = descriptor_and_roster(owners[origin].as_ref().unwrap(), &runtime);
     let (mut controller, archive) =
         create_and_admit(origin, owners, &runtime, &descriptor, &roster, signer);
+    // Distinct ordinary management mutations require trusted logical time to
+    // advance after Create; all three fixture trusts share this existing clock.
+    fixtures[origin]
+        .logical_slot
+        .as_ref()
+        .unwrap()
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     let locator = archive.provision().proposal().locator();
     let ordinary = locator.agent;
     let system = HostAgentId(owners[origin].as_ref().unwrap().pins.agent.0);
