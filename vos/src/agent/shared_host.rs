@@ -193,6 +193,39 @@ pub enum SharedAgentHostError {
     PortableBackupInvalid,
 }
 
+impl SharedAgentHostError {
+    /// Payload-free vocabulary for private opt-in branch diagnostics.
+    pub(crate) fn diagnostic_category(&self) -> &'static str {
+        match self {
+            Self::Unavailable => "Unavailable",
+            Self::DirectoryInUse => "DirectoryInUse",
+            Self::InvalidScope => "InvalidScope",
+            Self::ScopeMismatch => "ScopeMismatch",
+            Self::InvalidProvision => "InvalidProvision",
+            Self::InvalidCatalog => "InvalidCatalog",
+            Self::Conflict => "Conflict",
+            Self::CorruptResidue => "CorruptResidue",
+            Self::AgentNotFound => "AgentNotFound",
+            Self::CapacityExhausted => "CapacityExhausted",
+            Self::TransportNotAttached => "TransportNotAttached",
+            Self::SnapshotBoundaryRequired => "SnapshotBoundaryRequired",
+            Self::SnapshotCertificateInvalid => "SnapshotCertificateInvalid",
+            Self::SnapshotStale => "SnapshotStale",
+            Self::SnapshotReplay => "SnapshotReplay",
+            Self::SnapshotEvidenceLimit => "SnapshotEvidenceLimit",
+            Self::PortableBackupUnsupported => "PortableBackupUnsupported",
+            Self::PortableBackupInvalid => "PortableBackupInvalid",
+            Self::Finality(error) => match error {
+                AgentGenesisFinalityError::Unavailable => "FinalityUnavailable",
+                AgentGenesisFinalityError::NotFinalized => "FinalityNotFinalized",
+                AgentGenesisFinalityError::WrongSystemAgent => "FinalityWrongSystemAgent",
+                AgentGenesisFinalityError::Conflict => "FinalityConflict",
+                AgentGenesisFinalityError::Corrupt => "FinalityCorrupt",
+            },
+        }
+    }
+}
+
 /// Private opt-in observation of one exact ordinary routed request. These
 /// commitments identify work, not an attempt, admission proof or completion.
 #[derive(Clone, Copy)]
@@ -217,33 +250,7 @@ impl SharedInvokeDiagnostics {
     }
 
     pub(crate) fn refused(&self, stage: &'static str, error: &SharedAgentHostError) {
-        let category = match error {
-            SharedAgentHostError::Unavailable => "Unavailable",
-            SharedAgentHostError::DirectoryInUse => "DirectoryInUse",
-            SharedAgentHostError::InvalidScope => "InvalidScope",
-            SharedAgentHostError::ScopeMismatch => "ScopeMismatch",
-            SharedAgentHostError::InvalidProvision => "InvalidProvision",
-            SharedAgentHostError::InvalidCatalog => "InvalidCatalog",
-            SharedAgentHostError::Conflict => "Conflict",
-            SharedAgentHostError::CorruptResidue => "CorruptResidue",
-            SharedAgentHostError::AgentNotFound => "AgentNotFound",
-            SharedAgentHostError::CapacityExhausted => "CapacityExhausted",
-            SharedAgentHostError::TransportNotAttached => "TransportNotAttached",
-            SharedAgentHostError::SnapshotBoundaryRequired => "SnapshotBoundaryRequired",
-            SharedAgentHostError::SnapshotCertificateInvalid => "SnapshotCertificateInvalid",
-            SharedAgentHostError::SnapshotStale => "SnapshotStale",
-            SharedAgentHostError::SnapshotReplay => "SnapshotReplay",
-            SharedAgentHostError::SnapshotEvidenceLimit => "SnapshotEvidenceLimit",
-            SharedAgentHostError::PortableBackupUnsupported => "PortableBackupUnsupported",
-            SharedAgentHostError::PortableBackupInvalid => "PortableBackupInvalid",
-            SharedAgentHostError::Finality(error) => match error {
-                AgentGenesisFinalityError::Unavailable => "FinalityUnavailable",
-                AgentGenesisFinalityError::NotFinalized => "FinalityNotFinalized",
-                AgentGenesisFinalityError::WrongSystemAgent => "FinalityWrongSystemAgent",
-                AgentGenesisFinalityError::Conflict => "FinalityConflict",
-                AgentGenesisFinalityError::Corrupt => "FinalityCorrupt",
-            },
-        };
+        let category = error.diagnostic_category();
         self.trace(stage, category);
     }
 

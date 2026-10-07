@@ -348,6 +348,7 @@ fn authorize_with_application_validity(
                 "VOS operation preparation diagnostic");
             if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
                 tracing::debug!(actor = ?nonce.0, invocation = ?call.invocation.0,
+                    native_request = ?call.commitment().0,
                     boundary = "verified_preparation", "operation_binding");
             }
             let bytes = super::operation_authorization::prepare_retained(
@@ -390,6 +391,7 @@ fn authorize_with_application_validity(
     drop(delivery);
     if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
         tracing::debug!(actor = ?nonce.0, invocation = ?call.invocation.0,
+            native_request = ?call.commitment().0,
             boundary = "verified_submission", "operation_binding");
     }
     let response = super::operation_authorization::submit(&request_root, None, address)?;

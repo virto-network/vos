@@ -168,6 +168,12 @@ First reader39f7236f refuses with no SAFE because it mistakes the source's peer 
 
 Both physical invocations are consumed. Next scoped evidence should reuse existing issuance/credential/native-operation/timer discriminants to bind this exact issuance leaf before another remedy; no new run or cap renewal is implied. Keep ordinary nonleader/fatal-Unavailable classification separate, with a Current/no-reservation guard and true-failure/management preservation if later selected. Then qualify corrected Clerk delivery and the remaining staged/current quiet/ordinary M1 gates before M2/local M3; hardware M3 remains OPEN.
 
+## R74 approved review boundary
+
+Review the [R74 bounded issuance session](agent-saga-status.md#r74-approved-classify-exact-bootstrap-issuance-before-another-remedy): user approval starts16:13:15 UTC from clean28411096, checkpoint16:58:15–17:13:15 and cap18:13:15. One scoped invocation plus conditional quiet validation are newly allowed; old budgets/caps remain closed. Independent review must establish diagnostic-only original-predicate/result/lock/HTTP/bytes equality, exact actor/native call and actual owner-node binding, closed categories without private payloads, current source/provenance/six-file/Clerk/private/owned-group fences and prequalified finite reader/PURE grammar. Do not donate a known owner node to an unknown HTTP node or infer attempts/causes from proximity or missing markers.
+
+At the checkpoint require a bound issuance failure class and source invariant before choosing a small fix; preserve the exact signed requests/leases/results/ACK and original120/30. The quiet validation must positively complete Issued, corrected Clerk delivery/loss/exact retry/ACK/reopen before any workflow credit. Ordinary-nonleader error classification, automatic public routing and architecture/tuning changes remain separate; M1–M3 stay OPEN.
+
 ## Mandatory remaining review/qualification
 
 Review [replacement acceptance](agent-saga-status.md#replacement-contract-and-simplification-evidence), [dependency order](agent-saga-status.md#remaining-prerequisites-in-dependency-order) and [full checklist](agent-saga-status.md#mandatory-workflow-and-operations-checklist); every unchecked gate remains required.

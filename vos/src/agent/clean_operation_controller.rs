@@ -494,7 +494,23 @@ where
         I: CleanManagementIssuerStore,
     {
         let _timing = crate::agent::local_lifecycle::OperationTiming::start("controller_prepare");
-        if owner.authority_target() != self.authority || call.authority != self.authority {
+        let diagnostic_request = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS")
+            .map(|_| call.commitment());
+        let diagnostic_node = owner.pins().node();
+        let refused = |category: &'static str, error: &SharedAgentHostError| {
+            if let Some(request) = diagnostic_request {
+                tracing::debug!(target: "vos::agent::local_lifecycle",
+                    invocation = ?call.invocation.0, request = ?request.0,
+                    node = ?diagnostic_node.0, stage = "controller_prepare", category,
+                    error_code = error.diagnostic_category(), "operation_refusal");
+            }
+        };
+        if owner.authority_target() != self.authority {
+            refused("owner_authority", &SharedAgentHostError::ScopeMismatch);
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if call.authority != self.authority {
+            refused("call_authority", &SharedAgentHostError::ScopeMismatch);
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         self.validate()
@@ -509,16 +525,26 @@ where
                 // Preserve disposal of the masked store/controller error before
                 // logging; never format its payload at this boundary.
                 drop(error);
+                refused(category, &SharedAgentHostError::Unavailable);
                 tracing::warn!(invocation = ?call.invocation.0,
                     phase = "controller_validation", category,
                     "native operation preparation branch refused");
                 SharedAgentHostError::Unavailable
             })?;
-        if let Some((context, _)) = self.retired_for_call(call, None, None)? {
+        if let Some((context, _)) = self.retired_for_call(call, None, None)
+            .map_err(|error| {
+                refused("retained_lookup", &error);
+                error
+            })?
+        {
             return Ok(context);
         }
         operation_dispatch::NativeAuthorityOperationDispatcher::new(owner, &mut self.journal)
             .prepare_call(call)
+            .map_err(|error| {
+                refused("dispatch_prepare", &error);
+                error
+            })
     }
 
     /// Reconcile archive-certified older terminal rows, then cross-check both
@@ -760,37 +786,64 @@ where
             + NativeAuthorityOperationDenialSigner,
     {
         let diagnostics = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some();
+        let diagnostic_request = diagnostics.then(|| call.commitment());
+        let diagnostic_node = owner.pins().node();
+        let refused = |category: &'static str, error: &SharedAgentHostError| {
+            if let Some(request) = diagnostic_request {
+                tracing::debug!(target: "vos::agent::local_lifecycle",
+                    invocation = ?call.invocation.0, request = ?request.0,
+                    node = ?diagnostic_node.0, stage = "controller_coordinate", category,
+                    error_code = error.diagnostic_category(), "operation_refusal");
+            }
+        };
+        let mismatch = |category: &'static str| {
+            refused(category, &SharedAgentHostError::ScopeMismatch);
+            true
+        };
         let trace = |phase: &'static str, outcome: &'static str| {
             if diagnostics {
                 tracing::debug!(phase, outcome, "native_operation_phase");
             }
         };
         trace("controller_checks", "start");
-        if owner.authority_target() != self.authority
-            || call.authority != self.authority
-            || AuthorityOperationEvidenceSigner::public_key(signer)
-                != self.authority.binding.public_key
-            || NativeAuthorityOperationCompletionSigner::public_key(signer)
-                != self.authority.binding.public_key
-            || NativeAuthorityOperationRetirementSigner::public_key(signer)
-                != self.authority.binding.public_key
-            || NativeAuthorityOperationDenialSigner::public_key(signer)
-                != self.authority.binding.public_key
-            || !call.matches_invocation_context(&context)
-            || issued_at < context.observed_slot
-            || issued_at < call.requested_valid_from
-            || issued_at > call.requested_expires_at
+        if (owner.authority_target() != self.authority && mismatch("owner_authority"))
+            || (call.authority != self.authority && mismatch("call_authority"))
+            || (AuthorityOperationEvidenceSigner::public_key(signer)
+                != self.authority.binding.public_key && mismatch("evidence_signer"))
+            || (NativeAuthorityOperationCompletionSigner::public_key(signer)
+                != self.authority.binding.public_key && mismatch("completion_signer"))
+            || (NativeAuthorityOperationRetirementSigner::public_key(signer)
+                != self.authority.binding.public_key && mismatch("retirement_signer"))
+            || (NativeAuthorityOperationDenialSigner::public_key(signer)
+                != self.authority.binding.public_key && mismatch("denial_signer"))
+            || (!call.matches_invocation_context(&context) && mismatch("call_context"))
+            || (issued_at < context.observed_slot && mismatch("issued_before_observation"))
+            || (issued_at < call.requested_valid_from && mismatch("issued_before_validity"))
+            || (issued_at > call.requested_expires_at && mismatch("issued_after_expiry"))
         {
             trace("controller_checks", "scope_mismatch");
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         self.validate()
-            .map_err(|_| {
+            .map_err(|error| {
+                let category = match &error {
+                    NativeAuthorityOperationControllerError::WrongAuthority => "wrong_authority",
+                    NativeAuthorityOperationControllerError::Completion(_) => "completion",
+                    NativeAuthorityOperationControllerError::OpenIssuer(_) => "issuer_open",
+                    NativeAuthorityOperationControllerError::OpenCoordinator(_) => "coordinator_open",
+                    NativeAuthorityOperationControllerError::Coordinate(_) => "coordinate",
+                };
+                refused(category, &SharedAgentHostError::Unavailable);
                 trace("controller_validate", "error");
                 SharedAgentHostError::Unavailable
             })?;
         trace("controller_checks", "complete");
-        if let Some((_, issued)) = self.retired_for_call(call, Some(&context), Some(issued_at))? {
+        if let Some((_, issued)) = self.retired_for_call(call, Some(&context), Some(issued_at))
+            .map_err(|error| {
+                refused("retained_lookup", &error);
+                error
+            })?
+        {
             trace("retained_terminal", "issued");
             return Ok(NativeAuthorityOperationDecision::Issued(issued));
         }
@@ -878,6 +931,10 @@ where
                 trace("coordinate", "complete");
                 self.retire_issued(owner, call, issued, signer)
                     .map(NativeAuthorityOperationDecision::Issued)
+                    .map_err(|error| {
+                        refused("retire_issued", &error);
+                        error
+                    })
             },
             Err(NativeAuthorityOperationControllerError::Coordinate(
                 AuthorityOperationCoordinatorError::Rejected(
@@ -921,7 +978,14 @@ where
                         AuthorityOperationCoordinatorError::Rejected(_) => "coordinate_rejected",
                     },
                 };
+                let host_error = match &error {
+                    NativeAuthorityOperationControllerError::Coordinate(
+                        AuthorityOperationCoordinatorError::Dispatch(error),
+                    ) => *error,
+                    _ => SharedAgentHostError::Unavailable,
+                };
                 trace(category, "error");
+                refused(category, &host_error);
                 Err(SharedAgentHostError::Unavailable)
             },
         }

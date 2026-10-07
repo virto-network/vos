@@ -1533,24 +1533,51 @@ impl AgentProductionOwner {
         &mut self,
         call: &super::sdk::authority_operation::AuthorityOperationCall,
     ) -> super::local_lifecycle::AuthorityOperationPreparationResult {
+        let diagnostic_node = self.node;
+        let diagnostic_request = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS")
+            .map(|_| call.commitment());
+        let refused = |category: &'static str, error: &super::shared_host::SharedAgentHostError| {
+            if let Some(request) = diagnostic_request {
+                tracing::debug!(target: "vos::agent::local_lifecycle",
+                    invocation = ?call.invocation.0, request = ?request.0,
+                    node = ?diagnostic_node.0, stage = "owner_prepare", category,
+                    error_code = error.diagnostic_category(), "operation_refusal");
+            }
+        };
         if !self.is_running() {
+            refused("owner_stopped", &super::shared_host::SharedAgentHostError::Unavailable);
             return Err(super::shared_host::SharedAgentHostError::Unavailable);
         }
         if !self.is_ready()
             && !self
                 .lifecycle
                 .as_mut()
-                .ok_or(super::shared_host::SharedAgentHostError::Unavailable)?
+                .ok_or_else(|| {
+                    refused("retained_lifecycle_missing", &super::shared_host::SharedAgentHostError::Unavailable);
+                    super::shared_host::SharedAgentHostError::Unavailable
+                })?
                 .0
-                .retains_operation(call, None)?
+                .retains_operation(call, None)
+                .map_err(|error| {
+                    refused("retained_check", &error);
+                    error
+                })?
         {
+            refused("not_ready_unretained", &super::shared_host::SharedAgentHostError::ScopeMismatch);
             return Err(super::shared_host::SharedAgentHostError::ScopeMismatch);
         }
         self.lifecycle
             .as_mut()
-            .ok_or(super::shared_host::SharedAgentHostError::Unavailable)?
+            .ok_or_else(|| {
+                refused("execution_lifecycle_missing", &super::shared_host::SharedAgentHostError::Unavailable);
+                super::shared_host::SharedAgentHostError::Unavailable
+            })?
             .0
             .prepare_operation(call)
+            .map_err(|error| {
+                refused("lifecycle_prepare", &error);
+                error
+            })
     }
 
     pub(crate) fn authorize_operation(
@@ -1563,6 +1590,16 @@ impl AgentProductionOwner {
         super::shared_host::SharedAgentHostError,
     > {
         let diagnostics = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some();
+        let diagnostic_node = self.node;
+        let diagnostic_request = diagnostics.then(|| call.commitment());
+        let refused = |category: &'static str, error: &super::shared_host::SharedAgentHostError| {
+            if let Some(request) = diagnostic_request {
+                tracing::debug!(target: "vos::agent::local_lifecycle",
+                    invocation = ?call.invocation.0, request = ?request.0,
+                    node = ?diagnostic_node.0, stage = "owner_authorize", category,
+                    error_code = error.diagnostic_category(), "operation_refusal");
+            }
+        };
         let trace = |phase: &'static str, outcome: &'static str| {
             if diagnostics {
                 tracing::debug!(phase, outcome, "native_operation_phase");
@@ -1571,6 +1608,7 @@ impl AgentProductionOwner {
         trace("admission", "start");
         if !self.is_running() {
             trace("admission", "stopped");
+            refused("owner_stopped", &super::shared_host::SharedAgentHostError::Unavailable);
             return Err(super::shared_host::SharedAgentHostError::Unavailable);
         }
         let ready = self.is_ready();
@@ -1579,25 +1617,34 @@ impl AgentProductionOwner {
             && !self
                 .lifecycle
                 .as_mut()
-                .ok_or(super::shared_host::SharedAgentHostError::Unavailable)?
+                .ok_or_else(|| {
+                    refused("retained_lifecycle_missing", &super::shared_host::SharedAgentHostError::Unavailable);
+                    super::shared_host::SharedAgentHostError::Unavailable
+                })?
                 .0
                 .retains_operation(call, Some(&context))
                 .map_err(|error| {
                     trace("admission_retained", "error");
+                    refused("retained_check", &error);
                     error
                 })?
         {
             trace("admission_retained", "absent");
+            refused("not_ready_unretained", &super::shared_host::SharedAgentHostError::ScopeMismatch);
             return Err(super::shared_host::SharedAgentHostError::ScopeMismatch);
         }
         trace("admission", "complete");
         self.lifecycle
             .as_mut()
-            .ok_or(super::shared_host::SharedAgentHostError::Unavailable)?
+            .ok_or_else(|| {
+                refused("execution_lifecycle_missing", &super::shared_host::SharedAgentHostError::Unavailable);
+                super::shared_host::SharedAgentHostError::Unavailable
+            })?
             .0
             .authorize_operation(call, context, issued_at)
             .map_err(|error| {
                 trace("authorization", "error");
+                refused("lifecycle_authorize", &error);
                 error
             })
     }
