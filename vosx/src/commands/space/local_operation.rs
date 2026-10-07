@@ -130,6 +130,8 @@ fn authorize_with_application_validity(
     apply: bool,
     validity_secs: u64,
 ) -> anyhow::Result<(PathBuf, Vec<u8>)> {
+    use super::operation_authorization::DiagnosticStage;
+    let _timing = DiagnosticStage::start("client_authorize");
     anyhow::ensure!(validity_secs > 0, "authorization validity must be positive");
     anyhow::ensure!(
         address.ip().is_loopback() && address.port() != 0,
@@ -196,8 +198,16 @@ fn authorize_with_application_validity(
     let request_root = operation.join("request");
     let mut delivery = CleanOperationClientFile::open_or_create(&request_root)?;
     let request = match delivery.load_request()? {
-        Some(bytes) => bytes, // No discovery, physical preparation or signing on retry.
+        Some(bytes) => {
+            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                tracing::debug!(stage = "authorization_request", reused = true, "operation_reuse");
+            }
+            bytes // No discovery, physical preparation or signing on retry.
+        },
         None => {
+            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                tracing::debug!(stage = "authorization_request", reused = false, "operation_reuse");
+            }
             delivery.load_response()?; // Reject orphan/corrupt delivery before discovery.
             anyhow::ensure!(
                 status == CredentialReservationStatus::Pending,
@@ -231,12 +241,15 @@ fn authorize_with_application_validity(
             )?;
             host_preparation.load_response()?; // Reject orphan/corrupt preparation before discovery.
             if host_preparation.load_request()?.is_none() {
+                let credential_timing = DiagnosticStage::start("client_credential_discovery");
                 let (credential, _) = super::local_create::discover_operation_credential(
                     &operation.join("query"),
                     address,
                     operator,
                     authority,
                 )?;
+                drop(credential_timing);
+                let descriptor_timing = DiagnosticStage::start("client_descriptor_discovery");
                 let descriptor = super::local_install::discover_agent(
                     address,
                     operator,
@@ -244,6 +257,7 @@ fn authorize_with_application_validity(
                     credential.head,
                     intent.target().agent(),
                 )?;
+                drop(descriptor_timing);
                 anyhow::ensure!(
                     descriptor.identity.space == space
                         && operator_target_supported(
@@ -259,12 +273,15 @@ fn authorize_with_application_validity(
                 let secret = key.secret();
                 let token = vos::ingress::encode_access_token(secret.as_ref().try_into()?)
                     .ok_or_else(|| anyhow::anyhow!("invalid access token"))?;
+                let preparation_timing = DiagnosticStage::start("client_actor_preparation");
                 let prepared = super::local_invocation::prepare_retained(
                     &preparation_root,
                     address,
                     &token,
                     None,
                 )?;
+                drop(preparation_timing);
+                let _timing = DiagnosticStage::start("client_signed_preparation_retention");
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)?
                     .as_secs();
@@ -329,6 +346,10 @@ fn authorize_with_application_validity(
             tracing::info!(invocation = ?call.invocation.0,
                 phase = "client_prepare", category = "original_call",
                 "VOS operation preparation diagnostic");
+            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                tracing::debug!(actor = ?nonce.0, invocation = ?call.invocation.0,
+                    boundary = "verified_preparation", "operation_binding");
+            }
             let bytes = super::operation_authorization::prepare_retained(
                 &mut host_preparation,
                 address,
@@ -367,16 +388,27 @@ fn authorize_with_application_validity(
         "retained authorization differs from Space, operator, node or reservation"
     );
     drop(delivery);
+    if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+        tracing::debug!(actor = ?nonce.0, invocation = ?call.invocation.0,
+            boundary = "verified_submission", "operation_binding");
+    }
     let response = super::operation_authorization::submit(&request_root, None, address)?;
+    let _timing = DiagnosticStage::start("client_decision_and_retention");
     match submission
         .decode_response(&response)
         .map_err(|e| anyhow::anyhow!("invalid AOR1: {e:?}"))?
     {
         vos::agent::clean_bootstrap::NativeAuthorityOperationDecision::Denied { .. } => {
+            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                tracing::debug!(decision = "denied", "operation_decision");
+            }
             let mut delivery = CleanOperationClientFile::open_or_create(&request_root)?;
             reservation.deny_operation(&mut delivery)?;
         }
         vos::agent::clean_bootstrap::NativeAuthorityOperationDecision::Issued(_) => {
+            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                tracing::debug!(decision = "issued", "operation_decision");
+            }
             let application_root = operation.join("application");
             super::operation_authorization::application::retain(
                 &request_root,

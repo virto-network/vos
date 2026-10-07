@@ -7,6 +7,33 @@ pub(crate) mod application;
 #[path = "operation_preparation.rs"]
 pub(crate) mod preparation;
 
+/// Scoped host diagnostics only: no request bytes, persisted state or clock input.
+pub(super) struct DiagnosticStage {
+    stage: &'static str,
+    started: Option<(std::time::Instant, u64)>,
+}
+
+impl DiagnosticStage {
+    pub(super) fn start(stage: &'static str) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let started = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").map(|_| {
+            let timer = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::debug!(stage, timer, boundary = "start", elapsed_us = 0u64, "operation_timing");
+            (std::time::Instant::now(), timer)
+        });
+        Self { stage, started }
+    }
+}
+
+impl Drop for DiagnosticStage {
+    fn drop(&mut self) {
+        if let Some((started, timer)) = self.started {
+            tracing::debug!(stage = self.stage, timer, boundary = "exit",
+                elapsed_us = started.elapsed().as_micros() as u64, "operation_timing");
+        }
+    }
+}
+
 /// Return only a synchronized, exact call-bound native preparation. The host
 /// chooses the observation slot; retries never sign a new call or rebase AOQ1.
 pub(crate) fn prepare_retained(
@@ -14,6 +41,7 @@ pub(crate) fn prepare_retained(
     address: std::net::SocketAddr,
     minimum_slot: u64,
 ) -> anyhow::Result<Vec<u8>> {
+    let _timing = DiagnosticStage::start("client_native_preparation");
     anyhow::ensure!(
         address.ip().is_loopback() && address.port() != 0,
         "operation preparation requires nonzero loopback HTTP"
@@ -22,19 +50,27 @@ pub(crate) fn prepare_retained(
         .load_request()?
         .ok_or_else(|| anyhow::anyhow!("missing retained AOC5"))?;
     let response = match store.load_response()? {
-        Some(response) => response,
-        None => super::local_create::post_binary(
-            address,
-            "/__agents/prepare-authorization",
-            200,
-            &request,
-            AuthorityOperationSubmission::MAX_ENCODED_BYTES,
-        )
-        .map_err(|error| {
-            let diagnostic =
-                format!("{error}; exact preparation call retained; retry identical AOC5");
-            error.context(diagnostic)
-        })?,
+        Some(response) => {
+            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                tracing::debug!(stage = "preparation_response", reused = true, "operation_reuse");
+            }
+            response
+        },
+        None => {
+            let _timing = DiagnosticStage::start("client_preparation_http");
+            super::local_create::post_binary(
+                address,
+                "/__agents/prepare-authorization",
+                200,
+                &request,
+                AuthorityOperationSubmission::MAX_ENCODED_BYTES,
+            )
+            .map_err(|error| {
+                let diagnostic =
+                    format!("{error}; exact preparation call retained; retry identical AOC5");
+                error.context(diagnostic)
+            })?
+        },
     };
     let submission = AuthorityOperationSubmission::decode(&response)
         .map_err(|e| anyhow::anyhow!("invalid prepared AOQ1: {e:?}"))?;
@@ -51,6 +87,7 @@ pub(crate) fn submit(
     input: Option<&std::path::Path>,
     address: std::net::SocketAddr,
 ) -> anyhow::Result<Vec<u8>> {
+    let _timing = DiagnosticStage::start("client_authorization_delivery");
     use std::io::Read as _;
     anyhow::ensure!(
         address.ip().is_loopback() && address.port() != 0,
@@ -87,8 +124,12 @@ pub(crate) fn submit(
     );
     (|| {
         if let Some(response) = store.load_response()? {
+            if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+                tracing::debug!(stage = "authorization_response", reused = true, "operation_reuse");
+            }
             return Ok(response);
         }
+        let http_timing = DiagnosticStage::start("client_authorization_http");
         let response = super::local_create::post_binary(
             address,
             "/__agents/authorize",
@@ -96,6 +137,8 @@ pub(crate) fn submit(
             &request,
             AuthorityOperationSubmission::MAX_RESPONSE_BYTES,
         )?;
+        drop(http_timing);
+        let _timing = DiagnosticStage::start("client_authorization_response_retention");
         submission
             .decode_response(&response)
             .map_err(|e| anyhow::anyhow!("invalid request-bound AOR1: {e:?}"))?;

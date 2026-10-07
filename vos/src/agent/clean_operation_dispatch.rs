@@ -1686,6 +1686,7 @@ where
         envelope: &RuntimeWork,
         anchor: &super::super::clean_management_intent::ManagementJournalAnchor,
     ) -> Result<AuthorityOperationActorResult, SharedAgentHostError> {
+        let _timing = crate::agent::local_lifecycle::OperationTiming::start("native_dispatch");
         let diagnostics = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some();
         let method = match request.method {
             AuthorityOperationActorMethod::AuthorizeOperation => "authorization",
@@ -1713,6 +1714,9 @@ where
             trace("native_refusal", "envelope_kind");
             return Err(SharedAgentHostError::ScopeMismatch);
         };
+        if diagnostics {
+            tracing::debug!(work = ?work.invocation.0, method, "operation_work_binding");
+        }
         trace("native_material", "start");
         let mut material = self.supervisor_invocation_material(self.pins.agent, work.actor)
             .map_err(|error| {

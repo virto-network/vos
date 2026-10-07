@@ -1958,6 +1958,7 @@ pub(crate) mod tests {
         let Some(PendingLocalLifecycle::PrepareOperation {
             call: retained,
             reply,
+            ..
         }) = queue.pop().unwrap()
         else {
             panic!("accepted preparation was cancelled or replaced");
@@ -1969,6 +1970,7 @@ pub(crate) mod tests {
         let Some(PendingLocalLifecycle::AuthorizeOperation {
             submission: retained,
             reply,
+            ..
         }) = queue.pop().unwrap()
         else {
             panic!("accepted operation was cancelled or replaced")

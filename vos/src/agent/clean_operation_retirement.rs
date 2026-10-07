@@ -197,6 +197,7 @@ where
         S: NativeAuthorityOperationRetirementSigner,
         F: FnOnce(&[u8]) -> Result<(), SharedAgentHostError>,
     {
+        let _timing = crate::agent::local_lifecycle::OperationTiming::start("native_retirement");
         let diagnostics = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some();
         let trace = |phase: &'static str, outcome: &'static str| {
             if diagnostics {
@@ -241,6 +242,7 @@ where
         // NRT1 is synchronized before releasing its exact root retention.
         // A quorum timeout leaves the certificate available for exact retry.
         trace("terminal_release", "start");
+        let _release_timing = crate::agent::local_lifecycle::OperationTiming::start("terminal_release");
         self._network_host.release_management_retention(
             crate::service::AgentId(self.pins.agent.0),
             retained.completion.authorization.envelope(),

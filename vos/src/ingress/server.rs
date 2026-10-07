@@ -642,6 +642,13 @@ fn handle_operation_preparation(
         Ok(call) => call,
         Err(_) => return text(400, "invalid operation call"),
     };
+    let span = if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
+        tracing::debug_span!("operation_http", invocation = ?call.invocation.0, method = "prepare")
+    } else {
+        tracing::Span::none()
+    };
+    let _entered = span.enter();
+    let _timing = crate::agent::local_lifecycle::OperationTiming::start("http_preparation");
     if call.authenticated_node().is_some() {
         return text(
             403,
@@ -736,6 +743,13 @@ fn handle_operation_authorization(
         Ok(value) => value,
         Err(_) => return text(400, "invalid signed operation submission"),
     };
+    let span = if diagnostics {
+        tracing::debug_span!("operation_http", invocation = ?submission.call().invocation.0, method = "authorize")
+    } else {
+        tracing::Span::none()
+    };
+    let _entered = span.enter();
+    let _timing = crate::agent::local_lifecycle::OperationTiming::start("http_authorization");
     if submission.call().authenticated_node().is_some() {
         return text(
             403,

@@ -291,6 +291,7 @@ pub(super) fn exercise(
                 node_public,
                 Some(&intent),
             );
+            let _checks = commands::operation_authorization::DiagnosticStage::start("fixture_retained_checks");
             assert_eq!(
                 retained_operation(&data[0], space, &identity, false),
                 operation_root,

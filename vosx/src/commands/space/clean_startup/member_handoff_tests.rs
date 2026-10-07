@@ -481,12 +481,34 @@ pub(super) fn retry_exact_until<T>(
     deadline: std::time::Instant,
     mut operation: impl FnMut() -> anyhow::Result<T>,
 ) -> T {
+    let diagnostics = phase == "real Authority bootstrap issuance"
+        && std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some();
+    let mut attempt = 0u64;
     loop {
         assert!(
             std::time::Instant::now() < deadline,
             "{phase} exceeded its phase bound"
         );
-        match operation() {
+        attempt += 1;
+        let span = if diagnostics {
+            tracing::debug_span!("operation_attempt", phase, attempt)
+        } else {
+            tracing::Span::none()
+        };
+        let _entered = span.enter();
+        if diagnostics {
+            tracing::debug!(remaining_us = deadline.saturating_duration_since(std::time::Instant::now()).as_micros() as u64,
+                "operation_budget");
+        }
+        let timing = crate::commands::space::operation_authorization::DiagnosticStage::start("fixture_attempt");
+        let result = operation();
+        drop(timing);
+        if diagnostics {
+            tracing::debug!(ok = result.is_ok(),
+                overdue_us = std::time::Instant::now().saturating_duration_since(deadline).as_micros() as u64,
+                "operation_attempt_result");
+        }
+        match result {
             Ok(value) => {
                 assert!(
                     std::time::Instant::now() <= deadline,
@@ -502,6 +524,7 @@ pub(super) fn retry_exact_until<T>(
                 ) =>
             {
                 assert!(std::time::Instant::now() < deadline, "{phase}: {error:?}");
+                let _sleep = crate::commands::space::operation_authorization::DiagnosticStage::start("fixture_retry_sleep");
                 std::thread::sleep(Duration::from_millis(100));
             }
             Err(error) => panic!("{phase} failed without retryable transport: {error:?}"),

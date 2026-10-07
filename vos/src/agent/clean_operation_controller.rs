@@ -493,6 +493,7 @@ where
         R: CleanSystemAgentBootstrapStore,
         I: CleanManagementIssuerStore,
     {
+        let _timing = crate::agent::local_lifecycle::OperationTiming::start("controller_prepare");
         if owner.authority_target() != self.authority || call.authority != self.authority {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
@@ -528,6 +529,7 @@ where
         (),
         NativeAuthorityOperationControllerError<C::Error, B::Error, core::convert::Infallible>,
     > {
+        let _timing = crate::agent::local_lifecycle::OperationTiming::start("controller_validate");
         self.compact_retired()
             .map_err(NativeAuthorityOperationControllerError::Completion)?;
         let issuer =
@@ -670,6 +672,7 @@ where
         I: CleanManagementIssuerStore,
         S: AuthorityOperationEvidenceSigner,
     {
+        let _timing = crate::agent::local_lifecycle::OperationTiming::start("controller_coordinate");
         if !self.authority.is_valid()
             || self.authority != owner.authority_target()
             || call.authority != self.authority
@@ -981,6 +984,7 @@ where
         I: CleanManagementIssuerStore,
         S: NativeAuthorityOperationCompletionSigner,
     {
+        let _timing = crate::agent::local_lifecycle::OperationTiming::start("controller_completion");
         let diagnostics = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some();
         let trace = |phase: &'static str, outcome: &'static str| {
             if diagnostics {
@@ -1119,6 +1123,7 @@ where
         I: CleanManagementIssuerStore,
         S: NativeAuthorityOperationCompletionSigner + NativeAuthorityOperationRetirementSigner,
     {
+        let _timing = crate::agent::local_lifecycle::OperationTiming::start("controller_retirement");
         let diagnostics = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some();
         let trace = |phase: &'static str, outcome: &'static str| {
             if diagnostics {

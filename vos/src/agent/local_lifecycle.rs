@@ -17,6 +17,46 @@ use super::supervisor_adapters::{AgentRouteAdapterError, AgentRouteHostAttachmen
 
 pub const LOCAL_LIFECYCLE_QUEUE_CAPACITY: usize = 4;
 
+/// Host-only, opt-in timing. This carries no proof and never changes a deadline.
+pub(crate) struct OperationTiming {
+    stage: &'static str,
+    started: Option<(std::time::Instant, u64)>,
+}
+
+impl OperationTiming {
+    pub(crate) fn start(stage: &'static str) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let started = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").map(|_| {
+            let timer = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::debug!(stage, timer, boundary = "start", elapsed_us = 0u64, "operation_timing");
+            (std::time::Instant::now(), timer)
+        });
+        Self { stage, started }
+    }
+}
+
+impl Drop for OperationTiming {
+    fn drop(&mut self) {
+        if let Some((started, timer)) = self.started {
+            tracing::debug!(stage = self.stage, timer, boundary = "exit",
+                elapsed_us = started.elapsed().as_micros() as u64, "operation_timing");
+        }
+    }
+}
+
+fn operation_diagnostic(
+    call: &super::sdk::authority_operation::AuthorityOperationCall,
+    method: &'static str,
+) -> Option<(std::time::Instant, tracing::Span)> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").map(|_| {
+        let delivery = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let span = tracing::debug_span!("operation_delivery", delivery, method,
+            invocation = ?call.invocation.0);
+        (std::time::Instant::now(), span)
+    })
+}
+
 #[path = "operation_submission.rs"]
 mod operation_submission;
 pub use operation_submission::AuthorityOperationSubmission;
@@ -654,10 +694,12 @@ pub(crate) enum PendingLocalLifecycle {
     PrepareOperation {
         call: super::sdk::authority_operation::AuthorityOperationCall,
         reply: mpsc::SyncSender<AuthorityOperationPreparationResult>,
+        diagnostic: Option<(std::time::Instant, tracing::Span)>,
     },
     AuthorizeOperation {
         submission: AuthorityOperationSubmission,
         reply: mpsc::SyncSender<AuthorityOperationResult>,
+        diagnostic: Option<(std::time::Instant, tracing::Span)>,
     },
     Create(PendingLocalCreate),
     #[cfg(all(
@@ -845,7 +887,9 @@ impl LocalLifecycleQueue {
             .ok_or(LocalLifecycleIngressError::Unavailable)?;
         let (reply, receiver) = mpsc::sync_channel(1);
         sender
-            .try_send(PendingLocalLifecycle::PrepareOperation { call, reply })
+            .try_send(PendingLocalLifecycle::PrepareOperation {
+                diagnostic: operation_diagnostic(&call, "prepare"), call, reply,
+            })
             .map_err(|error| match error {
                 mpsc::TrySendError::Full(_) => LocalLifecycleIngressError::Busy,
                 mpsc::TrySendError::Disconnected(_) => LocalLifecycleIngressError::Unavailable,
@@ -866,7 +910,9 @@ impl LocalLifecycleQueue {
             .ok_or(LocalLifecycleIngressError::Unavailable)?;
         let (reply, receiver) = mpsc::sync_channel(1);
         sender
-            .try_send(PendingLocalLifecycle::AuthorizeOperation { submission, reply })
+            .try_send(PendingLocalLifecycle::AuthorizeOperation {
+                diagnostic: operation_diagnostic(submission.call(), "authorize"), submission, reply,
+            })
             .map_err(|error| match error {
                 mpsc::TrySendError::Full(_) => LocalLifecycleIngressError::Busy,
                 mpsc::TrySendError::Disconnected(_) => LocalLifecycleIngressError::Unavailable,
@@ -4436,10 +4482,13 @@ where
             .operations
             .as_mut()
             .ok_or(SharedAgentHostError::Unavailable)?;
+        let lock_timing = OperationTiming::start("system_owner_lock");
         let mut system = self
             .system
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
+        drop(lock_timing);
+        let _timing = OperationTiming::start("native_preparation");
         let context = operations.prepare(&mut system, call)?;
         let issued_at = context.observed_slot;
         AuthorityOperationSubmission::new(call.clone(), context, issued_at)
@@ -4457,10 +4506,13 @@ where
             .operations
             .as_mut()
             .ok_or(SharedAgentHostError::Unavailable)?;
+        let lock_timing = OperationTiming::start("system_owner_lock");
         let mut system = self
             .system
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
+        drop(lock_timing);
+        let _timing = OperationTiming::start("native_authorization");
         operations.coordinate(&mut system, call, context, issued_at)
     }
 

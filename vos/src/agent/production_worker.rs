@@ -333,8 +333,13 @@ fn drive(owner: &mut AgentProductionOwner, guard: &ExitGuard) -> Result<(), Erro
         }
         let reconciliation = {
             let mut active = ActiveWork::enter(&control.activity);
+            let timing = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").map(|_| Instant::now());
             let result = owner.drive_if_due(Instant::now());
             active.touched = !matches!(result, Ok(false));
+            if let Some(started) = timing.filter(|_| active.touched) {
+                tracing::debug!(stage = "reconciliation", elapsed_us = started.elapsed().as_micros() as u64,
+                    ok = result.is_ok(), "operation_background");
+            }
             result
         };
         match reconciliation {
@@ -376,12 +381,35 @@ fn dispatch(owner: &mut AgentProductionOwner, request: PendingLocalLifecycle) {
         } => {
             let _ = reply.try_send(owner.submit_admin(&call, &preparation));
         }
-        PendingLocalLifecycle::PrepareOperation { call, reply } => {
-            let _ = reply.try_send(owner.prepare_operation(&call));
+        PendingLocalLifecycle::PrepareOperation { call, reply, diagnostic } => {
+            let _entered = diagnostic.as_ref().map(|(_, span)| span.enter());
+            if let Some((started, _)) = &diagnostic {
+                tracing::debug!(elapsed_us = started.elapsed().as_micros() as u64, "operation_queue");
+            }
+            let _timing = super::local_lifecycle::OperationTiming::start("worker_preparation");
+            let result = owner.prepare_operation(&call);
+            if diagnostic.is_some() {
+                tracing::debug!(ok = result.is_ok(), "operation_handler_result");
+            }
+            let _ = reply.try_send(result);
         }
-        PendingLocalLifecycle::AuthorizeOperation { submission, reply } => {
+        PendingLocalLifecycle::AuthorizeOperation { submission, reply, diagnostic } => {
+            let _entered = diagnostic.as_ref().map(|(_, span)| span.enter());
+            if let Some((started, _)) = &diagnostic {
+                tracing::debug!(elapsed_us = started.elapsed().as_micros() as u64, "operation_queue");
+            }
+            let _timing = super::local_lifecycle::OperationTiming::start("worker_authorization");
             let (call, context, issued_at) = submission.into_parts();
-            let _ = reply.try_send(owner.authorize_operation(&call, context, issued_at));
+            let result = owner.authorize_operation(&call, context, issued_at);
+            if diagnostic.is_some() {
+                let decision = match &result {
+                    Ok(super::clean_bootstrap::NativeAuthorityOperationDecision::Issued(_)) => "issued",
+                    Ok(super::clean_bootstrap::NativeAuthorityOperationDecision::Denied { .. }) => "denied",
+                    Err(_) => "error",
+                };
+                tracing::debug!(decision, "operation_decision");
+            }
+            let _ = reply.try_send(result);
         }
         PendingLocalLifecycle::Create(request) => {
             let _ = request.reply.try_send(owner.create_local_disposition(
