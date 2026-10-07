@@ -9463,7 +9463,7 @@ mod keyed_actor_cursor_tests {
         manifest.observe(&first).unwrap();
         for owner in [original_owner, shadow_owner] {
             let slot = manifest.management_slot(owner).unwrap();
-            assert_eq!(slot.members_evidence()[0].invoke().unwrap().input_id(), first.input_id());
+            assert_eq!(slot.members_evidence()[0].invoke().unwrap().input_id(), first.observation().input_id());
             assert!(slot.members_evidence()[0].acknowledgement().is_none());
         }
         let (pending, registered_entries, registered_bytes) =

@@ -151,6 +151,8 @@ Rerun M1 exact full-data artifacts, then prescribed M3 hardware/load/soak/faults
 
 ## Effort and evidence discipline
 
+S8=5c71beee baseline build failed16.818s/E0599 in the new regression's wrapper accessor. The test now uses the existing borrowed observation; production is unchanged and no runtime result follows. Failed evidence: task-tmp/r70g-core-signed-headroom-baseline-5c71beee.
+
 Original O1–O3 **22–44 source hours plus qualification** is historical, not current remaining forecast.
 Both ordered remedies have S4 native/coherent guest preservation; Q1 public Query/cold30 fail. S7 publication retry passes while forwarding/retention fail separately; S8 tests/two fixture compositions remain unexecuted and production exact-pair correction unapplied. Baseline/correction/serial controls, final-source provenance/public execution and benefit remain pending. No defensible aggregate source-hour/integration/qualification forecast; remaining cycle count is unknown. Recorded costs are not ETA or public performance credit.
 The [live effort table](agent-saga-status.md#effort-variance-and-gono-go-discipline) records roughly21–35min for previously observed portable/coherent/all-mode build stages before runs, with high confidence in recorded costs and low confidence in remaining effort. S7 core48.148s/publication78.190s/forwarding67.175s/scoped80.891s/retention86.096s and older Q1 ordinary/quiet/scoped92.701/223.646/246.870s are separate measured outcomes, not future bounds, matched performance or an aggregate forecast.
