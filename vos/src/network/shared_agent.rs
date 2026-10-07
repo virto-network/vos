@@ -3447,6 +3447,32 @@ impl SharedRouteHandler {
             let observed_slot = prepared.observed_slot();
             if let Some(outcome) = prepared.denied().cloned() {
                 let _ = refused("ordinary_denied", SharedAgentHostError::Unavailable);
+                if forwarding_provenance.is_some()
+                    && std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some()
+                {
+                    // Classify the already-owned denial; lifecycle debt stays private.
+                    if let crate::agent_sdk::RuntimeOutcome::Management(Err(error)) = &outcome {
+                        use crate::agent_sdk::ManagementError;
+                        let category = match error {
+                            ManagementError::NotCreated => "NotCreated",
+                            ManagementError::AlreadyCreated => "AlreadyCreated",
+                            ManagementError::NotFound => "NotFound",
+                            ManagementError::AlreadyExists => "AlreadyExists",
+                            ManagementError::StaleDeployment => "StaleDeployment",
+                            ManagementError::UnsupportedRuntime => "UnsupportedRuntime",
+                            ManagementError::UnsupportedLane => "UnsupportedLane",
+                            ManagementError::Busy(_) => "Busy",
+                            ManagementError::DirectoryFull => "DirectoryFull",
+                            ManagementError::InvalidRequest => "InvalidRequest",
+                            ManagementError::AuthoritySequenceRegressed => "AuthoritySequenceRegressed",
+                            ManagementError::AuthoritySequenceConflict => "AuthoritySequenceConflict",
+                            ManagementError::AuthoritySlotRegressed => "AuthoritySlotRegressed",
+                            ManagementError::ResourceLimit => "ResourceLimit",
+                            ManagementError::ExpiredBeforeApplication => "ExpiredBeforeApplication",
+                        };
+                        tracing::debug!(category, "Shared Install ordinary management denied");
+                    }
+                }
                 return Ok(CleanManagementSubmission::Denied {
                     outcome,
                     observed_slot,
