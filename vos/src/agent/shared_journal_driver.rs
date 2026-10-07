@@ -216,7 +216,10 @@ fn management_retention_headroom<'a>(
                         saved == member && evidence.acknowledgement().is_some()
                     })
             });
-            if !acknowledged {
+            // Exact delivery holders share one pending runtime invocation.
+            // Keep every family's future reserve above; differing same-ID
+            // pairs remain present for the checked budget's original refusal.
+            if !acknowledged && !pending.contains(&(member.anchor(), member.envelope())) {
                 pending.push((member.anchor(), member.envelope()));
             }
         }
