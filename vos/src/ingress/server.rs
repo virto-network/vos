@@ -466,10 +466,16 @@ fn handle_clean_credential(
         Ok(query) => query,
         Err(_) => return text(400, "invalid clean credential query"),
     };
-    match handle.query_clean_credential(query) {
+    let diagnostics = handle.credential_observation_diagnostics(&query);
+    match handle.query_clean_credential_diagnostic(query, diagnostics) {
         Ok(projection) => match projection.encode() {
             Ok(bytes) => with_content_type(200, "application/octet-stream", bytes),
-            Err(_) => text(503, "invalid Authority projection"),
+            Err(_) => {
+                if let Some(diagnostics) = diagnostics {
+                    diagnostics.refused("server", "projection_encode");
+                }
+                text(503, "invalid Authority projection")
+            }
         },
         Err(IngressAuthenticationError::Invalid) => text(403, "invalid API credential query"),
         Err(IngressAuthenticationError::AuthorityUnavailable) => text(

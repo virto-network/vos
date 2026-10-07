@@ -2290,10 +2290,41 @@ impl IngressHandle {
         crate::agent::sdk::authority::AuthorityCredentialProjection,
         IngressAuthenticationError,
     > {
+        let diagnostics = self.credential_observation_diagnostics(&query);
+        self.query_clean_credential_diagnostic(query, diagnostics)
+    }
+
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    pub(crate) fn credential_observation_diagnostics(
+        &self,
+        query: &crate::agent::sdk::authority::AuthorityProjectionQuery,
+    ) -> Option<crate::agent::supervisor_adapters::CredentialObservationDiagnostics> {
+        std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some().then(|| {
+            crate::agent::supervisor_adapters::CredentialObservationDiagnostics {
+                query: query.commitment(),
+                node: self.shared_network.agent_node_id(),
+            }
+        })
+    }
+
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    pub(crate) fn query_clean_credential_diagnostic(
+        &self,
+        query: crate::agent::sdk::authority::AuthorityProjectionQuery,
+        diagnostics: Option<crate::agent::supervisor_adapters::CredentialObservationDiagnostics>,
+    ) -> Result<
+        crate::agent::sdk::authority::AuthorityCredentialProjection,
+        IngressAuthenticationError,
+    > {
         use crate::agent::sdk::authority::{
             AuthorityCredentialProjection, AuthorityProjectionSelector,
         };
         use crate::agent::sdk::wire::CanonicalWire as _;
+        let refused = |category: &'static str| {
+            if let Some(diagnostics) = diagnostics {
+                diagnostics.refused("node", category);
+            }
+        };
         if query.selector != AuthorityProjectionSelector::Credential
             || query.recovery.is_some()
             || query
@@ -2303,20 +2334,33 @@ impl IngressHandle {
             return Err(IngressAuthenticationError::Invalid);
         }
         if self.shutdown.load(Ordering::Acquire) {
+            refused("shutdown");
             return Err(IngressAuthenticationError::AuthorityUnavailable);
         }
-        let authority = self
-            .clean_agent_supervisor
-            .read()
-            .ok()
-            .and_then(|ingress| ingress.as_ref().map(|ingress| ingress.authority.clone()))
-            .ok_or(IngressAuthenticationError::AuthorityUnavailable)?;
+        let authority = match self.clean_agent_supervisor.read() {
+            Ok(ingress) => ingress.as_ref().map(|ingress| ingress.authority.clone()),
+            Err(error) => {
+                drop(error);
+                refused("publication_lock_poison");
+                return Err(IngressAuthenticationError::AuthorityUnavailable);
+            }
+        }.ok_or_else(|| {
+            refused("publication_missing");
+            IngressAuthenticationError::AuthorityUnavailable
+        })?;
         let bytes = authority
-            .invoke_authority_observation_bounded(query.clone())
-            .map_err(|_| IngressAuthenticationError::AuthorityUnavailable)?;
+            .invoke_authority_observation_bounded_diagnostic(query.clone(), diagnostics)
+            .map_err(|_| {
+                refused("observation_error");
+                IngressAuthenticationError::AuthorityUnavailable
+            })?;
         let projection = AuthorityCredentialProjection::decode(&bytes)
-            .map_err(|_| IngressAuthenticationError::AuthorityUnavailable)?;
+            .map_err(|_| {
+                refused("projection_decode");
+                IngressAuthenticationError::AuthorityUnavailable
+            })?;
         if projection.query != query {
+            refused("projection_mismatch");
             return Err(IngressAuthenticationError::AuthorityUnavailable);
         }
         Ok(projection)

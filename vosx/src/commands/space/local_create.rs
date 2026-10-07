@@ -475,17 +475,36 @@ fn query_credential_for(
         query.selector == AuthorityProjectionSelector::Credential,
         "credential discovery requires the Credential selector"
     );
-    let bytes = post_binary(
+    let diagnostic_query = std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS")
+        .map(|_| query.commitment());
+    if let Some(query) = diagnostic_query {
+        tracing::debug!(target: "vosx::credential_diagnostic", stage = "client_query",
+            query = ?query.0, address = %address, "credential_diagnostic");
+    }
+    let result = post_binary(
         address,
         "/__agents/credential",
         200,
         query_bytes,
         MAX_AUTHORITY_CREDENTIAL_PROJECTION_WIRE_BYTES,
-    )
-    .map_err(|error| {
-        let diagnostic = format!("{error}; retry the identical retained credential query");
-        error.context(diagnostic)
-    })?;
+    );
+    if let Some(query) = diagnostic_query {
+        let (category, status) = match &result {
+            Ok(_) => ("ok", 200u16),
+            Err(error) => match error.downcast_ref::<ureq::Error>() {
+                Some(ureq::Error::Status(status, _)) => ("http_error", *status),
+                Some(ureq::Error::Transport(_)) => ("transport_error", 0),
+                None => ("other_error", 0),
+            },
+        };
+        tracing::debug!(target: "vosx::credential_diagnostic", stage = "client_http_result",
+            query = ?query.0, address = %address, category, status, "credential_diagnostic");
+    }
+    let bytes = result
+        .map_err(|error| {
+            let diagnostic = format!("{error}; retry the identical retained credential query");
+            error.context(diagnostic)
+        })?;
     validate_credential_response_for(&query, expected_principal, &bytes, domain)
 }
 

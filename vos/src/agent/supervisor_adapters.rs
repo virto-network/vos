@@ -2294,6 +2294,7 @@ enum RouteHostCommand {
     AuthorityObservation {
         query: AuthorityProjectionQuery,
         reply: SyncSender<Result<Vec<u8>, AgentRouteError>>,
+        diagnostics: Option<CredentialObservationDiagnostics>,
     },
     Retire(SyncSender<Result<(), AgentRouteWorkerError>>),
 }
@@ -2725,6 +2726,35 @@ pub struct AgentRouteHostHandle {
     state: Arc<AtomicU8>,
 }
 
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+#[derive(Clone, Copy)]
+pub(crate) struct CredentialObservationDiagnostics {
+    pub(crate) query: Hash,
+    pub(crate) node: NodeId,
+}
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+impl CredentialObservationDiagnostics {
+    pub(crate) fn refused(self, stage: &'static str, category: &'static str) {
+        tracing::debug!(target: "vos::credential_diagnostic",
+            query = ?self.query.0, node = ?self.node.0, stage, category,
+            "credential_diagnostic");
+    }
+}
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+fn trace_credential_observation_backend_refusal(category: &'static str) {
+    // Only the explicitly carried credential command supplies this binding.
+    // Ordinary inventory observations have no credential diagnostic context.
+    if tracing::Span::current().metadata().is_some_and(|metadata| {
+        metadata.name() == "credential_observation"
+            && metadata.target() == "vos::credential_diagnostic"
+    }) {
+        tracing::debug!(target: "vos::credential_diagnostic",
+            stage = "backend_host", category, "credential_diagnostic");
+    }
+}
+
 #[derive(Clone)]
 enum RouteHostTransport {
     Worker(SyncSender<RouteHostCommand>),
@@ -2829,7 +2859,7 @@ impl AgentRouteHostHandle {
         query: AuthorityProjectionQuery,
     ) -> Result<Vec<u8>, AgentRouteError> {
         let (reply, result) = mpsc::sync_channel(1);
-        self.send(RouteHostCommand::AuthorityObservation { query, reply })?;
+        self.send(RouteHostCommand::AuthorityObservation { query, reply, diagnostics: None })?;
         result.recv().unwrap_or(Err(AgentRouteError::Unavailable))
     }
 
@@ -2838,36 +2868,100 @@ impl AgentRouteHostHandle {
         &self,
         query: AuthorityProjectionQuery,
     ) -> Result<Vec<u8>, AgentRouteError> {
+        self.invoke_authority_observation_bounded_diagnostic(query, None)
+    }
+
+    #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+    pub(crate) fn invoke_authority_observation_bounded_diagnostic(
+        &self,
+        query: AuthorityProjectionQuery,
+        diagnostics: Option<CredentialObservationDiagnostics>,
+    ) -> Result<Vec<u8>, AgentRouteError> {
         let (reply, result) = mpsc::sync_channel(1);
-        self.send(RouteHostCommand::AuthorityObservation { query, reply })?;
-        result
-            .recv_timeout(std::time::Duration::from_secs(120))
-            .unwrap_or(Err(AgentRouteError::Unavailable))
+        self.send_diagnostic(RouteHostCommand::AuthorityObservation { query, reply, diagnostics }, diagnostics)?;
+        match result.recv_timeout(std::time::Duration::from_secs(120)) {
+            Ok(result) => {
+                if let (Some(diagnostics), Err(error)) = (diagnostics, &result) {
+                    let category = match error {
+                        AgentRouteError::NotReady => "NotReady",
+                        AgentRouteError::Busy => "Busy",
+                        AgentRouteError::Rejected => "Rejected",
+                        AgentRouteError::Unavailable => "Unavailable",
+                    };
+                    diagnostics.refused("adapter_backend", category);
+                }
+                result
+            }
+            Err(error) => {
+                if let Some(diagnostics) = diagnostics {
+                    diagnostics.refused("adapter_reply", match error {
+                        mpsc::RecvTimeoutError::Timeout => "timeout",
+                        mpsc::RecvTimeoutError::Disconnected => "disconnected",
+                    });
+                }
+                Err(AgentRouteError::Unavailable)
+            }
+        }
     }
 
     fn send(&self, command: RouteHostCommand) -> Result<(), AgentRouteError> {
+        self.send_diagnostic(command, None)
+    }
+
+    fn send_diagnostic(
+        &self,
+        command: RouteHostCommand,
+        #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+        diagnostics: Option<CredentialObservationDiagnostics>,
+        #[cfg(not(all(feature = "storage", feature = "network", target_os = "linux")))]
+        _diagnostics: Option<()>,
+    ) -> Result<(), AgentRouteError> {
+        let refused = |category: &'static str| {
+            #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+            if let Some(diagnostics) = diagnostics {
+                diagnostics.refused("adapter_send", category);
+            }
+            #[cfg(not(all(feature = "storage", feature = "network", target_os = "linux")))]
+            let _ = category;
+        };
         if !self.is_running() {
+            refused("handle_not_running");
             return Err(AgentRouteError::Unavailable);
         }
         match &self.transport {
             RouteHostTransport::Worker(commands) => {
                 commands.try_send(command).map_err(|error| match error {
-                    TrySendError::Full(_) => AgentRouteError::NotReady,
-                    TrySendError::Disconnected(_) => AgentRouteError::Unavailable,
+                    TrySendError::Full(_) => {
+                        refused("queue_full");
+                        AgentRouteError::NotReady
+                    }
+                    TrySendError::Disconnected(_) => {
+                        refused("queue_disconnected");
+                        AgentRouteError::Unavailable
+                    }
                 })
             }
             RouteHostTransport::Inline(backend) => {
-                let mut backend = backend.lock().map_err(|_| AgentRouteError::Unavailable)?;
+                let mut backend = backend.lock().map_err(|error| {
+                    drop(error);
+                    refused("inline_lock_poison");
+                    AgentRouteError::Unavailable
+                })?;
                 // Retirement may have started while this caller waited.
                 if !self.is_running() {
+                    refused("inline_not_running");
                     return Err(AgentRouteError::Unavailable);
                 }
-                let backend = backend.as_mut().ok_or(AgentRouteError::Unavailable)?;
+                let backend = backend.as_mut().ok_or_else(|| {
+                    refused("inline_backend_missing");
+                    AgentRouteError::Unavailable
+                })?;
                 let result = panic::catch_unwind(AssertUnwindSafe(|| {
                     execute_route_host_command(backend.as_mut(), command)
                 }));
                 if !matches!(result, Ok(None)) {
                     self.state.store(ROUTE_WORKER_FAILED, Ordering::Release);
+                    refused("inline_execution_failed");
                     return Err(AgentRouteError::Unavailable);
                 }
                 Ok(())
@@ -3205,7 +3299,12 @@ fn execute_route_host_command(
             let _ = reply.send(backend.authority_target());
         }
         #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
-        RouteHostCommand::AuthorityObservation { query, reply } => {
+        RouteHostCommand::AuthorityObservation { query, reply, diagnostics } => {
+            let _diagnostic_span = diagnostics.map(|diagnostics| {
+                tracing::debug_span!(target: "vos::credential_diagnostic",
+                    "credential_observation", query = ?diagnostics.query.0,
+                    node = ?diagnostics.node.0).entered()
+            });
             let _ = reply.send(backend.authority_observation(query));
         }
         RouteHostCommand::Retire(reply) => {
@@ -4383,9 +4482,41 @@ where
     ) -> Result<Vec<u8>, AgentRouteError> {
         self.owner
             .lock()
-            .map_err(|_| AgentRouteError::Unavailable)?
+            .map_err(|error| {
+                drop(error);
+                trace_credential_observation_backend_refusal("owner_lock_poison");
+                AgentRouteError::Unavailable
+            })?
             .invoke_authority_observation(query)
             .map_err(|error| {
+                use super::genesis::AgentGenesisFinalityError as Finality;
+                use super::shared_host::SharedAgentHostError as Host;
+                let category = match error {
+                    Host::Unavailable => "Unavailable",
+                    Host::DirectoryInUse => "DirectoryInUse",
+                    Host::InvalidScope => "InvalidScope",
+                    Host::ScopeMismatch => "ScopeMismatch",
+                    Host::InvalidProvision => "InvalidProvision",
+                    Host::Finality(Finality::Unavailable) => "FinalityUnavailable",
+                    Host::Finality(Finality::NotFinalized) => "FinalityNotFinalized",
+                    Host::Finality(Finality::WrongSystemAgent) => "FinalityWrongSystemAgent",
+                    Host::Finality(Finality::Conflict) => "FinalityConflict",
+                    Host::Finality(Finality::Corrupt) => "FinalityCorrupt",
+                    Host::InvalidCatalog => "InvalidCatalog",
+                    Host::Conflict => "Conflict",
+                    Host::CorruptResidue => "CorruptResidue",
+                    Host::AgentNotFound => "AgentNotFound",
+                    Host::CapacityExhausted => "CapacityExhausted",
+                    Host::TransportNotAttached => "TransportNotAttached",
+                    Host::SnapshotBoundaryRequired => "SnapshotBoundaryRequired",
+                    Host::SnapshotCertificateInvalid => "SnapshotCertificateInvalid",
+                    Host::SnapshotStale => "SnapshotStale",
+                    Host::SnapshotReplay => "SnapshotReplay",
+                    Host::SnapshotEvidenceLimit => "SnapshotEvidenceLimit",
+                    Host::PortableBackupUnsupported => "PortableBackupUnsupported",
+                    Host::PortableBackupInvalid => "PortableBackupInvalid",
+                };
+                trace_credential_observation_backend_refusal(category);
                 tracing::debug!(?error, "System authority observation failed");
                 #[cfg(test)]
                 if std::env::var_os("VOS_TEST_INNER_DIAGNOSTICS").is_some() {
@@ -7283,16 +7414,19 @@ mod tests {
         let first = handle.send(RouteHostCommand::AuthorityObservation {
             query: query.clone(),
             reply: first_reply,
+            diagnostics: None,
         });
         let (second_reply, second_result) = mpsc::sync_channel(1);
         let second = handle.send(RouteHostCommand::AuthorityObservation {
             query: query.clone(),
             reply: second_reply,
+            diagnostics: None,
         });
         let (overflow_reply, _) = mpsc::sync_channel(1);
         let full = handle.send(RouteHostCommand::AuthorityObservation {
             query: query.clone(),
             reply: overflow_reply,
+            diagnostics: None,
         });
         release.send(()).unwrap();
         operation.join().unwrap().unwrap();
