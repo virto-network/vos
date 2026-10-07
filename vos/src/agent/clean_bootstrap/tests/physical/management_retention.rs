@@ -426,6 +426,44 @@ fn prune_and_catch_up_offline_management(
                 .unwrap(),
             Some(first.input_id())
         );
+        // Advance the live source through the ordinary signed Query
+        // Invoke/ACK contract. Constructing checkpoint gate work alone does
+        // not create a newer prefix than the detached destination.
+        let request = query(owner, source, nonce + cycle);
+        let (work, authorization, identity) = public_query_work(owner, &request);
+        let before_query = owner.ordered_index_for_test().unwrap();
+        let outcome = exact_management_retry("management catch-up public Query", || {
+            owner.supervisor_invoke_terminal(identity, work.clone(), authorization.clone())
+        });
+        let RuntimeOutcome::Completed(Ok(reply)) = outcome else {
+            panic!("management catch-up public Query did not complete");
+        };
+        assert_eq!(reply.status, InvocationStatus::Done);
+        let Some(crate::actors::value::Value::Bytes(bytes)) =
+            crate::actors::value::Value::try_decode(&reply.reply)
+        else {
+            panic!("management catch-up public Query returned no projection bytes");
+        };
+        let projection =
+            crate::agent_sdk::authority::AuthorityCredentialProjection::decode(&bytes).unwrap();
+        assert_eq!(projection.query, request);
+        assert_eq!(projection.query.credential, request.credential);
+        assert_eq!(
+            projection.status,
+            crate::agent_sdk::authority::AuthorityCredentialStatus::Active
+        );
+        assert_ne!(projection.principal, PrincipalId::ZERO);
+        let acknowledged = exact_management_retry("management catch-up public Query ACK", || {
+            owner.supervisor_acknowledge(identity, work.clone(), authorization.clone())
+        });
+        let RuntimeOutcome::Acknowledged(Ok(acknowledged)) = acknowledged else {
+            panic!("management catch-up public Query was not positively acknowledged");
+        };
+        assert_eq!(acknowledged.invocation, work.invocation);
+        assert_eq!(acknowledged.actor, work.actor);
+        assert_eq!(acknowledged.work, work.commitment());
+        assert_eq!(acknowledged.authorization, authorization.commitment());
+        assert!(owner.ordered_index_for_test().unwrap() > before_query);
         // Qualify the real candidate's same-call audited-manifest handoff
         // before QC collection, so a later vote timeout cannot mask whether
         // this exact source/read-count assertion ran.
@@ -434,8 +472,6 @@ fn prune_and_catch_up_offline_management(
             .lock()
             .unwrap()
             .assert_common_candidate_reuses_audited_manifest_for_test(system);
-        let (work, authorization, _) =
-            public_query_work(owner, &query(owner, source, nonce + cycle));
         let committee = owner.pins.replicas.clone();
         let mut certificate = None;
         assert!(wait_until(std::time::Duration::from_secs(30), || {
@@ -544,6 +580,13 @@ fn prune_and_catch_up_offline_management(
         drop(offline_database);
         let offline_applied = offline_host.lock().unwrap().capacity(system).unwrap().0;
         let target = certificate.claim().ordered();
+        assert!(
+            target.raft_index() > offline_applied
+                && target.raft_index() > offline_raft.last_applied
+                && target.raft_index() > offline_raft.commit_index
+                && target.raft_index() > offline_raft.snap_last_index,
+            "positive catch-up requires a genuinely newer certified prefix"
+        );
         offline_host
             .lock()
             .unwrap()

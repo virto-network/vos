@@ -13,13 +13,6 @@ use crate::agent::sdk::authority::{
     AuthorityInventoryPosition, AuthorityInventoryProjectionPage,
 };
 
-/// Emit only a fixed diagnostic phase; this carries no admission authority.
-pub(super) fn trace_member_admission_phase(phase: &'static str) {
-    if std::env::var_os("VOS_TEST_BOOTSTRAP_DIAGNOSTICS").is_some() {
-        tracing::debug!(phase, "VOS member admission phase");
-    }
-}
-
 /// Four exact rows: descriptor followed by the fixed-three voter roster. The
 /// existing inventory cursor is exclusive and need not name an existing row.
 pub(crate) fn member_inventory_selector(
@@ -161,30 +154,18 @@ where
         // Reject a substituted signer before observing. The configured Root
         // key remains the only signer for this lane.
         if signer.public_key() != self.pins.authority.public_key {
-            trace_member_admission_phase("member_signer");
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        trace_member_admission_phase("member_static_material_start");
         self.verify_member_shared_genesis_material(record)?;
-        trace_member_admission_phase("member_static_material_ok");
         let provision = record.provision();
         let agent = AgentId(provision.proposal().locator().agent.0);
-        trace_member_admission_phase("member_decision_query_start");
         let nonce = self.member_genesis_query_nonce(record, 0)?;
         let query = self.signed_genesis_decision_query(agent, nonce, signer)?;
-        trace_member_admission_phase("member_decision_query_ok");
         // The physical Authority guest revalidates the publication certificate
         // against its current committee. Do not decode its private state or
         // select a "trusted" committee from the untrusted archive.
-        trace_member_admission_phase("member_decision_observation_start");
         let decision = self.invoke_authority_observation(query)?;
-        trace_member_admission_phase("member_decision_observation_ok");
         if decision != provision.decision().encode() {
-            trace_member_admission_phase(if decision.is_empty() {
-                "member_decision_empty"
-            } else {
-                "member_decision_different"
-            });
             return Err(SharedAgentHostError::ScopeMismatch);
         }
 
@@ -192,41 +173,27 @@ where
             .proposal()
             .clean_descriptor()
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-        trace_member_admission_phase("member_inventory_query_start");
         let query = self.sign_member_inventory_query(
             member_inventory_selector(agent)?,
             self.member_genesis_query_nonce(record, 1)?,
             signer,
         )?;
-        trace_member_admission_phase("member_inventory_query_ok");
-        trace_member_admission_phase("member_inventory_observation_start");
         let bytes = self.invoke_authority_observation(query.clone())?;
-        trace_member_admission_phase("member_inventory_observation_ok");
-        let page = AuthorityInventoryProjectionPage::decode(&bytes).map_err(|_| {
-            trace_member_admission_phase("member_inventory_decode");
-            SharedAgentHostError::ScopeMismatch
-        })?;
-        if page.encode().ok().as_deref() != Some(bytes.as_slice()) {
-            trace_member_admission_phase("member_inventory_canonical");
-            return Err(SharedAgentHostError::ScopeMismatch);
-        }
-        if !member_inventory_page_matches(&page, &query, self.pins.authority.issuer.principal) {
-            trace_member_admission_phase("member_inventory_page_credential");
-            return Err(SharedAgentHostError::ScopeMismatch);
-        }
-        if !member_inventory_descriptor_matches(&page, expected) {
+        let page = AuthorityInventoryProjectionPage::decode(&bytes)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if page.encode().ok().as_deref() != Some(bytes.as_slice())
+            || !member_inventory_page_matches(&page, &query, self.pins.authority.issuer.principal)
+            || !member_inventory_descriptor_matches(&page, expected)
+        {
             // A permanent decision alone can exist before Create finalization.
             // The live descriptor includes all three exact replica rows; no
             // missing, altered, or merely archived roster is sufficient.
-            trace_member_admission_phase("member_inventory_descriptor");
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         // Recheck the exact sealed System generation after all executions.
         // This also rejects a committee transition or generation replacement
         // during the reads, before minting a process-only attestation.
-        trace_member_admission_phase("member_final_material_start");
         self.verify_member_shared_genesis_material(record)?;
-        trace_member_admission_phase("member_final_material_ok");
         Ok(ReplayVerifiedAgentGenesisFinality(provision.clone()))
     }
 
@@ -411,28 +378,20 @@ where
         &mut self,
         record: &super::super::genesis::AgentGenesisArchiveRecord,
     ) -> Result<(), SharedAgentHostError> {
-        self.validate_member_system_binding().map_err(|error| {
-            trace_member_admission_phase("material_binding");
-            error
-        })?;
+        self.validate_member_system_binding()?;
         let provision = record.provision();
-        provision.validate().map_err(|_| {
-            trace_member_admission_phase("material_provision");
-            SharedAgentHostError::ScopeMismatch
-        })?;
+        provision
+            .validate()
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
         super::super::genesis::validate_agent_genesis_catalog(
             provision.proposal(),
             record.catalog(),
         )
-        .map_err(|_| {
-            trace_member_admission_phase("material_catalog");
-            SharedAgentHostError::ScopeMismatch
-        })?;
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
         let proposal = provision.proposal();
-        let descriptor = proposal.clean_descriptor().map_err(|_| {
-            trace_member_admission_phase("material_descriptor");
-            SharedAgentHostError::ScopeMismatch
-        })?;
+        let descriptor = proposal
+            .clean_descriptor()
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
         let claim = provision.evidence().claim();
         let replicas = provision.replicas();
         if self.pins.replicas.members().len() != 3
@@ -453,7 +412,6 @@ where
             || claim.space().0 != self.pins.space.0
             || claim.system_agent().0 != self.pins.agent.0
         {
-            trace_member_admission_phase("material_descriptor");
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         let super::super::journal::ReplayOperation::CleanManage {
@@ -462,7 +420,6 @@ where
             observed_slot,
         } = &proposal.create().operation
         else {
-            trace_member_admission_phase("material_receipt");
             return Err(SharedAgentHostError::ScopeMismatch);
         };
         if !self.pins.authority.accepts(receipt)
@@ -475,16 +432,12 @@ where
             || receipt.selector.runtime_deployment != descriptor.identity.runtime_deployment
             || receipt.selector.request != request.commitment()
         {
-            trace_member_admission_phase("material_receipt");
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         let runtime = super::super::package_admission::admit_state_runtime_package(
             &record.catalog()[0].bytes,
         )
-        .map_err(|_| {
-            trace_member_admission_phase("material_runtime");
-            SharedAgentHostError::ScopeMismatch
-        })?;
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
         if descriptor.runtime_package != *runtime.package_ref()
             || descriptor.identity.runtime_deployment != runtime.deployment()
             || descriptor.identity.runtime_program != runtime.program()
@@ -494,12 +447,8 @@ where
             || proposal.create().runtime
                 != runtime
                     .binding(proposal.locator().space, proposal.locator().agent)
-                    .map_err(|_| {
-                        trace_member_admission_phase("material_runtime");
-                        SharedAgentHostError::ScopeMismatch
-                    })?
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?
         {
-            trace_member_admission_phase("material_runtime");
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         // Independently opened physical System lineage, not claim/archive
@@ -513,13 +462,9 @@ where
         if claim.system_genesis() != position.genesis
             || claim.system_admission() != position.admission
         {
-            trace_member_admission_phase("material_system_lineage");
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        self.validate_member_system_binding().map_err(|error| {
-            trace_member_admission_phase("material_binding");
-            error
-        })
+        self.validate_member_system_binding()
     }
 
     fn member_genesis_query_nonce(
@@ -633,10 +578,7 @@ fn member_inventory_page_matches(
     page.validate_shape().is_ok()
         && page.credential.query == *query
         && !page.unchanged
-        && (page.credential.principal == root_principal || {
-            trace_member_admission_phase("inventory_page_principal");
-            false
-        })
+        && page.credential.principal == root_principal
         && page.credential.status == AuthorityCredentialStatus::Active
         && page.credential.kind == AuthorityCredentialKind::Api
         && page.credential.builtin_role == AuthorityBuiltinRole::Admin

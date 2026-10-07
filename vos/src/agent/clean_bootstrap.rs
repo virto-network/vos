@@ -12848,7 +12848,12 @@ mod tests {
                 .unwrap_or_else(|| raw_constructor_actor("system-authority", RECEIPT_SEED));
             let catalog_package =
                 admitted_standard_actor_for_test("root-catalog", StateLane::Linear, 0xa5);
-            let authority = authority_binding(agent, &authority_package, &receipt_key);
+            let mut authority = authority_binding(agent, &authority_package, &receipt_key);
+            if real_authority {
+                // Match the real Root credential before signing the common
+                // descriptor/configuration; receipt keys are enrolled later.
+                authority.issuer.principal = owner;
+            }
             let mut descriptor = descriptor(
                 &runtime,
                 space,

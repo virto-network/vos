@@ -468,9 +468,7 @@ where
         }
         // Static certified material, actual Root and exclusion checks precede
         // even the empty lease. No signing or projection WAL occurs here.
-        super::member_genesis::trace_member_admission_phase("controller_static_preflight_start");
         owner.preflight_live_member_shared_genesis(record, signer.public_key())?;
-        super::member_genesis::trace_member_admission_phase("controller_static_preflight_ok");
         let index = match existing {
             Some(index) => index,
             None => {
@@ -499,13 +497,8 @@ where
         }
         // Published inputs cannot repair an absent serving namespace. Empty
         // preparation permits only a genuine first admission or exact stage.
-        super::member_genesis::trace_member_admission_phase("controller_namespace_start");
         owner.preflight_live_member_namespace(record, stored.is_some())?;
-        super::member_genesis::trace_member_admission_phase("controller_namespace_ok");
-        super::member_genesis::trace_member_admission_phase("controller_stage_start");
         let proof = owner.stage_live_member_shared_genesis(record, stored.is_some(), signer)?;
-        super::member_genesis::trace_member_admission_phase("controller_stage_ok");
-        super::member_genesis::trace_member_admission_phase("controller_publish_start");
         super::super::genesis_archive::ArchivedAgentGenesisProvider::new(locator.space, archive)
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?
             .publish(record)
@@ -515,16 +508,8 @@ where
                 }
                 _ => SharedAgentHostError::ScopeMismatch,
             })?;
-        super::member_genesis::trace_member_admission_phase("controller_publish_ok");
-        super::member_genesis::trace_member_admission_phase("controller_finish_start");
         owner.finish_live_member_shared_genesis(record, &proof, archive)?;
-        super::member_genesis::trace_member_admission_phase("controller_finish_ok");
-        super::member_genesis::trace_member_admission_phase("controller_projection_scope_start");
-        let result = self.refresh_member_projection_scope(owner);
-        if result.is_ok() {
-            super::member_genesis::trace_member_admission_phase("controller_projection_scope_ok");
-        }
-        result
+        self.refresh_member_projection_scope(owner)
     }
 
     /// Retain a new signed, unissued Create after startup recovery. The factory
