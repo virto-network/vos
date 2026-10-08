@@ -72,21 +72,22 @@ not ported; section 17 lists what is reused.
   - prepared programs cached by hash.
 
   No node-side fast path in v1 (sections 6.1 and 6.4).
-- **Storage engine (S4), proposed:** an LSM (fjall) replaces redb:
+- **Storage engine (S4), decided:** an LSM (fjall) replaces redb:
   - random updates at 10M rows: 1.5 µs per row, against redb's 18 µs;
   - durable log appends: 1.5–2× faster;
   - reads: about 5 µs at 10M rows.
 
-  A compressed root format would cut a committed write from 100–280
-  hashes to 8–25, at the cost of Clerk root compatibility (sections 9.3
-  and 9.5).
+  The compressed root format is decided too: it cuts a committed write
+  from 100–280 hashes to 8–25, and cipher-clerk changes with it (sections
+  9.3 and 9.5).
 - **Merge apply (S6):** the current merkle-crdt sync grows with history
   (8.7 s per synced operation at 1M). Incremental apply holds about 2 µs
   per operation from 1k to 1M (section 9.4).
 - **Attestable (S5):**
   - hashing dominates proving cost;
-  - today's hash precompile uses the JAR `ecall` opcode, which panics
-    under Gray Paper 0.8.0, so it is redefined as an `ecalli` host call;
+  - the existing precompiles are `ecalli` host calls, but only the legacy
+    tracer proves them. BLAKE2b's id (100) is JAM's `log`. They move to
+    VOS-owned ids on the refine path;
   - proofs run as chained segments of at most 2^16 steps (section 11).
 
 ## 1. Goals
@@ -472,16 +473,17 @@ The macros generate a view per mode, so forbidden access fails to compile.
   updates.
 - In-PVM hashing goes through a native hash host call. In-PVM BLAKE2b is
   28× (JIT) to 175× (interpreter) slower than native (S4).
-- **Proposed: a path-compressed root format** [awaiting owner decision].
+- **A path-compressed root format** [decided].
   - The current fixed-depth math rehashes empty spines: 100–280 hashes per
     update (18–49 µs at 1M–10M keys), however large the batch.
   - The compressed format, where a leaf commits its full key and a branch
     its split level, needs 8–25 hashes (3–8 µs).
   - Branch-node rows rewritten per update are the same in both: 20–24
     alone, 7–10 in batches of 10,000.
-  - The cost: roots stop matching cipher-clerk and the current
-    `vos::zk::state` math. Clerk, the witness math and the attestable
-    kernels would move to the new format together.
+  - Roots stop matching the current `vos::zk::state` math. cipher-clerk
+    (`merkle.rs`, `state_root.rs`, `succinct.rs`, `snapshot.rs`), the
+    witness math and the attestable kernels move to the new format
+    together. The owner cleared changing cipher-clerk as needed.
 - No global state root on VOS. Agents deployed on JAM keep one.
 
 ### 9.4 Merge lane
@@ -527,7 +529,7 @@ The macros generate a view per mode, so forbidden access fails to compile.
   The decision depends only on the log and the DAG, so every replica agrees.
   It costs O(1) per operation with per-member epoch intervals.
 
-### 9.5 Storage engine [proposed]
+### 9.5 Storage engine [decided: LSM; layout proposed]
 
 One embedded LSM key-value store per node (fjall first). It holds Linear
 state, Merge state and DAG, the page store, system tables (dedup and
@@ -626,10 +628,12 @@ fn apply_batch(w: Witness<LedgerSlice>, batch: Batch) -> Transition { /* ... */ 
   about 0.2–0.5M steps when hashing in the PVM; under today's fixed-depth
   format, about 5M.
 - **Required** (S5):
-  - a Gray Paper 0.8.0 hash precompile, invoked with `ecalli` and backed
-    by the existing BLAKE2b chip. Today's precompiles use the JAR `ecall`
-    opcode, which panics under conformance. The same applies to the
-    Ristretto chips;
+  - precompiles on the Gray Paper refine path, backed by the existing
+    BLAKE2b and Ristretto chips. They are `ecalli` host calls with
+    VOS-owned ids, answered natively on VOS nodes and in the prover. On a
+    JAM node an unknown id returns `WHAT`, and the guest falls back to
+    software with identical results. Today only the legacy tracer proves
+    them, and BLAKE2b's id (100) collides with JAM's `log`;
   - chained segments in the refine prover.
 - **Proposed size guideline:** kernels prove a whole settlement window at
   once, never one proof per item, in segments of at most 2^16 steps.

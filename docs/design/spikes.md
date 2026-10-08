@@ -603,10 +603,23 @@ Each proof runs in its own process under a 24 GiB memory cap. Sizes stop at
 2^16 steps, which peaked at 15 GiB, and larger windows are extrapolated
 rather than risked.
 
-**Finding before measuring.** Guests reach the existing BLAKE2b (and
-Ristretto) precompiles through the JAR `ecall` opcode, which panics under
-Gray Paper 0.8.0 conformance. A conformant attestable program therefore
-has no provable hash precompile today and must hash inside the PVM.
+**Finding before measuring** (corrected after review). The guest calls the
+existing BLAKE2b and Ristretto precompiles as host calls: `csrw 0x801;
+ecall` lowers to `ecalli 100`–`114`. Three things keep them from a
+conformant attestable program today:
+
+- **Id clash:** BLAKE2b's id 100 is JAM's `log` call (JIP-1).
+- **Not on the refine path:** only the legacy tracer intercepts them
+  (`TracingPvm::run_with_precompiles`). The Gray Paper refine prover
+  (`trace_refine`) treats any host call other than 9–14 as an error.
+- **JAR leftovers:** the proof allow-list still accepts JAR lifecycle stubs
+  (ids 1, 2, 4, 5, 6, 26, which "return 0"); JAM assigns those ids other
+  meanings.
+
+The measurements below therefore hash inside the PVM.
+
+An earlier version of this entry said the precompiles used the JAR `ecall`
+opcode; they do not.
 
 **Result: steps.** One BLAKE2b of a 76-byte node input costs 4,790 PVM
 steps in the guest (portable `blake2b_simd`). The program's fixed cost is
@@ -650,9 +663,12 @@ for the root after, with hash counts from S4 at 10M keys:
 - **Hashing dominates attestable cost.** Without a precompile, every hash
   costs about 0.4 s of proving. The current fixed-depth root math makes a
   single transfer cost minutes.
-- **The hash precompile has to be redefined for Gray Paper 0.8.0** as an
-  `ecalli` host call, keeping the existing BLAKE2b chip. The same applies
-  to the Ristretto chips used for signatures.
+- **The precompiles have to move to the Gray Paper refine path:**
+  - an id outside JAM's assignments;
+  - native service in the refine host;
+  - chip records in the refine collector.
+
+  The BLAKE2b and Ristretto chips themselves are reused.
 - **Memory, not time, limits a proof.** About 170 KiB per step; slices
   beyond about 2^16–2^17 steps must be chained.
 - **Per-item proofs do not scale; window proofs do.** Sharing upper tree
@@ -672,8 +688,8 @@ for the root after, with hash counts from S4 at 10M keys:
   transfer already costs 0.2–0.5M steps. It is checked once the
   precompile exists.
 - Required work:
-  - a Gray Paper 0.8.0 hash precompile (`ecalli`) backed by the BLAKE2b
-    chip, and the same for Ristretto;
+  - precompiles on the Gray Paper refine path, with VOS-owned `ecalli`
+    ids, backed by the existing BLAKE2b and Ristretto chips;
   - chained segments in the refine prover;
   - the compressed root format (S4) for every committed map that
     attestable code reads.
